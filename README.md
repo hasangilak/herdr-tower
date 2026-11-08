@@ -153,6 +153,17 @@ Every Claude session on this Mac carries its account: `tower agents`,
 account never changes, so it's looked up once per pid and kept in
 `~/.local/state/herder-tower/accounts.json`.
 
+### Screenshots
+
+Sessions show visual results in the tower: `tower screenshot shot.png
+--caption "the new login page"` (several images at once; PNG, JPEG, WebP or
+GIF up to 15 MB). The tower keeps a copy for 30 days and records it in its
+history (kind `screenshot`, with the session, its account, its job), so it
+appears in the orb's panel and on the phone. `tower screenshots --last 5`
+lists them. The brain asks sessions doing visual work to send one; the
+instruction block for sessions is in
+[docs/session-instructions.md](docs/session-instructions.md).
+
 ### The phone
 
 An Android app (in the works) can show the panel and be the tower's voice
@@ -178,6 +189,7 @@ tower say "hello"                    # speak anything
 tower agents                         # every agent on every machine, with its account (JSON when piped)
 tower accounts                       # the Claude accounts (from cca)
 tower phone pair                     # pair the Android app (tower phone enable first)
+tower screenshot shot.png --caption "…"  # show a visual result in the panel and on the phone
 tower start --name n --cwd d "task"  # a new Claude session on an account (--account), watched
 tower history [--jobs open|finished] [--session t3]   # what the tower has done (JSON when piped)
 tower job start|done|failed <t> "…"  # record a job (the brain does this)

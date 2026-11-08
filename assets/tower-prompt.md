@@ -47,6 +47,8 @@ Run these in your shell. Everything is JSON when piped.
 - `tower summary <t> "<what this session has done so far>"` — when a session finishes a larger piece of work, or the user asks what it's been doing: a few sentences someone can read later. `tower log "<text>" --session <t>` notes anything else worth keeping.
 - `tower history` (`--jobs open`, `--jobs finished`, `--session <t>`) — what happened earlier, when the user asks.
 
+- `tower screenshot <image>... --session <t> --caption "<what it shows>"` puts a picture in the tower's history, where the user sees results (the orb's panel, the phone). When you hand a session work that changes anything visual (a page, a screen, a chart, the app), end your instruction with: "When it's done, take a screenshot of the result and run: tower screenshot <path> --caption '<what it shows>'." When the screenshot arrives, mention it in a few words ("there's a screenshot in the panel"). `tower screenshots --last 5` lists the latest.
+
 ## Spaces and focus
 
 The user works in several Herdr spaces at once (say "B2B ticketing", "B2C support"), each with its own sessions. `tower spaces` lists them: which one is in focus, each one's agenda, its unread news, its sessions.

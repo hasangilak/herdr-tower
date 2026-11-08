@@ -91,6 +91,20 @@ pub fn run() -> Result<()> {
     {
         eprintln!("[phone] the phone API didn't start: {e:#}");
     }
+    load_screenshots(&shared);
+    {
+        let shared = shared.clone();
+        thread::Builder::new().name("screenshots".into()).spawn(move || {
+            loop {
+                let n = crate::screenshots::prune(&crate::screenshots::dir(), crate::screenshots::KEEP);
+                if n > 0 {
+                    eprintln!("[tower] removed {n} screenshot(s) older than 30 days");
+                    load_screenshots(&shared);
+                }
+                thread::sleep(Duration::from_secs(6 * 3600));
+            }
+        })?;
+    }
     let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan };
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
@@ -162,6 +176,7 @@ impl Daemon {
             }
             Request::Watch { terminal, note, account } => self.watches.add(&terminal, &note, account),
             Request::Status => {}
+            Request::Screenshots => load_screenshots(&self.shared),
             Request::Phone { action, arg } => {
                 let info = match action.as_str() {
                     "on" => {
@@ -199,6 +214,14 @@ impl Daemon {
         }
         Response { ok: true, error: None, state: Some(self.shared.json()) }
     }
+}
+
+/// The state's list of recent screenshots, from the history.
+fn load_screenshots(shared: &Shared) {
+    let entries = crate::history::load();
+    let list: Vec<serde_json::Value> =
+        crate::screenshots::recent(&entries, crate::screenshots::RECENT).into_iter().map(crate::screenshots::row).collect();
+    shared.update(|s| s.screenshots = list);
 }
 
 fn ack_delay(cfg: &Config) -> Option<Duration> {

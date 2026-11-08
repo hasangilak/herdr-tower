@@ -64,6 +64,9 @@ pub struct State {
     pub lan: String,
     /// The paired phone that is the tower's voice now (the Mac is silent), or null.
     pub phone: Option<String>,
+    /// The latest screenshots sessions sent (`tower screenshot`), newest
+    /// first, at most 30: `{id, at, session, name, space, account, job, caption, path, url}`.
+    pub screenshots: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -107,6 +110,7 @@ impl State {
             stt_model: stt_model.into(),
             lan: String::new(),
             phone: None,
+            screenshots: vec![],
         }
     }
 

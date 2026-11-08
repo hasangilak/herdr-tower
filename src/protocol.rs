@@ -53,6 +53,8 @@ pub enum Request {
         #[serde(default)]
         arg: String,
     },
+    /// A screenshot was added (`tower screenshot`): the state's list is re-read.
+    Screenshots,
     Status,
     Quit,
 }

@@ -51,6 +51,15 @@ pub struct Entry {
     /// News from a space that wasn't in focus, kept instead of spoken (see `spaces`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub held: bool,
+    /// `screenshot`: its id (the stored file's name), for `GET /v1/screenshots/<id>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// `screenshot`: what it shows, in the session's words.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    /// `screenshot`: the tower's own copy (absolute, under attachments/screenshots).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 pub fn path() -> PathBuf {
@@ -81,7 +90,7 @@ pub fn append(mut e: Entry) {
 }
 
 /// An entry about a session, with its name and space filled in from Herdr.
-fn about(kind: &str, session: &str, text: &str) -> Entry {
+pub fn about(kind: &str, session: &str, text: &str) -> Entry {
     let mut e = Entry { kind: kind.into(), session: Some(session.into()), text: text.into(), ..Default::default() };
     if let Some(t) = hc::get(session) {
         e.name = t["name"].as_str().filter(|n| !n.is_empty()).map(String::from).or_else(|| Some(hc::spoken_name(&t)));

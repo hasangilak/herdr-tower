@@ -20,6 +20,7 @@ mod install;
 mod orb;
 mod phone;
 mod protocol;
+mod screenshots;
 mod selftest;
 mod spaces;
 mod text;
@@ -118,6 +119,25 @@ enum Cmd {
         /// pair: print the pairing details as JSON (for the orb).
         #[arg(long)]
         json: bool,
+    },
+    /// Show a visual result in the tower (the panel, the phone): `tower screenshot shot.png --caption "the new login page"`.
+    Screenshot {
+        /// One or more images (PNG, JPEG, WebP, GIF; 15 MB each at most).
+        #[arg(required = true)]
+        images: Vec<PathBuf>,
+        /// The session it's from (default: the terminal this runs in).
+        #[arg(long)]
+        session: Option<String>,
+        /// What it shows.
+        #[arg(long)]
+        caption: Option<String>,
+    },
+    /// The latest screenshots sessions sent (JSON when piped).
+    Screenshots {
+        #[arg(long, default_value_t = 10)]
+        last: usize,
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Speak text.
     Say {
@@ -299,6 +319,8 @@ fn run(cli: Cli) -> Result<()> {
             start(account.as_deref(), &name, cwd, on.as_deref(), space.as_deref(), no_watch, &task.join(" "))
         }
         Cmd::Accounts { on } => list_accounts(on.as_deref()),
+        Cmd::Screenshot { images, session, caption } => screenshots::cmd(&images, session, caption),
+        Cmd::Screenshots { last, session } => screenshots::cmd_list(last, session.as_deref()),
         Cmd::Phone { action, id, json } => phone::cmd(&action, id.as_deref(), json),
         Cmd::Say { text, interrupt, alert } => {
             ok(Request::Say { text: text.join(" "), interrupt, kind: if alert { "alert".into() } else { String::new() } })

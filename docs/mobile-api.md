@@ -133,11 +133,14 @@ holds.
 | `GET /v1/jobs?status=open\|finished\|all&session=t3&limit=50` | `{"jobs":[{"job","session","name","space","account","status","asked","summary","started_ms","updated_ms"}]}`, newest first. `status`: `working`, `blocked`, `done`, `failed`, `error`, `exited`. |
 | `GET /v1/history?limit=100&session=t3&kind=summary,answer&before_ms=…` | `{"entries":[…]}`, oldest first, the latest `limit`. Page back with `before_ms` = the first entry's `at`. Summaries are `kind=summary`. |
 | `GET /v1/accounts` | `{"default": name, "accounts":[{"name","email"}]}`, the default first (from the claude-accounts mod; names are not fixed: colour by name). |
+| `GET /v1/screenshots?limit=30&session=t3` | `{"screenshots":[{"id","at","session","name","space","account","job","caption","path","url"}]}`, newest first (still on disk: kept 30 days). |
+| `GET /v1/screenshots/{id}` | The image itself (`image/png`, `image/jpeg`, `image/webp` or `image/gif`). `400 bad_id`, `404 no_screenshot`. |
 | `GET /v1/sessions/{address}/screen?lines=60` | `{"address","screen"}`: what that terminal shows (to see what a blocked agent asks). Up to 400 lines. |
 
 A history entry: `{"at", "kind", "session"?, "name"?, "space"?, "job"?,
 "account"?, "status"?, "text", "attachments"?, "held"?}`. `kind`: `request`
-(the user), `answer` (the tower), `watch`, `alert`, `job`, `summary`, `note`.
+(the user), `answer` (the tower), `watch`, `alert`, `job`, `summary`, `note`,
+`screenshot` (with `id`, `caption`, `path`; fetch it from `/v1/screenshots/{id}`).
 Keys are left out when empty.
 
 The state (`GET /v1/state`, event `state`):
@@ -154,7 +157,8 @@ The state (`GET /v1/state`, event `state`):
   "alerts": [{"at_ms": 0, "terminal": "t22", "text": "Claude in eyzflow is done", "level": "done"}],
   "agents": [{"address": "t22", "name": "Claude in eyzflow", "status": "working", "app": "claude-code", "account": "default"}],
   "error": "", "talk_key": "ctrl", "voice": "af_bella", "stt_model": "…",
-  "lan": "https://192.168.1.20:7843", "phone": "Pixel 9"
+  "lan": "https://192.168.1.20:7843", "phone": "Pixel 9",
+  "screenshots": [{"id": "1794160000000-login.png", "at": 1794160000000, "session": "t22", "name": "Claude in eyzflow", "space": "B2C support", "account": "default", "job": null, "caption": "The new login page", "path": "/Users/…/attachments/screenshots/1794160000000-login.png", "url": "/v1/screenshots/1794160000000-login.png"}]
 }
 ```
 

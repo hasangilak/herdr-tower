@@ -333,6 +333,26 @@ impl Lan {
                     Err(e) => Response::error(503, "hc", &format!("{e:#}")),
                 }
             }
+            ("GET", ["screenshots"]) => {
+                let session = q("session");
+                let entries = crate::history::load();
+                let rows: Vec<Value> = crate::screenshots::recent(&entries, usize::MAX)
+                    .into_iter()
+                    .filter(|e| session.is_none_or(|s| e.session.as_deref() == Some(s)))
+                    .take(limit(30))
+                    .map(crate::screenshots::row)
+                    .collect();
+                Response::json(200, &json!({ "screenshots": rows }))
+            }
+            ("GET", ["screenshots", id]) => {
+                if !crate::screenshots::valid_id(id) {
+                    return Some(Response::error(400, "bad_id", "a screenshot id is its file name, from /v1/screenshots"));
+                }
+                match std::fs::read(crate::screenshots::dir().join(id)) {
+                    Ok(bytes) => Response::bytes(crate::screenshots::content_type(id), bytes),
+                    Err(_) => Response::error(404, "no_screenshot", "no such screenshot (they are kept for 30 days)"),
+                }
+            }
             ("GET", ["audio", id]) => match self.ctx.hub.clip(id) {
                 Some(wav) => Response::bytes("audio/wav", wav),
                 None => Response::error(404, "no_clip", "that clip is gone (they are kept for 15 minutes)"),
@@ -698,6 +718,12 @@ mod tests {
         assert_eq!((st, v["mode"].as_str()), (200, Some("ptt")));
         assert_eq!(call(addr, &fp, "GET", "/v1/nope", Some(&token), "").unwrap().0, 404);
         assert_eq!(call(addr, &fp, "POST", "/v1/voice", Some(&token), "not audio").unwrap().0, 415);
+        // Screenshots: by id, never by path; the token is needed as everywhere.
+        assert_eq!(call(addr, &fp, "GET", "/v1/screenshots/..%2F..%2Fdevices.json", Some(&token), "").unwrap().0, 400);
+        assert_eq!(call(addr, &fp, "GET", "/v1/screenshots/0-no-such-shot.png", Some(&token), "").unwrap().0, 404);
+        assert_eq!(call(addr, &fp, "GET", "/v1/screenshots", None, "").unwrap().0, 401);
+        let (st, v) = call(addr, &fp, "GET", "/v1/screenshots?limit=2", Some(&token), "").unwrap();
+        assert!(st == 200 && v["screenshots"].is_array(), "{st} {v}");
 
         // A phone that pins another certificate never talks to this tower.
         assert!(call(addr, &"0".repeat(64), "GET", "/v1/hello", Some(&token), "").is_err());
