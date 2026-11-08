@@ -142,6 +142,12 @@ pub struct Panel {
     placeholder: &'static str,
     /// The input the voice writes in this take: the message, or a question's "Other".
     voice_field: Option<Entity<TextareaState>>,
+    /// A press-to-talk take is on (from the key going down to its text being
+    /// sent, kept or dropped).
+    take_open: bool,
+    /// Enter was pressed during a take with a draft: the message goes once
+    /// the take's text is in it.
+    send_after_take: bool,
     /// Screenshots in history, newest first (the state's recent list joins them when shown).
     shots: Vec<Shot>,
     thumbs: HashMap<PathBuf, Thumb>,
@@ -295,6 +301,8 @@ impl Panel {
             behaviors: Default::default(),
             placeholder: "Message the tower…",
             voice_field: None,
+            take_open: false,
+            send_after_take: false,
             shots: vec![],
             thumbs: HashMap::new(),
             dims: HashMap::new(),
@@ -334,15 +342,20 @@ impl Panel {
     /// daemon sends it, and it stays a moment and goes; after a draft (typed
     /// text, an image), it is added to the draft, which Enter sends whole.
     fn follow_voice(&mut self, tower: &Entity<Tower>, window: &mut Window, cx: &mut Context<Self>) {
-        let (hearing, heard, held, held_ms) = {
+        let (hearing, heard, held, held_ms, recording, transcribing) = {
             let t = tower.read(cx);
+            let recording = t.s("mic").as_str() == Some("recording");
+            let transcribing = t.s("transcribing").as_bool().unwrap_or(false);
             let heard = t.s("heard").as_str().unwrap_or("").to_string();
             // Only a request sent since the voice began writing here counts.
             let fresh = t.s("heard_ms").as_u64().unwrap_or(0) >= self.voice_since;
             let held_ms = t.s("dictated_ms").as_u64().unwrap_or(0);
             let held = if held_ms > self.held_seen { t.s("dictated").as_str().unwrap_or("").to_string() } else { String::new() };
-            (t.s("hearing").as_str().unwrap_or("").to_string(), if fresh { heard } else { String::new() }, held, held_ms)
+            (t.s("hearing").as_str().unwrap_or("").to_string(), if fresh { heard } else { String::new() }, held, held_ms, recording, transcribing)
         };
+        if recording {
+            self.take_open = true;
+        }
         if self.forgot && !held.is_empty() {
             // The end of the take you typed over.
             self.held_seen = held_ms;
@@ -356,9 +369,18 @@ impl Panel {
             _ => self.asks.other_focused(window, cx).unwrap_or_else(|| self.text.clone()),
         };
         self.voice_field = Some(field.clone());
-        let current = field.read(cx).value().to_string();
+        let mut current = field.read(cx).value().to_string();
+        // A new take while the last one's text still shows (it was sent):
+        // that text is gone, not a draft to add to.
+        if self.voice.is_none() && (!hearing.is_empty() || !held.is_empty()) && self.parting.as_deref() == Some(current.as_str()) {
+            field.update(cx, |s, cx| s.set_value("", window, cx));
+            self.parting = None;
+            current.clear();
+        }
         let base = self.base.text().to_string();
-        match voice_input(&hearing, &heard, &held, self.voice.as_deref(), &current, &base) {
+        let decision = voice_input(&hearing, &heard, &held, self.voice.as_deref(), &current, &base);
+        let ended = matches!(decision, VoiceInput::Held(_) | VoiceInput::Sent(_) | VoiceInput::Restore);
+        match decision {
             VoiceInput::Keep => {}
             VoiceInput::Forget => {
                 self.voice = None;
@@ -413,6 +435,15 @@ impl Panel {
         // Between takes there is no draft to keep apart: it's all in the input.
         if self.voice.is_none() {
             self.base = InputContent::new("");
+        }
+        // The take is over: its text was sent, kept or dropped (or nothing
+        // more is coming). A message waiting for it goes now.
+        let idle = !recording && !transcribing && hearing.is_empty() && self.voice.is_none();
+        if self.take_open && (ended || idle) {
+            self.take_open = false;
+            if std::mem::take(&mut self.send_after_take) {
+                self.send(window, cx);
+            }
         }
     }
 
@@ -584,6 +615,29 @@ impl Panel {
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.sending || !self.has_message(cx) {
             return;
+        }
+        let value = self.text.read(cx).value().to_string();
+        let into_message = self.voice_field.as_ref().is_none_or(|f| f == &self.text);
+        match on_enter(
+            self.parting.as_deref() == Some(value.as_str()),
+            self.take_open,
+            self.voice.is_some(),
+            self.base.text().trim().is_empty() && into_message,
+        ) {
+            Enter::Send => {}
+            Enter::Clear => {
+                self.parting = None;
+                self.text.update(cx, |s, cx| s.set_value("", window, cx));
+                cx.notify();
+                return;
+            }
+            Enter::Ignore => return,
+            Enter::AfterTake => {
+                self.send_after_take = true;
+                self.status = Some((true, "Sending when you finish talking…".into()));
+                cx.notify();
+                return;
+            }
         }
         if !self.tower.read(cx).alive {
             self.status = Some((false, "The tower is off. Start it, then send.".into()));
@@ -1864,6 +1918,31 @@ fn message_parts(content: &InputContent) -> (String, Vec<PathBuf>) {
     (content.text().trim().to_string(), files)
 }
 
+/// What Enter does.
+#[derive(Debug, PartialEq)]
+enum Enter {
+    Send,
+    /// The input shows what the voice just sent: it went already.
+    Clear,
+    /// A take into an empty input: the voice sends it itself.
+    Ignore,
+    /// A take after a draft: both go together once its text is in.
+    AfterTake,
+}
+
+/// `parting`: the input holds what the voice just sent; `take_open`: a
+/// press-to-talk take is on (or its text is still coming); `showing`: its
+/// words are in the input; `voice_sends`: it began on an empty message.
+fn on_enter(parting: bool, take_open: bool, showing: bool, voice_sends: bool) -> Enter {
+    if parting {
+        return Enter::Clear;
+    }
+    if !(take_open || showing) {
+        return Enter::Send;
+    }
+    if showing && voice_sends { Enter::Ignore } else { Enter::AfterTake }
+}
+
 /// What the input should do about the voice.
 #[derive(Debug, PartialEq)]
 enum VoiceInput {
@@ -1974,6 +2053,20 @@ mod voice_tests {
         assert_eq!(voice_input("", "run the tests", "", Some("run the tests"), "run the tests!", ""), Forget);
         // Nothing to do without a take.
         assert_eq!(voice_input("", "old", "", None, "", ""), Keep);
+    }
+
+    #[test]
+    fn enter_never_sends_a_voice_message_twice_or_half() {
+        use Enter::*;
+        // Nothing to do with the voice: it sends.
+        assert_eq!(on_enter(false, false, false, false), Send);
+        // The voice's message still shows after it went: Enter only clears.
+        assert_eq!(on_enter(true, false, false, true), Clear);
+        // Talking into an empty input: the voice sends it, not Enter.
+        assert_eq!(on_enter(false, true, true, true), Ignore);
+        // Talking after a draft (or before the words show): it waits for them.
+        assert_eq!(on_enter(false, true, true, false), AfterTake);
+        assert_eq!(on_enter(false, true, false, true), AfterTake);
     }
 
     #[test]
