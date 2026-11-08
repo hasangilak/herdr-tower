@@ -94,6 +94,18 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
                         mouth.hush();
                         continue;
                     }
+                    // The panel holds a draft (an image, typed text): this
+                    // goes into it, and Enter sends them together.
+                    if crate::draft::held() {
+                        eprintln!("[stt] into the panel's draft");
+                        shared.update(|s| {
+                            s.hearing.clear();
+                            s.dictated = heard.trim().to_string();
+                            s.dictated_ms = now_ms();
+                        });
+                        mouth.nothing_asked();
+                        continue;
+                    }
                     let _ = deliver(&shared, &mouth, heard.trim(), settings.ack);
                 }
                 Source::Phone(reply) => {

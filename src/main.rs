@@ -12,6 +12,7 @@ mod activity;
 mod brain;
 mod config;
 mod daemon;
+mod draft;
 mod hc;
 mod history;
 mod hooks;

@@ -25,7 +25,7 @@ use gpui::{
     ObjectFit, PathPromptOptions, Render, ScrollHandle, SharedString, StyledImage as _, Subscription, Task, Window, div, img,
     prelude::*, px, rgb, rgba,
 };
-use gpui_kit::component::input::{InlineToken, InputEvent, RopeExt as _, Textarea, TextareaState};
+use gpui_kit::component::input::{InlineToken, InputContent, InputEvent, RopeExt as _, Textarea, TextareaState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Icon, IconName, Sizable as _, Theme, ThemeMode, h_flex, v_flex};
 
@@ -121,11 +121,23 @@ pub struct Panel {
     filter: Filter,
     scope: Scope,
     listening_since: Option<Instant>,
-    /// What the voice put in the input (its partial or final transcript), so
-    /// it can be replaced or cleared, and a draft you typed never is.
+    /// What the voice put in the input (your draft, then its partial or
+    /// final transcript), so it can be replaced or cleared, and what you
+    /// typed over it never is.
     voice: Option<String>,
     /// When the voice first wrote in it, this take (Unix ms).
     voice_since: u64,
+    /// The draft the take began on (typed text, attachment tokens): what you
+    /// say goes after it, and it stays.
+    base: InputContent,
+    /// The last take dictated into a draft that the input took in (`dictated_ms`).
+    held_seen: u64,
+    /// You typed over this take: its final text isn't added.
+    forgot: bool,
+    /// The text a take sent, shown a moment before it goes (not a draft).
+    parting: Option<String>,
+    /// The daemon was told the input holds a draft (see `draft`).
+    holding: bool,
     /// The brain's current turn (when it began), to scroll its working line into view.
     turn: u64,
     /// The space opened in the Spaces view, and how far it had been read before.
@@ -228,6 +240,7 @@ impl Panel {
             }
         });
         text.update(cx, |s, cx| s.focus(window, cx));
+        let held_seen = tower.read(cx).s("dictated_ms").as_u64().unwrap_or(0);
         Self {
             tower,
             view: View::Chat,
@@ -245,6 +258,12 @@ impl Panel {
             listening_since: None,
             voice: None,
             voice_since: 0,
+            base: InputContent::new(""),
+            // A take dictated before the panel opened isn't this draft's.
+            held_seen,
+            forgot: false,
+            parting: None,
+            holding: false,
             turn: 0,
             open_space: None,
             prev_read: 0,
@@ -256,32 +275,63 @@ impl Panel {
     }
 
     /// Mirrors what you say into the input as you talk: the daemon's
-    /// `hearing` (partials, then the final text). Once it's sent (the daemon
-    /// sends it), the final text stays a moment and goes.
+    /// `hearing` (partials, then the final text). Into an empty input, the
+    /// daemon sends it, and it stays a moment and goes; after a draft (typed
+    /// text, an image), it is added to the draft, which Enter sends whole.
     fn follow_voice(&mut self, tower: &Entity<Tower>, window: &mut Window, cx: &mut Context<Self>) {
-        let (hearing, heard) = {
+        let (hearing, heard, held, held_ms) = {
             let t = tower.read(cx);
             let heard = t.s("heard").as_str().unwrap_or("").to_string();
             // Only a request sent since the voice began writing here counts.
             let fresh = t.s("heard_ms").as_u64().unwrap_or(0) >= self.voice_since;
-            (t.s("hearing").as_str().unwrap_or("").to_string(), if fresh { heard } else { String::new() })
+            let held_ms = t.s("dictated_ms").as_u64().unwrap_or(0);
+            let held = if held_ms > self.held_seen { t.s("dictated").as_str().unwrap_or("").to_string() } else { String::new() };
+            (t.s("hearing").as_str().unwrap_or("").to_string(), if fresh { heard } else { String::new() }, held, held_ms)
         };
+        if self.forgot && !held.is_empty() {
+            // The end of the take you typed over.
+            self.held_seen = held_ms;
+            self.forgot = false;
+            return;
+        }
         let current = self.text.read(cx).value().to_string();
-        match voice_input(&hearing, &heard, self.voice.as_deref(), &current) {
+        let base = self.base.text().to_string();
+        match voice_input(&hearing, &heard, &held, self.voice.as_deref(), &current, &base) {
             VoiceInput::Keep => {}
-            VoiceInput::Forget => self.voice = None,
+            VoiceInput::Forget => {
+                self.voice = None;
+                self.forgot = true;
+            }
             VoiceInput::Show(text) => {
                 if self.voice.is_none() {
                     self.voice_since = history::now_ms();
+                    self.base = self.text.read(cx).content();
+                    self.forgot = false;
+                    self.parting = None;
                 }
                 self.put_voice(&text, &current, window, cx);
                 self.voice = Some(text);
+            }
+            VoiceInput::Held(text) => {
+                if self.voice.is_none() {
+                    self.base = self.text.read(cx).content();
+                }
+                self.held_seen = held_ms;
+                self.put_voice(&text, &current, window, cx);
+                self.voice = None;
+            }
+            VoiceInput::Restore => {
+                let base = std::mem::replace(&mut self.base, InputContent::new(""));
+                let at = base.text().len();
+                self.voice = None;
+                self.set_content(base, at, window, cx);
             }
             VoiceInput::Sent(text) => {
                 if current != text {
                     self.put_voice(&text, &current, window, cx);
                 }
                 self.voice = None;
+                self.parting = Some(text.clone());
                 cx.spawn_in(window, async move |this, cx| {
                     cx.background_executor().timer(Duration::from_millis(1200)).await;
                     let _ = this.update_in(cx, |this, window, cx| {
@@ -289,23 +339,34 @@ impl Panel {
                         if this.voice.is_none() && this.text.read(cx).value().as_ref() == text.as_str() {
                             this.text.update(cx, |s, cx| s.set_value("", window, cx));
                         }
+                        if this.parting.as_deref() == Some(text.as_str()) {
+                            this.parting = None;
+                        }
+                        cx.notify();
                     });
                 })
                 .detach();
             }
         }
+        // Between takes there is no draft to keep apart: it's all in the input.
+        if self.voice.is_none() {
+            self.base = InputContent::new("");
+        }
     }
 
-    /// Writes the voice's text in the input, the caret following its end (and
-    /// the input scrolling with it), unless you put the caret somewhere else
-    /// or the input isn't focused: then it isn't taken.
+    /// Writes the voice's text in the input, with the draft's tokens (the
+    /// text begins with the draft), the caret following its end.
     fn put_voice(&mut self, text: &str, current: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let at = caret_after(self.text.read(cx).cursor(), current.len(), text);
+        let content = voice_content(&self.base, text);
+        self.set_content(content, at, window, cx);
+    }
+
+    /// Sets the input and puts the caret at `at` (and the input scrolling
+    /// with it), unless the input isn't focused: then it isn't taken.
+    fn set_content(&mut self, content: InputContent, at: usize, window: &mut Window, cx: &mut Context<Self>) {
         let focused = gpui::Focusable::focus_handle(self.text.read(cx), cx).is_focused(window);
-        let at = self.text.update(cx, |s, cx| {
-            let at = caret_after(s.cursor(), current.len(), text);
-            s.set_value(text.to_string(), window, cx);
-            at
-        });
+        self.text.update(cx, |s, cx| s.set_value(content, window, cx));
         if !focused {
             return;
         }
@@ -325,6 +386,19 @@ impl Panel {
         window.on_next_frame(move |window, _| {
             window.on_next_frame(move |window, cx| place(&state, at, window, cx));
         });
+    }
+
+    /// Tells the daemon whether the input holds a draft of yours, so a take
+    /// goes into it rather than to the brain alone.
+    fn sync_hold(&mut self, cx: &App) {
+        let value = self.text.read(cx).value();
+        let own_voice = self.voice.is_some() && self.base.text().trim().is_empty();
+        let parting = self.parting.as_deref() == Some(value.as_ref());
+        let draft = !value.trim().is_empty() && !own_voice && !parting;
+        if draft != self.holding {
+            self.holding = draft;
+            crate::draft::hold(draft);
+        }
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
@@ -415,15 +489,7 @@ impl Panel {
             cx.notify();
             return;
         }
-        let content = self.text.read(cx).content();
-        let text = content.text().trim().to_string();
-        let mut files: Vec<PathBuf> = vec![];
-        for span in content.tokens() {
-            let p = PathBuf::from(span.token().id().as_ref());
-            if !files.contains(&p) {
-                files.push(p);
-            }
-        }
+        let (text, files) = message_parts(&self.text.read(cx).content());
         self.sending = true;
         self.status = None;
         cx.notify();
@@ -463,8 +529,18 @@ impl Panel {
     }
 }
 
+impl Drop for Panel {
+    fn drop(&mut self) {
+        // Closed with a draft in it: the voice sends again.
+        if self.holding {
+            crate::draft::hold(false);
+        }
+    }
+}
+
 impl Render for Panel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_hold(cx);
         let g = glass();
         let body = match self.view {
             View::Chat => self.chat_view(cx),
@@ -1551,40 +1627,77 @@ fn default_account() -> Option<String> {
     crate::accounts::list().ok()?.into_iter().next().map(|a| a.name)
 }
 
+/// The message's text and the files behind its tokens, in order.
+fn message_parts(content: &InputContent) -> (String, Vec<PathBuf>) {
+    let mut files: Vec<PathBuf> = vec![];
+    for span in content.tokens() {
+        let p = PathBuf::from(span.token().id().as_ref());
+        if !files.contains(&p) {
+            files.push(p);
+        }
+    }
+    (content.text().trim().to_string(), files)
+}
+
 /// What the input should do about the voice.
 #[derive(Debug, PartialEq)]
 enum VoiceInput {
     Keep,
     /// You typed over it: leave the input alone from now on.
     Forget,
-    /// Show this (what you are saying so far).
+    /// Show this (your draft, then what you are saying so far).
     Show(String),
+    /// The take went into your draft as this: keep it, for Enter to send.
+    Held(String),
+    /// The take came to nothing: put your draft back as it was.
+    Restore,
     /// The take is done and sent as this: show it a moment, then clear.
     Sent(String),
 }
 
 /// `hearing`: the take so far (empty when none runs); `heard`: the request
-/// sent since the voice began writing (empty if none); `shown`: what the voice put in the input; `current`: what
-/// the input holds.
-fn voice_input(hearing: &str, heard: &str, shown: Option<&str>, current: &str) -> VoiceInput {
-    let ours = match shown {
-        Some(s) => current == s,
-        None => current.trim().is_empty(),
-    };
+/// sent since the voice began writing (empty if none); `held`: a take the
+/// daemon kept for the draft, not yet taken in (empty if none); `shown`: what
+/// the voice put in the input; `current`: what the input holds; `base`: the
+/// draft the take began on.
+fn voice_input(hearing: &str, heard: &str, held: &str, shown: Option<&str>, current: &str, base: &str) -> VoiceInput {
     if !hearing.is_empty() {
-        if !ours {
-            return if shown.is_some() { VoiceInput::Forget } else { VoiceInput::Keep };
-        }
-        return if current == hearing { VoiceInput::Keep } else { VoiceInput::Show(hearing.to_string()) };
+        return match shown {
+            // A take begins: after whatever the input holds.
+            None => VoiceInput::Show(joined(current, hearing)),
+            Some(s) if current != s => VoiceInput::Forget,
+            Some(_) => {
+                let want = joined(base, hearing);
+                if current == want { VoiceInput::Keep } else { VoiceInput::Show(want) }
+            }
+        };
     }
     match shown {
+        // A short take, over before a partial came.
+        None if !held.is_empty() => VoiceInput::Held(joined(current, held)),
         None => VoiceInput::Keep,
-        Some(_) if !ours => VoiceInput::Forget,
+        Some(s) if current != s => VoiceInput::Forget,
+        Some(_) if !held.is_empty() => VoiceInput::Held(joined(base, held)),
         // Sent: the daemon cleared `hearing` as it set `heard`.
-        Some(_) if !heard.is_empty() => VoiceInput::Sent(heard.to_string()),
-        // Dropped (nothing heard, a hush, cancelled): clear it.
-        Some(_) => VoiceInput::Sent(String::new()),
+        Some(_) if !heard.is_empty() && base.trim().is_empty() => VoiceInput::Sent(heard.to_string()),
+        // Dropped (nothing heard, a hush, cancelled), or sent without the
+        // draft: the draft is still yours.
+        Some(_) => VoiceInput::Restore,
     }
+}
+
+/// What you said after the draft: `draft said`.
+fn joined(draft: &str, said: &str) -> String {
+    let draft = draft.trim_end();
+    if draft.is_empty() { said.to_string() } else { format!("{draft} {said}") }
+}
+
+/// `text` (which begins with the draft) with the draft's attachment tokens.
+fn voice_content(base: &InputContent, text: &str) -> InputContent {
+    base.tokens().iter().fold(InputContent::new(text.to_string()), |c, span| {
+        let kept = c.clone();
+        c.with_token(span.range(), span.token().clone()).unwrap_or(kept)
+    })
 }
 
 /// Where the caret goes when the voice rewrites the input: at the end of the
@@ -1621,21 +1734,55 @@ mod voice_tests {
     fn what_you_say_shows_as_you_say_it() {
         use VoiceInput::*;
         // Partials replace each other in an empty input...
-        assert_eq!(voice_input("run the", "", None, ""), Show("run the".into()));
-        assert_eq!(voice_input("run the tests", "", Some("run the"), "run the"), Show("run the tests".into()));
-        assert_eq!(voice_input("run the tests", "", Some("run the tests"), "run the tests"), Keep);
+        assert_eq!(voice_input("run the", "", "", None, "", ""), Show("run the".into()));
+        assert_eq!(voice_input("run the tests", "", "", Some("run the"), "run the", ""), Show("run the tests".into()));
+        assert_eq!(voice_input("run the tests", "", "", Some("run the tests"), "run the tests", ""), Keep);
         // ...the final text arrives the same way, and once sent stays a moment.
-        assert_eq!(voice_input("", "run the tests in eyzflow", Some("run the tests in eyzflow"), "run the tests in eyzflow"), Sent("run the tests in eyzflow".into()));
+        let t = "run the tests in eyzflow";
+        assert_eq!(voice_input("", t, "", Some(t), t, ""), Sent(t.into()));
         // A take that came to nothing goes.
-        assert_eq!(voice_input("", "", Some("um"), "um"), Sent(String::new()));
+        assert_eq!(voice_input("", "", "", Some("um"), "um", ""), Restore);
         // The last partial differs from what was sent: the sent text wins.
-        assert_eq!(voice_input("", "run the tests", Some("run the test"), "run the test"), Sent("run the tests".into()));
-        // A draft you typed is never overwritten.
-        assert_eq!(voice_input("run the", "", None, "my draft"), Keep);
-        assert_eq!(voice_input("run the tests", "", Some("run the"), "run the, and"), Forget);
-        assert_eq!(voice_input("", "run the tests", Some("run the tests"), "run the tests!"), Forget);
+        assert_eq!(voice_input("", "run the tests", "", Some("run the test"), "run the test", ""), Sent("run the tests".into()));
+        // What you type over it is never overwritten.
+        assert_eq!(voice_input("run the tests", "", "", Some("run the"), "run the, and", ""), Forget);
+        assert_eq!(voice_input("", "run the tests", "", Some("run the tests"), "run the tests!", ""), Forget);
         // Nothing to do without a take.
-        assert_eq!(voice_input("", "old", None, ""), Keep);
+        assert_eq!(voice_input("", "old", "", None, "", ""), Keep);
+    }
+
+    #[test]
+    fn what_you_say_goes_after_your_draft() {
+        use VoiceInput::*;
+        // An image dropped in, then Control: the words follow the token...
+        let img = "[Image #1] ";
+        assert_eq!(voice_input("what is", "", "", None, img, ""), Show("[Image #1] what is".into()));
+        let shown = "[Image #1] what is";
+        assert_eq!(voice_input("what is this", "", "", Some(shown), shown, img), Show("[Image #1] what is this".into()));
+        // ...the daemon keeps the take for the draft, which stays for Enter.
+        let shown = "[Image #1] what is this";
+        assert_eq!(voice_input("", "", "what is this?", Some(shown), shown, img), Held("[Image #1] what is this?".into()));
+        // A take too short for a partial lands the same way.
+        assert_eq!(voice_input("", "", "look", None, "my draft", ""), Held("my draft look".into()));
+        // Nothing said: the draft is put back, the image with it.
+        assert_eq!(voice_input("", "", "", Some("[Image #1] um"), "[Image #1] um", img), Restore);
+        // Sent without the draft (an older daemon): the draft isn't cleared.
+        assert_eq!(voice_input("", "what is this", "", Some(shown), shown, img), Restore);
+    }
+
+    #[test]
+    fn the_draft_keeps_its_attachments() {
+        let base = InputContent::new("[Image #1] ").with_token(0..10, InlineToken::new("/tmp/a.png", "[Image #1]")).unwrap();
+        let c = voice_content(&base, "[Image #1] what is this");
+        assert_eq!(c.text().as_ref(), "[Image #1] what is this");
+        assert_eq!(c.tokens().len(), 1);
+        assert_eq!(c.tokens()[0].range(), 0..10);
+        // And Enter sends them together, as the tower prompt reads them.
+        let (text, files) = message_parts(&c);
+        assert_eq!(files, vec![PathBuf::from("/tmp/a.png")]);
+        assert_eq!(history::compose(&text, &["/tmp/a.png".into()]), "[Image #1] what is this [attached: /tmp/a.png]");
+        // No draft: plain text.
+        assert!(voice_content(&InputContent::new(""), "hello").tokens().is_empty());
     }
 }
 

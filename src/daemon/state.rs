@@ -44,6 +44,10 @@ pub struct State {
     /// What the tower last heard you say.
     pub heard: String,
     pub heard_ms: u64,
+    /// A take dictated into the panel's draft (see `draft`): its final text,
+    /// for the panel to keep in the input, not sent.
+    pub dictated: String,
+    pub dictated_ms: u64,
     /// What it is saying, or last said.
     pub said: String,
     pub said_ms: u64,
@@ -91,6 +95,8 @@ impl State {
             hearing: String::new(),
             heard: String::new(),
             heard_ms: 0,
+            dictated: String::new(),
+            dictated_ms: 0,
             said: String::new(),
             said_ms: 0,
             alerts: vec![],
