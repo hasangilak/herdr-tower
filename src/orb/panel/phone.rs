@@ -260,7 +260,8 @@ impl Panel {
         let g = glass();
         let section = |t: &str| div().pt_2().text_xs().font_weight(FontWeight::MEDIUM).text_color(g.faint).child(t.to_uppercase());
         // Settings: how questions are handled, then the phone app.
-        let mut items: Vec<AnyElement> = self.policy_items(cx);
+        let mut items: Vec<AnyElement> = vec![self.behaviors_entry(cx)];
+        items.extend(self.policy_items(cx));
         let busy = self.phone.busy;
         let Some(st) = self.phone.status.clone() else {
             items.push(div().pt_4().text_sm().text_color(g.muted).child("Looking…").into_any_element());

@@ -79,6 +79,8 @@ enum View {
     Activity,
     Spaces,
     Phone,
+    /// The tower's behaviors (from Settings, or a chat card).
+    Behaviors,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -113,6 +115,7 @@ enum Scope {
 }
 
 mod phone;
+mod behaviors;
 mod gallery;
 mod questions;
 mod viewer;
@@ -133,6 +136,10 @@ pub struct Panel {
     phone: phone::PhoneView,
     /// What sessions ask that the tower leaves to you.
     asks: questions::Asks,
+    /// The Behaviors screen.
+    behaviors: behaviors::BehaviorsUi,
+    /// The input's placeholder as set (it depends on the view and the voice).
+    placeholder: &'static str,
     /// The input the voice writes in this take: the message, or a question's "Other".
     voice_field: Option<Entity<TextareaState>>,
     /// Screenshots in history, newest first (the state's recent list joins them when shown).
@@ -221,9 +228,8 @@ impl Panel {
                 this.watch_sets(cx);
                 let listening = matches!(tower.read(cx).phase(), "listening" | "armed");
                 if listening != this.listening_since.is_some() {
+                    // (The placeholder follows in render.)
                     this.listening_since = listening.then(Instant::now);
-                    let hint = if listening { "Listening…" } else { "Message the tower…" };
-                    this.text.update(cx, |s, cx| s.set_placeholder(hint, window, cx));
                 }
                 cx.notify();
             }),
@@ -265,6 +271,9 @@ impl Panel {
                     if this.view == View::Phone {
                         this.phone_tick(cx);
                     }
+                    if this.view == View::Behaviors {
+                        this.behaviors_tick(cx);
+                    }
                     // The listening timer and running jobs' elapsed times tick.
                     let working = this.tower.read(cx).work.is_some();
                     if working || this.listening_since.is_some() || (this.view == View::Activity && this.jobs.iter().any(|j| j.open())) {
@@ -283,6 +292,8 @@ impl Panel {
             tower,
             phone: Default::default(),
             asks: Default::default(),
+            behaviors: Default::default(),
+            placeholder: "Message the tower…",
             voice_field: None,
             shots: vec![],
             thumbs: HashMap::new(),
@@ -637,9 +648,22 @@ impl Render for Panel {
             View::Activity => self.activity_view(cx),
             View::Spaces => self.spaces_view(cx),
             View::Phone => self.phone_view(cx),
+            View::Behaviors => self.behaviors_view(window, cx),
         };
+        // The input says where it goes: the chat, or a change to the behaviors.
+        let hint = if self.listening_since.is_some() {
+            "Listening…"
+        } else if self.view == View::Behaviors {
+            "Tell the tower what to change…"
+        } else {
+            "Message the tower…"
+        };
+        if hint != self.placeholder {
+            self.placeholder = hint;
+            self.text.update(cx, |s, cx| s.set_placeholder(hint, window, cx));
+        }
         // Pairing needs the room; there's nothing to send from there.
-        let input = if self.view == View::Phone { div().into_any_element() } else { self.input(window, cx) };
+        let input = if self.view == View::Phone || (self.view == View::Behaviors && self.behaviors.editing()) { div().into_any_element() } else { self.input(window, cx) };
         let header = self.header(cx);
         v_flex()
             .id("tower-panel")
@@ -709,9 +733,9 @@ impl Panel {
                                     .justify_center()
                                     .rounded_full()
                                     .cursor_pointer()
-                                    .when(view == View::Phone, |el| el.bg(rgb(PALE)))
-                                    .when(view != View::Phone, |el| el.hover(|s| s.bg(rgba(0xffffff1f))))
-                                    .text_color(if view == View::Phone { rgb(NAVY).into() } else { g.muted })
+                                    .when(matches!(view, View::Phone | View::Behaviors), |el| el.bg(rgb(PALE)))
+                                    .when(!matches!(view, View::Phone | View::Behaviors), |el| el.hover(|s| s.bg(rgba(0xffffff1f))))
+                                    .text_color(if matches!(view, View::Phone | View::Behaviors) { rgb(NAVY).into() } else { g.muted })
                                     .child(Icon::new(IconName::Settings).small())
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         if this.view == View::Phone {
@@ -824,6 +848,7 @@ impl Panel {
                     if !(e.kind == "answer" && e.text.trim().is_empty()) {
                         rows.push(match e.kind.as_str() {
                             "request" | "answer" => bubble(e, &g),
+                            "behavior" => self.behavior_chat_card(e, cx),
                             _ => event_line(e, &g),
                         });
                     }
@@ -1558,7 +1583,7 @@ fn segment(id: &'static str, text: String, selected: bool) -> gpui::Stateful<gpu
 fn chat_items(entries: &[Entry]) -> Vec<&Entry> {
     // News held from an unfocused space waits in Spaces, not here.
     let keep = |e: &&Entry| !e.held && match e.kind.as_str() {
-        "request" | "answer" | "watch" | "alert" | "summary" | "answered" => true,
+        "request" | "answer" | "watch" | "alert" | "summary" | "answered" | "behavior" => true,
         "screenshot" => e.path.is_some(),
         "job" => matches!(e.status.as_deref(), Some("done" | "failed" | "error" | "exited" | "blocked")) && !e.text.is_empty(),
         _ => false,

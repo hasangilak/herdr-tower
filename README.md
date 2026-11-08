@@ -180,6 +180,15 @@ on the phone, with `tower behavior …`, or just say it: "from now on, always
 Every change is logged and can be undone, and shows in the chat with what
 changed. Details: [docs/behaviors.md](docs/behaviors.md).
 
+In the panel: Settings (the gear) → **Behaviors**, or tap a behavior change
+in the chat. Each category is a section and each behavior a card: its name,
+its line, where it came from (built in, you, learned) and a switch. Tap one
+for the whole rule, with Edit (Preview shows what changes before Save), Turn
+off, Delete (asked twice) and Undo; **+ Add** writes a new one; the search
+finds any word; the fixed core is folded away at the end, with the recent
+changes. The input at the foot says "Tell the tower what to change…": type
+or hold Control and say it, and the tower does it and answers in a line.
+
 ### Screenshots
 
 Sessions show visual results in the tower: `tower screenshot shot.png
