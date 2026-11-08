@@ -108,12 +108,13 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
                     }
                     let _ = deliver(&shared, &mouth, heard.trim(), settings.ack);
                 }
-                Source::Phone(reply) => {
-                    if is_stop {
+                Source::Phone { reply, attachments } => {
+                    if is_stop && attachments.is_empty() {
                         mouth.hush();
                         continue;
                     }
-                    if deliver(&shared, &mouth, heard.trim(), settings.ack).is_ok() {
+                    let message = crate::history::compose(&crate::history::with_image_markers(heard.trim(), attachments.len()), &attachments);
+                    if deliver(&shared, &mouth, &message, settings.ack).is_ok() {
                         let _ = reply.send(heard.trim().to_string());
                     }
                 }

@@ -8,8 +8,8 @@ use anyhow::{Result, bail};
 use serde_json::Value;
 
 pub const MAX_HEAD: usize = 16 * 1024;
-/// Enough for a minute of 48 kHz stereo 16-bit WAV.
-pub const MAX_BODY: usize = 24 * 1024 * 1024;
+/// Six 15 MB images and a recording, with room for the framing.
+pub const MAX_BODY: usize = 100 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 pub struct Request {
@@ -126,6 +126,7 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+#[derive(Debug)]
 pub struct Response {
     pub status: u16,
     pub content_type: &'static str,

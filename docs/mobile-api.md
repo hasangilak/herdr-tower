@@ -170,12 +170,50 @@ may be added later: ignore them.
 
 | Call | Body | Does |
 |---|---|---|
-| `POST /v1/ask` | `{"text": "what's everyone doing?"}` | Sends it to the tower like typing in the panel (it arrives as `[voice] …`). `202 {"sent": text}`. The canned "Okay." is played (on the phone when it's the voice). |
+| `POST /v1/ask` | `{"text": "what's everyone doing?"}`, or multipart with images (below) | Sends it to the tower like typing in the panel (it arrives as `[voice] …`). `202 {"sent": text, "attachments": [paths]}`. The canned "Okay." is played (on the phone when it's the voice). |
 | `POST /v1/agents/{address}/answer` | `{"decision": "approve"\|"refuse", "note": "only the read"}` | Tells the tower, as the user would: "Approve what t22 is asking for. only the read". The tower reads the session's screen and answers it, as today. `202`. |
 | `POST /v1/focus` | `{"space": "B2C support"}` or `{"space": null}` | Focuses a space (its news is spoken, others held) or clears focus. `200 {"focus": name or null}`; `404 no_space`. |
 | `POST /v1/hush` | | Stops speaking now, and drops what's queued (the phone gets `hush`). |
 | `POST /v1/mode` | `{"mode": "ptt"\|"handsfree"\|"off"}` | The Mac microphone's mode. |
 | `DELETE /v1/device` | | Unpairs this phone (its token stops working). |
+
+### Images with an ask
+
+`POST /v1/ask` also takes `multipart/form-data` (OkHttp `MultipartBody`,
+`MultipartBody.FORM`): a `text` field and up to **6 image parts** (any part
+with a file name, or named `image`/`images`), each PNG, JPEG, WebP or GIF
+(checked by its bytes, not its name) and **15 MB** at most.
+
+```
+POST /v1/ask
+Content-Type: multipart/form-data; boundary=…
+
+--…  Content-Disposition: form-data; name="text"
+what's wrong on this page? [Image #1]
+--…  Content-Disposition: form-data; name="image"; filename="login.png"   Content-Type: image/png
+<bytes>
+--…  Content-Disposition: form-data; name="image"; filename="console.jpg"  Content-Type: image/jpeg
+<bytes>
+--…--
+```
+
+The Mac saves them as the panel saves its attachments
+(`~/.local/share/herder-tower/attachments/<ms>-phone/<n>-<name>.<ext>`;
+attachments are never pruned) and the tower gets exactly what the panel
+sends: `[voice] <text> [attached: <path 1> | <path 2>]`, where the text has
+an `[Image #N]` marker for the Nth image. Put the markers where the user put
+the images; any image the text doesn't mark gets its marker in front
+(`[Image #2] what's wrong on this page? [Image #1]`). Text may be empty when
+there are images.
+
+```json
+202 {"sent": "[Image #2] what's wrong on this page? [Image #1]", "attachments": ["/Users/…/attachments/1794165000000-phone/1-login.png", "…/2-console.jpg"]}
+413 {"error": {"code": "too_many_images" | "image_too_large", …}}
+415 {"error": {"code": "not_an_image", …}}
+400 {"error": {"code": "bad_multipart" | "empty", …}}
+```
+
+Bodies are 100 MB at most.
 
 ## Live updates: `GET /v1/events`
 
@@ -237,6 +275,12 @@ Content-Length: 160044
 415 {"error": {"code": "bad_audio", …}}
 400 {"error": {"code": "bad_length", …}}   // under 0.2 s or over 120 s
 ```
+
+**With images**: send `multipart/form-data` instead, the WAV as a part named
+`audio`, and up to 6 image parts as for `/v1/ask`. The transcript gets
+`[Image #N]` markers in front and the paths attached, as above;
+the answer adds `"attachments": [paths]`. (A stop word with images is sent,
+not taken as "stop".)
 
 The Mac resamples to 16 kHz, transcribes with the same Whisper model and
 vocabulary as the Mac's microphone, and hands the text to the tower as a

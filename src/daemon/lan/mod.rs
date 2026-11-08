@@ -10,6 +10,7 @@ pub mod audio;
 pub mod auth;
 pub mod http;
 pub mod hub;
+pub mod multipart;
 pub mod tls;
 
 use std::collections::HashMap;
@@ -362,12 +363,23 @@ impl Lan {
                 return None;
             }
             ("POST", ["ask"]) => {
-                let body = req.json().unwrap_or_default();
-                let text = body["text"].as_str().unwrap_or("").trim().to_string();
-                if text.is_empty() {
-                    return Some(Response::error(400, "empty", "send {\"text\": \"...\"}"));
+                let (text, images) = match ask_body(req) {
+                    Ok(x) => x,
+                    Err(r) => return Some(r),
+                };
+                if text.is_empty() && images.is_empty() {
+                    return Some(Response::error(400, "empty", "send {\"text\": \"...\"}, or multipart text and images"));
                 }
-                self.ask(&text)
+                let paths = match save_images(&images, &crate::history::attachments_dir(), now_ms()) {
+                    Ok(p) => p,
+                    Err(r) => return Some(r),
+                };
+                let text = crate::history::with_image_markers(&text, paths.len());
+                let mut resp = self.ask(&crate::history::compose(&text, &paths));
+                if resp.status == 202 {
+                    resp = Response::json(202, &json!({ "sent": text, "attachments": paths }));
+                }
+                resp
             }
             ("POST", ["agents", address, "answer"]) => {
                 if !valid_address(address) {
@@ -477,7 +489,25 @@ impl Lan {
     /// A recording from the phone: transcribed by the tower's Whisper, then
     /// handed to the brain like a press-to-talk take.
     fn voice(&self, req: &Request) -> Response {
-        let (samples, rate) = match audio::wav_decode(&req.body) {
+        // A WAV body, or multipart: the WAV as `audio`, images beside it.
+        let (wav, images): (Vec<u8>, Vec<multipart::Part>) = match req.header("content-type").and_then(multipart::boundary) {
+            Some(b) => match multipart::parse(&req.body, &b) {
+                Ok(parts) => {
+                    let (audio, rest): (Vec<_>, Vec<_>) = parts.into_iter().partition(|p| p.name == "audio");
+                    let Some(audio) = audio.into_iter().next() else {
+                        return Response::error(400, "no_audio", "a multipart voice request needs an `audio` part (the WAV)");
+                    };
+                    (audio.data, rest.into_iter().filter(is_image_part).collect())
+                }
+                Err(e) => return Response::error(400, "bad_multipart", &format!("{e:#}")),
+            },
+            None => (req.body.clone(), vec![]),
+        };
+        let attachments = match save_images(&images, &crate::history::attachments_dir(), now_ms()) {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+        let (samples, rate) = match audio::wav_decode(&wav) {
             Ok(x) => x,
             Err(e) => return Response::error(415, "bad_audio", &format!("{e:#}: send audio/wav, 16-bit PCM, mono, 16 kHz preferred")),
         };
@@ -487,11 +517,12 @@ impl Lan {
         }
         let samples = if rate == RATE { samples } else { super::mic::resample(&samples, rate, RATE) };
         let (tx, rx) = std::sync::mpsc::channel();
-        if self.ctx.stt.send(Utterance { samples, source: Source::Phone(tx) }).is_err() {
+        let n = attachments.len();
+        if self.ctx.stt.send(Utterance { samples, source: Source::Phone { reply: tx, attachments: attachments.clone() } }).is_err() {
             return Response::error(503, "stt", "the transcriber isn't running");
         }
         match rx.recv_timeout(Duration::from_secs(90)) {
-            Ok(heard) => Response::json(200, &json!({ "heard": heard, "sent": true })),
+            Ok(heard) => Response::json(200, &json!({ "heard": heard, "sent": true, "attachments": attachments, "images": n })),
             // Nothing worth sending (silence, noise, a stop word).
             Err(_) => Response::json(200, &json!({ "heard": "", "sent": false })),
         }
@@ -558,6 +589,65 @@ impl Lan {
             self.ctx.shared.update(|s| s.phone = None);
         }
     }
+}
+
+/// Most images one message carries.
+pub const MAX_IMAGES: usize = 6;
+
+/// A part that is a file (a field with a file name, or one named `image`).
+fn is_image_part(p: &multipart::Part) -> bool {
+    p.filename.is_some() || p.name.starts_with("image")
+}
+
+/// The text and images of `POST /v1/ask`: JSON `{"text"}`, or multipart with
+/// a `text` field and image parts.
+fn ask_body(req: &Request) -> Result<(String, Vec<multipart::Part>), Response> {
+    match req.header("content-type").and_then(multipart::boundary) {
+        Some(b) => {
+            let parts = multipart::parse(&req.body, &b).map_err(|e| Response::error(400, "bad_multipart", &format!("{e:#}")))?;
+            let text = parts.iter().find(|p| p.name == "text" && p.filename.is_none()).map(|p| String::from_utf8_lossy(&p.data).trim().to_string());
+            Ok((text.unwrap_or_default(), parts.into_iter().filter(|p| p.name != "text" && is_image_part(p)).collect()))
+        }
+        None => {
+            let body = req.json().map_err(|_| Response::error(400, "bad_json", "send {\"text\": \"...\"}"))?;
+            Ok((body["text"].as_str().unwrap_or("").trim().to_string(), vec![]))
+        }
+    }
+}
+
+/// Checks images (PNG, JPEG, WebP, GIF by their bytes; 15 MB each; six at
+/// most) and saves them as the panel saves its attachments:
+/// `<attachments>/<ms>/<name>`. Not screenshots: never pruned.
+pub fn save_images(parts: &[multipart::Part], attachments: &std::path::Path, at_ms: u64) -> Result<Vec<String>, Response> {
+    if parts.is_empty() {
+        return Ok(vec![]);
+    }
+    if parts.len() > MAX_IMAGES {
+        return Err(Response::error(413, "too_many_images", &format!("{MAX_IMAGES} images at most")));
+    }
+    let mut kinds = vec![];
+    for (i, p) in parts.iter().enumerate() {
+        if p.data.len() as u64 > crate::screenshots::MAX_BYTES {
+            return Err(Response::error(413, "image_too_large", &format!("image {} is over 15 MB", i + 1)));
+        }
+        let Some(ext) = crate::screenshots::kind_of(&p.data[..p.data.len().min(16)]) else {
+            return Err(Response::error(415, "not_an_image", &format!("image {} isn't a PNG, JPEG, WebP or GIF", i + 1)));
+        };
+        kinds.push(ext);
+    }
+    let dir = attachments.join(format!("{at_ms}-phone"));
+    std::fs::create_dir_all(&dir).map_err(|e| Response::error(503, "save", &e.to_string()))?;
+    let mut out = vec![];
+    for (i, (p, ext)) in parts.iter().zip(kinds).enumerate() {
+        let original = std::path::Path::new(p.filename.as_deref().unwrap_or("image"));
+        // `<ms>-<name>.<ext>` from the screenshot naming, without the ms (the folder has it).
+        let name = crate::screenshots::stored_name(0, original, ext);
+        let name = format!("{}-{}", i + 1, name.trim_start_matches("0-"));
+        let path = dir.join(name);
+        std::fs::write(&path, &p.data).map_err(|e| Response::error(503, "save", &e.to_string()))?;
+        out.push(path.to_string_lossy().into_owned());
+    }
+    Ok(out)
 }
 
 /// History lines added since `offset` (whole lines only), and the new offset.
@@ -670,6 +760,28 @@ mod tests {
         Ok((status, serde_json::from_str(body).unwrap_or(Value::Null)))
     }
 
+    /// One HTTPS call with a binary body and a content type.
+    fn call_raw(addr: SocketAddr, pin: &str, method: &str, path: &str, token: &str, ctype: &str, body: &[u8]) -> Result<(u16, Value)> {
+        use std::io::Read;
+        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Pin(pin.to_string())))
+            .with_no_client_auth();
+        let conn = rustls::ClientConnection::new(Arc::new(cfg), rustls::pki_types::ServerName::try_from("herder-tower")?.to_owned())?;
+        let tcp = TcpStream::connect(addr)?;
+        tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let mut s = rustls::StreamOwned::new(conn, tcp);
+        write!(s, "{method} {path} HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n", body.len())?;
+        s.write_all(body)?;
+        s.flush()?;
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        let text = String::from_utf8_lossy(&out);
+        let status: u16 = text.split(' ').nth(1).unwrap_or("0").parse()?;
+        Ok((status, serde_json::from_str(text.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap_or(Value::Null)))
+    }
+
     #[test]
     fn pairing_and_tokens_over_https() {
         let dir = std::env::temp_dir().join(format!("tower-lan-e2e-{}", std::process::id()));
@@ -718,6 +830,15 @@ mod tests {
         assert_eq!((st, v["mode"].as_str()), (200, Some("ptt")));
         assert_eq!(call(addr, &fp, "GET", "/v1/nope", Some(&token), "").unwrap().0, 404);
         assert_eq!(call(addr, &fp, "POST", "/v1/voice", Some(&token), "not audio").unwrap().0, 415);
+        // Multipart asks: images are checked before anything reaches the tower.
+        let mp = |path: &str, files: &[(&str, &str, &str, &[u8])]| {
+            let body = multipart::build("XB", &[("text", "what is this?")], files);
+            call_raw(addr, &fp, "POST", path, &token, "multipart/form-data; boundary=XB", &body).unwrap()
+        };
+        assert_eq!(mp("/v1/ask", &[("image", "a.png", "image/png", b"not an image")]).0, 415);
+        let seven: Vec<(&str, &str, &str, &[u8])> = (0..7).map(|_| ("image", "a.png", "image/png", &b"\x89PNG\r\n\x1a\n"[..])).collect();
+        assert_eq!(mp("/v1/ask", &seven).0, 413);
+        assert_eq!(mp("/v1/voice", &[("image", "a.png", "image/png", b"\x89PNG\r\n\x1a\n")]).0, 400, "voice needs its audio part");
         // Screenshots: by id, never by path; the token is needed as everywhere.
         assert_eq!(call(addr, &fp, "GET", "/v1/screenshots/..%2F..%2Fdevices.json", Some(&token), "").unwrap().0, 400);
         assert_eq!(call(addr, &fp, "GET", "/v1/screenshots/0-no-such-shot.png", Some(&token), "").unwrap().0, 404);
@@ -802,6 +923,41 @@ mod tests {
         assert!(shared.get().phone.is_none());
         lan.stop();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saves_phone_images_like_panel_attachments() {
+        let dir = std::env::temp_dir().join(format!("tower-lan-att-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let png: &[u8] = b"\x89PNG\r\n\x1a\n....";
+        let part = |name: &str, f: &str, d: &[u8]| multipart::Part { name: name.into(), filename: Some(f.into()), content_type: None, data: d.to_vec() };
+        let paths = save_images(&[part("image", "../../etc/Screen Shot.png", png), part("image", "b", b"\xff\xd8\xff\xe0")], &dir, 42).unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with("/42-phone/1-Screen-Shot.png"), "{}", paths[0]);
+        assert!(paths[1].ends_with("/42-phone/2-b.jpg"), "{}", paths[1]);
+        assert!(paths.iter().all(|p| p.starts_with(dir.to_str().unwrap())), "names can't climb out of the folder");
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), png);
+        assert_eq!(save_images(&[part("image", "x.png", b"text")], &dir, 43).unwrap_err().status, 415);
+        let seven: Vec<_> = (0..7).map(|i| part("image", &format!("{i}.png"), png)).collect();
+        assert_eq!(save_images(&seven, &dir, 44).unwrap_err().status, 413);
+        assert!(save_images(&[], &dir, 45).unwrap().is_empty());
+        // Screenshot pruning never looks here.
+        assert_eq!(crate::screenshots::prune(&dir, Duration::from_secs(0)), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_ask_bodies_both_ways() {
+        let json_req = Request { body: br#"{"text":" hi "}"#.to_vec(), ..Default::default() };
+        let (t, imgs) = ask_body(&json_req).ok().unwrap();
+        assert_eq!((t.as_str(), imgs.len()), ("hi", 0));
+        let body = multipart::build("BB", &[("text", "what's this?")], &[("image", "a.png", "image/png", b"\x89PNG\r\n\x1a\n"), ("images", "b.gif", "image/gif", b"GIF89a")]);
+        let mut req = Request { body, ..Default::default() };
+        req.headers.insert("content-type".into(), "multipart/form-data; boundary=BB".into());
+        let (t, imgs) = ask_body(&req).ok().unwrap();
+        assert_eq!((t.as_str(), imgs.len()), ("what's this?", 2));
+        let bad = Request { body: b"nope".to_vec(), ..Default::default() };
+        assert_eq!(ask_body(&bad).err().unwrap().status, 400);
     }
 
     #[test]

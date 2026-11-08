@@ -266,6 +266,18 @@ pub fn compose(text: &str, attachments: &[String]) -> String {
     if attachments.is_empty() { text } else { format!("{text}{ATTACHED}{}]", attachments.join(" | ")) }
 }
 
+/// `[Image #1] … [Image #n]` for the images the text doesn't already mark,
+/// in front, as the panel puts a token where you attach (the Nth token is the Nth file).
+pub fn with_image_markers(text: &str, n: usize) -> String {
+    let missing: Vec<String> = (1..=n).map(|k| format!("[Image #{k}]")).filter(|m| !text.contains(m.as_str())).collect();
+    let text = text.trim();
+    match (missing.is_empty(), text.is_empty()) {
+        (true, _) => text.to_string(),
+        (false, true) => missing.join(" "),
+        (false, false) => format!("{} {text}", missing.join(" ")),
+    }
+}
+
 /// `compose` undone.
 pub fn split(message: &str) -> (String, Vec<String>) {
     match message.rfind(ATTACHED) {
@@ -293,6 +305,17 @@ pub fn keep_attachment(src: &std::path::Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_markers_like_the_panel() {
+        assert_eq!(with_image_markers("what is wrong here?", 2), "[Image #1] [Image #2] what is wrong here?");
+        assert_eq!(with_image_markers("compare [Image #1] with [Image #2]", 2), "compare [Image #1] with [Image #2]", "marked already");
+        assert_eq!(with_image_markers("see [Image #2]", 2), "[Image #1] see [Image #2]");
+        assert_eq!(with_image_markers("  ", 1), "[Image #1]");
+        assert_eq!(with_image_markers("no images", 0), "no images");
+        let m = compose(&with_image_markers("fix this", 1), &["/a/x.png".into()]);
+        assert_eq!(m, "[Image #1] fix this [attached: /a/x.png]");
+    }
 
     #[test]
     fn compose_and_split() {

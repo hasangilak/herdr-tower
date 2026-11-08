@@ -63,7 +63,8 @@ pub enum Source {
     /// Recorded on a paired phone (the phone API): meant for the tower, like
     /// a press-to-talk take. What was heard goes back on the sender ("" when
     /// nothing was sent to the brain).
-    Phone(std::sync::mpsc::Sender<String>),
+    /// `attachments`: images sent with it (saved paths), passed on as the panel does.
+    Phone { reply: std::sync::mpsc::Sender<String>, attachments: Vec<String> },
 }
 
 pub struct Utterance {
