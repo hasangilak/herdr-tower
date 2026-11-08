@@ -255,7 +255,9 @@ impl Store {
             }
         }
         let title = after.map(|b| b.title.clone()).or_else(|| before.as_deref().and_then(parse).map(|b| b.title)).unwrap_or_default();
-        let c = Change { at: now_ms(), op: op.into(), id: id.into(), title, before, after: after_text, by: by.into(), undid };
+        // `at` names a change (undo finds it by it): never two the same.
+        let at = now_ms().max(self.history().last().map(|c| c.at + 1).unwrap_or(0));
+        let c = Change { at, op: op.into(), id: id.into(), title, before, after: after_text, by: by.into(), undid };
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("history.jsonl"))?;
         writeln!(f, "{}", serde_json::to_string(&c)?)?;
         Ok(c)
