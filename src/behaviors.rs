@@ -272,6 +272,11 @@ impl Store {
     }
 
     pub fn add(&self, title: &str, category: &str, summary: &str, text: &str, source: &str, by: &str) -> Result<(Behavior, Change)> {
+        self.add_as("add", title, category, summary, text, source, by)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_as(&self, op: &str, title: &str, category: &str, summary: &str, text: &str, source: &str, by: &str) -> Result<(Behavior, Change)> {
         let title = one_line(title);
         if title.is_empty() || text.trim().is_empty() {
             bail!("a behavior needs a title and its text");
@@ -296,7 +301,7 @@ impl Store {
             builtin_hash: None,
             text: text.trim().to_string() + "\n",
         };
-        let c = self.put(&id, Some(&b), "add", by, None)?;
+        let c = self.put(&id, Some(&b), op, by, None)?;
         Ok((b, c))
     }
 
@@ -345,7 +350,8 @@ impl Store {
     pub fn undo(&self, by: &str) -> Result<Change> {
         let h = self.history();
         let undone: Vec<u64> = h.iter().filter_map(|c| c.undid).collect();
-        let Some(last) = h.iter().rev().find(|c| !undone.contains(&c.at) && !matches!(c.op.as_str(), "seed" | "migrate" | "undo")) else {
+        // The tower's own setup (seeding, memory moved in) isn't the user's to undo.
+        let Some(last) = h.iter().rev().find(|c| !undone.contains(&c.at) && c.by != "tower" && !matches!(c.op.as_str(), "seed" | "migrate" | "undo")) else {
             bail!("nothing to undo")
         };
         let restored = last.before.as_deref().and_then(parse);
@@ -533,7 +539,7 @@ pub fn migrate_memory(store: &Store, memory: &Path) -> Result<Vec<String>> {
             continue;
         }
         let title = named(&format!("{name}.md")).unwrap_or_else(|| title_of(name, &description));
-        let (b, _) = store.add(&title, category, &description, &body, "learned", "tower")?;
+        let (b, _) = store.add_as("migrate", &title, category, &description, &body, "learned", "tower")?;
         std::fs::create_dir_all(&keep)?;
         std::fs::rename(&src, keep.join(format!("{name}.md"))).with_context(|| format!("moving {}", src.display()))?;
         moved.push(b.id);
@@ -623,6 +629,15 @@ mod tests {
         assert_eq!(first.len(), BUILTIN.len());
         assert!(s.seed().unwrap().is_empty(), "seeded once");
         assert!(s.undo("user").is_err(), "seeding isn't a change to undo");
+        // Older setups logged it as an add by the tower: still not undoable.
+        s.add("Setup rule", "Misc", "", "From setup.", "learned", "tower").unwrap();
+        assert!(s.undo("user").is_err(), "the tower's own changes aren't undone");
+        // The user's and the brain's are.
+        s.add("Mine", "Misc", "", "My rule.", "user", "user").unwrap();
+        s.add("Brain's", "Misc", "", "A rule the brain added.", "learned", "brain").unwrap();
+        assert_eq!(s.undo("user").unwrap().title, "Brain's");
+        assert_eq!(s.undo("user").unwrap().title, "Mine");
+        assert!(s.undo("user").is_err());
         // Edited by the user: a new release leaves it alone.
         s.edit("screenshots", &Patch { text: Some("My own screenshot rule.".into()), ..Default::default() }, "user").unwrap();
         let mut b = s.get("heard-not-read").unwrap();
@@ -687,6 +702,7 @@ mod tests {
         let index = std::fs::read_to_string(mem.join("MEMORY.md")).unwrap();
         assert!(!index.contains("release-dev-then-prod") && index.contains("email-setup-already-done"));
         assert!(migrate_memory(&s, &mem).unwrap().is_empty(), "once");
+        assert!(s.undo("user").is_err(), "moving memory in is setup, not the user's to undo");
         let _ = std::fs::remove_dir_all(&s.dir);
         let _ = std::fs::remove_dir_all(&mem);
     }
