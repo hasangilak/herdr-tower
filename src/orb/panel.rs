@@ -14,6 +14,7 @@
 //! - **Jobs** (the button by the status): what the tower handed out, in
 //!   progress and finished, by space or session.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
@@ -90,6 +91,9 @@ const AMBER: u32 = 0xffcf70;
 const ROSE: u32 = 0xff8f8f;
 const GREY: u32 = 0x9aa3b2;
 const NAVY: u32 = 0x16233a;
+/// Accents for Claude accounts, one picked from each account's name (none of
+/// them is a status colour): mint, orchid, peach, lime, lilac, coral, sand, aqua.
+const ACCOUNT_HUES: [u32; 8] = [0x6eeaa8, 0xf0a6ff, 0xffb98a, 0xc8f06e, 0xc9b3ff, 0xff9fb2, 0xe8d9a0, 0x7fe8e0];
 
 /// What the activity view is narrowed to.
 #[derive(Clone, PartialEq)]
@@ -123,6 +127,9 @@ pub struct Panel {
     prev_read: u64,
     /// Herdr's spaces and their sessions (`herdr-app ls`), refreshed while the panel is open.
     live: Vec<crate::spaces::Live>,
+    /// The account sessions run on when none is named (`cca ls --json`'s
+    /// `current`), shown quietly; refreshed while the panel is open.
+    default_account: Option<String>,
     _subs: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -184,6 +191,20 @@ impl Panel {
                         break;
                     }
                 }
+                // So is the list of Claude accounts: every 30 s.
+                if tick % 30 == 0 {
+                    let def = cx.background_executor().spawn(async { default_account() }).await;
+                    if this.update(cx, |this, cx| {
+                        if this.default_account != def {
+                            this.default_account = def;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
                 tick += 1;
                 let alive = this.update(cx, |this, cx| {
                     this.reload(cx);
@@ -219,6 +240,7 @@ impl Panel {
             open_space: None,
             prev_read: 0,
             live: vec![],
+            default_account: None,
             _subs: subs,
             _poll: poll,
         }
@@ -682,6 +704,7 @@ impl Panel {
     /// every session or one.
     fn activity_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let g = glass();
+        let acc = Accounts::of_tower(self.tower.read(cx), self.default_account.clone());
         let scope = self.scope.clone();
         let fits = |session: &str, space: &str| match &scope {
             Scope::Everything => true,
@@ -772,8 +795,8 @@ impl Panel {
         let now = history::now_ms();
         let mut items: Vec<AnyElement> = vec![];
         match filter {
-            Filter::Working => items.extend(working.iter().map(|j| job_card(j, &g, now))),
-            Filter::Done => items.extend(done.iter().map(|j| job_card(j, &g, now))),
+            Filter::Working => items.extend(working.iter().map(|j| job_card(j, &g, now, &acc))),
+            Filter::Done => items.extend(done.iter().map(|j| job_card(j, &g, now, &acc))),
             Filter::All => {
                 let mut day = String::new();
                 for e in &events {
@@ -782,7 +805,7 @@ impl Panel {
                         items.push(div().pt_1().text_xs().text_color(g.faint).child(d.clone()).into_any_element());
                         day = d;
                     }
-                    items.push(activity_row(e, &g));
+                    items.push(activity_row(e, &g, &acc));
                 }
             }
         }
@@ -822,6 +845,7 @@ impl Panel {
             return self.space_detail(&name, cx);
         }
         let g = glass();
+        let acc = Accounts::of_tower(self.tower.read(cx), self.default_account.clone());
         let sp = self.tower.read(cx).spaces.clone();
         let unread = crate::spaces::unread(&self.entries, &sp);
         let mut names = crate::spaces::known(&self.live, &self.entries, &sp);
@@ -897,6 +921,7 @@ impl Panel {
                             .items_center()
                             .child(div().size(px(8.0)).flex_none().rounded_full().bg(rgb(dot)))
                             .child(div().flex_1().min_w_0().truncate().text_base().font_weight(FontWeight::MEDIUM).child(name.clone()))
+                            .children(acc.space_badge(&sessions, &g))
                             .when(!held.is_empty(), |el| {
                                 el.child(
                                     div()
@@ -963,6 +988,7 @@ impl Panel {
     /// focus (marked read on opening), its jobs and its story so far.
     fn space_detail(&mut self, name: &str, cx: &mut Context<Self>) -> AnyElement {
         let g = glass();
+        let acc = Accounts::of_tower(self.tower.read(cx), self.default_account.clone());
         let sp = self.tower.read(cx).spaces.clone();
         let focused = sp.focus.as_deref() == Some(name);
         let sessions = self.live.iter().find(|l| l.name == name).map(|l| l.sessions.clone()).unwrap_or_default();
@@ -1009,7 +1035,15 @@ impl Panel {
                 )
                 .into_any_element(),
         );
-        items.push(div().pt_1().text_xl().font_weight(FontWeight::MEDIUM).child(name.to_string()).into_any_element());
+        items.push(
+            h_flex()
+                .pt_1()
+                .gap_2()
+                .items_center()
+                .child(div().min_w_0().truncate().text_xl().font_weight(FontWeight::MEDIUM).child(name.to_string()))
+                .children(acc.space_badge(&sessions, &g))
+                .into_any_element(),
+        );
         items.push(match sp.agendas.get(name) {
             Some(a) => div().text_sm().child(a.clone()).into_any_element(),
             None => div().text_sm().text_color(g.faint).child("No agenda yet. Tell the tower what this space is for.").into_any_element(),
@@ -1038,6 +1072,7 @@ impl Panel {
                             .child(div().size(px(6.0)).rounded_full().bg(rgb(dot)))
                             .child(if sname.is_empty() { addr.clone() } else { sname.clone() })
                             .when(!st.is_empty(), |el| el.child(div().text_color(g.muted).child(st.clone())))
+                            .children(acc.of(addr).map(|a| acc.badge(a, &g)))
                     }))
                     .into_any_element(),
             );
@@ -1047,17 +1082,17 @@ impl Panel {
             self.entries.iter().rev().filter(|e| e.held && e.space.as_deref() == Some(name) && e.at > self.prev_read).take(30).collect();
         if !fresh.is_empty() {
             items.push(section(&format!("New while you were elsewhere · {}", fresh.len())).into_any_element());
-            items.extend(fresh.iter().map(|e| activity_row(e, &g)));
+            items.extend(fresh.iter().map(|e| activity_row(e, &g, &acc)));
         }
         let jobs: Vec<&Job> = self.jobs.iter().filter(|j| j.space == name).collect();
         let (running, done): (Vec<&Job>, Vec<&Job>) = jobs.into_iter().partition(|j| j.open());
         if !running.is_empty() {
             items.push(section("Running").into_any_element());
-            items.extend(running.iter().map(|j| job_card(j, &g, now)));
+            items.extend(running.iter().map(|j| job_card(j, &g, now, &acc)));
         }
         if !done.is_empty() {
             items.push(section("Done").into_any_element());
-            items.extend(done.iter().take(10).map(|j| job_card(j, &g, now)));
+            items.extend(done.iter().take(10).map(|j| job_card(j, &g, now, &acc)));
         }
         let story: Vec<&Entry> = self
             .entries
@@ -1068,7 +1103,7 @@ impl Panel {
             .collect();
         if !story.is_empty() {
             items.push(section("Story so far").into_any_element());
-            items.extend(story.iter().map(|e| activity_row(e, &g)));
+            items.extend(story.iter().map(|e| activity_row(e, &g, &acc)));
         }
         div()
             .id("space-detail")
@@ -1254,7 +1289,7 @@ fn event_line(e: &Entry, g: &Glass) -> AnyElement {
 }
 
 /// A job: what was asked, of whom, and where it stands.
-fn job_card(j: &Job, g: &Glass, now: u64) -> AnyElement {
+fn job_card(j: &Job, g: &Glass, now: u64, acc: &Accounts) -> AnyElement {
     let who = if j.name.is_empty() { j.session.clone() } else { j.name.clone() };
     let (mark, color): (AnyElement, Hsla) = match j.status.as_str() {
         "working" => (div().size(px(8.0)).rounded_full().bg(rgb(CYAN)).into_any_element(), rgb(CYAN).into()),
@@ -1292,14 +1327,15 @@ fn job_card(j: &Job, g: &Glass, now: u64) -> AnyElement {
                 .pl(px(24.0))
                 .gap_2()
                 .text_xs()
-                .child(div().text_color(color).child(when))
-                .child(div().min_w_0().truncate().text_color(g.muted).child(meta.join(" · "))),
+                .child(div().flex_none().text_color(color).child(when))
+                .child(div().min_w_0().truncate().text_color(g.muted).child(meta.join(" · ")))
+                .children(acc.of(&j.session).map(|a| acc.badge(a, g))),
         )
         .into_any_element()
 }
 
 /// A line of activity: a session reporting back, an alert, a summary, a job starting or ending.
-fn activity_row(e: &Entry, g: &Glass) -> AnyElement {
+fn activity_row(e: &Entry, g: &Glass, acc: &Accounts) -> AnyElement {
     let who = e.name.clone().or_else(|| e.session.clone()).unwrap_or_default();
     let (icon, color, text) = match (e.kind.as_str(), e.status.as_deref()) {
         ("job", Some("working")) => (IconName::ArrowUp, CYAN, format!("Asked {who}: {}", e.text)),
@@ -1318,7 +1354,157 @@ fn activity_row(e: &Entry, g: &Glass) -> AnyElement {
         .child(div().w(px(52.0)).flex_none().pt(px(1.0)).text_xs().text_color(g.faint).child(clock(e.at)))
         .child(div().pt(px(2.0)).child(Icon::new(icon).xsmall().text_color(rgb(color))))
         .child(div().flex_1().min_w_0().text_sm().line_clamp(4).child(text))
+        .children(e.session.as_deref().and_then(|s| acc.of(s)).map(|a| div().pt(px(1.0)).flex_none().child(acc.badge(a, g))))
         .into_any_element()
+}
+
+/// Which Claude account each session runs on (`default`, `orca`), from the
+/// radar's `account` field; Codex and unknown sessions have none. Tolerates
+/// the field missing (older daemons): then nothing is shown.
+#[derive(Default)]
+struct Accounts {
+    by_session: HashMap<String, String>,
+    /// The claude-accounts mod's default, drawn quietly.
+    default: Option<String>,
+}
+
+impl Accounts {
+    fn of_tower(t: &Tower, default: Option<String>) -> Self {
+        Self::from_agents(t.s("agents"), default)
+    }
+
+    fn from_agents(agents: &serde_json::Value, default: Option<String>) -> Self {
+        let by_session = agents
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|a| {
+                    let addr = a["address"].as_str()?;
+                    let acc = a["account"].as_str().map(str::trim).filter(|s| !s.is_empty())?;
+                    Some((addr.to_string(), acc.to_string()))
+                })
+                .collect();
+        Accounts { by_session, default }
+    }
+
+    fn of(&self, addr: &str) -> Option<&str> {
+        self.by_session.get(addr).map(String::as_str)
+    }
+
+    fn badge(&self, account: &str, g: &Glass) -> AnyElement {
+        badge(account, self.default.as_deref() == Some(account), g)
+    }
+
+    /// The accounts a space's Claude sessions run on, each once.
+    fn space_accounts(&self, sessions: &[(String, String, String)]) -> Vec<&str> {
+        let mut seen: Vec<&str> = sessions.iter().filter_map(|(addr, _, _)| self.of(addr)).collect();
+        seen.sort();
+        seen.dedup();
+        seen
+    }
+
+    /// A space's account: the one all its Claude sessions share, or mixed.
+    fn space(&self, sessions: &[(String, String, String)]) -> SpaceAccount {
+        match self.space_accounts(sessions).as_slice() {
+            [] => SpaceAccount::None,
+            [one] => SpaceAccount::One(one.to_string()),
+            _ => SpaceAccount::Mixed,
+        }
+    }
+
+    fn space_badge(&self, sessions: &[(String, String, String)], g: &Glass) -> Option<AnyElement> {
+        match self.space(sessions) {
+            SpaceAccount::None => None,
+            SpaceAccount::One(a) => Some(self.badge(&a, g)),
+            SpaceAccount::Mixed => Some(
+                h_flex()
+                    .flex_none()
+                    .gap(px(4.0))
+                    .items_center()
+                    .px(px(7.0))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(g.edge)
+                    .text_xs()
+                    .text_color(g.muted)
+                    .children(self.space_accounts(sessions).into_iter().take(3).map(|a| {
+                        let c: Hsla = if self.default.as_deref() == Some(a) { g.muted } else { rgb(account_hue(a)).into() };
+                        div().size(px(5.0)).rounded_full().bg(c)
+                    }))
+                    .child("mixed")
+                    .into_any_element(),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum SpaceAccount {
+    None,
+    One(String),
+    Mixed,
+}
+
+/// A small account label with the account's own name: the default account
+/// quiet (outlined), any other filled with a colour picked from its name, so
+/// an account keeps its colour and a new one gets one without a code change.
+fn badge(account: &str, quiet: bool, g: &Glass) -> AnyElement {
+    let el = div().flex_none().px(px(7.0)).rounded_full().text_xs().max_w(px(110.0)).truncate();
+    if quiet {
+        el.border_1().border_color(g.edge).text_color(g.muted).child(account.to_string())
+    } else {
+        el.bg(rgb(account_hue(account))).text_color(rgb(NAVY)).font_weight(FontWeight::MEDIUM).child(account.to_string())
+    }
+    .into_any_element()
+}
+
+/// The same colour for the same name, every run (FNV-1a over the name).
+fn account_hue(name: &str) -> u32 {
+    let h = name.to_lowercase().bytes().fold(0x811c_9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193));
+    ACCOUNT_HUES[h as usize % ACCOUNT_HUES.len()]
+}
+
+/// The claude-accounts mod's default account (`cca ls --json`'s `current`),
+/// or None without the mod.
+fn default_account() -> Option<String> {
+    let out = Command::new("cca").args(["ls", "--json"]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    v["current"].as_str().filter(|s| !s.is_empty()).map(String::from)
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sessions(addrs: &[&str]) -> Vec<(String, String, String)> {
+        addrs.iter().map(|a| (a.to_string(), String::new(), String::new())).collect()
+    }
+
+    #[test]
+    fn a_space_shows_its_one_account_or_mixed() {
+        let agents = json!([
+            { "address": "t1", "account": "work" },
+            { "address": "t2", "account": "work" },
+            { "address": "t3", "account": "side" },
+            { "address": "t4", "account": null },
+            { "address": "t5" }
+        ]);
+        let acc = Accounts::from_agents(&agents, Some("work".into()));
+        assert_eq!(acc.space(&sessions(&["t1", "t2", "t4", "t5"])), SpaceAccount::One("work".into()));
+        assert_eq!(acc.space(&sessions(&["t1", "t3"])), SpaceAccount::Mixed);
+        assert_eq!(acc.space(&sessions(&["t4", "t5", "t9"])), SpaceAccount::None);
+        assert_eq!(acc.of("t3"), Some("side"));
+        assert_eq!(acc.of("t4"), None);
+        // No field at all (an older daemon): nothing to show.
+        assert_eq!(Accounts::from_agents(&json!(null), None).of("t1"), None);
+    }
+
+    #[test]
+    fn an_account_keeps_its_colour() {
+        assert_eq!(account_hue("side"), account_hue("Side"));
+        assert!(ACCOUNT_HUES.contains(&account_hue("anything-new")));
+    }
 }
 
 /// What the tower is doing, in a word, and its colour (the orb's).
