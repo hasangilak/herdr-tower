@@ -170,7 +170,7 @@ impl Daemon {
             }
             Request::Ask { text } => {
                 timing::start("asked");
-                if let Err(e) = stt::deliver(&self.shared, &self.mouth, &text, ack_delay(&self.cfg)) {
+                if let Err(e) = stt::deliver(&self.shared, &self.mouth, &text, ack_delay(&self.cfg), "mac") {
                     return Response::err(brain::spoken_error(&format!("{e:#}")));
                 }
             }

@@ -10,6 +10,7 @@ extern crate gpui_kit as gpui;
 mod accounts;
 mod activity;
 mod brain;
+mod chat;
 mod config;
 mod daemon;
 mod draft;

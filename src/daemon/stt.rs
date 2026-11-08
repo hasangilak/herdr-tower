@@ -106,9 +106,9 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
                         mouth.nothing_asked();
                         continue;
                     }
-                    let _ = deliver(&shared, &mouth, heard.trim(), settings.ack);
+                    let _ = deliver(&shared, &mouth, heard.trim(), settings.ack, "voice");
                 }
-                Source::Phone { reply, attachments, markers, send, phone } => {
+                Source::Phone { reply, attachments, markers, send, phone, device } => {
                     if !send {
                         // Dictation: the text goes back, nothing to the tower.
                         let _ = reply.send(heard.trim().to_string());
@@ -119,7 +119,7 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
                         continue;
                     }
                     let message = crate::history::compose(&super::lan::with_markers(heard.trim(), &markers), &attachments);
-                    if deliver_from(&shared, &mouth, &message, settings.ack, phone).is_ok() {
+                    if deliver_from(&shared, &mouth, &message, settings.ack, phone, &format!("phone:{device}")).is_ok() {
                         let _ = reply.send(heard.trim().to_string());
                     }
                 }
@@ -140,7 +140,7 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
                     if armed_until.is_some_and(|t| Instant::now() < t) {
                         armed_until = None;
                         shared.update(|s| s.armed = false);
-                        let _ = deliver(&shared, &mouth, heard.trim(), settings.ack);
+                        let _ = deliver(&shared, &mouth, heard.trim(), settings.ack, "voice");
                         continue;
                     }
                     if let Some(rest) = after_wake_word(&heard, &settings.wake_words) {
@@ -150,7 +150,7 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
                             shared.update(|s| s.armed = true);
                             mouth.chime(true);
                         } else {
-                            let _ = deliver(&shared, &mouth, &rest, settings.ack);
+                            let _ = deliver(&shared, &mouth, &rest, settings.ack, "voice");
                         }
                     }
                 }
@@ -250,20 +250,21 @@ fn vocabulary(shared: &Shared) -> String {
 }
 
 /// Hands a request to the brain and acknowledges it out loud.
-pub fn deliver(shared: &Shared, mouth: &Mouth, text: &str, ack: Option<Duration>) -> anyhow::Result<()> {
-    deliver_from(shared, mouth, text, ack, None)
+/// `source`: `mac` (typed) or `voice` (this Mac's microphone), for the chat.
+pub fn deliver(shared: &Shared, mouth: &Mouth, text: &str, ack: Option<Duration>, source: &str) -> anyhow::Result<()> {
+    deliver_from(shared, mouth, text, ack, None, source)
 }
 
 /// `deliver` for a request from a paired phone whose replies are heard on
 /// the phone only (`phone`: its device id; None: heard as usual).
-pub fn deliver_from(shared: &Shared, mouth: &Mouth, text: &str, ack: Option<Duration>, phone: Option<String>) -> anyhow::Result<()> {
+pub fn deliver_from(shared: &Shared, mouth: &Mouth, text: &str, ack: Option<Duration>, phone: Option<String>, source: &str) -> anyhow::Result<()> {
     shared.update(|s| {
         s.heard = text.to_string();
         s.heard_ms = now_ms();
         s.hearing.clear();
         s.error.clear();
     });
-    match brain::ask(text, &radar(shared)) {
+    match brain::ask(text, &radar(shared), source) {
         Ok(()) => {
             timing::mark("sent to the brain");
             mouth.asked(text, phone);

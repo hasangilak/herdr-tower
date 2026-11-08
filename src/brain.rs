@@ -163,12 +163,13 @@ fn trust_answer(screen: &str) -> Option<Vec<&'static str>> {
 
 /// Hands what the user said to the brain, with the radar's view of every
 /// agent (`radar`, may be empty), so a status question needs no lookup.
-pub fn ask(text: &str, radar: &str) -> Result<()> {
+/// `source`: `mac`, `voice` or `phone:<device id>`, for the chat.
+pub fn ask(text: &str, radar: &str, source: &str) -> Result<()> {
     let msg = if radar.is_empty() { format!("[voice] {text}") } else { format!("[voice] {text} {radar}") };
     note(&msg)?;
     crate::activity::start();
-    let text = text.to_string();
-    crate::history::later(move || crate::history::record_request(&text));
+    let (text, source) = (text.to_string(), source.to_string());
+    crate::history::later(move || crate::history::record_request(&text, &source));
     Ok(())
 }
 

@@ -64,6 +64,10 @@ pub struct Entry {
     /// `[shot:<id>]` / `[shots:<session>]` markers, which `text` no longer has.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub shots: Vec<String>,
+    /// `request`: where it came from: `mac` (typed in the panel or `tower
+    /// ask`), `voice` (the Mac's microphone) or `phone:<device id>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 pub fn path() -> PathBuf {
@@ -182,9 +186,10 @@ pub fn record_space(kind: &str, space: &str, session: Option<&str>, text: &str) 
     append(e);
 }
 
-pub fn record_request(message: &str) {
+pub fn record_request(message: &str, source: &str) {
     let (text, attachments) = split(message);
-    append(Entry { kind: "request".into(), text, attachments, ..Default::default() });
+    let source = (!source.is_empty()).then(|| source.to_string());
+    append(Entry { kind: "request".into(), text, attachments, source, ..Default::default() });
 }
 
 /// A job starts: the brain handed `session` this work. Returns its id.

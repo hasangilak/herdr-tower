@@ -301,6 +301,12 @@ impl Lan {
                     Err(e) => Response::error(503, "save", &format!("{e:#}")),
                 }
             }
+            // The main chat thread, as the panel shows it: newest last, in pages.
+            ("GET", ["chat"]) => {
+                let all = crate::chat::thread(&crate::chat::load(), &crate::history::attachments_dir());
+                let (messages, more) = crate::chat::page(&all, q("before"), limit(50).min(200));
+                Response::json(200, &json!({ "messages": messages, "more": more }))
+            }
             // Clips this phone may have missed (no stream open): the last 15 minutes.
             ("GET", ["audio"]) => Response::json(200, &json!({ "clips": self.ctx.hub.clips_for(&device.id, q("after")) })),
             ("GET", ["attachments", folder, name]) => attachment(&crate::history::attachments_dir(), folder, name),
@@ -501,7 +507,8 @@ impl Lan {
 
     fn ask(&self, device: &auth::Device, text: &str) -> Response {
         crate::daemon::timing::start("asked");
-        match super::stt::deliver_from(&self.ctx.shared, &self.ctx.mouth, text, self.ctx.ack, heard_on_phone(device)) {
+        let source = format!("phone:{}", device.id);
+        match super::stt::deliver_from(&self.ctx.shared, &self.ctx.mouth, text, self.ctx.ack, heard_on_phone(device), &source) {
             Ok(()) => Response::json(202, &json!({ "sent": text })),
             Err(e) => Response::error(503, "brain", &crate::brain::spoken_error(&format!("{e:#}"))),
         }
@@ -571,7 +578,7 @@ impl Lan {
         }
         let samples = if rate == RATE { samples } else { super::mic::resample(&samples, rate, RATE) };
         let (tx, rx) = std::sync::mpsc::channel();
-        let source = Source::Phone { reply: tx, attachments: attachments.clone(), markers, send, phone: heard_on_phone(device) };
+        let source = Source::Phone { reply: tx, attachments: attachments.clone(), markers, send, phone: heard_on_phone(device), device: device.id.clone() };
         if self.ctx.stt.send(Utterance { samples, source }).is_err() {
             return Response::error(503, "stt", "the transcriber isn't running");
         }
@@ -603,6 +610,9 @@ impl Lan {
         let mut ok = send(w, "hello", &json!({ "api": API, "device": device.id, "voice": voice })) && send(w, "state", &state);
         let history = crate::history::path();
         let mut offset = std::fs::metadata(&history).map(|m| m.len()).unwrap_or(0);
+        // The chat's latest messages as last sent: a new or changed one is a `chat` event.
+        let mut chat = ChatTail::default();
+        chat.diff(&crate::chat::thread(&crate::chat::load(), &crate::history::attachments_dir()));
         let (mut last_ping, mut last_check, mut last_history) = (Instant::now(), Instant::now(), Instant::now());
         while ok {
             match rx.recv_timeout(Duration::from_millis(250)) {
@@ -622,11 +632,20 @@ impl Lan {
                 last_history = Instant::now();
                 let (entries, end) = new_history(&history, offset);
                 offset = end;
+                let grew = !entries.is_empty();
                 for e in entries {
                     if !ok {
                         break;
                     }
                     ok = send(w, "history", &e);
+                }
+                if grew {
+                    for (op, m) in chat.diff(&crate::chat::thread(&crate::chat::load(), &crate::history::attachments_dir())) {
+                        if !ok {
+                            break;
+                        }
+                        ok = send(w, "chat", &json!({ "op": op, "message": m }));
+                    }
                 }
             }
             if ok && last_ping.elapsed() > Duration::from_secs(10) {
@@ -645,6 +664,33 @@ impl Lan {
         if voice && !self.ctx.hub.voice() {
             self.ctx.shared.update(|s| s.phone = None);
         }
+    }
+}
+
+/// The chat messages a stream has seen (the latest ones), to send only what is new or changed.
+#[derive(Default)]
+struct ChatTail {
+    seen: std::collections::HashMap<String, String>,
+}
+
+impl ChatTail {
+    /// `add` for a message not seen, `update` for one that changed (a screenshot card that grew).
+    fn diff(&mut self, thread: &[Value]) -> Vec<(&'static str, Value)> {
+        let mut out = vec![];
+        for m in thread.iter().rev().take(60).collect::<Vec<_>>().into_iter().rev() {
+            let id = m["id"].as_str().unwrap_or("").to_string();
+            let body = m.to_string();
+            match self.seen.insert(id, body.clone()) {
+                None => out.push(("add", m.clone())),
+                Some(before) if before != body => out.push(("update", m.clone())),
+                Some(_) => {}
+            }
+        }
+        if self.seen.len() > 500 {
+            let keep: std::collections::HashSet<String> = thread.iter().rev().take(60).filter_map(|m| m["id"].as_str().map(String::from)).collect();
+            self.seen.retain(|k, _| keep.contains(k));
+        }
+        out
     }
 }
 
@@ -1200,6 +1246,16 @@ mod tests {
         assert_eq!((t.as_str(), files.len()), ("what's this?", 2));
         let bad = Request { body: b"nope".to_vec(), ..Default::default() };
         assert_eq!(ask_body(&bad).err().unwrap().status, 400);
+    }
+
+    #[test]
+    fn chat_events_add_and_update() {
+        let mut tail = ChatTail::default();
+        let m = |id: &str, n: usize| json!({ "id": id, "screenshots": vec![0; n] });
+        assert_eq!(tail.diff(&[m("h1", 0), m("h2", 1)]).len(), 2, "the first look: everything is new");
+        assert!(tail.diff(&[m("h1", 0), m("h2", 1)]).is_empty(), "nothing changed: nothing sent");
+        let d = tail.diff(&[m("h1", 0), m("h2", 2), m("h5", 0)]);
+        assert_eq!(d.iter().map(|(op, m)| (*op, m["id"].as_str().unwrap())).collect::<Vec<_>>(), [("update", "h2"), ("add", "h5")]);
     }
 
     #[test]

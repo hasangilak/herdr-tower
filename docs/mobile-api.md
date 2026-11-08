@@ -132,6 +132,7 @@ holds.
 | `GET /v1/spaces` | `tower spaces --json`: `{"focus": name or null, "spaces":[{"space","focus","agenda","unread","running_jobs","sessions":[{"address","name","status","account"}],"last_activity_ms"}]}` |
 | `GET /v1/jobs?status=open\|finished\|all&session=t3&limit=50` | `{"jobs":[{"job","session","name","space","account","status","asked","summary","started_ms","updated_ms"}]}`, newest first. `status`: `working`, `blocked`, `done`, `failed`, `error`, `exited`. |
 | `GET /v1/history?limit=100&session=t3&kind=summary,answer&before_ms=…` | `{"entries":[…]}`, oldest first, the latest `limit`. Page back with `before_ms` = the first entry's `at`. Summaries are `kind=summary`. |
+| `GET /v1/chat?before=h120&limit=50` | `{"messages":[…], "more": bool}`: **the main chat thread**, the same one the Mac panel shows, newest last; `before` pages back (the first message's `id`), `more` says older ones remain. See "The chat" below. |
 | `GET /v1/accounts` | `{"default": name, "accounts":[{"name","email"}]}`, the default first (from the claude-accounts mod; names are not fixed: colour by name). |
 | `GET /v1/screenshots?limit=30&session=t3` | `{"screenshots":[{"id","at","session","name","space","account","job","caption","path","url"}]}`, newest first (still on disk: kept 30 days). |
 | `GET /v1/attachments/{folder}/{name}` | A picture someone sent with a message (the image itself, by its bytes: `image/png`, `image/jpeg`, `image/webp`, `image/gif`). `{folder}/{name}` is the end of its path in a `request` entry's `attachments` (`…/attachments/1794165000000-phone/1-login.png` → `/v1/attachments/1794165000000-phone/1-login.png`), URL-encoded (panel attachments keep their original names, spaces and all). Only files directly in a folder of `attachments/`; `400 bad_path`, `404 no_attachment`, `415 not_an_image` (videos and other files aren't served). |
@@ -231,6 +232,47 @@ may be empty when there are files.
 
 Bodies are 100 MB at most.
 
+## The chat
+
+There is one chat thread, the tower's, on every screen: the Mac panel and
+every phone show the same messages. It lives on the Mac in the history
+(`history.jsonl`, kept across restarts); what the phone sends goes into it
+(marked with its source) and shows in the panel, and the other way round.
+
+A message:
+
+```json
+{
+  "id": "h812", "at": 1794158000000, "updated_at": 1794158000000,
+  "role": "user",                // user | tower | screenshots | event
+  "kind": "request",             // the history's: request, answer, screenshot, watch, alert, job, summary
+  "text": "[Image #1] [File #2: notes.pdf] compare these",
+  "source": "phone:d_9fce5c6c",  // mac (typed in the panel, tower ask) | voice (the Mac's microphone) | phone:<device> | tower
+  "attachments": [
+    {"n": 1, "kind": "image", "name": "1-login.png", "path": "/…/attachments/…/1-login.png", "url": "/v1/attachments/1794-phone/1-login.png"},
+    {"n": 2, "kind": "file",  "name": "2-notes.pdf", "path": "/…/2-notes.pdf", "url": null}
+  ],
+  "screenshots": []
+}
+```
+
+- **user**: what the user asked, typed or spoken, from any screen. The text
+  keeps the panel's tokens; `attachments[n-1]` is the file for token `#n`
+  (`kind` `image`, `video` or `file`; pictures have a `url`).
+- **tower**: an answer. Screenshots it attached (`[shot:…]` in what it
+  wrote; never in `text`) are in `screenshots`:
+  `{"id","caption","session","name","account","at","url"}`.
+- **screenshots**: a card of screenshots a session sent (several sent by
+  the same session within two minutes make one card; `updated_at` moves
+  when one joins). `session`, `name`.
+- **event**: news the panel shows between messages (a watched session
+  finished, a job done or blocked, an alert, a summary), `text` as the
+  panel words it; `session`, `name`, `status`.
+
+`id` is `h<line>`: stable, unique, in order. What the tower is writing
+right now isn't a message yet: the state's `work` (its working line) and
+`said` (what it is saying) show it until the answer lands.
+
 ## Live updates: `GET /v1/events`
 
 Server-Sent Events (`text/event-stream`), one long response. Use OkHttp's
@@ -243,6 +285,7 @@ line of JSON `data`. A comment line `: ping` comes every 10 s.
 | `hello` | `{"api":1,"device":"d_…","voice":bool}`, first |
 | `state` | the whole state, first right after `hello`, then whenever it changes (at most 4 a second) |
 | `history` | one new history entry (as in `/v1/history`), as it's written |
+| `chat` | `{"op": "add"\|"update", "message": {…}}`: a message joined the thread (from the Mac or any phone), or one changed (a screenshot card grew). Messages the phone sent itself come back this way too. |
 | `audio` | voice streams only: `{"id":"a17","kind":"reply"\|"alert"\|"ack"\|"cue","text":"…","ms":1840,"url":"/v1/audio/a17"}` |
 | `hush` | voice streams only: stop playing and drop everything queued |
 | `pause` / `resume` | voice streams only: someone is talking at the Mac (hold playback, then go on) |

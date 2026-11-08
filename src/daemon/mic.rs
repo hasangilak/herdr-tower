@@ -66,7 +66,8 @@ pub enum Source {
     /// `attachments`: images sent with it (saved paths), passed on as the panel does.
     /// `markers`: their tokens (`[Image #1]`, ...). `send`: false only transcribes.
     /// `phone`: the device whose replies are heard on it only (route `phone`).
-    Phone { reply: std::sync::mpsc::Sender<String>, attachments: Vec<String>, markers: Vec<String>, send: bool, phone: Option<String> },
+    /// `device`: the phone that sent it (for the chat).
+    Phone { reply: std::sync::mpsc::Sender<String>, attachments: Vec<String>, markers: Vec<String>, send: bool, phone: Option<String>, device: String },
 }
 
 pub struct Utterance {
