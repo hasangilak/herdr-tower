@@ -14,7 +14,8 @@ use crate::hc;
 
 pub const NAME: &str = "tower";
 pub const VOICE_NAME: &str = "tower-voice";
-pub const PROMPT: &str = include_str!("../assets/tower-prompt.md");
+/// The fixed part of the brain's instructions (the rest are the user's behaviors).
+pub const PROMPT: &str = crate::behaviors::CORE;
 
 /// The brain's terminal: `tower`, or `HERDER_TOWER_BRAIN` (a second tower
 /// beside the first, for trying changes out).
@@ -22,13 +23,33 @@ pub fn name() -> String {
     std::env::var("HERDER_TOWER_BRAIN").ok().filter(|n| !n.is_empty()).unwrap_or_else(|| NAME.into())
 }
 
+/// The brain's instructions, generated from the core and the enabled behaviors.
+pub fn write_prompt() -> Result<()> {
+    let dir = config::brain_dir();
+    std::fs::create_dir_all(&dir)?;
+    let text = crate::behaviors::Store::open().prompt();
+    std::fs::write(dir.join("CLAUDE.md"), &text)?;
+    std::fs::write(dir.join("AGENTS.md"), &text)?;
+    Ok(())
+}
+
 /// Writes the brain's folder: its instructions (CLAUDE.md for Claude Code,
 /// AGENTS.md for Codex) and Claude Code's hooks and permissions.
 pub fn write_files() -> Result<()> {
     let dir = config::brain_dir();
     std::fs::create_dir_all(dir.join(".claude"))?;
-    std::fs::write(dir.join("CLAUDE.md"), PROMPT)?;
-    std::fs::write(dir.join("AGENTS.md"), PROMPT)?;
+    // The tower's own behaviors, first time (and unedited ones that changed);
+    // the brain's memory notes that are standing preferences become behaviors.
+    let store = crate::behaviors::Store::open();
+    let seeded = store.seed()?;
+    if !seeded.is_empty() {
+        eprintln!("behaviors: seeded {}", seeded.join(", "));
+    }
+    let moved = crate::behaviors::migrate_memory(&store, &crate::behaviors::brain_memory_dir())?;
+    if !moved.is_empty() {
+        eprintln!("behaviors: from the brain's memory: {}", moved.join(", "));
+    }
+    write_prompt()?;
     let tower = config::tower_bin();
     let tower = tower.display();
     let settings = json!({
@@ -198,9 +219,10 @@ pub fn question_turn() -> bool {
     QUESTION_TURN.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// A turn's prompt is a `[question]` note (not something the user said).
+/// A turn's prompt is the tower's own quiet note (`[question]`,
+/// `[question-text]`, `[behaviors]`), not something the user said.
 pub fn is_question_prompt(prompt: &str) -> bool {
-    prompt.contains("[question]") && !prompt.contains("[voice]")
+    (prompt.contains("[question]") || prompt.contains("[question-text]") || prompt.contains("[behaviors]")) && !prompt.contains("[voice]")
 }
 
 /// A message from the tower itself (a watch firing).
@@ -221,7 +243,7 @@ pub fn note(text: &str) -> Result<()> {
     // A busy brain takes it after its turn; the transcript says when.
     if status.as_deref() != Some("working") {
         set_watch_turn(text.starts_with("[watch]"));
-        set_question_turn(text.starts_with("[question]"));
+        set_question_turn(text.starts_with("[question") || text.starts_with("[behaviors]"));
     }
     Ok(())
 }

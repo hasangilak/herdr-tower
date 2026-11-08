@@ -33,7 +33,7 @@ pub fn parse(text: &str) -> Vec<(usize, Entry)> {
 pub fn shown(e: &Entry) -> bool {
     !e.held
         && match e.kind.as_str() {
-            "request" | "answer" | "watch" | "alert" | "summary" | "answered" => true,
+            "request" | "answer" | "watch" | "alert" | "summary" | "answered" | "behavior" => true,
             "screenshot" => e.path.is_some(),
             "job" => matches!(e.status.as_deref(), Some("done" | "failed" | "error" | "exited" | "blocked")) && !e.text.is_empty(),
             _ => false,
@@ -89,6 +89,7 @@ fn event_text(e: &Entry) -> String {
         ("alert", _) => e.text.clone(),
         // The tower answered a session's question itself.
         ("answered", _) => format!("{who}: {}", e.text),
+        ("behavior", _) => e.text.clone(),
         ("summary", _) => format!("{who}: {}", e.text),
         _ => {
             let mut t = e.text.clone();
@@ -148,6 +149,9 @@ pub fn thread(lines: &[(usize, Entry)], root: &Path) -> Vec<Value> {
             "id": format!("h{n}"), "at": e.at, "updated_at": e.at, "role": role, "kind": e.kind, "text": text, "source": source,
             "attachments": attachments(e, root), "screenshots": shots,
         });
+        if e.kind == "behavior" {
+            m["diff"] = json!(e.diff);
+        }
         if role == "event" {
             m["session"] = json!(e.session);
             m["name"] = json!(e.name);

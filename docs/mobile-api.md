@@ -136,6 +136,7 @@ holds.
 | `GET /v1/questions` | `{"questions":[…]}`: what blocked sessions ask, as question sets (see [questions.md](questions.md)); also in the state (`questions`; each agent's `question` id). |
 | `GET /v1/questions/{id}` | One set. `404 no_question`. |
 | `GET /v1/questions-policy` | `{"policy": "normal"\|"keep-moving"\|"ask-everything"}`: how questions are handled (also `question_policy` in the state). |
+| `GET /v1/behaviors` | The user's behaviors (how the tower works), the fixed core and a summary; add, edit, enable/disable, remove, preview, undo and history: see [behaviors.md](behaviors.md). |
 | `GET /v1/accounts` | `{"default": name, "accounts":[{"name","email"}]}`, the default first (from the claude-accounts mod; names are not fixed: colour by name). |
 | `GET /v1/screenshots?limit=30&session=t3` | `{"screenshots":[{"id","at","session","name","space","account","job","caption","path","url"}]}`, newest first (still on disk: kept 30 days). |
 | `GET /v1/attachments/{folder}/{name}` | A picture someone sent with a message (the image itself, by its bytes: `image/png`, `image/jpeg`, `image/webp`, `image/gif`). `{folder}/{name}` is the end of its path in a `request` entry's `attachments` (`…/attachments/1794165000000-phone/1-login.png` → `/v1/attachments/1794165000000-phone/1-login.png`), URL-encoded (panel attachments keep their original names, spaces and all). Only files directly in a folder of `attachments/`; `400 bad_path`, `404 no_attachment`, `415 not_an_image` (videos and other files aren't served). |
@@ -294,6 +295,7 @@ line of JSON `data`. A comment line `: ping` comes every 10 s.
 | `state` | the whole state, first right after `hello`, then whenever it changes (at most 4 a second) |
 | `history` | one new history entry (as in `/v1/history`), as it's written |
 | `question` | `{"op": "open"\|"update"\|"closed", "id", "question": {…}}`: a question set appeared, changed (recommendations arrived, the dialog moved to another tab, answering started, finished or stopped) or closed (the session moved on). |
+| `behaviors` | a change: `{at, op, id, title, by, undid, diff}` (the chat also gets a `behavior` card with the diff) |
 | `chat` | `{"op": "add"\|"update", "message": {…}}`: a message joined the thread (from the Mac or any phone), or one changed (a screenshot card grew). Messages the phone sent itself come back this way too. |
 | `audio` | voice streams only: `{"id":"a17","kind":"reply"\|"alert"\|"ack"\|"cue","text":"…","ms":1840,"url":"/v1/audio/a17"}` |
 | `hush` | voice streams only: stop playing and drop everything queued |

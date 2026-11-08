@@ -105,6 +105,11 @@ pub fn choose_ip(cfg: &crate::config::Lan) -> Result<IpAddr> {
 }
 
 impl Lan {
+    /// Who listens over the network (for events other parts of the daemon send).
+    pub fn hub(&self) -> Arc<Hub> {
+        self.ctx.hub.clone()
+    }
+
     pub fn new(ctx: Ctx) -> Lan {
         Self::with_paths(ctx, Devices::path(), Identity::dir())
     }
@@ -303,6 +308,33 @@ impl Lan {
                     Err(e) => Response::error(503, "save", &format!("{e:#}")),
                 }
             }
+            // The user's behaviors (see docs/behaviors.md).
+            ("GET", ["behaviors"]) => Response::json(200, &crate::behaviors::listing()),
+            ("GET", ["behaviors", "history"]) => {
+                let changes: Vec<Value> = crate::behaviors::Store::open().history().iter().rev().take(limit(50)).map(|c| c.view()).collect();
+                Response::json(200, &json!({ "changes": changes }))
+            }
+            ("GET", ["behaviors", id]) => match crate::behaviors::Store::open().get(id) {
+                Some(b) => Response::json(200, &serde_json::to_value(b).unwrap_or_default()),
+                None => Response::error(404, "no_behavior", "no behavior with that id"),
+            },
+            ("POST", ["behaviors"]) => {
+                let v = req.json().unwrap_or_default();
+                let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
+                behavior_change(crate::behaviors::Op::Add { title: s("title"), category: s("category"), summary: s("summary"), text: s("text") })
+            }
+            ("POST", ["behaviors", "undo"]) => behavior_change(crate::behaviors::Op::Undo),
+            // What an edit would change, without saving it.
+            ("POST", ["behaviors", id, "preview"]) => {
+                let Some(b) = crate::behaviors::Store::open().get(id) else { return Some(Response::error(404, "no_behavior", "no behavior with that id")) };
+                let text = req.json().unwrap_or_default()["text"].as_str().unwrap_or(&b.text).to_string();
+                Response::json(200, &json!({ "id": id, "diff": crate::behaviors::diff(&b.text, &text) }))
+            }
+            ("PUT", ["behaviors", id]) => match serde_json::from_slice::<crate::behaviors::Patch>(&req.body) {
+                Ok(patch) => behavior_change(crate::behaviors::Op::Edit { id: id.to_string(), patch }),
+                Err(e) => Response::error(400, "bad_behavior", &format!("{e}")),
+            },
+            ("DELETE", ["behaviors", id]) => behavior_change(crate::behaviors::Op::Remove { id: id.to_string() }),
             // What blocked sessions ask (see docs/questions.md).
             ("GET", ["questions"]) => {
                 let v: Vec<Value> = self.ctx.asks.list().iter().map(|s| serde_json::to_value(s).unwrap_or_default()).collect();
@@ -791,6 +823,22 @@ impl ChatTail {
             self.seen.retain(|k, _| keep.contains(k));
         }
         out
+    }
+}
+
+/// A change to the behaviors from the phone: applied, then the daemon tells everyone.
+fn behavior_change(op: crate::behaviors::Op) -> Response {
+    let adding = matches!(op, crate::behaviors::Op::Add { .. });
+    match crate::behaviors::apply(op, "user") {
+        Ok((b, c)) => {
+            let view = c.view();
+            let _ = crate::protocol::send(&crate::protocol::Request::BehaviorsChanged { by: "user".into(), change: view.clone() });
+            Response::json(if adding { 201 } else { 200 }, &json!({ "behavior": b, "change": view }))
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            Response::error(if msg.starts_with("no behavior") { 404 } else { 400 }, "behavior", &msg)
+        }
     }
 }
 

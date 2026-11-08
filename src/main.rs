@@ -10,6 +10,7 @@ extern crate gpui_kit as gpui;
 mod accounts;
 mod answers;
 mod activity;
+mod behaviors;
 mod brain;
 mod chat;
 mod config;
@@ -143,6 +144,27 @@ enum Cmd {
         last: usize,
         #[arg(long)]
         session: Option<String>,
+    },
+    /// The user's behaviors (how the tower works): list, show <id>, add, edit <id>,
+    /// enable <id>, disable <id>, remove <id>, undo, history.
+    Behavior {
+        /// list | show | add | edit | enable | disable | remove | undo | history | prompt
+        #[arg(default_value = "list")]
+        action: String,
+        /// The behavior's id (show, edit, enable, disable, remove); for add, its text.
+        arg: Vec<String>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        category: Option<String>,
+        /// One plain sentence for the user.
+        #[arg(long)]
+        summary: Option<String>,
+        /// edit: the whole rule, rewritten.
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// What blocked sessions ask, as question sets (JSON). `--session t3`: read that session's dialog now.
     Questions {
@@ -364,6 +386,7 @@ fn run(cli: Cli) -> Result<()> {
             start(account.as_deref(), &name, cwd, on.as_deref(), space.as_deref(), no_watch, &task.join(" "))
         }
         Cmd::Accounts { on } => list_accounts(on.as_deref()),
+        Cmd::Behavior { action, arg, title, category, summary, text, json } => behavior_cmd(&action, &arg, title, category, summary, text, json),
         Cmd::Questions { session } => {
             let v = match session {
                 Some(t) => match daemon::asks::detect(&t) {
@@ -751,6 +774,79 @@ fn placed_space(address: &str) -> Option<String> {
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
     None
+}
+
+/// `tower behavior ...`.
+fn behavior_cmd(action: &str, arg: &[String], title: Option<String>, category: Option<String>, summary: Option<String>, text: Option<String>, json: bool) -> Result<()> {
+    use behaviors::{Op, Patch, Store};
+    let store = Store::open();
+    let id = arg.first().cloned().unwrap_or_default();
+    let need_id = || -> Result<String> {
+        if id.is_empty() {
+            bail!("tower behavior {action} <id> (ids: tower behavior list)");
+        }
+        Ok(id.clone())
+    };
+    let op = match action {
+        "list" | "ls" => {
+            if json || !std::io::stdout().is_terminal() {
+                print_json(&behaviors::listing());
+                return Ok(());
+            }
+            let mut last = String::new();
+            for b in store.list() {
+                if b.category != last {
+                    println!("\n{}", b.category);
+                    last = b.category.clone();
+                }
+                println!("  {} {:<34} {}", if b.enabled { "●" } else { "○" }, b.id, b.summary);
+            }
+            return Ok(());
+        }
+        "show" => {
+            let Some(b) = store.get(&need_id()?) else { bail!("no behavior {id}") };
+            if json || !std::io::stdout().is_terminal() {
+                print_json(&serde_json::to_value(&b)?);
+            } else {
+                println!("{} ({}, {}, {})\n{}\n\n{}", b.title, b.category, b.source, if b.enabled { "on" } else { "off" }, b.summary, b.text.trim());
+            }
+            return Ok(());
+        }
+        "history" => {
+            for c in store.history().iter().rev().take(20) {
+                println!("{} {:<8} {:<30} by {}", c.at, c.op, c.title, c.by);
+            }
+            return Ok(());
+        }
+        "prompt" => {
+            print!("{}", store.prompt());
+            return Ok(());
+        }
+        "add" => {
+            let body = text.unwrap_or_else(|| arg.join(" "));
+            let Some(title) = title else { bail!("tower behavior add --title \"…\" [--category …] [--summary \"…\"] \"<the rule>\"") };
+            Op::Add { title, category: category.unwrap_or_else(|| "Misc".into()), summary: summary.unwrap_or_default(), text: body }
+        }
+        "edit" => Op::Edit { id: need_id()?, patch: Patch { title, category, summary, text, enabled: None } },
+        "enable" | "disable" => Op::Edit { id: need_id()?, patch: Patch { enabled: Some(action == "enable"), ..Default::default() } },
+        "remove" | "rm" | "delete" => Op::Remove { id: need_id()? },
+        "undo" => Op::Undo,
+        other => bail!("tower behavior {other}: use list, show, add, edit, enable, disable, remove, undo, history"),
+    };
+    let by = behaviors::caller();
+    let (b, c) = behaviors::apply(op, by)?;
+    let view = c.view();
+    let _ = protocol::send(&Request::BehaviorsChanged { by: by.into(), change: view.clone() });
+    if json || !std::io::stdout().is_terminal() {
+        print_json(&json!({ "behavior": b, "change": view }));
+    } else {
+        println!("{} {} ({}).", c.op, c.title, c.id);
+        let d = view["diff"].as_str().unwrap_or("");
+        if !d.is_empty() {
+            println!("{d}");
+        }
+    }
+    Ok(())
 }
 
 /// `tower accounts`.

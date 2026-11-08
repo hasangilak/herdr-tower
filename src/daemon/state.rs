@@ -74,6 +74,8 @@ pub struct State {
     /// How questions are handled: `normal` (the 90/10 rule), `keep-moving`
     /// (the brain answers more itself), `ask-everything` (never for the user).
     pub question_policy: String,
+    /// The user's behaviors: `{count, enabled, by_category, updated_ms}`.
+    pub behaviors: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -122,6 +124,7 @@ impl State {
             screenshots: vec![],
             questions: vec![],
             question_policy: "normal".into(),
+            behaviors: serde_json::Value::Null,
         }
     }
 

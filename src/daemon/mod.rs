@@ -95,6 +95,7 @@ pub fn run() -> Result<()> {
         eprintln!("[phone] the phone API didn't start: {e:#}");
     }
     load_screenshots(&shared);
+    shared.update(|s| s.behaviors = crate::behaviors::Store::open().summary());
     {
         let shared = shared.clone();
         thread::Builder::new().name("screenshots".into()).spawn(move || {
@@ -199,6 +200,7 @@ impl Daemon {
                     Err(e) => Response::err(format!("{e:#}")),
                 };
             }
+            Request::BehaviorsChanged { by, change } => self.behaviors_changed(&by, &change),
             Request::Dismiss { id } => {
                 return match self.asks.dismiss(&id) {
                     Ok(()) => Response { ok: true, error: None, state: None },
@@ -268,6 +270,46 @@ fn load_screenshots(shared: &Shared) {
     let list: Vec<serde_json::Value> =
         crate::screenshots::recent(&entries, crate::screenshots::RECENT).into_iter().map(crate::screenshots::row).collect();
     shared.update(|s| s.screenshots = list);
+}
+
+impl Daemon {
+    /// The behaviors changed: the state, the phones, a card in the chat, and
+    /// the brain (told to read its instructions again, when it wasn't the one).
+    fn behaviors_changed(&self, by: &str, change: &serde_json::Value) {
+        let summary = crate::behaviors::Store::open().summary();
+        self.shared.update(|s| s.behaviors = summary);
+        self.lan.hub().broadcast("behaviors", change.clone());
+        let title = change["title"].as_str().unwrap_or("").to_string();
+        let verb = match change["op"].as_str().unwrap_or("") {
+            "add" => "Added",
+            "edit" => "Changed",
+            "enable" => "Turned on",
+            "disable" => "Turned off",
+            "remove" => "Removed",
+            "undo" => "Undid the last change to",
+            other => other,
+        }
+        .to_string();
+        let diff = change["diff"].as_str().map(String::from);
+        crate::history::later(move || {
+            crate::history::append(crate::history::Entry {
+                kind: "behavior".into(),
+                text: format!("{verb} a behavior: {title}"),
+                diff,
+                ..Default::default()
+            })
+        });
+        if by != "brain" {
+            let note = format!(
+                "[behaviors] {} \"{}\": read ~/.config/herder-tower/brain/CLAUDE.md again, and write nothing.",
+                change["op"].as_str().unwrap_or("changed"),
+                change["title"].as_str().unwrap_or("")
+            );
+            std::thread::spawn(move || {
+                let _ = crate::brain::note(&note);
+            });
+        }
+    }
 }
 
 fn ack_delay(cfg: &Config) -> Option<Duration> {

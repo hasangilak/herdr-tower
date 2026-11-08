@@ -76,6 +76,8 @@ pub enum Request {
         #[serde(default)]
         none: bool,
     },
+    /// The behaviors changed (`change`: `behaviors::Change::view`; `by`: user or brain).
+    BehaviorsChanged { by: String, change: serde_json::Value },
     /// The user dismissed a question set.
     Dismiss { id: String },
     /// `normal`, `keep-moving` or `ask-everything`.

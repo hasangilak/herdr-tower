@@ -68,6 +68,9 @@ pub struct Entry {
     /// ask`), `voice` (the Mac's microphone) or `phone:<device id>`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// `behavior`: what changed, line by line (`+ `, `- `, `  `).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
 }
 
 pub fn path() -> PathBuf {

@@ -165,6 +165,19 @@ Every Claude session on this Mac carries its account: `tower agents`,
 account never changes, so it's looked up once per pid and kept in
 `~/.local/state/herder-tower/accounts.json`.
 
+### Behaviors
+
+How the tower works is a list of **behaviors** you can read and change:
+how it talks, hands out and watches work, spaces, accounts, releases and
+safety, which questions it answers for you, screenshots, browsers. Each is a
+short rule with a one-line summary, on or off, in
+`~/.config/herder-tower/behaviors/`; the brain's instructions are generated
+from them (plus a fixed core with its tools). Change them in the panel or
+on the phone, with `tower behavior …`, or just say it: "from now on, always
+…", "change the screenshot behavior to …", "turn off …", "undo that".
+Every change is logged and can be undone, and shows in the chat with what
+changed. Details: [docs/behaviors.md](docs/behaviors.md).
+
 ### Screenshots
 
 Sessions show visual results in the tower: `tower screenshot shot.png
@@ -237,6 +250,7 @@ tower agents                         # every agent on every machine, with its ac
 tower accounts                       # the Claude accounts (from cca)
 tower phone pair                     # pair the Android app (tower phone enable first)
 tower screenshot shot.png --caption "…"  # show a visual result in the panel and on the phone
+tower behavior list                  # how the tower works; add, edit, disable, remove, undo
 tower start --name n --cwd d "task"  # a new Claude session on an account (--account), watched
 tower history [--jobs open|finished] [--session t3]   # what the tower has done (JSON when piped)
 tower job start|done|failed <t> "…"  # record a job (the brain does this)
