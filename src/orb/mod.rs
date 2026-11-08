@@ -17,6 +17,7 @@ mod liquid;
 mod mac;
 mod panel;
 mod render;
+mod shots;
 mod sim;
 
 use std::cell::RefCell;

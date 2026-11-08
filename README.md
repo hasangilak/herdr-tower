@@ -164,6 +164,14 @@ lists them. The brain asks sessions doing visual work to send one; the
 instruction block for sessions is in
 [docs/session-instructions.md](docs/session-instructions.md).
 
+In the panel, **Activity → Shots** is the gallery, newest first: each
+thumbnail with its caption, the session and its account (the session and
+space chips narrow it). A job's screenshots also show small on its card.
+Click one to see it full size over the screen: it fits the screen, a click
+shows it at 100% (scroll to look around), ← and → go through the others,
+and Esc, ✕ or a click outside closes it. Thumbnails are made once, in the
+background, the first time one is shown.
+
 ### The phone
 
 An Android app (in the works) can show the panel and be the tower's voice

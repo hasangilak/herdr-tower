@@ -5,7 +5,9 @@
 //!   the left, and what the sessions reported in between. Type in the pill at
 //!   the bottom: Enter sends, Shift+Enter starts a new line. While you talk,
 //!   what you say appears in it as you say it (the voice daemon's partial
-//!   transcripts), then the final text, which is sent as any voice request.
+//!   transcripts), then the final text, which is sent as any voice request;
+//!   after a draft (typed text, attachments) it is added to the draft, which
+//!   Enter sends whole.
 //! - **Attachments, as in Claude Code and Codex**: paste a screenshot or a
 //!   copied file, drop files on the panel, or pick them with +; each becomes
 //!   a token where the cursor is (`[Image #1]`, `[Video #2]`,
@@ -14,6 +16,9 @@
 //!   paths in token order.
 //! - **Jobs** (the button by the status): what the tower handed out, in
 //!   progress and finished, by space or session.
+//! - **Shots** (in Activity): screenshots sessions sent, as a gallery and on
+//!   their jobs' cards; a click shows one full size (`viewer`).
+//! - **Phone** (the phone button): pairing the Android app (`phone`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -81,6 +86,8 @@ enum Filter {
     Working,
     Done,
     All,
+    /// Screenshots sessions sent.
+    Shots,
 }
 
 /// The orb's own colours (its calm, listening and speaking looks), for
@@ -106,11 +113,26 @@ enum Scope {
 }
 
 mod phone;
+mod gallery;
+mod viewer;
+
+use crate::orb::shots::{self, Shot};
+
+/// A screenshot's thumbnail: being made, made (its file), or it can't be.
+#[derive(Clone)]
+enum Thumb {
+    Making,
+    Ready(PathBuf),
+    Failed,
+}
 
 pub struct Panel {
     tower: Entity<Tower>,
     /// The Phone view (pairing the Android app).
     phone: phone::PhoneView,
+    /// Screenshots in history, newest first (the state's recent list joins them when shown).
+    shots: Vec<Shot>,
+    thumbs: HashMap<PathBuf, Thumb>,
     view: View,
     text: Entity<TextareaState>,
     /// The next attachment's number in this message.
@@ -252,6 +274,8 @@ impl Panel {
         Self {
             tower,
             phone: Default::default(),
+            shots: vec![],
+            thumbs: HashMap::new(),
             view: View::Chat,
             text,
             next: 1,
@@ -418,6 +442,7 @@ impl Panel {
         self.loaded = modified;
         self.entries = history::load();
         self.jobs = history::jobs(&self.entries);
+        self.shots = shots::load();
         let n = chat_items(&self.entries).len();
         if n != self.shown {
             self.shown = n;
@@ -923,6 +948,8 @@ impl Panel {
             .cloned()
             .collect();
 
+        let all_shots = self.all_shots(cx);
+        let gallery: Vec<Shot> = all_shots.iter().filter(|s| fits(&s.session, &s.space)).cloned().collect();
         let filter = self.filter;
         let filters = h_flex()
             .mx_5()
@@ -944,7 +971,13 @@ impl Panel {
             .child(segment("f-all", "All".into(), filter == Filter::All).flex_1().on_click(cx.listener(|this, _, _, cx| {
                 this.filter = Filter::All;
                 cx.notify();
-            })));
+            })))
+            .when(!gallery.is_empty() || filter == Filter::Shots, |el| {
+                el.child(segment("f-shots", format!("Shots · {}", gallery.len()), filter == Filter::Shots).flex_1().on_click(cx.listener(|this, _, _, cx| {
+                    this.filter = Filter::Shots;
+                    cx.notify();
+                })))
+            });
 
         // Sessions that did something, most recent first (and spaces, when there are several).
         let mut spaces: Vec<String> = vec![];
@@ -994,8 +1027,23 @@ impl Panel {
         let now = history::now_ms();
         let mut items: Vec<AnyElement> = vec![];
         match filter {
-            Filter::Working => items.extend(working.iter().map(|j| job_card(j, &g, now, &acc))),
-            Filter::Done => items.extend(done.iter().map(|j| job_card(j, &g, now, &acc))),
+            Filter::Working => {
+                for j in &working {
+                    let strip = self.job_shots(j, &all_shots, cx);
+                    items.push(job_card(j, &g, now, &acc, strip));
+                }
+            }
+            Filter::Done => {
+                for j in &done {
+                    let strip = self.job_shots(j, &all_shots, cx);
+                    items.push(job_card(j, &g, now, &acc, strip));
+                }
+            }
+            Filter::Shots => {
+                if !gallery.is_empty() {
+                    items.push(self.gallery(&gallery, &acc, cx));
+                }
+            }
             Filter::All => {
                 let mut day = String::new();
                 for e in &events {
@@ -1013,6 +1061,7 @@ impl Panel {
                 Filter::Working => ("No work running", "When the tower hands a session a job, it shows here with how long it's been going."),
                 Filter::Done => ("Nothing finished yet", "Finished jobs land here with what came of them."),
                 Filter::All => ("No activity yet", "Jobs, session reports and alerts show up here as they happen."),
+                Filter::Shots => ("No screenshots yet", "When a session shows you what it made (tower screenshot), it lands here."),
             };
             items.push(
                 v_flex()
@@ -1283,15 +1332,23 @@ impl Panel {
             items.push(section(&format!("New while you were elsewhere · {}", fresh.len())).into_any_element());
             items.extend(fresh.iter().map(|e| activity_row(e, &g, &acc)));
         }
-        let jobs: Vec<&Job> = self.jobs.iter().filter(|j| j.space == name).collect();
-        let (running, done): (Vec<&Job>, Vec<&Job>) = jobs.into_iter().partition(|j| j.open());
+        let jobs: Vec<Job> = self.jobs.iter().filter(|j| j.space == name).cloned().collect();
+        let (running, done): (Vec<Job>, Vec<Job>) = jobs.into_iter().partition(|j| j.open());
         if !running.is_empty() {
             items.push(section("Running").into_any_element());
-            items.extend(running.iter().map(|j| job_card(j, &g, now, &acc)));
+            let all_shots = self.all_shots(cx);
+            for j in &running {
+                let strip = self.job_shots(j, &all_shots, cx);
+                items.push(job_card(j, &g, now, &acc, strip));
+            }
         }
         if !done.is_empty() {
             items.push(section("Done").into_any_element());
-            items.extend(done.iter().take(10).map(|j| job_card(j, &g, now, &acc)));
+            let all_shots = self.all_shots(cx);
+            for j in done.iter().take(10) {
+                let strip = self.job_shots(j, &all_shots, cx);
+                items.push(job_card(j, &g, now, &acc, strip));
+            }
         }
         let story: Vec<&Entry> = self
             .entries
@@ -1488,7 +1545,7 @@ fn event_line(e: &Entry, g: &Glass) -> AnyElement {
 }
 
 /// A job: what was asked, of whom, and where it stands.
-fn job_card(j: &Job, g: &Glass, now: u64, acc: &Accounts) -> AnyElement {
+fn job_card(j: &Job, g: &Glass, now: u64, acc: &Accounts, shots: Option<AnyElement>) -> AnyElement {
     let who = if j.name.is_empty() { j.session.clone() } else { j.name.clone() };
     let (mark, color): (AnyElement, Hsla) = match j.status.as_str() {
         "working" => (div().size(px(8.0)).rounded_full().bg(rgb(CYAN)).into_any_element(), rgb(CYAN).into()),
@@ -1530,6 +1587,7 @@ fn job_card(j: &Job, g: &Glass, now: u64, acc: &Accounts) -> AnyElement {
                 .child(div().min_w_0().truncate().text_color(g.muted).child(meta.join(" · ")))
                 .children(j.account.as_deref().or_else(|| acc.of(&j.session)).map(|a| acc.badge(a, g))),
         )
+        .children(shots.map(|s| div().pl(px(24.0)).pt_1().child(s)))
         .into_any_element()
 }
 
