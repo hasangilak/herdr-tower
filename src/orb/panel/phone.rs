@@ -210,6 +210,27 @@ impl Panel {
         .detach();
     }
 
+    /// Where a phone hears the tower's replies: on the phone, or on this Mac.
+    fn phone_route(&mut self, id: String, route: &'static str, cx: &mut Context<Self>) {
+        // Shown at once; the next read of the status says how it went.
+        if let Some(d) = self.phone.status.as_mut().and_then(|s| s.devices.iter_mut().find(|d| d.id == id)) {
+            d.audio_route = route.into();
+        }
+        cx.notify();
+        let task = cx.background_executor().spawn(async move { crate::phone::set_route(&id, route) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Err(e) = result {
+                    this.phone.note = Some((false, format!("{e:#}")));
+                }
+                this.phone.read_at = None;
+                this.phone_refresh(cx);
+            });
+        })
+        .detach();
+    }
+
     fn phone_revoke(&mut self, id: String, cx: &mut Context<Self>) {
         self.phone.busy = true;
         self.phone.revoking = None;
@@ -362,51 +383,92 @@ impl Panel {
             let id = d.id.clone();
             let seen =
                 if d.last_seen_ms == 0 { "never seen".to_string() } else { format!("last seen {}", crate::phone::ago(d.last_seen_ms)) };
-            items.push(
+            // Replies: Phone | Mac.
+            let current = route_of(&d.audio_route);
+            let choice = |route: &'static str, label: &'static str| {
+                let id = d.id.clone();
+                let on = current == route;
+                div()
+                    .id(gpui::SharedString::from(format!("route-{}-{route}", d.id)))
+                    .px_3()
+                    .py(px(2.0))
+                    .rounded_full()
+                    .text_xs()
+                    .when(on, |el| el.bg(rgb(super::PALE)).text_color(rgb(super::NAVY)).font_weight(FontWeight::MEDIUM))
+                    .when(!on, |el| {
+                        el.text_color(g.muted)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgba(0xffffff1f)))
+                            .on_click(cx.listener(move |this, _, _, cx| this.phone_route(id.clone(), route, cx)))
+                    })
+                    .child(label)
+            };
+            let replies = h_flex().pl(px(24.0)).gap_2().items_center().child(div().text_xs().text_color(g.faint).child("Replies")).child(
                 h_flex()
-                    .gap_3()
-                    .items_center()
+                    .p(px(2.0))
+                    .rounded_full()
+                    .bg(rgba(0xffffff14))
+                    .border_1()
+                    .border_color(g.edge)
+                    .child(choice("phone", "Phone"))
+                    .child(choice("mac", "Mac")),
+            );
+            items.push(
+                v_flex()
+                    .gap_2()
                     .px_3()
                     .py_2()
                     .rounded(px(14.0))
                     .bg(g.bubble_tower)
-                    .child(glyph(g.muted.into()))
                     .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).truncate().child(if d.name.is_empty() {
-                                d.id.clone()
-                            } else {
-                                d.name.clone()
-                            }))
-                            .child(div().text_xs().text_color(g.faint).child(seen)),
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(glyph(g.muted.into()))
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).truncate().child(if d.name.is_empty() {
+                                        d.id.clone()
+                                    } else {
+                                        d.name.clone()
+                                    }))
+                                    .child(div().text_xs().text_color(g.faint).child(seen)),
+                            )
+                            .child(
+                                div()
+                                    .id(gpui::SharedString::from(format!("revoke-{}", d.id)))
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .text_sm()
+                                    .when(asking, |el| el.bg(rgb(0xff8f8f)).text_color(rgb(0x16233a)).font_weight(FontWeight::MEDIUM))
+                                    .when(!asking, |el| el.text_color(g.muted).hover(|s| s.bg(rgba(0xffffff1f))))
+                                    .child(if asking { "Revoke?" } else { "Revoke" })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if this.phone.revoking.as_deref() == Some(id.as_str()) {
+                                            this.phone_revoke(id.clone(), cx);
+                                        } else {
+                                            this.phone.revoking = Some(id.clone());
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
                     )
-                    .child(
-                        div()
-                            .id(gpui::SharedString::from(format!("revoke-{}", d.id)))
-                            .px_2()
-                            .py(px(3.0))
-                            .rounded_full()
-                            .cursor_pointer()
-                            .text_sm()
-                            .when(asking, |el| el.bg(rgb(0xff8f8f)).text_color(rgb(0x16233a)).font_weight(FontWeight::MEDIUM))
-                            .when(!asking, |el| el.text_color(g.muted).hover(|s| s.bg(rgba(0xffffff1f))))
-                            .child(if asking { "Revoke?" } else { "Revoke" })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if this.phone.revoking.as_deref() == Some(id.as_str()) {
-                                    this.phone_revoke(id.clone(), cx);
-                                } else {
-                                    this.phone.revoking = Some(id.clone());
-                                }
-                                cx.notify();
-                            })),
-                    )
+                    .child(replies)
                     .into_any_element(),
             );
         }
         body(items)
     }
+}
+
+/// Where a phone hears replies: `mac`, else the phone (the default, and what
+/// an unknown value means).
+pub(super) fn route_of(route: &str) -> &'static str {
+    if route == "mac" { "mac" } else { "phone" }
 }
 
 /// A phone, drawn (the kit's bundled icons have none): a rounded outline
@@ -519,6 +581,14 @@ mod tests {
             }
         }
         assert_eq!(painted, qr.dark);
+    }
+
+    #[test]
+    fn replies_go_to_the_phone_unless_it_says_mac() {
+        assert_eq!(route_of("mac"), "mac");
+        assert_eq!(route_of("phone"), "phone");
+        assert_eq!(route_of(""), "phone");
+        assert_eq!(route_of("speaker"), "phone");
     }
 
     #[test]
