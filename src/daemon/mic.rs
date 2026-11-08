@@ -60,6 +60,10 @@ pub enum Source {
     /// Hands-free: for the tower only after the wake word. `over_speech`:
     /// the tower was talking, so it may be its own echo.
     HandsFree { over_speech: bool },
+    /// Recorded on a paired phone (the phone API): meant for the tower, like
+    /// a press-to-talk take. What was heard goes back on the sender ("" when
+    /// nothing was sent to the brain).
+    Phone(std::sync::mpsc::Sender<String>),
 }
 
 pub struct Utterance {

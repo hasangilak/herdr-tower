@@ -2,6 +2,7 @@
 
 mod book;
 pub mod hotkey;
+pub mod lan;
 pub mod mic;
 pub mod narrate;
 pub mod queue;
@@ -33,6 +34,7 @@ struct Daemon {
     narrator: narrate::Narrator,
     ears: mic::Ears,
     watches: watch::Watches,
+    lan: lan::Lan,
 }
 
 pub fn run() -> Result<()> {
@@ -46,6 +48,7 @@ pub fn run() -> Result<()> {
 
     let model_name = cfg.whisper_model.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let shared = Shared::new(State::new(&cfg.mode, &cfg.voice, &model_name));
+    let hub = std::sync::Arc::new(lan::hub::Hub::default());
     eprintln!("[tower] loading Kokoro ({}) ...", cfg.voice);
     let mouth = tts::start(
         tts::Settings {
@@ -58,6 +61,7 @@ pub fn run() -> Result<()> {
             alert_max_age: Duration::from_secs(cfg.alert_max_age_secs),
         },
         shared.clone(),
+        hub.clone(),
     )?;
     let narrator = narrate::Narrator::start(cfg.narrate, mouth.clone(), cfg.max_spoken_chars);
     eprintln!("[tower] loading Whisper ...");
@@ -74,6 +78,7 @@ pub fn run() -> Result<()> {
         shared.clone(),
         mouth.clone(),
     )?;
+    let lan = lan::Lan::new(lan::Ctx { shared: shared.clone(), mouth: mouth.clone(), hub, ack: ack_delay(&cfg), stt: utt_tx.clone() });
     let ears = mic::start(cfg.mode.clone(), cfg.input_device.clone(), cfg.vad.clone(), shared.clone(), mouth.clone(), utt_tx)?;
     hotkey::start(&cfg.talk_key, ears.clone(), shared.clone(), mouth.clone());
     let watches = watch::Watches::default();
@@ -81,7 +86,12 @@ pub fn run() -> Result<()> {
 
     let listener = UnixListener::bind(&sock).with_context(|| format!("listening on {}", sock.display()))?;
     eprintln!("[tower] ready on {} (mode {})", sock.display(), cfg.mode);
-    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches };
+    if cfg.lan.enabled
+        && let Err(e) = lan.start(&cfg.lan)
+    {
+        eprintln!("[phone] the phone API didn't start: {e:#}");
+    }
+    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan };
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let d = daemon.clone();
@@ -152,6 +162,32 @@ impl Daemon {
             }
             Request::Watch { terminal, note, account } => self.watches.add(&terminal, &note, account),
             Request::Status => {}
+            Request::Phone { action, arg } => {
+                let info = match action.as_str() {
+                    "on" => {
+                        // The config as it is now: `tower phone enable` just wrote it.
+                        let cfg = Config::load().map(|c| c.lan).unwrap_or_else(|_| self.cfg.lan.clone());
+                        match self.lan.start(&cfg) {
+                            Ok(_) => Ok(self.lan.info()),
+                            Err(e) => Err(e),
+                        }
+                    }
+                    "off" => {
+                        self.lan.stop();
+                        Ok(self.lan.info())
+                    }
+                    "pair" => self.lan.pair(),
+                    "revoked" => {
+                        self.lan.revoked(&arg);
+                        Ok(self.lan.info())
+                    }
+                    _ => Ok(self.lan.info()),
+                };
+                return match info {
+                    Ok(v) => Response { ok: true, error: None, state: Some(v) },
+                    Err(e) => Response::err(format!("{e:#}")),
+                };
+            }
             Request::Quit => {
                 let _ = std::fs::remove_file(config::socket_path());
                 self.shared.update(|s| {

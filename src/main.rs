@@ -17,6 +17,7 @@ mod history;
 mod hooks;
 mod install;
 mod orb;
+mod phone;
 mod protocol;
 mod selftest;
 mod spaces;
@@ -105,6 +106,17 @@ enum Cmd {
         /// Another machine's accounts.
         #[arg(long)]
         on: Option<String>,
+    },
+    /// The phone API for the Android app (docs/mobile-api.md): enable, disable, pair, devices, revoke <id|all>.
+    Phone {
+        /// enable | disable | pair | devices | revoke
+        #[arg(default_value = "devices")]
+        action: String,
+        /// revoke: a device id (`tower phone devices`), or `all`.
+        id: Option<String>,
+        /// pair: print the pairing details as JSON (for the orb).
+        #[arg(long)]
+        json: bool,
     },
     /// Speak text.
     Say {
@@ -286,6 +298,7 @@ fn run(cli: Cli) -> Result<()> {
             start(account.as_deref(), &name, cwd, on.as_deref(), space.as_deref(), no_watch, &task.join(" "))
         }
         Cmd::Accounts { on } => list_accounts(on.as_deref()),
+        Cmd::Phone { action, id, json } => phone::cmd(&action, id.as_deref(), json),
         Cmd::Say { text, interrupt, alert } => {
             ok(Request::Say { text: text.join(" "), interrupt, kind: if alert { "alert".into() } else { String::new() } })
         }
@@ -384,10 +397,7 @@ fn show_history(jobs: Option<&str>, session: Option<&str>, n: usize) -> Result<(
                 );
             }
         } else {
-            let rows: Vec<Value> = list
-                .iter()
-                .map(|j| json!({ "job": j.id, "session": j.session, "name": j.name, "space": j.space, "account": j.account, "status": j.status, "asked": j.title, "summary": j.summary, "started_ms": j.started, "updated_ms": j.updated }))
-                .collect();
+            let rows: Vec<Value> = list.iter().map(|j| j.row()).collect();
             print_json(&json!(rows));
         }
         return Ok(());
@@ -418,6 +428,35 @@ fn print_json(v: &Value) {
 
 /// Every agent, here and on each machine, in one list.
 fn agents(all: bool) -> Result<()> {
+    let (rows, errors) = agent_rows(all);
+    if std::io::stdout().is_terminal() {
+        for r in &rows {
+            println!(
+                "{:<12} {:<9} {:<12} {:<10} {}  {}",
+                r["address"].as_str().unwrap_or(""),
+                r["status"].as_str().unwrap_or("-"),
+                r["agent"].as_str().unwrap_or(""),
+                r["account"].as_str().unwrap_or("-"),
+                r["folder"].as_str().unwrap_or(""),
+                r["title"].as_str().unwrap_or("")
+            );
+        }
+        for e in &errors {
+            println!("! {}: {}", e["machine"].as_str().unwrap_or(""), e["error"].as_str().unwrap_or(""));
+        }
+    } else {
+        print_json(&json!({ "agents": rows, "unreachable": errors }));
+    }
+    Ok(())
+}
+
+/// `tower agents` as JSON (the phone API serves it too).
+pub fn agents_value(all: bool) -> Value {
+    let (rows, errors) = agent_rows(all);
+    json!({ "agents": rows, "unreachable": errors })
+}
+
+fn agent_rows(all: bool) -> (Vec<Value>, Vec<Value>) {
     let mut rows = Vec::new();
     let mut errors = Vec::new();
     let mut lists = vec![(None, hc::list_on(None))];
@@ -458,25 +497,7 @@ fn agents(all: bool) -> Result<()> {
             Err(e) => errors.push(json!({ "machine": machine, "error": format!("{e:#}") })),
         }
     }
-    if std::io::stdout().is_terminal() {
-        for r in &rows {
-            println!(
-                "{:<12} {:<9} {:<12} {:<10} {}  {}",
-                r["address"].as_str().unwrap_or(""),
-                r["status"].as_str().unwrap_or("-"),
-                r["agent"].as_str().unwrap_or(""),
-                r["account"].as_str().unwrap_or("-"),
-                r["folder"].as_str().unwrap_or(""),
-                r["title"].as_str().unwrap_or("")
-            );
-        }
-        for e in &errors {
-            println!("! {}: {}", e["machine"].as_str().unwrap_or(""), e["error"].as_str().unwrap_or(""));
-        }
-    } else {
-        print_json(&json!({ "agents": rows, "unreachable": errors }));
-    }
-    Ok(())
+    (rows, errors)
 }
 
 /// `tower start`: a Claude Code session on an account, through `cca <account>`.

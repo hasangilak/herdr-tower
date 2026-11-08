@@ -24,6 +24,7 @@ use anyhow::{Context, Result};
 use rodio::Player;
 use rodio::buffer::SamplesBuffer;
 
+use super::lan::hub::Hub;
 use super::queue::{Kind, Queue};
 use super::state::{Shared, now_ms};
 use super::timing;
@@ -71,6 +72,8 @@ pub struct Mouth {
     hushes: Arc<AtomicU64>,
     held: Arc<AtomicU8>,
     player: Arc<Player>,
+    /// Paired phones; while one is the voice, speech goes there instead.
+    hub: Arc<Hub>,
 }
 
 impl Mouth {
@@ -122,6 +125,7 @@ impl Mouth {
         if self.held.load(Ordering::SeqCst) == 0 {
             self.player.play();
         }
+        self.hub.to_voice("hush", serde_json::json!({}));
         let _ = self.tx.send(Msg::Hush);
     }
 
@@ -132,9 +136,11 @@ impl Mouth {
         if on {
             if self.held.fetch_or(bit, Ordering::SeqCst) & bit == 0 {
                 self.player.pause();
+                self.hub.to_voice("pause", serde_json::json!({}));
             }
         } else if self.held.fetch_and(!bit, Ordering::SeqCst) == bit {
             self.player.play();
+            self.hub.to_voice("resume", serde_json::json!({}));
         }
     }
 
@@ -155,6 +161,25 @@ impl Mouth {
     }
 }
 
+#[cfg(test)]
+impl Mouth {
+    /// A mouth that says nothing (no speakers, no Kokoro), for tests.
+    pub fn silent(hub: Arc<Hub>) -> Mouth {
+        let (tx, rx) = channel();
+        // Messages are dropped unread.
+        std::mem::forget(rx);
+        let (player, _out) = Player::new();
+        Mouth {
+            tx,
+            generation: Arc::new(AtomicU64::new(0)),
+            hushes: Arc::new(AtomicU64::new(0)),
+            held: Arc::new(AtomicU8::new(0)),
+            player: Arc::new(player),
+            hub,
+        }
+    }
+}
+
 pub struct Settings {
     pub voice: String,
     pub speed: f32,
@@ -172,7 +197,7 @@ pub struct Settings {
 
 /// Starts the speech thread. Kokoro loads (and on first use downloads,
 /// about 330 MB) before this returns, so the first sentence is quick.
-pub fn start(settings: Settings, shared: Shared) -> Result<Mouth> {
+pub fn start(settings: Settings, shared: Shared, hub: Arc<Hub>) -> Result<Mouth> {
     let sink = rodio::DeviceSinkBuilder::open_default_sink().context("opening the speakers")?;
     let player = Arc::new(Player::connect_new(sink.mixer()));
     let bell = Player::connect_new(sink.mixer());
@@ -184,7 +209,7 @@ pub fn start(settings: Settings, shared: Shared) -> Result<Mouth> {
     engine
         .speak(&loqui::SpeakRequest { voice: settings.voice.clone(), speed: settings.speed, ..loqui::SpeakRequest::new("Ready.") })
         .with_context(|| format!("trying voice {:?}", settings.voice))?;
-    let acks: Vec<Vec<f32>> = settings
+    let acks: Vec<(String, Vec<f32>)> = settings
         .acks
         .iter()
         .filter_map(|a| {
@@ -194,7 +219,7 @@ pub fn start(settings: Settings, shared: Shared) -> Result<Mouth> {
                 format: loqui::Format::Pcm,
                 ..loqui::SpeakRequest::new(a.clone())
             };
-            engine.speak(&req).map_err(|e| eprintln!("[tts] ack {a:?}: {e}")).ok().map(|s| pcm(&s.audio))
+            engine.speak(&req).map_err(|e| eprintln!("[tts] ack {a:?}: {e}")).ok().map(|s| (a.clone(), pcm(&s.audio)))
         })
         .collect();
 
@@ -205,6 +230,7 @@ pub fn start(settings: Settings, shared: Shared) -> Result<Mouth> {
         hushes: Arc::new(AtomicU64::new(0)),
         held: Arc::new(AtomicU8::new(0)),
         player: player.clone(),
+        hub: hub.clone(),
     };
     let speech = Speech {
         engine,
@@ -217,6 +243,8 @@ pub fn start(settings: Settings, shared: Shared) -> Result<Mouth> {
         held: mouth.held.clone(),
         shared,
         playing: VecDeque::new(),
+        hub,
+        routed: VecDeque::new(),
         awaiting: None,
         ack: None,
         acked: false,
@@ -239,7 +267,7 @@ struct Speech {
     engine: loqui::Engine,
     q: Queue,
     settings: Settings,
-    acks: Vec<Vec<f32>>,
+    acks: Vec<(String, Vec<f32>)>,
     player: Arc<Player>,
     bell: Player,
     generation: Arc<AtomicU64>,
@@ -247,6 +275,9 @@ struct Speech {
     shared: Shared,
     /// The kind of each sound in the player, oldest (playing) first.
     playing: VecDeque<Kind>,
+    hub: Arc<Hub>,
+    /// Sent to the phone instead: when each will have played, and its kind.
+    routed: VecDeque<(Instant, Kind)>,
     /// The user waits for an answer since then: alerts wait too.
     awaiting: Option<Instant>,
     ack: Option<(Instant, u64)>,
@@ -315,7 +346,7 @@ impl Speech {
             self.maybe_ack();
             // One sentence ahead of the one playing is enough: what comes in
             // meanwhile can still go first.
-            if self.player.len() > 1 {
+            if self.out_len() > 1 {
                 continue;
             }
             self.speak_next();
@@ -352,6 +383,8 @@ impl Speech {
                 if interrupt {
                     self.generation.fetch_add(1, Ordering::SeqCst);
                     self.player.clear();
+                    self.routed.clear();
+                    self.hub.to_voice("hush", serde_json::json!({}));
                     if self.held.load(Ordering::SeqCst) == 0 {
                         self.player.play();
                     }
@@ -372,6 +405,7 @@ impl Speech {
                 }
             }
             Msg::Hush => {
+                self.routed.clear();
                 let n = self.q.clear();
                 if n > 0 {
                     eprintln!("[speech] hushed: dropped {n} waiting");
@@ -413,9 +447,9 @@ impl Speech {
         if self.replies_started != before {
             return;
         }
-        let clip = self.acks[self.next_ack % self.acks.len()].clone();
+        let (text, clip) = self.acks[self.next_ack % self.acks.len()].clone();
         self.next_ack += 1;
-        self.append(Kind::Reply, clip);
+        self.append(Kind::Reply, clip, &text, "ack");
         self.acked = true;
         timing::mark("acknowledged");
     }
@@ -427,9 +461,9 @@ impl Speech {
         let Some(next) = self.q.next(alerts_may, status) else { return };
         let generation = self.generation.load(Ordering::SeqCst);
         if next.kind == Kind::Alert {
-            let in_a_row = self.last_alert.is_some_and(|t| t.elapsed() < Duration::from_secs(4)) && !self.player.empty();
+            let in_a_row = self.last_alert.is_some_and(|t| t.elapsed() < Duration::from_secs(4)) && self.out_len() > 0;
             if next.first && self.settings.cue && !in_a_row {
-                self.append(Kind::Alert, cue());
+                self.append(Kind::Alert, cue(), "", "cue");
             }
             self.last_alert = Some(Instant::now());
         } else if next.first {
@@ -454,7 +488,8 @@ impl Speech {
                 if self.generation.load(Ordering::SeqCst) != generation {
                     return;
                 }
-                self.append(next.kind, pcm(&speech.audio));
+                let label = if next.kind == Kind::Alert { "alert" } else { "reply" };
+                self.append(next.kind, pcm(&speech.audio), &next.text, label);
                 if next.kind == Kind::Reply {
                     timing::mark("first words playing");
                 }
@@ -463,10 +498,29 @@ impl Speech {
         }
     }
 
-    fn append(&mut self, kind: Kind, samples: Vec<f32>) {
-        self.player.append(SamplesBuffer::new(NonZero::new(1).unwrap(), NonZero::new(RATE).unwrap(), samples));
-        self.playing.push_back(kind);
+    /// Plays a sound: here, or on the phone that is the voice (the Mac
+    /// stays silent). `text` is what it says; `label` what it is (`reply`,
+    /// `alert`, `ack`, `cue`), for the phone.
+    fn append(&mut self, kind: Kind, samples: Vec<f32>, text: &str, label: &str) {
+        if self.hub.voice() {
+            let dur = Duration::from_secs_f32(samples.len() as f32 / RATE as f32);
+            let start = self.routed.back().map(|(end, _)| *end).filter(|end| *end > Instant::now()).unwrap_or_else(Instant::now);
+            self.hub.push_audio(label, text, &samples, RATE);
+            self.routed.push_back((start + dur, kind));
+        } else {
+            self.player.append(SamplesBuffer::new(NonZero::new(1).unwrap(), NonZero::new(RATE).unwrap(), samples));
+            self.playing.push_back(kind);
+        }
         self.publish();
+    }
+
+    /// Sounds still to play, here and (by the clock) on the phone.
+    fn out_len(&mut self) -> usize {
+        let now = Instant::now();
+        while self.routed.front().is_some_and(|(end, _)| *end <= now) {
+            self.routed.pop_front();
+        }
+        self.player.len() + self.routed.len()
     }
 
     /// Speaking or not, and whether it's an alert (the orb shows which).
@@ -475,8 +529,9 @@ impl Speech {
         while self.playing.len() > left {
             self.playing.pop_front();
         }
-        let speaking = left > 0;
-        let announcing = speaking && self.playing.front() == Some(&Kind::Alert);
+        let speaking = self.out_len() > 0;
+        let front = if left > 0 { self.playing.front() } else { self.routed.front().map(|(_, k)| k) };
+        let announcing = speaking && front == Some(&Kind::Alert);
         if self.published == Some((speaking, announcing)) {
             return;
         }

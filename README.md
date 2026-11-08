@@ -153,6 +153,16 @@ Every Claude session on this Mac carries its account: `tower agents`,
 account never changes, so it's looked up once per pid and kept in
 `~/.local/state/herder-tower/accounts.json`.
 
+### The phone
+
+An Android app (in the works) can show the panel and be the tower's voice
+over the local network: `tower phone enable`, then `tower phone pair` and
+scan the QR. It is off by default, HTTPS only (the phone pins the Mac's
+certificate), on the Mac's private LAN address only, and every call needs a
+paired phone's token (`tower phone revoke` forgets one). While a phone is the
+voice, the Mac stays silent and the tower speaks on the phone. The API, the
+pairing flow and the security model: [docs/mobile-api.md](docs/mobile-api.md).
+
 From a shell (or a Raycast/skhd hotkey outside Herdr):
 
 ```sh
@@ -161,6 +171,7 @@ tower ask "what's waiting for me?"   # typed instead of spoken
 tower say "hello"                    # speak anything
 tower agents                         # every agent on every machine, with its account (JSON when piped)
 tower accounts                       # the Claude accounts (from cca)
+tower phone pair                     # pair the Android app (tower phone enable first)
 tower start --name n --cwd d "task"  # a new Claude session on an account (--account), watched
 tower history [--jobs open|finished] [--session t3]   # what the tower has done (JSON when piped)
 tower job start|done|failed <t> "…"  # record a job (the brain does this)

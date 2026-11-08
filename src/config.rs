@@ -120,6 +120,8 @@ pub struct Config {
     pub codex_args: Vec<String>,
     pub vad: Vad,
     pub alerts: Alerts,
+    /// The phone API (`tower phone`): off unless enabled.
+    pub lan: Lan,
     /// How many characters of a reply are read aloud at most.
     pub max_spoken_chars: usize,
     /// Said the moment a request reaches the brain, in turn ("Got it.").
@@ -203,6 +205,7 @@ impl Default for Config {
             codex_args: vec![],
             vad: Vad::default(),
             alerts: Alerts::default(),
+            lan: Lan::default(),
             max_spoken_chars: 900,
             ack: ["Got it.", "Okay.", "Sure."].map(String::from).to_vec(),
             ack_delay_ms: 0,
@@ -225,6 +228,27 @@ impl Default for Vad {
             ptt_no_speech_ms: 8000,
             max_utterance_ms: 60_000,
         }
+    }
+}
+
+/// The phone API, for the Android app (docs/mobile-api.md).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Lan {
+    /// Off unless turned on (`tower phone enable`).
+    pub enabled: bool,
+    pub port: u16,
+    /// The address to listen on: `auto` (this Mac's address on the local
+    /// network, the one its default route uses) or an IP of this Mac.
+    pub bind: String,
+    /// Listen on an address that isn't private (10/8, 172.16/12, 192.168/16,
+    /// 100.64/10, link-local). Leave off.
+    pub allow_public: bool,
+}
+
+impl Default for Lan {
+    fn default() -> Self {
+        Self { enabled: false, port: 7843, bind: "auto".into(), allow_public: false }
     }
 }
 

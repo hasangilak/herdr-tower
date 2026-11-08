@@ -56,6 +56,10 @@ pub struct State {
     pub talk_key: String,
     pub voice: String,
     pub stt_model: String,
+    /// The phone API's address (`https://192.168.1.20:7843`), or "" when it's off.
+    pub lan: String,
+    /// The paired phone that is the tower's voice now (the Mac is silent), or null.
+    pub phone: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -95,6 +99,8 @@ impl State {
             talk_key: "off".into(),
             voice: voice.into(),
             stt_model: stt_model.into(),
+            lan: String::new(),
+            phone: None,
         }
     }
 
@@ -178,6 +184,10 @@ impl Shared {
     }
 
     fn publish(&self) {
+        // Tests never touch the live state.json.
+        if cfg!(test) {
+            return;
+        }
         let v = self.json();
         let dir = config::ui_dir();
         let _ = std::fs::create_dir_all(&dir);

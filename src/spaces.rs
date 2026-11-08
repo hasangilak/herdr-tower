@@ -315,7 +315,24 @@ pub fn cmd_agenda(space: String, text: String) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_spaces() -> Result<()> {
+/// Every space, as `tower spaces` prints it when piped (and the phone API serves it).
+pub fn spaces_value() -> Value {
+    let (focus, rows) = rows();
+    json!({ "focus": focus, "spaces": rows })
+}
+
+/// Focuses a space (None: no focus). Returns the focused space's full name.
+pub fn set_focus(space: Option<&str>) -> Result<Option<String>> {
+    let mut s = load();
+    s.focus = match space.map(str::trim).filter(|w| !w.is_empty()) {
+        Some(want) => Some(pick(want)?),
+        None => None,
+    };
+    save(&s);
+    Ok(s.focus)
+}
+
+fn rows() -> (Option<String>, Vec<Value>) {
     let s = load();
     let entries = history::load();
     let live = live();
@@ -342,6 +359,11 @@ pub fn cmd_spaces() -> Result<()> {
             })
         })
         .collect();
+    (s.focus, rows)
+}
+
+pub fn cmd_spaces() -> Result<()> {
+    let (focus, rows) = rows();
     if std::io::stdout().is_terminal() {
         for r in &rows {
             let busy = r["sessions"].as_array().map(|a| a.iter().filter(|t| t["status"] == "working").count()).unwrap_or(0);
@@ -354,11 +376,11 @@ pub fn cmd_spaces() -> Result<()> {
                 r["agenda"].as_str().unwrap_or("")
             );
         }
-        if s.focus.is_none() {
+        if focus.is_none() {
             println!("(no focus: every space's news is spoken)");
         }
     } else {
-        println!("{}", serde_json::to_string_pretty(&json!({ "focus": s.focus, "spaces": rows }))?);
+        println!("{}", serde_json::to_string_pretty(&json!({ "focus": focus, "spaces": rows }))?);
     }
     Ok(())
 }

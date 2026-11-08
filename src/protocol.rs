@@ -47,6 +47,12 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<String>,
     },
+    /// The phone API: `on`, `off`, `pair`, `revoked` (arg: device id), `status`.
+    Phone {
+        action: String,
+        #[serde(default)]
+        arg: String,
+    },
     Status,
     Quit,
 }

@@ -238,6 +238,16 @@ pub fn jobs(entries: &[Entry]) -> Vec<Job> {
     out
 }
 
+impl Job {
+    /// As `tower history --jobs` prints it when piped (and the phone API serves it).
+    pub fn row(&self) -> serde_json::Value {
+        serde_json::json!({
+            "job": self.id, "session": self.session, "name": self.name, "space": self.space, "account": self.account,
+            "status": self.status, "asked": self.title, "summary": self.summary, "started_ms": self.started, "updated_ms": self.updated,
+        })
+    }
+}
+
 const ATTACHED: &str = " [attached: ";
 
 /// One line for the brain: the message, then the files attached to it.

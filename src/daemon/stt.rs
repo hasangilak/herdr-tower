@@ -96,6 +96,15 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
                     }
                     let _ = deliver(&shared, &mouth, heard.trim(), settings.ack);
                 }
+                Source::Phone(reply) => {
+                    if is_stop {
+                        mouth.hush();
+                        continue;
+                    }
+                    if deliver(&shared, &mouth, heard.trim(), settings.ack).is_ok() {
+                        let _ = reply.send(heard.trim().to_string());
+                    }
+                }
                 Source::HandsFree { over_speech } => {
                     if over_speech || shared.get().speaking {
                         // Probably the tower hearing itself; only a stop word
