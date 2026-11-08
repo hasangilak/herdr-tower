@@ -8,6 +8,7 @@
 extern crate gpui_kit as gpui;
 
 mod accounts;
+mod answers;
 mod activity;
 mod brain;
 mod chat;
@@ -388,10 +389,7 @@ fn run(cli: Cli) -> Result<()> {
                     Err(stop) => bail!("stopped at {stop}"),
                 };
             }
-            let r = protocol::send(&Request::Answer { target, answers, submit: !no_submit })?;
-            if !r.ok {
-                bail!("{}", r.error.unwrap_or_default());
-            }
+            answers::answer(&target, answers, !no_submit)?;
             println!("Answered{}.", if no_submit { " (filled in, not sent)" } else { "" });
             Ok(())
         }
@@ -419,10 +417,7 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Dismiss { id } => {
-            let r = protocol::send(&Request::Dismiss { id: id.clone() })?;
-            if !r.ok {
-                bail!("{}", r.error.unwrap_or_default());
-            }
+            answers::dismiss(&id)?;
             println!("Dismissed {id}.");
             Ok(())
         }
@@ -432,11 +427,7 @@ fn run(cli: Cli) -> Result<()> {
                 println!("{}", now.unwrap_or_else(|| config::Config::load().map(|c| c.question_policy).unwrap_or_else(|_| "normal".into())));
                 return Ok(());
             };
-            if !["normal", "keep-moving", "ask-everything"].contains(&p.as_str()) {
-                bail!("tower policy normal|keep-moving|ask-everything");
-            }
-            phone::set_question_policy(&p)?;
-            let _ = protocol::send(&Request::Policy { policy: p.clone() });
+            answers::set_policy(&p)?;
             println!("Questions: {p}.");
             Ok(())
         }
