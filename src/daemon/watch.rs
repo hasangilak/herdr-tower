@@ -324,6 +324,13 @@ impl Radar {
         if is_voice || app.is_empty() {
             return;
         }
+        // A test session (the tower's own fixtures): seen, never announced.
+        if is_test(t) {
+            if live && !status.is_empty() {
+                self.watches.seen(&address, &status);
+            }
+            return;
+        }
         if live && !status.is_empty() {
             self.watches.seen(&address, &status);
         }
@@ -413,7 +420,7 @@ impl Radar {
     /// question (trusting its folder) holds it: treat that as needing a person.
     fn check_startup(&self, address: &str, t: &Value) {
         let program = t["argv"][0].as_str().unwrap_or("").rsplit('/').next().unwrap_or("").to_string();
-        if !["claude", "codex"].contains(&program.as_str()) || t["name"].as_str() == Some(brain::NAME) {
+        if !["claude", "codex"].contains(&program.as_str()) || t["name"].as_str() == Some(brain::NAME) || is_test(t) {
             return;
         }
         let me = self.clone();
@@ -663,6 +670,13 @@ fn down_why(status: &str, was: &str) -> String {
     }
 }
 
+/// A test session: labelled `tower.test`, or named `qfix-…`. It never raises
+/// an alert, a trust notice or a question (start one with
+/// `hc run --label tower.test=1 --name qfix-…`).
+pub fn is_test(t: &Value) -> bool {
+    t["labels"].get("tower.test").is_some() || t["name"].as_str().is_some_and(|n| n.starts_with("qfix-"))
+}
+
 fn say_status(status: &str) -> &str {
     match status {
         "blocked" => "waiting for you",
@@ -670,5 +684,19 @@ fn say_status(status: &str) -> &str {
         "error" => "stuck on an error",
         "" => "stopped",
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_test;
+    use serde_json::json;
+
+    #[test]
+    fn test_sessions_are_known_by_label_or_name() {
+        assert!(is_test(&json!({ "name": "qfix-ask", "labels": {} })));
+        assert!(is_test(&json!({ "name": "anything", "labels": { "tower.test": "1" } })));
+        assert!(!is_test(&json!({ "name": "orb-rust", "labels": { "herdr.space": "sp1" } })));
+        assert!(!is_test(&json!({ "address": "t3" })));
     }
 }
