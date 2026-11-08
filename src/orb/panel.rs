@@ -127,8 +127,8 @@ pub struct Panel {
     prev_read: u64,
     /// Herdr's spaces and their sessions (`herdr-app ls`), refreshed while the panel is open.
     live: Vec<crate::spaces::Live>,
-    /// The account sessions run on when none is named (`cca ls --json`'s
-    /// `current`), shown quietly; refreshed while the panel is open.
+    /// The account sessions run on when none is named (the first `tower
+    /// accounts` lists), shown quietly; re-read while the panel is open.
     default_account: Option<String>,
     _subs: Vec<Subscription>,
     _poll: Task<()>,
@@ -1329,7 +1329,7 @@ fn job_card(j: &Job, g: &Glass, now: u64, acc: &Accounts) -> AnyElement {
                 .text_xs()
                 .child(div().flex_none().text_color(color).child(when))
                 .child(div().min_w_0().truncate().text_color(g.muted).child(meta.join(" · ")))
-                .children(acc.of(&j.session).map(|a| acc.badge(a, g))),
+                .children(j.account.as_deref().or_else(|| acc.of(&j.session)).map(|a| acc.badge(a, g))),
         )
         .into_any_element()
 }
@@ -1354,13 +1354,13 @@ fn activity_row(e: &Entry, g: &Glass, acc: &Accounts) -> AnyElement {
         .child(div().w(px(52.0)).flex_none().pt(px(1.0)).text_xs().text_color(g.faint).child(clock(e.at)))
         .child(div().pt(px(2.0)).child(Icon::new(icon).xsmall().text_color(rgb(color))))
         .child(div().flex_1().min_w_0().text_sm().line_clamp(4).child(text))
-        .children(e.session.as_deref().and_then(|s| acc.of(s)).map(|a| div().pt(px(1.0)).flex_none().child(acc.badge(a, g))))
+        .children(e.account.as_deref().or_else(|| e.session.as_deref().and_then(|s| acc.of(s))).map(|a| div().pt(px(1.0)).flex_none().child(acc.badge(a, g))))
         .into_any_element()
 }
 
-/// Which Claude account each session runs on (`default`, `orca`), from the
-/// radar's `account` field; Codex and unknown sessions have none. Tolerates
-/// the field missing (older daemons): then nothing is shown.
+/// Which Claude account each session runs on, from the radar's `account`
+/// field (a name as `tower accounts` lists it); Codex, other machines and
+/// unknown sessions have none. Tolerates the field missing: nothing is shown.
 #[derive(Default)]
 struct Accounts {
     by_session: HashMap<String, String>,
@@ -1464,12 +1464,10 @@ fn account_hue(name: &str) -> u32 {
     ACCOUNT_HUES[h as usize % ACCOUNT_HUES.len()]
 }
 
-/// The claude-accounts mod's default account (`cca ls --json`'s `current`),
-/// or None without the mod.
+/// The default Claude account (the first the claude-accounts mod lists, as
+/// `tower accounts` has it), or None without the mod.
 fn default_account() -> Option<String> {
-    let out = Command::new("cca").args(["ls", "--json"]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    v["current"].as_str().filter(|s| !s.is_empty()).map(String::from)
+    crate::accounts::list().ok()?.into_iter().next().map(|a| a.name)
 }
 
 #[cfg(test)]

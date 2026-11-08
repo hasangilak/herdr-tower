@@ -104,9 +104,9 @@ starts a job, the watch report ends it, the brain adds the outcome
 Each Claude session, job and history row carries a small badge naming the
 Claude account it runs on (the `account` the radar reports per agent); Codex
 sessions have none. The panel has no list of accounts of its own: it shows
-whatever name the data carries, outlines the claude-accounts mod's default
-(`cca ls --json`, re-read every 30 s) and fills any other account with a colour
-picked from its name, so a new account needs no change here. A space shows its
+whatever name the data carries, outlines the default account (the first
+`tower accounts` lists, re-read every 30 s) and fills any other account with a
+colour picked from its name, so a new account needs no change here. A space shows its
 account when all its Claude sessions share one, and "mixed" when they differ.
 
 Things to say: "What's everyone doing?", "Tell the eyzflow session to run
