@@ -318,7 +318,7 @@ impl Panel {
         self.open_sets(cx).iter().map(|s| self.question_card(s, acc, cx)).collect()
     }
 
-    fn question_card(&mut self, set: &QuestionSet, acc: &Accounts, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn question_card(&mut self, set: &QuestionSet, acc: &Accounts, cx: &mut Context<Self>) -> AnyElement {
         let g = glass();
         let n = set.tabs.len();
         let id = set.id.clone();

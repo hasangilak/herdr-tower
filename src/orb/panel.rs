@@ -83,6 +83,8 @@ enum View {
     Behaviors,
     /// Screenshots sessions sent, as a gallery.
     Shots,
+    /// One session, from the Active now row.
+    Session,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -118,6 +120,7 @@ enum Scope {
 mod phone;
 mod activity;
 mod behaviors;
+mod now;
 mod gallery;
 mod questions;
 mod viewer;
@@ -142,6 +145,8 @@ pub struct Panel {
     behaviors: behaviors::BehaviorsUi,
     /// The Activity tab's filter and open rows.
     act: activity::ActivityUi,
+    /// The Active now row and the session it opened.
+    session: now::SessionUi,
     /// The input's placeholder as set (it depends on the view and the voice).
     placeholder: &'static str,
     /// The input the voice writes in this take: the message, or a question's "Other".
@@ -284,6 +289,9 @@ impl Panel {
                     if this.view == View::Behaviors {
                         this.behaviors_tick(cx);
                     }
+                    if this.view == View::Session {
+                        this.session_tick(cx);
+                    }
                     // The listening timer and running jobs' elapsed times tick.
                     let working = this.tower.read(cx).work.is_some();
                     if working || this.listening_since.is_some() || (this.view == View::Activity && this.jobs.iter().any(|j| j.open())) {
@@ -304,6 +312,7 @@ impl Panel {
             asks: Default::default(),
             behaviors: Default::default(),
             act: Default::default(),
+            session: Default::default(),
             placeholder: "Message the tower…",
             voice_field: None,
             take_open: false,
@@ -706,6 +715,7 @@ impl Render for Panel {
             View::Chat => self.chat_view(cx),
             View::Activity => self.activity_view(window, cx),
             View::Shots => self.shots_view(window, cx),
+            View::Session => self.session_view(window, cx),
             View::Spaces => self.spaces_view(cx),
             View::Phone => self.phone_view(cx),
             View::Behaviors => self.behaviors_view(window, cx),
@@ -724,7 +734,8 @@ impl Render for Panel {
         }
         // Pairing needs the room; there's nothing to send from there.
         let input = if self.view == View::Phone || (self.view == View::Behaviors && self.behaviors.editing()) { div().into_any_element() } else { self.input(window, cx) };
-        let header = self.header(cx);
+        let now = self.now_strip(window, cx);
+        let header = self.header(now, cx);
         v_flex()
             .id("tower-panel")
             .size_full()
@@ -747,7 +758,7 @@ impl Render for Panel {
 }
 
 impl Panel {
-    fn header(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn header(&mut self, now: AnyElement, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let g = glass();
         let t = self.tower.read(cx);
         let phase = if t.starting.is_some() { "starting".to_string() } else { t.phase().to_string() };
@@ -818,7 +829,9 @@ impl Panel {
                             .text_color(g.muted)
                             .child(div().size(px(7.0)).flex_none().rounded_full().bg(dot))
                             .child(div().min_w_0().truncate().child(line)),
-                    ),
+                    )
+                    // The sessions at work right now, at a glance.
+                    .child(div().pt_1().child(now)),
             )
             .child(
                 h_flex()

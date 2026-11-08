@@ -100,6 +100,15 @@ right, its answers on the left, what the sessions reported in between.
 Type in the pill at the bottom: Enter sends, Shift+Enter starts a new line,
 Esc closes. While you talk (Control or ⌘⇧Space), what you say appears in it as you say it, transcribed every second or so, then the final text, which goes to the brain as any spoken request. If the input already holds a draft (text you typed, an image or file you attached), what you say is added after it instead, and nothing goes until you press Enter, which sends the text and the attachments together.
 
+Under the panel's status line, **Active now** shows the sessions working
+or waiting for you right now, one chip each (a soft pulse while working,
+amber when it needs you, its space, account and how long it has run),
+blocked ones first, then the longest running; with a focus, that space's
+first and the others dimmed. It scrolls sideways and says "Nothing running"
+when nothing does. A chip opens the session: what it is doing, its question
+to answer, its live screen, its jobs and screenshots, and **Show in Herdr**
+(a right click on the chip does that directly).
+
 **Activity** is what is happening now, what finished, and what sessions
 reported. At the top, Active / Done / All, and under it one line of chips
 that scrolls sideways (the trackpad, the wheel, dragging, or ‹ ›): a search,

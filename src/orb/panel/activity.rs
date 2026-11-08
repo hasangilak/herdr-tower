@@ -389,7 +389,7 @@ impl Panel {
     }
 
     /// A job in a line: status, title, who and where, account, pictures, time.
-    fn job_row(&mut self, j: &Job, acc: &Accounts, all_shots: &[crate::orb::shots::Shot], now: u64, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn job_row(&mut self, j: &Job, acc: &Accounts, all_shots: &[crate::orb::shots::Shot], now: u64, cx: &mut Context<Self>) -> AnyElement {
         let g = glass();
         let open = self.act.expanded.contains(&j.id);
         if open {
@@ -539,7 +539,7 @@ impl Panel {
     }
 
     /// The space a session is in (from the live spaces, else its history).
-    fn space_of(&self, addr: &str) -> String {
+    pub(super) fn space_of(&self, addr: &str) -> String {
         self.live
             .iter()
             .find(|l| l.sessions.iter().any(|s| s.0 == addr))
