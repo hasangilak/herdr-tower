@@ -23,6 +23,8 @@ struct Seen {
     name: String,
     status: String,
     app: String,
+    /// The Claude account it runs under (see `accounts`), when known.
+    account: Option<String>,
     live: bool,
     /// The Herdr space it's in, for focus (see `spaces`).
     space: Option<String>,
@@ -52,10 +54,10 @@ impl Watches {
     fn save(map: &HashMap<String, String>) {
         let _ = std::fs::write(Self::path(), serde_json::to_string_pretty(map).unwrap_or_default());
     }
-    pub fn add(&self, terminal: &str, note: &str) {
+    pub fn add(&self, terminal: &str, note: &str, account: Option<String>) {
         let (t, n) = (terminal.to_string(), note.to_string());
         crate::history::later(move || {
-            crate::history::job_start(&t, &n);
+            crate::history::job_start_on(&t, &n, account);
         });
         {
             let mut m = self.0.lock().unwrap();
@@ -260,9 +262,10 @@ impl Radar {
         let is_brain = machine.is_none() && t["name"].as_str() == Some(brain::NAME);
         let is_voice = machine.is_none() && t["name"].as_str() == Some(brain::VOICE_NAME);
         let space = crate::spaces::space_of(t);
+        let account = if machine.is_none() { crate::accounts::of_terminal(t) } else { None };
         let before = self.seen.lock().unwrap().insert(
             address.clone(),
-            Seen { name: name.clone(), status: status.clone(), app: app.clone(), live, space: space.clone() },
+            Seen { name: name.clone(), status: status.clone(), app: app.clone(), account, live, space: space.clone() },
         );
 
         if is_brain {
@@ -287,10 +290,10 @@ impl Radar {
         {
             let what = if asked.is_empty() { String::new() } else { format!(" You had asked it: {asked}.") };
             let msg = format!("[watch] {address} ({name}) is now {status}.{what} Read its screen and tell me what happened, briefly.");
-                {
-                    let (t, st, a) = (address.to_string(), status.to_string(), asked.clone());
-                    crate::history::later(move || crate::history::job_watched(&t, &st, &a));
-                }
+            {
+                let (t, st, a) = (address.to_string(), status.to_string(), asked.clone());
+                crate::history::later(move || crate::history::job_watched(&t, &st, &a));
+            }
             if self.held(&address, &name, space.as_deref(), &format!("{name} is now {status}.{what}"), &status, "watch") {
                 return;
             }
@@ -339,7 +342,8 @@ impl Radar {
             return false;
         }
         let space = space.unwrap_or("");
-        let (a, n, sp, t, st, k) = (address.to_string(), name.to_string(), space.to_string(), text.to_string(), status.to_string(), kind.to_string());
+        let (a, n, sp, t, st, k) =
+            (address.to_string(), name.to_string(), space.to_string(), text.to_string(), status.to_string(), kind.to_string());
         crate::history::later(move || crate::spaces::hold(&k, &a, &n, &sp, &t, Some(&st)));
         if gate == crate::spaces::Gate::Urgent {
             self.mouth.alert(format!("{space} needs you."), Some((address, status)));
@@ -402,7 +406,14 @@ impl Radar {
         }
         let name = hc::spoken_name(&t);
         let folder = t["cwd"].as_str().unwrap_or("its folder");
-        if self.held(address, &name, crate::spaces::space_of(&t).as_deref(), &format!("{name} asks to trust its folder {folder}"), "blocked", "alert") {
+        if self.held(
+            address,
+            &name,
+            crate::spaces::space_of(&t).as_deref(),
+            &format!("{name} asks to trust its folder {folder}"),
+            "blocked",
+            "alert",
+        ) {
             if self.watches.take(address).is_some() {
                 let a = address.to_string();
                 crate::history::later(move || crate::history::job_update(&a, "blocked", "asks to trust its folder"));
@@ -449,7 +460,13 @@ impl Radar {
             .unwrap()
             .iter()
             .filter(|(_, s)| s.live && !s.app.is_empty())
-            .map(|(a, s)| AgentLine { address: a.clone(), name: s.name.clone(), status: s.status.clone(), app: s.app.clone() })
+            .map(|(a, s)| AgentLine {
+                address: a.clone(),
+                name: s.name.clone(),
+                status: s.status.clone(),
+                app: s.app.clone(),
+                account: s.account.clone(),
+            })
             .filter(|a| !a.name.starts_with("tower"))
             .collect();
         agents.sort_by(|a, b| a.address.cmp(&b.address));

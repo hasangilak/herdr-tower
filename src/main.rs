@@ -7,6 +7,7 @@
 // GPUI comes through GPUI Kit; its macros expect the crate to be called `gpui`.
 extern crate gpui_kit as gpui;
 
+mod accounts;
 mod activity;
 mod brain;
 mod config;
@@ -73,6 +74,33 @@ enum Cmd {
         /// Plain programs and shells too.
         #[arg(long)]
         all: bool,
+    },
+    /// Start a Claude Code session on a Claude account, with its first task,
+    /// and watch it: `tower start --name fix-login --cwd ~/w/app "look at the login bug"`.
+    Start {
+        /// One of the claude-accounts mod's accounts (`tower accounts`); default: the first it lists.
+        #[arg(long)]
+        account: Option<String>,
+        /// The session's name (a-z 0-9 - _), unique among live terminals.
+        #[arg(long)]
+        name: String,
+        /// Its working folder (default: here; with --on, that machine's home).
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Another machine (`hc machine ls`).
+        #[arg(long)]
+        on: Option<String>,
+        /// Don't watch it (by default you get a [watch] message when it stops working).
+        #[arg(long)]
+        no_watch: bool,
+        /// Its first task.
+        task: Vec<String>,
+    },
+    /// The Claude accounts the claude-accounts mod (`cca`) knows; the first is the default.
+    Accounts {
+        /// Another machine's accounts.
+        #[arg(long)]
+        on: Option<String>,
     },
     /// Speak text.
     Say {
@@ -250,6 +278,10 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Agents { all } => agents(all),
+        Cmd::Start { account, name, cwd, on, no_watch, task } => {
+            start(account.as_deref(), &name, cwd, on.as_deref(), no_watch, &task.join(" "))
+        }
+        Cmd::Accounts { on } => list_accounts(on.as_deref()),
         Cmd::Say { text, interrupt, alert } => {
             ok(Request::Say { text: text.join(" "), interrupt, kind: if alert { "alert".into() } else { String::new() } })
         }
@@ -276,7 +308,9 @@ fn run(cli: Cli) -> Result<()> {
                     history::record_space("summary", &sp, session.as_deref(), &words.join(" "));
                 }
                 None => {
-                    let Some((terminal, text)) = words.split_first() else { bail!("tower summary <terminal> \"<text>\" (or --space <space>)") };
+                    let Some((terminal, text)) = words.split_first() else {
+                        bail!("tower summary <terminal> \"<text>\" (or --space <space>)")
+                    };
                     history::record_session("summary", terminal, &text.join(" "), None);
                 }
             }
@@ -298,7 +332,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::History { jobs, session, n } => show_history(jobs.as_deref(), session.as_deref(), n),
         Cmd::Watch { terminal, note } => {
-            ok(Request::Watch { terminal: terminal.clone(), note: note.join(" ") })?;
+            ok(Request::Watch { terminal: terminal.clone(), note: note.join(" "), account: None })?;
             println!("Watching {terminal}: you'll get a [watch] message when it stops working. End your turn now.");
             Ok(())
         }
@@ -335,12 +369,20 @@ fn show_history(jobs: Option<&str>, session: Option<&str>, n: usize) -> Result<(
         let list: Vec<_> = history::jobs(&entries).into_iter().filter(|j| j.open() == open && mine(&j.session)).take(n).collect();
         if std::io::stdout().is_terminal() {
             for j in &list {
-                println!("{:<9} {:<10} {:<16} {}{}", j.status, j.session, j.name, j.title, if j.summary.is_empty() { String::new() } else { format!(" — {}", j.summary) });
+                println!(
+                    "{:<9} {:<10} {:<16} {:<10} {}{}",
+                    j.status,
+                    j.session,
+                    j.name,
+                    j.account.as_deref().unwrap_or("-"),
+                    j.title,
+                    if j.summary.is_empty() { String::new() } else { format!(" — {}", j.summary) }
+                );
             }
         } else {
             let rows: Vec<Value> = list
                 .iter()
-                .map(|j| json!({ "job": j.id, "session": j.session, "name": j.name, "space": j.space, "status": j.status, "asked": j.title, "summary": j.summary, "started_ms": j.started, "updated_ms": j.updated }))
+                .map(|j| json!({ "job": j.id, "session": j.session, "name": j.name, "space": j.space, "account": j.account, "status": j.status, "asked": j.title, "summary": j.summary, "started_ms": j.started, "updated_ms": j.updated }))
                 .collect();
             print_json(&json!(rows));
         }
@@ -349,7 +391,8 @@ fn show_history(jobs: Option<&str>, session: Option<&str>, n: usize) -> Result<(
     let list: Vec<_> = entries.iter().rev().filter(|e| mine(e.session.as_deref().unwrap_or(""))).take(n).collect();
     if std::io::stdout().is_terminal() {
         for e in list.iter().rev() {
-            println!("{:<8} {:<10} {}", e.kind, e.session.as_deref().unwrap_or(""), e.text);
+            let account = e.account.as_deref().map(|a| format!("[{a}] ")).unwrap_or_default();
+            println!("{:<8} {:<10} {account}{}", e.kind, e.session.as_deref().unwrap_or(""), e.text);
         }
     } else {
         print_json(&serde_json::to_value(&list)?);
@@ -390,17 +433,21 @@ fn agents(all: bool) -> Result<()> {
                     if status.is_none() && !all {
                         continue;
                     }
+                    // `hc ls` has the reporting app (or else the program) as `agent`.
+                    let app = hc::agent_app(&t).or_else(|| t["agent"].as_str().map(String::from));
+                    let account = if machine.is_none() { accounts::of_address(t["address"].as_str().unwrap_or("")) } else { None };
                     rows.push(json!({
                         "address": t["address"],
+                        "account": account,
                         "machine": machine.clone().unwrap_or_else(|| "this mac".into()),
                         "name": t["name"],
                         "spoken": hc::spoken_name(&t),
-                        "agent": hc::agent_app(&t).or_else(|| t["foreground"]["argv"][0].as_str().map(String::from)),
+                        "agent": app.or_else(|| t["foreground"]["argv"][0].as_str().map(String::from)),
                         "status": status,
                         "doing": t["status"]["msg"],
                         "title": t["title"],
                         "folder": t["foreground"]["cwd"].as_str().or(t["cwd"].as_str()),
-                        "where": t["labels"]["where"],
+                        "where": t["labels"].get("where").unwrap_or(&t["where"]),
                     }));
                 }
             }
@@ -410,10 +457,11 @@ fn agents(all: bool) -> Result<()> {
     if std::io::stdout().is_terminal() {
         for r in &rows {
             println!(
-                "{:<12} {:<9} {:<12} {}  {}",
+                "{:<12} {:<9} {:<12} {:<10} {}  {}",
                 r["address"].as_str().unwrap_or(""),
                 r["status"].as_str().unwrap_or("-"),
                 r["agent"].as_str().unwrap_or(""),
+                r["account"].as_str().unwrap_or("-"),
                 r["folder"].as_str().unwrap_or(""),
                 r["title"].as_str().unwrap_or("")
             );
@@ -423,6 +471,76 @@ fn agents(all: bool) -> Result<()> {
         }
     } else {
         print_json(&json!({ "agents": rows, "unreachable": errors }));
+    }
+    Ok(())
+}
+
+/// `tower start`: a Claude Code session on an account, through `cca <account>`.
+fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str>, no_watch: bool, task: &str) -> Result<()> {
+    let (known, cca) = match on {
+        None => (accounts::list()?, accounts::cca_bin().map(|p| p.to_string_lossy().into_owned())),
+        Some(m) => {
+            let l = accounts::list_on(m);
+            let cca = if l.is_empty() { None } else { Some("cca".to_string()) };
+            (l, cca)
+        }
+    };
+    let account = accounts::resolve(account, &known)?;
+    // `~` in --cwd, as a shell would have it.
+    let cwd = cwd.map(|c| match c.strip_prefix("~/") {
+        Some(rest) if on.is_none() => dirs::home_dir().unwrap_or_default().join(rest).to_string_lossy().into_owned(),
+        _ => c,
+    });
+    let cca = cca.unwrap_or_else(|| "cca".into());
+    let args = accounts::hc_run_args(&accounts::Start { name, cwd: cwd.as_deref(), on, task, account: account.as_deref(), cca: &cca });
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = hc::run(&refs)?;
+    if out.code != 0 {
+        bail!("hc run: {}{}", out.stderr.trim(), out.stdout.trim());
+    }
+    let v: Value = serde_json::from_str(out.stdout.trim()).unwrap_or_default();
+    let address = v["address"].as_str().or_else(|| v["terminal"]["address"].as_str()).map(String::from).unwrap_or_else(|| name.to_string());
+    let address = match on {
+        Some(m) if !address.contains('/') => format!("{m}/{address}"),
+        _ => address,
+    };
+    let on_account = account.as_deref().map(|a| format!(" on the {a} account")).unwrap_or_default();
+    let watched = !no_watch
+        && protocol::send(&Request::Watch { terminal: address.clone(), note: task.to_string(), account: account.clone() })
+            .is_ok_and(|r| r.ok);
+    if !watched && !task.is_empty() {
+        // No voice running (or no watch wanted): keep the job in the history all the same.
+        history::job_start_on(&address, task, account.clone());
+    }
+    if std::io::stdout().is_terminal() || !watched {
+        println!(
+            "Started {name} as {address}{on_account}.{}",
+            if watched { " Watching it: you'll get a [watch] message when it stops working. End your turn now." } else { "" }
+        );
+    } else {
+        print_json(&json!({ "address": address, "name": name, "account": account, "watching": watched }));
+    }
+    Ok(())
+}
+
+/// `tower accounts`.
+fn list_accounts(on: Option<&str>) -> Result<()> {
+    let list = match on {
+        None => accounts::list()?,
+        Some(m) => accounts::list_on(m),
+    };
+    if std::io::stdout().is_terminal() {
+        if list.is_empty() {
+            println!(
+                "No Claude accounts: the claude-accounts mod (cca) isn't installed{}.",
+                on.map(|m| format!(" on {m}")).unwrap_or_default()
+            );
+        }
+        for (i, a) in list.iter().enumerate() {
+            println!("{} {:<12} {}", if i == 0 { "*" } else { " " }, a.name, a.email);
+        }
+    } else {
+        print_json(&json!({ "default": list.first().map(|a| &a.name), "accounts": list }));
     }
     Ok(())
 }

@@ -43,6 +43,9 @@ pub enum Request {
         terminal: String,
         #[serde(default)]
         note: String,
+        /// The Claude account it was started on (`tower start`), for its job.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
     },
     Status,
     Quit,

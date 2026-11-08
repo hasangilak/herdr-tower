@@ -104,8 +104,40 @@ starts a job, the watch report ends it, the brain adds the outcome
 Things to say: "What's everyone doing?", "Tell the eyzflow session to run
 the tests and fix what fails", "What is Codex on the VPS asking?", "Approve
 it", "Start a Claude session in sooner-app-web and have it look at the login
-bug". The brain hands off work, calls `tower watch`, and tells you when the
+bug" (add "on the <name> account" for another account). The brain hands off
+work (`tower start` for new sessions), calls `tower watch`, and tells you when the
 session finishes. When any agent anywhere needs you, the radar says so.
+
+### Claude accounts
+
+The tower knows nothing about your accounts itself: it asks the
+claude-accounts mod (the `cca` command, in the Herdr header) each time.
+`cca --porcelain` lists the accounts, the first being the default (cca's
+`default`: `~/.claude`, with `CLAUDE_CONFIG_DIR` unset). `cca --porcelain
+<pid>` names the account a running `claude` uses, from the
+`CLAUDE_CONFIG_DIR` in its environment. Add an account with `cca add <name>`
+and the tower can use it straight away.
+
+```sh
+tower accounts                      # the accounts cca knows; * is the default
+tower start --name fix-login --cwd ~/w/app "look at the login bug"
+tower start --account <name> --name fix-login --cwd ~/w/app "..."
+tower start --on vps --name x "..." # uses cca on that machine, if it has it
+```
+
+`tower start` runs `hc run --bg --outlive-parent ... -- cca <account> -n
+<name> "<task>"`: cca sets (or unsets) `CLAUDE_CONFIG_DIR` and `CCA_ACCOUNT`
+and starts claude. It records a job in the history with the account, and
+watches the session (`--no-watch` not to). An account cca doesn't know is an
+error that lists the ones it does. Without the mod, sessions start as plain
+`claude` and accounts show as unknown.
+
+Every Claude session on this Mac carries its account: `tower agents`,
+`tower spaces`, `tower history` and jobs, and the `agents` in the daemon's
+`state.json` (the orb's panel). It's the account's name as cca has it, or
+`null` for Codex, other machines, and sessions it can't tell. A process's
+account never changes, so it's looked up once per pid and kept in
+`~/.local/state/herder-tower/accounts.json`.
 
 From a shell (or a Raycast/skhd hotkey outside Herdr):
 
@@ -113,7 +145,9 @@ From a shell (or a Raycast/skhd hotkey outside Herdr):
 tower talk | tower hush | tower mode handsfree
 tower ask "what's waiting for me?"   # typed instead of spoken
 tower say "hello"                    # speak anything
-tower agents                         # every agent on every machine (JSON when piped)
+tower agents                         # every agent on every machine, with its account (JSON when piped)
+tower accounts                       # the Claude accounts (from cca)
+tower start --name n --cwd d "task"  # a new Claude session on an account (--account), watched
 tower history [--jobs open|finished] [--session t3]   # what the tower has done (JSON when piped)
 tower job start|done|failed <t> "…"  # record a job (the brain does this)
 tower summary <t> "…"                # record what a session has done (the brain does this)

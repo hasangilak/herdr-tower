@@ -149,7 +149,7 @@ impl Daemon {
                     return Response::err(brain::spoken_error(&format!("{e:#}")));
                 }
             }
-            Request::Watch { terminal, note } => self.watches.add(&terminal, &note),
+            Request::Watch { terminal, note, account } => self.watches.add(&terminal, &note, account),
             Request::Status => {}
             Request::Quit => {
                 let _ = std::fs::remove_file(config::socket_path());

@@ -36,6 +36,11 @@ pub struct Entry {
     pub space: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job: Option<String>,
+    /// The Claude account the session runs under (a name from the
+    /// claude-accounts mod, `cca`). Absent for Codex, other machines, or
+    /// when it can't be told.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     /// For jobs: `working`, `done`, `blocked`, `error`, `exited`, `failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -85,6 +90,7 @@ fn about(kind: &str, session: &str, text: &str) -> Entry {
         if let Some(a) = t["address"].as_str() {
             e.session = Some(a.into());
         }
+        e.account = crate::accounts::of_terminal(&t);
     }
     e
 }
@@ -124,7 +130,16 @@ pub fn record_request(message: &str) {
 
 /// A job starts: the brain handed `session` this work. Returns its id.
 pub fn job_start(session: &str, title: &str) -> String {
+    job_start_on(session, title, None)
+}
+
+/// `job_start` for a session started on a known Claude account (`tower start`):
+/// recorded as given, since claude may not be running yet to ask.
+pub fn job_start_on(session: &str, title: &str, account: Option<String>) -> String {
     let mut e = about("job", session, title);
+    if account.is_some() {
+        e.account = account;
+    }
     let id = format!("{}-{}", e.session.as_deref().unwrap_or(session).replace('/', "_"), now_ms());
     e.job = Some(id.clone());
     e.status = Some("working".into());
@@ -170,6 +185,8 @@ pub struct Job {
     pub session: String,
     pub name: String,
     pub space: String,
+    /// The Claude account it ran on, when known.
+    pub account: Option<String>,
     /// What was asked.
     pub title: String,
     pub status: String,
@@ -198,6 +215,9 @@ pub fn jobs(entries: &[Entry]) -> Vec<Job> {
                 if !e.text.is_empty() {
                     j.summary = e.text.clone();
                 }
+                if j.account.is_none() {
+                    j.account = e.account.clone();
+                }
                 j.updated = e.at;
             }
             None => out.push(Job {
@@ -205,6 +225,7 @@ pub fn jobs(entries: &[Entry]) -> Vec<Job> {
                 session: e.session.clone().unwrap_or_default(),
                 name: e.name.clone().unwrap_or_default(),
                 space: e.space.clone().unwrap_or_default(),
+                account: e.account.clone(),
                 title: e.text.clone(),
                 status: e.status.clone().unwrap_or_else(|| "working".into()),
                 summary: String::new(),
@@ -247,11 +268,7 @@ pub fn keep_attachment(src: &std::path::Path) -> PathBuf {
     let dir = attachments_dir().join(now_ms().to_string());
     let name = src.file_name().map(|n| n.to_owned()).unwrap_or_else(|| "file".into());
     let dst = dir.join(name);
-    if std::fs::create_dir_all(&dir).is_ok() && std::fs::copy(src, &dst).is_ok() {
-        dst
-    } else {
-        src.to_path_buf()
-    }
+    if std::fs::create_dir_all(&dir).is_ok() && std::fs::copy(src, &dst).is_ok() { dst } else { src.to_path_buf() }
 }
 
 #[cfg(test)]
@@ -268,6 +285,19 @@ mod tests {
     }
 
     #[test]
+    fn account_is_kept_only_when_known() {
+        let e = Entry { at: 1, kind: "job".into(), account: Some("work".into()), ..Default::default() };
+        let line = serde_json::to_string(&e).unwrap();
+        assert!(line.contains(r#""account":"work""#), "{line}");
+        assert_eq!(serde_json::from_str::<Entry>(&line).unwrap(), e);
+        let none = serde_json::to_string(&Entry { kind: "note".into(), ..Default::default() }).unwrap();
+        assert!(!none.contains("account"), "{none}");
+        // Entries written before accounts existed still load.
+        let old: Entry = serde_json::from_str(r#"{"at":1,"kind":"job","session":"t3","text":"x"}"#).unwrap();
+        assert_eq!(old.account, None);
+    }
+
+    #[test]
     fn jobs_fold() {
         let e = |at, status: &str, text: &str| Entry {
             at,
@@ -278,8 +308,11 @@ mod tests {
             text: text.into(),
             ..Default::default()
         };
-        let j = jobs(&[e(1, "working", "run the tests"), e(5, "done", "all 40 pass")]);
+        let mut first = e(1, "working", "run the tests");
+        first.account = Some("work".into());
+        let j = jobs(&[first, e(5, "done", "all 40 pass")]);
         assert_eq!(j.len(), 1);
+        assert_eq!(j[0].account.as_deref(), Some("work"), "the job keeps the account it started on");
         assert_eq!((j[0].title.as_str(), j[0].status.as_str(), j[0].summary.as_str()), ("run the tests", "done", "all 40 pass"));
         assert!(!j[0].open());
     }

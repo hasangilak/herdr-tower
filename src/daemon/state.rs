@@ -60,6 +60,9 @@ pub struct AgentLine {
     pub name: String,
     pub status: String,
     pub app: String,
+    /// The Claude account (a name from the claude-accounts mod, `cca`), or
+    /// null: Codex, another machine, or not known.
+    pub account: Option<String>,
 }
 
 impl State {

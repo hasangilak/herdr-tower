@@ -277,7 +277,10 @@ pub fn cmd_spaces() -> Result<()> {
                 "agenda": s.agendas.get(n),
                 "unread": unread.get(n).map(|v| v.len()).unwrap_or(0),
                 "running_jobs": running,
-                "sessions": sessions.iter().map(|(a, name, st)| json!({ "address": a, "name": name, "status": st })).collect::<Vec<_>>(),
+                "sessions": sessions
+                    .iter()
+                    .map(|(a, name, st)| json!({ "address": a, "name": name, "status": st, "account": crate::accounts::of_address(a) }))
+                    .collect::<Vec<_>>(),
                 "last_activity_ms": last,
             })
         })
@@ -381,7 +384,11 @@ pub fn cmd_digest(list: bool, skip: bool, space: Option<String>, peek: bool) -> 
     }
     let after = digest_order(&unread, &s);
     match after.iter().find(|n| **n != target) {
-        Some(next) => println!("Next: {next} ({} update{}). Ask the user before going on.", unread[next].len(), if unread[next].len() == 1 { "" } else { "s" }),
+        Some(next) => println!(
+            "Next: {next} ({} update{}). Ask the user before going on.",
+            unread[next].len(),
+            if unread[next].len() == 1 { "" } else { "s" }
+        ),
         None => println!("That was the last space with news."),
     }
     Ok(())
@@ -392,7 +399,15 @@ mod tests {
     use super::*;
 
     fn e(at: u64, space: &str, status: Option<&str>, held: bool) -> Entry {
-        Entry { at, kind: "watch".into(), space: Some(space.into()), status: status.map(String::from), text: "x".into(), held, ..Default::default() }
+        Entry {
+            at,
+            kind: "watch".into(),
+            space: Some(space.into()),
+            status: status.map(String::from),
+            text: "x".into(),
+            held,
+            ..Default::default()
+        }
     }
 
     #[test]
