@@ -64,7 +64,8 @@ pub enum Source {
     /// a press-to-talk take. What was heard goes back on the sender ("" when
     /// nothing was sent to the brain).
     /// `attachments`: images sent with it (saved paths), passed on as the panel does.
-    Phone { reply: std::sync::mpsc::Sender<String>, attachments: Vec<String> },
+    /// `markers`: their tokens (`[Image #1]`, ...). `send`: false only transcribes.
+    Phone { reply: std::sync::mpsc::Sender<String>, attachments: Vec<String>, markers: Vec<String>, send: bool },
 }
 
 pub struct Utterance {

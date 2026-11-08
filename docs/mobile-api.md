@@ -134,6 +134,7 @@ holds.
 | `GET /v1/history?limit=100&session=t3&kind=summary,answer&before_ms=…` | `{"entries":[…]}`, oldest first, the latest `limit`. Page back with `before_ms` = the first entry's `at`. Summaries are `kind=summary`. |
 | `GET /v1/accounts` | `{"default": name, "accounts":[{"name","email"}]}`, the default first (from the claude-accounts mod; names are not fixed: colour by name). |
 | `GET /v1/screenshots?limit=30&session=t3` | `{"screenshots":[{"id","at","session","name","space","account","job","caption","path","url"}]}`, newest first (still on disk: kept 30 days). |
+| `GET /v1/attachments/{folder}/{name}` | A picture someone sent with a message (the image itself, by its bytes: `image/png`, `image/jpeg`, `image/webp`, `image/gif`). `{folder}/{name}` is the end of its path in a `request` entry's `attachments` (`…/attachments/1794165000000-phone/1-login.png` → `/v1/attachments/1794165000000-phone/1-login.png`), URL-encoded (panel attachments keep their original names, spaces and all). Only files directly in a folder of `attachments/`; `400 bad_path`, `404 no_attachment`, `415 not_an_image` (videos and other files aren't served). |
 | `GET /v1/screenshots/{id}` | The image itself (`image/png`, `image/jpeg`, `image/webp` or `image/gif`). `400 bad_id`, `404 no_screenshot`. |
 | `GET /v1/sessions/{address}/screen?lines=60` | `{"address","screen"}`: what that terminal shows (to see what a blocked agent asks). Up to 400 lines. |
 
@@ -158,9 +159,16 @@ The state (`GET /v1/state`, event `state`):
   "agents": [{"address": "t22", "name": "Claude in eyzflow", "status": "working", "app": "claude-code", "account": "default"}],
   "error": "", "talk_key": "ctrl", "voice": "af_bella", "stt_model": "…",
   "lan": "https://192.168.1.20:7843", "phone": "Pixel 9",
+  "work": {"word": "Reading", "detail": "eyzflow", "since_ms": 1794158000000, "at_ms": 1794158004000, "done_ms": 0},
   "screenshots": [{"id": "1794160000000-login.png", "at": 1794160000000, "session": "t22", "name": "Claude in eyzflow", "space": "B2C support", "account": "default", "job": null, "caption": "The new login page", "path": "/Users/…/attachments/screenshots/1794160000000-login.png", "url": "/v1/screenshots/1794160000000-login.png"}]
 }
 ```
+
+`work` is what the brain is doing right now, as the panel's working line shows
+it ("Delegating to orb-rust · 12s"): `{"word": "Delegating", "detail": "to
+orb-rust", "since_ms": <turn began>, "at_ms": <this step began>, "done_ms":
+<step finished, 0 while it runs>}`, or `null` between turns. A `state` event
+is sent when it changes too.
 
 `phase` (one word for the orb): `announcing`, `speaking`, `transcribing`,
 `listening`, `thinking`, `blocked`, `armed`, `standby`, `idle`. Unknown keys
@@ -177,12 +185,16 @@ may be added later: ignore them.
 | `POST /v1/mode` | `{"mode": "ptt"\|"handsfree"\|"off"}` | The Mac microphone's mode. |
 | `DELETE /v1/device` | | Unpairs this phone (its token stops working). |
 
-### Images with an ask
+### Files with an ask
 
 `POST /v1/ask` also takes `multipart/form-data` (OkHttp `MultipartBody`,
-`MultipartBody.FORM`): a `text` field and up to **6 image parts** (any part
-with a file name, or named `image`/`images`), each PNG, JPEG, WebP or GIF
-(checked by its bytes, not its name) and **15 MB** at most.
+`MultipartBody.FORM`): a `text` field and up to **6 file parts** (any part
+with a file name, or named `image…`/`file…`):
+
+- **images**: PNG, JPEG, WebP or GIF (checked by their bytes; a file named
+  as an image that isn't one is refused), **15 MB** each;
+- **videos** (`.mov .mp4 .m4v .webm .mkv .avi`, or `Content-Type: video/*`)
+  and **any other file** (PDF, text, …): **50 MB** each.
 
 ```
 POST /v1/ask
@@ -201,14 +213,15 @@ The Mac saves them as the panel saves its attachments
 (`~/.local/share/herder-tower/attachments/<ms>-phone/<n>-<name>.<ext>`;
 attachments are never pruned) and the tower gets exactly what the panel
 sends: `[voice] <text> [attached: <path 1> | <path 2>]`, where the text has
-an `[Image #N]` marker for the Nth image. Put the markers where the user put
-the images; any image the text doesn't mark gets its marker in front
-(`[Image #2] what's wrong on this page? [Image #1]`). Text may be empty when
-there are images.
+the panel's token for the Nth file: `[Image #N]`, `[Video #N]` or
+`[File #N: <file name>]`. Put the tokens where the user put the files; any
+file the text doesn't mark gets its token in front (`[Image #2] what's wrong
+on this page? [Image #1]`; a `[File #N:` token counts by its number). Text
+may be empty when there are files.
 
 ```json
 202 {"sent": "[Image #2] what's wrong on this page? [Image #1]", "attachments": ["/Users/…/attachments/1794165000000-phone/1-login.png", "…/2-console.jpg"]}
-413 {"error": {"code": "too_many_images" | "image_too_large", …}}
+413 {"error": {"code": "too_many_files" | "image_too_large" | "file_too_large", …}}
 415 {"error": {"code": "not_an_image", …}}
 400 {"error": {"code": "bad_multipart" | "empty", …}}
 ```
@@ -276,11 +289,23 @@ Content-Length: 160044
 400 {"error": {"code": "bad_length", …}}   // under 0.2 s or over 120 s
 ```
 
-**With images**: send `multipart/form-data` instead, the WAV as a part named
-`audio`, and up to 6 image parts as for `/v1/ask`. The transcript gets
+**With files**: send `multipart/form-data` instead, the WAV as a part named
+`audio`, and up to 6 file parts as for `/v1/ask`. The transcript gets
 `[Image #N]` markers in front and the paths attached, as above;
 the answer adds `"attachments": [paths]`. (A stop word with images is sent,
 not taken as "stop".)
+
+### Dictation: transcribe without sending
+
+`POST /v1/transcribe` (or `POST /v1/voice?send=0`) takes the same WAV and
+returns `200 {"heard": "…", "sent": false}`; nothing reaches the tower, and a
+stop word is just text. It uses the same Whisper model and vocabulary (the
+session names) as the panel's dictation. For **text while the user is still
+talking**, do what the panel does: every second or so, post the recording so
+far to `/v1/transcribe` and show what comes back, then post the whole take at
+the end (to `/v1/voice` to send it, or `/v1/transcribe` to put it in the text
+box). Keep one request in flight at a time: the Mac transcribes one
+recording at a time, and a 30-second take takes about a second.
 
 The Mac resamples to 16 kHz, transcribes with the same Whisper model and
 vocabulary as the Mac's microphone, and hands the text to the tower as a

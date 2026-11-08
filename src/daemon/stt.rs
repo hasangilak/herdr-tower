@@ -108,12 +108,17 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
                     }
                     let _ = deliver(&shared, &mouth, heard.trim(), settings.ack);
                 }
-                Source::Phone { reply, attachments } => {
+                Source::Phone { reply, attachments, markers, send } => {
+                    if !send {
+                        // Dictation: the text goes back, nothing to the tower.
+                        let _ = reply.send(heard.trim().to_string());
+                        continue;
+                    }
                     if is_stop && attachments.is_empty() {
                         mouth.hush();
                         continue;
                     }
-                    let message = crate::history::compose(&crate::history::with_image_markers(heard.trim(), attachments.len()), &attachments);
+                    let message = crate::history::compose(&super::lan::with_markers(heard.trim(), &markers), &attachments);
                     if deliver(&shared, &mouth, &message, settings.ack).is_ok() {
                         let _ = reply.send(heard.trim().to_string());
                     }

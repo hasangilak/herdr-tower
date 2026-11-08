@@ -286,7 +286,8 @@ impl Lan {
                     "phone_is_voice": self.ctx.hub.voice(),
                 }),
             ),
-            ("GET", ["state"]) => Response::json(200, &self.ctx.shared.json()),
+            ("GET", ["state"]) => Response::json(200, &self.state()),
+            ("GET", ["attachments", folder, name]) => attachment(&crate::history::attachments_dir(), folder, name),
             ("GET", ["agents"]) => Response::json(200, &crate::agents_value(q("all") == Some("1"))),
             ("GET", ["spaces"]) => Response::json(200, &crate::spaces::spaces_value()),
             ("GET", ["accounts"]) => match crate::accounts::list() {
@@ -363,18 +364,20 @@ impl Lan {
                 return None;
             }
             ("POST", ["ask"]) => {
-                let (text, images) = match ask_body(req) {
+                let (text, files) = match ask_body(req) {
                     Ok(x) => x,
                     Err(r) => return Some(r),
                 };
-                if text.is_empty() && images.is_empty() {
-                    return Some(Response::error(400, "empty", "send {\"text\": \"...\"}, or multipart text and images"));
+                if text.is_empty() && files.is_empty() {
+                    return Some(Response::error(400, "empty", "send {\"text\": \"...\"}, or multipart text and files"));
                 }
-                let paths = match save_images(&images, &crate::history::attachments_dir(), now_ms()) {
+                let saved = match save_files(&files, &crate::history::attachments_dir(), now_ms()) {
                     Ok(p) => p,
                     Err(r) => return Some(r),
                 };
-                let text = crate::history::with_image_markers(&text, paths.len());
+                let paths: Vec<String> = saved.iter().map(|f| f.path.clone()).collect();
+                let markers: Vec<String> = saved.iter().map(|f| f.marker.clone()).collect();
+                let text = with_markers(&text, &markers);
                 let mut resp = self.ask(&crate::history::compose(&text, &paths));
                 if resp.status == 202 {
                     resp = Response::json(202, &json!({ "sent": text, "attachments": paths }));
@@ -417,7 +420,9 @@ impl Lan {
                     _ => Response::error(400, "bad_mode", "mode is ptt, handsfree or off"),
                 }
             }
-            ("POST", ["voice"]) => self.voice(req),
+            // Transcribe only: the text comes back, nothing goes to the tower.
+            ("POST", ["voice"]) => self.voice(req, q("send") != Some("0")),
+            ("POST", ["transcribe"]) => self.voice(req, false),
             ("DELETE", ["device"]) => {
                 let mut d = Devices::load_from(&self.devices_path);
                 d.revoke(&device.id);
@@ -488,8 +493,15 @@ impl Lan {
 
     /// A recording from the phone: transcribed by the tower's Whisper, then
     /// handed to the brain like a press-to-talk take.
-    fn voice(&self, req: &Request) -> Response {
-        // A WAV body, or multipart: the WAV as `audio`, images beside it.
+    /// The state with what the brain is doing now (`work`, the panel's working line).
+    fn state(&self) -> Value {
+        let mut s = self.ctx.shared.json();
+        s["work"] = work_value();
+        s
+    }
+
+    fn voice(&self, req: &Request, send: bool) -> Response {
+        // A WAV body, or multipart: the WAV as `audio`, files beside it.
         let (wav, images): (Vec<u8>, Vec<multipart::Part>) = match req.header("content-type").and_then(multipart::boundary) {
             Some(b) => match multipart::parse(&req.body, &b) {
                 Ok(parts) => {
@@ -497,16 +509,22 @@ impl Lan {
                     let Some(audio) = audio.into_iter().next() else {
                         return Response::error(400, "no_audio", "a multipart voice request needs an `audio` part (the WAV)");
                     };
-                    (audio.data, rest.into_iter().filter(is_image_part).collect())
+                    (audio.data, rest.into_iter().filter(is_file_part).collect())
                 }
                 Err(e) => return Response::error(400, "bad_multipart", &format!("{e:#}")),
             },
             None => (req.body.clone(), vec![]),
         };
-        let attachments = match save_images(&images, &crate::history::attachments_dir(), now_ms()) {
-            Ok(p) => p,
-            Err(r) => return r,
+        let saved = if send {
+            match save_files(&images, &crate::history::attachments_dir(), now_ms()) {
+                Ok(p) => p,
+                Err(r) => return r,
+            }
+        } else {
+            vec![]
         };
+        let attachments: Vec<String> = saved.iter().map(|f| f.path.clone()).collect();
+        let markers: Vec<String> = saved.iter().map(|f| f.marker.clone()).collect();
         let (samples, rate) = match audio::wav_decode(&wav) {
             Ok(x) => x,
             Err(e) => return Response::error(415, "bad_audio", &format!("{e:#}: send audio/wav, 16-bit PCM, mono, 16 kHz preferred")),
@@ -517,12 +535,13 @@ impl Lan {
         }
         let samples = if rate == RATE { samples } else { super::mic::resample(&samples, rate, RATE) };
         let (tx, rx) = std::sync::mpsc::channel();
-        let n = attachments.len();
-        if self.ctx.stt.send(Utterance { samples, source: Source::Phone { reply: tx, attachments: attachments.clone() } }).is_err() {
+        let source = Source::Phone { reply: tx, attachments: attachments.clone(), markers, send };
+        if self.ctx.stt.send(Utterance { samples, source }).is_err() {
             return Response::error(503, "stt", "the transcriber isn't running");
         }
         match rx.recv_timeout(Duration::from_secs(90)) {
-            Ok(heard) => Response::json(200, &json!({ "heard": heard, "sent": true, "attachments": attachments, "images": n })),
+            Ok(heard) if send => Response::json(200, &json!({ "heard": heard, "sent": true, "attachments": attachments })),
+            Ok(heard) => Response::json(200, &json!({ "heard": heard, "sent": false })),
             // Nothing worth sending (silence, noise, a stop word).
             Err(_) => Response::json(200, &json!({ "heard": "", "sent": false })),
         }
@@ -542,8 +561,9 @@ impl Lan {
             n += 1;
             w.write_all(http::sse_event(n, event, data).as_bytes()).and_then(|_| w.flush()).is_ok()
         };
-        let state = self.ctx.shared.json();
+        let state = self.state();
         let mut version = state["version"].as_u64().unwrap_or(0);
+        let mut work = state["work"].clone();
         let mut ok = send(w, "hello", &json!({ "api": API, "device": device.id, "voice": voice })) && send(w, "state", &state);
         let history = crate::history::path();
         let mut offset = std::fs::metadata(&history).map(|m| m.len()).unwrap_or(0);
@@ -555,11 +575,12 @@ impl Lan {
                 // Dropped by the hub: revoked.
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            let s = self.ctx.shared.json();
-            let v = s["version"].as_u64().unwrap_or(0);
-            if ok && v != version {
+            let v = self.ctx.shared.get().version;
+            let now_work = work_value();
+            if ok && (v != version || now_work != work) {
                 version = v;
-                ok = send(w, "state", &s);
+                work = now_work;
+                ok = send(w, "state", &self.state());
             }
             if ok && last_history.elapsed() > Duration::from_secs(1) {
                 last_history = Instant::now();
@@ -591,22 +612,33 @@ impl Lan {
     }
 }
 
-/// Most images one message carries.
-pub const MAX_IMAGES: usize = 6;
+/// Most files one message carries.
+pub const MAX_FILES: usize = 6;
+/// A video, PDF or other file (an image is 15 MB at most).
+pub const MAX_FILE_BYTES: usize = 50 * 1024 * 1024;
 
-/// A part that is a file (a field with a file name, or one named `image`).
-fn is_image_part(p: &multipart::Part) -> bool {
-    p.filename.is_some() || p.name.starts_with("image")
+/// What the brain is doing now, as the panel's working line shows it:
+/// `{word, detail, since_ms, at_ms, done_ms}`, or null between turns.
+fn work_value() -> Value {
+    match crate::activity::read() {
+        Some(w) if w.since_ms > 0 => json!({ "word": w.word, "detail": w.detail, "since_ms": w.since_ms, "at_ms": w.at_ms, "done_ms": w.done_ms }),
+        _ => Value::Null,
+    }
 }
 
-/// The text and images of `POST /v1/ask`: JSON `{"text"}`, or multipart with
-/// a `text` field and image parts.
+/// A part that is a file (a field with a file name, or one named `image`/`file`).
+fn is_file_part(p: &multipart::Part) -> bool {
+    p.filename.is_some() || p.name.starts_with("image") || p.name.starts_with("file")
+}
+
+/// The text and files of `POST /v1/ask`: JSON `{"text"}`, or multipart with
+/// a `text` field and file parts.
 fn ask_body(req: &Request) -> Result<(String, Vec<multipart::Part>), Response> {
     match req.header("content-type").and_then(multipart::boundary) {
         Some(b) => {
             let parts = multipart::parse(&req.body, &b).map_err(|e| Response::error(400, "bad_multipart", &format!("{e:#}")))?;
             let text = parts.iter().find(|p| p.name == "text" && p.filename.is_none()).map(|p| String::from_utf8_lossy(&p.data).trim().to_string());
-            Ok((text.unwrap_or_default(), parts.into_iter().filter(|p| p.name != "text" && is_image_part(p)).collect()))
+            Ok((text.unwrap_or_default(), parts.into_iter().filter(|p| p.name != "text" && is_file_part(p)).collect()))
         }
         None => {
             let body = req.json().map_err(|_| Response::error(400, "bad_json", "send {\"text\": \"...\"}"))?;
@@ -615,39 +647,134 @@ fn ask_body(req: &Request) -> Result<(String, Vec<multipart::Part>), Response> {
     }
 }
 
-/// Checks images (PNG, JPEG, WebP, GIF by their bytes; 15 MB each; six at
-/// most) and saves them as the panel saves its attachments:
-/// `<attachments>/<ms>/<name>`. Not screenshots: never pruned.
-pub fn save_images(parts: &[multipart::Part], attachments: &std::path::Path, at_ms: u64) -> Result<Vec<String>, Response> {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FileKind {
+    Image,
+    Video,
+    Other,
+}
+
+/// As the panel tells them apart: images by their bytes (or name), videos
+/// by name or type, anything else is a file.
+pub fn file_kind(name: &str, content_type: Option<&str>, head: &[u8]) -> FileKind {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    if crate::screenshots::kind_of(head).is_some() || matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "bmp" | "tiff") {
+        FileKind::Image
+    } else if matches!(ext.as_str(), "mov" | "mp4" | "m4v" | "webm" | "mkv" | "avi") || content_type.is_some_and(|t| t.starts_with("video/")) {
+        FileKind::Video
+    } else {
+        FileKind::Other
+    }
+}
+
+/// The panel's token for the Nth file: `[Image #1]`, `[Video #2]`, `[File #3: notes.pdf]`.
+pub fn marker(kind: FileKind, n: usize, name: &str) -> String {
+    let name: String = name.chars().filter(|c| !matches!(c, '[' | ']' | '\n' | '\r')).collect();
+    match kind {
+        FileKind::Image => format!("[Image #{n}]"),
+        FileKind::Video => format!("[Video #{n}]"),
+        FileKind::Other => format!("[File #{n}: {}]", if name.trim().is_empty() { "file" } else { name.trim() }),
+    }
+}
+
+/// The text with a token for every file it doesn't mark yet, in front (as
+/// the panel puts a token where you attach). A token is there when the text
+/// has its `[Image #N]`, `[Video #N]` or `[File #N:` already.
+pub fn with_markers(text: &str, markers: &[String]) -> String {
+    // Only images, numbered in order: the same as the panel's image tokens.
+    if markers.iter().enumerate().all(|(i, m)| *m == format!("[Image #{}]", i + 1)) {
+        return crate::history::with_image_markers(text, markers.len());
+    }
+    let present = |m: &String| match m.split_once(':') {
+        Some((head, _)) if m.starts_with("[File #") => text.contains(&format!("{head}:")),
+        _ => text.contains(m.as_str()),
+    };
+    let missing: Vec<&String> = markers.iter().filter(|m| !present(m)).collect();
+    let text = text.trim();
+    match (missing.is_empty(), text.is_empty()) {
+        (true, _) => text.to_string(),
+        (false, true) => missing.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(" "),
+        (false, false) => format!("{} {text}", missing.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(" ")),
+    }
+}
+
+/// A file saved for a message: where, and its token.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Saved {
+    pub path: String,
+    pub marker: String,
+}
+
+/// Checks files and saves them as the panel saves its attachments:
+/// `<attachments>/<ms>-phone/<n>-<name>`, never pruned. Six at most; an
+/// image is a real PNG, JPEG, WebP or GIF of 15 MB at most; a video or other
+/// file is 50 MB at most.
+pub fn save_files(parts: &[multipart::Part], attachments: &std::path::Path, at_ms: u64) -> Result<Vec<Saved>, Response> {
     if parts.is_empty() {
         return Ok(vec![]);
     }
-    if parts.len() > MAX_IMAGES {
-        return Err(Response::error(413, "too_many_images", &format!("{MAX_IMAGES} images at most")));
+    if parts.len() > MAX_FILES {
+        return Err(Response::error(413, "too_many_files", &format!("{MAX_FILES} files at most")));
     }
-    let mut kinds = vec![];
+    let mut plan = vec![];
     for (i, p) in parts.iter().enumerate() {
-        if p.data.len() as u64 > crate::screenshots::MAX_BYTES {
-            return Err(Response::error(413, "image_too_large", &format!("image {} is over 15 MB", i + 1)));
-        }
-        let Some(ext) = crate::screenshots::kind_of(&p.data[..p.data.len().min(16)]) else {
-            return Err(Response::error(415, "not_an_image", &format!("image {} isn't a PNG, JPEG, WebP or GIF", i + 1)));
+        let original = p.filename.clone().unwrap_or_else(|| "file".into());
+        let head = &p.data[..p.data.len().min(16)];
+        let kind = file_kind(&original, p.content_type.as_deref(), head);
+        let ext = match kind {
+            FileKind::Image => {
+                if p.data.len() as u64 > crate::screenshots::MAX_BYTES {
+                    return Err(Response::error(413, "image_too_large", &format!("file {} is an image over 15 MB", i + 1)));
+                }
+                let Some(ext) = crate::screenshots::kind_of(head) else {
+                    return Err(Response::error(415, "not_an_image", &format!("file {} is named as an image but isn't a PNG, JPEG, WebP or GIF", i + 1)));
+                };
+                ext.to_string()
+            }
+            _ => {
+                if p.data.len() > MAX_FILE_BYTES {
+                    return Err(Response::error(413, "file_too_large", &format!("file {} is over 50 MB", i + 1)));
+                }
+                let e: String = original.rsplit_once('.').map(|(_, e)| e).unwrap_or("").chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
+                if e.is_empty() { "bin".into() } else { e.to_ascii_lowercase() }
+            }
         };
-        kinds.push(ext);
+        plan.push((kind, original, ext));
     }
     let dir = attachments.join(format!("{at_ms}-phone"));
     std::fs::create_dir_all(&dir).map_err(|e| Response::error(503, "save", &e.to_string()))?;
     let mut out = vec![];
-    for (i, (p, ext)) in parts.iter().zip(kinds).enumerate() {
-        let original = std::path::Path::new(p.filename.as_deref().unwrap_or("image"));
+    for (i, (p, (kind, original, ext))) in parts.iter().zip(plan).enumerate() {
         // `<ms>-<name>.<ext>` from the screenshot naming, without the ms (the folder has it).
-        let name = crate::screenshots::stored_name(0, original, ext);
+        let name = crate::screenshots::stored_name(0, std::path::Path::new(&original), &ext);
         let name = format!("{}-{}", i + 1, name.trim_start_matches("0-"));
-        let path = dir.join(name);
+        let path = dir.join(&name);
         std::fs::write(&path, &p.data).map_err(|e| Response::error(503, "save", &e.to_string()))?;
-        out.push(path.to_string_lossy().into_owned());
+        let shown = std::path::Path::new(&original).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name);
+        out.push(Saved { path: path.to_string_lossy().into_owned(), marker: marker(kind, i + 1, &shown) });
     }
     Ok(out)
+}
+
+/// `GET /v1/attachments/{folder}/{name}`: a picture from the attachments
+/// folder, for a sent message. Only a file directly in one of its folders,
+/// only an image, and only if it really is inside (no `..`, no links out).
+pub fn attachment(root: &std::path::Path, folder: &str, name: &str) -> Response {
+    let ok = |s: &str| !s.is_empty() && s.len() <= 255 && !s.starts_with('.') && !s.contains(['/', '\\', '\0']);
+    if !ok(folder) || !ok(name) {
+        return Response::error(400, "bad_path", "an attachment is <folder>/<name>, as in its path under attachments/");
+    }
+    let (Ok(root), Ok(path)) = (root.canonicalize(), root.join(folder).join(name).canonicalize()) else {
+        return Response::error(404, "no_attachment", "no such attachment");
+    };
+    if !path.starts_with(&root) || path.parent().and_then(|p| p.parent()) != Some(root.as_path()) || !path.is_file() {
+        return Response::error(404, "no_attachment", "no such attachment");
+    }
+    let Ok(bytes) = std::fs::read(&path) else { return Response::error(404, "no_attachment", "no such attachment") };
+    match crate::screenshots::kind_of(&bytes[..bytes.len().min(16)]) {
+        Some(ext) => Response::bytes(crate::screenshots::content_type(&format!("x.{ext}")), bytes),
+        None => Response::error(415, "not_an_image", "only pictures are served"),
+    }
 }
 
 /// History lines added since `offset` (whole lines only), and the new offset.
@@ -839,6 +966,12 @@ mod tests {
         let seven: Vec<(&str, &str, &str, &[u8])> = (0..7).map(|_| ("image", "a.png", "image/png", &b"\x89PNG\r\n\x1a\n"[..])).collect();
         assert_eq!(mp("/v1/ask", &seven).0, 413);
         assert_eq!(mp("/v1/voice", &[("image", "a.png", "image/png", b"\x89PNG\r\n\x1a\n")]).0, 400, "voice needs its audio part");
+        assert_eq!(call(addr, &fp, "POST", "/v1/transcribe", Some(&token), "not audio").unwrap().0, 415);
+        assert_eq!(call(addr, &fp, "POST", "/v1/voice?send=0", Some(&token), "not audio").unwrap().0, 415);
+        assert_eq!(call(addr, &fp, "GET", "/v1/attachments/..%2F..%2Fx/y.png", Some(&token), "").unwrap().0, 400);
+        assert_eq!(call(addr, &fp, "GET", "/v1/attachments/0-none/none.png", None, "").unwrap().0, 401);
+        let (st, v) = call(addr, &fp, "GET", "/v1/state", Some(&token), "").unwrap();
+        assert!(st == 200 && v.get("work").is_some(), "the state carries the working line: {v}");
         // Screenshots: by id, never by path; the token is needed as everywhere.
         assert_eq!(call(addr, &fp, "GET", "/v1/screenshots/..%2F..%2Fdevices.json", Some(&token), "").unwrap().0, 400);
         assert_eq!(call(addr, &fp, "GET", "/v1/screenshots/0-no-such-shot.png", Some(&token), "").unwrap().0, 404);
@@ -926,24 +1059,81 @@ mod tests {
     }
 
     #[test]
-    fn saves_phone_images_like_panel_attachments() {
+    fn saves_phone_files_like_panel_attachments() {
         let dir = std::env::temp_dir().join(format!("tower-lan-att-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let png: &[u8] = b"\x89PNG\r\n\x1a\n....";
-        let part = |name: &str, f: &str, d: &[u8]| multipart::Part { name: name.into(), filename: Some(f.into()), content_type: None, data: d.to_vec() };
-        let paths = save_images(&[part("image", "../../etc/Screen Shot.png", png), part("image", "b", b"\xff\xd8\xff\xe0")], &dir, 42).unwrap();
-        assert_eq!(paths.len(), 2);
-        assert!(paths[0].ends_with("/42-phone/1-Screen-Shot.png"), "{}", paths[0]);
-        assert!(paths[1].ends_with("/42-phone/2-b.jpg"), "{}", paths[1]);
-        assert!(paths.iter().all(|p| p.starts_with(dir.to_str().unwrap())), "names can't climb out of the folder");
-        assert_eq!(std::fs::read(&paths[0]).unwrap(), png);
-        assert_eq!(save_images(&[part("image", "x.png", b"text")], &dir, 43).unwrap_err().status, 415);
-        let seven: Vec<_> = (0..7).map(|i| part("image", &format!("{i}.png"), png)).collect();
-        assert_eq!(save_images(&seven, &dir, 44).unwrap_err().status, 413);
-        assert!(save_images(&[], &dir, 45).unwrap().is_empty());
+        let part = |f: &str, ct: Option<&str>, d: &[u8]| multipart::Part {
+            name: "file".into(),
+            filename: Some(f.into()),
+            content_type: ct.map(String::from),
+            data: d.to_vec(),
+        };
+        let saved = save_files(
+            &[
+                part("../../etc/Screen Shot.png", None, png),
+                part("clip.MOV", Some("video/quicktime"), b"\0\0\0 ftypqt"),
+                part("Q3 report [final].pdf", Some("application/pdf"), b"%PDF-1.7"),
+                part("noext", None, b"abc"),
+            ],
+            &dir,
+            42,
+        )
+        .unwrap();
+        let tail = |s: &Saved| s.path.rsplit_once("/42-phone/").map(|(_, t)| t.to_string()).unwrap();
+        assert_eq!(saved.iter().map(tail).collect::<Vec<_>>(), ["1-Screen-Shot.png", "2-clip.mov", "3-Q3-report--final.pdf", "4-noext.bin"]);
+        assert_eq!(
+            saved.iter().map(|s| s.marker.as_str()).collect::<Vec<_>>(),
+            ["[Image #1]", "[Video #2]", "[File #3: Q3 report final.pdf]", "[File #4: noext]"],
+            "the panel's tokens"
+        );
+        assert!(saved.iter().all(|p| p.path.starts_with(dir.to_str().unwrap())), "names can't climb out of the folder");
+        assert_eq!(std::fs::read(&saved[0].path).unwrap(), png);
+        assert_eq!(save_files(&[part("x.png", None, b"text")], &dir, 43).unwrap_err().status, 415, "named as an image, isn't one");
+        let seven: Vec<_> = (0..7).map(|i| part(&format!("{i}.png"), None, png)).collect();
+        assert_eq!(save_files(&seven, &dir, 44).unwrap_err().status, 413);
+        assert_eq!(save_files(&[part("big.mp4", None, &vec![0; MAX_FILE_BYTES + 1])], &dir, 46).unwrap_err().status, 413);
+        assert!(save_files(&[], &dir, 45).unwrap().is_empty());
         // Screenshot pruning never looks here.
         assert_eq!(crate::screenshots::prune(&dir, Duration::from_secs(0)), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn markers_like_the_panel() {
+        let m = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(with_markers("what is this?", &m(&["[Image #1]", "[Video #2]"])), "[Image #1] [Video #2] what is this?");
+        assert_eq!(with_markers("see [File #2: a.pdf] and [Image #1]", &m(&["[Image #1]", "[File #2: a.pdf]"])), "see [File #2: a.pdf] and [Image #1]");
+        assert_eq!(with_markers("see [File #1: renamed.pdf]", &m(&["[File #1: a.pdf]"])), "see [File #1: renamed.pdf]", "a file token counts by its number");
+        assert_eq!(with_markers("", &m(&["[File #1: a.pdf]"])), "[File #1: a.pdf]");
+        assert_eq!(with_markers("x", &m(&["[Image #1]", "[Image #2]"])), crate::history::with_image_markers("x", 2));
+        assert_eq!(with_markers("plain", &[]), "plain");
+    }
+
+    #[test]
+    fn serves_only_pictures_inside_attachments() {
+        let root = std::env::temp_dir().join(format!("tower-lan-get-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let png: &[u8] = b"\x89PNG\r\n\x1a\n....";
+        let att = root.join("attachments");
+        std::fs::create_dir_all(att.join("1794-phone")).unwrap();
+        std::fs::write(att.join("1794-phone/1-a.png"), png).unwrap();
+        std::fs::write(att.join("1794-phone/Screen Shot 10.00.png"), png).unwrap();
+        std::fs::write(att.join("1794-phone/notes.pdf"), b"%PDF").unwrap();
+        std::fs::write(root.join("secret.png"), png).unwrap();
+        std::os::unix::fs::symlink(root.join("secret.png"), att.join("1794-phone/link.png")).unwrap();
+        std::os::unix::fs::symlink(&root, att.join("up")).unwrap();
+        let r = attachment(&att, "1794-phone", "1-a.png");
+        assert_eq!((r.status, r.content_type, r.body.as_slice()), (200, "image/png", png));
+        assert_eq!(attachment(&att, "1794-phone", "Screen Shot 10.00.png").status, 200, "the panel keeps the original name");
+        assert_eq!(attachment(&att, "1794-phone", "notes.pdf").status, 415);
+        assert_eq!(attachment(&att, "1794-phone", "missing.png").status, 404);
+        for (f, n) in [("..", "secret.png"), ("1794-phone", ".."), ("1794-phone/..", "x"), ("", "a"), (".hidden", "a.png"), ("a\\b", "c")] {
+            assert_eq!(attachment(&att, f, n).status, 400, "{f}/{n}");
+        }
+        assert_eq!(attachment(&att, "1794-phone", "link.png").status, 404, "a link out of attachments isn't followed");
+        assert_eq!(attachment(&att, "up", "secret.png").status, 404, "nor a folder that links out");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -954,8 +1144,8 @@ mod tests {
         let body = multipart::build("BB", &[("text", "what's this?")], &[("image", "a.png", "image/png", b"\x89PNG\r\n\x1a\n"), ("images", "b.gif", "image/gif", b"GIF89a")]);
         let mut req = Request { body, ..Default::default() };
         req.headers.insert("content-type".into(), "multipart/form-data; boundary=BB".into());
-        let (t, imgs) = ask_body(&req).ok().unwrap();
-        assert_eq!((t.as_str(), imgs.len()), ("what's this?", 2));
+        let (t, files) = ask_body(&req).ok().unwrap();
+        assert_eq!((t.as_str(), files.len()), ("what's this?", 2));
         let bad = Request { body: b"nope".to_vec(), ..Default::default() };
         assert_eq!(ask_body(&bad).err().unwrap().status, 400);
     }
