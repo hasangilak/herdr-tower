@@ -196,6 +196,11 @@ impl Daemon {
                         self.lan.revoked(&arg);
                         Ok(self.lan.info())
                     }
+                    // `<device id>`: its route changed on file.
+                    "route" => {
+                        self.lan.route_changed(&arg);
+                        Ok(self.lan.info())
+                    }
                     _ => Ok(self.lan.info()),
                 };
                 return match info {

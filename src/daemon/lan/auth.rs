@@ -60,6 +60,19 @@ pub struct Device {
     pub created_ms: u64,
     #[serde(default)]
     pub last_seen_ms: u64,
+    /// Where replies to what this phone sends are heard: `phone` (only on
+    /// the phone; the Mac stays silent) or `mac`.
+    #[serde(default = "phone_route")]
+    pub audio_route: String,
+}
+
+fn phone_route() -> String {
+    "phone".into()
+}
+
+/// `phone` or `mac`.
+pub fn valid_route(r: &str) -> bool {
+    matches!(r, "phone" | "mac")
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -115,9 +128,21 @@ impl Devices {
             token_sha256: sha256_hex(token.as_bytes()),
             created_ms: now_ms,
             last_seen_ms: now_ms,
+            audio_route: phone_route(),
         };
         self.devices.push(d.clone());
         (d, token)
+    }
+
+    /// Sets where a device's replies are heard. False: no such device.
+    pub fn set_route(&mut self, id: &str, route: &str) -> bool {
+        match self.devices.iter_mut().find(|d| d.id == id) {
+            Some(d) if valid_route(route) => {
+                d.audio_route = route.to_string();
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Removes a device by id, or every device for `all`. How many went.
@@ -252,6 +277,20 @@ mod tests {
         assert_eq!(d.revoke("d_nope"), 0);
         assert_eq!(d.revoke("all"), 1);
         assert!(d.find(&tb).is_none());
+    }
+
+    #[test]
+    fn audio_route_defaults_to_the_phone_and_is_kept() {
+        let mut d = Devices::default();
+        let (dev, _) = d.add("Pixel", 1);
+        assert_eq!(dev.audio_route, "phone");
+        assert!(d.set_route(&dev.id, "mac"));
+        assert!(!d.set_route(&dev.id, "speaker"), "only phone or mac");
+        assert!(!d.set_route("d_nope", "mac"));
+        assert_eq!(d.devices[0].audio_route, "mac");
+        // A devices.json from before the setting reads as `phone`.
+        let old: Devices = serde_json::from_str(r#"{"devices":[{"id":"d_1","name":"P","token_sha256":"x","created_ms":1}]}"#).unwrap();
+        assert_eq!(old.devices[0].audio_route, "phone");
     }
 
     #[test]

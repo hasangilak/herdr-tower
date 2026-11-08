@@ -109,13 +109,15 @@ enum Cmd {
         #[arg(long)]
         on: Option<String>,
     },
-    /// The phone API for the Android app (docs/mobile-api.md): enable, disable, pair, devices, revoke <id|all>.
+    /// The phone API for the Android app (docs/mobile-api.md): enable, disable, pair, devices, route <id> phone|mac, revoke <id|all>.
     Phone {
-        /// enable | disable | pair | devices | revoke
+        /// enable | disable | pair | devices | route | revoke
         #[arg(default_value = "devices")]
         action: String,
-        /// revoke: a device id (`tower phone devices`), or `all`.
+        /// revoke: a device id (`tower phone devices`), or `all`. route: a device id.
         id: Option<String>,
+        /// route: `phone` (replies to what it sends are heard on the phone only) or `mac`.
+        value: Option<String>,
         /// pair: print the pairing details as JSON (for the orb).
         #[arg(long)]
         json: bool,
@@ -321,7 +323,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Accounts { on } => list_accounts(on.as_deref()),
         Cmd::Screenshot { images, session, caption } => screenshots::cmd(&images, session, caption),
         Cmd::Screenshots { last, session } => screenshots::cmd_list(last, session.as_deref()),
-        Cmd::Phone { action, id, json } => phone::cmd(&action, id.as_deref(), json),
+        Cmd::Phone { action, id, value, json } => phone::cmd(&action, id.as_deref(), value.as_deref(), json),
         Cmd::Say { text, interrupt, alert } => {
             ok(Request::Say { text: text.join(" "), interrupt, kind: if alert { "alert".into() } else { String::new() } })
         }

@@ -181,6 +181,9 @@ may be added later: ignore them.
 | `POST /v1/ask` | `{"text": "what's everyone doing?"}`, or multipart with images (below) | Sends it to the tower like typing in the panel (it arrives as `[voice] …`). `202 {"sent": text, "attachments": [paths]}`. The canned "Okay." is played (on the phone when it's the voice). |
 | `POST /v1/agents/{address}/answer` | `{"decision": "approve"\|"refuse", "note": "only the read"}` | Tells the tower, as the user would: "Approve what t22 is asking for. only the read". The tower reads the session's screen and answers it, as today. `202`. |
 | `POST /v1/focus` | `{"space": "B2C support"}` or `{"space": null}` | Focuses a space (its news is spoken, others held) or clears focus. `200 {"focus": name or null}`; `404 no_space`. |
+| `GET /v1/device/audio` | | `200 {"route": "phone"\|"mac"}`: where this phone's replies are heard (below). |
+| `PUT /v1/device/audio` | `{"route": "phone"\|"mac"}` | Sets it (kept in the Mac's devices.json, so it survives restarts). `400 bad_route`. Also in `hello` and the state as `audio_route`. |
+| `GET /v1/audio?after=a17` | | `{"clips": [{"id","kind","text","ms","url","at_ms"}]}`: clips meant for this phone (its own and the voice's) from the last 15 minutes, after clip `after`: what it missed while no stream was open. |
 | `POST /v1/hush` | | Stops speaking now, and drops what's queued (the phone gets `hush`). |
 | `POST /v1/mode` | `{"mode": "ptt"\|"handsfree"\|"off"}` | The Mac microphone's mode. |
 | `DELETE /v1/device` | | Unpairs this phone (its token stops working). |
@@ -314,10 +317,35 @@ transcription (about a second); the reply comes on the event stream. On
 Android: `AudioRecord` at 16000 Hz, `CHANNEL_IN_MONO`, `ENCODING_PCM_16BIT`;
 write a 44-byte WAV header in front.
 
+### Where replies are heard: the phone's `audio_route`
+
+Each paired phone has a setting, **`phone`** (the default) or **`mac`**: where
+the replies to what *it* sends (asks, voice takes, approve/refuse) are heard.
+Change it with `PUT /v1/device/audio`, in the Mac panel's Phone section, or
+`tower phone route <device id> phone|mac`. It is kept on the Mac
+(`devices.json`), so it survives restarts.
+
+- **`phone`**: for a turn the phone started, its "Okay." and every sentence
+  of the reply go to **that phone only**, as `audio` clips on **every
+  stream it has open** (a plain `GET /v1/events` is enough; `voice=1` isn't
+  needed), and **the Mac stays silent** for that turn. If the phone has no
+  stream open, the clips are not played anywhere: they are **kept 15
+  minutes** (the last 200) and listed by `GET /v1/audio?after=<last id>`, so
+  the app can play what it missed when it reconnects, or skip it (the text
+  is in the history either way).
+- **`mac`**: the phone sends, the Mac speaks the reply as if it was asked on
+  the Mac; the phone shows the text (history and `state.said`).
+- Turns started on the Mac (its microphone, the panel, `tower ask`) and
+  alerts: spoken on the Mac, unless a phone with route `phone` has a
+  `voice=1` stream open, which takes the voice as before (a route-`mac`
+  phone's voice stream doesn't).
+- `hush`, `pause` and `resume` go to every open stream.
+
 ### The tower speaking on the phone
 
-- While **any** stream with `voice=1` is open, everything the tower says goes
-  to the phones as `audio` clips and **the Mac stays silent**. When the last
+- While **any** stream with `voice=1` is open (of a phone whose route is
+  `phone`), everything the tower says goes to the phones as `audio` clips
+  and **the Mac stays silent**. When the last
   voice stream closes (the app disconnects, or the network drops: noticed
   within ~10 s, on the next write), the Mac speaks again. A clip already
   sent when the phone vanished is not replayed on the Mac.

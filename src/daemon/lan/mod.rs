@@ -284,9 +284,25 @@ impl Lan {
                     "device": { "id": device.id, "name": device.name },
                     "voice": self.ctx.shared.get().voice,
                     "phone_is_voice": self.ctx.hub.voice(),
+                    "audio_route": device.audio_route,
                 }),
             ),
-            ("GET", ["state"]) => Response::json(200, &self.state()),
+            ("GET", ["state"]) => Response::json(200, &self.state(&device)),
+            // Where this phone's replies are heard: `phone` (only there) or `mac`.
+            ("GET", ["device", "audio"]) => Response::json(200, &json!({ "route": device.audio_route })),
+            ("PUT", ["device", "audio"]) | ("POST", ["device", "audio"]) => {
+                let body = req.json().unwrap_or_default();
+                let route = body["route"].as_str().unwrap_or("");
+                if !auth::valid_route(route) {
+                    return Some(Response::error(400, "bad_route", "route is phone or mac"));
+                }
+                match self.set_route(&device.id, route) {
+                    Ok(()) => Response::json(200, &json!({ "route": route })),
+                    Err(e) => Response::error(503, "save", &format!("{e:#}")),
+                }
+            }
+            // Clips this phone may have missed (no stream open): the last 15 minutes.
+            ("GET", ["audio"]) => Response::json(200, &json!({ "clips": self.ctx.hub.clips_for(&device.id, q("after")) })),
             ("GET", ["attachments", folder, name]) => attachment(&crate::history::attachments_dir(), folder, name),
             ("GET", ["agents"]) => Response::json(200, &crate::agents_value(q("all") == Some("1"))),
             ("GET", ["spaces"]) => Response::json(200, &crate::spaces::spaces_value()),
@@ -378,7 +394,7 @@ impl Lan {
                 let paths: Vec<String> = saved.iter().map(|f| f.path.clone()).collect();
                 let markers: Vec<String> = saved.iter().map(|f| f.marker.clone()).collect();
                 let text = with_markers(&text, &markers);
-                let mut resp = self.ask(&crate::history::compose(&text, &paths));
+                let mut resp = self.ask(&device, &crate::history::compose(&text, &paths));
                 if resp.status == 202 {
                     resp = Response::json(202, &json!({ "sent": text, "attachments": paths }));
                 }
@@ -395,7 +411,7 @@ impl Lan {
                     _ => return Some(Response::error(400, "bad_decision", "decision is approve or refuse")),
                 };
                 let note = body["note"].as_str().map(str::trim).filter(|n| !n.is_empty()).map(|n| format!(" {n}")).unwrap_or_default();
-                self.ask(&format!("{verb} what {address} is asking for.{note}"))
+                self.ask(&device, &format!("{verb} what {address} is asking for.{note}"))
             }
             ("POST", ["focus"]) => {
                 let body = req.json().unwrap_or_default();
@@ -421,8 +437,8 @@ impl Lan {
                 }
             }
             // Transcribe only: the text comes back, nothing goes to the tower.
-            ("POST", ["voice"]) => self.voice(req, q("send") != Some("0")),
-            ("POST", ["transcribe"]) => self.voice(req, false),
+            ("POST", ["voice"]) => self.voice(req, q("send") != Some("0"), &device),
+            ("POST", ["transcribe"]) => self.voice(req, false, &device),
             ("DELETE", ["device"]) => {
                 let mut d = Devices::load_from(&self.devices_path);
                 d.revoke(&device.id);
@@ -483,9 +499,9 @@ impl Lan {
         }
     }
 
-    fn ask(&self, text: &str) -> Response {
+    fn ask(&self, device: &auth::Device, text: &str) -> Response {
         crate::daemon::timing::start("asked");
-        match super::stt::deliver(&self.ctx.shared, &self.ctx.mouth, text, self.ctx.ack) {
+        match super::stt::deliver_from(&self.ctx.shared, &self.ctx.mouth, text, self.ctx.ack, heard_on_phone(device)) {
             Ok(()) => Response::json(202, &json!({ "sent": text })),
             Err(e) => Response::error(503, "brain", &crate::brain::spoken_error(&format!("{e:#}"))),
         }
@@ -494,13 +510,33 @@ impl Lan {
     /// A recording from the phone: transcribed by the tower's Whisper, then
     /// handed to the brain like a press-to-talk take.
     /// The state with what the brain is doing now (`work`, the panel's working line).
-    fn state(&self) -> Value {
+    fn state(&self, device: &auth::Device) -> Value {
         let mut s = self.ctx.shared.json();
         s["work"] = work_value();
+        s["audio_route"] = json!(device.audio_route);
         s
     }
 
-    fn voice(&self, req: &Request, send: bool) -> Response {
+    /// Sets where a device's replies are heard, on file and for its open streams.
+    pub fn set_route(&self, id: &str, route: &str) -> Result<()> {
+        let mut d = Devices::load_from(&self.devices_path);
+        if !d.set_route(id, route) {
+            bail!("no paired device {id}, or route {route:?} isn't phone or mac");
+        }
+        d.save_to(&self.devices_path)?;
+        self.ctx.hub.set_route(id, route == "phone");
+        eprintln!("[phone] {id} hears its replies on the {route}");
+        Ok(())
+    }
+
+    /// Another process changed the route on file (`tower phone route`, the panel).
+    pub fn route_changed(&self, id: &str) {
+        if let Some(d) = Devices::load_from(&self.devices_path).devices.iter().find(|d| d.id == id) {
+            self.ctx.hub.set_route(id, d.audio_route == "phone");
+        }
+    }
+
+    fn voice(&self, req: &Request, send: bool, device: &auth::Device) -> Response {
         // A WAV body, or multipart: the WAV as `audio`, files beside it.
         let (wav, images): (Vec<u8>, Vec<multipart::Part>) = match req.header("content-type").and_then(multipart::boundary) {
             Some(b) => match multipart::parse(&req.body, &b) {
@@ -535,7 +571,7 @@ impl Lan {
         }
         let samples = if rate == RATE { samples } else { super::mic::resample(&samples, rate, RATE) };
         let (tx, rx) = std::sync::mpsc::channel();
-        let source = Source::Phone { reply: tx, attachments: attachments.clone(), markers, send };
+        let source = Source::Phone { reply: tx, attachments: attachments.clone(), markers, send, phone: heard_on_phone(device) };
         if self.ctx.stt.send(Utterance { samples, source }).is_err() {
             return Response::error(503, "stt", "the transcriber isn't running");
         }
@@ -552,7 +588,7 @@ impl Lan {
         if http::write_sse_head(w).is_err() {
             return;
         }
-        let (sid, rx) = self.ctx.hub.subscribe(&device.id, voice);
+        let (sid, rx) = self.ctx.hub.subscribe(&device.id, voice, device.audio_route == "phone");
         if voice {
             self.ctx.shared.update(|s| s.phone = Some(device.name.clone()));
         }
@@ -561,7 +597,7 @@ impl Lan {
             n += 1;
             w.write_all(http::sse_event(n, event, data).as_bytes()).and_then(|_| w.flush()).is_ok()
         };
-        let state = self.state();
+        let state = self.state(device);
         let mut version = state["version"].as_u64().unwrap_or(0);
         let mut work = state["work"].clone();
         let mut ok = send(w, "hello", &json!({ "api": API, "device": device.id, "voice": voice })) && send(w, "state", &state);
@@ -580,7 +616,7 @@ impl Lan {
             if ok && (v != version || now_work != work) {
                 version = v;
                 work = now_work;
-                ok = send(w, "state", &self.state());
+                ok = send(w, "state", &self.state(device));
             }
             if ok && last_history.elapsed() > Duration::from_secs(1) {
                 last_history = Instant::now();
@@ -610,6 +646,11 @@ impl Lan {
             self.ctx.shared.update(|s| s.phone = None);
         }
     }
+}
+
+/// What a phone sends is answered on that phone only when its route is `phone`.
+fn heard_on_phone(device: &auth::Device) -> Option<String> {
+    (device.audio_route == "phone").then(|| device.id.clone())
 }
 
 /// Most files one message carries.
@@ -972,6 +1013,17 @@ mod tests {
         assert_eq!(call(addr, &fp, "GET", "/v1/attachments/0-none/none.png", None, "").unwrap().0, 401);
         let (st, v) = call(addr, &fp, "GET", "/v1/state", Some(&token), "").unwrap();
         assert!(st == 200 && v.get("work").is_some(), "the state carries the working line: {v}");
+        // Where this phone hears its replies: the phone by default, kept on file.
+        let (st, v) = call(addr, &fp, "GET", "/v1/device/audio", Some(&token), "").unwrap();
+        assert_eq!((st, v["route"].as_str()), (200, Some("phone")));
+        assert_eq!(call(addr, &fp, "PUT", "/v1/device/audio", Some(&token), r#"{"route":"speaker"}"#).unwrap().0, 400);
+        let (st, v) = call(addr, &fp, "PUT", "/v1/device/audio", Some(&token), r#"{"route":"mac"}"#).unwrap();
+        assert_eq!((st, v["route"].as_str()), (200, Some("mac")));
+        assert_eq!(call(addr, &fp, "GET", "/v1/hello", Some(&token), "").unwrap().1["audio_route"], "mac");
+        assert_eq!(call(addr, &fp, "GET", "/v1/state", Some(&token), "").unwrap().1["audio_route"], "mac");
+        assert!(std::fs::read_to_string(dir.join("devices.json")).unwrap().contains("\"audio_route\": \"mac\""), "it survives a restart");
+        let (st, v) = call(addr, &fp, "GET", "/v1/audio", Some(&token), "").unwrap();
+        assert!(st == 200 && v["clips"].is_array());
         // Screenshots: by id, never by path; the token is needed as everywhere.
         assert_eq!(call(addr, &fp, "GET", "/v1/screenshots/..%2F..%2Fdevices.json", Some(&token), "").unwrap().0, 400);
         assert_eq!(call(addr, &fp, "GET", "/v1/screenshots/0-no-such-shot.png", Some(&token), "").unwrap().0, 404);
@@ -1037,7 +1089,7 @@ mod tests {
         assert!(hub.voice(), "an open voice stream makes the phone the voice");
         assert!(shared.get().phone.is_some());
 
-        let id = hub.push_audio("ack", "Okay.", &[0.1; 4800], 24_000);
+        let id = hub.push_audio("ack", "Okay.", &[0.1; 4800], 24_000, None);
         let got = read_until(&mut s, "event: audio");
         assert!(got.contains(&format!("\"id\":\"{id}\"")) && got.contains("\"kind\":\"ack\""), "{got}");
         let (st, _) = call(addr, &fp, "GET", &format!("/v1/audio/{id}"), Some(&token), "").unwrap();
@@ -1049,7 +1101,7 @@ mod tests {
             if !hub.voice() {
                 break;
             }
-            hub.push_audio("reply", "Anyone there?", &[0.0; 240], 24_000);
+            hub.push_audio("reply", "Anyone there?", &[0.0; 240], 24_000, None);
             thread::sleep(Duration::from_millis(100));
         }
         assert!(!hub.voice(), "back to the Mac");

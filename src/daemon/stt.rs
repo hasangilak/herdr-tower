@@ -108,7 +108,7 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
                     }
                     let _ = deliver(&shared, &mouth, heard.trim(), settings.ack);
                 }
-                Source::Phone { reply, attachments, markers, send } => {
+                Source::Phone { reply, attachments, markers, send, phone } => {
                     if !send {
                         // Dictation: the text goes back, nothing to the tower.
                         let _ = reply.send(heard.trim().to_string());
@@ -119,7 +119,7 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
                         continue;
                     }
                     let message = crate::history::compose(&super::lan::with_markers(heard.trim(), &markers), &attachments);
-                    if deliver(&shared, &mouth, &message, settings.ack).is_ok() {
+                    if deliver_from(&shared, &mouth, &message, settings.ack, phone).is_ok() {
                         let _ = reply.send(heard.trim().to_string());
                     }
                 }
@@ -251,6 +251,12 @@ fn vocabulary(shared: &Shared) -> String {
 
 /// Hands a request to the brain and acknowledges it out loud.
 pub fn deliver(shared: &Shared, mouth: &Mouth, text: &str, ack: Option<Duration>) -> anyhow::Result<()> {
+    deliver_from(shared, mouth, text, ack, None)
+}
+
+/// `deliver` for a request from a paired phone whose replies are heard on
+/// the phone only (`phone`: its device id; None: heard as usual).
+pub fn deliver_from(shared: &Shared, mouth: &Mouth, text: &str, ack: Option<Duration>, phone: Option<String>) -> anyhow::Result<()> {
     shared.update(|s| {
         s.heard = text.to_string();
         s.heard_ms = now_ms();
@@ -260,7 +266,7 @@ pub fn deliver(shared: &Shared, mouth: &Mouth, text: &str, ack: Option<Duration>
     match brain::ask(text, &radar(shared)) {
         Ok(()) => {
             timing::mark("sent to the brain");
-            mouth.asked(text);
+            mouth.asked(text, phone);
             if let Some(delay) = ack {
                 mouth.ack(delay);
             }

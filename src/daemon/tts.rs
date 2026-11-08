@@ -53,7 +53,8 @@ pub enum Msg {
     Expect(bool),
     /// A request reached the brain (`true`: the user took something back,
     /// "never mind": a short reply is not said).
-    Asked(bool),
+    /// `.1`: the phone whose replies go to it alone (its route is `phone`).
+    Asked(bool, Option<String>),
     /// The brain's turn is over: its answer is all in.
     Answered,
 }
@@ -103,8 +104,9 @@ impl Mouth {
     }
 
     /// A request reached the brain: its answer is next. `request`: what was asked.
-    pub fn asked(&self, request: &str) {
-        let _ = self.tx.send(Msg::Asked(crate::text::is_dismissal(request)));
+    /// `phone`: it came from that paired phone, whose replies are heard there only.
+    pub fn asked(&self, request: &str, phone: Option<String>) {
+        let _ = self.tx.send(Msg::Asked(crate::text::is_dismissal(request), phone));
     }
 
     /// The brain's answer is all in.
@@ -125,7 +127,7 @@ impl Mouth {
         if self.held.load(Ordering::SeqCst) == 0 {
             self.player.play();
         }
-        self.hub.to_voice("hush", serde_json::json!({}));
+        self.hub.broadcast("hush", serde_json::json!({}));
         let _ = self.tx.send(Msg::Hush);
     }
 
@@ -136,11 +138,11 @@ impl Mouth {
         if on {
             if self.held.fetch_or(bit, Ordering::SeqCst) & bit == 0 {
                 self.player.pause();
-                self.hub.to_voice("pause", serde_json::json!({}));
+                self.hub.broadcast("pause", serde_json::json!({}));
             }
         } else if self.held.fetch_and(!bit, Ordering::SeqCst) == bit {
             self.player.play();
-            self.hub.to_voice("resume", serde_json::json!({}));
+            self.hub.broadcast("resume", serde_json::json!({}));
         }
     }
 
@@ -249,6 +251,7 @@ pub fn start(settings: Settings, shared: Shared, hub: Arc<Hub>) -> Result<Mouth>
         ack: None,
         acked: false,
         dismissed: false,
+        turn_phone: None,
         replies_started: 0,
         next_ack: 0,
         last_alert: None,
@@ -286,6 +289,9 @@ struct Speech {
     acked: bool,
     /// The current request takes something back ("never mind").
     dismissed: bool,
+    /// The current request came from this phone (route `phone`): its
+    /// replies and acknowledgement are heard there only.
+    turn_phone: Option<String>,
     replies_started: u64,
     next_ack: usize,
     /// When the last alert sentence was queued: alerts in a row share a bell.
@@ -384,7 +390,7 @@ impl Speech {
                     self.generation.fetch_add(1, Ordering::SeqCst);
                     self.player.clear();
                     self.routed.clear();
-                    self.hub.to_voice("hush", serde_json::json!({}));
+                    self.hub.broadcast("hush", serde_json::json!({}));
                     if self.held.load(Ordering::SeqCst) == 0 {
                         self.player.play();
                     }
@@ -422,11 +428,14 @@ impl Speech {
                 self.awaiting = Some(Instant::now());
                 self.acked = false;
                 self.dismissed = false;
+                // A take from the Mac's microphone.
+                self.turn_phone = None;
             }
             Msg::Expect(false) => self.awaiting = None,
-            Msg::Asked(dismissed) => {
+            Msg::Asked(dismissed, phone) => {
                 self.acked = false;
                 self.dismissed = dismissed;
+                self.turn_phone = phone;
                 let n = self.q.asked();
                 if n > 0 {
                     eprintln!("[speech] new request: dropped {n} old replies");
@@ -502,10 +511,12 @@ impl Speech {
     /// stays silent). `text` is what it says; `label` what it is (`reply`,
     /// `alert`, `ack`, `cue`), for the phone.
     fn append(&mut self, kind: Kind, samples: Vec<f32>, text: &str, label: &str) {
-        if self.hub.voice() {
+        // A reply to what a phone sent: that phone only. Else a phone that is the voice, or here.
+        let to_phone = if kind == Kind::Reply { self.turn_phone.clone() } else { None };
+        if to_phone.is_some() || self.hub.voice() {
             let dur = Duration::from_secs_f32(samples.len() as f32 / RATE as f32);
             let start = self.routed.back().map(|(end, _)| *end).filter(|end| *end > Instant::now()).unwrap_or_else(Instant::now);
-            self.hub.push_audio(label, text, &samples, RATE);
+            self.hub.push_audio(label, text, &samples, RATE, to_phone.as_deref());
             self.routed.push_back((start + dur, kind));
         } else {
             self.player.append(SamplesBuffer::new(NonZero::new(1).unwrap(), NonZero::new(RATE).unwrap(), samples));

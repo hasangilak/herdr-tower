@@ -534,7 +534,7 @@ mod tests {
 
     #[test]
     fn a_new_phone_ends_the_pairing() {
-        let dev = |id: &str| Device { id: id.into(), name: format!("Pixel {id}"), token_sha256: String::new(), created_ms: 1, last_seen_ms: 0 };
+        let dev = |id: &str| Device { id: id.into(), name: format!("Pixel {id}"), token_sha256: String::new(), created_ms: 1, last_seen_ms: 0, audio_route: "phone".into() };
         let st = |url: Option<&str>, ids: &[&str]| Status {
             enabled: true,
             voice: true,

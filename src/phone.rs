@@ -75,7 +75,22 @@ pub fn revoke(id: &str) -> Result<usize> {
     Ok(n)
 }
 
-pub fn cmd(action: &str, id: Option<&str>, json: bool) -> Result<()> {
+/// Where a paired phone's replies are heard: `phone` (on the phone only; the
+/// Mac stays silent for what it sends) or `mac`. Kept in devices.json.
+pub fn set_route(id: &str, route: &str) -> Result<()> {
+    if !crate::daemon::lan::auth::valid_route(route) {
+        bail!("where to hear replies: phone or mac, not {route:?}");
+    }
+    let mut d = Devices::load_from(&Devices::path());
+    if !d.set_route(id, route) {
+        bail!("no paired device {id}");
+    }
+    d.save_to(&Devices::path())?;
+    let _ = daemon("route", id);
+    Ok(())
+}
+
+pub fn cmd(action: &str, id: Option<&str>, value: Option<&str>, json: bool) -> Result<()> {
     match action {
         "enable" | "on" => {
             match enable()? {
@@ -133,8 +148,14 @@ pub fn cmd(action: &str, id: Option<&str>, json: bool) -> Result<()> {
                 println!("No paired phones.");
             }
             for x in &d.devices {
-                println!("  {:<12} {:<24} last seen {}", x.id, x.name, ago(x.last_seen_ms));
+                println!("  {:<12} {:<24} replies on the {:<5}  last seen {}", x.id, x.name, x.audio_route, ago(x.last_seen_ms));
             }
+            Ok(())
+        }
+        "route" => {
+            let (Some(id), Some(route)) = (id, value) else { bail!("tower phone route <device id> phone|mac") };
+            set_route(id, route)?;
+            println!("{id}: replies to what it sends are heard on the {route}.");
             Ok(())
         }
         "revoke" => {
@@ -143,7 +164,7 @@ pub fn cmd(action: &str, id: Option<&str>, json: bool) -> Result<()> {
             println!("Revoked {n} device(s): their tokens no longer work, and their open streams are closed.");
             Ok(())
         }
-        other => bail!("tower phone {other}: use enable, disable, pair, devices or revoke"),
+        other => bail!("tower phone {other}: use enable, disable, pair, devices, route or revoke"),
     }
 }
 
