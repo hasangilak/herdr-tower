@@ -683,7 +683,10 @@ impl Panel {
                 .hover(|s| s.bg(rgba(0xffcf7040)))
                 .text_xs()
                 .child(div().size(px(6.0)).flex_none().rounded_full().bg(rgb(AMBER)))
-                .child(div().flex_1().min_w_0().truncate().child(format!("Asks: {}", set.title)))
+                .child(div().flex_1().min_w_0().truncate().child({
+                    let who = if set.name.is_empty() { set.session.clone() } else { set.name.clone() };
+                    format!("{who} asks: {}", set.title)
+                }))
                 .child(div().flex_none().font_weight(FontWeight::MEDIUM).child("Answer ›"))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.phone_leave();

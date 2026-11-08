@@ -100,6 +100,17 @@ right, its answers on the left, what the sessions reported in between.
 Type in the pill at the bottom: Enter sends, Shift+Enter starts a new line,
 Esc closes. While you talk (Control or ⌘⇧Space), what you say appears in it as you say it, transcribed every second or so, then the final text, which goes to the brain as any spoken request. If the input already holds a draft (text you typed, an image or file you attached), what you say is added after it instead, and nothing goes until you press Enter, which sends the text and the attachments together.
 
+**Activity** is what is happening now, what finished, and what sessions
+reported. At the top, Active / Done / All, and under it one line of chips
+that scrolls sideways (the trackpad, the wheel, dragging, or ‹ ›): a search,
+All, the focused space (chosen until you choose), then each space followed
+by its sessions; only live sessions and those heard from in the last day,
+the others behind "+ older"; test sessions never. Active is what needs you
+(questions, blocked jobs) and what runs; Done is what finished, by day; All
+adds what sessions reported. Jobs are one-line rows (status, title, session
+and space, account, screenshots, time), a repeated job once; tap one for its
+card with the summary and pictures.
+
 When a session asks something the tower leaves to you (see "who decides" in [docs/questions.md](docs/questions.md)), a card waits at the foot of the chat, and the session's job card says "Asks: …" with a link to it. One question at a time, as the terminal dialog: the tower's three recommendations as large answers (the first marked Recommended, with why; a spinner while they come, and you can answer already), the session's own choices one tap away, and **Other** for your own answer: type it, hold Control and say it, or add files. Several questions end with a review, then Submit; the tower types the answers into the session and the card says how it goes (answering, waiting for the session, or where it stopped). ✕ dismisses it. What the tower answered for you shows as a quiet line ("answered for you: …"). How much it answers by itself is in Settings (the gear): normal, keep moving, or ask me everything.
 
 Attachments work as in Claude Code and Codex: paste a screenshot or a file
@@ -207,9 +218,10 @@ The tower can also put them with its own message: `[shot:<id>]` or
 latest ones, up to 4) under the message instead; the marker is never spoken
 or shown.
 
-In the panel, **Activity → Shots** is the gallery, newest first: each
-thumbnail with its caption, the session and its account (the session and
-space chips narrow it). A job's screenshots also show small on its card.
+In the panel, the **Shots** tab is the gallery, newest first: each
+thumbnail with its caption, the session and its account (the same sideways
+filter as Activity narrows it). A job's screenshots also show small on its
+card.
 Click one to see it full size over the screen: it fits the screen, a click
 shows it at 100% (scroll to look around), ← and → go through the others,
 and Esc, ✕ or a click outside closes it. Thumbnails are made once, in the

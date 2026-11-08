@@ -81,15 +81,16 @@ enum View {
     Phone,
     /// The tower's behaviors (from Settings, or a chat card).
     Behaviors,
+    /// Screenshots sessions sent, as a gallery.
+    Shots,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Filter {
-    Working,
+    /// Running jobs and what needs you.
+    Active,
     Done,
     All,
-    /// Screenshots sessions sent.
-    Shots,
 }
 
 /// The orb's own colours (its calm, listening and speaking looks), for
@@ -107,7 +108,7 @@ const NAVY: u32 = 0x16233a;
 const ACCOUNT_HUES: [u32; 8] = [0x6eeaa8, 0xf0a6ff, 0xffb98a, 0xc8f06e, 0xc9b3ff, 0xff9fb2, 0xe8d9a0, 0x7fe8e0];
 
 /// What the activity view is narrowed to.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Scope {
     Everything,
     Space(String),
@@ -115,6 +116,7 @@ enum Scope {
 }
 
 mod phone;
+mod activity;
 mod behaviors;
 mod gallery;
 mod questions;
@@ -138,6 +140,8 @@ pub struct Panel {
     asks: questions::Asks,
     /// The Behaviors screen.
     behaviors: behaviors::BehaviorsUi,
+    /// The Activity tab's filter and open rows.
+    act: activity::ActivityUi,
     /// The input's placeholder as set (it depends on the view and the voice).
     placeholder: &'static str,
     /// The input the voice writes in this take: the message, or a question's "Other".
@@ -299,6 +303,7 @@ impl Panel {
             phone: Default::default(),
             asks: Default::default(),
             behaviors: Default::default(),
+            act: Default::default(),
             placeholder: "Message the tower…",
             voice_field: None,
             take_open: false,
@@ -316,7 +321,7 @@ impl Panel {
             loaded: None,
             chat: ScrollHandle::new(),
             shown: 0,
-            filter: Filter::Working,
+            filter: Filter::Active,
             scope: Scope::Everything,
             listening_since: None,
             voice: None,
@@ -699,7 +704,8 @@ impl Render for Panel {
         let g = glass();
         let body = match self.view {
             View::Chat => self.chat_view(cx),
-            View::Activity => self.activity_view(cx),
+            View::Activity => self.activity_view(window, cx),
+            View::Shots => self.shots_view(window, cx),
             View::Spaces => self.spaces_view(cx),
             View::Phone => self.phone_view(cx),
             View::Behaviors => self.behaviors_view(window, cx),
@@ -761,10 +767,11 @@ impl Panel {
         if let Some(f) = &spaces.focus {
             line = format!("{line} · Focus: {f}");
         }
-        let running = self.jobs.iter().filter(|j| j.open()).count();
+        // Counts only where they mean "look": what needs you, news held for you.
+        let needs = self.needs_you(cx);
         let held: usize = crate::spaces::unread(&self.entries, &spaces).values().map(|v| v.len()).sum();
         let view = self.view;
-        let tab = |id: &'static str, text: String, me: View| segment(id, text, view == me).flex_1();
+        let tab = |id: &'static str, text: &str, count: usize, me: View| tab_segment(id, text, count, view == me).flex_1();
         v_flex()
             .px_5()
             .pt_5()
@@ -821,13 +828,13 @@ impl Panel {
                     .bg(rgba(0xffffff1a))
                     .border_1()
                     .border_color(g.edge)
-                    .child(tab("view-chat", "Chat".into(), View::Chat).on_click(cx.listener(|this, _, _, cx| {
+                    .child(tab("view-chat", "Chat", 0, View::Chat).on_click(cx.listener(|this, _, _, cx| {
                         this.phone_leave();
                         this.view = View::Chat;
                         cx.notify();
                     })))
                     .child(
-                        tab("view-activity", if running > 0 { format!("Activity · {running}") } else { "Activity".into() }, View::Activity).on_click(
+                        tab("view-activity", "Activity", needs, View::Activity).on_click(
                             cx.listener(|this, _, _, cx| {
                                 this.phone_leave();
                                 this.view = View::Activity;
@@ -835,14 +842,17 @@ impl Panel {
                             }),
                         ),
                     )
-                    .child(tab("view-spaces", if held > 0 { format!("Spaces · {held}") } else { "Spaces".into() }, View::Spaces).on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.phone_leave();
-                            this.view = View::Spaces;
-                            this.open_space = None;
-                            cx.notify();
-                        },
-                    ))),
+                    .child(tab("view-spaces", "Spaces", held, View::Spaces).on_click(cx.listener(|this, _, _, cx| {
+                        this.phone_leave();
+                        this.view = View::Spaces;
+                        this.open_space = None;
+                        cx.notify();
+                    })))
+                    .child(tab("view-shots", "Shots", 0, View::Shots).on_click(cx.listener(|this, _, _, cx| {
+                        this.phone_leave();
+                        this.view = View::Shots;
+                        cx.notify();
+                    }))),
             )
     }
 
@@ -1096,167 +1106,6 @@ impl Panel {
             .pb_4()
             .pt_2()
             .child(div().w_full().rounded(px(26.0)).bg(g.pill).shadow_lg().text_color(g.pill_text).child(pill))
-            .into_any_element()
-    }
-
-    /// Real work only: the jobs the tower handed out (running, with how
-    /// long; done, with what came of it) and what happened around them, for
-    /// every session or one.
-    fn activity_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let g = glass();
-        let acc = Accounts::of_tower(self.tower.read(cx), self.default_account.clone());
-        let scope = self.scope.clone();
-        let fits = |session: &str, space: &str| match &scope {
-            Scope::Everything => true,
-            Scope::Space(s) => space == s,
-            Scope::Session(s) => session == s,
-        };
-        let working: Vec<Job> = self.jobs.iter().filter(|j| j.open() && fits(&j.session, &j.space)).cloned().collect();
-        let done: Vec<Job> = self.jobs.iter().filter(|j| !j.open() && fits(&j.session, &j.space)).cloned().collect();
-        let events: Vec<Entry> = self
-            .entries
-            .iter()
-            .rev()
-            .filter(|e| !matches!(e.kind.as_str(), "request" | "answer"))
-            .filter(|e| fits(e.session.as_deref().unwrap_or(""), e.space.as_deref().unwrap_or("")))
-            .filter(|e| scope == Scope::Everything || e.session.is_some())
-            .take(200)
-            .cloned()
-            .collect();
-
-        let all_shots = self.all_shots(cx);
-        let gallery: Vec<Shot> = all_shots.iter().filter(|s| fits(&s.session, &s.space)).cloned().collect();
-        let filter = self.filter;
-        let filters = h_flex()
-            .mx_5()
-            .mb_2()
-            .p(px(3.0))
-            .gap(px(2.0))
-            .rounded_full()
-            .bg(rgba(0xffffff14))
-            .border_1()
-            .border_color(g.edge)
-            .child(segment("f-working", format!("Working · {}", working.len()), filter == Filter::Working).flex_1().on_click(cx.listener(|this, _, _, cx| {
-                this.filter = Filter::Working;
-                cx.notify();
-            })))
-            .child(segment("f-done", format!("Done · {}", done.len()), filter == Filter::Done).flex_1().on_click(cx.listener(|this, _, _, cx| {
-                this.filter = Filter::Done;
-                cx.notify();
-            })))
-            .child(segment("f-all", "All".into(), filter == Filter::All).flex_1().on_click(cx.listener(|this, _, _, cx| {
-                this.filter = Filter::All;
-                cx.notify();
-            })))
-            .when(!gallery.is_empty() || filter == Filter::Shots, |el| {
-                el.child(segment("f-shots", format!("Shots · {}", gallery.len()), filter == Filter::Shots).flex_1().on_click(cx.listener(|this, _, _, cx| {
-                    this.filter = Filter::Shots;
-                    cx.notify();
-                })))
-            });
-
-        // Sessions that did something, most recent first (and spaces, when there are several).
-        let mut spaces: Vec<String> = vec![];
-        let mut sessions: Vec<(String, String)> = vec![];
-        for e in self.entries.iter().rev() {
-            let (Some(addr), false) = (e.session.as_ref(), matches!(e.kind.as_str(), "request" | "answer")) else { continue };
-            if let Some(sp) = e.space.as_ref().filter(|s| !s.is_empty()) {
-                if !spaces.contains(sp) {
-                    spaces.push(sp.clone());
-                }
-            }
-            if !sessions.iter().any(|(a, _)| a == addr) {
-                sessions.push((addr.clone(), e.name.clone().unwrap_or_else(|| addr.clone())));
-            }
-        }
-        let mut targets: Vec<(String, Scope)> = vec![];
-        if !sessions.is_empty() {
-            targets.push(("All sessions".into(), Scope::Everything));
-            if spaces.len() > 1 {
-                targets.extend(spaces.iter().map(|s| (s.clone(), Scope::Space(s.clone()))));
-            }
-            targets.extend(sessions.iter().take(12).map(|(a, n)| (n.clone(), Scope::Session(a.clone()))));
-        }
-        let chips: Vec<AnyElement> = targets
-            .into_iter()
-            .enumerate()
-            .map(|(i, (text, target))| {
-                let selected = target == scope;
-                div()
-                    .id(SharedString::from(format!("scope-{i}")))
-                    .px_2()
-                    .py(px(3.0))
-                    .rounded_full()
-                    .cursor_pointer()
-                    .text_xs()
-                    .when(selected, |el| el.bg(rgb(PALE)).text_color(rgb(NAVY)))
-                    .when(!selected, |el| el.bg(rgba(0xffffff14)).text_color(g.muted).hover(|s| s.bg(rgba(0xffffff2e))))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.scope = target.clone();
-                        cx.notify();
-                    }))
-                    .child(text)
-                    .into_any_element()
-            })
-            .collect();
-
-        let now = history::now_ms();
-        let mut items: Vec<AnyElement> = vec![];
-        match filter {
-            Filter::Working => {
-                for j in &working {
-                    let strip = self.job_extra(j, &all_shots, cx);
-                    items.push(job_card(j, &g, now, &acc, strip));
-                }
-            }
-            Filter::Done => {
-                for j in &done {
-                    let strip = self.job_extra(j, &all_shots, cx);
-                    items.push(job_card(j, &g, now, &acc, strip));
-                }
-            }
-            Filter::Shots => {
-                if !gallery.is_empty() {
-                    items.push(self.gallery(&gallery, &acc, cx));
-                }
-            }
-            Filter::All => {
-                let mut day = String::new();
-                for e in &events {
-                    let d = day_label(e.at);
-                    if d != day {
-                        items.push(div().pt_1().text_xs().text_color(g.faint).child(d.clone()).into_any_element());
-                        day = d;
-                    }
-                    items.push(activity_row(e, &g, &acc));
-                }
-            }
-        }
-        if items.is_empty() {
-            let (title, sub) = match filter {
-                Filter::Working => ("No work running", "When the tower hands a session a job, it shows here with how long it's been going."),
-                Filter::Done => ("Nothing finished yet", "Finished jobs land here with what came of them."),
-                Filter::All => ("No activity yet", "Jobs, session reports and alerts show up here as they happen."),
-                Filter::Shots => ("No screenshots yet", "When a session shows you what it made (tower screenshot), it lands here."),
-            };
-            items.push(
-                v_flex()
-                    .pt(px(100.0))
-                    .px_6()
-                    .items_center()
-                    .gap_2()
-                    .text_color(g.muted)
-                    .child(div().text_base().text_color(g.text).child(title))
-                    .child(div().text_sm().text_center().child(sub))
-                    .into_any_element(),
-            );
-        }
-        v_flex()
-            .flex_1()
-            .min_h_0()
-            .child(filters)
-            .child(h_flex().px_5().pb_3().gap_1().flex_wrap().children(chips))
-            .child(div().id("activity").flex_1().min_h_0().overflow_y_scroll().child(v_flex().w_full().px_5().pb_3().gap_2().children(items)))
             .into_any_element()
     }
 }
@@ -1618,19 +1467,33 @@ fn report(text: &str) -> String {
 }
 
 /// One choice in a segmented control on the glass.
-fn segment(id: &'static str, text: String, selected: bool) -> gpui::Stateful<gpui::Div> {
+/// A top tab: its name, and a small count when there is something to look at.
+fn tab_segment(id: &'static str, text: &str, count: usize, selected: bool) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
-        .px_3()
+        .px_1()
         .py(px(5.0))
         .flex()
+        .gap_1()
+        .items_center()
         .justify_center()
         .rounded_full()
         .cursor_pointer()
         .text_sm()
         .when(selected, |el| el.bg(rgb(PALE)).text_color(rgb(NAVY)).font_weight(FontWeight::MEDIUM))
         .when(!selected, |el| el.text_color(rgba(0xffffffd9)).hover(|s| s.bg(rgba(0xffffff1f))))
-        .child(text)
+        .child(text.to_string())
+        .when(count > 0, |el| {
+            el.child(
+                div()
+                    .px(px(5.0))
+                    .rounded_full()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .bg(if selected { rgba(0x16233a24) } else { rgba(0xffcf7059) })
+                    .child(if count > 99 { "99+".to_string() } else { count.to_string() }),
+            )
+        })
 }
 
 /// What the chat shows: requests and answers, and what came in between.
