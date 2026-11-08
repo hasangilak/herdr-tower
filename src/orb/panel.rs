@@ -114,6 +114,7 @@ enum Scope {
 
 mod phone;
 mod gallery;
+mod questions;
 mod viewer;
 
 use crate::orb::shots::{self, Shot};
@@ -130,6 +131,10 @@ pub struct Panel {
     tower: Entity<Tower>,
     /// The Phone view (pairing the Android app).
     phone: phone::PhoneView,
+    /// What sessions ask that the tower leaves to you.
+    asks: questions::Asks,
+    /// The input the voice writes in this take: the message, or a question's "Other".
+    voice_field: Option<Entity<TextareaState>>,
     /// Screenshots in history, newest first (the state's recent list joins them when shown).
     shots: Vec<Shot>,
     thumbs: HashMap<PathBuf, Thumb>,
@@ -213,6 +218,7 @@ impl Panel {
                     }
                 }
                 this.follow_voice(&tower, window, cx);
+                this.watch_sets(cx);
                 let listening = matches!(tower.read(cx).phase(), "listening" | "armed");
                 if listening != this.listening_since.is_some() {
                     this.listening_since = listening.then(Instant::now);
@@ -276,6 +282,8 @@ impl Panel {
         Self {
             tower,
             phone: Default::default(),
+            asks: Default::default(),
+            voice_field: None,
             shots: vec![],
             thumbs: HashMap::new(),
             dims: HashMap::new(),
@@ -330,7 +338,14 @@ impl Panel {
             self.forgot = false;
             return;
         }
-        let current = self.text.read(cx).value().to_string();
+        // A take writes where it began: a question's "Other" if it had the
+        // keyboard, else the message.
+        let field = match (&self.voice, &self.voice_field) {
+            (Some(_), Some(f)) => f.clone(),
+            _ => self.asks.other_focused(window, cx).unwrap_or_else(|| self.text.clone()),
+        };
+        self.voice_field = Some(field.clone());
+        let current = field.read(cx).value().to_string();
         let base = self.base.text().to_string();
         match voice_input(&hearing, &heard, &held, self.voice.as_deref(), &current, &base) {
             VoiceInput::Keep => {}
@@ -341,30 +356,30 @@ impl Panel {
             VoiceInput::Show(text) => {
                 if self.voice.is_none() {
                     self.voice_since = history::now_ms();
-                    self.base = self.text.read(cx).content();
+                    self.base = field.read(cx).content();
                     self.forgot = false;
                     self.parting = None;
                 }
-                self.put_voice(&text, &current, window, cx);
+                self.put_voice(&field, &text, &current, window, cx);
                 self.voice = Some(text);
             }
             VoiceInput::Held(text) => {
                 if self.voice.is_none() {
-                    self.base = self.text.read(cx).content();
+                    self.base = field.read(cx).content();
                 }
                 self.held_seen = held_ms;
-                self.put_voice(&text, &current, window, cx);
+                self.put_voice(&field, &text, &current, window, cx);
                 self.voice = None;
             }
             VoiceInput::Restore => {
                 let base = std::mem::replace(&mut self.base, InputContent::new(""));
                 let at = base.text().len();
                 self.voice = None;
-                self.set_content(base, at, window, cx);
+                self.set_content(&field, base, at, window, cx);
             }
             VoiceInput::Sent(text) => {
                 if current != text {
-                    self.put_voice(&text, &current, window, cx);
+                    self.put_voice(&field, &text, &current, window, cx);
                 }
                 self.voice = None;
                 self.parting = Some(text.clone());
@@ -392,17 +407,17 @@ impl Panel {
 
     /// Writes the voice's text in the input, with the draft's tokens (the
     /// text begins with the draft), the caret following its end.
-    fn put_voice(&mut self, text: &str, current: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let at = caret_after(self.text.read(cx).cursor(), current.len(), text);
+    fn put_voice(&mut self, field: &Entity<TextareaState>, text: &str, current: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let at = caret_after(field.read(cx).cursor(), current.len(), text);
         let content = voice_content(&self.base, text);
-        self.set_content(content, at, window, cx);
+        self.set_content(field, content, at, window, cx);
     }
 
     /// Sets the input and puts the caret at `at` (and the input scrolling
     /// with it), unless the input isn't focused: then it isn't taken.
-    fn set_content(&mut self, content: InputContent, at: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let focused = gpui::Focusable::focus_handle(self.text.read(cx), cx).is_focused(window);
-        self.text.update(cx, |s, cx| s.set_value(content, window, cx));
+    fn set_content(&mut self, field: &Entity<TextareaState>, content: InputContent, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let focused = gpui::Focusable::focus_handle(field.read(cx), cx).is_focused(window);
+        field.update(cx, |s, cx| s.set_value(content, window, cx));
         if !focused {
             return;
         }
@@ -417,8 +432,8 @@ impl Panel {
                 }
             });
         }
-        place(&self.text, at, window, cx);
-        let state = self.text.clone();
+        place(field, at, window, cx);
+        let state = field.clone();
         window.on_next_frame(move |window, _| {
             window.on_next_frame(move |window, cx| place(&state, at, window, cx));
         });
@@ -426,15 +441,27 @@ impl Panel {
 
     /// Tells the daemon whether the input holds a draft of yours, so a take
     /// goes into it rather than to the brain alone.
-    fn sync_hold(&mut self, cx: &App) {
+    fn sync_hold(&mut self, window: &Window, cx: &App) {
         let value = self.text.read(cx).value();
         let own_voice = self.voice.is_some() && self.base.text().trim().is_empty();
         let parting = self.parting.as_deref() == Some(value.as_ref());
-        let draft = !value.trim().is_empty() && !own_voice && !parting;
+        // A question's "Other" with the keyboard: a take is an answer there, never a request.
+        let answering = self.asks.other_focused(window, cx).is_some();
+        let draft = answering || (!value.trim().is_empty() && !own_voice && !parting);
         if draft != self.holding {
             self.holding = draft;
             crate::draft::hold(draft);
         }
+    }
+
+    /// Under a job's card: its session's question, its screenshots.
+    fn job_extra(&mut self, j: &Job, all_shots: &[Shot], cx: &mut Context<Self>) -> Option<AnyElement> {
+        let asks = self.job_asks(&j.session, cx);
+        let shots = self.job_shots(j, all_shots, cx);
+        if asks.is_none() && shots.is_none() {
+            return None;
+        }
+        Some(v_flex().gap_2().children(asks).children(shots).into_any_element())
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
@@ -454,8 +481,12 @@ impl Panel {
         cx.notify();
     }
 
-    /// Each file becomes a token at the cursor: `[Image #1]`, `[Video #2]`, `[File #3: name]`.
+    /// Each file becomes a token at the cursor: `[Image #1]`, `[Video #2]`,
+    /// `[File #3: name]`; in a question's "Other" when it has the keyboard.
     fn attach(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(field) = self.asks.other_focused(window, cx) {
+            return self.attach_to(&field, paths, window, cx);
+        }
         for p in paths.into_iter().filter(|p| p.is_file()) {
             let n = self.next;
             self.next += 1;
@@ -474,6 +505,28 @@ impl Panel {
         }
         self.status = None;
         self.text.update(cx, |s, cx| s.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Files into another field (a question's "Other"), numbered after its own.
+    fn attach_to(&mut self, field: &Entity<TextareaState>, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let mut n = field.read(cx).tokens().len() + 1;
+        for p in paths.into_iter().filter(|p| p.is_file()) {
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let label = match file_kind(&p) {
+                Kind::Image => format!("[Image #{n}]"),
+                Kind::Video => format!("[Video #{n}]"),
+                Kind::Other => format!("[File #{n}: {name}]"),
+            };
+            n += 1;
+            let id = p.display().to_string();
+            field.update(cx, |s, cx| {
+                if s.replace_with_token(InlineToken::new(id, label), window, cx).is_ok() {
+                    s.insert(" ", window, cx);
+                }
+            });
+        }
+        field.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
     }
 
@@ -577,7 +630,7 @@ impl Drop for Panel {
 
 impl Render for Panel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_hold(cx);
+        self.sync_hold(window, cx);
         let g = glass();
         let body = match self.view {
             View::Chat => self.chat_view(cx),
@@ -647,7 +700,7 @@ impl Panel {
                             .items_center()
                             .child(div().flex_1().text_lg().font_weight(FontWeight::MEDIUM).child("Tower"))
                             .child(
-                                // The phone app: pairing, paired phones.
+                                // Settings: questions, the phone app.
                                 div()
                                     .id("view-phone")
                                     .size(px(30.0))
@@ -658,7 +711,8 @@ impl Panel {
                                     .cursor_pointer()
                                     .when(view == View::Phone, |el| el.bg(rgb(PALE)))
                                     .when(view != View::Phone, |el| el.hover(|s| s.bg(rgba(0xffffff1f))))
-                                    .child(phone::glyph(if view == View::Phone { rgb(NAVY).into() } else { g.muted.into() }))
+                                    .text_color(if view == View::Phone { rgb(NAVY).into() } else { g.muted })
+                                    .child(Icon::new(IconName::Settings).small())
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         if this.view == View::Phone {
                                             this.phone_leave();
@@ -791,6 +845,8 @@ impl Panel {
                 rows.push(working_line(&w, now, &g));
             }
         }
+        // What sessions ask you: at the foot, where you look.
+        rows.extend(self.question_cards(&acc, cx));
         if let Some((ok, msg)) = self.status.clone() {
             rows.push(
                 h_flex()
@@ -1070,13 +1126,13 @@ impl Panel {
         match filter {
             Filter::Working => {
                 for j in &working {
-                    let strip = self.job_shots(j, &all_shots, cx);
+                    let strip = self.job_extra(j, &all_shots, cx);
                     items.push(job_card(j, &g, now, &acc, strip));
                 }
             }
             Filter::Done => {
                 for j in &done {
-                    let strip = self.job_shots(j, &all_shots, cx);
+                    let strip = self.job_extra(j, &all_shots, cx);
                     items.push(job_card(j, &g, now, &acc, strip));
                 }
             }
@@ -1379,7 +1435,7 @@ impl Panel {
             items.push(section("Running").into_any_element());
             let all_shots = self.all_shots(cx);
             for j in &running {
-                let strip = self.job_shots(j, &all_shots, cx);
+                let strip = self.job_extra(j, &all_shots, cx);
                 items.push(job_card(j, &g, now, &acc, strip));
             }
         }
@@ -1387,7 +1443,7 @@ impl Panel {
             items.push(section("Done").into_any_element());
             let all_shots = self.all_shots(cx);
             for j in done.iter().take(10) {
-                let strip = self.job_shots(j, &all_shots, cx);
+                let strip = self.job_extra(j, &all_shots, cx);
                 items.push(job_card(j, &g, now, &acc, strip));
             }
         }
@@ -1502,7 +1558,7 @@ fn segment(id: &'static str, text: String, selected: bool) -> gpui::Stateful<gpu
 fn chat_items(entries: &[Entry]) -> Vec<&Entry> {
     // News held from an unfocused space waits in Spaces, not here.
     let keep = |e: &&Entry| !e.held && match e.kind.as_str() {
-        "request" | "answer" | "watch" | "alert" | "summary" => true,
+        "request" | "answer" | "watch" | "alert" | "summary" | "answered" => true,
         "screenshot" => e.path.is_some(),
         "job" => matches!(e.status.as_deref(), Some("done" | "failed" | "error" | "exited" | "blocked")) && !e.text.is_empty(),
         _ => false,
@@ -1563,6 +1619,8 @@ fn event_line(e: &Entry, g: &Glass) -> AnyElement {
         ("job", _) => (IconName::CircleX, format!("{who}: {}", e.text)),
         ("alert", _) => (IconName::Bell, e.text.clone()),
         ("summary", _) => (IconName::FileText, format!("{who}: {}", e.text)),
+        // The tower answered a session's question itself: quiet.
+        ("answered", _) => (IconName::Check, if who.is_empty() { e.text.clone() } else { format!("{who}: {}", e.text) }),
         _ => (IconName::SquareTerminal, report(&e.text)),
     };
     h_flex()

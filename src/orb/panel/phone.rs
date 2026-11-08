@@ -111,6 +111,13 @@ pub(super) fn pairing_outcome(before: &[String], status: &Status) -> Option<Resu
     None
 }
 
+impl PhoneView {
+    /// Something went wrong in Settings: said under the phone's status.
+    pub(super) fn note_error(&mut self, e: String) {
+        self.note = Some((false, e));
+    }
+}
+
 impl Panel {
     /// Reads the status (in the background); every 2 s while the view is open.
     pub(super) fn phone_refresh(&mut self, cx: &mut Context<Self>) {
@@ -252,7 +259,8 @@ impl Panel {
     pub(super) fn phone_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let g = glass();
         let section = |t: &str| div().pt_2().text_xs().font_weight(FontWeight::MEDIUM).text_color(g.faint).child(t.to_uppercase());
-        let mut items: Vec<AnyElement> = vec![];
+        // Settings: how questions are handled, then the phone app.
+        let mut items: Vec<AnyElement> = self.policy_items(cx);
         let busy = self.phone.busy;
         let Some(st) = self.phone.status.clone() else {
             items.push(div().pt_4().text_sm().text_color(g.muted).child("Looking…").into_any_element());

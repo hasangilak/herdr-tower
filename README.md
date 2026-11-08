@@ -100,6 +100,8 @@ right, its answers on the left, what the sessions reported in between.
 Type in the pill at the bottom: Enter sends, Shift+Enter starts a new line,
 Esc closes. While you talk (Control or ⌘⇧Space), what you say appears in it as you say it, transcribed every second or so, then the final text, which goes to the brain as any spoken request. If the input already holds a draft (text you typed, an image or file you attached), what you say is added after it instead, and nothing goes until you press Enter, which sends the text and the attachments together.
 
+When a session asks something the tower leaves to you (see "who decides" in [docs/questions.md](docs/questions.md)), a card waits at the foot of the chat, and the session's job card says "Asks: …" with a link to it. One question at a time, as the terminal dialog: the tower's three recommendations as large answers (the first marked Recommended, with why; a spinner while they come, and you can answer already), the session's own choices one tap away, and **Other** for your own answer: type it, hold Control and say it, or add files. Several questions end with a review, then Submit; the tower types the answers into the session and the card says how it goes (answering, waiting for the session, or where it stopped). ✕ dismisses it. What the tower answered for you shows as a quiet line ("answered for you: …"). How much it answers by itself is in Settings (the gear): normal, keep moving, or ask me everything.
+
 Attachments work as in Claude Code and Codex: paste a screenshot or a file
 copied in Finder, drop files on the panel, or pick them with +. Each becomes a
 token where you were typing, `[Image #1]`, `[Video #2]`, `[File #3: name]`;
@@ -233,8 +235,8 @@ address; and every call needs the paired phone's token, which the Mac keeps
 only as a hash. The API, the pairing flow and the security model:
 [docs/mobile-api.md](docs/mobile-api.md).
 
-The panel does the same without a terminal: the phone button at its top
-right shows whether the phone API is on and where it listens, turns it on or
+The panel does the same without a terminal: Settings (the gear at its top
+right) shows whether the phone API is on and where it listens, turns it on or
 off, and **Pair a phone** shows the QR code (and the code to type) with its
 5-minute countdown, opening a fresh one when it runs out. Below it are the
 paired phones, each with Revoke and **Replies: Phone | Mac**: where the
