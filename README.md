@@ -1,4 +1,4 @@
-# herder-tower
+# herdr-tower
 
 A voice control tower for [Herdr](https://herdr.dev). Talk to it, and it
 steers every Claude Code and Codex session you run in Herdr, on this Mac and
@@ -179,15 +179,34 @@ shows it at 100% (scroll to look around), ← and → go through the others,
 and Esc, ✕ or a click outside closes it. Thumbnails are made once, in the
 background, the first time one is shown.
 
-### The phone
+### The phone: Tower for Android
 
-An Android app (in the works) can show the panel and be the tower's voice
-over the local network: `tower phone enable`, then `tower phone pair` and
-scan the QR. It is off by default, HTTPS only (the phone pins the Mac's
-certificate), on the Mac's private LAN address only, and every call needs a
-paired phone's token (`tower phone revoke` forgets one). While a phone is the
-voice, the Mac stays silent and the tower speaks on the phone. The API, the
-pairing flow and the security model: [docs/mobile-api.md](docs/mobile-api.md).
+**Tower for Android** ([github.com/hasangilak/herdr-tower-android](https://github.com/hasangilak/herdr-tower-android),
+`git@github.com:hasangilak/herdr-tower-android.git`) is the tower in your
+pocket, over the local network. It mirrors the panel: chat with the tower,
+spaces and their sessions (with their Claude accounts), running and finished
+jobs, history, and the screenshots sessions send (a gallery and a full-size
+viewer). It acts like the panel: ask (typed or dictated, with pictures and
+files attached), approve or refuse what a blocked agent asks, focus a space,
+hush. And it can be **the tower's voice**: you talk into the phone, the Mac
+transcribes with its own Whisper, and the replies (and the "Okay.") play on
+the phone in the tower's Kokoro voice while the Mac stays silent.
+
+To connect it:
+
+1. `tower phone enable` (the phone API is off until you do).
+2. Pair: open the panel's **Phone** section and press **Pair a phone** for
+   a QR code, or run `tower phone pair` in a terminal. Scan the QR in the app
+   (or type the address and the 8-digit code; the code works once, for 5
+   minutes).
+3. `tower phone devices` lists paired phones; `tower phone revoke <id|all>`
+   forgets one at once.
+
+It is HTTPS only, with a certificate the Mac makes for itself and the phone
+pins (its fingerprint is in the QR); it listens only on the Mac's private LAN
+address; and every call needs the paired phone's token, which the Mac keeps
+only as a hash. The API, the pairing flow and the security model:
+[docs/mobile-api.md](docs/mobile-api.md).
 
 The panel does the same without a terminal: the phone button at its top
 right shows whether the phone API is on and where it listens, turns it on or
