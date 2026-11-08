@@ -1,36 +1,100 @@
 //! `tower phone`: turns the phone API on and off, pairs phones, lists and
 //! revokes them. The API itself runs in the voice daemon (`daemon::lan`).
+//! The orb's panel (its Phone view) does the same through the functions
+//! below, which the command uses too.
 
 use anyhow::{Result, bail};
 use serde_json::Value;
 
 use crate::config;
-use crate::daemon::lan::{auth::Devices, tls};
+use crate::daemon::lan::{auth::{Device, Devices}, tls};
 use crate::protocol::{self, Request};
+
+/// Where the phone API stands, for the panel.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Status {
+    /// `[lan] enabled` in config.toml: it starts with the voice.
+    pub enabled: bool,
+    /// The voice daemon is running (the API lives in it).
+    pub voice: bool,
+    /// Where it listens (`https://ip:port`) while it's on.
+    pub url: Option<String>,
+    /// Seconds left on the open pairing code (none open: `None`).
+    pub pairing_expires_in_s: Option<u64>,
+    pub devices: Vec<Device>,
+}
+
+pub fn status() -> Status {
+    let info = daemon("status", "").ok();
+    Status {
+        enabled: config::Config::load().map(|c| c.lan.enabled).unwrap_or(false),
+        voice: info.is_some(),
+        url: info.as_ref().and_then(|v| v["url"].as_str().map(String::from)),
+        pairing_expires_in_s: info.as_ref().and_then(|v| v["pairing_expires_in_s"].as_u64()),
+        devices: Devices::load_from(&Devices::path()).devices,
+    }
+}
+
+/// Turns it on (in config.toml, and now if the voice runs): where it
+/// listens and its certificate; `None` when the voice isn't running.
+pub fn enable() -> Result<Option<Value>> {
+    set_enabled(true)?;
+    match daemon("on", "") {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e.to_string().contains("not running") => Ok(None),
+        Err(e) => bail!("enabled in config.toml, but it didn't start: {e:#}"),
+    }
+}
+
+/// Turns it off. Paired phones stay paired.
+pub fn disable() -> Result<()> {
+    set_enabled(false)?;
+    let _ = daemon("off", "");
+    Ok(())
+}
+
+/// Opens a one-time pairing code: `code`, `host`, `port`, `fingerprint`,
+/// `link` (what the QR carries), `expires_in_s`. Secret: never logged.
+pub fn pair() -> Result<Value> {
+    daemon("pair", "")
+}
+
+/// Forgets a paired phone (or `all`): its token stops working and its open
+/// streams close. How many were revoked.
+pub fn revoke(id: &str) -> Result<usize> {
+    let mut d = Devices::load_from(&Devices::path());
+    let ids: Vec<String> = d.devices.iter().filter(|x| id == "all" || x.id == id).map(|x| x.id.clone()).collect();
+    let n = d.revoke(id);
+    if n == 0 {
+        bail!("no paired device {id}");
+    }
+    d.save_to(&Devices::path())?;
+    for i in ids {
+        let _ = daemon("revoked", &i);
+    }
+    Ok(n)
+}
 
 pub fn cmd(action: &str, id: Option<&str>, json: bool) -> Result<()> {
     match action {
         "enable" | "on" => {
-            set_enabled(true)?;
-            match daemon("on", "") {
-                Ok(v) => println!(
+            match enable()? {
+                Some(v) => println!(
                     "Phone API on at {} (certificate {}).\nPair a phone: tower phone pair",
                     v["url"].as_str().unwrap_or("?"),
                     tls::grouped(&v["fingerprint"].as_str().unwrap_or("")[..16.min(v["fingerprint"].as_str().unwrap_or("").len())])
                 ),
-                Err(e) if e.to_string().contains("not running") => println!("Enabled: it starts with the voice (tower up)."),
-                Err(e) => bail!("enabled in config.toml, but it didn't start: {e:#}"),
+                None => println!("Enabled: it starts with the voice (tower up)."),
             }
             Ok(())
         }
         "disable" | "off" => {
-            set_enabled(false)?;
-            let _ = daemon("off", "");
+            disable()?;
             println!("Phone API off. Paired phones stay paired (tower phone revoke all to forget them).");
             Ok(())
         }
         "pair" => {
-            let v = daemon("pair", "")?;
+            let v = pair()?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&v)?);
                 return Ok(());
@@ -75,16 +139,7 @@ pub fn cmd(action: &str, id: Option<&str>, json: bool) -> Result<()> {
         }
         "revoke" => {
             let Some(id) = id else { bail!("tower phone revoke <device id|all> (ids: tower phone devices)") };
-            let mut d = Devices::load_from(&Devices::path());
-            let ids: Vec<String> = d.devices.iter().filter(|x| id == "all" || x.id == id).map(|x| x.id.clone()).collect();
-            let n = d.revoke(id);
-            if n == 0 {
-                bail!("no paired device {id}");
-            }
-            d.save_to(&Devices::path())?;
-            for i in ids {
-                let _ = daemon("revoked", &i);
-            }
+            let n = revoke(id)?;
             println!("Revoked {n} device(s): their tokens no longer work, and their open streams are closed.");
             Ok(())
         }
@@ -103,7 +158,7 @@ fn daemon(action: &str, arg: &str) -> Result<Value> {
     Ok(r.state.unwrap_or_default())
 }
 
-fn ago(ms: u64) -> String {
+pub fn ago(ms: u64) -> String {
     let s = crate::history::now_ms().saturating_sub(ms) / 1000;
     match s {
         0..60 => "just now".into(),

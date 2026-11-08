@@ -163,6 +163,12 @@ paired phone's token (`tower phone revoke` forgets one). While a phone is the
 voice, the Mac stays silent and the tower speaks on the phone. The API, the
 pairing flow and the security model: [docs/mobile-api.md](docs/mobile-api.md).
 
+The panel does the same without a terminal: the phone button at its top
+right shows whether the phone API is on and where it listens, turns it on or
+off, and **Pair a phone** shows the QR code (and the code to type) with its
+5-minute countdown, opening a fresh one when it runs out. Below it are the
+paired phones, each with Revoke.
+
 From a shell (or a Raycast/skhd hotkey outside Herdr):
 
 ```sh

@@ -73,6 +73,7 @@ enum View {
     Chat,
     Activity,
     Spaces,
+    Phone,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -104,8 +105,12 @@ enum Scope {
     Session(String),
 }
 
+mod phone;
+
 pub struct Panel {
     tower: Entity<Tower>,
+    /// The Phone view (pairing the Android app).
+    phone: phone::PhoneView,
     view: View,
     text: Entity<TextareaState>,
     /// The next attachment's number in this message.
@@ -227,6 +232,9 @@ impl Panel {
                 tick += 1;
                 let alive = this.update(cx, |this, cx| {
                     this.reload(cx);
+                    if this.view == View::Phone {
+                        this.phone_tick(cx);
+                    }
                     // The listening timer and running jobs' elapsed times tick.
                     let working = this.tower.read(cx).work.is_some();
                     if working || this.listening_since.is_some() || (this.view == View::Activity && this.jobs.iter().any(|j| j.open())) {
@@ -243,6 +251,7 @@ impl Panel {
         let held_seen = tower.read(cx).s("dictated_ms").as_u64().unwrap_or(0);
         Self {
             tower,
+            phone: Default::default(),
             view: View::Chat,
             text,
             next: 1,
@@ -546,8 +555,10 @@ impl Render for Panel {
             View::Chat => self.chat_view(cx),
             View::Activity => self.activity_view(cx),
             View::Spaces => self.spaces_view(cx),
+            View::Phone => self.phone_view(cx),
         };
-        let input = self.input(window, cx);
+        // Pairing needs the room; there's nothing to send from there.
+        let input = if self.view == View::Phone { div().into_any_element() } else { self.input(window, cx) };
         let header = self.header(cx);
         v_flex()
             .id("tower-panel")
@@ -603,7 +614,35 @@ impl Panel {
             .child(
                 v_flex()
                     .gap(px(2.0))
-                    .child(div().text_lg().font_weight(FontWeight::MEDIUM).child("Tower"))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .child(div().flex_1().text_lg().font_weight(FontWeight::MEDIUM).child("Tower"))
+                            .child(
+                                // The phone app: pairing, paired phones.
+                                div()
+                                    .id("view-phone")
+                                    .size(px(30.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .when(view == View::Phone, |el| el.bg(rgb(PALE)))
+                                    .when(view != View::Phone, |el| el.hover(|s| s.bg(rgba(0xffffff1f))))
+                                    .child(phone::glyph(if view == View::Phone { rgb(NAVY).into() } else { g.muted.into() }))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if this.view == View::Phone {
+                                            this.phone_leave();
+                                            this.view = View::Chat;
+                                        } else {
+                                            this.view = View::Phone;
+                                            this.phone_tick(cx);
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
                     .child(
                         h_flex()
                             .gap(px(6.0))
@@ -623,12 +662,14 @@ impl Panel {
                     .border_1()
                     .border_color(g.edge)
                     .child(tab("view-chat", "Chat".into(), View::Chat).on_click(cx.listener(|this, _, _, cx| {
+                        this.phone_leave();
                         this.view = View::Chat;
                         cx.notify();
                     })))
                     .child(
                         tab("view-activity", if running > 0 { format!("Activity · {running}") } else { "Activity".into() }, View::Activity).on_click(
                             cx.listener(|this, _, _, cx| {
+                                this.phone_leave();
                                 this.view = View::Activity;
                                 cx.notify();
                             }),
@@ -636,6 +677,7 @@ impl Panel {
                     )
                     .child(tab("view-spaces", if held > 0 { format!("Spaces · {held}") } else { "Spaces".into() }, View::Spaces).on_click(cx.listener(
                         |this, _, _, cx| {
+                            this.phone_leave();
                             this.view = View::Spaces;
                             this.open_space = None;
                             cx.notify();
