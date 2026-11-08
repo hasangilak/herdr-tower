@@ -182,7 +182,7 @@ pub fn deliver(shared: &Shared, mouth: &Mouth, text: &str, ack: Option<Duration>
     match brain::ask(text, &radar(shared)) {
         Ok(()) => {
             timing::mark("sent to the brain");
-            mouth.asked();
+            mouth.asked(text);
             if let Some(delay) = ack {
                 mouth.ack(delay);
             }

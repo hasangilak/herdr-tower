@@ -170,6 +170,92 @@ pub fn is_hallucination(text: &str) -> bool {
         || text.trim().starts_with('(') && text.trim().ends_with(')')
 }
 
+/// Short acknowledgements, English and German, lowercase. Not "yes", "no",
+/// "ja", "right": those can be the answer itself.
+const ACKS: &[&str] = &[
+    "okay sure", "ok sure", "okay", "okey", "ok", "sure thing", "sure", "got it", "gotcha", "i'm on it", "i\u{2019}m on it", "im on it", "on it", "will do",
+    "alright", "all right", "understood", "roger that", "roger", "no problem", "absolutely", "certainly", "of course", "sounds good",
+    "i'll do that", "i\u{2019}ll do that", "i will do that", "doing it now", "one moment", "one sec", "just a moment", "alles klar", "klar", "mach ich",
+    "mache ich", "wird gemacht", "verstanden", "geht klar", "in ordnung", "gerne", "gern", "jawohl", "natürlich", "sofort",
+    "ich bin dran", "bin dran", "ich mach das", "ich mache das", "gut",
+];
+
+/// The ack phrase `s` starts with (as a whole word, the longest), and the rest after it.
+fn leading_ack(s: &str) -> Option<&str> {
+    let lower = s.to_lowercase();
+    let n = ACKS
+        .iter()
+        .filter(|a| {
+            lower.starts_with(*a) && lower[a.len()..].chars().next().is_none_or(|c| !c.is_alphanumeric() && c != '\'' && c != '\u{2019}')
+        })
+        .map(|a| a.len())
+        .max()?;
+    // The letters in ACKS lowercase from same-length capitals, so `n` holds in `s` too.
+    s.get(n..)
+}
+
+fn is_mark(c: char) -> bool {
+    matches!(c, ',' | '.' | '!' | '?' | ';' | ':' | '-' | '—' | '–' | '…')
+}
+
+/// A reply heard right after the tower's own "Okay." / "Got it.": None
+/// when it is nothing but an acknowledgement, else the reply without the
+/// acknowledgement it starts with ("Sure, the tests pass." -> "The tests pass.").
+/// A word after it without a mark ("Sure enough ...", "Klar ist ...") is content.
+pub fn without_ack(text: &str) -> Option<String> {
+    let mut s = text.trim();
+    let mut stripped = false;
+    loop {
+        let Some(rest) = leading_ack(s) else { break };
+        let t = rest.trim_start();
+        if t.is_empty() || t.chars().all(|c| is_mark(c) || c.is_whitespace()) {
+            return None;
+        }
+        if t.starts_with(is_mark) {
+            s = t.trim_start_matches(|c: char| is_mark(c) || c.is_whitespace());
+            stripped = true;
+        } else if leading_ack(t).is_some() {
+            // "Okay sure, ..."
+            s = t;
+            stripped = true;
+        } else {
+            break;
+        }
+    }
+    if !stripped {
+        return Some(text.to_string());
+    }
+    let mut c = s.chars();
+    Some(match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => return None,
+    })
+}
+
+/// The user takes back what they said ("never mind", "forget it", "ignore
+/// that", "vergiss es"): the canned acknowledgement is all the answer needed.
+pub fn is_dismissal(request: &str) -> bool {
+    let n: String = request.to_lowercase().chars().map(|c| if c.is_alphanumeric() || c == '\'' { c } else { ' ' }).collect();
+    let n = n.split_whitespace().collect::<Vec<_>>().join(" ");
+    let n = n.strip_prefix("tower ").unwrap_or(&n);
+    if n.split(' ').count() > 8 {
+        return false;
+    }
+    const START: &[&str] = &[
+        "never mind", "nevermind", "forget it", "forget that", "forget about it", "forget what i said", "forget my", "ignore that",
+        "ignore this", "ignore it", "ignore my", "ignore what i said", "ignore the last", "scratch that", "cancel that", "disregard",
+        "vergiss es", "vergiss das", "ignorier das", "ignoriere das", "schon gut", "lass gut sein",
+    ];
+    // Only as the whole message: "Nothing is blocked?" is a question.
+    const WHOLE: &[&str] = &["nothing", "no nothing", "oh nothing", "sorry nothing", "egal", "nichts", "doch nicht", "nicht so wichtig"];
+    WHOLE.contains(&n) || START.iter().any(|p| n == *p || n.starts_with(&format!("{p} ")))
+}
+
+/// A short reply: what the brain says to a dismissal is dropped when this short.
+pub fn is_short_reply(text: &str) -> bool {
+    text.split_whitespace().count() <= 12
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +284,38 @@ mod tests {
         assert!(is_hallucination(" Thank you."));
         assert!(is_hallucination("[BLANK_AUDIO]"));
         assert!(!is_hallucination("Tell eyzflow to run the tests"));
+    }
+
+    #[test]
+    fn drops_acks_after_the_canned_one() {
+        for only in ["Okay, sure.", "okay sure", "Got it!", "On it.", "Will do.", "Sure thing.", "OK.", "Alright — on it.", "I'm on it.", "Alles klar.", "Mach ich!", "Klar, wird gemacht.", "Okay, sure. Got it.", "Verstanden"] {
+            assert_eq!(without_ack(only), None, "{only:?}");
+        }
+        assert_eq!(without_ack("Okay, sure. The tests pass.").as_deref(), Some("The tests pass."));
+        assert_eq!(without_ack("Got it, starting the eyzflow session.").as_deref(), Some("Starting the eyzflow session."));
+        assert_eq!(without_ack("Alles klar, t22 läuft noch.").as_deref(), Some("T22 läuft noch."));
+        assert_eq!(without_ack("okay sure, checking").as_deref(), Some("Checking"));
+        // Real content stays as it is.
+        for keep in ["Sure enough, the build failed.", "Okayama is a city.", "Yes.", "No, it's still working.", "Right now nothing is blocked.", "Gut gemacht, alles grün.", "The okay button is broken.", "Klarna is down."] {
+            assert_eq!(without_ack(keep).as_deref(), Some(keep), "{keep:?}");
+        }
+    }
+
+    #[test]
+    fn dismissals() {
+        for d in ["Never mind.", "never mind, it's fine", "Forget it!", "Ignore my last prompt.", "ignore that", "Tower, forget that.", "Scratch that.", "Vergiss es.", "Egal.", "Schon gut.", "Ignorier das bitte", "Oh, nothing."] {
+            assert!(is_dismissal(d), "{d:?}");
+        }
+        for r in [
+            "Never mind the tests, deploy the dashboard to production now please",
+            "Ignore the failing lint and open the PR into dev for the release",
+            "What's everyone doing?",
+            "Nothing is blocked?",
+            "Egal welche Session, starte die Tests",
+        ] {
+            assert!(!is_dismissal(r), "{r:?}");
+        }
+        assert!(is_short_reply("No problem, I'll ignore that."));
+        assert!(!is_short_reply("No problem. By the way, the eyzflow session finished and its pull request is ready for your review now."));
     }
 }

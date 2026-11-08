@@ -50,8 +50,9 @@ pub enum Msg {
     Hush,
     /// A take was sent (`true`: its answer is coming), or came to nothing.
     Expect(bool),
-    /// A request reached the brain.
-    Asked,
+    /// A request reached the brain (`true`: the user took something back,
+    /// "never mind": a short reply is not said).
+    Asked(bool),
     /// The brain's turn is over: its answer is all in.
     Answered,
 }
@@ -98,9 +99,9 @@ impl Mouth {
         let _ = self.tx.send(Msg::Ack { delay });
     }
 
-    /// A request reached the brain: its answer is next.
-    pub fn asked(&self) {
-        let _ = self.tx.send(Msg::Asked);
+    /// A request reached the brain: its answer is next. `request`: what was asked.
+    pub fn asked(&self, request: &str) {
+        let _ = self.tx.send(Msg::Asked(crate::text::is_dismissal(request)));
     }
 
     /// The brain's answer is all in.
@@ -218,6 +219,8 @@ pub fn start(settings: Settings, shared: Shared) -> Result<Mouth> {
         playing: VecDeque::new(),
         awaiting: None,
         ack: None,
+        acked: false,
+        dismissed: false,
         replies_started: 0,
         next_ack: 0,
         last_alert: None,
@@ -247,6 +250,11 @@ struct Speech {
     /// The user waits for an answer since then: alerts wait too.
     awaiting: Option<Instant>,
     ack: Option<(Instant, u64)>,
+    /// The canned acknowledgement was played for the current request: the
+    /// brain's own "Okay, sure." is not said again (see `text::without_ack`).
+    acked: bool,
+    /// The current request takes something back ("never mind").
+    dismissed: bool,
     replies_started: u64,
     next_ack: usize,
     /// When the last alert sentence was queued: alerts in a row share a bell.
@@ -318,11 +326,24 @@ impl Speech {
         match m {
             Msg::Chime(on) => self.bell.append(chime(on)),
             Msg::Ack { delay } => {
+                self.acked = false;
                 if !self.acks.is_empty() {
                     self.ack = Some((Instant::now() + delay, self.replies_started));
                 }
             }
             Msg::Say { text, kind, interrupt } => {
+                if kind == Kind::Reply && self.dismissed && !text.trim().is_empty() && crate::text::is_short_reply(&text) {
+                    eprintln!("[speech] you said never mind: not saying {text:?}");
+                    return;
+                }
+                let text = match (kind == Kind::Reply && self.acked && !text.trim().is_empty()).then(|| crate::text::without_ack(&text)) {
+                    Some(None) => {
+                        eprintln!("[speech] already acknowledged: not saying {text:?}");
+                        return;
+                    }
+                    Some(Some(t)) => t,
+                    None => text,
+                };
                 self.shared.update(|s| {
                     s.said = text.clone();
                     s.said_ms = now_ms();
@@ -365,9 +386,13 @@ impl Speech {
                     eprintln!("[speech] you asked something new: dropped {n} old replies");
                 }
                 self.awaiting = Some(Instant::now());
+                self.acked = false;
+                self.dismissed = false;
             }
             Msg::Expect(false) => self.awaiting = None,
-            Msg::Asked => {
+            Msg::Asked(dismissed) => {
+                self.acked = false;
+                self.dismissed = dismissed;
                 let n = self.q.asked();
                 if n > 0 {
                     eprintln!("[speech] new request: dropped {n} old replies");
@@ -391,6 +416,7 @@ impl Speech {
         let clip = self.acks[self.next_ack % self.acks.len()].clone();
         self.next_ack += 1;
         self.append(Kind::Reply, clip);
+        self.acked = true;
         timing::mark("acknowledged");
     }
 
