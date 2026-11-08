@@ -224,7 +224,8 @@ The panel does the same without a terminal: the phone button at its top
 right shows whether the phone API is on and where it listens, turns it on or
 off, and **Pair a phone** shows the QR code (and the code to type) with its
 5-minute countdown, opening a fresh one when it runs out. Below it are the
-paired phones, each with Revoke.
+paired phones, each with Revoke and **Replies: Phone | Mac**: where the
+tower's replies to what that phone sends are heard.
 
 From a shell (or a Raycast/skhd hotkey outside Herdr):
 
