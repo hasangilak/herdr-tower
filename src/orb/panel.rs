@@ -25,7 +25,7 @@ use gpui::{
     ObjectFit, PathPromptOptions, Render, ScrollHandle, SharedString, StyledImage as _, Subscription, Task, Window, div, img,
     prelude::*, px, rgb, rgba,
 };
-use gpui_kit::component::input::{InlineToken, InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{InlineToken, InputEvent, RopeExt as _, Textarea, TextareaState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Icon, IconName, Sizable as _, Theme, ThemeMode, h_flex, v_flex};
 
@@ -274,12 +274,12 @@ impl Panel {
                 if self.voice.is_none() {
                     self.voice_since = history::now_ms();
                 }
-                self.text.update(cx, |s, cx| s.set_value(text.clone(), window, cx));
+                self.put_voice(&text, &current, window, cx);
                 self.voice = Some(text);
             }
             VoiceInput::Sent(text) => {
                 if current != text {
-                    self.text.update(cx, |s, cx| s.set_value(text.clone(), window, cx));
+                    self.put_voice(&text, &current, window, cx);
                 }
                 self.voice = None;
                 cx.spawn_in(window, async move |this, cx| {
@@ -294,6 +294,37 @@ impl Panel {
                 .detach();
             }
         }
+    }
+
+    /// Writes the voice's text in the input, the caret following its end (and
+    /// the input scrolling with it), unless you put the caret somewhere else
+    /// or the input isn't focused: then it isn't taken.
+    fn put_voice(&mut self, text: &str, current: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let focused = gpui::Focusable::focus_handle(self.text.read(cx), cx).is_focused(window);
+        let at = self.text.update(cx, |s, cx| {
+            let at = caret_after(s.cursor(), current.len(), text);
+            s.set_value(text.to_string(), window, cx);
+            at
+        });
+        if !focused {
+            return;
+        }
+        // set_value puts the caret at the start. Moving it scrolls it into
+        // view, which needs the new text laid out (wrapped, the pill grown):
+        // so once now, and again once a frame has drawn it.
+        fn place(state: &Entity<TextareaState>, at: usize, window: &mut Window, cx: &mut App) {
+            state.update(cx, |s, cx| {
+                if at <= s.text().len() {
+                    let pos = s.text().offset_to_position(at);
+                    s.set_cursor_position(pos, window, cx);
+                }
+            });
+        }
+        place(&self.text, at, window, cx);
+        let state = self.text.clone();
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |window, cx| place(&state, at, window, cx));
+        });
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
@@ -1556,9 +1587,35 @@ fn voice_input(hearing: &str, heard: &str, shown: Option<&str>, current: &str) -
     }
 }
 
+/// Where the caret goes when the voice rewrites the input: at the end of the
+/// new text if it was at the end of the old (following the dictation), else
+/// where you put it.
+fn caret_after(cursor: usize, old_len: usize, new: &str) -> usize {
+    if cursor >= old_len {
+        return new.len();
+    }
+    let mut at = cursor.min(new.len());
+    while !new.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
 #[cfg(test)]
 mod voice_tests {
     use super::*;
+
+    #[test]
+    fn the_caret_follows_the_dictation() {
+        // An empty input, then each partial: the caret stays at the end.
+        assert_eq!(caret_after(0, 0, "run the"), 7);
+        assert_eq!(caret_after(7, 7, "run the tests"), 13);
+        // You clicked into the middle: it stays there.
+        assert_eq!(caret_after(3, 7, "run the tests"), 3);
+        // Never inside a character, never past the end.
+        assert_eq!(caret_after(2, 9, "né"), 1);
+        assert_eq!(caret_after(5, 9, "ab"), 2);
+    }
 
     #[test]
     fn what_you_say_shows_as_you_say_it() {
