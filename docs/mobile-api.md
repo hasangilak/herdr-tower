@@ -86,7 +86,7 @@ holds.
    `tower phone pair --json`.) The QR is a link:
 
    ```
-   herdertower://pair?h=192.168.1.20&p=7843&c=48213907&fp=<64 hex chars>
+   herdertower://pair?h=192.168.1.20&p=7843&c=<8 digits>&fp=<64 hex chars>
    ```
 
 2. The app scans it (or the user types address and code; then the app shows
@@ -98,7 +98,7 @@ holds.
    POST /v1/pair
    Content-Type: application/json
 
-   {"code": "48213907", "name": "Pixel 9"}
+   {"code": "<the 8 digits>", "name": "Pixel 9"}
    ```
 
    ```json
