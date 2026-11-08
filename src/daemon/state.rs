@@ -37,6 +37,10 @@ pub struct State {
     /// The brain terminal's status (`idle`, `working`, `blocked`, ...) or `absent`.
     pub brain: String,
     pub brain_app: String,
+    /// What you are saying, while you say it: the take so far, transcribed
+    /// every second or so (press-to-talk only). Cleared when the take is
+    /// done; the final text then lands in `heard`.
+    pub hearing: String,
     /// What the tower last heard you say.
     pub heard: String,
     pub heard_ms: u64,
@@ -80,6 +84,7 @@ impl State {
             announcing: false,
             brain: "absent".into(),
             brain_app: String::new(),
+            hearing: String::new(),
             heard: String::new(),
             heard_ms: 0,
             said: String::new(),

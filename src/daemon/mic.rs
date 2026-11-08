@@ -6,6 +6,7 @@
 //! utterance to the transcriber, which listens for the wake word.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,6 +24,27 @@ const FRAME_MS: u32 = 30;
 const PREROLL_FRAMES: usize = 12;
 /// Twenty minutes of holding the talk key.
 const HELD_MAX_FRAMES: u32 = 20 * 60 * 1000 / FRAME_MS;
+/// A press-to-talk take is transcribed as it goes, for the panel: after
+/// every this much new audio...
+const PARTIAL_EVERY: usize = RATE as usize;
+/// ...while it fits in Whisper's one 30 s window (longer takes keep the last
+/// partial until the final text).
+const PARTIAL_MAX: usize = 28 * RATE as usize;
+
+/// A partial transcription is waiting or running: the next one waits, so
+/// they never pile up in front of the final one.
+static PARTIAL_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// The transcriber is done with a partial (or dropped it).
+pub fn partial_done() {
+    PARTIAL_BUSY.store(false, Ordering::SeqCst);
+}
+
+/// Whether a take of `len` samples, last transcribed at `last`, is due a
+/// partial transcription.
+fn partial_due(len: usize, last: usize, heard_speech: bool, busy: bool) -> bool {
+    heard_speech && !busy && len <= PARTIAL_MAX && len >= last + PARTIAL_EVERY
+}
 
 pub enum Ctl {
     Mode(String),
@@ -33,6 +55,8 @@ pub enum Ctl {
 pub enum Source {
     /// A press-to-talk take: meant for the tower.
     Ptt,
+    /// A press-to-talk take still in progress, so far: shown, never sent.
+    Partial,
     /// Hands-free: for the tower only after the wake word. `over_speech`:
     /// the tower was talking, so it may be its own echo.
     HandsFree { over_speech: bool },
@@ -105,6 +129,8 @@ struct Take {
     held: bool,
     silence_run: u32,
     started: Instant,
+    /// How long it was (samples) at its last partial transcription.
+    partial_at: usize,
 }
 
 struct Mic {
@@ -144,7 +170,10 @@ impl Mic {
                         self.mouth.chime(false);
                         self.mouth.take_ended(false);
                     }
-                    self.shared.update(|s| s.armed = false);
+                    self.shared.update(|s| {
+                        s.armed = false;
+                        s.hearing.clear();
+                    });
                     self.after_take();
                 }
                 Ok(Event::StreamError(e)) => {
@@ -200,10 +229,12 @@ impl Mic {
                 held,
                 silence_run: 0,
                 started: Instant::now(),
+                partial_at: 0,
             });
             self.mouth.chime(true);
             self.shared.update(|s| {
                 s.mic = "recording".into();
+                s.hearing.clear();
                 s.error.clear();
             });
         } else if held && recording {
@@ -225,7 +256,10 @@ impl Mic {
             super::timing::start("take ended");
             let _ = self.out.send(Utterance { samples: take.samples, source: Source::Ptt });
         } else {
-            self.shared.update(|s| s.error = "I didn't hear anything.".into());
+            self.shared.update(|s| {
+                s.error = "I didn't hear anything.".into();
+                s.hearing.clear();
+            });
         }
         self.after_take();
     }
@@ -346,6 +380,12 @@ impl Mic {
             let paused = !take.held && take.heard_speech && take.silence_run * FRAME_MS >= self.vad.ptt_silence_ms;
             if long || paused {
                 self.finish_take();
+            } else if partial_due(take.samples.len(), take.partial_at, take.heard_speech, PARTIAL_BUSY.load(Ordering::SeqCst)) {
+                take.partial_at = take.samples.len();
+                PARTIAL_BUSY.store(true, Ordering::SeqCst);
+                if self.out.send(Utterance { samples: take.samples.clone(), source: Source::Partial }).is_err() {
+                    partial_done();
+                }
             }
             return;
         }
@@ -452,6 +492,21 @@ impl Resampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partials_come_every_second_of_speech_one_at_a_time() {
+        let s = RATE as usize;
+        // Not before speech, and not before a second of new audio.
+        assert!(!partial_due(3 * s, 0, false, false));
+        assert!(!partial_due(s / 2, 0, true, false));
+        assert!(partial_due(s, 0, true, false));
+        assert!(!partial_due(s + s / 2, s, true, false));
+        assert!(partial_due(2 * s, s, true, false));
+        // One at a time: the transcriber is still on the last one.
+        assert!(!partial_due(5 * s, s, true, true));
+        // Past Whisper's window, the final text has to do.
+        assert!(!partial_due(29 * s, 20 * s, true, false));
+    }
 
     #[test]
     fn resamples_48k_to_16k() {

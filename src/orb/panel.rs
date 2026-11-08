@@ -4,7 +4,8 @@
 //! - **Chat**: what you said or typed on the right, the tower's answers on
 //!   the left, and what the sessions reported in between. Type in the pill at
 //!   the bottom: Enter sends, Shift+Enter starts a new line. While you talk,
-//!   it says "Listening…" with a timer.
+//!   what you say appears in it as you say it (the voice daemon's partial
+//!   transcripts), then the final text, which is sent as any voice request.
 //! - **Attachments, as in Claude Code and Codex**: paste a screenshot or a
 //!   copied file, drop files on the panel, or pick them with +; each becomes
 //!   a token where the cursor is (`[Image #1]`, `[Video #2]`,
@@ -120,6 +121,11 @@ pub struct Panel {
     filter: Filter,
     scope: Scope,
     listening_since: Option<Instant>,
+    /// What the voice put in the input (its partial or final transcript), so
+    /// it can be replaced or cleared, and a draft you typed never is.
+    voice: Option<String>,
+    /// When the voice first wrote in it, this take (Unix ms).
+    voice_since: u64,
     /// The brain's current turn (when it began), to scroll its working line into view.
     turn: u64,
     /// The space opened in the Spaces view, and how far it had been read before.
@@ -165,6 +171,7 @@ impl Panel {
                         this.chat.scroll_to_bottom();
                     }
                 }
+                this.follow_voice(&tower, window, cx);
                 let listening = matches!(tower.read(cx).phase(), "listening" | "armed");
                 if listening != this.listening_since.is_some() {
                     this.listening_since = listening.then(Instant::now);
@@ -236,6 +243,8 @@ impl Panel {
             filter: Filter::Working,
             scope: Scope::Everything,
             listening_since: None,
+            voice: None,
+            voice_since: 0,
             turn: 0,
             open_space: None,
             prev_read: 0,
@@ -243,6 +252,47 @@ impl Panel {
             default_account: None,
             _subs: subs,
             _poll: poll,
+        }
+    }
+
+    /// Mirrors what you say into the input as you talk: the daemon's
+    /// `hearing` (partials, then the final text). Once it's sent (the daemon
+    /// sends it), the final text stays a moment and goes.
+    fn follow_voice(&mut self, tower: &Entity<Tower>, window: &mut Window, cx: &mut Context<Self>) {
+        let (hearing, heard) = {
+            let t = tower.read(cx);
+            let heard = t.s("heard").as_str().unwrap_or("").to_string();
+            // Only a request sent since the voice began writing here counts.
+            let fresh = t.s("heard_ms").as_u64().unwrap_or(0) >= self.voice_since;
+            (t.s("hearing").as_str().unwrap_or("").to_string(), if fresh { heard } else { String::new() })
+        };
+        let current = self.text.read(cx).value().to_string();
+        match voice_input(&hearing, &heard, self.voice.as_deref(), &current) {
+            VoiceInput::Keep => {}
+            VoiceInput::Forget => self.voice = None,
+            VoiceInput::Show(text) => {
+                if self.voice.is_none() {
+                    self.voice_since = history::now_ms();
+                }
+                self.text.update(cx, |s, cx| s.set_value(text.clone(), window, cx));
+                self.voice = Some(text);
+            }
+            VoiceInput::Sent(text) => {
+                if current != text {
+                    self.text.update(cx, |s, cx| s.set_value(text.clone(), window, cx));
+                }
+                self.voice = None;
+                cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_millis(1200)).await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        // Unless you started typing over it.
+                        if this.voice.is_none() && this.text.read(cx).value().as_ref() == text.as_str() {
+                            this.text.update(cx, |s, cx| s.set_value("", window, cx));
+                        }
+                    });
+                })
+                .detach();
+            }
         }
     }
 
@@ -1468,6 +1518,68 @@ fn account_hue(name: &str) -> u32 {
 /// `tower accounts` has it), or None without the mod.
 fn default_account() -> Option<String> {
     crate::accounts::list().ok()?.into_iter().next().map(|a| a.name)
+}
+
+/// What the input should do about the voice.
+#[derive(Debug, PartialEq)]
+enum VoiceInput {
+    Keep,
+    /// You typed over it: leave the input alone from now on.
+    Forget,
+    /// Show this (what you are saying so far).
+    Show(String),
+    /// The take is done and sent as this: show it a moment, then clear.
+    Sent(String),
+}
+
+/// `hearing`: the take so far (empty when none runs); `heard`: the request
+/// sent since the voice began writing (empty if none); `shown`: what the voice put in the input; `current`: what
+/// the input holds.
+fn voice_input(hearing: &str, heard: &str, shown: Option<&str>, current: &str) -> VoiceInput {
+    let ours = match shown {
+        Some(s) => current == s,
+        None => current.trim().is_empty(),
+    };
+    if !hearing.is_empty() {
+        if !ours {
+            return if shown.is_some() { VoiceInput::Forget } else { VoiceInput::Keep };
+        }
+        return if current == hearing { VoiceInput::Keep } else { VoiceInput::Show(hearing.to_string()) };
+    }
+    match shown {
+        None => VoiceInput::Keep,
+        Some(_) if !ours => VoiceInput::Forget,
+        // Sent: the daemon cleared `hearing` as it set `heard`.
+        Some(_) if !heard.is_empty() => VoiceInput::Sent(heard.to_string()),
+        // Dropped (nothing heard, a hush, cancelled): clear it.
+        Some(_) => VoiceInput::Sent(String::new()),
+    }
+}
+
+#[cfg(test)]
+mod voice_tests {
+    use super::*;
+
+    #[test]
+    fn what_you_say_shows_as_you_say_it() {
+        use VoiceInput::*;
+        // Partials replace each other in an empty input...
+        assert_eq!(voice_input("run the", "", None, ""), Show("run the".into()));
+        assert_eq!(voice_input("run the tests", "", Some("run the"), "run the"), Show("run the tests".into()));
+        assert_eq!(voice_input("run the tests", "", Some("run the tests"), "run the tests"), Keep);
+        // ...the final text arrives the same way, and once sent stays a moment.
+        assert_eq!(voice_input("", "run the tests in eyzflow", Some("run the tests in eyzflow"), "run the tests in eyzflow"), Sent("run the tests in eyzflow".into()));
+        // A take that came to nothing goes.
+        assert_eq!(voice_input("", "", Some("um"), "um"), Sent(String::new()));
+        // The last partial differs from what was sent: the sent text wins.
+        assert_eq!(voice_input("", "run the tests", Some("run the test"), "run the test"), Sent("run the tests".into()));
+        // A draft you typed is never overwritten.
+        assert_eq!(voice_input("run the", "", None, "my draft"), Keep);
+        assert_eq!(voice_input("run the tests", "", Some("run the"), "run the, and"), Forget);
+        assert_eq!(voice_input("", "run the tests", Some("run the tests"), "run the tests!"), Forget);
+        // Nothing to do without a take.
+        assert_eq!(voice_input("", "old", None, ""), Keep);
+    }
 }
 
 #[cfg(test)]

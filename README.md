@@ -86,7 +86,7 @@ Click the orb for a glass chat with the tower (built with
 [GPUI Kit](https://gpui-kit.com) on macOS's own blur): your messages on the
 right, its answers on the left, what the sessions reported in between.
 Type in the pill at the bottom: Enter sends, Shift+Enter starts a new line,
-Esc closes. While you talk it shows "Listening…" and a timer.
+Esc closes. While you talk (Control or ⌘⇧Space), what you say appears in it as you say it, transcribed every second or so, then the final text, which goes to the brain as any spoken request.
 
 Attachments work as in Claude Code and Codex: paste a screenshot or a file
 copied in Finder, drop files on the panel, or pick them with +. Each becomes a

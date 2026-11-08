@@ -1,6 +1,7 @@
 //! Understanding: whisper.cpp (whisper-rs, Metal) turns utterances into
 //! text, then decides what they are for: the brain, a hush, or nothing.
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 use std::thread;
@@ -36,19 +37,37 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
             }
         };
         let mut armed_until: Option<Instant> = None;
-        for utt in rx {
+        let mut queue: VecDeque<Utterance> = VecDeque::new();
+        loop {
+            if queue.is_empty() {
+                match rx.recv() {
+                    Ok(u) => queue.push_back(u),
+                    Err(_) => return,
+                }
+            }
+            queue.extend(rx.try_iter());
+            let Some(utt) = next(&mut queue) else { continue };
+            if matches!(utt.source, Source::Partial) {
+                partial(&mut state, &utt.samples, &settings.language, &shared);
+                continue;
+            }
             // A press-to-talk take that asks nothing: alerts needn't wait.
             let ptt = matches!(utt.source, Source::Ptt);
             let secs = utt.samples.len() as f32 / RATE as f32;
             shared.update(|s| s.transcribing = true);
             let started = Instant::now();
             let heard = transcribe(&mut state, &utt.samples, &settings.language, &vocabulary(&shared));
-            shared.update(|s| s.transcribing = false);
+            // The take's final text replaces its last partial (sending it clears that).
+            shared.update(|s| {
+                s.transcribing = false;
+                s.hearing = if ptt { heard.as_deref().map(|h| h.trim().to_string()).unwrap_or_default() } else { String::new() };
+            });
             let heard = match heard {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("[stt] {e:#}");
                     if ptt {
+                        shared.update(|s| s.hearing.clear());
                         mouth.nothing_asked();
                     }
                     continue;
@@ -58,6 +77,7 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
             timing::mark("transcribed");
             if text::is_hallucination(&heard) {
                 if ptt {
+                    shared.update(|s| s.hearing.clear());
                     mouth.nothing_asked();
                 }
                 continue;
@@ -66,8 +86,10 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
             let is_stop = is_only_stop(&norm, &settings.stop_words);
 
             match utt.source {
+                Source::Partial => {}
                 Source::Ptt => {
                     if is_stop {
+                        shared.update(|s| s.hearing.clear());
                         mouth.nothing_asked();
                         mouth.hush();
                         continue;
@@ -113,6 +135,34 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
         }
     })?;
     Ok(())
+}
+
+/// The next utterance to transcribe. A partial is only worth it while
+/// nothing newer waits behind it (a newer partial, or the take's end).
+fn next(queue: &mut VecDeque<Utterance>) -> Option<Utterance> {
+    while queue.len() > 1 && matches!(queue.front().map(|u| &u.source), Some(Source::Partial)) {
+        queue.pop_front();
+        super::mic::partial_done();
+    }
+    queue.pop_front()
+}
+
+/// A press-to-talk take so far, for the panel to show while you talk.
+fn partial(state: &mut whisper_rs::WhisperState, samples: &[f32], language: &str, shared: &Shared) {
+    let started = Instant::now();
+    let heard = transcribe(state, samples, language, &vocabulary(shared));
+    super::mic::partial_done();
+    let Ok(heard) = heard else { return };
+    if heard.is_empty() || text::is_hallucination(&heard) {
+        return;
+    }
+    eprintln!("[stt] partial {:.1}s in {:.0} ms: {heard:?}", samples.len() as f32 / RATE as f32, started.elapsed().as_millis());
+    // Only while the take still runs: a late partial mustn't undo the final text.
+    shared.update(|s| {
+        if s.mic == "recording" && !s.transcribing {
+            s.hearing = heard;
+        }
+    });
 }
 
 fn load(model: &Path) -> Result<WhisperContext> {
@@ -177,6 +227,7 @@ pub fn deliver(shared: &Shared, mouth: &Mouth, text: &str, ack: Option<Duration>
     shared.update(|s| {
         s.heard = text.to_string();
         s.heard_ms = now_ms();
+        s.hearing.clear();
         s.error.clear();
     });
     match brain::ask(text, &radar(shared)) {
@@ -247,6 +298,29 @@ fn after_wake_word(heard: &str, wake_words: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn utt(source: Source) -> Utterance {
+        Utterance { samples: vec![], source }
+    }
+
+    #[test]
+    fn a_stale_partial_gives_way() {
+        let kinds = |q: &VecDeque<Utterance>| q.iter().map(|u| matches!(u.source, Source::Partial)).collect::<Vec<_>>();
+        // The take ended while its partial waited: only the final is transcribed.
+        let mut q: VecDeque<Utterance> = [utt(Source::Partial), utt(Source::Ptt)].into();
+        assert!(matches!(next(&mut q).unwrap().source, Source::Ptt));
+        assert!(q.is_empty());
+        // Of several partials, the newest.
+        let mut q: VecDeque<Utterance> = [utt(Source::Partial), utt(Source::Partial)].into();
+        assert!(matches!(next(&mut q).unwrap().source, Source::Partial));
+        assert!(q.is_empty());
+        // A partial alone is transcribed; a final is never skipped.
+        let mut q: VecDeque<Utterance> = [utt(Source::Partial)].into();
+        assert!(next(&mut q).is_some());
+        let mut q: VecDeque<Utterance> = [utt(Source::Ptt), utt(Source::Partial)].into();
+        assert!(matches!(next(&mut q).unwrap().source, Source::Ptt));
+        assert_eq!(kinds(&q), vec![true]);
+    }
 
     fn wakes() -> Vec<String> {
         ["hey tower", "okay tower", "tower"].map(String::from).to_vec()
