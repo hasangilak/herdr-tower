@@ -1,0 +1,120 @@
+
+ ▐▛███▛█   Claude Code v2.1.319
+▝▜██████▀  Haiku 5.5 · Claude Ultra
+ ▝▝   ▝▝   ~/Work/herder-tower-cca
+
+
+❯ Use the AskUserQuestion tool right now, once, with three questions in one call: (1) header 'Database', question 'Which database should the app use?', options Postgres (managed, scales), SQLite
+  (single file), MySQL (classic); (2) header 'Features', question 'Which features do you want in the first release?', multiSelect true, options Auth (sign in), Search (full text), Billing (Stripe);
+  (3) header 'Deploy', question 'Where should it deploy?', options Vercel (serverless), Fly (containers). Do nothing else before asking.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Database  ☐ Features  ☐ Deploy  ✔ Submit  →
+
+Which database should the app use?
+
+❯ 1. Postgres (managed, scales)
+     Managed Postgres that scales with load.
+  2. SQLite (single file)
+     Single-file database, simple to run and back up.
+  3. MySQL (classic)
+     Classic, widely supported relational database.
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── qfix-ask ─

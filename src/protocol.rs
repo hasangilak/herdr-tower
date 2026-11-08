@@ -53,6 +53,17 @@ pub enum Request {
         #[serde(default)]
         arg: String,
     },
+    /// The open question sets.
+    Questions,
+    /// Answer a question set (`target`: its id, or a session's address).
+    Answer {
+        target: String,
+        answers: serde_json::Value,
+        #[serde(default = "yes")]
+        submit: bool,
+    },
+    /// The brain's recommended answers for a question set.
+    Recommend { id: String, recs: serde_json::Value },
     /// A screenshot was added (`tower screenshot`): the state's list is re-read.
     Screenshots,
     Status,
@@ -93,4 +104,8 @@ pub fn send(req: &Request) -> Result<Response> {
 
 pub fn is_running() -> bool {
     UnixStream::connect(config::socket_path()).is_ok()
+}
+
+fn yes() -> bool {
+    true
 }

@@ -133,6 +133,8 @@ holds.
 | `GET /v1/jobs?status=open\|finished\|all&session=t3&limit=50` | `{"jobs":[{"job","session","name","space","account","status","asked","summary","started_ms","updated_ms"}]}`, newest first. `status`: `working`, `blocked`, `done`, `failed`, `error`, `exited`. |
 | `GET /v1/history?limit=100&session=t3&kind=summary,answer&before_ms=…` | `{"entries":[…]}`, oldest first, the latest `limit`. Page back with `before_ms` = the first entry's `at`. Summaries are `kind=summary`. |
 | `GET /v1/chat?before=h120&limit=50` | `{"messages":[…], "more": bool}`: **the main chat thread**, the same one the Mac panel shows, newest last; `before` pages back (the first message's `id`), `more` says older ones remain. See "The chat" below. |
+| `GET /v1/questions` | `{"questions":[…]}`: what blocked sessions ask, as question sets (see [questions.md](questions.md)); also in the state (`questions`; each agent's `question` id). |
+| `GET /v1/questions/{id}` | One set. `404 no_question`. |
 | `GET /v1/accounts` | `{"default": name, "accounts":[{"name","email"}]}`, the default first (from the claude-accounts mod; names are not fixed: colour by name). |
 | `GET /v1/screenshots?limit=30&session=t3` | `{"screenshots":[{"id","at","session","name","space","account","job","caption","path","url"}]}`, newest first (still on disk: kept 30 days). |
 | `GET /v1/attachments/{folder}/{name}` | A picture someone sent with a message (the image itself, by its bytes: `image/png`, `image/jpeg`, `image/webp`, `image/gif`). `{folder}/{name}` is the end of its path in a `request` entry's `attachments` (`…/attachments/1794165000000-phone/1-login.png` → `/v1/attachments/1794165000000-phone/1-login.png`), URL-encoded (panel attachments keep their original names, spaces and all). Only files directly in a folder of `attachments/`; `400 bad_path`, `404 no_attachment`, `415 not_an_image` (videos and other files aren't served). |
@@ -187,6 +189,9 @@ may be added later: ignore them.
 | `GET /v1/audio?after=a17` | | `{"clips": [{"id","kind","text","ms","url","at_ms"}]}`: clips meant for this phone (its own and the voice's) from the last 15 minutes, after clip `after`: what it missed while no stream was open. |
 | `POST /v1/hush` | | Stops speaking now, and drops what's queued (the phone gets `hush`). |
 | `POST /v1/mode` | `{"mode": "ptt"\|"handsfree"\|"off"}` | The Mac microphone's mode. |
+| `POST /v1/questions/{id}/answer` | `{"answers":[{"tab":0,"choice":1},{"tab":1,"choice":{"options":[0,2],"other":"…"}}],"submit":true}`; or multipart: that JSON as a part named `json`, files for tab N's typed answer as parts named `tab<N>` | Types the answers into the session's dialog, checking the screen after each step, then submits after checking the review. `200 {"ok":true,"id","submitted"}`; `409 {"error":{"code":"stopped"\|"changed"\|"cannot_answer","message":"where and why"}}`; `404`. |
+| `POST /v1/questions/{id}/interpret` | `{"tab":0,"text":"the second one"}` | `{"tab","choice":{"options":[1],"other":null}}`: a spoken answer as a choice, to show before sending. |
+| `POST /v1/questions/{id}/voice?tab=N` | a WAV take | `{"tab","heard","choice"}`: transcribed by the Mac's Whisper, then as `interpret`. |
 | `DELETE /v1/device` | | Unpairs this phone (its token stops working). |
 
 ### Files with an ask
@@ -285,6 +290,7 @@ line of JSON `data`. A comment line `: ping` comes every 10 s.
 | `hello` | `{"api":1,"device":"d_…","voice":bool}`, first |
 | `state` | the whole state, first right after `hello`, then whenever it changes (at most 4 a second) |
 | `history` | one new history entry (as in `/v1/history`), as it's written |
+| `question` | `{"op": "open"\|"update"\|"closed", "id", "question": {…}}`: a question set appeared, changed (recommendations arrived, the dialog moved to another tab, answering started, finished or stopped) or closed (the session moved on). |
 | `chat` | `{"op": "add"\|"update", "message": {…}}`: a message joined the thread (from the Mac or any phone), or one changed (a screenshot card grew). Messages the phone sent itself come back this way too. |
 | `audio` | voice streams only: `{"id":"a17","kind":"reply"\|"alert"\|"ack"\|"cue","text":"…","ms":1840,"url":"/v1/audio/a17"}` |
 | `hush` | voice streams only: stop playing and drop everything queued |

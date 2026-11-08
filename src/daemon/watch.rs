@@ -155,13 +155,14 @@ struct Radar {
     mouth: Mouth,
     alerts: Alerts,
     watches: Watches,
+    asks: super::asks::Asks,
     seen: Arc<Mutex<HashMap<String, Seen>>>,
 }
 
-pub fn start(shared: Shared, mouth: Mouth, alerts: Alerts, watches: Watches) {
+pub fn start(shared: Shared, mouth: Mouth, alerts: Alerts, watches: Watches, asks: super::asks::Asks) {
     // What was known when the last run ended, before this run's first look updates it.
     let before = watches.snapshot();
-    let radar = Radar { shared, mouth, alerts, watches: watches.clone(), seen: Arc::new(Mutex::new(HashMap::new())) };
+    let radar = Radar { shared, mouth, alerts, watches: watches.clone(), asks, seen: Arc::new(Mutex::new(HashMap::new())) };
     let _ = watches.radar.set(radar.clone());
     let r = radar.clone();
     thread::Builder::new().name("reconcile".into()).spawn(move || r.reconcile(before)).ok();
@@ -334,6 +335,10 @@ impl Radar {
         if live && !status.is_empty() {
             self.watches.seen(&address, &status);
         }
+        // What it asks, as a question set (this machine's sessions).
+        if machine.is_none() {
+            self.asks.seen(&address, t, live && status == "blocked");
+        }
         let was = before.as_ref().map(|b| b.status.as_str()).unwrap_or("");
         if was == status {
             return;
@@ -349,8 +354,10 @@ impl Radar {
         if !announce {
             return;
         }
+        // What it asks, in a sentence (or just that it needs you).
+        let notice = super::asks::blocked_notice(&name, &t["status"]);
         let news = match status.as_str() {
-            "blocked" if self.alerts.blocked => Some(format!("{name} needs you")),
+            "blocked" if self.alerts.blocked => Some(notice.clone()),
             "done" | "idle" if stopped_working && self.alerts.done => Some(format!("{name} finished")),
             "error" => Some(format!("{name} hit an error")),
             _ => None,
@@ -361,8 +368,8 @@ impl Radar {
             return;
         }
         if status == "blocked" && self.alerts.blocked {
-            self.shared.alert(&address, &format!("{name} needs you"), "blocked");
-            self.mouth.alert(format!("{name} needs you."), Some((address.as_str(), status.as_str())));
+            self.shared.alert(&address, &notice, "blocked");
+            self.mouth.alert(format!("{notice}."), Some((address.as_str(), status.as_str())));
         } else if stopped_working && (status == "done" || status == "idle") && self.alerts.done {
             self.shared.alert(&address, &format!("{name} finished"), "done");
             self.mouth.alert(format!("{name} finished."), Some((address.as_str(), status.as_str())));
@@ -473,6 +480,7 @@ impl Radar {
     }
 
     fn gone(&self, address: &str) {
+        self.asks.seen(address, &Value::Null, false);
         let removed = self.seen.lock().unwrap().remove(address);
         if (address == brain::NAME || removed.as_ref().is_some_and(|_| hc::get(brain::NAME).is_none()))
             && hc::get(brain::NAME).filter(|t| t["state"] == "live").is_none()
@@ -630,10 +638,16 @@ impl Radar {
                 status: s.status.clone(),
                 app: s.app.clone(),
                 account: s.account.clone(),
+                question: None,
             })
             .filter(|a| !a.name.starts_with("tower"))
             .collect();
         agents.sort_by(|a, b| a.address.cmp(&b.address));
+        for set in self.asks.list() {
+            if let Some(a) = agents.iter_mut().find(|a| a.address == set.session) {
+                a.question = Some(set.id);
+            }
+        }
         self.shared.update(|s| s.agents = agents);
     }
 }

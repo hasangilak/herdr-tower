@@ -67,6 +67,10 @@ pub struct State {
     /// The latest screenshots sessions sent (`tower screenshot`), newest
     /// first, at most 30: `{id, at, session, name, space, account, job, caption, path, url}`.
     pub screenshots: Vec<serde_json::Value>,
+    /// What blocked sessions ask, as question sets (see `questions`):
+    /// `{id, session, name, kind, title, detail, context, tabs, current_tab,
+    /// submit_state, recommendations, status, error, exact, at_ms}`.
+    pub questions: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -78,6 +82,8 @@ pub struct AgentLine {
     /// The Claude account (a name from the claude-accounts mod, `cca`), or
     /// null: Codex, another machine, or not known.
     pub account: Option<String>,
+    /// The id of its open question set, when it is blocked on one.
+    pub question: Option<String>,
 }
 
 impl State {
@@ -111,6 +117,7 @@ impl State {
             lan: String::new(),
             phone: None,
             screenshots: vec![],
+            questions: vec![],
         }
     }
 

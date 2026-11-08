@@ -163,13 +163,15 @@ impl Narrator {
                 }
                 // What it says this turn is news for the user, not an answer.
                 crate::brain::set_watch_turn(prompt.contains("[watch]"));
+                crate::brain::set_question_turn(crate::brain::is_question_prompt(&prompt));
             }
             Some("assistant") => {
                 let Some(blocks) = v["message"]["content"].as_array() else { return };
                 for b in blocks {
                     let Some(t) = b["text"].as_str().filter(|_| b["type"] == "text") else { continue };
                     let spoken = text::speakable(t, self.max_chars);
-                    if spoken.is_empty() {
+                    // Recommending answers: quiet.
+                    if spoken.is_empty() || crate::brain::question_turn() {
                         continue;
                     }
                     timing::mark("the brain's first words");

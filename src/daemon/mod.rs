@@ -1,5 +1,6 @@
 //! `tower daemon`: the ears, the mouth and the radar, behind a Unix socket.
 
+pub mod asks;
 mod book;
 pub mod hotkey;
 pub mod lan;
@@ -35,6 +36,7 @@ struct Daemon {
     ears: mic::Ears,
     watches: watch::Watches,
     lan: lan::Lan,
+    asks: asks::Asks,
 }
 
 pub fn run() -> Result<()> {
@@ -49,6 +51,7 @@ pub fn run() -> Result<()> {
     let model_name = cfg.whisper_model.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let shared = Shared::new(State::new(&cfg.mode, &cfg.voice, &model_name));
     let hub = std::sync::Arc::new(lan::hub::Hub::default());
+    let asks = asks::Asks::new(shared.clone(), hub.clone());
     eprintln!("[tower] loading Kokoro ({}) ...", cfg.voice);
     let mouth = tts::start(
         tts::Settings {
@@ -78,11 +81,11 @@ pub fn run() -> Result<()> {
         shared.clone(),
         mouth.clone(),
     )?;
-    let lan = lan::Lan::new(lan::Ctx { shared: shared.clone(), mouth: mouth.clone(), hub, ack: ack_delay(&cfg), stt: utt_tx.clone() });
+    let lan = lan::Lan::new(lan::Ctx { shared: shared.clone(), mouth: mouth.clone(), hub: hub.clone(), ack: ack_delay(&cfg), stt: utt_tx.clone(), asks: asks.clone() });
     let ears = mic::start(cfg.mode.clone(), cfg.input_device.clone(), cfg.vad.clone(), shared.clone(), mouth.clone(), utt_tx)?;
     hotkey::start(&cfg.talk_key, ears.clone(), shared.clone(), mouth.clone());
     let watches = watch::Watches::default();
-    watch::start(shared.clone(), mouth.clone(), cfg.alerts.clone(), watches.clone());
+    watch::start(shared.clone(), mouth.clone(), cfg.alerts.clone(), watches.clone(), asks.clone());
 
     let listener = UnixListener::bind(&sock).with_context(|| format!("listening on {}", sock.display()))?;
     eprintln!("[tower] ready on {} (mode {})", sock.display(), cfg.mode);
@@ -105,7 +108,7 @@ pub fn run() -> Result<()> {
             }
         })?;
     }
-    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan };
+    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks };
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let d = daemon.clone();
@@ -149,9 +152,15 @@ impl Daemon {
                 // turn's kind below is current.)
                 let heard = !interrupt && self.narrator.already_said(&text);
                 // A watch's news, or the brain telling one, waits its turn.
+                let kind_word = kind.clone();
                 let kind = if kind == "alert" { queue::Kind::Alert } else { narrate::turn_kind() };
                 let spoken = text::speakable(&text, self.cfg.max_spoken_chars);
-                if !heard && !spoken.is_empty() {
+                // The brain recommending answers to a session's questions: it stays quiet.
+                let quiet = brain::question_turn() && kind_word != "alert";
+                if quiet && !spoken.is_empty() {
+                    eprintln!("[questions] the brain's [question] turn isn't spoken: {spoken:?}");
+                }
+                if !heard && !spoken.is_empty() && !quiet {
                     self.mouth.say_as(spoken, kind, interrupt);
                 }
                 // The answer is all in: alerts may follow it.
@@ -176,6 +185,26 @@ impl Daemon {
             }
             Request::Watch { terminal, note, account } => self.watches.add(&terminal, &note, account),
             Request::Status => {}
+            Request::Questions => {
+                let v: Vec<serde_json::Value> = self.asks.list().iter().map(|s| serde_json::to_value(s).unwrap_or_default()).collect();
+                return Response { ok: true, error: None, state: Some(serde_json::json!({ "questions": v })) };
+            }
+            Request::Answer { target, answers, submit } => {
+                let answers: Vec<crate::questions::Answer> = match serde_json::from_value(answers) {
+                    Ok(a) => a,
+                    Err(e) => return Response::err(format!("answers: {e}")),
+                };
+                return match self.asks.answer(&target, &answers, submit) {
+                    Ok(set) => Response { ok: true, error: None, state: Some(serde_json::to_value(set).unwrap_or_default()) },
+                    Err(e) => Response::err(format!("{e:#}")),
+                };
+            }
+            Request::Recommend { id, recs } => {
+                return match self.asks.recommend(&id, &recs) {
+                    Ok(set) => Response { ok: true, error: None, state: Some(serde_json::to_value(set).unwrap_or_default()) },
+                    Err(e) => Response::err(format!("{e:#}")),
+                };
+            }
             Request::Screenshots => load_screenshots(&self.shared),
             Request::Phone { action, arg } => {
                 let info = match action.as_str() {

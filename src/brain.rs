@@ -167,6 +167,7 @@ fn trust_answer(screen: &str) -> Option<Vec<&'static str>> {
 pub fn ask(text: &str, radar: &str, source: &str) -> Result<()> {
     let msg = if radar.is_empty() { format!("[voice] {text}") } else { format!("[voice] {text} {radar}") };
     note(&msg)?;
+    set_question_turn(false);
     crate::activity::start();
     let (text, source) = (text.to_string(), source.to_string());
     crate::history::later(move || crate::history::record_request(&text, &source));
@@ -183,6 +184,23 @@ pub fn set_watch_turn(on: bool) {
 
 pub fn watch_turn() -> bool {
     WATCH_TURN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The brain's turn is a `[question]` note (it recommends answers with
+/// `tower recommend`): nothing it writes is spoken or kept in the chat.
+static QUESTION_TURN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_question_turn(on: bool) {
+    QUESTION_TURN.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn question_turn() -> bool {
+    QUESTION_TURN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A turn's prompt is a `[question]` note (not something the user said).
+pub fn is_question_prompt(prompt: &str) -> bool {
+    prompt.contains("[question]") && !prompt.contains("[voice]")
 }
 
 /// A message from the tower itself (a watch firing).
@@ -203,6 +221,7 @@ pub fn note(text: &str) -> Result<()> {
     // A busy brain takes it after its turn; the transcript says when.
     if status.as_deref() != Some("working") {
         set_watch_turn(text.starts_with("[watch]"));
+        set_question_turn(text.starts_with("[question]"));
     }
     Ok(())
 }

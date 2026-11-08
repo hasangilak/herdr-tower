@@ -21,6 +21,7 @@ mod install;
 mod orb;
 mod phone;
 mod protocol;
+mod questions;
 mod screenshots;
 mod selftest;
 mod spaces;
@@ -141,6 +142,30 @@ enum Cmd {
         last: usize,
         #[arg(long)]
         session: Option<String>,
+    },
+    /// What blocked sessions ask, as question sets (JSON). `--session t3`: read that session's dialog now.
+    Questions {
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Answer a question set: `tower answer <id|session> --json '[{"tab":0,"choice":1}, {"tab":1,"choice":{"other":"…"}}]'`.
+    Answer {
+        target: String,
+        #[arg(long)]
+        json: String,
+        /// Fill in the answers but don't send them.
+        #[arg(long)]
+        no_submit: bool,
+        /// Drive the dialog from this process, not the voice (for testing).
+        #[arg(long, hide = true)]
+        here: bool,
+    },
+    /// The tower's brain: three recommended answers per tab for a question set.
+    Recommend {
+        id: String,
+        /// `[{"tab":0,"options":[{"label":"…","why":"…","choice":1}, …]}, …]`
+        #[arg(long)]
+        json: String,
     },
     /// Speak text.
     Say {
@@ -322,6 +347,47 @@ fn run(cli: Cli) -> Result<()> {
             start(account.as_deref(), &name, cwd, on.as_deref(), space.as_deref(), no_watch, &task.join(" "))
         }
         Cmd::Accounts { on } => list_accounts(on.as_deref()),
+        Cmd::Questions { session } => {
+            let v = match session {
+                Some(t) => match daemon::asks::detect(&t) {
+                    Some(set) => serde_json::to_value(set)?,
+                    None => bail!("{t} isn't blocked on a dialog the tower can read"),
+                },
+                None => protocol::send(&Request::Questions)?.state.unwrap_or_default(),
+            };
+            print_json(&v);
+            Ok(())
+        }
+        Cmd::Answer { target, json, no_submit, here } => {
+            let answers: Value = serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("--json: {e}"))?;
+            if here {
+                let Some(set) = daemon::asks::detect(&target) else { bail!("{target} isn't blocked on a dialog the tower can read") };
+                let answers: Vec<questions::Answer> = serde_json::from_value(answers)?;
+                let mut term = questions::Hc { address: set.session.clone() };
+                return match questions::drive(&mut term, &set, &answers, !no_submit) {
+                    Ok(()) => {
+                        println!("Answered {} ({}).", set.id, set.kind);
+                        Ok(())
+                    }
+                    Err(stop) => bail!("stopped at {stop}"),
+                };
+            }
+            let r = protocol::send(&Request::Answer { target, answers, submit: !no_submit })?;
+            if !r.ok {
+                bail!("{}", r.error.unwrap_or_default());
+            }
+            println!("Answered{}.", if no_submit { " (filled in, not sent)" } else { "" });
+            Ok(())
+        }
+        Cmd::Recommend { id, json } => {
+            let recs: Value = serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("--json: {e}"))?;
+            let r = protocol::send(&Request::Recommend { id: id.clone(), recs })?;
+            if !r.ok {
+                bail!("{}", r.error.unwrap_or_default());
+            }
+            println!("Recommendations for {id} are in.");
+            Ok(())
+        }
         Cmd::Screenshot { images, session, caption } => screenshots::cmd(&images, session, caption),
         Cmd::Screenshots { last, session } => screenshots::cmd_list(last, session.as_deref()),
         Cmd::Phone { action, id, value, json } => phone::cmd(&action, id.as_deref(), value.as_deref(), json),

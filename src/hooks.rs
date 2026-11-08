@@ -14,6 +14,11 @@ pub fn claude_stop() {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let v: Value = serde_json::from_str(&input).unwrap_or_default();
+    // A turn that answered a `[question]` note (recommendations): nothing to say or keep.
+    if v["transcript_path"].as_str().and_then(last_prompt).is_some_and(|p| crate::brain::is_question_prompt(&p)) {
+        let _ = protocol::send(&Request::Say { text: String::new(), interrupt: false, kind: "answer".into() });
+        return;
+    }
     let text = v["last_assistant_message"]
         .as_str()
         .map(String::from)
@@ -58,6 +63,26 @@ fn say(text: &str, kind: &str) {
     // The text without its screenshot markers; the screenshots beside it.
     crate::history::record_said(kind, text);
     let _ = protocol::send(&Request::Say { text: text.to_string(), interrupt: false, kind: kind.into() });
+}
+
+/// The prompt that started the last turn in a Claude Code transcript.
+fn last_prompt(path: &str) -> Option<String> {
+    let data = std::fs::read_to_string(path).ok()?;
+    let mut last = None;
+    for line in data.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if v["type"] != "user" || v["isMeta"] == true {
+            continue;
+        }
+        let c = &v["message"]["content"];
+        let text = c.as_str().map(String::from).or_else(|| {
+            c.as_array().and_then(|a| a.iter().find(|b| b["type"] == "text")).and_then(|b| b["text"].as_str().map(String::from))
+        });
+        if text.is_some() {
+            last = text;
+        }
+    }
+    last
 }
 
 /// The last text the assistant wrote in a Claude Code transcript (JSONL).

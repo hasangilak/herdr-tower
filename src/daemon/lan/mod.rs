@@ -47,6 +47,8 @@ pub struct Ctx {
     pub hub: Arc<Hub>,
     pub ack: Option<Duration>,
     pub stt: Sender<Utterance>,
+    /// The open question sets (blocked sessions' dialogs).
+    pub asks: super::asks::Asks,
 }
 
 struct Running {
@@ -301,6 +303,38 @@ impl Lan {
                     Err(e) => Response::error(503, "save", &format!("{e:#}")),
                 }
             }
+            // What blocked sessions ask (see docs/questions.md).
+            ("GET", ["questions"]) => {
+                let v: Vec<Value> = self.ctx.asks.list().iter().map(|s| serde_json::to_value(s).unwrap_or_default()).collect();
+                Response::json(200, &json!({ "questions": v }))
+            }
+            ("GET", ["questions", id]) => match self.ctx.asks.get(id) {
+                Some(s) => Response::json(200, &serde_json::to_value(s).unwrap_or_default()),
+                None => Response::error(404, "no_question", "no open question set with that id"),
+            },
+            ("POST", ["questions", id, "answer"]) => return Some(self.answer_questions(req, id)),
+            // A spoken answer for a tab: text (from /v1/transcribe), or a WAV take.
+            ("POST", ["questions", id, "interpret"]) => {
+                let Some(set) = self.ctx.asks.get(id) else { return Some(Response::error(404, "no_question", "no open question set with that id")) };
+                let body = req.json().unwrap_or_default();
+                let tab = body["tab"].as_u64().unwrap_or(0) as usize;
+                let Some(t) = set.tabs.get(tab) else { return Some(Response::error(400, "bad_tab", "no such tab")) };
+                let p = crate::questions::interpret(body["text"].as_str().unwrap_or(""), t);
+                Response::json(200, &json!({ "tab": tab, "choice": { "options": p.options, "other": p.other } }))
+            }
+            ("POST", ["questions", id, "voice"]) => {
+                let Some(set) = self.ctx.asks.get(id) else { return Some(Response::error(404, "no_question", "no open question set with that id")) };
+                let tab = q("tab").and_then(|t| t.parse::<usize>().ok()).unwrap_or(0);
+                let Some(t) = set.tabs.get(tab).cloned() else { return Some(Response::error(400, "bad_tab", "no such tab")) };
+                let heard = self.voice(req, false, &device);
+                if heard.status != 200 {
+                    return Some(heard);
+                }
+                let v: Value = serde_json::from_slice(&heard.body).unwrap_or_default();
+                let text = v["heard"].as_str().unwrap_or("").to_string();
+                let p = crate::questions::interpret(&text, &t);
+                Response::json(200, &json!({ "tab": tab, "heard": text, "choice": { "options": p.options, "other": p.other } }))
+            }
             // The main chat thread, as the panel shows it: newest last, in pages.
             ("GET", ["chat"]) => {
                 let all = crate::chat::thread(&crate::chat::load(), &crate::history::attachments_dir());
@@ -522,6 +556,53 @@ impl Lan {
         s["work"] = work_value();
         s["audio_route"] = json!(device.audio_route);
         s
+    }
+
+    /// `POST /v1/questions/{id}/answer`: JSON `{answers, submit}`, or
+    /// multipart with that JSON as a `json` part and files for a tab's typed
+    /// answer as parts named `tab<N>` (saved like the panel's attachments).
+    fn answer_questions(&self, req: &Request, id: &str) -> Response {
+        if self.ctx.asks.get(id).is_none() {
+            return Response::error(404, "no_question", "no open question set with that id");
+        }
+        let (body, files): (Value, Vec<multipart::Part>) = match req.header("content-type").and_then(multipart::boundary) {
+            Some(b) => match multipart::parse(&req.body, &b) {
+                Ok(parts) => {
+                    let (json_part, rest): (Vec<_>, Vec<_>) = parts.into_iter().partition(|p| p.name == "json");
+                    let Some(j) = json_part.into_iter().next() else {
+                        return Response::error(400, "no_json", "a multipart answer needs a `json` part with {answers, submit}");
+                    };
+                    (serde_json::from_slice(&j.data).unwrap_or_default(), rest)
+                }
+                Err(e) => return Response::error(400, "bad_multipart", &format!("{e:#}")),
+            },
+            None => (req.json().unwrap_or_default(), vec![]),
+        };
+        let mut answers: Vec<crate::questions::Answer> = match serde_json::from_value(body["answers"].clone()) {
+            Ok(a) => a,
+            Err(e) => return Response::error(400, "bad_answers", &format!("answers: {e}")),
+        };
+        // Files for tab N: saved, then attached to that tab's typed answer.
+        for a in answers.iter_mut() {
+            let mine: Vec<multipart::Part> =
+                files.iter().filter(|p| p.name == format!("tab{}", a.tab)).map(|p| multipart::Part { name: p.name.clone(), filename: p.filename.clone(), content_type: p.content_type.clone(), data: p.data.clone() }).collect();
+            if mine.is_empty() {
+                continue;
+            }
+            match save_files(&mine, &crate::history::attachments_dir(), now_ms()) {
+                Ok(saved) => a.attachments.extend(saved.into_iter().map(|s| s.path)),
+                Err(r) => return r,
+            }
+        }
+        let submit = body["submit"].as_bool().unwrap_or(true);
+        match self.ctx.asks.answer(id, &answers, submit) {
+            Ok(set) => Response::json(200, &json!({ "ok": true, "id": set.id, "submitted": submit })),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                let code = if msg.starts_with("stopped at") { "stopped" } else if msg.contains("changed") { "changed" } else { "cannot_answer" };
+                Response::error(409, code, &msg)
+            }
+        }
     }
 
     /// Sets where a device's replies are heard, on file and for its open streams.
@@ -1002,13 +1083,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let hub = Arc::new(Hub::default());
         let (stt, _rx) = std::sync::mpsc::channel();
-        let ctx = Ctx {
-            shared: Shared::new(super::super::state::State::new("ptt", "af_bella", "test")),
-            mouth: Mouth::silent(hub.clone()),
-            hub,
-            ack: None,
-            stt,
-        };
+        let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
+        let asks = super::super::asks::Asks::new(shared.clone(), hub.clone());
+        let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
         let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
@@ -1059,6 +1136,13 @@ mod tests {
         assert_eq!(call(addr, &fp, "GET", "/v1/attachments/0-none/none.png", None, "").unwrap().0, 401);
         let (st, v) = call(addr, &fp, "GET", "/v1/state", Some(&token), "").unwrap();
         assert!(st == 200 && v.get("work").is_some(), "the state carries the working line: {v}");
+        // Questions: listed, and an unknown id is refused before anything is typed.
+        let (st, v) = call(addr, &fp, "GET", "/v1/questions", Some(&token), "").unwrap();
+        assert!(st == 200 && v["questions"].is_array());
+        assert_eq!(call(addr, &fp, "GET", "/v1/questions/qnope", Some(&token), "").unwrap().0, 404);
+        let (st, v) = call(addr, &fp, "POST", "/v1/questions/qnope/answer", Some(&token), r#"{"answers":[{"tab":0,"choice":0}]}"#).unwrap();
+        assert_eq!((st, v["error"]["code"].as_str()), (404, Some("no_question")));
+        assert_eq!(call(addr, &fp, "POST", "/v1/questions/qnope/interpret", Some(&token), r#"{"tab":0,"text":"the first"}"#).unwrap().0, 404);
         // Where this phone hears its replies: the phone by default, kept on file.
         let (st, v) = call(addr, &fp, "GET", "/v1/device/audio", Some(&token), "").unwrap();
         assert_eq!((st, v["route"].as_str()), (200, Some("phone")));
@@ -1098,7 +1182,8 @@ mod tests {
         let hub = Arc::new(Hub::default());
         let (stt, _rx) = std::sync::mpsc::channel();
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
-        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub: hub.clone(), ack: None, stt };
+        let asks = super::super::asks::Asks::new(shared.clone(), hub.clone());
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub: hub.clone(), ack: None, stt, asks };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
         let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();

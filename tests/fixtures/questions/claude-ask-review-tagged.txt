@@ -1,0 +1,120 @@
+
+ ▐▛███▛█   Claude Code v2.1.319
+▝▜██████▀  Haiku 5.5 · Claude Ultra
+ ▝▝   ▝▝   ~/Work/herder-tower-cca
+
+
+❯ Use the AskUserQuestion tool right now, once, with three questions in one call: (1) header 'Database', question 'Which database should the app use?', options Postgres (managed, scales), SQLite
+  (single file), MySQL (classic); (2) header 'Features', question 'Which features do you want in the first release?', multiSelect true, options Auth (sign in), Search (full text), Billing (Stripe);
+  (3) header 'Deploy', question 'Where should it deploy?', options Vercel (serverless), Fly (containers). Do nothing else before asking.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Database  ☒ Features  ☒ Deploy  ✔ Submit  →
+
+Review your answers
+
+⚠ You have not answered all questions
+
+ ● Which features do you want in the first release?
+   → Search (full text)
+ ● Where should it deploy?
+   → <hc from="t1">Railway, with a staging app
+   and preview deploys per PR</hc>
+
+Ready to submit your answers?
+
+❯ 1. Submit answers
+  2. Cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── qfix-ask ─
