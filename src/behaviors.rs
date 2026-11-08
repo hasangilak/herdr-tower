@@ -492,7 +492,15 @@ pub const FROM_MEMORY: &[(&str, &str)] = &[
 fn memory_note(text: &str) -> (String, String) {
     let Some(rest) = text.strip_prefix("---\n") else { return (String::new(), text.trim().to_string()) };
     let Some((head, body)) = rest.split_once("\n---\n") else { return (String::new(), text.trim().to_string()) };
-    let description = head.lines().find_map(|l| l.strip_prefix("description:")).map(|d| d.trim().trim_matches('"').to_string()).unwrap_or_default();
+    let description = head
+        .lines()
+        .find_map(|l| l.strip_prefix("description:"))
+        .map(|d| {
+            let d = d.trim();
+            // A quoted YAML string; a value that only starts with a quoted word stays as it is.
+            if d.len() > 1 && d.starts_with('"') && d.ends_with('"') { d[1..d.len() - 1].replace("\\\"", "\"") } else { d.to_string() }
+        })
+        .unwrap_or_default();
     (description, body.trim().to_string())
 }
 
@@ -510,6 +518,11 @@ fn title_of(name: &str, description: &str) -> String {
 pub fn migrate_memory(store: &Store, memory: &Path) -> Result<Vec<String>> {
     let mut moved = vec![];
     let keep = store.dir.join(".migrated");
+    // The index names each note: `- [Browser per account](open-in-brave.md) — …`.
+    let index = std::fs::read_to_string(memory.join("MEMORY.md")).unwrap_or_default();
+    let named = |file: &str| -> Option<String> {
+        index.lines().find(|l| l.contains(&format!("({file})"))).and_then(|l| l.split_once('[')).and_then(|(_, r)| r.split_once(']')).map(|(t, _)| t.trim().to_string())
+    };
     for (name, category) in FROM_MEMORY {
         let src = memory.join(format!("{name}.md"));
         let Ok(text) = std::fs::read_to_string(&src) else { continue };
@@ -517,7 +530,7 @@ pub fn migrate_memory(store: &Store, memory: &Path) -> Result<Vec<String>> {
         if body.is_empty() {
             continue;
         }
-        let title = title_of(name, &description);
+        let title = named(&format!("{name}.md")).unwrap_or_else(|| title_of(name, &description));
         let (b, _) = store.add(&title, category, &description, &body, "learned", "tower")?;
         std::fs::create_dir_all(&keep)?;
         std::fs::rename(&src, keep.join(format!("{name}.md"))).with_context(|| format!("moving {}", src.display()))?;
@@ -663,6 +676,9 @@ mod tests {
         assert_eq!(moved, ["release-dev-then-prod"]);
         let b = s.get("release-dev-then-prod").unwrap();
         assert_eq!((b.category.as_str(), b.source.as_str(), b.summary.as_str()), ("Releases and safety", "learned", "Releases always go to dev first, then dev to prod"));
+        assert_eq!(b.title, "Release dev then prod", "the title from the memory index");
+        assert_eq!(memory_note("---\ndescription: \"dashboard\" means eyzflow\n---\nx").0, "\"dashboard\" means eyzflow");
+        assert_eq!(memory_note("---\ndescription: \"all quoted\"\n---\nx").0, "all quoted");
         assert!(b.text.contains("**Why:** standing rule."), "the whole text is kept");
         assert!(!mem.join("release-dev-then-prod.md").exists() && s.dir.join(".migrated/release-dev-then-prod.md").exists());
         assert!(mem.join("email-setup-already-done.md").exists(), "facts stay memory");
