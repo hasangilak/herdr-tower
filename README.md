@@ -4,6 +4,21 @@ A voice control tower for [Herdr](https://herdr.dev). Talk to it, and it
 steers every Claude Code and Codex session you run in Herdr, on this Mac and
 on every machine added with `hc machine add`. It answers out loud.
 
+<p align="center">
+  <img src="docs/screenshots/orb.png" width="420" alt="The orb: calm when ready, cyan while it listens, periwinkle while it replies">
+</p>
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/screenshots/chat.png" width="300" alt="Chat with the tower, a picture attached as [Image #1]"><br><sub>Chat: type or talk; attach files as tokens</sub></td>
+    <td align="center"><img src="docs/screenshots/work.png" width="300" alt="The working line: Delegating to web, 15s"><br><sub>The brain at work, from its own hooks</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/screenshots/activity.png" width="300" alt="Activity: running and finished jobs by session"><br><sub>Activity: jobs running and done</sub></td>
+    <td align="center"><img src="docs/screenshots/spaces.png" width="300" alt="Spaces: one focused, the others' news held"><br><sub>Spaces: focus one, hold the rest</sub></td>
+  </tr>
+</table>
+
 Everything that listens and speaks runs locally, in one Rust binary:
 
 | Part | What | How |
