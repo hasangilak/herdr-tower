@@ -60,6 +60,10 @@ pub struct Entry {
     /// `screenshot`: the tower's own copy (absolute, under attachments/screenshots).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// `answer`: the screenshots the brain attached to it (ids), from its
+    /// `[shot:<id>]` / `[shots:<session>]` markers, which `text` no longer has.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub shots: Vec<String>,
 }
 
 pub fn path() -> PathBuf {
@@ -112,6 +116,52 @@ pub fn later(f: impl FnOnce() + Send + 'static) {
 
 pub fn record(kind: &str, text: &str) {
     append(Entry { kind: kind.into(), text: text.into(), ..Default::default() });
+}
+
+/// What the brain said (its Stop hook): the text without its screenshot
+/// markers, and the screenshots they name.
+pub fn record_said(kind: &str, text: &str) {
+    let (clean, refs) = crate::text::shot_refs(text);
+    if refs.is_empty() {
+        return record(kind, text);
+    }
+    let shots = resolve_shots(&refs, &load());
+    if clean.trim().is_empty() && shots.is_empty() {
+        return;
+    }
+    append(Entry { kind: kind.into(), text: clean, shots, ..Default::default() });
+}
+
+/// How many screenshots one message carries.
+pub const SHOTS_PER_MESSAGE: usize = 4;
+/// Screenshots a session sent this close together came in one go.
+const ONE_GO_MS: u64 = 2 * 60 * 1000;
+
+/// The screenshot ids the markers name, in order, each once, at most
+/// `SHOTS_PER_MESSAGE`: `[shot:<id>]` if there is one; `[shots:<session>]`
+/// the latest ones the session (address or name) sent in one go.
+pub fn resolve_shots(refs: &[crate::text::ShotRef], entries: &[Entry]) -> Vec<String> {
+    use crate::text::ShotRef;
+    let shots: Vec<&Entry> = entries.iter().filter(|e| e.kind == "screenshot" && e.id.is_some()).collect();
+    let mut out: Vec<String> = vec![];
+    for r in refs {
+        let ids: Vec<String> = match r {
+            ShotRef::Id(id) => shots.iter().filter(|e| e.id.as_deref() == Some(id)).map(|_| id.clone()).take(1).collect(),
+            ShotRef::Session(who) => {
+                let of = |e: &&&Entry| {
+                    e.session.as_deref() == Some(who.as_str()) || e.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(who))
+                };
+                let latest = shots.iter().filter(of).map(|e| e.at).max().unwrap_or(0);
+                shots.iter().filter(of).filter(|e| e.at + ONE_GO_MS >= latest).filter_map(|e| e.id.clone()).collect()
+            }
+        };
+        for id in ids {
+            if !out.contains(&id) && out.len() < SHOTS_PER_MESSAGE {
+                out.push(id);
+            }
+        }
+    }
+    out
 }
 
 pub fn record_session(kind: &str, session: &str, text: &str, status: Option<&str>) {
@@ -315,6 +365,33 @@ mod tests {
         assert_eq!(with_image_markers("no images", 0), "no images");
         let m = compose(&with_image_markers("fix this", 1), &["/a/x.png".into()]);
         assert_eq!(m, "[Image #1] fix this [attached: /a/x.png]");
+    }
+
+    #[test]
+    fn markers_become_the_answers_screenshots() {
+        use crate::text::ShotRef;
+        let shot = |at, session: &str, name: &str, id: &str| Entry {
+            at,
+            kind: "screenshot".into(),
+            session: Some(session.into()),
+            name: Some(name.into()),
+            id: Some(id.into()),
+            ..Default::default()
+        };
+        let entries = vec![
+            shot(1_000, "t26", "orb-rust", "old.png"),
+            shot(900_000, "t26", "orb-rust", "a.png"),
+            shot(901_000, "t26", "orb-rust", "b.png"),
+            shot(902_000, "t3", "eyzflow", "c.png"),
+        ];
+        // A session's latest go (by address or name), not the old one.
+        assert_eq!(resolve_shots(&[ShotRef::Session("t26".into())], &entries), vec!["a.png", "b.png"]);
+        assert_eq!(resolve_shots(&[ShotRef::Session("Orb-Rust".into())], &entries), vec!["a.png", "b.png"]);
+        // By id; unknown ids and repeats drop; never more than four.
+        let refs = [ShotRef::Id("c.png".into()), ShotRef::Id("nope.png".into()), ShotRef::Session("t26".into()), ShotRef::Id("c.png".into()), ShotRef::Id("old.png".into())];
+        assert_eq!(resolve_shots(&refs, &entries), vec!["c.png", "a.png", "b.png", "old.png"]);
+        let many: Vec<Entry> = (0..6).map(|i| shot(1_000 + i, "t9", "x", &format!("{i}.png"))).collect();
+        assert_eq!(resolve_shots(&[ShotRef::Session("t9".into())], &many).len(), SHOTS_PER_MESSAGE);
     }
 
     #[test]

@@ -133,6 +133,8 @@ pub struct Panel {
     /// Screenshots in history, newest first (the state's recent list joins them when shown).
     shots: Vec<Shot>,
     thumbs: HashMap<PathBuf, Thumb>,
+    /// Screenshots' sizes in pixels, from their headers.
+    dims: HashMap<PathBuf, Option<(u32, u32)>>,
     view: View,
     text: Entity<TextareaState>,
     /// The next attachment's number in this message.
@@ -276,6 +278,7 @@ impl Panel {
             phone: Default::default(),
             shots: vec![],
             thumbs: HashMap::new(),
+            dims: HashMap::new(),
             view: View::Chat,
             text,
             next: 1,
@@ -713,7 +716,24 @@ impl Panel {
 
     fn chat_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let g = glass();
-        let items = chat_items(&self.entries);
+        let items: Vec<Entry> = chat_items(&self.entries).into_iter().cloned().collect();
+        let acc = Accounts::of_tower(self.tower.read(cx), self.default_account.clone());
+        // Screenshots: on their own as they come, or under the message the
+        // tower attached them to; the viewer goes through all of them.
+        let attached: std::collections::HashSet<String> = self.entries.iter().flat_map(|e| e.shots.iter().cloned()).collect();
+        let plan = gallery::chat_rows(&items, &attached);
+        let known = self.all_shots(cx);
+        let shot_of = |e: &Entry| -> Option<Shot> {
+            e.id.as_ref().and_then(|id| known.iter().find(|s| &s.id == id).cloned()).or_else(|| Shot::from_entry(e))
+        };
+        let shots_at: Vec<Vec<Shot>> = plan
+            .iter()
+            .map(|r| match r {
+                gallery::ChatRow::Shots(group) => group.iter().filter_map(|&i| shot_of(&items[i])).collect(),
+                gallery::ChatRow::Entry(i) => items[*i].shots.iter().filter_map(|id| known.iter().find(|s| &s.id == id).cloned()).collect(),
+            })
+            .collect();
+        let list: Vec<Shot> = shots_at.iter().flatten().cloned().collect();
         let mut rows: Vec<AnyElement> = vec![];
         if items.is_empty() {
             rows.push(
@@ -728,16 +748,37 @@ impl Panel {
             );
         }
         let mut day = String::new();
-        for e in items {
+        let mut start = 0;
+        for (row, shots) in plan.iter().zip(&shots_at) {
+            let e = match row {
+                gallery::ChatRow::Entry(i) => &items[*i],
+                gallery::ChatRow::Shots(group) => &items[group[0]],
+            };
             let d = day_label(e.at);
             if d != day {
                 rows.push(h_flex().justify_center().py_1().child(div().text_xs().text_color(g.faint).child(d.clone())).into_any_element());
                 day = d;
             }
-            rows.push(match e.kind.as_str() {
-                "request" | "answer" => bubble(e, &g),
-                _ => event_line(e, &g),
-            });
+            match row {
+                gallery::ChatRow::Shots(_) => {
+                    if !shots.is_empty() {
+                        rows.push(self.shot_card(shots, &list, start, true, e.at, &acc, cx));
+                    }
+                }
+                gallery::ChatRow::Entry(_) => {
+                    // An answer that is only pictures has no bubble.
+                    if !(e.kind == "answer" && e.text.trim().is_empty()) {
+                        rows.push(match e.kind.as_str() {
+                            "request" | "answer" => bubble(e, &g),
+                            _ => event_line(e, &g),
+                        });
+                    }
+                    if !shots.is_empty() {
+                        rows.push(self.shot_card(shots, &list, start, false, e.at, &acc, cx));
+                    }
+                }
+            }
+            start += shots.len();
         }
         if self.sending {
             rows.push(h_flex().justify_end().child(div().text_xs().text_color(g.muted).child("Sending…")).into_any_element());
@@ -1462,6 +1503,7 @@ fn chat_items(entries: &[Entry]) -> Vec<&Entry> {
     // News held from an unfocused space waits in Spaces, not here.
     let keep = |e: &&Entry| !e.held && match e.kind.as_str() {
         "request" | "answer" | "watch" | "alert" | "summary" => true,
+        "screenshot" => e.path.is_some(),
         "job" => matches!(e.status.as_deref(), Some("done" | "failed" | "error" | "exited" | "blocked")) && !e.text.is_empty(),
         _ => false,
     };

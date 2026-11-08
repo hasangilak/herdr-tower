@@ -51,6 +51,11 @@ impl Shot {
         })
     }
 
+    /// A history entry of kind `screenshot`.
+    pub fn from_entry(e: &crate::history::Entry) -> Option<Shot> {
+        Shot::of(&serde_json::to_value(e).ok()?)
+    }
+
     /// Who sent it: its name, else its address.
     pub fn who(&self) -> &str {
         if self.name.is_empty() { &self.session } else { &self.name }
@@ -111,9 +116,9 @@ pub fn thumb_path(dir: &Path, src: &Path) -> PathBuf {
     dir.join(format!("{h:016x}.png"))
 }
 
-/// The longest side of a thumbnail, in pixels (tiles are about 170 points
-/// wide, twice that on a Retina screen).
-const THUMB: u32 = 400;
+/// The longest side of a thumbnail, in pixels: a chat card shows one about
+/// 290 points wide, so twice that on a Retina screen, and readable.
+const THUMB: u32 = 800;
 
 /// Makes the thumbnail if it isn't there yet (slow: call it off the main thread).
 pub fn make_thumb(dir: &Path, src: &Path) -> anyhow::Result<PathBuf> {
@@ -182,7 +187,7 @@ mod tests {
         image::RgbImage::from_fn(1600, 1000, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 90])).save(&src).unwrap();
         let t = make_thumb(&dir.join("thumbs"), &src).unwrap();
         let (w, h) = image::image_dimensions(&t).unwrap();
-        assert_eq!((w, h), (400, 250));
+        assert_eq!((w, h), (800, 500));
         let made = std::fs::metadata(&t).unwrap().modified().unwrap();
         assert_eq!(make_thumb(&dir.join("thumbs"), &src).unwrap(), t);
         assert_eq!(std::fs::metadata(&t).unwrap().modified().unwrap(), made);

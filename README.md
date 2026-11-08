@@ -164,6 +164,13 @@ lists them. The brain asks sessions doing visual work to send one; the
 instruction block for sessions is in
 [docs/session-instructions.md](docs/session-instructions.md).
 
+Screenshots show in the panel's chat as they arrive: one card per go, with
+the picture large enough to read, its caption, the session and its account.
+The tower can also put them with its own message: `[shot:<id>]` or
+`[shots:<session>]` in its reply shows that screenshot (or the session's
+latest ones, up to 4) under the message instead; the marker is never spoken
+or shown.
+
 In the panel, **Activity → Shots** is the gallery, newest first: each
 thumbnail with its caption, the session and its account (the session and
 space chips narrow it). A job's screenshots also show small on its card.

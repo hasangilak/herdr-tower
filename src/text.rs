@@ -3,6 +3,8 @@
 /// Plain spoken text: code blocks, tables, links and markdown marks removed,
 /// cut at a sentence end once it passes `max` characters.
 pub fn speakable(markdown: &str, max: usize) -> String {
+    // The screenshots it attached are for the eyes only.
+    let markdown = shot_refs(markdown).0;
     let mut out = String::new();
     let mut in_code = false;
     for line in markdown.lines() {
@@ -256,9 +258,81 @@ pub fn is_short_reply(text: &str) -> bool {
     text.split_whitespace().count() <= 12
 }
 
+/// A screenshot the brain attached to its message: `[shot:<id>]`, or a
+/// session's latest ones: `[shots:<session>]` (its address or name).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShotRef {
+    Id(String),
+    Session(String),
+}
+
+/// The message without its screenshot markers, and the markers in order.
+/// The text is tidied where they were: no doubled spaces, no space before
+/// punctuation, no line left empty by one.
+pub fn shot_refs(text: &str) -> (String, Vec<ShotRef>) {
+    let mut refs = vec![];
+    let mut lines: Vec<String> = vec![];
+    for line in text.split('\n') {
+        let mut out = String::new();
+        let mut rest = line;
+        let mut had = false;
+        while let Some(i) = rest.find('[') {
+            let tail = &rest[i + 1..];
+            let parsed = ["shots:", "shot:"].iter().find_map(|p| {
+                let body = tail.strip_prefix(p)?;
+                let end = body.find(']')?;
+                let arg = body[..end].trim();
+                (!arg.is_empty() && !arg.contains(char::is_whitespace)).then(|| (*p, arg.to_string(), p.len() + end + 2))
+            });
+            match parsed {
+                Some((p, arg, len)) => {
+                    out.push_str(&rest[..i]);
+                    refs.push(if p == "shots:" { ShotRef::Session(arg) } else { ShotRef::Id(arg) });
+                    rest = &rest[i + len..];
+                    had = true;
+                }
+                None => {
+                    out.push_str(&rest[..=i]);
+                    rest = &rest[i + 1..];
+                }
+            }
+        }
+        out.push_str(rest);
+        if had {
+            let mut tidy = out.split_whitespace().collect::<Vec<_>>().join(" ");
+            for p in [".", ",", ":", ";", "!", "?"] {
+                tidy = tidy.replace(&format!(" {p}"), p);
+            }
+            // Keep the line's indent (a list item stays one).
+            let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+            if tidy.is_empty() {
+                continue;
+            }
+            out = format!("{indent}{tidy}");
+        }
+        lines.push(out);
+    }
+    (lines.join("\n").trim_end().to_string(), refs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screenshot_markers_are_never_said() {
+        let (text, refs) = shot_refs("The login page is done [shot:1794-a.png], see [shots:orb-rust].\n[shot:x.png]\nTests pass.");
+        assert_eq!(text, "The login page is done, see.\nTests pass.");
+        assert_eq!(refs, vec![ShotRef::Id("1794-a.png".into()), ShotRef::Session("orb-rust".into()), ShotRef::Id("x.png".into())]);
+        // Brackets that aren't markers stay.
+        assert_eq!(shot_refs("Use [link](x) and [shot: two words] or [shot:]").0, "Use [link](x) and [shot: two words] or [shot:]");
+        assert!(shot_refs("No markers [here].").1.is_empty());
+        // Spoken: never the marker; an answer that is only pictures says nothing.
+        assert_eq!(speakable("Done. [shots:t26]", 400), "Done.");
+        assert_eq!(speakable("[shot:a.png] [shot:b.png]", 400), "");
+        // The brain's acknowledgement is still caught after the marker goes.
+        assert_eq!(without_ack(&speakable("Okay. [shot:a.png]", 400)), None);
+    }
 
     #[test]
     fn strips_markdown() {

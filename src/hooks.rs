@@ -55,7 +55,8 @@ fn say(text: &str, kind: &str) {
     if text.trim().is_empty() {
         return;
     }
-    crate::history::record(kind, text);
+    // The text without its screenshot markers; the screenshots beside it.
+    crate::history::record_said(kind, text);
     let _ = protocol::send(&Request::Say { text: text.to_string(), interrupt: false, kind: kind.into() });
 }
 
