@@ -63,9 +63,15 @@ pub fn agent_app(t: &Value) -> Option<String> {
     t["status"].get("app").and_then(Value::as_str).map(String::from)
 }
 
+/// A terminal's name: hc's, or the one `tower start --space` gave it (a tab
+/// made in a space can't carry an hc name, so it's the label `tower.name`).
+pub fn name(t: &Value) -> Option<&str> {
+    t["name"].as_str().filter(|n| !n.is_empty()).or_else(|| t["labels"]["tower.name"].as_str().filter(|n| !n.is_empty()))
+}
+
 /// What to call a terminal out loud: its name, else its folder.
 pub fn spoken_name(t: &Value) -> String {
-    if let Some(n) = t["name"].as_str().filter(|n| !n.is_empty()) {
+    if let Some(n) = name(t) {
         return n.replace(['-', '_'], " ");
     }
     let cwd = t["foreground"]["cwd"].as_str().or_else(|| t["cwd"].as_str()).unwrap_or("");

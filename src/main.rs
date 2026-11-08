@@ -90,6 +90,10 @@ enum Cmd {
         /// Another machine (`hc machine ls`).
         #[arg(long)]
         on: Option<String>,
+        /// The Herdr space to put it in, by its name or a part of it (default:
+        /// a new tab in the space the window shows).
+        #[arg(long)]
+        space: Option<String>,
         /// Don't watch it (by default you get a [watch] message when it stops working).
         #[arg(long)]
         no_watch: bool,
@@ -278,8 +282,8 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Agents { all } => agents(all),
-        Cmd::Start { account, name, cwd, on, no_watch, task } => {
-            start(account.as_deref(), &name, cwd, on.as_deref(), no_watch, &task.join(" "))
+        Cmd::Start { account, name, cwd, on, space, no_watch, task } => {
+            start(account.as_deref(), &name, cwd, on.as_deref(), space.as_deref(), no_watch, &task.join(" "))
         }
         Cmd::Accounts { on } => list_accounts(on.as_deref()),
         Cmd::Say { text, interrupt, alert } => {
@@ -440,7 +444,7 @@ fn agents(all: bool) -> Result<()> {
                         "address": t["address"],
                         "account": account,
                         "machine": machine.clone().unwrap_or_else(|| "this mac".into()),
-                        "name": t["name"],
+                        "name": hc::name(&t),
                         "spoken": hc::spoken_name(&t),
                         "agent": app.or_else(|| t["foreground"]["argv"][0].as_str().map(String::from)),
                         "status": status,
@@ -476,7 +480,19 @@ fn agents(all: bool) -> Result<()> {
 }
 
 /// `tower start`: a Claude Code session on an account, through `cca <account>`.
-fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str>, no_watch: bool, task: &str) -> Result<()> {
+fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str>, space: Option<&str>, no_watch: bool, task: &str) -> Result<()> {
+    // The space first: it may say which machine the session runs on.
+    let spaces = if space.is_some() { spaces::windows() } else { vec![] };
+    let target = match space {
+        Some(want) => Some(spaces::pick_window(want, &spaces)?.clone()),
+        None => None,
+    };
+    let machine: Option<String> = match (on, target.as_ref().and_then(|t| t.machine.clone())) {
+        (Some(m), Some(sm)) if m != sm => bail!("space \"{}\" runs on {sm}, not {m}", target.as_ref().map(|t| t.name.as_str()).unwrap_or("")),
+        (Some(m), _) => Some(m.to_string()),
+        (None, sm) => sm,
+    };
+    let on = machine.as_deref();
     let (known, cca) = match on {
         None => (accounts::list()?, accounts::cca_bin().map(|p| p.to_string_lossy().into_owned())),
         Some(m) => {
@@ -492,19 +508,32 @@ fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str
         _ => c,
     });
     let cca = cca.unwrap_or_else(|| "cca".into());
-    let args = accounts::hc_run_args(&accounts::Start { name, cwd: cwd.as_deref(), on, task, account: account.as_deref(), cca: &cca });
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = hc::run(&refs)?;
-    if out.code != 0 {
-        bail!("hc run: {}{}", out.stderr.trim(), out.stdout.trim());
-    }
-    let v: Value = serde_json::from_str(out.stdout.trim()).unwrap_or_default();
-    let address = v["address"].as_str().or_else(|| v["terminal"]["address"].as_str()).map(String::from).unwrap_or_else(|| name.to_string());
-    let address = match on {
-        Some(m) if !address.contains('/') => format!("{m}/{address}"),
-        _ => address,
+    let how = accounts::Start { name, cwd: cwd.as_deref(), on, task, account: account.as_deref(), cca: &cca };
+    let (address, placed) = match &target {
+        Some(sp) => (start_in_space(sp, &how, &spaces)?, Some(sp.name.clone())),
+        None => {
+            let args = accounts::hc_run_args(&how);
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = hc::run(&refs)?;
+            if out.code != 0 {
+                bail!("hc run: {}{}", out.stderr.trim(), out.stdout.trim());
+            }
+            let v: Value = serde_json::from_str(out.stdout.trim()).unwrap_or_default();
+            let address = v["address"].as_str().or_else(|| v["terminal"]["address"].as_str()).map(String::from).unwrap_or_else(|| name.to_string());
+            let address = match on {
+                Some(m) if !address.contains('/') => format!("{m}/{address}"),
+                _ => address,
+            };
+            // The voice puts it in a tab of the space the window shows; say which.
+            let placed = placed_space(&address);
+            (address, placed)
+        }
     };
     let on_account = account.as_deref().map(|a| format!(" on the {a} account")).unwrap_or_default();
+    let in_space = match &placed {
+        Some(sp) => format!(" in space \"{sp}\""),
+        None => " (not in a space yet: no Herdr window, or the voice isn't running)".into(),
+    };
     let watched = !no_watch
         && protocol::send(&Request::Watch { terminal: address.clone(), note: task.to_string(), account: account.clone() })
             .is_ok_and(|r| r.ok);
@@ -514,13 +543,58 @@ fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str
     }
     if std::io::stdout().is_terminal() || !watched {
         println!(
-            "Started {name} as {address}{on_account}.{}",
+            "Started {name} as {address}{in_space}{on_account}.{}",
             if watched { " Watching it: you'll get a [watch] message when it stops working. End your turn now." } else { "" }
         );
     } else {
-        print_json(&json!({ "address": address, "name": name, "account": account, "watching": watched }));
+        print_json(&json!({ "address": address, "name": name, "space": placed, "account": account, "watching": watched }));
     }
     Ok(())
+}
+
+/// A new tab in `sp` running the session (Herdr's `tab.new`), and the window
+/// left on the space it showed. Returns the terminal's address.
+fn start_in_space(sp: &spaces::Window, how: &accounts::Start, all: &[spaces::Window]) -> Result<String> {
+    let argv = serde_json::to_string(&accounts::command(how))?;
+    let folder = how.cwd.map(String::from).unwrap_or_else(|| sp.folder.clone());
+    let mut args = vec!["do", "tab.new", "--space", &sp.id, "--name", how.name, "--argv", &argv];
+    if !folder.is_empty() {
+        args.extend(["--folder", &folder]);
+    }
+    let out = match std::process::Command::new("herdr-app").args(&args).stdin(std::process::Stdio::null()).output() {
+        Ok(o) => o,
+        Err(e) => bail!("herdr-app: {e}"),
+    };
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let Some(terminal) = v["terminal"].as_str() else {
+        bail!("herdr-app tab.new: {}{}", String::from_utf8_lossy(&out.stdout).trim(), String::from_utf8_lossy(&out.stderr).trim());
+    };
+    let address = match &sp.machine {
+        Some(m) if !terminal.contains('/') => format!("{m}/{terminal}"),
+        _ => terminal.to_string(),
+    };
+    // A tab's terminal has no hc name: the tower's own label stands in (see `hc::name`).
+    let label = format!("tower.name={}", how.name);
+    let _ = hc::run(&["label", &address, &label]);
+    // tab.new shows the new tab; give the window back to the space it showed.
+    if let Some(was) = all.iter().find(|s| s.active)
+        && was.id != sp.id
+    {
+        let _ = std::process::Command::new("herdr-app").args(["do", "space.select", "--id", &was.id]).output();
+    }
+    Ok(address)
+}
+
+/// The space a session landed in, once the voice has given it a tab (up to 3 s).
+fn placed_space(address: &str) -> Option<String> {
+    for _ in 0..12 {
+        let t = hc::get(address)?;
+        if let Some(sp) = t["labels"]["where"].as_str().and_then(|w| w.split(" / ").next()).filter(|s| !s.is_empty()) {
+            return Some(sp.to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    None
 }
 
 /// `tower accounts`.

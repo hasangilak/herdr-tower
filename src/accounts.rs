@@ -221,11 +221,18 @@ pub fn hc_run_args(s: &Start) -> Vec<String> {
         a.extend(["--on".into(), m.into()]);
     }
     a.push("--".into());
-    match s.account {
-        // cca sets CLAUDE_CONFIG_DIR (or unsets it) and CCA_ACCOUNT, then execs claude.
-        Some(acc) => a.extend([s.cca.into(), acc.into()]),
-        None => a.push("claude".into()),
-    }
+    a.extend(command(s));
+    a
+}
+
+/// The program that runs the session: `cca <account> -n <name> "<task>"`
+/// (cca sets or unsets CLAUDE_CONFIG_DIR and CCA_ACCOUNT, then execs claude),
+/// or plain `claude` when there are no accounts.
+pub fn command(s: &Start) -> Vec<String> {
+    let mut a: Vec<String> = match s.account {
+        Some(acc) => vec![s.cca.into(), acc.into()],
+        None => vec!["claude".into()],
+    };
     a.extend(["-n".into(), s.name.into()]);
     if !s.task.is_empty() {
         a.push(s.task.into());
@@ -304,6 +311,7 @@ mod tests {
                 "look at the login bug"
             ]
         );
+        assert_eq!(command(&s), ["/bin/cca", "work", "-n", "fix-login", "look at the login bug"], "what a tab in a space runs");
         let s = Start { name: "x", cwd: None, on: Some("vps"), task: "", account: None, cca: "cca" };
         assert_eq!(hc_run_args(&s), ["run", "--bg", "--json", "--outlive-parent", "--name", "x", "--on", "vps", "--", "claude", "-n", "x"]);
     }

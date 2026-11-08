@@ -158,6 +158,63 @@ pub fn resolve(want: &str, known: &[String]) -> Option<String> {
     by(&|k| k == w).or_else(|| by(&|k| k.starts_with(&w))).or_else(|| by(&|k| k.contains(&w)))
 }
 
+/// A space in Herdr's window, for placing a new session in it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Window {
+    pub id: String,
+    pub name: String,
+    pub folder: String,
+    /// The machine its terminals run on (None: this Mac).
+    pub machine: Option<String>,
+    /// The one the window shows now.
+    pub active: bool,
+}
+
+/// Herdr's spaces with their ids, from `herdr-app ls` (empty when Herdr isn't open).
+pub fn windows() -> Vec<Window> {
+    let Ok(out) = std::process::Command::new("herdr-app").arg("ls").stdin(std::process::Stdio::null()).output() else { return vec![] };
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    windows_from(&v)
+}
+
+pub fn windows_from(v: &Value) -> Vec<Window> {
+    v["spaces"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            Some(Window {
+                id: s["id"].as_str()?.to_string(),
+                name: s["name"].as_str()?.to_string(),
+                folder: s["folder"].as_str().unwrap_or("").to_string(),
+                machine: s["machine"].as_str().filter(|m| !m.is_empty()).map(String::from),
+                active: s["active"].as_bool().unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// The space `want` names: its whole name, or else a part of it (any case).
+/// No match, or several, is an error that lists them.
+pub fn pick_window<'a>(want: &str, list: &'a [Window]) -> Result<&'a Window> {
+    let w = want.trim().to_lowercase();
+    if w.is_empty() {
+        bail!("give a space's name (or part of it)");
+    }
+    let names = |l: &[&Window]| l.iter().map(|s| format!("\"{}\"", s.name)).collect::<Vec<_>>().join(", ");
+    let exact: Vec<&Window> = list.iter().filter(|s| s.name.to_lowercase() == w).collect();
+    if exact.len() == 1 {
+        return Ok(exact[0]);
+    }
+    let part: Vec<&Window> = list.iter().filter(|s| s.name.to_lowercase().contains(&w)).collect();
+    match part.as_slice() {
+        [one] => Ok(one),
+        [] if list.is_empty() => bail!("no space matches {want:?}: Herdr's window isn't open, so there are no spaces"),
+        [] => bail!("no space matches {want:?} (spaces: {})", names(&list.iter().collect::<Vec<_>>())),
+        many => bail!("{want:?} matches several spaces: {}; say which", names(many)),
+    }
+}
+
 /// A space as Herdr's window has it now.
 #[derive(Debug, Clone, Default)]
 pub struct Live {
@@ -411,6 +468,30 @@ mod tests {
     }
 
     #[test]
+fn picks_a_space_by_part_of_its_name() {
+    let v = json!({ "spaces": [
+        { "id": "sp1", "name": "M5 Pro", "folder": "/u", "machine": null, "active": false },
+        { "id": "sp2", "name": "B2B ticketing", "folder": "/w/a", "machine": null, "active": false },
+        { "id": "sp3", "name": "B2C support", "folder": "/w/b", "machine": null, "active": true },
+        { "id": "sp4", "name": "Support", "folder": "/w/c", "machine": "vps", "active": false },
+    ]});
+    let l = windows_from(&v);
+    assert_eq!(l.len(), 4);
+    assert_eq!(l[3].machine.as_deref(), Some("vps"));
+    assert_eq!(pick_window("ticket", &l).unwrap().id, "sp2");
+    assert_eq!(pick_window("b2c", &l).unwrap().id, "sp3");
+    assert_eq!(pick_window("m5 PRO", &l).unwrap().id, "sp1");
+    // A whole name wins over the spaces it is part of.
+    assert_eq!(pick_window("support", &l).unwrap().id, "sp4");
+    let e = pick_window("b2", &l).unwrap_err().to_string();
+    assert!(e.contains("several") && e.contains("\"B2B ticketing\"") && e.contains("\"B2C support\""), "{e}");
+    let e = pick_window("nope", &l).unwrap_err().to_string();
+    assert!(e.contains("no space matches") && e.contains("\"M5 Pro\""), "{e}");
+    assert!(pick_window("x", &[]).unwrap_err().to_string().contains("isn't open"));
+    assert!(pick_window(" ", &l).is_err());
+}
+
+#[test]
     fn focus_holds_other_spaces() {
         // No focus: everything is spoken.
         assert_eq!(gate(Some("B2C support"), None, false, true), Gate::Speak);

@@ -131,12 +131,18 @@ tower accounts                      # the accounts cca knows; * is the default
 tower start --name fix-login --cwd ~/w/app "look at the login bug"
 tower start --account <name> --name fix-login --cwd ~/w/app "..."
 tower start --on vps --name x "..." # uses cca on that machine, if it has it
+tower start --space ticket --name x "..."  # in the space whose name has "ticket" in it
 ```
 
 `tower start` runs `hc run --bg --outlive-parent ... -- cca <account> -n
 <name> "<task>"`: cca sets (or unsets) `CLAUDE_CONFIG_DIR` and `CCA_ACCOUNT`
 and starts claude. It records a job in the history with the account, and
-watches the session (`--no-watch` not to). An account cca doesn't know is an
+watches the session (`--no-watch` not to). `--space <name>` puts it in a new
+tab of that Herdr space (its whole name or a part of it; none or several
+matching is an error that lists them), through Herdr's `tab.new`, running the
+same `cca` command; the window stays on the space it showed. Without
+`--space` it gets a tab in the space the window shows. Either way it says which
+space the session went to. An account cca doesn't know is an
 error that lists the ones it does. Without the mod, sessions start as plain
 `claude` and accounts show as unknown.
 
