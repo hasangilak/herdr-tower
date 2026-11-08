@@ -431,6 +431,23 @@ impl Lan {
                 list.reverse();
                 Response::json(200, &json!({ "entries": list }))
             }
+            // Bring a session on screen in Herdr (as `tower show <t>`).
+            ("POST", ["sessions", address, "show"]) => {
+                if !valid_address(address) {
+                    return Some(Response::error(400, "bad_address", "an address looks like t3 or vps/t3"));
+                }
+                match crate::show_terminal(address) {
+                    Ok(()) => Response::json(200, &json!({ "shown": address })),
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        if msg.starts_with("no terminal") {
+                            Response::error(404, "no_session", &msg)
+                        } else {
+                            Response::error(503, "herdr", &msg)
+                        }
+                    }
+                }
+            }
             ("GET", ["sessions", address, "screen"]) => {
                 if !valid_address(address) {
                     return Some(Response::error(400, "bad_address", "an address looks like t3 or vps/t3"));
@@ -1221,6 +1238,10 @@ mod tests {
         assert!(std::fs::read_to_string(dir.join("devices.json")).unwrap().contains("\"audio_route\": \"mac\""), "it survives a restart");
         let (st, v) = call(addr, &fp, "GET", "/v1/audio", Some(&token), "").unwrap();
         assert!(st == 200 && v["clips"].is_array());
+        // Showing a session: an unknown one is a 404, a bad address a 400, and a token is needed.
+        assert_eq!(call(addr, &fp, "POST", "/v1/sessions/qnope-no-such-terminal/show", Some(&token), "").unwrap().0, 404);
+        assert_eq!(call(addr, &fp, "POST", "/v1/sessions/a%3Bb/show", Some(&token), "").unwrap().0, 400);
+        assert_eq!(call(addr, &fp, "POST", "/v1/sessions/t1/show", None, "").unwrap().0, 401);
         // Screenshots: by id, never by path; the token is needed as everywhere.
         assert_eq!(call(addr, &fp, "GET", "/v1/screenshots/..%2F..%2Fdevices.json", Some(&token), "").unwrap().0, 400);
         assert_eq!(call(addr, &fp, "GET", "/v1/screenshots/0-no-such-shot.png", Some(&token), "").unwrap().0, 404);

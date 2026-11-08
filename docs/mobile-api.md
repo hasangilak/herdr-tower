@@ -185,6 +185,7 @@ may be added later: ignore them.
 |---|---|---|
 | `POST /v1/ask` | `{"text": "what's everyone doing?"}`, or multipart with images (below) | Sends it to the tower like typing in the panel (it arrives as `[voice] …`). `202 {"sent": text, "attachments": [paths]}`. The canned "Okay." is played (on the phone when it's the voice). |
 | `POST /v1/agents/{address}/answer` | `{"decision": "approve"\|"refuse", "note": "only the read"}` | Tells the tower, as the user would: "Approve what t22 is asking for. only the read". The tower reads the session's screen and answers it, as today. `202`. |
+| `POST /v1/sessions/{address}/show` | | Brings that session on screen in the Mac's Herdr window (as `tower show <t>`: focuses its tab, or gives it one). `200 {"shown": address}`, `404 no_session`, `400 bad_address`, `503 herdr` (the window isn't open). |
 | `POST /v1/focus` | `{"space": "B2C support"}` or `{"space": null}` | Focuses a space (its news is spoken, others held) or clears focus. `200 {"focus": name or null}`; `404 no_space`. |
 | `GET /v1/device/audio` | | `200 {"route": "phone"\|"mac"}`: where this phone's replies are heard (below). |
 | `PUT /v1/device/audio` | `{"route": "phone"\|"mac"}` | Sets it (kept in the Mac's devices.json, so it survives restarts). `400 bad_route`. Also in `hello` and the state as `audio_route`. |
