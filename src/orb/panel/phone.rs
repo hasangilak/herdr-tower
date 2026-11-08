@@ -6,7 +6,7 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, AnyElement, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Bounds,
+    AnyElement, App, Bounds, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
     StatefulInteractiveElement as _, Styled as _, Window, canvas, div, point, prelude::FluentBuilder as _, px, rgb, rgba, size,
 };
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
@@ -191,9 +191,9 @@ impl Panel {
         self.phone.busy = true;
         self.phone.note = None;
         self.phone.pairing = None;
-        let task = cx.background_executor().spawn(async move {
-            if on { crate::phone::enable().map(|v| v.is_some()) } else { crate::phone::disable().map(|_| true) }
-        });
+        let task = cx
+            .background_executor()
+            .spawn(async move { if on { crate::phone::enable().map(|v| v.is_some()) } else { crate::phone::disable().map(|_| true) } });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -305,21 +305,13 @@ impl Panel {
                             .text_color(rgb(0x1d2330))
                             .child(qr_element(&p.qr))
                             .child(div().text_sm().text_color(rgb(0x5b6475)).child("Scan in the Tower app, or enter"))
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_family("Menlo")
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(spaced(&p.code)),
-                            )
-                            .child(
-                                div().text_xs().font_family("Menlo").text_color(rgb(0x5b6475)).child(format!(
-                                    "{}:{} · {}",
-                                    p.host,
-                                    p.port,
-                                    crate::daemon::lan::tls::grouped(&p.fingerprint[..8.min(p.fingerprint.len())])
-                                )),
-                            )
+                            .child(div().text_lg().font_family("Menlo").font_weight(FontWeight::MEDIUM).child(spaced(&p.code)))
+                            .child(div().text_xs().font_family("Menlo").text_color(rgb(0x5b6475)).child(format!(
+                                "{}:{} · {}",
+                                p.host,
+                                p.port,
+                                crate::daemon::lan::tls::grouped(&p.fingerprint[..8.min(p.fingerprint.len())])
+                            )))
                             .child(
                                 h_flex()
                                     .gap_2()
@@ -368,7 +360,8 @@ impl Panel {
         for d in &st.devices {
             let asking = self.phone.revoking.as_deref() == Some(d.id.as_str());
             let id = d.id.clone();
-            let seen = if d.last_seen_ms == 0 { "never seen".to_string() } else { format!("last seen {}", crate::phone::ago(d.last_seen_ms)) };
+            let seen =
+                if d.last_seen_ms == 0 { "never seen".to_string() } else { format!("last seen {}", crate::phone::ago(d.last_seen_ms)) };
             items.push(
                 h_flex()
                     .gap_3()
@@ -382,7 +375,11 @@ impl Panel {
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).truncate().child(if d.name.is_empty() { d.id.clone() } else { d.name.clone() }))
+                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).truncate().child(if d.name.is_empty() {
+                                d.id.clone()
+                            } else {
+                                d.name.clone()
+                            }))
                             .child(div().text_xs().text_color(g.faint).child(seen)),
                     )
                     .child(
@@ -534,7 +531,14 @@ mod tests {
 
     #[test]
     fn a_new_phone_ends_the_pairing() {
-        let dev = |id: &str| Device { id: id.into(), name: format!("Pixel {id}"), token_sha256: String::new(), created_ms: 1, last_seen_ms: 0, audio_route: "phone".into() };
+        let dev = |id: &str| Device {
+            id: id.into(),
+            name: format!("Pixel {id}"),
+            token_sha256: String::new(),
+            created_ms: 1,
+            last_seen_ms: 0,
+            audio_route: "phone".into(),
+        };
         let st = |url: Option<&str>, ids: &[&str]| Status {
             enabled: true,
             voice: true,
