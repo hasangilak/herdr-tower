@@ -197,6 +197,13 @@ for **Herdr Core**, because the voice runs in a Herdr terminal.
 - `tower watch <t>` (the brain calls it after handing off work) makes the
   daemon send the brain a `[watch]` message when that session stops working,
   is blocked, or sits on a first-run "trust this folder?" question.
+  Watches survive restarts: `~/.local/state/herder-tower/watches.json` keeps
+  them, the last status of every agent, and reports the brain hasn't taken
+  yet. On start the voice compares that with what Herdr says now and reports
+  what finished, blocked or ended while it was down, for watched sessions and
+  for sessions with an open job. A watch leaves the file in the same write
+  that queues its report, so each finish is told once, and a report waits
+  (said out loud once) until the brain is there to take it.
 - Codex as the brain: `tower up --brain codex` (it uses Codex's `notify`
   instead of a hook, and runs with `--sandbox danger-full-access
   --ask-for-approval on-request` because `hc` talks to herdr-core over a Unix

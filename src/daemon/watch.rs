@@ -3,15 +3,17 @@
 //! and the agent list current, says out loud when an agent needs the user,
 //! and fires the brain's watches.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 use serde_json::Value;
 
+use super::book::{self, Book, Now, OpenJob, Owed, Pending, Watch};
 use super::state::{AgentLine, Shared};
 use super::tts::Mouth;
 use crate::brain;
@@ -30,91 +32,120 @@ struct Seen {
     space: Option<String>,
 }
 
-/// Terminals the brain asked to hear about: address -> what it asked. Kept
-/// in `watches.json` too, so a restarted voice still reports back.
+/// Terminals the brain asked to hear about, what each was last seen doing,
+/// and reports not yet taken: the radar's book (see `book`), kept in
+/// `watches.json` so a restarted voice still reports back, once.
 #[derive(Clone)]
-pub struct Watches(Arc<Mutex<HashMap<String, String>>>);
+pub struct Watches {
+    book: Arc<Mutex<Book>>,
+    radar: Arc<OnceLock<Radar>>,
+    /// One delivery at a time, so no report goes out twice.
+    sending: Arc<Mutex<()>>,
+}
 
 impl Default for Watches {
     fn default() -> Self {
-        let saved: HashMap<String, String> =
-            std::fs::read_to_string(Self::path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-        let w = Self(Arc::new(Mutex::new(saved.clone())));
-        for t in saved.keys() {
-            w.recheck(t);
+        Self {
+            book: Arc::new(Mutex::new(Book::load_from(&Book::path()))),
+            radar: Arc::new(OnceLock::new()),
+            sending: Arc::new(Mutex::new(())),
         }
-        w
     }
 }
 
 impl Watches {
-    fn path() -> std::path::PathBuf {
-        config::state_dir().join("watches.json")
-    }
-    fn save(map: &HashMap<String, String>) {
-        let _ = std::fs::write(Self::path(), serde_json::to_string_pretty(map).unwrap_or_default());
-    }
-    pub fn add(&self, terminal: &str, note: &str, account: Option<String>) {
-        let (t, n) = (terminal.to_string(), note.to_string());
-        crate::history::later(move || {
-            crate::history::job_start_on(&t, &n, account);
-        });
-        {
-            let mut m = self.0.lock().unwrap();
-            m.insert(terminal.to_string(), note.to_string());
-            Self::save(&m);
-        }
-        self.recheck(terminal);
+    fn save(book: &Book) {
+        book.save_to(&Book::path());
     }
 
-    /// A watched terminal may have finished already, before the watch was
-    /// asked for (or while the voice was restarting). A prompt sent just now
-    /// has started within a few seconds.
-    fn recheck(&self, terminal: &str) {
-        let me = self.clone();
-        let terminal = terminal.to_string();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_secs(3));
-            let Some(t) = hc::get(&terminal) else { return };
-            let status = hc::status_word(&t).unwrap_or_default();
-            if t["state"] == "live" && !matches!(status.as_str(), "done" | "blocked" | "error") {
-                return;
-            }
-            if let Some(asked) = me.take(&terminal) {
-                let name = hc::spoken_name(&t);
-                let status = if t["state"] == "live" { status } else { "exited".into() };
-                {
-                    let (t, st, a) = (terminal.to_string(), status.to_string(), asked.clone());
-                    crate::history::later(move || crate::history::job_watched(&t, &st, &a));
-                }
-                let what = if asked.is_empty() { String::new() } else { format!(" You had asked it: {asked}.") };
-                // Another space than the one in focus: keep it for later (no bell here).
-                let space = crate::spaces::space_of(&t);
-                let focus = crate::spaces::load().focus;
-                if crate::spaces::gate(space.as_deref(), focus.as_deref(), false, false) != crate::spaces::Gate::Speak {
-                    let report = format!("{name} is now {status}.{what}");
-                    crate::spaces::hold("watch", &terminal, &name, space.as_deref().unwrap_or(""), &report, Some(&status));
-                    return;
-                }
-                let _ = brain::note(&format!(
-                    "[watch] {terminal} ({name}) is now {status}.{what} Read its screen and tell me what happened, briefly."
-                ));
-            }
+    pub fn add(&self, terminal: &str, note: &str, account: Option<String>) {
+        let (t, n, acc) = (terminal.to_string(), note.to_string(), account.clone());
+        crate::history::later(move || {
+            crate::history::job_start_on(&t, &n, acc);
         });
-    }
-    fn take(&self, terminal: &str) -> Option<String> {
-        let mut m = self.0.lock().unwrap();
-        let note = m.remove(terminal);
-        if note.is_some() {
-            Self::save(&m);
+        {
+            let mut b = self.book.lock().unwrap();
+            let last = b.seen.get(terminal).cloned().unwrap_or_default();
+            b.watches.insert(terminal.to_string(), Watch { note: note.to_string(), since_ms: crate::history::now_ms(), last, account });
+            Self::save(&b);
         }
-        note
+        if let Some(r) = self.radar.get() {
+            r.recheck(terminal);
+        }
+    }
+
+    /// The watch fires: out of the watches, its report into the outbox, in
+    /// one write. None when it had fired already (each finish is told once).
+    fn fire(&self, address: &str, report: impl FnOnce(&Watch) -> Pending) -> Option<Pending> {
+        let mut b = self.book.lock().unwrap();
+        let p = b.fire(address, report)?;
+        Self::save(&b);
+        Some(p)
+    }
+
+    /// A report owed without a watch.
+    fn owe(&self, p: Pending) -> bool {
+        let mut b = self.book.lock().unwrap();
+        let added = b.owe(p);
+        if added {
+            Self::save(&b);
+        }
+        added
+    }
+
+    /// Remembers a session's status (for the next start's reconcile).
+    fn seen(&self, address: &str, status: &str) {
+        let mut b = self.book.lock().unwrap();
+        let mut changed = b.seen.get(address).map(String::as_str) != Some(status);
+        if changed {
+            b.seen.insert(address.to_string(), status.to_string());
+        }
+        if let Some(w) = b.watches.get_mut(address)
+            && w.last != status
+        {
+            w.last = status.to_string();
+            changed = true;
+        }
+        if changed {
+            Self::save(&b);
+        }
+    }
+
+    fn watched(&self, terminal: &str) -> bool {
+        self.book.lock().unwrap().watches.contains_key(terminal)
+    }
+    fn snapshot(&self) -> Book {
+        self.book.lock().unwrap().clone()
     }
     fn remote(&self) -> Vec<String> {
-        self.0.lock().unwrap().keys().filter(|k| k.contains('/')).cloned().collect()
+        self.book.lock().unwrap().watches.keys().filter(|k| k.contains('/')).cloned().collect()
     }
     fn all(&self) -> Vec<String> {
-        self.0.lock().unwrap().keys().cloned().collect()
+        self.book.lock().unwrap().watches.keys().cloned().collect()
+    }
+
+    /// Hands the outbox to `send`, outside the lock (it talks to Herdr);
+    /// what it couldn't hand over stays for the next try.
+    fn deliver(&self, send: impl FnMut(&mut Pending) -> bool) {
+        let _one = self.sending.lock().unwrap();
+        let mut pending = {
+            let b = self.book.lock().unwrap();
+            if b.outbox.is_empty() {
+                return;
+            }
+            Book { outbox: b.outbox.clone(), ..Default::default() }
+        };
+        let tried = pending.outbox.clone();
+        if !pending.deliver(crate::history::now_ms(), send) {
+            return;
+        }
+        let mut b = self.book.lock().unwrap();
+        // Keep reports added meanwhile; drop the ones taken (or gone stale).
+        b.outbox.retain(|p| !tried.contains(p));
+        let mut rest = pending.outbox;
+        rest.append(&mut b.outbox);
+        b.outbox = rest;
+        Self::save(&b);
     }
 }
 
@@ -128,7 +159,22 @@ struct Radar {
 }
 
 pub fn start(shared: Shared, mouth: Mouth, alerts: Alerts, watches: Watches) {
-    let radar = Radar { shared, mouth, alerts, watches, seen: Arc::new(Mutex::new(HashMap::new())) };
+    // What was known when the last run ended, before this run's first look updates it.
+    let before = watches.snapshot();
+    let radar = Radar { shared, mouth, alerts, watches: watches.clone(), seen: Arc::new(Mutex::new(HashMap::new())) };
+    let _ = watches.radar.set(radar.clone());
+    let r = radar.clone();
+    thread::Builder::new().name("reconcile".into()).spawn(move || r.reconcile(before)).ok();
+    let r = radar.clone();
+    thread::Builder::new()
+        .name("outbox".into())
+        .spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(5));
+                r.deliver();
+            }
+        })
+        .ok();
     let r = radar.clone();
     thread::Builder::new().name("events".into()).spawn(move || r.follow_local()).ok();
     let r = radar.clone();
@@ -198,10 +244,10 @@ impl Radar {
     fn poll_remote(&self) {
         let mut first: HashMap<String, bool> = HashMap::new();
         // Watches saved by an earlier run: check the local ones now.
+        // (Those that ended meanwhile are the reconcile's.)
         for w in self.watches.all().into_iter().filter(|w| !w.contains('/')) {
-            match hc::get(&w) {
-                Some(t) if t["state"] == "live" => self.check_startup(&w, &t),
-                _ => self.gone(&w),
+            if let Some(t) = hc::get(&w).filter(|t| t["state"] == "live") {
+                self.check_startup(&w, &t);
             }
         }
         loop {
@@ -278,6 +324,9 @@ impl Radar {
         if is_voice || app.is_empty() {
             return;
         }
+        if live && !status.is_empty() {
+            self.watches.seen(&address, &status);
+        }
         let was = before.as_ref().map(|b| b.status.as_str()).unwrap_or("");
         if was == status {
             return;
@@ -285,23 +334,9 @@ impl Radar {
         let stopped_working = was == "working" && status != "working";
 
         // The brain asked to hear when this one stops.
-        if (stopped_working || status == "blocked" || !live)
-            && let Some(asked) = self.watches.take(&address)
-        {
-            let what = if asked.is_empty() { String::new() } else { format!(" You had asked it: {asked}.") };
-            let msg = format!("[watch] {address} ({name}) is now {status}.{what} Read its screen and tell me what happened, briefly.");
-            {
-                let (t, st, a) = (address.to_string(), status.to_string(), asked.clone());
-                crate::history::later(move || crate::history::job_watched(&t, &st, &a));
-            }
-            if self.held(&address, &name, space.as_deref(), &format!("{name} is now {status}.{what}"), &status, "watch") {
-                return;
-            }
-            if let Err(e) = brain::note(&msg) {
-                eprintln!("[radar] watch note: {e:#}");
-                self.mouth.alert(format!("{name} is {}.", say_status(&status)), Some((address.as_str(), status.as_str())));
-            }
-            self.shared.alert(&address, &format!("{name} is {}", say_status(&status)), &status);
+        if (stopped_working || status == "blocked" || !live) && self.watches.watched(&address) {
+            let status = if live { status.clone() } else { "exited".into() };
+            self.fire_watch(&address, &name, space.clone(), &status, "");
             return;
         }
         if !announce {
@@ -406,31 +441,27 @@ impl Radar {
         }
         let name = hc::spoken_name(&t);
         let folder = t["cwd"].as_str().unwrap_or("its folder");
-        if self.held(
-            address,
-            &name,
-            crate::spaces::space_of(&t).as_deref(),
-            &format!("{name} asks to trust its folder {folder}"),
-            "blocked",
-            "alert",
-        ) {
-            if self.watches.take(address).is_some() {
-                let a = address.to_string();
-                crate::history::later(move || crate::history::job_update(&a, "blocked", "asks to trust its folder"));
-            }
-            return true;
-        }
-        self.shared.alert(address, &format!("{name} asks to trust its folder"), "blocked");
-        let msg = format!(
-            "[watch] {address} ({name}) is waiting on its first-run question: may it trust the folder {folder}? It can't start until someone answers. Ask me before you answer it."
-        );
-        if self.watches.take(address).is_some() {
+        let report = Pending {
+            address: address.to_string(),
+            name: name.clone(),
+            space: crate::spaces::space_of(&t),
+            status: "blocked".into(),
+            msg: format!(
+                "[watch] {address} ({name}) is waiting on its first-run question: may it trust the folder {folder}? It can't start until someone answers. Ask me before you answer it."
+            ),
+            speech: format!("{name} is asking whether to trust its folder."),
+            kind: "alert".into(),
+            at_ms: crate::history::now_ms(),
+            spoken: false,
+        };
+        let r = report.clone();
+        if self.watches.fire(address, move |_| r).is_some() {
             let a = address.to_string();
             crate::history::later(move || crate::history::job_update(&a, "blocked", "asks to trust its folder"));
+        } else {
+            self.watches.owe(report);
         }
-        if brain::note(&msg).is_err() {
-            self.mouth.alert(format!("{name} is asking whether to trust its folder."), None);
-        }
+        self.deliver();
         true
     }
 
@@ -441,16 +472,142 @@ impl Radar {
         {
             self.shared.update(|s| s.brain = "absent".into());
         }
-        if let Some(asked) = self.watches.take(address) {
-            let (a, q) = (address.to_string(), asked.clone());
-            crate::history::later(move || crate::history::job_watched(&a, "exited", &q));
+        // Gone while the tower looked: nothing owed at the next start for it.
+        if removed.as_ref().is_some_and(|r| !r.app.is_empty()) {
+            self.watches.seen(address, "gone");
+        }
+        if self.watches.watched(address) {
             let space = removed.as_ref().and_then(|r| r.space.clone());
             let name = removed.map(|r| r.name).unwrap_or_else(|| address.to_string());
-            if self.held(address, &name, space.as_deref(), &format!("{name} has exited. You had asked it: {asked}."), "exited", "watch") {
+            self.fire_watch(address, &name, space, "exited", "");
+        }
+    }
+
+    /// A watched session stopped (`status`): its report goes out, once
+    /// (`why` adds how it was found, e.g. while the tower was down).
+    fn fire_watch(&self, address: &str, name: &str, space: Option<String>, status: &str, why: &str) -> bool {
+        let fired = self.watches.fire(address, |w| {
+            let (t, st, a) = (address.to_string(), status.to_string(), w.note.clone());
+            crate::history::later(move || crate::history::job_watched(&t, if st == "gone" { "exited" } else { &st }, &a));
+            report(address, name, space.clone(), status, &w.note, why, "watch")
+        });
+        if fired.is_none() {
+            return false;
+        }
+        eprintln!("[radar] watch on {address} fired: {status}{why}");
+        self.deliver();
+        true
+    }
+
+    /// Hands what's owed to the brain: kept in the outbox until it takes it
+    /// (said out loud once meanwhile). News from a space out of focus is held instead.
+    fn deliver(&self) {
+        self.watches.deliver(|p| {
+            let news = p.msg.trim_start_matches("[watch] ").to_string();
+            if self.held(&p.address, &p.name, p.space.as_deref(), &news, &p.status, &p.kind) {
+                return true;
+            }
+            match brain::note(&p.msg) {
+                Ok(()) => {
+                    if !p.spoken {
+                        self.shared.alert(&p.address, &format!("{} is {}", p.name, say_status(&p.status)), &p.status);
+                    }
+                    true
+                }
+                Err(e) => {
+                    if !p.spoken {
+                        eprintln!("[radar] the brain can't take it yet ({e:#}): {}", p.msg);
+                        self.shared.alert(&p.address, &format!("{} is {}", p.name, say_status(&p.status)), &p.status);
+                        self.mouth.alert(p.speech.clone(), Some((p.address.as_str(), p.status.as_str())));
+                        p.spoken = true;
+                    }
+                    false
+                }
+            }
+        });
+    }
+
+    /// A watch set just now: the session may have finished already (before
+    /// the watch was asked for). A prompt sent just now has started within a
+    /// few seconds.
+    fn recheck(&self, terminal: &str) {
+        let me = self.clone();
+        let terminal = terminal.to_string();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(3));
+            let Some(t) = hc::get(&terminal) else { return };
+            let status = hc::status_word(&t).unwrap_or_default();
+            if t["state"] == "live" && !matches!(status.as_str(), "done" | "blocked" | "error") {
                 return;
             }
-            let _ = brain::note(&format!("[watch] {address} ({name}) has exited. You had asked it: {asked}. Tell me briefly."));
+            let status = if t["state"] == "live" { status } else { "exited".into() };
+            me.fire_watch(&terminal, &hc::spoken_name(&t), crate::spaces::space_of(&t), &status, "");
+        });
+    }
+
+    /// At start: what finished, blocked or ended while the voice was down,
+    /// among the watched sessions (`before`: the book as the last run left
+    /// it) and those with an open job.
+    fn reconcile(&self, before: Book) {
+        // Let the brain's terminal settle when everything is starting at once.
+        thread::sleep(Duration::from_secs(2));
+        let mut now: BTreeMap<String, Now> = BTreeMap::new();
+        let mut facts: HashMap<String, Value> = HashMap::new();
+        let mut reached: Vec<String> = vec![];
+        let mut lists = vec![(None, hc::list_on(None))];
+        if before.watches.keys().any(|k| k.contains('/')) || self.alerts.remote_poll_secs > 0 {
+            for m in hc::machines() {
+                let l = hc::list_on(Some(&m));
+                lists.push((Some(m), l));
+            }
         }
+        for (m, list) in lists {
+            let Ok(list) = list else { continue };
+            reached.push(m.map(|m| format!("{m}/")).unwrap_or_default());
+            for t in list {
+                let Some(a) = t["address"].as_str().map(String::from) else { continue };
+                now.insert(
+                    a.clone(),
+                    Now { live: t["state"].as_str().is_none_or(|s| s == "live"), status: hc::status_word(&t).unwrap_or_default() },
+                );
+                facts.insert(a, t);
+            }
+        }
+        let reachable = |a: &str| match a.split_once('/') {
+            Some((m, _)) => reached.contains(&format!("{m}/")),
+            None => reached.iter().any(String::is_empty),
+        };
+        let jobs: Vec<OpenJob> = crate::history::jobs(&crate::history::load())
+            .into_iter()
+            .filter(|j| j.open())
+            .map(|j| OpenJob { session: j.session, status: j.status, title: j.title })
+            .collect();
+        let owed = book::reconcile(&before, &jobs, &now, reachable);
+        eprintln!("[radar] start: {} watch(es), {} open job(s), {} owed", before.watches.len(), jobs.len(), owed.len());
+        let name_of = |a: &str| facts.get(a).map(hc::spoken_name).unwrap_or_else(|| a.to_string());
+        let space_of = |a: &str| facts.get(a).and_then(crate::spaces::space_of);
+        for o in owed {
+            match o {
+                Owed::Watch { address, status, was } => {
+                    let why = down_why(&status, &was);
+                    self.fire_watch(&address, &name_of(&address), space_of(&address), &status, &why);
+                }
+                Owed::Job { address, status, was, title } => {
+                    let name = name_of(&address);
+                    let p = report(&address, &name, space_of(&address), &status, &title, &down_why(&status, &was), "watch");
+                    if self.watches.owe(p) {
+                        let job_status = match status.as_str() {
+                            "gone" | "exited" => "exited",
+                            "idle" => "done",
+                            s => s,
+                        }
+                        .to_string();
+                        crate::history::later(move || crate::history::job_update(&address, &job_status, ""));
+                    }
+                }
+            }
+        }
+        self.deliver();
     }
 
     fn publish(&self) {
@@ -471,6 +628,38 @@ impl Radar {
             .collect();
         agents.sort_by(|a, b| a.address.cmp(&b.address));
         self.shared.update(|s| s.agents = agents);
+    }
+}
+
+/// A report on a watched (or job) session for the brain.
+fn report(address: &str, name: &str, space: Option<String>, status: &str, asked: &str, why: &str, kind: &str) -> Pending {
+    let what = if asked.is_empty() { String::new() } else { format!(" You had asked it: {asked}.") };
+    let (msg, speech) = match status {
+        "exited" | "gone" => (format!("[watch] {address} ({name}) has exited{why}.{what} Tell me briefly."), format!("{name} has exited.")),
+        _ => (
+            format!("[watch] {address} ({name}) is now {status}{why}.{what} Read its screen and tell me what happened, briefly."),
+            format!("{name} is {}.", say_status(status)),
+        ),
+    };
+    Pending {
+        address: address.into(),
+        name: name.into(),
+        space,
+        status: status.into(),
+        msg,
+        speech,
+        kind: kind.into(),
+        at_ms: crate::history::now_ms(),
+        spoken: false,
+    }
+}
+
+/// How a report found at start came about.
+fn down_why(status: &str, was: &str) -> String {
+    let was = if was.is_empty() || was == status { String::new() } else { format!("; it was {was} when last seen") };
+    match status {
+        "exited" | "gone" => format!(" while the tower was down{was}"),
+        _ => format!(" (this happened while the tower was down{was})"),
     }
 }
 
