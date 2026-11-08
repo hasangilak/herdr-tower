@@ -33,7 +33,7 @@ pub fn parse(text: &str) -> Vec<(usize, Entry)> {
 pub fn shown(e: &Entry) -> bool {
     !e.held
         && match e.kind.as_str() {
-            "request" | "answer" | "watch" | "alert" | "summary" => true,
+            "request" | "answer" | "watch" | "alert" | "summary" | "answered" => true,
             "screenshot" => e.path.is_some(),
             "job" => matches!(e.status.as_deref(), Some("done" | "failed" | "error" | "exited" | "blocked")) && !e.text.is_empty(),
             _ => false,
@@ -87,6 +87,8 @@ fn event_text(e: &Entry) -> String {
         ("job", Some("blocked")) => format!("{who} needs you: {}", e.text),
         ("job", _) => format!("{who}: {}", e.text),
         ("alert", _) => e.text.clone(),
+        // The tower answered a session's question itself.
+        ("answered", _) => format!("{who}: {}", e.text),
         ("summary", _) => format!("{who}: {}", e.text),
         _ => {
             let mut t = e.text.clone();

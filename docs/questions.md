@@ -1,6 +1,17 @@
-# Questions: what blocked sessions ask, answered with a tap
+# Questions: what sessions ask, answered for you or with a tap
 
-When a Claude Code or Codex session stops to ask something, it shows a
+Sessions ask in two ways, and both become the same **question set**:
+
+- **A dialog** (`kind` `claude-ask`, `claude-plan`, `claude-permission`,
+  `codex-menu`): the session is blocked on a terminal menu.
+- **Plain text** (`kind` `text`): the session finished its turn with a
+  message that asks the user something ("Want me to open the PR, or wait?").
+
+The tower's brain recommends three answers per question and decides, by the
+**90/10 rule**: it answers routine ones itself (about 90%) and leaves the
+rest to the user (see "Who decides").
+
+When a Claude Code or Codex session stops to ask something in a dialog, it shows a
 terminal dialog: Claude Code's tabbed questions (`AskUserQuestion`, one tab
 per question, options, "Type something", a review tab and Submit), its
 plan approval, its permission prompts, Codex's approval menu. The tower
@@ -72,6 +83,28 @@ the session stops being blocked, its set closes.
 It is in the daemon's `state.json` (`questions`, and each agent's
 `question` id), in the phone API, and pushed as a `question` event.
 
+## Plain-text questions
+
+When a session goes from `working` to `done` or `idle`, the tower reads its
+last message (from its transcript for Claude Code on this Mac, else from its
+screen without the interface around it) and checks the end cheaply: a `?`
+near the end (not in code or a link), "want me to", "should I", "which do you
+prefer", "let me know", "soll ich", … or options laid out to choose from.
+Only then does it open a `text` question set (one tab, its guess at the
+question, `allows_other: true`) and send the brain
+`[question-text] <session> <id> <json>` (the message's end, what the session
+was asked to do). The brain says what it really asks (one or more
+questions, each with three replies) or `tower recommend <id> --none`, which
+closes it. A text question set closes by itself when the session starts
+working again (it got a prompt from anywhere), and can be dismissed
+(`DELETE /v1/questions/{id}`, `tower dismiss <id>`).
+
+Its answer is **one reply** typed into the session as the user would (no
+sender note): the chosen recommendation's text or the user's own words
+(typed or spoken, with files attached as the panel does), several questions
+numbered `1.`, `2.`, …. If the session is working again by then, the reply
+waits (`status: queued`) and goes in when it stops.
+
 ## Recommendations
 
 When a new set appears, the daemon sends the tower's brain one line:
@@ -87,6 +120,38 @@ for multi, or `{"other":"text"}`). The set shows at once with
 `recommendations: null`; they land with an `update` when ready. The brain's
 turn for a `[question]` is never spoken and never kept in the chat (its
 prompt rule says to stay quiet, and the voice drops what it writes then).
+
+## Who decides: the 90/10 rule
+
+With its recommendations the brain gives a decision: `tower recommend <id>
+--decision auto|escalate --reason "…"`.
+
+- **auto**: the tower answers right away with recommendation 1 for every
+  question (it is always the default pick), once, and writes a history entry
+  (`kind: answered`): "answered for you: Which test runner? -> Vitest,
+  because …". It shows in the chat as a small event and is never spoken.
+- **escalate**: the card stays for the user, who hears one sentence: "The
+  web session asks: Should I deploy to production? I'd say: Not yet." (held
+  for later if another space is in focus, as notices are).
+
+The brain's prompt has both lists (routine: naming, which of two reasonable
+implementations, proceed, run the tests, edits and commands inside the
+project, lint, local commits, the safe default; for the user: deploys,
+pushes, merges to main or prod, deleting or overwriting, infrastructure,
+secrets, money, outside the project, security, big scope or product
+decisions, anything surprising or uncertain). The daemon enforces the hard
+part whatever the brain says (`questions::must_escalate`): a question about
+deploying or releasing, pushing or merging to a shared branch, deleting or
+overwriting, infrastructure, secrets or money always escalates.
+
+The user's policy (`tower policy`, `PUT /v1/questions-policy`, kept in
+config.toml as `question_policy`): `normal`; `keep-moving` (the brain answers
+borderline ones too, never the hard list); `ask-everything` (nothing is
+answered for the user).
+
+If the brain gives no decision within 40 seconds (it's away or busy), a
+dialog escalates by itself. A dialog the tower can't read gets the plain
+notice, as before.
 
 ## Answering
 
@@ -143,22 +208,26 @@ itself).
 
 ## Notices
 
-The spoken notice (and the panel's and phone's alert) says what is asked,
-in a sentence, from herdr-core's status line: "The orb session asks: Which
+Questions go through the brain: the user hears only escalated ones, in one
+sentence with the tower's pick. Other blocked sessions (and dialogs the tower
+can't read) get the notice from herdr-core's status line, in a sentence: "The orb session asks: Which
 database should the app use?", "… asks to run touch /tmp/x", "… has a plan
 ready for you to approve", "… asks to edit login.rs"; just "… needs you"
 when there is nothing to say. Focus still holds news from other spaces.
 
 ## What's reliable, and what isn't yet
 
-- Tried live, end to end: Claude Code's three-tab questions (a single
+- Tried live, end to end (the driver): Claude Code's three-tab questions (a single
   choice, a multi-choice with a typed answer, a two-line typed answer, then
   Submit), a Claude Code permission prompt and a Codex approval (both
   answered "No").
 - From real screens but not driven live: the plan approval (driven like the
   permission prompt), one-question dialogs.
-- Sessions on other machines don't get question sets yet (their screens
-  aren't read).
+- Not tried live yet: the brain's decisions (auto-answer, escalate) and
+  plain-text questions from a real finished turn; they are covered by tests
+  with real finished messages (`finished-messages.json`) and fixtures.
+- Dialogs on other machines don't get question sets yet (their screens
+  aren't read); their plain-text questions do (read from the screen).
 - "Chat about this", Claude's "Tab to amend" and a plan's "Tell Claude what
   to change" with text aren't offered: those are for the terminal.
 - New Claude Code or Codex versions may draw their dialogs differently; the

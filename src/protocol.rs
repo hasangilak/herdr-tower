@@ -63,7 +63,23 @@ pub enum Request {
         submit: bool,
     },
     /// The brain's recommended answers for a question set.
-    Recommend { id: String, recs: serde_json::Value },
+    Recommend {
+        id: String,
+        #[serde(default)]
+        recs: serde_json::Value,
+        /// `auto` or `escalate`.
+        #[serde(default)]
+        decision: Option<String>,
+        #[serde(default)]
+        reason: String,
+        /// A text question set that asks nothing after all.
+        #[serde(default)]
+        none: bool,
+    },
+    /// The user dismissed a question set.
+    Dismiss { id: String },
+    /// `normal`, `keep-moving` or `ask-everything`.
+    Policy { policy: String },
     /// A screenshot was added (`tower screenshot`): the state's list is re-read.
     Screenshots,
     Status,

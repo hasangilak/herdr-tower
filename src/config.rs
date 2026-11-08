@@ -122,6 +122,10 @@ pub struct Config {
     pub alerts: Alerts,
     /// The phone API (`tower phone`): off unless enabled.
     pub lan: Lan,
+    /// How session questions are handled (`tower policy`): `normal` (the
+    /// tower answers routine ones itself, the user decides the rest),
+    /// `keep-moving` (it answers more), `ask-everything`.
+    pub question_policy: String,
     /// How many characters of a reply are read aloud at most.
     pub max_spoken_chars: usize,
     /// Said the moment a request reaches the brain, in turn ("Got it.").
@@ -206,6 +210,7 @@ impl Default for Config {
             vad: Vad::default(),
             alerts: Alerts::default(),
             lan: Lan::default(),
+            question_policy: "normal".into(),
             max_spoken_chars: 900,
             ack: ["Got it.", "Okay.", "Sure."].map(String::from).to_vec(),
             ack_delay_ms: 0,

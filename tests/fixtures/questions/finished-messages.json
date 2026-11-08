@@ -1,0 +1,8 @@
+[
+  {"asks": true, "text": "The README covers setup and every command. Want me to commit it, or add the echo cancellation next?"},
+  {"asks": true, "text": "That session and I are editing one folder with nothing committed yet, so we could overwrite each other's work. I'd commit what's there now as a baseline and let `orb-rust` build its window as a separate crate or branch. Should I commit now, or wait until it's finished?"},
+  {"asks": true, "text": "You answered \"Teal, not too dark?\" instead of picking Red or Blue, so I've made no changes. Teal is a fine choice. For something not too dark, a medium teal like `#14B8A6` or a lighter one like `#2DD4BF` would work. Tell me which you want, or if you meant Red or Blue, say so."},
+  {"asks": false, "text": "If the phone has no connection open, those clips are kept for 15 minutes and listed by `GET /v1/audio?after=<id>`. The voice restarted last and reloaded the t1 and t2s watches."},
+  {"asks": false, "text": "Sources: [herdr.dev mod gallery](https://herdr.dev/mods/?tab=all), [herdr.dev guide](https://herdr.dev/guide/), plus the GitHub repos linked in the table."},
+  {"asks": false, "text": "Main is pushed and git ls-remote shows it matches local main. Nothing blocked the push."}
+]

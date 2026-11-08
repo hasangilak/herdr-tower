@@ -98,6 +98,13 @@ pub struct QuestionSet {
     /// The questions came from the session's transcript (exact), not only its screen.
     pub exact: bool,
     pub at_ms: u64,
+    /// `auto` (the tower answers it itself, with recommendation 1) or
+    /// `escalate` (the user decides); `None` until the brain says.
+    pub decision: Option<String>,
+    /// Why: the brain's reason, or the rule that made it escalate.
+    pub reason: String,
+    /// What the tower answered for the user, when it did.
+    pub answered_with: String,
 }
 
 // ---- reading the screen ----
@@ -976,6 +983,294 @@ pub fn brain_note(set: &QuestionSet) -> String {
     format!("[question] {} {} {}", set.session, set.id, serde_json::to_string(&body).unwrap_or_default())
 }
 
+// ---- questions asked in plain text, at the end of a turn ----
+
+/// The last thing the assistant wrote in a Claude Code transcript (JSONL).
+pub fn last_assistant_text(jsonl: &str) -> Option<String> {
+    let mut last: Option<String> = None;
+    for line in jsonl.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        match v["type"].as_str() {
+            Some("assistant") => {
+                for b in v["message"]["content"].as_array().into_iter().flatten() {
+                    if b["type"] == "text"
+                        && let Some(t) = b["text"].as_str().filter(|t| !t.trim().is_empty())
+                    {
+                        last = Some(t.to_string());
+                    }
+                }
+            }
+            Some("user") => {
+                let c = &v["message"]["content"];
+                if c.is_string() || c.as_array().is_some_and(|a| a.iter().any(|b| b["type"] == "text")) {
+                    last = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    last
+}
+
+/// The last message on a Claude Code or Codex screen, without the
+/// interface around it (the prompt box, the status lines, tool calls).
+pub fn message_from_screen(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.lines().map(|l| l.trim_end()).collect();
+    // Where the input box begins: the last rule, or Codex's prompt line.
+    let end = lines.iter().rposition(|l| is_rule(l) || l.trim_start().starts_with("› ")).unwrap_or(lines.len());
+    // The last message bullet above it (Claude ⏺, Codex •), skipping tool calls.
+    let start = (0..end).rev().find(|&i| {
+        let t = lines[i].trim_start();
+        (t.starts_with("⏺ ") || t.starts_with("• "))
+            && !t.contains('(')
+            && !["Running", "Ran ", "Read", "Edited", "Explored", "Called", "Bash", "Exited", "Worked"].iter().any(|w| t[t.char_indices().nth(2).map(|(k, _)| k).unwrap_or(0)..].starts_with(w))
+    })?;
+    let text: Vec<String> = lines[start..end]
+        .iter()
+        .map(|l| l.trim())
+        .take_while(|l| !l.starts_with('✻') && !l.starts_with("■") && !l.starts_with("─ Worked"))
+        .map(|l| l.trim_start_matches("⏺ ").trim_start_matches("• ").to_string())
+        .collect();
+    let t = text.join("\n").trim().to_string();
+    (!t.is_empty()).then_some(t)
+}
+
+/// Worth asking the brain: the message's end asks the user something.
+/// Cheap and generous; the brain decides.
+pub fn looks_like_question(message: &str) -> bool {
+    // A `?` in code or a link isn't a question.
+    let mut plain = String::new();
+    let mut in_code = false;
+    for part in message.split('`') {
+        if !in_code {
+            plain.push_str(part);
+        }
+        in_code = !in_code;
+    }
+    let plain: String = plain.split_whitespace().filter(|w| !w.contains("://") && !w.starts_with("](")).collect::<Vec<_>>().join(" ");
+    let plain = plain.replace("](", " ");
+    let chars: Vec<char> = plain.trim().chars().collect();
+    let tail: String = chars[chars.len().saturating_sub(600)..].iter().collect();
+    let end: String = chars[chars.len().saturating_sub(300)..].iter().collect();
+    let lower = tail.to_lowercase();
+    let phrases = [
+        "want me to", "should i ", "shall i ", "would you like", "do you want", "which do you prefer", "which one", "which would you",
+        "let me know", "your call", "or should i", "do you prefer", "ok to ", "okay to ", "go ahead and", "should we", "any preference",
+        "möchtest du", "soll ich", "willst du", "sollen wir", "lass mich wissen", "welche", "wie möchtest",
+    ];
+    if end.contains('?') || phrases.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+    // Options laid out for a choice: "1. …", "2. …" or "a) …", "b) …" near the end, with a question word.
+    let listed = tail.lines().filter(|l| {
+        let t = l.trim_start();
+        let b = t.as_bytes();
+        b.len() > 3 && ((b[0].is_ascii_digit() && (b[1] == b'.' || b[1] == b')')) || (b[0].is_ascii_lowercase() && b[1] == b')'))
+    });
+    listed.count() >= 2 && ["option", "choose", "pick", "prefer", "which"].iter().any(|w| lower.contains(w))
+}
+
+/// The question it seems to ask, until the brain says: the last sentence with a `?`.
+fn last_question(message: &str) -> String {
+    let flat = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some(q) = flat.rfind('?') else { return flat.chars().rev().take(160).collect::<Vec<_>>().into_iter().rev().collect() };
+    let before = &flat[..q];
+    let start = before.rfind(['.', '!', '\n', ':']).map(|i| i + 1).unwrap_or(0);
+    flat[start..=q].trim().to_string()
+}
+
+/// A question set for a message that ends asking something (kind `text`).
+pub fn text_set(session: &str, name: &str, message: &str, context: &str) -> QuestionSet {
+    let tail: String = {
+        let c: Vec<char> = message.trim().chars().collect();
+        c[c.len().saturating_sub(1500)..].iter().collect()
+    };
+    let tab = Tab { title: "Reply".into(), question: last_question(&tail), allows_other: true, ..Default::default() };
+    let mut q = QuestionSet {
+        session: session.into(),
+        name: name.into(),
+        kind: "text".into(),
+        title: tab.question.clone(),
+        detail: tail,
+        context: context.into(),
+        tabs: vec![tab],
+        submit_state: "single".into(),
+        status: "open".into(),
+        ..Default::default()
+    };
+    q.id = id_of(session, "text", &[], &q.detail);
+    q
+}
+
+/// The one-line message the brain gets for a message that may ask the user something.
+pub fn text_note(set: &QuestionSet) -> String {
+    let body = json!({ "id": set.id, "session": set.session, "name": set.name, "asked": set.context, "message": set.detail });
+    format!("[question-text] {} {} {}", set.session, set.id, serde_json::to_string(&body).unwrap_or_default())
+}
+
+/// The brain's reading of a text question set: the questions it asks (each
+/// with three recommended replies). `[{"question": "...", "options": [{label, why, choice}]}]`
+/// (or `{"tabs": [...]}`); `choice` is `{"other": "<the reply>"}`.
+pub fn text_recs(v: &Value) -> Result<(Vec<Tab>, Vec<TabRecs>)> {
+    let list = v.get("tabs").or_else(|| v.get("questions")).unwrap_or(v).as_array().cloned().unwrap_or_default();
+    if list.is_empty() {
+        bail!("give the questions it asks (or --none when it asks nothing)");
+    }
+    let mut tabs = vec![];
+    let mut recs = vec![];
+    for (i, q) in list.iter().enumerate() {
+        let question = q["question"].as_str().unwrap_or("").trim().to_string();
+        if question.is_empty() {
+            bail!("question {}: its text is missing", i + 1);
+        }
+        let tab = Tab { title: q["title"].as_str().map(String::from).unwrap_or_else(|| format!("Question {}", i + 1)), question, allows_other: true, ..Default::default() };
+        let mut kept = vec![];
+        for o in q["options"].as_array().into_iter().flatten().take(3) {
+            let r: Rec = serde_json::from_value(o.clone())?;
+            let reply = r.choice.get("other").and_then(Value::as_str).or_else(|| r.choice.as_str()).unwrap_or("").trim().to_string();
+            if r.label.trim().is_empty() || reply.is_empty() {
+                bail!("question {}: each recommendation needs a label and the reply as {{\"other\": \"text\"}}", i + 1);
+            }
+            kept.push(Rec { choice: json!({ "other": reply }), ..r });
+        }
+        recs.push(TabRecs { tab: i, options: kept });
+        tabs.push(tab);
+    }
+    Ok((tabs, recs))
+}
+
+/// One reply to a text question set: each question's answer (numbered when
+/// there are several), files attached as the panel does.
+pub fn compose_reply(set: &QuestionSet, answers: &[Answer]) -> Result<String> {
+    if answers.is_empty() {
+        bail!("no answer");
+    }
+    let mut parts: Vec<(usize, String)> = vec![];
+    let mut files: Vec<String> = vec![];
+    for a in answers {
+        let Some(tab) = set.tabs.get(a.tab) else { bail!("there is no question {}", a.tab) };
+        let text = match &a.choice {
+            Value::String(s) => s.clone(),
+            Value::Object(o) => {
+                let mut v: Vec<String> = o.get("options").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_u64).filter_map(|i| tab.options.get(i as usize).map(|x| x.label.clone())).collect();
+                if let Some(t) = o.get("other").or_else(|| o.get("spoken")).and_then(Value::as_str) {
+                    v.push(t.to_string());
+                }
+                v.join("; ")
+            }
+            Value::Number(i) => tab.options.get(i.as_u64().unwrap_or(u64::MAX) as usize).map(|o| o.label.clone()).unwrap_or_default(),
+            _ => String::new(),
+        };
+        if text.trim().is_empty() && a.attachments.is_empty() {
+            bail!("question {}: no answer", a.tab + 1);
+        }
+        parts.push((a.tab, text.trim().to_string()));
+        files.extend(a.attachments.iter().cloned());
+    }
+    parts.sort_by_key(|(t, _)| *t);
+    let body = if set.tabs.len() > 1 || parts.len() > 1 {
+        parts.iter().map(|(t, text)| format!("{}. {text}", t + 1)).collect::<Vec<_>>().join("\n")
+    } else {
+        parts[0].1.clone()
+    };
+    if files.is_empty() {
+        return Ok(body);
+    }
+    let markers: Vec<String> = files
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let name = std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            crate::daemon::lan::marker(crate::daemon::lan::file_kind(&name, None, &[]), i + 1, &name)
+        })
+        .collect();
+    // As the panel attaches them, keeping the reply's lines (it is typed into the session as it is).
+    Ok(format!("{} [attached: {}]", crate::daemon::lan::with_markers(&body, &markers), files.join(" | ")))
+}
+
+// ---- the 90/10 rule: what the user must decide ----
+
+/// Why a question set must go to the user whatever the brain says: it
+/// deploys or releases, pushes or merges to a shared branch, deletes or
+/// overwrites, touches infrastructure, secrets or money. None: the brain may
+/// answer it itself if it's routine.
+pub fn must_escalate(set: &QuestionSet) -> Option<&'static str> {
+    let mut text = format!("{}\n{}\n{}", set.title, set.detail, set.context);
+    for t in &set.tabs {
+        text.push('\n');
+        text.push_str(&t.question);
+        for o in &t.options {
+            text.push('\n');
+            text.push_str(&o.label);
+            text.push(' ');
+            text.push_str(&o.description);
+        }
+    }
+    let raw = text.to_lowercase();
+    let words = format!(" {} ", norm(&text));
+    let word = |w: &str| words.contains(&format!(" {w} "));
+    let any = |ws: &[&str]| ws.iter().any(|w| word(w));
+    let raw_any = |ps: &[&str]| ps.iter().any(|p| raw.contains(p));
+    // A Yes/No about one of these is the same as doing it.
+    if any(&["deploy", "deploys", "deploying", "deployment", "redeploy", "production", "prod", "go live", "rollout", "publish", "publishing"])
+        || (any(&["release", "releasing"]) && !raw.contains("release notes"))
+    {
+        return Some("it deploys or releases");
+    }
+    if raw_any(&["git push", "push to", "push the", "push origin", "force push", "--force", "merge into main", "merge to main", "into main", "into master", "merge into prod", "into prod"]) {
+        return Some("it pushes or merges to a shared branch");
+    }
+    if any(&["delete", "deletes", "deleting", "remove the branch", "drop", "truncate", "overwrite", "overwrites", "wipe", "destroy", "purge", "irreversible"])
+        || raw_any(&["rm -rf", "rm -r ", "reset --hard", "drop table", "drop database", "branch -d", "branch -d "])
+    {
+        return Some("it deletes or overwrites");
+    }
+    if any(&["aws", "s3", "ec2", "terraform", "kubernetes", "kubectl", "dns", "cloudflare", "infrastructure", "servers", "firewall", "iam"]) {
+        return Some("it touches infrastructure");
+    }
+    if any(&["secret", "secrets", "credential", "credentials", "password", "passwords", "api key", "private key", "token", "tokens"]) || raw.contains(".env") {
+        return Some("it involves secrets or credentials");
+    }
+    if any(&["billing", "payment", "payments", "subscription", "pricing", "purchase", "paid", "credit card", "invoice", "charge"]) {
+        return Some("it spends money");
+    }
+    None
+}
+
+/// The decision that holds: the user's policy first, then the rule, then the brain.
+/// `policy`: `normal`, `keep-moving` or `ask-everything`.
+pub fn decide(set: &QuestionSet, brain: Option<&str>, brain_reason: &str, policy: &str) -> (String, String) {
+    if policy == "ask-everything" {
+        return ("escalate".into(), "you asked to decide everything yourself".into());
+    }
+    if let Some(why) = must_escalate(set) {
+        return ("escalate".into(), why.into());
+    }
+    match brain {
+        Some("auto") => ("auto".into(), brain_reason.to_string()),
+        _ => ("escalate".into(), if brain_reason.is_empty() { "it needs your call".into() } else { brain_reason.to_string() }),
+    }
+}
+
+/// The answers the tower gives by itself: recommendation 1 for every question.
+pub fn first_picks(set: &QuestionSet) -> Option<Vec<Answer>> {
+    let recs = set.recommendations.as_ref()?;
+    (0..set.tabs.len())
+        .map(|t| recs.iter().find(|r| r.tab == t).and_then(|r| r.options.first()).map(|o| Answer { tab: t, choice: o.choice.clone(), attachments: vec![] }))
+        .collect()
+}
+
+/// "Which database? -> SQLite; Which features? -> Auth": what was picked, in a line.
+pub fn picked_line(set: &QuestionSet) -> String {
+    let Some(recs) = &set.recommendations else { return String::new() };
+    set.tabs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| recs.iter().find(|r| r.tab == i).and_then(|r| r.options.first()).map(|o| format!("{} -> {}", t.question, o.label)))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1367,5 +1662,133 @@ mod tests {
         other.tabs[0].question = "Something else?".into();
         let mut sim = Sim::new();
         assert!(drive(&mut sim, &other, &[Answer { tab: 0, choice: json!(0), attachments: vec![] }], true).is_err());
+    }
+
+    #[test]
+    fn plain_text_questions() {
+        let real = [
+            "I added the filter and the tests pass. Want me to also open the PR into dev, or wait until you've looked at it?",
+            "Done. The import works for both formats.\n\nTwo ways to handle the old files:\n1. Convert them on read\n2. Migrate them once with a script\n\nWhich do you prefer?",
+            "Ich habe die Seite umgebaut. Soll ich das gleich deployen?",
+            "The build is green. Let me know if you want the changelog updated too.",
+        ];
+        for m in real {
+            assert!(looks_like_question(m), "{m}");
+        }
+        let not = [
+            "All 40 tests pass and the PR is merged into dev. The deploy finished in 3 minutes.",
+            "Fixed the redirect loop: the cookie domain was wrong. Verified in the browser.",
+            "Q: why did it fail? A: the token expired. Renewed it, everything works now and the job is done. Nothing else is pending on my side, and the release notes are written in the docs folder as usual for this project.",
+        ];
+        for m in &not[..2] {
+            assert!(!looks_like_question(m), "{m}");
+        }
+        let set = text_set("t22", "eyzflow", real[0], "add the filter");
+        assert_eq!(set.kind, "text");
+        assert_eq!(set.tabs[0].question, "Want me to also open the PR into dev, or wait until you've looked at it?");
+        assert!(set.tabs[0].allows_other);
+        assert!(text_note(&set).starts_with(&format!("[question-text] t22 {} {{", set.id)));
+    }
+
+    #[test]
+    fn real_finished_messages() {
+        let list: Vec<Value> = serde_json::from_str(&fixture("finished-messages.json")).unwrap();
+        for m in list {
+            let text = m["text"].as_str().unwrap();
+            assert_eq!(looks_like_question(text), m["asks"].as_bool().unwrap(), "{text}");
+        }
+    }
+
+    #[test]
+    fn messages_from_screens_and_transcripts() {
+        let screen = "❯ do it\n⏺ Bash(npm test)\n  ⎿  ok\n⏺ The tests pass.\n  Want me to open the PR?\n✻ Worked for 9s\n──────────\n❯ \n──────────\n";
+        assert_eq!(message_from_screen(screen).as_deref(), Some("The tests pass.\nWant me to open the PR?"));
+        let codex = "› fix it\n• Ran cargo test\n• Fixed. Should I also update the docs?\n\n› Ask Codex to do anything\n";
+        assert_eq!(message_from_screen(codex).as_deref(), Some("Fixed. Should I also update the docs?"));
+        let jsonl = r#"{"type":"user","message":{"content":"go"}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Working on it."}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Done. Deploy now?"}]}}"#;
+        assert_eq!(last_assistant_text(jsonl).as_deref(), Some("Done. Deploy now?"));
+    }
+
+    #[test]
+    fn the_brain_reads_text_questions_and_one_reply_goes_back() {
+        let set = text_set("t22", "eyzflow", "Done. Want me to open the PR? And should I tag a release?", "");
+        let v = json!([
+            {"question": "Open the PR?", "options": [
+                {"label": "Yes, into dev", "why": "the tests pass", "choice": {"other": "Yes, open the PR into dev."}},
+                {"label": "Not yet", "why": "I want to look first", "choice": {"other": "Not yet, I'll review first."}},
+                {"label": "Into main", "why": "it's a hotfix", "choice": {"other": "Open it into main."}}]},
+            {"question": "Tag a release?", "options": [{"label": "No", "why": "nothing user-facing", "choice": {"other": "No release."}}]}
+        ]);
+        let (tabs, recs) = text_recs(&v).unwrap();
+        assert_eq!((tabs.len(), recs[0].options.len(), tabs[1].question.as_str()), (2, 3, "Tag a release?"));
+        assert!(text_recs(&json!([{"question": "x", "options": [{"label": "a", "why": "", "choice": 1}]}])).is_err(), "text replies are text");
+        let mut set = set;
+        set.tabs = tabs;
+        let reply = compose_reply(&set, &[
+            Answer { tab: 1, choice: json!({"other": "No release."}), attachments: vec![] },
+            Answer { tab: 0, choice: json!({"other": "Yes, open the PR into dev."}), attachments: vec!["/a/attachments/1-phone/1-shot.png".into()] },
+        ]).unwrap();
+        assert_eq!(reply, "[Image #1] 1. Yes, open the PR into dev.\n2. No release. [attached: /a/attachments/1-phone/1-shot.png]");
+        let one = text_set("t3", "x", "Deploy now?", "");
+        assert_eq!(compose_reply(&one, &[Answer { tab: 0, choice: json!("Yes, deploy."), attachments: vec![] }]).unwrap(), "Yes, deploy.");
+        assert!(compose_reply(&one, &[]).is_err());
+    }
+
+    fn q(title: &str, question: &str, options: &[&str]) -> QuestionSet {
+        QuestionSet {
+            title: title.into(),
+            tabs: vec![Tab { question: question.into(), options: options.iter().map(|o| Opt { label: o.to_string(), ..Default::default() }).collect(), ..Default::default() }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_90_10_rule() {
+        // Must go to the user.
+        for (set, why) in [
+            (q("", "Should I deploy the dashboard to production now?", &["Yes", "No"]), "it deploys or releases"),
+            (q("Allow Bash: git push origin main?", "Do you want to proceed?", &["Yes", "No"]), "it pushes or merges to a shared branch"),
+            (q("", "Want me to merge this into main?", &[]), "it pushes or merges to a shared branch"),
+            (q("Allow Bash: rm -rf build/ dist/?", "Do you want to proceed?", &["Yes", "No"]), "it deletes or overwrites"),
+            (q("", "Should I delete the old migration files?", &[]), "it deletes or overwrites"),
+            (q("", "Which AWS region for the new bucket?", &["eu-central-1", "us-east-1"]), "it touches infrastructure"),
+            (q("", "Should I put the API key in .env and commit it?", &[]), "it involves secrets or credentials"),
+            (q("", "Enable the paid plan for more build minutes?", &[]), "it spends money"),
+        ] {
+            assert_eq!(must_escalate(&set), Some(why), "{}", set.tabs[0].question);
+            assert_eq!(decide(&set, Some("auto"), "routine", "normal").0, "escalate", "the rule wins over the brain");
+        }
+        // Routine: the brain may answer.
+        for set in [
+            q("", "Which test runner should I use?", &["Vitest", "Jest"]),
+            q("Allow Bash: npm test?", "Do you want to proceed?", &["Yes", "No"]),
+            q("", "Want me to run the linter and fix the warnings?", &[]),
+            q("", "Should I name it useCaseFilters or useFilters?", &[]),
+            q("", "Want me to add the release notes to CHANGELOG.md?", &[]),
+            q("", "Should I commit this locally?", &[]),
+        ] {
+            assert_eq!(must_escalate(&set), None, "{}", set.tabs[0].question);
+            assert_eq!(decide(&set, Some("auto"), "routine choice", "normal"), ("auto".into(), "routine choice".into()));
+            assert_eq!(decide(&set, Some("escalate"), "", "normal").0, "escalate", "the brain may still ask");
+            assert_eq!(decide(&set, None, "", "normal").0, "escalate", "no word from the brain: ask");
+            assert_eq!(decide(&set, Some("auto"), "routine", "ask-everything").0, "escalate", "the user's toggle wins");
+        }
+    }
+
+    #[test]
+    fn recommendation_one_is_the_default_pick() {
+        let mut set = q("", "Which test runner?", &["Vitest", "Jest"]);
+        assert!(first_picks(&set).is_none(), "nothing recommended yet");
+        set.recommendations = Some(vec![TabRecs {
+            tab: 0,
+            options: vec![Rec { label: "Vitest".into(), why: "fast".into(), choice: json!(0) }, Rec { label: "Jest".into(), why: "".into(), choice: json!(1) }],
+        }]);
+        let picks = first_picks(&set).unwrap();
+        assert_eq!((picks.len(), picks[0].choice.clone()), (1, json!(0)));
+        assert_eq!(picked_line(&set), "Which test runner? -> Vitest");
     }
 }

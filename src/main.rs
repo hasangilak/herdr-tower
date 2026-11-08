@@ -160,13 +160,29 @@ enum Cmd {
         #[arg(long, hide = true)]
         here: bool,
     },
-    /// The tower's brain: three recommended answers per tab for a question set.
+    /// The tower's brain: three recommended answers per question, and whether
+    /// to answer it itself (`--decision auto`) or ask the user (`escalate`).
     Recommend {
         id: String,
-        /// `[{"tab":0,"options":[{"label":"…","why":"…","choice":1}, …]}, …]`
-        #[arg(long)]
+        /// `[{"tab":0,"options":[{"label":"…","why":"…","choice":1}, …]}, …]`; for a
+        /// text question also each tab's `"question"`.
+        #[arg(long, default_value = "")]
         json: String,
+        /// `auto` (routine: the tower answers with recommendation 1) or `escalate` (the user decides).
+        #[arg(long)]
+        decision: Option<String>,
+        /// Why, in a few words.
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// A finished message that asks the user nothing after all.
+        #[arg(long)]
+        none: bool,
     },
+    /// Dismiss a question set (it shows no more).
+    Dismiss { id: String },
+    /// How session questions are handled: normal (the tower answers routine
+    /// ones, the user decides the rest), keep-moving, or ask-everything.
+    Policy { policy: Option<String> },
     /// Speak text.
     Say {
         text: Vec<String>,
@@ -379,13 +395,49 @@ fn run(cli: Cli) -> Result<()> {
             println!("Answered{}.", if no_submit { " (filled in, not sent)" } else { "" });
             Ok(())
         }
-        Cmd::Recommend { id, json } => {
-            let recs: Value = serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("--json: {e}"))?;
-            let r = protocol::send(&Request::Recommend { id: id.clone(), recs })?;
+        Cmd::Recommend { id, json, decision, reason, none } => {
+            let recs: Value = if none || json.trim().is_empty() { Value::Null } else { serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("--json: {e}"))? };
+            if !none && recs.is_null() {
+                bail!("give --json with the recommendations, or --none");
+            }
+            if let Some(d) = &decision
+                && d != "auto"
+                && d != "escalate"
+            {
+                bail!("--decision is auto or escalate");
+            }
+            let r = protocol::send(&Request::Recommend { id: id.clone(), recs, decision, reason, none })?;
             if !r.ok {
                 bail!("{}", r.error.unwrap_or_default());
             }
-            println!("Recommendations for {id} are in.");
+            let v = r.state.unwrap_or_default();
+            match (none, v["decision"].as_str()) {
+                (true, _) => println!("{id}: closed, it asks nothing."),
+                (_, Some("auto")) => println!("{id}: answering it for the user ({}).", v["reason"].as_str().unwrap_or("")),
+                (_, d) => println!("{id}: for the user to decide ({}).", if d.is_some() { v["reason"].as_str().unwrap_or("") } else { "" }),
+            }
+            Ok(())
+        }
+        Cmd::Dismiss { id } => {
+            let r = protocol::send(&Request::Dismiss { id: id.clone() })?;
+            if !r.ok {
+                bail!("{}", r.error.unwrap_or_default());
+            }
+            println!("Dismissed {id}.");
+            Ok(())
+        }
+        Cmd::Policy { policy } => {
+            let Some(p) = policy else {
+                let now = protocol::send(&Request::Status).ok().and_then(|r| r.state).and_then(|s| s["question_policy"].as_str().map(String::from));
+                println!("{}", now.unwrap_or_else(|| config::Config::load().map(|c| c.question_policy).unwrap_or_else(|_| "normal".into())));
+                return Ok(());
+            };
+            if !["normal", "keep-moving", "ask-everything"].contains(&p.as_str()) {
+                bail!("tower policy normal|keep-moving|ask-everything");
+            }
+            phone::set_question_policy(&p)?;
+            let _ = protocol::send(&Request::Policy { policy: p.clone() });
+            println!("Questions: {p}.");
             Ok(())
         }
         Cmd::Screenshot { images, session, caption } => screenshots::cmd(&images, session, caption),

@@ -165,6 +165,8 @@ pub fn start(shared: Shared, mouth: Mouth, alerts: Alerts, watches: Watches, ask
     let radar = Radar { shared, mouth, alerts, watches: watches.clone(), asks, seen: Arc::new(Mutex::new(HashMap::new())) };
     let _ = watches.radar.set(radar.clone());
     let r = radar.clone();
+    radar.asks.set_notify(move |address, text| r.announce(address, text));
+    let r = radar.clone();
     thread::Builder::new().name("reconcile".into()).spawn(move || r.reconcile(before)).ok();
     let r = radar.clone();
     thread::Builder::new()
@@ -337,16 +339,23 @@ impl Radar {
         }
         // What it asks, as a question set (this machine's sessions).
         if machine.is_none() {
-            self.asks.seen(&address, t, live && status == "blocked");
+            self.asks.seen(&address, t, if live { status.as_str() } else { "" });
         }
         let was = before.as_ref().map(|b| b.status.as_str()).unwrap_or("");
         if was == status {
             return;
         }
         let stopped_working = was == "working" && status != "working";
+        // A turn ended: its last message may ask the user something.
+        if stopped_working && matches!(status.as_str(), "idle" | "done") {
+            self.asks.finished(&address, t);
+        }
+        // Blocked on a dialog this machine can read: the questions go through
+        // the brain (answered for the user, or told to them), not a plain notice.
+        let handled = machine.is_none() && status == "blocked" && matches!(t["status"]["kind"].as_str(), Some("question" | "permission"));
 
         // The brain asked to hear when this one stops.
-        if (stopped_working || status == "blocked" || !live) && self.watches.watched(&address) {
+        if (stopped_working || (status == "blocked" && !handled) || !live) && self.watches.watched(&address) {
             let status = if live { status.clone() } else { "exited".into() };
             self.fire_watch(&address, &name, space.clone(), &status, "");
             return;
@@ -357,7 +366,7 @@ impl Radar {
         // What it asks, in a sentence (or just that it needs you).
         let notice = super::asks::blocked_notice(&name, &t["status"]);
         let news = match status.as_str() {
-            "blocked" if self.alerts.blocked => Some(notice.clone()),
+            "blocked" if self.alerts.blocked && !handled => Some(notice.clone()),
             "done" | "idle" if stopped_working && self.alerts.done => Some(format!("{name} finished")),
             "error" => Some(format!("{name} hit an error")),
             _ => None,
@@ -367,7 +376,7 @@ impl Radar {
         {
             return;
         }
-        if status == "blocked" && self.alerts.blocked {
+        if status == "blocked" && self.alerts.blocked && !handled {
             self.shared.alert(&address, &notice, "blocked");
             self.mouth.alert(format!("{notice}."), Some((address.as_str(), status.as_str())));
         } else if stopped_working && (status == "done" || status == "idle") && self.alerts.done {
@@ -378,6 +387,19 @@ impl Radar {
             if self.alerts.blocked {
                 self.mouth.alert(format!("{name} hit an error."), Some((address.as_str(), status.as_str())));
             }
+        }
+    }
+
+    /// A question a session asks, told to the user (`asks`): as a blocked
+    /// session's notice, held for another space in focus as usual.
+    fn announce(&self, address: &str, text: &str) {
+        let (name, space) = self.seen.lock().unwrap().get(address).map(|s| (s.name.clone(), s.space.clone())).unwrap_or_else(|| (address.to_string(), None));
+        if self.held(address, &name, space.as_deref(), text, "blocked", "alert") {
+            return;
+        }
+        self.shared.alert(address, text, "blocked");
+        if self.alerts.blocked {
+            self.mouth.alert(text.to_string(), None);
         }
     }
 
@@ -480,7 +502,7 @@ impl Radar {
     }
 
     fn gone(&self, address: &str) {
-        self.asks.seen(address, &Value::Null, false);
+        self.asks.seen(address, &Value::Null, "");
         let removed = self.seen.lock().unwrap().remove(address);
         if (address == brain::NAME || removed.as_ref().is_some_and(|_| hc::get(brain::NAME).is_none()))
             && hc::get(brain::NAME).filter(|t| t["state"] == "live").is_none()

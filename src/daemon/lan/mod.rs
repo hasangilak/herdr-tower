@@ -313,6 +313,25 @@ impl Lan {
                 None => Response::error(404, "no_question", "no open question set with that id"),
             },
             ("POST", ["questions", id, "answer"]) => return Some(self.answer_questions(req, id)),
+            ("DELETE", ["questions", id]) => match self.ctx.asks.dismiss(id) {
+                Ok(()) => Response::json(200, &json!({ "dismissed": id })),
+                Err(_) => Response::error(404, "no_question", "no open question set with that id"),
+            },
+            // How questions are handled: normal (90/10), keep-moving, ask-everything.
+            ("GET", ["questions-policy"]) => Response::json(200, &json!({ "policy": self.ctx.asks.policy() })),
+            ("PUT", ["questions-policy"]) => {
+                let p = req.json().unwrap_or_default()["policy"].as_str().unwrap_or("").to_string();
+                if !["normal", "keep-moving", "ask-everything"].contains(&p.as_str()) {
+                    return Some(Response::error(400, "bad_policy", "policy is normal, keep-moving or ask-everything"));
+                }
+                match crate::phone::set_question_policy(&p) {
+                    Ok(()) => {
+                        self.ctx.asks.set_policy(&p);
+                        Response::json(200, &json!({ "policy": p }))
+                    }
+                    Err(e) => Response::error(503, "save", &format!("{e:#}")),
+                }
+            }
             // A spoken answer for a tab: text (from /v1/transcribe), or a WAV take.
             ("POST", ["questions", id, "interpret"]) => {
                 let Some(set) = self.ctx.asks.get(id) else { return Some(Response::error(404, "no_question", "no open question set with that id")) };
@@ -1084,7 +1103,7 @@ mod tests {
         let hub = Arc::new(Hub::default());
         let (stt, _rx) = std::sync::mpsc::channel();
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
-        let asks = super::super::asks::Asks::new(shared.clone(), hub.clone());
+        let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
         let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
         let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false }).unwrap();
@@ -1182,7 +1201,7 @@ mod tests {
         let hub = Arc::new(Hub::default());
         let (stt, _rx) = std::sync::mpsc::channel();
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
-        let asks = super::super::asks::Asks::new(shared.clone(), hub.clone());
+        let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
         let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub: hub.clone(), ack: None, stt, asks };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
         let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false }).unwrap();

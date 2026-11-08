@@ -51,7 +51,7 @@ pub fn run() -> Result<()> {
     let model_name = cfg.whisper_model.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let shared = Shared::new(State::new(&cfg.mode, &cfg.voice, &model_name));
     let hub = std::sync::Arc::new(lan::hub::Hub::default());
-    let asks = asks::Asks::new(shared.clone(), hub.clone());
+    let asks = asks::Asks::new(shared.clone(), hub.clone(), &cfg.question_policy);
     eprintln!("[tower] loading Kokoro ({}) ...", cfg.voice);
     let mouth = tts::start(
         tts::Settings {
@@ -199,8 +199,20 @@ impl Daemon {
                     Err(e) => Response::err(format!("{e:#}")),
                 };
             }
-            Request::Recommend { id, recs } => {
-                return match self.asks.recommend(&id, &recs) {
+            Request::Dismiss { id } => {
+                return match self.asks.dismiss(&id) {
+                    Ok(()) => Response { ok: true, error: None, state: None },
+                    Err(e) => Response::err(format!("{e:#}")),
+                };
+            }
+            Request::Policy { policy } => {
+                if !["normal", "keep-moving", "ask-everything"].contains(&policy.as_str()) {
+                    return Response::err("policy is normal, keep-moving or ask-everything");
+                }
+                self.asks.set_policy(&policy);
+            }
+            Request::Recommend { id, recs, decision, reason, none } => {
+                return match self.asks.recommend(&id, &recs, decision.as_deref(), &reason, none) {
                     Ok(set) => Response { ok: true, error: None, state: Some(serde_json::to_value(set).unwrap_or_default()) },
                     Err(e) => Response::err(format!("{e:#}")),
                 };

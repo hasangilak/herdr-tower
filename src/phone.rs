@@ -189,6 +189,42 @@ pub fn ago(ms: u64) -> String {
     }
 }
 
+/// Saves how questions are handled (`question_policy` in config.toml).
+pub fn set_question_policy(policy: &str) -> Result<()> {
+    config::Config::write_default_if_missing()?;
+    let path = config::config_file();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    std::fs::write(&path, with_top_level(&text, "question_policy", &format!("\"{policy}\"")))?;
+    Ok(())
+}
+
+/// Sets a top-level `key = value` (before any `[section]`), keeping the rest.
+pub fn with_top_level(text: &str, key: &str, value: &str) -> String {
+    let line = format!("{key} = {value}");
+    let mut out: Vec<String> = vec![];
+    let mut done = false;
+    let mut in_table = false;
+    for l in text.lines() {
+        let t = l.trim();
+        if t.starts_with('[') {
+            if !done {
+                out.push(line.clone());
+                done = true;
+            }
+            in_table = true;
+        } else if !in_table && !done && t.split('=').next().map(str::trim) == Some(key) {
+            out.push(line.clone());
+            done = true;
+            continue;
+        }
+        out.push(l.to_string());
+    }
+    if !done {
+        out.push(line);
+    }
+    out.join("\n") + "\n"
+}
+
 /// Sets `[lan] enabled` in config.toml, keeping the rest of the file as it is.
 fn set_enabled(on: bool) -> Result<()> {
     config::Config::write_default_if_missing()?;
@@ -235,6 +271,16 @@ pub fn with_enabled(text: &str, on: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::with_enabled;
+
+    #[test]
+    fn top_level_keys_stay_above_the_tables() {
+        use super::with_top_level;
+        assert_eq!(with_top_level("voice = \"x\"\n[lan]\nenabled = true\n", "question_policy", "\"keep-moving\""), "voice = \"x\"\nquestion_policy = \"keep-moving\"\n[lan]\nenabled = true\n");
+        assert_eq!(with_top_level("question_policy = \"normal\"\n[lan]\nquestion_policy = 1\n", "question_policy", "\"ask-everything\""), "question_policy = \"ask-everything\"\n[lan]\nquestion_policy = 1\n");
+        let t = with_top_level("", "question_policy", "\"normal\"");
+        let v: toml::Value = toml::from_str(&t).unwrap();
+        assert_eq!(v["question_policy"].as_str(), Some("normal"));
+    }
 
     #[test]
     fn edits_only_the_lan_switch() {

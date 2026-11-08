@@ -71,6 +71,9 @@ pub struct State {
     /// `{id, session, name, kind, title, detail, context, tabs, current_tab,
     /// submit_state, recommendations, status, error, exact, at_ms}`.
     pub questions: Vec<serde_json::Value>,
+    /// How questions are handled: `normal` (the 90/10 rule), `keep-moving`
+    /// (the brain answers more itself), `ask-everything` (never for the user).
+    pub question_policy: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -118,6 +121,7 @@ impl State {
             phone: None,
             screenshots: vec![],
             questions: vec![],
+            question_policy: "normal".into(),
         }
     }
 
