@@ -187,6 +187,27 @@ Every Claude session on this Mac carries its account: `tower agents`,
 account never changes, so it's looked up once per pid and kept in
 `~/.local/state/herder-tower/accounts.json`.
 
+### Questions: answered for you, or with a tap
+
+When a session asks something, the tower reads it as a **question set**:
+a blocked session's dialog (Claude Code's tabbed questions, a plan or
+permission prompt, a Codex approval) or a question at the end of a finished
+turn ("Want me to open the PR, or wait?"). The brain recommends three
+answers per question, the best first, and decides by the **90/10 rule**:
+routine questions (naming, which of two reasonable ways, proceed, run the
+tests, edits and commands inside the project, local commits) it answers
+itself, once, with its first recommendation, and the chat shows a quiet
+"answered for you: …" line; the rest (deploys, pushes and merges to shared
+branches, deleting, infrastructure, secrets, money, anything outside the
+project or surprising) come to you as a card, and you hear one sentence with
+what is asked and what the tower would pick. Deploys, pushes, deletes,
+infrastructure, secrets and money always come to you, whatever the brain
+thinks. Answer with a tap, your own words (typed or spoken, with files), and
+the tower types it into the session for you, checking the screen after every
+step and stopping on any surprise. `tower policy keep-moving` lets it answer
+more, `ask-everything` none, `normal` is the default. The design, and what
+has been tried live: [docs/questions.md](docs/questions.md).
+
 ### Behaviors
 
 How the tower works is a list of **behaviors** you can read and change:
@@ -243,11 +264,16 @@ background, the first time one is shown.
 pocket, over the local network. It mirrors the panel: chat with the tower,
 spaces and their sessions (with their Claude accounts), running and finished
 jobs, history, and the screenshots sessions send (a gallery and a full-size
-viewer). It acts like the panel: ask (typed or dictated, with pictures and
-files attached), approve or refuse what a blocked agent asks, focus a space,
-hush. And it can be **the tower's voice**: you talk into the phone, the Mac
-transcribes with its own Whisper, and the replies (and the "Okay.") play on
-the phone in the tower's Kokoro voice while the Mac stays silent.
+viewer), and the same chat thread as the Mac: what you send from either
+shows on both. It acts like the panel: ask (typed or dictated, with pictures
+and files attached), answer what sessions ask (the question cards and their
+recommendations), approve or refuse, focus a space, hush, bring a session on
+screen on the Mac, read and change the tower's behaviors. And it can be
+**the tower's voice**: you talk into the phone, the Mac transcribes with its
+own Whisper, and the replies (and the "Okay.") play on the phone in the
+tower's Kokoro voice. Each phone chooses where the replies to what *it*
+sends are heard (**Replies: Phone | Mac**): on the phone, with the Mac
+silent for them, or on the Mac.
 
 To connect it:
 
@@ -283,6 +309,8 @@ tower accounts                       # the Claude accounts (from cca)
 tower phone pair                     # pair the Android app (tower phone enable first)
 tower screenshot shot.png --caption "…"  # show a visual result in the panel and on the phone
 tower behavior list                  # how the tower works; add, edit, disable, remove, undo
+tower questions                      # what sessions ask now; tower answer <id> --json '[…]', tower dismiss <id>
+tower policy [normal|keep-moving|ask-everything]   # how much the tower answers for you
 tower start --name n --cwd d "task"  # a new Claude session on an account (--account), watched
 tower history [--jobs open|finished] [--session t3]   # what the tower has done (JSON when piped)
 tower job start|done|failed <t> "…"  # record a job (the brain does this)
@@ -347,3 +375,6 @@ for **Herdr Core**, because the voice runs in a Herdr terminal.
   Privacy & Security). Set `talk_key = "right_ctrl"` (or `off`) in
   config.toml if plain Control taps get in your way.
 - Other machines are polled every 15 s, so their alerts lag a little.
+- Questions: dialogs on other machines aren't read yet (their plain-text
+  questions are); a new Claude Code or Codex version may draw its dialogs
+  differently, and then the tower just doesn't offer them as cards.
