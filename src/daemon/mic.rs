@@ -139,6 +139,30 @@ struct Take {
     started: Instant,
     /// How long it was (samples) at its last partial transcription.
     partial_at: usize,
+    /// How long it was when the key was let go (or tapped to send): it
+    /// records a moment more, so the last word isn't clipped.
+    release_at: Option<usize>,
+}
+
+/// After the key is let go, the take keeps this much (the end of the last word).
+const RELEASE_TAIL: usize = RATE as usize * 3 / 10;
+/// At its length cap a take ends at the next breath this long, not mid-word.
+const BREATH_MS: u32 = 240;
+
+/// Whether a take ends with this frame. `held`: by holding the key (it lasts
+/// until let go); `silence_ms`: quiet so far; `frames`: its length; `cap`: its
+/// length cap in frames (soft: it waits for a breath, up to twice that);
+/// `pause_ms`: the pause that ends a tapped take; `len`/`release_at`: samples
+/// now and when the key was let go.
+#[allow(clippy::too_many_arguments)]
+fn take_over(held: bool, heard_speech: bool, silence_ms: u32, frames: u32, cap: u32, pause_ms: u32, len: usize, release_at: Option<usize>) -> bool {
+    if let Some(r) = release_at {
+        return len >= r + RELEASE_TAIL;
+    }
+    if !held && heard_speech && silence_ms >= pause_ms {
+        return true;
+    }
+    frames >= cap && (silence_ms >= BREATH_MS || frames >= cap.saturating_mul(2))
 }
 
 struct Mic {
@@ -238,6 +262,7 @@ impl Mic {
                 silence_run: 0,
                 started: Instant::now(),
                 partial_at: 0,
+                release_at: None,
             });
             self.mouth.chime(true);
             self.shared.update(|s| {
@@ -250,7 +275,12 @@ impl Mic {
                 t.held = true;
             }
         } else if !start && recording {
-            self.finish_take();
+            // Not cut at the key: the take ends a moment later (see `frame`).
+            if let Some(t) = self.take.as_mut()
+                && t.release_at.is_none()
+            {
+                t.release_at = Some(t.samples.len());
+            }
         }
     }
 
@@ -384,9 +414,18 @@ impl Mic {
             }
             // A held take ends when the key is let go; the cap is a safety net.
             let cap = if take.held { HELD_MAX_FRAMES } else { max_frames };
-            let long = take.samples.len() as u32 / FRAME as u32 >= cap;
-            let paused = !take.held && take.heard_speech && take.silence_run * FRAME_MS >= self.vad.ptt_silence_ms;
-            if long || paused {
+            let frames = take.samples.len() as u32 / FRAME as u32;
+            let over = take_over(
+                take.held,
+                take.heard_speech,
+                take.silence_run * FRAME_MS,
+                frames,
+                cap,
+                self.vad.ptt_silence_ms,
+                take.samples.len(),
+                take.release_at,
+            );
+            if over {
                 self.finish_take();
             } else if partial_due(take.samples.len(), take.partial_at, take.heard_speech, PARTIAL_BUSY.load(Ordering::SeqCst)) {
                 take.partial_at = take.samples.len();
@@ -514,6 +553,25 @@ mod tests {
         assert!(!partial_due(5 * s, s, true, true));
         // Past Whisper's window, the final text has to do.
         assert!(!partial_due(29 * s, 20 * s, true, false));
+    }
+
+    #[test]
+    fn a_take_is_never_cut_mid_word() {
+        let cap = 2000; // 60 s of 30 ms frames
+        // Let go: a moment more, then it ends.
+        assert!(!take_over(true, true, 0, 100, cap, 1400, 48_000, Some(48_000)));
+        assert!(!take_over(true, true, 0, 100, cap, 1400, 48_000 + RELEASE_TAIL - 1, Some(48_000)));
+        assert!(take_over(true, true, 0, 100, cap, 1400, 48_000 + RELEASE_TAIL, Some(48_000)));
+        // Held: a pause doesn't end it.
+        assert!(!take_over(true, true, 5000, 100, cap, 1400, 0, None));
+        // Tapped: the pause does.
+        assert!(take_over(false, true, 1400, 100, cap, 1400, 0, None));
+        assert!(!take_over(false, true, 1000, 100, cap, 1400, 0, None));
+        // At the cap, mid-speech: it goes on to the next breath...
+        assert!(!take_over(false, true, 0, cap, cap, 1400, 0, None));
+        assert!(take_over(false, true, BREATH_MS, cap + 10, cap, 1400, 0, None));
+        // ...but never past twice the cap.
+        assert!(take_over(false, true, 0, cap * 2, cap, 1400, 0, None));
     }
 
     #[test]
