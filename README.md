@@ -10,14 +10,26 @@ on every machine added with `hc machine add`. It answers out loud.
 
 <table>
   <tr>
-    <td align="center"><img src="docs/screenshots/chat.png" width="300" alt="Chat with the tower, a picture attached as [Image #1]"><br><sub>Chat: type or talk; attach files as tokens</sub></td>
-    <td align="center"><img src="docs/screenshots/work.png" width="300" alt="The working line: Delegating to web, 15s"><br><sub>The brain at work, from its own hooks</sub></td>
+    <td align="center"><img src="docs/screenshots/chat-shots.png" width="300" alt="The tower's reply with the screenshot a session sent shown under it"><br><sub>Chat: replies, with the screenshots sessions send</sub></td>
+    <td align="center"><img src="docs/screenshots/attachments.png" width="300" alt="An image and a PDF in the input as [Image #1] and [File #2: notes.pdf] tokens"><br><sub>Attach pictures and files as tokens</sub></td>
   </tr>
   <tr>
-    <td align="center"><img src="docs/screenshots/activity.png" width="300" alt="Activity: running and finished jobs by session"><br><sub>Activity: jobs running and done</sub></td>
+    <td align="center"><img src="docs/screenshots/accounts.png" width="300" alt="Activity: running jobs with each session's Claude account and its screenshots"><br><sub>Activity: jobs, their Claude accounts and screenshots</sub></td>
+    <td align="center"><img src="docs/screenshots/shots.png" width="300" alt="Activity, Shots: every screenshot with its caption, session and account"><br><sub>Shots: the gallery of visual results</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/screenshots/dictation.png" width="300" alt="Live dictation: what you say appears in the input as you talk"><br><sub>Dictation: your words appear as you talk</sub></td>
+    <td align="center"><img src="docs/screenshots/phone.png" width="300" alt="The Phone view: the phone API on and a pairing QR with its one-time code (blurred)"><br><sub>Phone: pair the Android app with a QR</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/screenshots/work.png" width="300" alt="The working line: Delegating to web, 15s"><br><sub>The brain at work, from its own hooks</sub></td>
     <td align="center"><img src="docs/screenshots/spaces.png" width="300" alt="Spaces: one focused, the others' news held"><br><sub>Spaces: focus one, hold the rest</sub></td>
   </tr>
 </table>
+
+<p align="center">
+  <img src="docs/screenshots/viewer.png" width="620" alt="A screenshot full size over the screen, with arrows to step through the others"><br><sub>Click a screenshot for the full-size viewer: fit or 100%, ← → through the rest, Esc to close</sub>
+</p>
 
 Everything that listens and speaks runs locally, in one Rust binary:
 
