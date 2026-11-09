@@ -37,6 +37,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::hc::SessionStatus;
 use crate::{config, hc};
 
 /// After a hand-over, the session gets this long to show it took it (its
@@ -405,7 +406,7 @@ impl Book {
 
     /// The session may take its next instruction now.
     fn may_send(&self, s: &Session, now: u64) -> bool {
-        if !ready(&s.status) {
+        if !s.status.ready() {
             return false;
         }
         match self.last_delivery(&s.address) {
@@ -449,23 +450,13 @@ impl Book {
         let moved = matches!((s.turn, d.turn_before), (Some(now), Some(before)) if now > before);
         let mut changed = moved && d.take();
         // Taken and ready again; or, with no turn count to go by, ready again.
-        if (moved || d.turn_before.is_none()) && ready(&s.status) {
+        if (moved || d.turn_before.is_none()) && s.status.ready() {
             changed |= d.finish();
         }
         changed
     }
 }
 
-/// A status that takes an instruction: the session is not working, and not
-/// waiting on a question.
-pub fn ready(status: &str) -> bool {
-    matches!(status, "idle" | "done")
-}
-
-/// A status an instruction can wait out (the session goes back to ready by itself).
-fn passing(status: &str) -> bool {
-    matches!(status, "working" | "blocked")
-}
 
 /// What `add` did.
 #[derive(Debug, Clone, PartialEq)]
@@ -563,7 +554,7 @@ impl SendQueue {
             Look::Gone => bail!("no session {session}"),
             Look::Unreachable(e) => bail!("can't reach {session} right now ({e}); try again in a moment"),
         };
-        if s.status.is_empty() {
+        if s.status == SessionStatus::Starting {
             bail!("{} ({}) runs no agent the tower can follow: use hc send for a plain program", s.address, s.name);
         }
         let now = crate::history::now_ms();
@@ -572,7 +563,7 @@ impl SendQueue {
             // A retry of what's already queued, or went in a moment ago: the same item.
             if let Some(i) = b.items.iter().find(|i| i.session == s.address && i.text == text) {
                 let position = b.items.iter().filter(|j| j.session == s.address && j.parked.is_none() && j.id <= i.id).count();
-                return Ok((Added::Queued { id: i.id, position, status: s.status.clone() }, s.address, s.name));
+                return Ok((Added::Queued { id: i.id, position, status: s.status.word().to_string() }, s.address, s.name));
             }
             if let Some(d) =
                 b.delivered.iter().rev().find(|d| d.session == s.address && d.text == text && now.saturating_sub(d.at_ms) < RETRY_MS)
@@ -601,7 +592,7 @@ impl SendQueue {
             return Ok((Added::Sent { id: item.id }, s.address, s.name));
         }
         let position = b.items.iter().filter(|j| j.session == s.address && j.parked.is_none() && j.id <= item.id).count();
-        Ok((Added::Queued { id: item.id, position: position.max(1), status: s.status }, s.address, s.name))
+        Ok((Added::Queued { id: item.id, position: position.max(1), status: s.status.word().to_string() }, s.address, s.name))
     }
 
     /// A session started with its first task (`tower start` from a
@@ -960,9 +951,9 @@ impl SendQueue {
                         changed = true;
                     }
                     // Nothing goes into this status; the brain hears it once.
-                    if !s.status.is_empty() && !ready(&s.status) && !passing(&s.status) && b.waiting_for(session) > 0 {
-                        if b.stuck.get(session) != Some(&s.status) {
-                            b.stuck.insert(session.to_string(), s.status.clone());
+                    if s.status != SessionStatus::Starting && !s.status.ready() && !s.status.passing() && b.waiting_for(session) > 0 {
+                        if b.stuck.get(session).map(String::as_str) != Some(s.status.word()) {
+                            b.stuck.insert(session.to_string(), s.status.word().to_string());
                             let n = b.waiting_for(session);
                             h.tell(Note {
                                 session: session.into(),
@@ -1155,7 +1146,7 @@ impl SendQueue {
 pub struct Session {
     pub address: String,
     pub name: String,
-    pub status: String,
+    pub status: SessionStatus,
     pub created_ms: Option<u64>,
     pub turn: Option<u64>,
 }
@@ -1269,7 +1260,7 @@ fn session_of(t: &Value, asked: &str) -> Session {
     Session {
         address: t["address"].as_str().unwrap_or(asked).to_string(),
         name: hc::spoken_name(t),
-        status: hc::status_word(t).unwrap_or_default(),
+        status: hc::status(t),
         created_ms: hc::created_ms(t),
         turn: hc::turn(t),
     }
@@ -1341,7 +1332,7 @@ mod tests {
             }
             match self.sessions.lock().unwrap().get(session).cloned() {
                 Some((st, created, turn)) => {
-                    Look::Live(Session { address: session.into(), name: format!("{session}-name"), status: st, created_ms: created, turn })
+                    Look::Live(Session { address: session.into(), name: format!("{session}-name"), status: SessionStatus::parse(&st), created_ms: created, turn })
                 }
                 None => Look::Gone,
             }
@@ -1770,7 +1761,7 @@ mod tests {
         f.0.set("t1", "working");
         for i in 0..5 {
             q.lock().push(
-                &Session { address: format!("vps/t{i}"), name: "n".into(), status: "working".into(), ..Default::default() },
+                &Session { address: format!("vps/t{i}"), name: "n".into(), status: SessionStatus::Working, ..Default::default() },
                 "x",
                 &[],
                 0,

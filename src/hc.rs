@@ -164,6 +164,136 @@ pub fn is_live(terminal: &str) -> bool {
     get(terminal).is_some_and(|t| t["state"] == "live")
 }
 
+/// What a session is doing, as the tower understands it: Herdr's status
+/// word for it, or its agent's hooks, in one vocabulary (see
+/// docs/state-machines.md, section 1). On disk and on the wire it is its
+/// word, as before; older words fold in (the hooks' `waiting` is blocked,
+/// `ended` is exited), and a word Herdr adds later is kept as it is.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum SessionStatus {
+    /// Live, no status reported yet (starting, a first-run question, or a plain program). Its word is "".
+    #[default]
+    Starting,
+    Idle,
+    Working,
+    /// Waiting on a person: a dialog (question, permission, plan, menu) or
+    /// other (`block_kind` says which).
+    Blocked,
+    Done,
+    Error,
+    /// The terminal is there; its program ended.
+    Exited,
+    /// Herdr doesn't know the address any more (or it is another terminal now).
+    Gone,
+    /// A machine that doesn't answer: not gone, unknown.
+    Unreachable,
+    Other(String),
+}
+
+impl SessionStatus {
+    pub fn parse(s: &str) -> SessionStatus {
+        match s {
+            "" => SessionStatus::Starting,
+            "idle" => SessionStatus::Idle,
+            "working" => SessionStatus::Working,
+            "blocked" | "waiting" => SessionStatus::Blocked,
+            "done" => SessionStatus::Done,
+            "error" => SessionStatus::Error,
+            "exited" | "ended" => SessionStatus::Exited,
+            "gone" => SessionStatus::Gone,
+            "unreachable" => SessionStatus::Unreachable,
+            other => SessionStatus::Other(other.to_string()),
+        }
+    }
+
+    pub fn word(&self) -> &str {
+        match self {
+            SessionStatus::Starting => "",
+            SessionStatus::Idle => "idle",
+            SessionStatus::Working => "working",
+            SessionStatus::Blocked => "blocked",
+            SessionStatus::Done => "done",
+            SessionStatus::Error => "error",
+            SessionStatus::Exited => "exited",
+            SessionStatus::Gone => "gone",
+            SessionStatus::Unreachable => "unreachable",
+            SessionStatus::Other(s) => s,
+        }
+    }
+
+    /// Takes an instruction: not working, not waiting on a question.
+    pub fn ready(&self) -> bool {
+        matches!(self, SessionStatus::Idle | SessionStatus::Done)
+    }
+
+    /// Goes back to ready by itself: an instruction can wait it out.
+    pub fn passing(&self) -> bool {
+        matches!(self, SessionStatus::Working | SessionStatus::Blocked)
+    }
+
+    /// Stopped for someone to look at it: finished, failed or waiting on a person.
+    pub fn stopped(&self) -> bool {
+        matches!(self, SessionStatus::Idle | SessionStatus::Done | SessionStatus::Error | SessionStatus::Blocked)
+    }
+
+    /// Its program is over, one way or another.
+    pub fn ended(&self) -> bool {
+        matches!(self, SessionStatus::Exited | SessionStatus::Gone)
+    }
+}
+
+impl From<String> for SessionStatus {
+    fn from(s: String) -> SessionStatus {
+        SessionStatus::parse(&s)
+    }
+}
+
+impl From<&str> for SessionStatus {
+    fn from(s: &str) -> SessionStatus {
+        SessionStatus::parse(s)
+    }
+}
+
+impl From<SessionStatus> for String {
+    fn from(s: SessionStatus) -> String {
+        s.word().to_string()
+    }
+}
+
+impl std::fmt::Display for SessionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.word())
+    }
+}
+
+/// What a blocked session waits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockKind {
+    Question,
+    Permission,
+    Other,
+}
+
+/// What a terminal's agent says it is doing (Starting for none: see `status_word`).
+pub fn status(t: &Value) -> SessionStatus {
+    status_word(t).map(|w| SessionStatus::parse(&w)).unwrap_or_default()
+}
+
+/// What a terminal is doing, its program's end included: Exited when it isn't live.
+pub fn status_live(t: &Value) -> SessionStatus {
+    if t["state"].as_str().is_some_and(|s| s != "live") { SessionStatus::Exited } else { status(t) }
+}
+
+/// What a blocked terminal waits on (herdr-core's `status.kind`).
+pub fn block_kind(t: &Value) -> BlockKind {
+    match t["status"]["kind"].as_str() {
+        Some("question") => BlockKind::Question,
+        Some("permission") => BlockKind::Permission,
+        _ => BlockKind::Other,
+    }
+}
+
 /// The agent status word a terminal reports (`idle`, `working`, `blocked`,
 /// `done`, `error`), or None for a plain program.
 pub fn status_word(t: &Value) -> Option<String> {
@@ -255,6 +385,30 @@ pub fn clean(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_vocabulary_for_a_session() {
+        use SessionStatus as S;
+        for (w, st) in [("", S::Starting), ("idle", S::Idle), ("working", S::Working), ("blocked", S::Blocked), ("done", S::Done), ("error", S::Error), ("exited", S::Exited), ("gone", S::Gone)] {
+            assert_eq!(S::parse(w), st);
+            assert_eq!(st.word(), w, "the words on disk and on the wire stay as they were");
+        }
+        // The hooks' words fold in.
+        assert_eq!(S::parse("waiting"), S::Blocked);
+        assert_eq!(S::parse("ended"), S::Exited);
+        assert_eq!(S::parse("thinking"), S::Other("thinking".into()), "a word Herdr adds later is kept");
+        assert!(S::Idle.ready() && S::Done.ready() && !S::Blocked.ready() && !S::Other("x".into()).ready());
+        assert!(S::Working.passing() && S::Blocked.passing() && !S::Error.passing());
+        assert!(S::Error.stopped() && S::Blocked.stopped() && !S::Working.stopped() && !S::Exited.stopped());
+        assert!(S::Gone.ended() && S::Exited.ended() && !S::Unreachable.ended(), "out of reach isn't gone");
+        let t = serde_json::json!({"state": "finished", "status": {"state": "idle", "kind": "question"}});
+        assert_eq!((status(&t), status_live(&t)), (S::Idle, S::Exited));
+        assert_eq!(block_kind(&t), BlockKind::Question);
+        assert_eq!(status(&serde_json::json!({"state": "live"})), S::Starting, "a plain program: no status");
+        let v: Vec<S> = serde_json::from_str(r#"["", "waiting", "idle"]"#).unwrap();
+        assert_eq!(v, [S::Starting, S::Blocked, S::Idle]);
+        assert_eq!(serde_json::to_string(&v).unwrap(), r#"["","blocked","idle"]"#);
+    }
 
     fn out(code: i32, stdout: &str) -> Output {
         Output { code, stdout: stdout.into(), stderr: String::new() }

@@ -307,20 +307,20 @@ impl JobState {
         matches!(self, JobState::Working | JobState::Blocked)
     }
 
-    /// What a session doing `status` (its status word; "" none yet) means
-    /// for its job. None: nothing to say (no status yet).
-    pub fn of_session(status: &str, live: bool) -> Option<JobState> {
+    /// What a session doing `status` means for its job (`live`: its
+    /// program still runs). None: nothing to say (no status yet, out of reach).
+    pub fn of_session(status: &hc::SessionStatus, live: bool) -> Option<JobState> {
+        use hc::SessionStatus as S;
         if !live {
             return Some(JobState::Exited);
         }
         match status {
-            "" => None,
-            "working" => Some(JobState::Working),
-            "blocked" => Some(JobState::Blocked),
-            "idle" | "done" => Some(JobState::Done),
-            "error" => Some(JobState::Error),
-            "exited" | "gone" => Some(JobState::Exited),
-            _ => None,
+            S::Working => Some(JobState::Working),
+            S::Blocked => Some(JobState::Blocked),
+            S::Idle | S::Done => Some(JobState::Done),
+            S::Error => Some(JobState::Error),
+            S::Exited | S::Gone => Some(JobState::Exited),
+            S::Starting | S::Unreachable | S::Other(_) => None,
         }
     }
 
@@ -675,12 +675,14 @@ mod tests {
         assert_eq!(Done.next(&JobEv::ByHand(Failed)), Ok(Failed), "by hand, anywhere");
         assert_eq!(Exited.next(&JobEv::ByHand(Done)), Ok(Done));
         // The session's words, in one place.
-        assert_eq!(JobState::of_session("idle", true), Some(Done));
-        assert_eq!(JobState::of_session("done", true), Some(Done));
-        assert_eq!(JobState::of_session("blocked", true), Some(Blocked));
-        assert_eq!(JobState::of_session("working", false), Some(Exited), "an ended program is an end, whatever it said last");
-        assert_eq!(JobState::of_session("gone", true), Some(Exited));
-        assert_eq!(JobState::of_session("", true), None, "no status yet: nothing to say");
+        let of = |w: &str, live| JobState::of_session(&hc::SessionStatus::parse(w), live);
+        assert_eq!(of("idle", true), Some(Done));
+        assert_eq!(of("done", true), Some(Done));
+        assert_eq!(of("blocked", true), Some(Blocked));
+        assert_eq!(of("working", false), Some(Exited), "an ended program is an end, whatever it said last");
+        assert_eq!(of("gone", true), Some(Exited));
+        assert_eq!(of("", true), None, "no status yet: nothing to say");
+        assert_eq!(of("unreachable", true), None, "out of reach isn't an end");
         for w in ["working", "blocked", "done", "failed", "error", "exited"] {
             assert_eq!(JobState::parse(w).word(), w);
         }

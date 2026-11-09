@@ -17,14 +17,16 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::hc::SessionStatus;
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Watch {
     /// What the brain asked the session to do.
     pub note: String,
     pub since_ms: u64,
-    /// Its status when watched or last seen (`working`, ...; "" unknown).
-    pub last: String,
+    /// Its status when watched or last seen (Starting, "": unknown).
+    pub last: SessionStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
     /// When the terminal was made: the watch is for that one (an address can
@@ -61,7 +63,7 @@ pub struct Pending {
 #[serde(default)]
 pub struct Book {
     pub watches: BTreeMap<String, Watch>,
-    pub seen: BTreeMap<String, String>,
+    pub seen: BTreeMap<String, SessionStatus>,
     pub outbox: Vec<Pending>,
 }
 
@@ -118,13 +120,13 @@ impl Book {
 
     /// Remembers a session's last status, forgetting the oldest ended ones
     /// past a few hundred (the book stays small).
-    pub fn note_seen(&mut self, address: &str, status: &str) -> bool {
-        if self.seen.get(address).map(String::as_str) == Some(status) {
+    pub fn note_seen(&mut self, address: &str, status: &SessionStatus) -> bool {
+        if self.seen.get(address) == Some(status) {
             return false;
         }
-        self.seen.insert(address.to_string(), status.to_string());
+        self.seen.insert(address.to_string(), status.clone());
         if self.seen.len() > 400 {
-            let ended: Vec<String> = self.seen.iter().filter(|(a, s)| s.as_str() == "gone" && !self.watches.contains_key(*a)).map(|(a, _)| a.clone()).collect();
+            let ended: Vec<String> = self.seen.iter().filter(|(a, s)| **s == SessionStatus::Gone && !self.watches.contains_key(*a)).map(|(a, _)| a.clone()).collect();
             for a in ended.into_iter().take(self.seen.len() - 400) {
                 self.seen.remove(&a);
             }
@@ -152,7 +154,7 @@ impl Book {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Now {
     pub live: bool,
-    pub status: String,
+    pub status: SessionStatus,
     /// When its terminal was made (another terminal at the same address is another session).
     pub created_ms: Option<u64>,
     /// Its turn count.
@@ -171,13 +173,9 @@ pub struct OpenJob {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Owed {
     /// A watched session stopped working, is blocked or exited.
-    Watch { address: String, status: String, was: String },
+    Watch { address: String, status: SessionStatus, was: SessionStatus },
     /// A session with an open job (and no watch) did, while nobody looked.
-    Job { address: String, status: String, was: String, title: String },
-}
-
-fn stopped(status: &str) -> bool {
-    matches!(status, "done" | "idle" | "blocked" | "error")
+    Job { address: String, status: SessionStatus, was: SessionStatus, title: String },
 }
 
 /// What is owed after a restart. `now` has every session on the machines
@@ -193,9 +191,9 @@ pub fn reconcile(book: &Book, jobs: &[OpenJob], now: &BTreeMap<String, Now>, rea
         let other = |n: &Now| matches!((w.created_ms, n.created_ms), (Some(a), Some(b)) if a != b);
         let turned = |n: &Now| matches!((w.turn, n.turn), (Some(a), Some(b)) if b > a);
         match now.get(address) {
-            None => out.push(Owed::Watch { address: address.clone(), status: "gone".into(), was }),
-            Some(n) if !n.live || other(n) => out.push(Owed::Watch { address: address.clone(), status: "exited".into(), was }),
-            Some(n) if stopped(&n.status) && (was == "working" || turned(n) || w.turn.is_none() || n.status == "blocked") => {
+            None => out.push(Owed::Watch { address: address.clone(), status: SessionStatus::Gone, was }),
+            Some(n) if !n.live || other(n) => out.push(Owed::Watch { address: address.clone(), status: SessionStatus::Exited, was }),
+            Some(n) if n.status.stopped() && (was == SessionStatus::Working || turned(n) || w.turn.is_none() || n.status == SessionStatus::Blocked) => {
                 out.push(Owed::Watch { address: address.clone(), status: n.status.clone(), was })
             }
             // Still working, or not reporting yet (a first-run question: the trust check has it).
@@ -210,19 +208,19 @@ pub fn reconcile(book: &Book, jobs: &[OpenJob], now: &BTreeMap<String, Now>, rea
         }
         done.push(a);
         // Where it stood when last seen; the job's own word when never seen.
-        let was = book.seen.get(a).cloned().unwrap_or_else(|| j.status.word().to_string());
+        let was = book.seen.get(a).cloned().unwrap_or_else(|| SessionStatus::parse(j.status.word()));
         let status = match now.get(a) {
-            None => "gone".to_string(),
-            Some(n) if !n.live => "exited".into(),
+            None => SessionStatus::Gone,
+            Some(n) if !n.live => SessionStatus::Exited,
             Some(n) => n.status.clone(),
         };
-        let owed = match status.as_str() {
+        let owed = match status {
             // Unless the radar saw it end while it was up.
-            "gone" | "exited" => !matches!(was.as_str(), "gone" | "exited"),
+            SessionStatus::Gone | SessionStatus::Exited => !was.ended(),
             // Finished since it was last seen working.
-            "done" | "idle" | "error" => was == "working",
+            SessionStatus::Done | SessionStatus::Idle | SessionStatus::Error => was == SessionStatus::Working,
             // Newly waiting on someone (a job already marked blocked was told).
-            "blocked" => j.status != crate::history::JobState::Blocked && was != "blocked",
+            SessionStatus::Blocked => j.status != crate::history::JobState::Blocked && was != SessionStatus::Blocked,
             _ => false,
         };
         if owed {
@@ -237,7 +235,7 @@ mod tests {
     use super::*;
 
     fn now(list: &[(&str, bool, &str)]) -> BTreeMap<String, Now> {
-        list.iter().map(|(a, live, s)| (a.to_string(), Now { live: *live, status: s.to_string(), created_ms: None, turn: None })).collect()
+        list.iter().map(|(a, live, s)| (a.to_string(), Now { live: *live, status: SessionStatus::parse(s), created_ms: None, turn: None })).collect()
     }
 
     fn watch(note: &str, last: &str) -> Watch {
@@ -324,9 +322,17 @@ mod tests {
         std::fs::write(&path, r#"{ "t22": "release it" }"#).unwrap();
         let b = Book::load_from(&path);
         assert_eq!(b.watches["t22"].note, "release it");
-        assert_eq!(b.watches["t22"].last, "");
+        assert_eq!(b.watches["t22"].last, SessionStatus::Starting);
         std::fs::write(&path, r#"{ "watches": {}, "seen": {}, "outbox": [] }"#).unwrap();
         assert_eq!(Book::load_from(&path), Book::default());
+        // What an older tower wrote: the session words as strings, read back as they were.
+        std::fs::write(&path, r#"{ "watches": {"t3": {"note": "x", "since_ms": 1, "last": "working"}}, "seen": {"t3": "working", "t4": "gone", "t5": ""}, "outbox": [] }"#).unwrap();
+        let b = Book::load_from(&path);
+        assert_eq!(b.watches["t3"].last, SessionStatus::Working);
+        assert_eq!((b.seen["t4"].clone(), b.seen["t5"].clone()), (SessionStatus::Gone, SessionStatus::Starting));
+        b.save_to(&path);
+        let again: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!((again["seen"]["t4"].as_str(), again["watches"]["t3"]["last"].as_str()), (Some("gone"), Some("working")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -422,10 +428,10 @@ mod tests {
     fn seen_stays_small() {
         let mut b = Book::default();
         for i in 0..500 {
-            b.note_seen(&format!("t{i}"), "gone");
+            b.note_seen(&format!("t{i}"), &SessionStatus::Gone);
         }
         assert!(b.seen.len() <= 401);
-        assert!(!b.note_seen("t499", "gone"));
+        assert!(!b.note_seen("t499", &SessionStatus::Gone));
     }
 
     #[test]

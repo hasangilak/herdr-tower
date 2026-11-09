@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use super::card::{self, Answerer, CloseWhy, Decision, Ev, Phase, Refused};
 use super::lan::hub::Hub;
 use super::state::Shared;
-use crate::hc;
+use crate::hc::{self, SessionStatus};
 use crate::questions::{self, Answer, QuestionSet};
 
 type Notify = Box<dyn Fn(&str, &str) + Send + Sync>;
@@ -42,7 +42,7 @@ struct Reply {
     /// raised by one for each dialog it shows meanwhile.
     turn: Option<u64>,
     /// The session's status when last seen.
-    last: String,
+    last: SessionStatus,
     /// When the session's terminal was made: the reply is for that one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     created_ms: Option<u64>,
@@ -54,13 +54,13 @@ struct Reply {
 impl Reply {
     /// Why it no longer goes in: too old, or the session has stopped and
     /// started again on its own since it was queued (a new turn).
-    fn stale(&self, now_ms: u64, turn: Option<u64>, status: &str) -> Option<&'static str> {
+    fn stale(&self, now_ms: u64, turn: Option<u64>, status: &SessionStatus) -> Option<&'static str> {
         if now_ms.saturating_sub(self.at_ms) > REPLY_TTL_MS {
             return Some("it waited too long");
         }
         let (Some(then), Some(now)) = (self.turn, turn) else { return None };
         // One stop is the one it waits for; working again after it, or a second stop, is a turn of its own.
-        if now > then + 1 || (now > then && status == "working") {
+        if now > then + 1 || (now > then && *status == SessionStatus::Working) {
             return Some("the session moved on without it");
         }
         None
@@ -193,7 +193,7 @@ impl Saved {
 /// A session's terminal as Herdr has it, for settling what a restart left.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Terminal {
-    Live { created_ms: Option<u64>, status: String },
+    Live { created_ms: Option<u64>, status: SessionStatus },
     /// The terminal is there; its program ended.
     Ended,
     Gone,
@@ -204,7 +204,7 @@ pub enum Terminal {
 impl Terminal {
     fn of(address: &str) -> Terminal {
         match hc::lookup(address) {
-            hc::Lookup::Found(t) if t["state"] == "live" => Terminal::Live { created_ms: hc::created_ms(&t), status: hc::status_word(&t).unwrap_or_default() },
+            hc::Lookup::Found(t) if t["state"] == "live" => Terminal::Live { created_ms: hc::created_ms(&t), status: hc::status(&t) },
             hc::Lookup::Found(_) => Terminal::Ended,
             hc::Lookup::Gone => Terminal::Gone,
             hc::Lookup::Unreachable(_) => Terminal::Unknown,
@@ -303,8 +303,10 @@ impl Asks {
             let t = look(&set.session);
             let why = match &t {
                 _ if !t.same(set.created_ms) => Some(CloseWhy::SessionGone),
-                Terminal::Live { status, .. } if set.kind != "text" && status != "blocked" => Some(over_why(&set, false)),
-                Terminal::Live { status, .. } if set.kind == "text" && (status == "working" || status.is_empty()) => Some(over_why(&set, false)),
+                Terminal::Live { status, .. } if set.kind != "text" && *status != SessionStatus::Blocked => Some(over_why(&set, false)),
+                Terminal::Live { status, .. } if set.kind == "text" && matches!(status, SessionStatus::Working | SessionStatus::Starting) => {
+                    Some(over_why(&set, false))
+                }
                 _ => None,
             };
             match why {
@@ -318,14 +320,14 @@ impl Asks {
         let mut dropped: Vec<(String, Reply)> = vec![];
         let mut replies = HashMap::new();
         for (a, r) in saved.replies {
-            if look(&a).same(r.created_ms) && r.stale(now_ms, None, "").is_none() {
+            if look(&a).same(r.created_ms) && r.stale(now_ms, None, &SessionStatus::Starting).is_none() {
                 replies.insert(a, r);
             } else {
                 dropped.push((a, r));
             }
         }
         let dismissed: Vec<(String, String)> =
-            saved.dismissed.into_iter().filter(|(a, _)| matches!(look(a), Terminal::Live { ref status, .. } if status == "blocked") || look(a) == Terminal::Unknown).collect();
+            saved.dismissed.into_iter().filter(|(a, _)| matches!(look(a), Terminal::Live { status: SessionStatus::Blocked, .. }) || look(a) == Terminal::Unknown).collect();
         eprintln!("[questions] start: {} card(s) back, {} over, {} reply(ies) waiting, {} dropped", kept.len(), over.len(), replies.len(), dropped.len());
         {
             let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -442,18 +444,18 @@ impl Asks {
         Ok(Some(set))
     }
 
-    /// A session's status as the radar sees it (`status`: its status word,
-    /// "" when it is gone). Blocked with a new status line: its dialog is read
-    /// (on a thread). Not blocked: its dialog's set closes. Working (or gone):
-    /// a question its last message asked is stale. Idle or done: a reply
+    /// A session's status as the radar sees it (Gone or Exited when it is
+    /// over). Blocked with a new status line: its dialog is read (on a
+    /// thread). Not blocked: its dialog's set closes. Working (or over): a
+    /// question its last message asked is stale. Idle or done: a reply
     /// waiting for it goes in.
-    pub fn seen(&self, address: &str, t: &Value, status: &str) {
-        let blocked = status == "blocked";
+    pub fn seen(&self, address: &str, t: &Value, status: &SessionStatus) {
+        let blocked = *status == SessionStatus::Blocked;
         self.reply_sees(address, status);
         if !blocked {
-            let gone = status.is_empty();
+            let gone = status.ended();
             self.close_where(address, |s| s.kind != "text", |s| over_why(s, gone), true);
-            if status == "working" || gone {
+            if *status == SessionStatus::Working || gone {
                 self.close_where(address, |s| s.kind == "text", |s| over_why(s, gone), true);
             }
             if let Some(r) = self.due_reply(address, status, turn_of(t), hc::created_ms(t), crate::history::now_ms()) {
@@ -503,13 +505,13 @@ impl Asks {
 
     /// A waiting reply's session has `status` now: stopping for a dialog
     /// isn't the turn's end the reply waits for (its count goes up by one).
-    fn reply_sees(&self, address: &str, status: &str) {
+    fn reply_sees(&self, address: &str, status: &SessionStatus) {
         let changed = match self.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.get_mut(address) {
-            Some(r) if r.last != status => {
-                if status == "blocked" && r.last != "blocked" {
+            Some(r) if r.last != *status => {
+                if *status == SessionStatus::Blocked {
                     r.turn = r.turn.map(|n| n + 1);
                 }
-                r.last = status.to_string();
+                r.last = status.clone();
                 true
             }
             _ => false,
@@ -523,15 +525,15 @@ impl Asks {
     /// idle or done). Dropped when the session is gone (or another terminal
     /// is at its address now), it is too old, or the session moved on
     /// without it: logged, and the user, who was told it would go in, hears it didn't.
-    fn due_reply(&self, address: &str, status: &str, turn: Option<u64>, created_ms: Option<u64>, now_ms: u64) -> Option<Reply> {
+    fn due_reply(&self, address: &str, status: &SessionStatus, turn: Option<u64>, created_ms: Option<u64>, now_ms: u64) -> Option<Reply> {
         let (taken, dropped) = {
             let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let r = i.replies.get(address)?;
             let other = matches!((r.created_ms, created_ms), (Some(a), Some(b)) if a != b);
-            let why = if status.is_empty() || other { Some("the session is gone") } else { r.stale(now_ms, turn, status) };
+            let why = if status.ended() || other { Some("the session is gone") } else { r.stale(now_ms, turn, status) };
             match why {
                 Some(why) => (None, i.replies.remove(address).map(|r| (r, why))),
-                None if matches!(status, "idle" | "done") => (i.replies.remove(address), None),
+                None if status.ready() => (i.replies.remove(address), None),
                 None => return None,
             }
         };
@@ -553,7 +555,7 @@ impl Asks {
                 self.close_where(address, |s| s.kind != "text", |s| over_why(s, false), true);
                 // Blocked on something it can't read: the plain notice, as before.
                 if !had
-                    && let Some(t) = hc::get(address).filter(|t| hc::status_word(t).as_deref() == Some("blocked"))
+                    && let Some(t) = hc::get(address).filter(|t| hc::status(t) == SessionStatus::Blocked)
                     && !super::watch::is_test(&t)
                 {
                     self.tell(address, &blocked_notice(&hc::spoken_name(&t), &t["status"]));
@@ -1048,9 +1050,9 @@ impl Asks {
     /// is idle or done, else when it is.
     fn reply(&self, set: &QuestionSet, answers: &[Answer]) -> Result<QuestionSet> {
         let text = questions::compose_reply(set, answers)?;
-        let status = hc::get(&set.session).and_then(|t| hc::status_word(&t)).unwrap_or_default();
-        let queued = !matches!(status.as_str(), "idle" | "done");
-        if queued && status.is_empty() {
+        let status = hc::get(&set.session).map(|t| hc::status_live(&t)).unwrap_or(SessionStatus::Gone);
+        let queued = !status.ready();
+        if queued && (status.ended() || status == SessionStatus::Starting) {
             self.close_where(&set.session, |s| s.id == set.id, |_| CloseWhy::SessionGone, true);
             bail!(Late(CloseWhy::SessionGone.late(&set.id, if set.name.is_empty() { &set.session } else { &set.name })));
         }
@@ -1113,7 +1115,7 @@ impl Asks {
 /// control characters, and never at the same time as other keys for it.
 fn type_into(address: &str, text: &str) -> Result<()> {
     let _typing = hc::typing(address);
-    let status = hc::get(address).and_then(|t| hc::status_word(&t)).unwrap_or_default();
+    let status = hc::get(address).map(|t| hc::status_live(&t)).unwrap_or(SessionStatus::Gone);
     let args = send_args(address, &questions::clean_text(text), &status)?;
     let out = std::process::Command::new(crate::config::hc_bin())
         .args(&args)
@@ -1131,12 +1133,12 @@ fn type_into(address: &str, text: &str) -> Result<()> {
 /// now: only idle or done takes one (idle: hc checks it again as it types,
 /// with `--if idle`). `--` before the terminal and the text, so a reply like
 /// "- yes" isn't taken for a flag.
-fn send_args(address: &str, text: &str, status: &str) -> Result<Vec<String>> {
+fn send_args(address: &str, text: &str, status: &SessionStatus) -> Result<Vec<String>> {
     let mut args = vec!["send".to_string()];
     match status {
-        "idle" => args.extend(["--if".to_string(), "idle".to_string()]),
-        "done" => {}
-        "" => bail!("{address} isn't there any more"),
+        SessionStatus::Idle => args.extend(["--if".to_string(), "idle".to_string()]),
+        SessionStatus::Done => {}
+        SessionStatus::Gone | SessionStatus::Exited | SessionStatus::Starting => bail!("{address} isn't there any more"),
         s => bail!("{address} is {s} now"),
     }
     args.extend(["--".to_string(), address.to_string(), text.to_string()]);
@@ -1165,7 +1167,7 @@ fn is_set_id(s: &str) -> bool {
 
 pub fn detect(address: &str) -> Option<QuestionSet> {
     let t = hc::get(address)?;
-    if hc::status_word(&t).as_deref() != Some("blocked") {
+    if hc::status(&t) != SessionStatus::Blocked {
         return None;
     }
     let screen_text = hc::run(&["read", address]).ok()?.stdout;
@@ -1345,7 +1347,7 @@ mod tests {
         a.upsert(set.clone());
         assert_eq!(told(&t, 1).len(), 1, "the same dialog, still up: told once");
         // Answered: the session works again, the set closes.
-        a.seen("t37", &Value::Null, "working");
+        a.seen("t37", &Value::Null, &SessionStatus::parse("working"));
         assert!(a.list().is_empty());
         assert!(a.inner.lock().unwrap_or_else(|e| e.into_inner()).noted.is_empty(), "closed: forgotten");
         // The next "Allow Bash: npm test?" looks the same, and is a new question.
@@ -1369,7 +1371,7 @@ mod tests {
         a.upsert(set.clone());
         assert!(a.list().is_empty(), "dismissed: not shown again while the session shows it");
         assert_eq!(told(&t, 1).len(), 1);
-        a.seen("t37", &Value::Null, "idle");
+        a.seen("t37", &Value::Null, &SessionStatus::parse("idle"));
         a.upsert(set.clone());
         assert_eq!(a.list().len(), 1, "a new episode: shown");
         assert_eq!(told(&t, 2).len(), 2, "and told again");
@@ -1407,7 +1409,7 @@ mod tests {
         let set = perm("approve Bash: touch /tmp/qfix-perm-test");
         a.upsert(set.clone());
         // The user answered it in the terminal: the session works again.
-        a.seen("t37", &Value::Null, "working");
+        a.seen("t37", &Value::Null, &SessionStatus::parse("working"));
         assert!(a.list().is_empty());
         assert_eq!(phase(&a, &set.id), Phase::Closed { why: CloseWhy::Unblocked });
         // The phone's card, a moment late: told it was answered, nothing typed (no hc asked).
@@ -1425,7 +1427,7 @@ mod tests {
         text.at_ms = 1;
         a.upsert(text.clone());
         assert_eq!(a.list().len(), 2);
-        a.seen("t37", &Value::Null, "");
+        a.seen("t37", &Value::Null, &SessionStatus::Gone);
         assert!(a.list().is_empty());
         assert_eq!(phase(&a, &set.id), Phase::Closed { why: CloseWhy::SessionGone });
         assert_eq!(phase(&a, &text.id), Phase::Closed { why: CloseWhy::SessionGone });
@@ -1440,7 +1442,7 @@ mod tests {
         a.upsert(set.clone());
         assert_eq!(a.start_answering(&set.id, Answerer::User), Ok(true));
         assert_eq!(a.transition(&set.id, &Ev::Submitted).unwrap().unwrap().status, "answered");
-        a.seen("t37", &Value::Null, "working");
+        a.seen("t37", &Value::Null, &SessionStatus::parse("working"));
         assert_eq!(phase(&a, &set.id), Phase::Closed { why: CloseWhy::AnsweredHere });
         let e = a.answer(&set.id, &ans0(), true).unwrap_err();
         assert!(format!("{e:#}").starts_with("already answered"), "{e:#}");
@@ -1510,7 +1512,7 @@ mod tests {
         a.upsert(set.clone());
         a.dismiss(&set.id).unwrap();
         assert_eq!(phase(&a, &set.id), Phase::Dismissed);
-        a.seen("t37", &Value::Null, "idle");
+        a.seen("t37", &Value::Null, &SessionStatus::parse("idle"));
         assert_eq!(phase(&a, &set.id), Phase::Closed { why: CloseWhy::Unblocked });
     }
 
@@ -1551,7 +1553,7 @@ mod tests {
         let dir = tmp("restart");
         let path = dir.0.join("questions.json");
         let now = crate::history::now_ms();
-        let live = |c: u64, st: &str| Terminal::Live { created_ms: Some(c), status: st.into() };
+        let live = |c: u64, st: &str| Terminal::Live { created_ms: Some(c), status: SessionStatus::parse(st) };
         let with = |mut s: QuestionSet, session: &str| {
             s.session = session.into();
             s.created_ms = Some(1);
@@ -1573,7 +1575,7 @@ mod tests {
             for (addr, created) in [("t39", 1), ("t40", 1)] {
                 a.inner.lock().unwrap().replies.insert(
                     addr.into(),
-                    Reply { set: format!("q-{addr}"), text: "yes".into(), at_ms: now, turn: Some(3), last: "working".into(), created_ms: Some(created), name: format!("{addr} name") },
+                    Reply { set: format!("q-{addr}"), text: "yes".into(), at_ms: now, turn: Some(3), last: SessionStatus::Working, created_ms: Some(created), name: format!("{addr} name") },
                 );
             }
             // t41: open when the tower stopped, idle by its start (answered in the terminal meanwhile).
@@ -1638,7 +1640,7 @@ mod tests {
         assert!(std::fs::read_dir(&dir.0).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().contains("bad-")), "kept aside");
         // Words this tower doesn't know, and fields it doesn't have: loaded as open, undecided.
         std::fs::write(&path, r#"{"sets": [{"id": "q1", "session": "t9", "kind": "claude-permission", "status": "pondering", "decision": "later", "future": 1}], "extra": true}"#).unwrap();
-        a.restore_from(Saved::load(&path), &mut |_| Terminal::Live { created_ms: None, status: "blocked".into() }, 1);
+        a.restore_from(Saved::load(&path), &mut |_| Terminal::Live { created_ms: None, status: SessionStatus::Blocked }, 1);
         let s = a.get("q1").unwrap();
         assert_eq!((s.status.as_str(), s.decision.as_deref()), ("open", None));
     }
@@ -1659,41 +1661,41 @@ mod tests {
 
     #[test]
     fn waiting_replies_expire() {
-        let r = Reply { set: "q1".into(), text: "yes".into(), at_ms: 1_000, turn: Some(4), last: "working".into(), created_ms: None, name: String::new() };
-        assert_eq!(r.stale(2_000, Some(4), "working"), None, "still on the turn it waits for");
-        assert_eq!(r.stale(2_000, Some(5), "idle"), None, "that turn ended: it goes in");
-        assert!(r.stale(2_000, Some(5), "working").is_some(), "stopped and started again on its own");
-        assert!(r.stale(2_000, Some(6), "idle").is_some(), "a turn of its own since");
-        assert!(r.stale(1_000 + REPLY_TTL_MS + 1, Some(4), "idle").is_some(), "too old");
-        assert_eq!(Reply { turn: None, ..r.clone() }.stale(2_000, None, "idle"), None);
+        let r = Reply { set: "q1".into(), text: "yes".into(), at_ms: 1_000, turn: Some(4), last: SessionStatus::Working, created_ms: None, name: String::new() };
+        assert_eq!(r.stale(2_000, Some(4), &SessionStatus::parse("working")), None, "still on the turn it waits for");
+        assert_eq!(r.stale(2_000, Some(5), &SessionStatus::parse("idle")), None, "that turn ended: it goes in");
+        assert!(r.stale(2_000, Some(5), &SessionStatus::parse("working")).is_some(), "stopped and started again on its own");
+        assert!(r.stale(2_000, Some(6), &SessionStatus::parse("idle")).is_some(), "a turn of its own since");
+        assert!(r.stale(1_000 + REPLY_TTL_MS + 1, Some(4), &SessionStatus::Idle).is_some(), "too old");
+        assert_eq!(Reply { turn: None, ..r.clone() }.stale(2_000, None, &SessionStatus::Idle), None);
 
         let (a, _) = asks();
         a.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.insert("t5".into(), r.clone());
-        assert_eq!(a.due_reply("t5", "working", Some(4), None, 2_000), None);
-        assert_eq!(a.due_reply("t5", "idle", Some(5), None, 2_000), Some(r.clone()));
-        assert_eq!(a.due_reply("t5", "idle", Some(5), None, 2_000), None, "taken once");
+        assert_eq!(a.due_reply("t5", &SessionStatus::parse("working"), Some(4), None, 2_000), None);
+        assert_eq!(a.due_reply("t5", &SessionStatus::parse("idle"), Some(5), None, 2_000), Some(r.clone()));
+        assert_eq!(a.due_reply("t5", &SessionStatus::parse("idle"), Some(5), None, 2_000), None, "taken once");
         // A dialog on the way (the count goes up for it): still the turn it waits for.
         a.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.insert("t5".into(), r.clone());
         for st in ["blocked", "blocked", "working"] {
-            a.reply_sees("t5", st);
+            a.reply_sees("t5", &SessionStatus::parse(st));
         }
-        assert_eq!(a.due_reply("t5", "working", Some(5), None, 2_000), None);
-        assert_eq!(a.due_reply("t5", "idle", Some(6), None, 2_000).map(|r| r.set), Some("q1".into()), "it goes in after the dialog");
+        assert_eq!(a.due_reply("t5", &SessionStatus::parse("working"), Some(5), None, 2_000), None);
+        assert_eq!(a.due_reply("t5", &SessionStatus::parse("idle"), Some(6), None, 2_000).map(|r| r.set), Some("q1".into()), "it goes in after the dialog");
         a.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.insert("t5".into(), r.clone());
-        a.seen("t5", &Value::Null, "");
+        a.seen("t5", &Value::Null, &SessionStatus::Gone);
         assert!(a.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.is_empty(), "the session is gone: dropped");
         a.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.insert("t5".into(), r);
-        assert_eq!(a.due_reply("t5", "done", Some(5), None, 1_000 + REPLY_TTL_MS + 1), None);
+        assert_eq!(a.due_reply("t5", &SessionStatus::parse("done"), Some(5), None, 1_000 + REPLY_TTL_MS + 1), None);
         assert!(a.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.is_empty(), "too old: dropped");
     }
 
     #[test]
     fn replies_go_in_only_when_the_session_is_free() {
-        assert_eq!(send_args("t3", "- yes", "idle").unwrap(), ["send", "--if", "idle", "--", "t3", "- yes"]);
-        assert_eq!(send_args("t3", "-x", "done").unwrap(), ["send", "--", "t3", "-x"]);
-        assert!(send_args("t3", "yes", "working").is_err());
-        assert!(send_args("t3", "yes", "blocked").is_err());
-        assert!(send_args("t3", "yes", "").is_err());
+        assert_eq!(send_args("t3", "- yes", &SessionStatus::parse("idle")).unwrap(), ["send", "--if", "idle", "--", "t3", "- yes"]);
+        assert_eq!(send_args("t3", "-x", &SessionStatus::parse("done")).unwrap(), ["send", "--", "t3", "-x"]);
+        assert!(send_args("t3", "yes", &SessionStatus::parse("working")).is_err());
+        assert!(send_args("t3", "yes", &SessionStatus::parse("blocked")).is_err());
+        assert!(send_args("t3", "yes", &SessionStatus::parse("")).is_err());
     }
 
     #[test]

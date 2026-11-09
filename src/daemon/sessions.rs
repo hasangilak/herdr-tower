@@ -19,6 +19,7 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 
 use crate::config;
+use crate::hc::SessionStatus;
 
 /// One hook call, as `tower hook agent` hands it over.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -68,8 +69,10 @@ pub struct AgentSession {
     pub transcript: String,
     #[serde(default)]
     pub cwd: String,
-    /// `working`, `waiting` (on a permission or a question), `done`, `ended`.
-    pub state: String,
+    /// Idle, working, blocked (on a permission or a question), done, exited:
+    /// the radar's own vocabulary (`hc::SessionStatus`). Older files said
+    /// `waiting` and `ended`; they read the same.
+    pub state: crate::hc::SessionStatus,
     #[serde(default)]
     pub prompt: String,
     #[serde(default)]
@@ -182,14 +185,14 @@ impl Sessions {
         let text = keep(&ev.text);
         let change = match ev.event.as_str() {
             "start" => {
-                s.state = "idle".into();
+                s.state = SessionStatus::Idle;
                 if s.started_ms == 0 {
                     s.started_ms = now;
                 }
                 Change::Started
             }
             "prompt" => {
-                s.state = "working".into();
+                s.state = SessionStatus::Working;
                 s.prompt = text;
                 s.prompt_ms = now;
                 Change::Prompted
@@ -198,15 +201,15 @@ impl Sessions {
                 s.notice = text;
                 s.notice_ms = now;
                 // "Waiting for your input" after a finished turn is no question.
-                if ev.event == "permission" || s.state == "working" {
-                    s.state = "waiting".into();
+                if ev.event == "permission" || s.state == SessionStatus::Working {
+                    s.state = SessionStatus::Blocked;
                     Change::Waiting
                 } else {
                     Change::Nothing
                 }
             }
             "stop" | "stop-failed" => {
-                s.state = "done".into();
+                s.state = SessionStatus::Done;
                 if !text.is_empty() {
                     s.said = text.clone();
                     s.said_ms = now;
@@ -214,7 +217,7 @@ impl Sessions {
                 Change::Stopped(text)
             }
             "end" => {
-                s.state = "ended".into();
+                s.state = SessionStatus::Exited;
                 Change::Ended
             }
             _ => Change::Nothing,
@@ -314,11 +317,11 @@ mod tests {
         let t0 = crate::history::now_ms();
         assert_eq!(r.apply(&ev("start", "", t0)), Change::Started);
         assert_eq!(r.apply(&ev("prompt", "fix the login", t0 + 1)), Change::Prompted);
-        assert_eq!(r.get("t5").unwrap().state, "working");
+        assert_eq!(r.get("t5").unwrap().state, SessionStatus::Working);
         assert_eq!(r.apply(&ev("notify", "Claude needs your permission to use Bash", t0 + 2)), Change::Waiting);
         assert_eq!(r.apply(&ev("stop", "Fixed it; tests pass.", t0 + 3)), Change::Stopped("Fixed it; tests pass.".into()));
         let s = r.get("t5").unwrap();
-        assert_eq!((s.state.as_str(), s.prompt.as_str(), s.said.as_str()), ("done", "fix the login", "Fixed it; tests pass."));
+        assert_eq!((s.state.word(), s.prompt.as_str(), s.said.as_str()), ("done", "fix the login", "Fixed it; tests pass."));
         assert_eq!(r.said_since("t5", t0), Some("Fixed it; tests pass.".into()));
         assert_eq!(r.said_since("t5", t0 + 10), None);
         // Kept across a restart.
@@ -351,7 +354,7 @@ mod tests {
         let spool = p.with_extension("spool.jsonl");
         std::fs::write(&spool, serde_json::to_string(&ev("prompt", "older", t0)).unwrap() + "\n").unwrap();
         assert_eq!(r.take_spool(&spool), 1);
-        assert_eq!(r.get("t5").unwrap().state, "done");
+        assert_eq!(r.get("t5").unwrap().state, SessionStatus::Done);
         assert!(!spool.exists());
         let _ = std::fs::remove_file(p);
     }
