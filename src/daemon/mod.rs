@@ -1,6 +1,7 @@
 //! `tower daemon`: the ears, the mouth and the radar, behind a Unix socket.
 
 pub mod asks;
+pub mod card;
 mod book;
 pub mod hotkey;
 pub mod lan;

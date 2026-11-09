@@ -109,6 +109,14 @@ pub struct QuestionSet {
     /// on a tab is known now, say). Its card carries on as this one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replaces: Option<String>,
+    /// Where it is in its life (`daemon::card`): `status`, `decision` and
+    /// `error` are its words on the wire, written from it.
+    #[serde(skip)]
+    pub state: crate::daemon::card::SetState,
+    /// When the session's terminal was made: the set is for that terminal
+    /// (an address can come back for another one).
+    #[serde(skip)]
+    pub created_ms: Option<u64>,
 }
 
 /// The same question on both: its title, wording, kind and options (a

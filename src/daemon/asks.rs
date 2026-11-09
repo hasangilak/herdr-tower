@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
+use super::card::{self, Answerer, CloseWhy, Decision, Ev, Phase, Refused};
 use super::lan::hub::Hub;
 use super::state::Shared;
 use crate::hc;
@@ -77,6 +78,34 @@ impl std::fmt::Display for Held {
 
 impl std::error::Error for Held {}
 
+/// An answer that comes too late: the question was answered (or closed, or
+/// read again) meanwhile. Nothing was typed; the tower doesn't take it to
+/// the user as a failure.
+#[derive(Debug)]
+struct Late(String);
+
+impl std::fmt::Display for Late {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Late {}
+
+/// Closed sets remembered, so a late action on one hears how it ended.
+const KEEP_PAST: usize = 100;
+
+/// Why a session's set is over when the session stops showing it.
+fn over_why(s: &QuestionSet, gone: bool) -> CloseWhy {
+    if gone {
+        CloseWhy::SessionGone
+    } else if s.state.answered_here() {
+        CloseWhy::AnsweredHere
+    } else {
+        CloseWhy::Unblocked
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     sets: Vec<QuestionSet>,
@@ -93,6 +122,22 @@ struct Inner {
     /// Dialogs the user dismissed (session, id): not shown again while the
     /// session still shows them.
     dismissed: Vec<(String, String)>,
+    /// Sets that are over (closed, or dismissed while still up), newest
+    /// last, in their last state: what a late answer to one is told.
+    past: Vec<QuestionSet>,
+    /// Sessions whose dialog is being read (the status line it was read
+    /// for): one reader per screen.
+    reading: HashMap<String, String>,
+}
+
+impl Inner {
+    fn remember(&mut self, set: QuestionSet) {
+        self.past.retain(|p| p.id != set.id);
+        self.past.push(set);
+        if self.past.len() > KEEP_PAST {
+            self.past.remove(0);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -148,6 +193,11 @@ impl Asks {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).sets.iter().find(|s| s.id == id).cloned()
     }
 
+    /// A set that is over (or dismissed), as it ended.
+    fn past(&self, id: &str) -> Option<QuestionSet> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).past.iter().rev().find(|s| s.id == id).cloned()
+    }
+
     fn publish(&self) {
         let sets = self.list();
         let by_session: HashMap<String, String> = sets.iter().map(|s| (s.session.clone(), s.id.clone())).collect();
@@ -167,6 +217,20 @@ impl Asks {
         self.hub.broadcast("question", data);
     }
 
+    /// Moves the set `id` by `ev` (`card::SetState::next`), and tells
+    /// everyone. None: the tower doesn't track it.
+    fn transition(&self, id: &str, ev: &Ev) -> Result<Option<QuestionSet>, Refused> {
+        let set = {
+            let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(s) = i.sets.iter_mut().find(|s| s.id == id) else { return Ok(None) };
+            card::apply(s, ev)?;
+            s.clone()
+        };
+        self.publish();
+        self.event("update", Some(&set), id);
+        Ok(Some(set))
+    }
+
     /// A session's status as the radar sees it (`status`: its status word,
     /// "" when it is gone). Blocked with a new status line: its dialog is read
     /// (on a thread). Not blocked: its dialog's set closes. Working (or gone):
@@ -176,9 +240,10 @@ impl Asks {
         let blocked = status == "blocked";
         self.reply_sees(address, status);
         if !blocked {
-            self.close_where(address, |s| s.kind != "text", true);
-            if status == "working" || status.is_empty() {
-                self.close_where(address, |s| s.kind == "text", true);
+            let gone = status.is_empty();
+            self.close_where(address, |s| s.kind != "text", |s| over_why(s, gone), true);
+            if status == "working" || gone {
+                self.close_where(address, |s| s.kind == "text", |s| over_why(s, gone), true);
             }
             if let Some(r) = self.due_reply(address, status, turn_of(t), crate::history::now_ms()) {
                 match type_into(address, &r.text) {
@@ -195,7 +260,12 @@ impl Asks {
             if i.msgs.get(address) == Some(&msg) && showing {
                 return;
             }
-            i.msgs.insert(address.to_string(), msg);
+            // Being read for this very screen already.
+            if i.reading.get(address) == Some(&msg) {
+                return;
+            }
+            i.msgs.insert(address.to_string(), msg.clone());
+            i.reading.insert(address.to_string(), msg.clone());
         }
         let (me, address) = (self.clone(), address.to_string());
         std::thread::spawn(move || {
@@ -213,6 +283,10 @@ impl Asks {
                 std::thread::sleep(std::time::Duration::from_millis(800));
             }
             me.refresh(&address);
+            let mut i = me.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if i.reading.get(&address) == Some(&msg) {
+                i.reading.remove(&address);
+            }
         });
     }
 
@@ -248,7 +322,7 @@ impl Asks {
             Some(set) => Some(self.upsert(set)),
             None => {
                 let had = self.list().iter().any(|s| s.session == address && s.kind != "text");
-                self.close_where(address, |s| s.kind != "text", true);
+                self.close_where(address, |s| s.kind != "text", |s| over_why(s, false), true);
                 // Blocked on something it can't read: the plain notice, as before.
                 if !had
                     && let Some(t) = hc::get(address).filter(|t| hc::status_word(t).as_deref() == Some("blocked"))
@@ -277,67 +351,89 @@ impl Asks {
             let context = crate::history::jobs(&crate::history::load()).into_iter().find(|j| j.session == address).map(|j| j.title).unwrap_or_default();
             let mut set = questions::text_set(&address, &hc::spoken_name(&t), &message, &context);
             set.at_ms = crate::history::now_ms();
+            set.created_ms = hc::created_ms(&t);
             me.upsert(set);
         });
     }
 
+    /// A set read from the session: new, the same one again (it keeps its
+    /// state), or another in its place (the old one closes: replaced when it
+    /// is the same dialog read again). A set being answered isn't replaced:
+    /// the answer reads the screen again when its keys are in.
     fn upsert(&self, mut set: QuestionSet) -> QuestionSet {
-        let (new, note) = {
+        let (new, note, closed) = {
             let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             // Dismissed while the session still shows it: it stays away.
             if i.dismissed.iter().any(|(a, id)| *a == set.session && *id == set.id) {
                 return set;
             }
             let old = i.sets.iter().position(|s| s.session == set.session && (s.kind == "text") == (set.kind == "text"));
+            let mut closed = None;
             let new = match old {
                 Some(k) if i.sets[k].id == set.id => {
-                    // The same questions: keep what came for them.
-                    set.recommendations = i.sets[k].recommendations.clone();
-                    set.decision = i.sets[k].decision.clone();
-                    set.reason = i.sets[k].reason.clone();
-                    set.answered_with = i.sets[k].answered_with.clone();
-                    if matches!(i.sets[k].status.as_str(), "answering" | "answered") {
-                        set.status = i.sets[k].status.clone();
-                    }
+                    // The same questions: keep what came for them, and where it stands.
+                    let o = &i.sets[k];
+                    set.recommendations = o.recommendations.clone();
+                    set.reason = o.reason.clone();
+                    set.answered_with = o.answered_with.clone();
+                    set.replaces = set.replaces.take().or_else(|| o.replaces.clone());
+                    set.created_ms = set.created_ms.or(o.created_ms);
+                    set.state = o.state.clone();
+                    card::sync(&mut set);
                     i.sets[k] = set.clone();
                     false
                 }
                 Some(k) => {
-                    let old = &i.sets[k];
-                    if questions::redrawn(old, &set) {
+                    let old = i.sets[k].clone();
+                    let redrawn = questions::redrawn(&old, &set);
+                    let why = if redrawn { CloseWhy::Replaced { by: set.id.clone() } } else { over_why(&old, false) };
+                    let mut over = old.clone();
+                    if let Err(e) = card::apply(&mut over, &Ev::Close(why)) {
+                        eprintln!("[questions] {} reads {} now, but {} stays until its answer is in ({e})", set.session, set.id, old.id);
+                        return old;
+                    }
+                    if redrawn {
                         // The same dialog read again: its card carries on (the user
                         // decides it still), with what was recommended for the
                         // questions that didn't change.
                         set.replaces = Some(old.id.clone());
-                        if old.decision.as_deref() == Some("escalate") {
-                            set.decision = old.decision.clone();
+                        if old.state.decision == Decision::Escalated {
+                            set.state.decision = Decision::Escalated;
                             set.reason = old.reason.clone();
                         }
                         set.recommendations = old.recommendations.as_ref().map(|recs| {
                             recs.iter().filter(|r| matches!((old.tabs.get(r.tab), set.tabs.get(r.tab)), (Some(a), Some(b)) if questions::same_tab(a, b))).cloned().collect()
                         });
                     }
+                    card::sync(&mut set);
                     // Other questions now: the old ones may be told again if they come back.
-                    let gone = std::mem::replace(&mut i.sets[k], set.clone()).id;
-                    i.noted.retain(|n| *n != gone);
+                    i.sets[k] = set.clone();
+                    i.noted.retain(|n| *n != old.id);
+                    i.remember(over.clone());
+                    closed = Some(over);
                     true
                 }
                 None => {
+                    card::sync(&mut set);
                     i.sets.push(set.clone());
                     true
                 }
             };
-            let note = new && !i.noted.contains(&set.id) && set.decision.is_none();
+            let note = new && !i.noted.contains(&set.id) && set.state.decision == Decision::Deciding;
             if note {
                 i.noted.push(set.id.clone());
                 if i.noted.len() > 200 {
                     i.noted.remove(0);
                 }
             }
-            (new, note)
+            (new, note, closed)
         };
         self.publish();
         self.event(if new { "open" } else { "update" }, Some(&set), &set.id);
+        if let Some(c) = &closed {
+            eprintln!("[questions] {} closed: {:?}", c.id, c.state.phase);
+            self.event("closed", None, &c.id);
+        }
         if note {
             eprintln!("[questions] {} ({}) asks: {} ({} tab(s), id {})", set.session, set.kind, set.title, set.tabs.len(), set.id);
             // The brain recommends answers and decides, quietly.
@@ -347,23 +443,24 @@ impl Asks {
             std::thread::spawn(move || brain(&text));
         }
         // No word from the brain in time: a newly shown dialog goes to the user as it is.
-        if new && set.kind != "text" && set.decision.is_none() {
+        if new && set.kind != "text" && set.state.decision == Decision::Deciding {
             let (me, id) = (self.clone(), set.id.clone());
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(40));
-                if let Some(s) = me.get(&id).filter(|s| s.decision.is_none() && s.status == "open") {
-                    me.escalate(&s.id, "no recommendation came in time");
+                if me.get(&id).is_some_and(|s| s.state == card::SetState::default()) {
+                    me.escalate(&id, "no recommendation came in time");
                 }
             });
         }
         set
     }
 
-    /// Closes a session's sets that `which` picks. `over`: the session no
-    /// longer shows them (answered, unblocked, gone), so the same questions
-    /// asked again later are new ones (told to the brain again); without it
-    /// (the user dismissed a dialog still up) they stay known.
-    fn close_where(&self, address: &str, which: impl Fn(&QuestionSet) -> bool, over: bool) {
+    /// Closes a session's sets that `which` picks, each for the reason `why`
+    /// gives. `over`: the session no longer shows them (answered, unblocked,
+    /// gone), so the same questions asked again later are new ones (told to
+    /// the brain again); without it (the user dismissed a dialog still up)
+    /// they stay known.
+    fn close_where(&self, address: &str, which: impl Fn(&QuestionSet) -> bool, why: impl Fn(&QuestionSet) -> CloseWhy, over: bool) {
         let gone: Vec<String> = {
             let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let ids: Vec<String> = i.sets.iter().filter(|s| s.session == address && which(s)).map(|s| s.id.clone()).collect();
@@ -372,7 +469,14 @@ impl Asks {
             if over && (dialog || !i.sets.iter().any(|s| s.session == address)) {
                 i.msgs.remove(address);
             }
-            i.sets.retain(|s| !(s.session == address && which(s)));
+            let (closing, keep): (Vec<QuestionSet>, Vec<QuestionSet>) = std::mem::take(&mut i.sets).into_iter().partition(|s| s.session == address && which(s));
+            i.sets = keep;
+            for mut s in closing {
+                let w = why(&s);
+                // Closing never fails but for a re-read while typing, which isn't closed here.
+                let _ = card::apply(&mut s, &Ev::Close(w));
+                i.remember(s);
+            }
             if over {
                 i.noted.retain(|n| !ids.contains(n));
                 // Its dialogs are over: dismissed ones may come back as new.
@@ -380,6 +484,9 @@ impl Asks {
                     let dismissed: Vec<String> = i.dismissed.iter().filter(|(a, _)| a == address).map(|(_, id)| id.clone()).collect();
                     i.noted.retain(|n| !dismissed.contains(n));
                     i.dismissed.retain(|(a, _)| a != address);
+                    for p in i.past.iter_mut().filter(|p| dismissed.contains(&p.id) && p.state.phase == Phase::Dismissed) {
+                        let _ = card::apply(p, &Ev::Close(CloseWhy::Unblocked));
+                    }
                 }
             }
             ids
@@ -394,13 +501,35 @@ impl Asks {
 
     /// The user dismissed a question set (a text question that isn't one, or one they'll answer in the terminal).
     pub fn dismiss(&self, id: &str) -> Result<()> {
-        let Some(set) = self.get(id) else { bail!("no open question set {id}") };
+        let Some(set) = self.get(id) else {
+            if let Some(p) = self.past(id) {
+                return match &p.state.phase {
+                    Phase::Dismissed => Ok(()),
+                    Phase::Closed { .. } => Ok(()),
+                    _ => bail!("no open question set {id}"),
+                };
+            }
+            bail!("no open question set {id}")
+        };
         // A dialog stays on screen until it's answered there: it stays dismissed until then.
         let dialog = set.kind != "text";
-        if dialog {
-            self.inner.lock().unwrap_or_else(|e| e.into_inner()).dismissed.push((set.session.clone(), id.to_string()));
+        let ev = if dialog { Ev::Dismiss } else { Ev::Close(CloseWhy::Dismissed) };
+        if let Err(e) = set.state.next(&ev) {
+            bail!("{id} can't be dismissed now: {e}");
         }
-        self.close_where(&set.session, |s| s.id == id, !dialog);
+        if dialog {
+            let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            i.dismissed.push((set.session.clone(), id.to_string()));
+            let mut hidden = set.clone();
+            let _ = card::apply(&mut hidden, &Ev::Dismiss);
+            i.remember(hidden);
+            i.sets.retain(|s| s.id != id);
+            drop(i);
+            self.publish();
+            self.event("closed", None, id);
+        } else {
+            self.close_where(&set.session, |s| s.id == id, |_| CloseWhy::Dismissed, true);
+        }
         Ok(())
     }
 
@@ -408,15 +537,20 @@ impl Asks {
     /// its decision (`auto` or `escalate`, with why). For a text question
     /// set the brain also says what it asks; `none`: it asks nothing.
     pub fn recommend(&self, id: &str, v: &Value, decision: Option<&str>, reason: &str, none: bool) -> Result<QuestionSet> {
-        let set = self.get(id).ok_or_else(|| anyhow::anyhow!("no open question set {id}"))?;
-        if set.decision.is_some() {
+        let Some(set) = self.get(id) else {
+            match self.past(id) {
+                Some(p) => bail!("{id} is over: {}", late_of(&p)),
+                None => bail!("no open question set {id}"),
+            }
+        };
+        if set.state.decision != Decision::Deciding {
             bail!("{id} is decided already ({})", set.decision.unwrap_or_default());
         }
         if none {
             if set.kind != "text" {
                 bail!("--none is for a message that turned out to ask nothing; a dialog always asks");
             }
-            self.close_where(&set.session, |s| s.id == id, true);
+            self.close_where(&set.session, |s| s.id == id, |_| CloseWhy::NothingAsked, true);
             eprintln!("[questions] {id}: the brain says {} asks nothing", set.session);
             return Ok(set);
         }
@@ -436,13 +570,16 @@ impl Asks {
             }
             s.recommendations = Some(recs);
             let (d, why) = questions::decide(s, decision, reason, &policy);
-            s.decision = Some(d);
+            card::apply(s, &Ev::Decide { auto: d == "auto" }).map_err(|e| anyhow::anyhow!("{id}: {e}"))?;
             s.reason = why;
             s.clone()
         };
         self.publish();
         self.event("update", Some(&set), id);
-        if set.decision.as_deref() == Some("auto") {
+        if !matches!(set.state.phase, Phase::Open | Phase::Failed { .. }) {
+            // Answered meanwhile (by the user): nothing to answer or announce.
+            eprintln!("[questions] {id}: decided {:?}, but it is {} already", set.state.decision, set.status);
+        } else if set.state.decision == Decision::Auto {
             let me = self.clone();
             let id = id.to_string();
             std::thread::spawn(move || me.auto_answer(&id));
@@ -473,34 +610,40 @@ impl Asks {
             None => questions::picked_line(&set),
         };
         match self.answer_as(id, &answers, true, true) {
-            Ok(_) => {
+            Ok(now) => {
                 let line =
                     format!("answered for you: {picked}, because {}", if set.reason.is_empty() { "it's routine" } else { &set.reason });
                 eprintln!("[questions] {}: {line}", set.session);
                 let (a, l) = (set.session.clone(), line.clone());
                 crate::history::later(move || crate::history::record_session("answered", &a, &l, Some("auto")));
-                if let Some(s) = self.inner.lock().unwrap_or_else(|e| e.into_inner()).sets.iter_mut().find(|s| s.id == id) {
+                if let Some(s) = self.inner.lock().unwrap_or_else(|e| e.into_inner()).sets.iter_mut().find(|s| s.id == now.id) {
                     s.answered_with = picked;
                 }
                 self.publish();
             }
-            Err(e) => match e.downcast_ref::<Held>() {
-                Some(held) => self.escalate(id, &held.0),
-                None => self.escalate(id, &format!("answering it didn't work: {e:#}")),
-            },
+            Err(e) => {
+                if let Some(held) = e.downcast_ref::<Held>() {
+                    self.escalate(&set.id, &held.0);
+                } else if e.downcast_ref::<Late>().is_some() || e.downcast_ref::<Refused>().is_some() {
+                    // Answered (or closed) meanwhile: nothing for the user to do.
+                    eprintln!("[questions] {}: not answering {id} for the user: {e:#}", set.session);
+                } else {
+                    self.escalate(&set.id, &format!("answering it didn't work: {e:#}"));
+                }
+            }
         }
     }
 
-    /// Goes to the user after all.
+    /// Goes to the user after all (unless it can't: answered, the user typing it).
     fn escalate(&self, id: &str, why: &str) {
         let set = {
             let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let Some(s) = i.sets.iter_mut().find(|s| s.id == id) else { return };
-            s.decision = Some("escalate".into());
-            s.reason = why.to_string();
-            if s.status == "failed" || s.status == "answering" {
-                s.status = "open".into();
+            if let Err(e) = card::apply(s, &Ev::Escalate) {
+                eprintln!("[questions] {id} isn't escalated ({why}): {e}");
+                return;
             }
+            s.reason = why.to_string();
             s.clone()
         };
         self.publish();
@@ -539,29 +682,11 @@ impl Asks {
         questions::safe_auto(now, answers).map(|(a, _)| a)
     }
 
-    /// Marks the set `id` as answering, unless answers are going in already
-    /// (one lock for both). False: the tower doesn't track it.
-    fn start_answering(&self, id: &str) -> Result<bool> {
-        let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(s) = i.sets.iter_mut().find(|s| s.id == id) else { return Ok(false) };
-        if s.status == "answering" {
-            bail!("answers are already going in");
-        }
-        s.status = "answering".into();
-        s.error = None;
-        Ok(true)
-    }
-
-    fn set_status(&self, id: &str, status: &str, error: Option<String>) {
-        let set = {
-            let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(s) = i.sets.iter_mut().find(|s| s.id == id) else { return };
-            s.status = status.into();
-            s.error = error;
-            s.clone()
-        };
-        self.publish();
-        self.event("update", Some(&set), id);
+    /// Marks the set `id` as being answered by `by`, unless the table says
+    /// no (answers going in already, answered, not the tower's): one lock for
+    /// the check and the mark. False: the tower doesn't track it.
+    fn start_answering(&self, id: &str, by: Answerer) -> Result<bool, Refused> {
+        Ok(self.transition(id, &Ev::Answer { by })?.is_some())
     }
 
     /// Answers a question set (by id, or a session's address: its dialog is
@@ -575,25 +700,38 @@ impl Asks {
     /// the menu check are applied again to the screen as it is now (a `Held`
     /// error when it must go to the user after all).
     fn answer_as(&self, target: &str, answers: &[Answer], submit: bool, auto: bool) -> Result<QuestionSet> {
-        let known = self.get(target);
+        let by = if auto { Answerer::Tower } else { Answerer::User };
+        let mut known = self.get(target);
         if let Some(k) = &known {
-            if k.status == "answered" {
-                bail!("{} is answered already", k.id);
+            // Answered already, going in, not the tower's: said before anything is read.
+            if let Err(e) = k.state.next(&Ev::Answer { by }) {
+                return Err(match e {
+                    Refused::AnsweredAlready => anyhow::Error::new(Late(format!("already answered: {} is answered already", k.id))),
+                    e => anyhow::Error::new(e).context(k.id.clone()),
+                });
             }
             if k.kind == "text" {
                 return self.reply(k, answers);
+            }
+        } else if let Some(p) = self.past(target) {
+            // A card that is over. Read again (or hidden): what the screen
+            // shows now may still take these answers. Otherwise it says how it ended.
+            match &p.state.phase {
+                Phase::Closed { why: CloseWhy::Replaced { .. } } | Phase::Dismissed if p.kind != "text" => known = Some(p),
+                _ => bail!(Late(late_of(&p))),
             }
         }
         let address = known.as_ref().map(|s| s.session.clone()).unwrap_or_else(|| target.to_string());
         let Some(mut now) = detect(&address) else {
             if let Some(k) = &known {
-                // Answered in the session (or it moved on): the card goes, nothing is typed.
-                self.close_where(&address, |s| s.id == k.id, true);
-                bail!("already answered: {} isn't asking this any more (it was answered or closed in the session)", if k.name.is_empty() { &k.session } else { &k.name });
+                // Answered in the session (or it moved on): its card goes (the one
+                // it was read again as too), nothing is typed.
+                self.close_where(&address, |s| s.kind != "text", |_| CloseWhy::AnsweredElsewhere, true);
+                bail!(Late(CloseWhy::AnsweredElsewhere.late(&k.id, if k.name.is_empty() { &k.session } else { &k.name })));
             }
             if is_set_id(target) {
                 // A card's id, no longer open: its dialog was answered (or closed) meanwhile.
-                bail!("already answered: {target} isn't open any more (it was answered or closed in the session)");
+                bail!(Late(format!("already answered: {target} isn't open any more (it was answered or closed in the session)")));
             }
             bail!("{address} shows no question it can answer now")
         };
@@ -605,6 +743,10 @@ impl Asks {
                 // what was answered is unchanged, so it goes in.
                 eprintln!("[questions] {} is {} read again; the answers still fit", k.id, now.id);
                 now = self.upsert(now);
+                // The tower's own answer carries over to the set it was decided for.
+                if auto && now.state.decision == Decision::Deciding {
+                    let _ = self.transition(&now.id, &Ev::Decide { auto: true });
+                }
             } else {
                 // The card shows what the dialog asks now, keeping what still fits.
                 let shown = self.upsert(now.clone());
@@ -613,10 +755,11 @@ impl Asks {
         }
         let answers = if auto { self.recheck(&now, answers).map_err(Held)? } else { answers.to_vec() };
         // Checked and marked at once: a second answer (the phone, the panel, the tower) waits its turn.
-        let tracked = self.start_answering(&now.id)?;
-        if tracked {
-            self.set_status(&now.id, "answering", None);
-        }
+        let tracked = match self.start_answering(&now.id, by) {
+            Ok(t) => t,
+            Err(Refused::AnsweredAlready) => bail!(Late(format!("already answered: {} is answered already", now.id))),
+            Err(e) => return Err(anyhow::Error::new(e).context(now.id.clone())),
+        };
         let result = {
             let _typing = hc::typing(&address);
             let mut term = questions::Hc { address: address.clone() };
@@ -626,7 +769,11 @@ impl Asks {
             Ok(()) => {
                 eprintln!("[questions] answered {} on {address}", now.id);
                 if tracked {
-                    self.set_status(&now.id, if submit || now.submit_state == "single" { "answered" } else { "open" }, None);
+                    let ev = if submit || now.submit_state == "single" { Ev::Submitted } else { Ev::Filled };
+                    // Closed meanwhile (the dialog went as the keys went in): that's fine.
+                    if let Err(e) = self.transition(&now.id, &ev) {
+                        eprintln!("[questions] {}: {e}", now.id);
+                    }
                 }
                 // The session moves on: read it again shortly.
                 let (me, a) = (self.clone(), address.clone());
@@ -634,16 +781,26 @@ impl Asks {
                     std::thread::sleep(std::time::Duration::from_millis(800));
                     me.refresh(&a);
                 });
-                Ok(now)
+                Ok(self.get(&now.id).unwrap_or(now))
             }
             Err(stop) => {
                 eprintln!("[questions] stopped answering {} on {address}: {stop}", now.id);
-                if tracked {
-                    self.set_status(&now.id, "failed", Some(stop.to_string()));
+                if tracked && let Err(e) = self.transition(&now.id, &Ev::Stopped { error: stop.to_string() }) {
+                    eprintln!("[questions] {}: {e}", now.id);
                 }
                 bail!("stopped at {}", stop)
             }
         }
+    }
+}
+
+/// What a late action on a set that is over is told.
+fn late_of(p: &QuestionSet) -> String {
+    let who = if p.name.is_empty() { &p.session } else { &p.name };
+    match &p.state.phase {
+        Phase::Closed { why } => why.late(&p.id, who),
+        Phase::Dismissed => format!("{} was dismissed; answer it in the session, or by its address ({})", p.id, p.session),
+        _ => format!("{} isn't open any more", p.id),
     }
 }
 
@@ -654,10 +811,19 @@ impl Asks {
         let text = questions::compose_reply(set, answers)?;
         let status = hc::get(&set.session).and_then(|t| hc::status_word(&t)).unwrap_or_default();
         let queued = !matches!(status.as_str(), "idle" | "done");
+        if queued && status.is_empty() {
+            self.close_where(&set.session, |s| s.id == set.id, |_| CloseWhy::SessionGone, true);
+            bail!(Late(CloseWhy::SessionGone.late(&set.id, if set.name.is_empty() { &set.session } else { &set.name })));
+        }
+        // Checked first: nothing is typed or queued for a set that can't take it.
+        let ev = Ev::Reply { queued };
+        if let Some(Err(e)) = self.get(&set.id).map(|s| s.state.next(&ev)) {
+            return Err(match e {
+                Refused::AnsweredAlready => anyhow::Error::new(Late(format!("already answered: {} is answered already", set.id))),
+                e => anyhow::Error::new(e).context(set.id.clone()),
+            });
+        }
         if queued {
-            if status.is_empty() {
-                bail!("{} isn't there any more", set.session);
-            }
             let turn = hc::get(&set.session).as_ref().and_then(turn_of);
             let r = Reply { set: set.id.clone(), text: text.clone(), at_ms: crate::history::now_ms(), turn, last: status.clone() };
             self.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.insert(set.session.clone(), r);
@@ -666,10 +832,22 @@ impl Asks {
         }
         let done = {
             let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(s) = i.sets.iter_mut().find(|s| s.id == set.id) else { bail!("no open question set {}", set.id) };
-            s.status = if queued { "queued".into() } else { "answered".into() };
-            s.answered_with = text.clone();
-            s.clone()
+            match i.sets.iter_mut().find(|s| s.id == set.id) {
+                Some(s) => {
+                    if let Err(e) = card::apply(s, &ev) {
+                        eprintln!("[questions] {}: {e}", set.id);
+                    }
+                    s.answered_with = text.clone();
+                    s.clone()
+                }
+                // Closed meanwhile; the reply went in (or waits) all the same.
+                None => {
+                    let mut s = set.clone();
+                    let _ = card::apply(&mut s, &ev);
+                    s.answered_with = text.clone();
+                    s
+                }
+            }
         };
         self.publish();
         self.event("update", Some(&done), &done.id);
@@ -677,7 +855,7 @@ impl Asks {
         let (me, a, id) = (self.clone(), set.session.clone(), set.id.clone());
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(3));
-            me.close_where(&a, |s| s.id == id, true);
+            me.close_where(&a, |s| s.id == id, |_| CloseWhy::AnsweredHere, true);
         });
         Ok(done)
     }
@@ -756,6 +934,7 @@ pub fn detect(address: &str) -> Option<QuestionSet> {
     let msg = t["status"]["msg"].as_str().unwrap_or("");
     let mut set = questions::build(&addr, &hc::spoken_name(&t), app == "codex", &screen, transcript, msg, &context);
     set.at_ms = crate::history::now_ms();
+    set.created_ms = hc::created_ms(&t);
     Some(set)
 }
 
@@ -957,7 +1136,7 @@ mod tests {
         let won: Vec<bool> = (0..8)
             .map(|_| {
                 let (a, id) = (a.clone(), set.id.clone());
-                std::thread::spawn(move || a.start_answering(&id).is_ok())
+                std::thread::spawn(move || a.start_answering(&id, Answerer::User).is_ok())
             })
             .collect::<Vec<_>>()
             .into_iter()
@@ -965,7 +1144,127 @@ mod tests {
             .collect();
         assert_eq!(won.iter().filter(|w| **w).count(), 1, "{won:?}");
         assert_eq!(a.get(&set.id).unwrap().status, "answering");
-        assert!(!a.start_answering("q000000000000").unwrap(), "untracked: nothing to mark");
+        assert!(!a.start_answering("q000000000000", Answerer::User).unwrap(), "untracked: nothing to mark");
+    }
+
+    fn phase(a: &Asks, id: &str) -> Phase {
+        a.get(id).or_else(|| a.past(id)).map(|s| s.state.phase).unwrap()
+    }
+    fn ans0() -> Vec<Answer> {
+        vec![Answer { tab: 0, choice: json!(0), attachments: vec![] }]
+    }
+
+    #[test]
+    fn answered_in_the_terminal_closes_the_card_and_a_late_answer_says_so() {
+        let (a, _) = asks();
+        let set = perm("approve Bash: touch /tmp/qfix-perm-test");
+        a.upsert(set.clone());
+        // The user answered it in the terminal: the session works again.
+        a.seen("t37", &Value::Null, "working");
+        assert!(a.list().is_empty());
+        assert_eq!(phase(&a, &set.id), Phase::Closed { why: CloseWhy::Unblocked });
+        // The phone's card, a moment late: told it was answered, nothing typed (no hc asked).
+        let e = a.answer(&set.id, &ans0(), true).unwrap_err();
+        assert!(e.downcast_ref::<Late>().is_some() && format!("{e:#}").starts_with("already answered"), "{e:#}");
+        assert!(a.dismiss(&set.id).is_ok(), "dismissing what is over is fine");
+    }
+
+    #[test]
+    fn a_session_that_ends_takes_its_cards() {
+        let (a, _) = asks();
+        let set = perm("approve Bash: touch /tmp/qfix-perm-test");
+        a.upsert(set.clone());
+        let mut text = questions::text_set("t37", "qfix perm", "Done. Should I also push it?", "");
+        text.at_ms = 1;
+        a.upsert(text.clone());
+        assert_eq!(a.list().len(), 2);
+        a.seen("t37", &Value::Null, "");
+        assert!(a.list().is_empty());
+        assert_eq!(phase(&a, &set.id), Phase::Closed { why: CloseWhy::SessionGone });
+        assert_eq!(phase(&a, &text.id), Phase::Closed { why: CloseWhy::SessionGone });
+        let e = a.answer(&text.id, &ans0(), true).unwrap_err();
+        assert!(format!("{e:#}").contains("isn't there any more"), "{e:#}");
+    }
+
+    #[test]
+    fn a_card_answered_by_the_tower_closes_as_answered_here() {
+        let (a, _) = asks();
+        let set = perm("approve Bash: touch /tmp/qfix-perm-test");
+        a.upsert(set.clone());
+        assert_eq!(a.start_answering(&set.id, Answerer::User), Ok(true));
+        assert_eq!(a.transition(&set.id, &Ev::Submitted).unwrap().unwrap().status, "answered");
+        a.seen("t37", &Value::Null, "working");
+        assert_eq!(phase(&a, &set.id), Phase::Closed { why: CloseWhy::AnsweredHere });
+        let e = a.answer(&set.id, &ans0(), true).unwrap_err();
+        assert!(format!("{e:#}").starts_with("already answered"), "{e:#}");
+    }
+
+    #[test]
+    fn a_card_being_answered_isnt_replaced_until_its_keys_are_in() {
+        let (a, _) = asks();
+        let (mut half, mut whole) = gutter_sets();
+        half.session = "t-qfix-nowhere-1".into();
+        whole.session = half.session.clone();
+        a.upsert(half.clone());
+        assert_eq!(a.start_answering(&half.id, Answerer::User), Ok(true));
+        // Read whole while the keys go in: the card stays as it is.
+        let shown = a.upsert(whole.clone());
+        assert_eq!(shown.id, half.id);
+        assert_eq!(a.list().iter().map(|s| (s.id.clone(), s.status.clone())).collect::<Vec<_>>(), [(half.id.clone(), "answering".to_string())]);
+        // A second answer meanwhile: one at a time.
+        assert_eq!(a.start_answering(&half.id, Answerer::User), Err(Refused::AlreadyGoingIn));
+        // Filled without submitting: open again, and now the re-read replaces it.
+        a.transition(&half.id, &Ev::Filled).unwrap();
+        let shown = a.upsert(whole.clone());
+        assert_eq!((shown.id.as_str(), shown.replaces.as_deref()), (whole.id.as_str(), Some(half.id.as_str())));
+        assert_eq!(phase(&a, &half.id), Phase::Closed { why: CloseWhy::Replaced { by: whole.id.clone() } });
+        // An answer to the old card follows it to the screen (no dialog there: answered meanwhile).
+        let e = a.answer(&half.id, &ans0(), true).unwrap_err();
+        assert!(format!("{e:#}").starts_with("already answered"), "{e:#}");
+        assert!(a.list().is_empty(), "the new card closed with it");
+    }
+
+    #[test]
+    fn the_same_set_read_again_keeps_where_it_stands() {
+        let (a, _) = asks();
+        let set = perm("approve Bash: touch /tmp/qfix-perm-test");
+        a.upsert(set.clone());
+        a.start_answering(&set.id, Answerer::User).unwrap();
+        a.transition(&set.id, &Ev::Stopped { error: "the dialog moved".into() }).unwrap();
+        let again = a.upsert(set.clone());
+        assert_eq!((again.status.as_str(), again.error.as_deref()), ("failed", Some("the dialog moved")), "still failed: try again");
+        assert_eq!(a.start_answering(&set.id, Answerer::User), Ok(true), "and it may be tried again");
+    }
+
+    #[test]
+    fn the_tower_answers_only_what_it_decided_and_never_over_the_user() {
+        let (a, _) = asks();
+        let set = perm("approve Bash: touch /tmp/qfix-perm-test");
+        a.upsert(set.clone());
+        assert_eq!(a.start_answering(&set.id, Answerer::Tower), Err(Refused::NotTheTowers));
+        // The user is typing; the tower's timeout (or a failed auto answer) can't take it away.
+        a.start_answering(&set.id, Answerer::User).unwrap();
+        a.escalate(&set.id, "no recommendation came in time");
+        let s = a.get(&set.id).unwrap();
+        assert_eq!((s.status.as_str(), s.decision.as_deref()), ("answering", None));
+        assert!(a.dismiss(&set.id).is_err(), "not hidden while its keys go in");
+        // Decided while the user answered: the decision is kept, nothing else happens.
+        a.transition(&set.id, &Ev::Submitted).unwrap();
+        let recs = json!([{"tab": 0, "options": [{"label": "Yes", "why": "", "choice": 0}]}]);
+        let s = a.recommend(&set.id, &recs, Some("auto"), "routine", false).unwrap();
+        assert_eq!((s.status.as_str(), s.decision.as_deref()), ("answered", Some("auto")));
+        assert!(a.recommend(&set.id, &recs, Some("auto"), "again", false).is_err(), "decided once");
+    }
+
+    #[test]
+    fn a_dismissed_dialog_closes_when_it_goes() {
+        let (a, _) = asks();
+        let set = perm("approve Bash: touch /tmp/qfix-perm-test");
+        a.upsert(set.clone());
+        a.dismiss(&set.id).unwrap();
+        assert_eq!(phase(&a, &set.id), Phase::Dismissed);
+        a.seen("t37", &Value::Null, "idle");
+        assert_eq!(phase(&a, &set.id), Phase::Closed { why: CloseWhy::Unblocked });
     }
 
     #[test]
