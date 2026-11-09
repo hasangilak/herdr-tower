@@ -110,7 +110,9 @@ impl Book {
     /// A report owed without a watch (an open job). Once per address and
     /// status; a note (the send queue's) once per text.
     pub fn owe(&mut self, p: Pending) -> bool {
-        let same = |o: &Pending| if p.kind == "queue" { o.msg == p.msg } else { o.address == p.address && o.status == p.status && o.kind != "queue" };
+        // Notes (the send queue's, the agenda ledger's) are one per text.
+        let note = |k: &str| k == "queue" || k == "agenda";
+        let same = |o: &Pending| if note(&p.kind) { o.msg == p.msg } else { o.address == p.address && o.status == p.status && !note(&o.kind) };
         if self.outbox.iter().any(same) {
             return false;
         }

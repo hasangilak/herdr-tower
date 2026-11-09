@@ -73,6 +73,15 @@ pub enum Request {
         /// `start`: the `tower start` arguments for a session started once `after` is done.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         start: Vec<String>,
+        /// How it goes into the agenda ledger (`add`, `start`, `track`): which agenda, its title.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<crate::agenda::Tag>,
+    },
+    /// The agenda ledger: `list`, `tasks`, `show`, `open`, `close`, `abandon`,
+    /// `verify`, `fail`, `requeue`, `judge` (`tower job done|failed`).
+    Agenda {
+        #[serde(flatten)]
+        ledger: crate::agenda::Cmd,
     },
     /// An agent session's hook fired (`tower hook agent`).
     Agent {
@@ -145,7 +154,7 @@ pub fn send(req: &Request) -> Result<Response> {
 fn wait_for(req: &Request) -> Duration {
     match req {
         Request::Answer { .. } => Duration::from_secs(180),
-        Request::Queue { .. } => Duration::from_secs(90),
+        Request::Queue { .. } | Request::Agenda { .. } => Duration::from_secs(90),
         _ => Duration::from_secs(10),
     }
 }

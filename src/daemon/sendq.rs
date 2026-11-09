@@ -737,6 +737,38 @@ impl SendQueue {
         }
     }
 
+    /// What the queue knows about one of its ids (for the agenda ledger).
+    pub fn fact(&self, id: u64) -> crate::agenda::QueueFact {
+        use crate::agenda::QueueFact;
+        let b = self.lock();
+        if let Some(i) = b.items.iter().find(|i| i.id == id) {
+            return match i.state() {
+                ItemState::Claimed { .. } => QueueFact::Claimed,
+                ItemState::Parked(why) => QueueFact::Waiting { session: i.session.clone(), parked: Some(why.word().to_string()), start: !i.start.is_empty() },
+                _ => QueueFact::Waiting { session: i.session.clone(), parked: None, start: !i.start.is_empty() },
+            };
+        }
+        if let Some(d) = b.delivered.iter().find(|d| d.id == id) {
+            // The session's next hand-over after this one: its turn was over by then.
+            let next_ms = b.delivered.iter().filter(|o| o.session == d.session && o.id != d.id && o.at_ms > d.at_ms).map(|o| o.at_ms).min();
+            return QueueFact::Delivered {
+                session: d.session.clone(),
+                at_ms: d.at_ms,
+                turn_before: d.turn_before,
+                taken: d.taken,
+                finished: d.finished,
+                next_ms,
+            };
+        }
+        if b.cancelled.contains(&id) {
+            return QueueFact::Cancelled;
+        }
+        if let Some(i) = b.expired.iter().find(|i| i.id == id) {
+            return QueueFact::Expired { why: i.parked.as_ref().map(|p| p.word().to_string()).unwrap_or_default() };
+        }
+        QueueFact::Unknown
+    }
+
     /// Everything waiting, oldest first.
     pub fn items(&self) -> Vec<Item> {
         self.lock().items.clone()
@@ -1382,6 +1414,33 @@ mod tests {
         for d in &mut q.lock().delivered {
             d.at_ms = d.at_ms.min(then);
         }
+    }
+
+    #[test]
+    fn the_ledger_reads_each_id_as_the_queue_knows_it() {
+        use crate::agenda::QueueFact;
+        let (q, _d) = queue();
+        let h = Fake::default();
+        h.set("t1", "idle");
+        h.set("t2", "working");
+        let (Added::Sent { id: sent }, ..) = q.add_with(&h, "t1", "first", &[]).unwrap() else { panic!("t1 was free") };
+        let (Added::Queued { id: waiting, .. }, ..) = q.add_with(&h, "t2", "second", &[]).unwrap() else { panic!("t2 works") };
+        let (Added::Queued { id: dropped, .. }, ..) = q.add_with(&h, "t2", "third", &[]).unwrap() else { panic!("t2 works") };
+        assert!(matches!(q.fact(sent), QueueFact::Delivered { ref session, next_ms: None, .. } if session == "t1"));
+        assert_eq!(q.fact(waiting), QueueFact::Waiting { session: "t2".into(), parked: None, start: false });
+        q.cancel(dropped).unwrap();
+        assert_eq!(q.fact(dropped), QueueFact::Cancelled);
+        assert_eq!(q.fact(9999), QueueFact::Unknown);
+        // A second hand-over to t1: the first one's turn was over by then.
+        h.turn("t1");
+        settle(&q);
+        q.session_round(&h, "t1");
+        let (Added::Sent { .. }, ..) = q.add_with(&h, "t1", "fourth", &[]).unwrap() else { panic!("t1 is free again") };
+        assert!(matches!(q.fact(sent), QueueFact::Delivered { next_ms: Some(_), .. }));
+        // t2 ends: what waits for it is parked, and the ledger hears why.
+        h.sessions.lock().unwrap().remove("t2");
+        q.session_round(&h, "t2");
+        assert_eq!(q.fact(waiting), QueueFact::Waiting { session: "t2".into(), parked: Some("gone".into()), start: false });
     }
 
     #[test]

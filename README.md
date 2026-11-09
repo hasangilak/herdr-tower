@@ -320,7 +320,9 @@ tower summary <t> "…"                # record what a session has done (the bra
 tower queue <t> "…"                  # an instruction for a session: now if it's free, else the moment it stops working; watched
 tower queue <t> --after 3 "…"        # ... once instruction #3 (on any session) is done
 tower queue list | cancel <id> | retarget <id> <t>   # what waits (in order, kept across restarts, sent once)
-tower dispatch --json '{"tasks":[…]}'   # several tasks: each to its project's session or a new one (--dry-run)
+tower dispatch --json '{"request":"…","tasks":[…]}'   # several tasks: each to its project's session or a new one (--dry-run)
+tower agenda [--all] | tasks         # what the user asked for and isn't finished: each request, its tasks and their state
+tower agenda show|close|abandon|verify|fail|requeue <id> …   # one request (a3) or task (a3.2); close --force drops what's left
 tower sessions [<t>]                 # what each agent session's hooks said: prompt, last answer, state
 tower hooks install|remove|status    # the hooks that let the tower see every Claude Code and Codex session
 tower status                         # the daemon's state
@@ -402,6 +404,24 @@ for **Herdr Core**, because the voice runs in a Herdr terminal.
   a request that reads that way reaches the brain with a `[split?]` note.
   Project names come from the sessions' folders, plus aliases in
   `~/.config/herder-tower/aliases.json` (`{"dashboard": "~/Work/eyz/eyzflow"}`).
+- The agenda ledger (`tower agenda`) keeps every request of the user's that
+  hands out work, in their words, and a task for each instruction it went
+  out as (`dispatch`, `queue` and `start` write them in by themselves;
+  what's handed out while a request is fresh joins its agenda). A
+  reconciler in the voice follows each task through the send queue, Herdr
+  and the agents' hooks: queued, running, blocked (with its question),
+  done-claimed (its last message is compared with what it was asked: a
+  match is verified, anything else waits for the brain's `tower job done`
+  or `tower agenda verify`), failed, stalled (parked, its session exited
+  or vanished, never took it, no progress on its screen for 25 minutes),
+  abandoned. A session that never took its instruction gets it once more.
+  What goes wrong reaches the brain as an `[agenda]` note through the
+  radar's outbox (so the focus treats it as work the user asked for), a
+  request with several tasks says when it's all done, unfinished work is
+  recalled now and then, and the brain's `[radar]` line and `tower digest`
+  end with what is still open. Kept in
+  `~/.local/state/herder-tower/agendas.json`, written whole (synced, then
+  renamed) after every change, so it survives restarts.
 - Codex as the brain: `tower up --brain codex` (it uses Codex's `notify`
   instead of a hook, and runs with `--sandbox danger-full-access
   --ask-for-approval on-request` because `hc` talks to herdr-core over a Unix

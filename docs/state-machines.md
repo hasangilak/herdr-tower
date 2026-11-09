@@ -400,3 +400,63 @@ Where it differs from the design above:
 - **Testing**: `HERDER_TOWER_TEST=1` makes a daemon handle only test sessions
   (`qfix-…`, `tower.test`), the ones the real tower leaves alone (README,
   "How it fits together").
+
+---
+
+## 5. Agendas and their tasks (`src/agenda.rs`, `src/daemon/agendas.rs`)
+
+The ledger above the other machines: one **agenda** per request of the
+user's (their words, the spaces it touches), one **task** per instruction
+it went out as, tied to the send queue's ids (a retry, a re-prompt or a
+follow-up adds an id to the same task). `dispatch`, `queue` (`add`,
+`start`) and `start` (`track`) register in the daemon as the queue takes
+the instruction; what goes out while the user's request is under half an
+hour old joins its agenda, more for a session whose task waits on a
+question is that task again, and work the brain starts on its own gets an
+agenda with `origin: tower`.
+
+```rust
+pub enum TaskState { Queued, Running, Blocked, DoneClaimed, Verified, Failed, Stalled, Abandoned }
+pub enum TaskEv { Delivered{..}, Working, Blocked{question}, Claimed{said}, Verify{how}, Fail{why}, Stall{why}, Requeue{queue_id, text}, Abandon{why} }
+pub enum AgendaState { Open, Done, Closed, Abandoned }
+```
+
+| From | Event | To |
+|---|---|---|
+| queued, stalled | delivered (the queue's id went in; a new session's first task) | running |
+| queued, running, blocked, stalled | the session works (Herdr, hooks) | running |
+| any open | the session is blocked (dialog), or its turn ends asking the user | blocked |
+| any open | its turn ends with a message (Stop hook); another instruction went in after it | done-claimed |
+| done-claimed | the message says it's done and names what it was asked | verified |
+| any open | `tower job done`, `tower agenda verify` | verified |
+| any but verified, abandoned | it says it couldn't, StopFailure, `tower job failed`, `tower agenda fail` | failed |
+| any open | parked / expired in the queue, the session exited, vanished or is another terminal, error, never took it after a re-send, no progress 25 min, an id the queue has no trace of | stalled |
+| any | `tower agenda requeue`, the reconciler's re-send, a follow-up, a parked id retargeted | queued |
+| any but verified | the queue id cancelled, `tower agenda abandon`, `close --force` | abandoned |
+
+Refused moves are values (`Refused::Same`, `Settled`, `NotNow`): once a
+task is failed, verified or abandoned, what its session does next is the
+next task's. An agenda is `done` by itself once every task is verified or
+abandoned (and open again if one is requeued); `closed` and `abandoned`
+are said by hand, and `close` refuses while tasks are unfinished unless
+`--force`.
+
+**The reconciler** runs every 20 s and at once on any hook event or
+registration. Facts are gathered outside the ledger's lock (the queue's
+`fact(id)`, one `hc` lookup per session, the hooks registry, the open
+question cards, and, for a task working a while with no other sign of
+life, a look at its screen with the digits left out); `Ledger::step`
+applies `assess` to each open task; `Ledger::news` says what the brain
+should hear: a task in trouble once per state and reason, after a grace
+(45 s; 3 min for an unverified claim, since the brain usually judges it
+from the watch report; 30 min for a question the user hasn't answered),
+an agenda of two tasks or more when it is all done, and up to three
+reminders, six hours apart, of what was told and is still unfinished.
+Notes go through the radar's outbox as kind `agenda` (`News::Asked`: from
+a space out of focus they come through, marked).
+
+**Restart**: the ledger is written whole after every change (a synced
+temporary file, then a rename); an unreadable file is kept aside. At start
+the reconciler waits for the radar's and the queue's own reconcile, then
+looks at every open task again: what ended or finished while the voice was
+down moves then.

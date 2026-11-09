@@ -332,7 +332,12 @@ fn radar(shared: &Shared) -> String {
     let hours = crate::config::Config::load().map(|c| c.alerts.focus_hours).unwrap_or(8);
     let focus = crate::spaces::focus_now(hours);
     let spaces = crate::spaces::load();
-    match crate::spaces::radar_note(&crate::spaces::held(&crate::history::load(), &spaces), focus.as_deref()) {
+    let line = match crate::spaces::radar_note(&crate::spaces::held(&crate::history::load(), &spaces), focus.as_deref()) {
+        Some(note) => format!("{line} {note}"),
+        None => line,
+    };
+    // What the user asked for earlier and isn't finished yet.
+    match super::agendas::radar_note() {
         Some(note) => format!("{line} {note}"),
         None => line,
     }

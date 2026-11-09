@@ -13,8 +13,10 @@
 //! - `after`: the other tasks (by their ids in the plan) that must be done
 //!   first. The send queue holds it until they are.
 //!
-//! Every task is watched when it goes in. It prints one line per task, for
-//! the brain to tell the user in a sentence.
+//! Every task is watched when it goes in, and the whole plan is one agenda in
+//! the ledger (`crate::agenda`), with the user's words (`request`), so no
+//! task of it is lost. It prints one line per task, for the brain to tell the
+//! user in a sentence.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -31,6 +33,12 @@ use crate::split::{self, Project};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Plan {
+    /// The user's words, as they asked (default: the request the tower heard last).
+    #[serde(default)]
+    pub request: String,
+    /// The agenda it belongs to (`a3`; default: a new one, or the request's).
+    #[serde(default)]
+    pub agenda: Option<String>,
     pub tasks: Vec<Task>,
 }
 
@@ -96,6 +104,8 @@ pub fn run(json_text: &str, dry_run: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
+    // One agenda for the whole plan: the user's words, every task in it.
+    let agenda = open_agenda(&plan);
     // In order: what a task waits for has a queue id before it does.
     let mut ids: BTreeMap<String, u64> = BTreeMap::new();
     let mut lines = vec![];
@@ -103,26 +113,60 @@ pub fn run(json_text: &str, dry_run: bool) -> Result<()> {
     for &i in &order {
         let t = &plan.tasks[i];
         let after: Vec<u64> = t.after.iter().filter_map(|a| ids.get(a).copied()).collect();
-        let (line, id) = match &routes[&t.id] {
-            Route::Queue { session } => queue(session, &t.instruction, &after)?,
+        let title = if t.title.is_empty() { t.id.clone() } else { t.title.clone() };
+        let tag = crate::agenda::Tag {
+            agenda: agenda.clone(),
+            title: title.clone(),
+            plan_id: t.id.clone(),
+            after: t.after.clone(),
+            project: t.project.clone(),
+            space: t.space.clone(),
+            skip: false,
+        };
+        let (line, id, task) = match &routes[&t.id] {
+            Route::Queue { session } => queue(session, &t.instruction, &after, tag)?,
             Route::Start { name, cwd, worktree } => {
                 let cwd = if *worktree { make_worktree(cwd, name)? } else { cwd.clone() };
-                start(t, name, &cwd, &after)?
+                start(t, name, &cwd, &after, tag)?
             }
         };
         ids.insert(t.id.clone(), id);
-        let title = if t.title.is_empty() { t.id.clone() } else { t.title.clone() };
         lines.push(format!("{title}: {line}"));
-        rows.push(json!({ "id": t.id, "title": title, "queue_id": id, "what": line }));
+        rows.push(json!({ "id": t.id, "title": title, "queue_id": id, "agenda_task": task, "what": line }));
     }
     if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        if let Some(a) = &agenda {
+            println!("Agenda {a}: every task below is followed until it's done (`tower agenda show {a}`).");
+        }
         for l in &lines {
             println!("{l}");
         }
     } else {
-        println!("{}", serde_json::to_string_pretty(&json!({ "tasks": rows }))?);
+        println!("{}", serde_json::to_string_pretty(&json!({ "agenda": agenda, "tasks": rows }))?);
     }
     Ok(())
+}
+
+/// The plan's agenda in the ledger: the one it names, or one opened for the
+/// user's words (the request's own, when it has one already). None: no voice to keep it.
+fn open_agenda(plan: &Plan) -> Option<String> {
+    if let Some(a) = &plan.agenda {
+        return Some(a.clone());
+    }
+    let titles: Vec<&str> = plan.tasks.iter().map(|t| if t.title.is_empty() { t.id.as_str() } else { t.title.as_str() }).collect();
+    let spaces: Vec<String> = plan.tasks.iter().filter_map(|t| t.space.clone()).collect();
+    let cmd = crate::agenda::Cmd { action: "open".into(), text: plan.request.clone(), title: titles.join("; "), spaces, ..Default::default() };
+    match protocol::send(&Request::Agenda { ledger: cmd }) {
+        Ok(r) if r.ok => r.state.and_then(|v| v["id"].as_str().map(String::from)),
+        Ok(r) => {
+            eprintln!("tower: no agenda for the plan: {}", r.error.unwrap_or_default());
+            None
+        }
+        Err(e) => {
+            eprintln!("tower: no agenda for the plan: {e:#}");
+            None
+        }
+    }
 }
 
 /// The plan makes sense: ids unique, what tasks wait for exists, no loop,
@@ -218,7 +262,7 @@ pub fn route(plan: &Plan, order: &[usize], live: &[Live]) -> Result<BTreeMap<Str
     Ok(out)
 }
 
-fn queue(session: &str, text: &str, after: &[u64]) -> Result<(String, u64)> {
+fn queue(session: &str, text: &str, after: &[u64], tag: crate::agenda::Tag) -> Result<(String, u64, Value)> {
     let r = protocol::send(&Request::Queue {
         action: "add".into(),
         session: session.into(),
@@ -226,6 +270,7 @@ fn queue(session: &str, text: &str, after: &[u64]) -> Result<(String, u64)> {
         id: None,
         after: after.to_vec(),
         start: vec![],
+        tag: Some(tag),
     })?;
     if !r.ok {
         bail!("queueing for {session}: {}", r.error.unwrap_or_default());
@@ -240,38 +285,49 @@ fn queue(session: &str, text: &str, after: &[u64]) -> Result<(String, u64)> {
     } else {
         format!("queued for {who} (#{id}), after {}", after.iter().map(|a| format!("#{a}")).collect::<Vec<_>>().join(", "))
     };
-    Ok((line, id))
+    Ok((line, id, v["task"].clone()))
 }
 
-fn start(t: &Task, name: &str, cwd: &str, after: &[u64]) -> Result<(String, u64)> {
+fn start(t: &Task, name: &str, cwd: &str, after: &[u64], tag: crate::agenda::Tag) -> Result<(String, u64, Value)> {
     let mut args: Vec<String> = vec!["--name".into(), name.into(), "--cwd".into(), cwd.into()];
     for (flag, v) in [("--space", &t.space), ("--account", &t.account), ("--on", &t.on)] {
         if let Some(v) = v {
             args.extend([flag.to_string(), v.clone()]);
         }
     }
-    args.push(t.instruction.clone());
+    // Its place in the agenda (a start held back is the queue's item already: `--no-track`).
+    if let Some(a) = &tag.agenda {
+        args.extend(["--agenda".into(), a.clone()]);
+    }
+    args.extend(["--title".into(), tag.title.clone(), "--plan-id".into(), tag.plan_id.clone()]);
     if !after.is_empty() {
+        let mut held = args.clone();
+        held.push("--no-track".into());
+        held.push(t.instruction.clone());
         let r = protocol::send(&Request::Queue {
             action: "start".into(),
             session: name.into(),
             text: t.instruction.clone(),
             id: None,
             after: after.to_vec(),
-            start: args.clone(),
+            start: held,
+            tag: Some(tag),
         })?;
         if !r.ok {
             bail!("queueing the start of {name}: {}", r.error.unwrap_or_default());
         }
-        let id = r.state.unwrap_or_default()["id"].as_u64().unwrap_or(0);
+        let v = r.state.unwrap_or_default();
+        let id = v["id"].as_u64().unwrap_or(0);
         return Ok((
             format!(
                 "a new session {name} in {cwd}, started once {} is done (#{id})",
                 after.iter().map(|a| format!("#{a}")).collect::<Vec<_>>().join(", ")
             ),
             id,
+            v["task"].clone(),
         ));
     }
+    args.push(t.instruction.clone());
     let me = std::env::current_exe()?;
     let mut cmd = Command::new(me);
     cmd.arg("start").args(&args);
@@ -281,18 +337,25 @@ fn start(t: &Task, name: &str, cwd: &str, after: &[u64]) -> Result<(String, u64)
     }
     let v: Value = serde_json::from_str(out.stdout.trim()).unwrap_or_default();
     let address = v["address"].as_str().unwrap_or(name).to_string();
-    // Something later tasks can wait for.
-    let r = protocol::send(&Request::Queue {
-        action: "track".into(),
-        session: address.clone(),
-        text: t.instruction.clone(),
-        id: None,
-        after: vec![],
-        start: vec![],
-    })?;
-    let id = r.state.unwrap_or_default()["id"].as_u64().unwrap_or(0);
+    // `tower start` gave it an id later tasks can wait for (and its place in the agenda).
+    let (id, task) = match v["queue_id"].as_u64() {
+        Some(id) if id > 0 => (id, v["task"].clone()),
+        _ => {
+            let r = protocol::send(&Request::Queue {
+                action: "track".into(),
+                session: address.clone(),
+                text: t.instruction.clone(),
+                id: None,
+                after: vec![],
+                start: vec![],
+                tag: Some(tag),
+            })?;
+            let s = r.state.unwrap_or_default();
+            (s["id"].as_u64().unwrap_or(0), s["task"].clone())
+        }
+    };
     let space = v["space"].as_str().map(|s| format!(" in space \"{s}\"")).unwrap_or_default();
-    Ok((format!("started {name} as {address}{space}, in {cwd}, watched (#{id})"), id))
+    Ok((format!("started {name} as {address}{space}, in {cwd}, watched (#{id})"), id, task))
 }
 
 /// A git worktree beside the project for a session of its own: `<project>-<name>`
@@ -418,15 +481,15 @@ mod tests {
     #[test]
     fn a_plan_is_checked_and_ordered() {
         let tmp = std::env::temp_dir().to_string_lossy().into_owned();
-        let plan = Plan { tasks: vec![task("c", &tmp, &["a", "b"]), task("a", &tmp, &[]), task("b", &tmp, &["a"])] };
+        let plan = Plan { request: String::new(), agenda: None, tasks: vec![task("c", &tmp, &["a", "b"]), task("a", &tmp, &[]), task("b", &tmp, &["a"])] };
         let order = check(&plan).unwrap();
         let ids: Vec<&str> = order.iter().map(|&i| plan.tasks[i].id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b", "c"]);
-        let looped = Plan { tasks: vec![task("a", &tmp, &["b"]), task("b", &tmp, &["a"])] };
+        let looped = Plan { request: String::new(), agenda: None, tasks: vec![task("a", &tmp, &["b"]), task("b", &tmp, &["a"])] };
         assert!(check(&looped).unwrap_err().to_string().contains("loop"));
-        let unknown = Plan { tasks: vec![task("a", &tmp, &["zz"])] };
+        let unknown = Plan { request: String::new(), agenda: None, tasks: vec![task("a", &tmp, &["zz"])] };
         assert!(check(&unknown).is_err());
-        let twice = Plan { tasks: vec![task("a", &tmp, &[]), task("a", &tmp, &[])] };
+        let twice = Plan { request: String::new(), agenda: None, tasks: vec![task("a", &tmp, &[]), task("a", &tmp, &[])] };
         assert!(check(&twice).is_err());
     }
 
@@ -444,13 +507,13 @@ mod tests {
         let mut iso = task("c", &api, &[]);
         iso.isolate = true;
         iso.title = "Rewrite the auth module".into();
-        let plan = Plan { tasks: vec![task("a", &api, &[]), task("b", &web, &["a"]), iso] };
+        let plan = Plan { request: String::new(), agenda: None, tasks: vec![task("a", &api, &[]), task("b", &web, &["a"]), iso] };
         let order = check(&plan).unwrap();
         let r = route(&plan, &order, &live).unwrap();
         assert_eq!(r["a"], Route::Queue { session: "t5".into() });
         assert!(matches!(&r["b"], Route::Start { name, worktree: false, .. } if name == "webapp-task"));
         assert!(matches!(&r["c"], Route::Start { name, worktree: true, .. } if name == "api-rewrite-auth"));
-        let missing = Plan { tasks: vec![task("a", "/no/such/folder", &[])] };
+        let missing = Plan { request: String::new(), agenda: None, tasks: vec![task("a", "/no/such/folder", &[])] };
         assert!(route(&missing, &[0], &live).is_err());
         let _ = std::fs::remove_dir_all(&base);
     }

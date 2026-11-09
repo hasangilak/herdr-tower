@@ -1,5 +1,6 @@
 //! `tower daemon`: the ears, the mouth and the radar, behind a Unix socket.
 
+pub mod agendas;
 pub mod asks;
 pub mod card;
 mod book;
@@ -41,6 +42,7 @@ struct Daemon {
     lan: lan::Lan,
     asks: asks::Asks,
     sendq: sendq::SendQueue,
+    agendas: agendas::Agendas,
 }
 
 pub fn run() -> Result<()> {
@@ -151,7 +153,10 @@ pub fn run() -> Result<()> {
         });
     }
     sendq.start();
-    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks, sendq };
+    // The agenda ledger: what the user asked for, followed until it's done.
+    let agendas = agendas::Agendas::open();
+    agendas.start(agendas::Ctx { sendq: sendq.clone(), watches: watches.clone(), asks: asks.clone(), shared: shared.clone() });
+    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks, sendq, agendas };
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let d = daemon.clone();
@@ -261,15 +266,19 @@ impl Daemon {
                     Err(e) => Response::err(format!("{e:#}")),
                 };
             }
-            Request::Queue { action, session, text, id, after, start } => {
+            Request::Queue { action, session, text, id, after, start, tag } => {
                 if action == "start" {
                     return match self.sendq.add_start(&session, &text, &start, &after) {
-                        Ok(id) => Response { ok: true, error: None, state: Some(serde_json::json!({ "id": id, "name": session })) },
+                        Ok(id) => {
+                            let r = self.ledger(id, "", &session, &text, tag);
+                            Response { ok: true, error: None, state: Some(with_agenda(serde_json::json!({ "id": id, "name": session }), r)) }
+                        }
                         Err(e) => Response::err(format!("{e:#}")),
                     };
                 }
-                return self.queue(&action, &session, &text, id, &after);
+                return self.queue(&action, &session, &text, id, &after, tag);
             }
+            Request::Agenda { ledger } => return self.agendas.request(&ledger),
             Request::Agent { event } => {
                 // Only the terminal's own agent speaks for it (not a `claude -p` it runs).
                 let foreground = crate::hc::get(&event.terminal).and_then(|t| t["foreground"]["pid"].as_u64());
@@ -281,6 +290,8 @@ impl Daemon {
                 if change != sessions::Change::Nothing {
                     self.watches.agent(&event, &change);
                     self.sendq.kick();
+                    // A turn that ends is judged at once, before the next instruction follows it in.
+                    self.agendas.kick();
                 }
                 return Response { ok: true, error: None, state: None };
             }
@@ -417,7 +428,12 @@ impl Daemon {
 
 impl Daemon {
     /// `tower queue`: add (sent now when the session is free), list, cancel.
-    fn queue(&self, action: &str, session: &str, text: &str, id: Option<u64>, after: &[u64]) -> Response {
+    /// The agenda ledger takes on what the queue just did.
+    fn ledger(&self, queue_id: u64, session: &str, name: &str, text: &str, tag: Option<crate::agenda::Tag>) -> Option<crate::agenda::Registered> {
+        self.agendas.register(crate::agenda::Reg { queue_id, session: session.into(), name: name.into(), text: text.into(), tag: tag.unwrap_or_default() })
+    }
+
+    fn queue(&self, action: &str, session: &str, text: &str, id: Option<u64>, after: &[u64], tag: Option<crate::agenda::Tag>) -> Response {
         let ok = |v: serde_json::Value| Response { ok: true, error: None, state: Some(v) };
         match action {
             "retarget" => match id.map(|id| self.sendq.retarget(id, session)) {
@@ -426,13 +442,24 @@ impl Daemon {
                 None => Response::err("retarget needs an id and a session"),
             },
             "track" => match self.sendq.track(session, text) {
-                Ok(id) => ok(serde_json::json!({ "id": id, "session": session })),
+                Ok(id) => {
+                    let name = crate::hc::get(session).map(|t| crate::hc::spoken_name(&t)).unwrap_or_default();
+                    let r = self.ledger(id, session, &name, text, tag);
+                    ok(with_agenda(serde_json::json!({ "id": id, "session": session }), r))
+                }
                 Err(e) => Response::err(format!("{e:#}")),
             },
             "add" => match self.sendq.add(session, text, after) {
-                Ok((sendq::Added::Sent { id }, address, name)) => ok(serde_json::json!({ "sent": true, "id": id, "session": address, "name": name })),
+                Ok((sendq::Added::Sent { id }, address, name)) => {
+                    let r = self.ledger(id, &address, &name, text, tag);
+                    ok(with_agenda(serde_json::json!({ "sent": true, "id": id, "session": address, "name": name }), r))
+                }
                 Ok((sendq::Added::Queued { id, position, status }, address, name)) => {
-                    ok(serde_json::json!({ "sent": false, "id": id, "position": position, "status": status, "session": address, "name": name }))
+                    let r = self.ledger(id, &address, &name, text, tag);
+                    ok(with_agenda(
+                        serde_json::json!({ "sent": false, "id": id, "position": position, "status": status, "session": address, "name": name }),
+                        r,
+                    ))
                 }
                 Err(e) => Response::err(format!("{e:#}")),
             },
@@ -445,6 +472,16 @@ impl Daemon {
             _ => Response::err("queue is add, list, cancel or retarget"),
         }
     }
+}
+
+/// An answer with where its task went in the agenda ledger.
+fn with_agenda(mut v: serde_json::Value, r: Option<crate::agenda::Registered>) -> serde_json::Value {
+    if let Some(r) = r {
+        v["agenda"] = r.agenda.into();
+        v["task"] = r.task.into();
+        v["agenda_how"] = r.how.into();
+    }
+    v
 }
 
 fn ack_delay(cfg: &Config) -> Option<Duration> {
