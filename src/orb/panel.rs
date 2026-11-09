@@ -1535,6 +1535,7 @@ impl Panel {
 
     fn set_focus(&mut self, focus: Option<String>, cx: &mut Context<Self>) {
         self.tower.update(cx, |t, cx| {
+            t.spaces.focus_ms = focus.is_some().then(history::now_ms);
             t.spaces.focus = focus;
             t.save_spaces();
             cx.notify();

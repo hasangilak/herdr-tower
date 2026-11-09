@@ -676,7 +676,7 @@ impl Radar {
     /// How news of `kind` and `status` from `space` goes with the focus as
     /// it is now, and the focus (empty: none).
     fn gate(&self, space: Option<&str>, status: &str, kind: &str) -> (crate::spaces::Gate, String) {
-        let focus = crate::spaces::load().focus;
+        let focus = crate::spaces::focus_now(self.alerts.focus_hours);
         let news = crate::spaces::News::of(kind, status);
         (crate::spaces::gate(space, focus.as_deref(), news, self.alerts.held_urgent), focus.unwrap_or_default())
     }

@@ -184,6 +184,9 @@ pub struct Alerts {
     /// With a space in focus, news from other spaces is held; but an agent
     /// there needing the user still rings the bell and says "<space> needs you".
     pub held_urgent: bool,
+    /// A focus ends this many hours after it was set (0: never), so a focus
+    /// left on doesn't keep holding other spaces' news for days.
+    pub focus_hours: u64,
 }
 
 impl Default for Config {
@@ -264,7 +267,7 @@ impl Default for Lan {
 
 impl Default for Alerts {
     fn default() -> Self {
-        Self { blocked: true, done: false, remote_poll_secs: 15, show_sessions: true, held_urgent: true }
+        Self { blocked: true, done: false, remote_poll_secs: 15, show_sessions: true, held_urgent: true, focus_hours: 8 }
     }
 }
 

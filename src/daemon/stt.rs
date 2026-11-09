@@ -329,8 +329,10 @@ fn radar(shared: &Shared) -> String {
         let list: Vec<String> = agents.iter().map(radar_entry).collect();
         format!("[radar] {}", list.join("; "))
     };
+    let hours = crate::config::Config::load().map(|c| c.alerts.focus_hours).unwrap_or(8);
+    let focus = crate::spaces::focus_now(hours);
     let spaces = crate::spaces::load();
-    match crate::spaces::radar_note(&crate::spaces::held(&crate::history::load(), &spaces), spaces.focus.as_deref()) {
+    match crate::spaces::radar_note(&crate::spaces::held(&crate::history::load(), &spaces), focus.as_deref()) {
         Some(note) => format!("{line} {note}"),
         None => line,
     }

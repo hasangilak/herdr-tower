@@ -15,7 +15,11 @@
 //!   the send queue's notes): held, not spoken, kept as unread for the
 //!   panel, the phone and "what did I miss".
 //!
-//! No focus: everything is spoken, as before.
+//! No focus: everything is spoken, as before. A focus ends by itself
+//! `alerts.focus_hours` (8) after it was set, so one left on doesn't keep
+//! holding news for days; setting it again starts it over. Talking about
+//! another space doesn't move it: work the user starts there comes through
+//! anyway (it is asked for), and its held news is on the radar line.
 //!
 //! `spaces.json` (beside `state.json`, which the orb watches) keeps the
 //! focus, each space's agenda, and how far its held news has been read.
@@ -36,6 +40,10 @@ use crate::history::{self, Entry};
 pub struct Spaces {
     /// The space whose news is spoken; None: every space's.
     pub focus: Option<String>,
+    /// When the focus was set (Unix ms): it ends `alerts.focus_hours` later.
+    /// None for a focus an older tower set: dated when first seen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus_ms: Option<u64>,
     /// What each space is for, set by the user or the brain.
     pub agendas: BTreeMap<String, String>,
     /// Held news up to this time (Unix ms) has been delivered.
@@ -67,6 +75,37 @@ pub fn save_to(ui_dir: &Path, s: &Spaces) {
 
 pub fn save(s: &Spaces) {
     save_to(&config::ui_dir(), s)
+}
+
+/// The focus as it stands at `now`: none once `hours` have passed since it
+/// was set (`hours` 0: it never ends).
+pub fn active_focus(s: &Spaces, now_ms: u64, hours: u64) -> Option<&str> {
+    let f = s.focus.as_deref()?;
+    match s.focus_ms {
+        Some(at) if hours > 0 && now_ms.saturating_sub(at) >= hours * 3_600_000 => None,
+        _ => Some(f),
+    }
+}
+
+/// The focus now, for the daemon: a focus past its hours is cleared (and
+/// said in the log); one an older tower set without a time is dated now.
+pub fn focus_now(hours: u64) -> Option<String> {
+    let mut s = load();
+    let f = s.focus.clone()?;
+    let now = history::now_ms();
+    if s.focus_ms.is_none() {
+        s.focus_ms = Some(now);
+        save(&s);
+        return Some(f);
+    }
+    if active_focus(&s, now, hours).is_none() {
+        eprintln!("[spaces] the focus on {f} ended after {hours} h: every space's news is spoken again");
+        s.focus = None;
+        s.focus_ms = None;
+        save(&s);
+        return None;
+    }
+    Some(f)
 }
 
 /// What a piece of news is to the user, for the focus.
@@ -393,6 +432,7 @@ pub fn cmd_focus(space: Option<String>, clear: bool) -> Result<()> {
     let mut s = load();
     if clear {
         s.focus = None;
+        s.focus_ms = None;
         save(&s);
         println!("No focus: news from every space is spoken.");
         return Ok(());
@@ -406,6 +446,7 @@ pub fn cmd_focus(space: Option<String>, clear: bool) -> Result<()> {
     };
     let name = pick(&want)?;
     s.focus = Some(name.clone());
+    s.focus_ms = Some(history::now_ms());
     save(&s);
     let held: usize = unread(&history::load(), &s).iter().filter(|(k, _)| **k != name).map(|(_, v)| v.len()).sum();
     println!(
@@ -442,11 +483,13 @@ pub fn set_focus(space: Option<&str>) -> Result<Option<String>> {
         Some(want) => Some(pick(want)?),
         None => None,
     };
+    s.focus_ms = s.focus.is_some().then(history::now_ms);
     save(&s);
     Ok(s.focus)
 }
 
 fn rows() -> (Option<String>, Vec<Value>) {
+    focus_now(config::Config::load().map(|c| c.alerts.focus_hours).unwrap_or(8));
     let s = load();
     let entries = history::load();
     let live = live();
@@ -691,6 +734,23 @@ fn picks_a_space_by_part_of_its_name() {
         assert!(!note.contains("M5 Pro"), "chatter alone isn't named: {note}");
         // Only chatter held: nothing to say.
         assert_eq!(radar_note(&h[2..], s.focus.as_deref()), None);
+    }
+
+    #[test]
+    fn a_focus_ends_after_its_hours() {
+        let h = 3_600_000;
+        let mut s = Spaces { focus: Some("B2C support".into()), focus_ms: Some(10 * h), ..Default::default() };
+        assert_eq!(active_focus(&s, 10 * h, 8), Some("B2C support"));
+        assert_eq!(active_focus(&s, 17 * h + 59 * 60_000, 8), Some("B2C support"));
+        assert_eq!(active_focus(&s, 18 * h, 8), None, "8 hours on: over");
+        assert_eq!(active_focus(&s, 1000 * h, 0), Some("B2C support"), "0: never ends");
+        // Set by an older tower, without a time: it stands (dated when the daemon sees it).
+        s.focus_ms = None;
+        assert_eq!(active_focus(&s, 1000 * h, 8), Some("B2C support"));
+        // An older spaces.json loads, and a focus without a time isn't written with one.
+        let old: Spaces = serde_json::from_str(r#"{"focus":"B2C support","agendas":{},"read_ms":{},"skipped_ms":{}}"#).unwrap();
+        assert_eq!((old.focus.as_deref(), old.focus_ms), (Some("B2C support"), None));
+        assert!(!serde_json::to_string(&Spaces::default()).unwrap().contains("focus_ms"));
     }
 
     #[test]
