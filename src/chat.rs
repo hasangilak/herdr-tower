@@ -35,6 +35,8 @@ pub fn shown(e: &Entry) -> bool {
         && match e.kind.as_str() {
             "request" | "answer" | "watch" | "alert" | "summary" | "answered" | "behavior" => true,
             "screenshot" => e.path.is_some(),
+            // A PR a session opened: its chip.
+            "pr" => e.id.is_some(),
             "job" => matches!(e.status.as_deref(), Some("done" | "failed" | "error" | "exited" | "blocked")) && !e.text.is_empty(),
             _ => false,
         }
@@ -101,13 +103,16 @@ fn event_text(e: &Entry) -> String {
     }
 }
 
-/// The thread, oldest first. `root`: the attachments folder (for picture URLs).
+/// The thread, oldest first. `root`: the attachments folder (for picture
+/// URLs); `prs`: the PRs by key, as they are now (a chip shows its PR's
+/// state, so it changes in place).
 ///
 /// Each message: `id`, `at`, `role` (`user`, `tower`, `screenshots`,
 /// `event`), `kind` (the history's), `text`, `source` (`mac`, `voice`,
 /// `phone:<device>` for the user; `tower` otherwise), `attachments`,
-/// `screenshots`, and for news and cards `session`, `name`, `status`.
-pub fn thread(lines: &[(usize, Entry)], root: &Path) -> Vec<Value> {
+/// `screenshots`, and for news and cards `session`, `name`, `status`; a PR
+/// chip (`role` `pr`) has `pr`, the PR as it is now (`prs::Pr::view`).
+pub fn thread_with(lines: &[(usize, Entry)], root: &Path, prs: &std::collections::BTreeMap<String, crate::prs::Pr>) -> Vec<Value> {
     let by_id = |id: &str| lines.iter().map(|(_, e)| e).find(|e| e.kind == "screenshot" && e.id.as_deref() == Some(id));
     // Screenshots the tower attached to a message show under it, not on their own.
     let attached: HashSet<&str> = lines.iter().flat_map(|(_, e)| e.shots.iter().map(String::as_str)).collect();
@@ -137,6 +142,16 @@ pub fn thread(lines: &[(usize, Entry)], root: &Path) -> Vec<Value> {
                 "session": e.session, "name": e.name,
             }));
             card = Some((out.len() - 1, e));
+            continue;
+        }
+        if e.kind == "pr" {
+            let key = e.id.clone().unwrap_or_default();
+            out.push(json!({
+                "id": format!("h{n}"), "at": e.at, "updated_at": prs.get(&key).map(|p| p.checked_ms.max(e.at)).unwrap_or(e.at),
+                "role": "pr", "kind": "pr", "text": e.text, "source": "tower", "attachments": [], "screenshots": [],
+                "session": e.session, "name": e.name, "space": e.space,
+                "pr": prs.get(&key).map(crate::prs::Pr::view).unwrap_or_else(|| json!({ "key": key, "title": e.text })),
+            }));
             continue;
         }
         let (role, text, source) = match e.kind.as_str() {
@@ -225,7 +240,7 @@ mod tests {
         .enumerate()
         .map(|(i, x)| (i + 1, x))
         .collect();
-        let t = thread(&lines, root);
+        let t = thread_with(&lines, root, &Default::default());
         let ids: Vec<&str> = t.iter().map(|m| m["id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["h1", "h3", "h5", "h7", "h8", "h9", "h12"], "attached and held entries, notes and running jobs aren't messages");
         assert_eq!((t[0]["role"].as_str(), t[0]["source"].as_str()), (Some("user"), Some("phone:d_1")));
@@ -238,6 +253,30 @@ mod tests {
         assert_eq!(t[4]["source"], "mac", "an old request without a source was typed on the Mac");
         assert_eq!(t[5]["text"], "api finished: all tests pass");
         assert_eq!(t[6]["text"], "t3 (api) is now done. You had asked it: x.");
+    }
+
+    #[test]
+    fn a_pr_chip_shows_its_pr_as_it_is_now() {
+        let mut chip = e("pr", 5, "release: tickets");
+        chip.id = Some("o/app#12".into());
+        chip.session = Some("t58".into());
+        chip.name = Some("mediaroom".into());
+        let lines = vec![(1, e("request", 1, "release it")), (2, chip)];
+        let mut prs = std::collections::BTreeMap::new();
+        let mut pr = crate::prs::Pr { repo: "o/app".into(), number: 12, base: "main".into(), state: "open".into(), waiting: true, checked_ms: 9, ..Default::default() };
+        pr.checks.state = "pending".into();
+        prs.insert(pr.key(), pr.clone());
+        let t = thread_with(&lines, Path::new("/a"), &prs);
+        assert_eq!((t[1]["role"].as_str(), t[1]["id"].as_str(), t[1]["session"].as_str()), (Some("pr"), Some("h2"), Some("t58")));
+        assert_eq!((t[1]["pr"]["key"].as_str(), t[1]["pr"]["waiting"].as_bool(), t[1]["pr"]["checks"]["state"].as_str()), (Some("o/app#12"), Some(true), Some("pending")));
+        assert_eq!(t[1]["updated_at"], 9);
+        // Merged since: the same message, changed (an `update` for the phones), not a new one.
+        pr.state = "merged".into();
+        pr.checked_ms = 20;
+        prs.insert(pr.key(), pr);
+        let t2 = thread_with(&lines, Path::new("/a"), &prs);
+        assert_eq!((t2.len(), t2[1]["id"].as_str(), t2[1]["pr"]["state"].as_str()), (2, Some("h2"), Some("merged")));
+        assert_eq!(t2[1]["pr"]["merge"]["can"], false);
     }
 
     #[test]

@@ -128,13 +128,6 @@ pub fn key(repo: &str, number: u64) -> String {
     format!("{repo}#{number}")
 }
 
-/// `owner/name#123` back into its parts.
-pub fn parse_key(k: &str) -> Option<(String, u64)> {
-    let (repo, n) = k.rsplit_once('#')?;
-    let n = n.parse().ok()?;
-    (repo.split('/').count() == 2 && !repo.starts_with('/') && !repo.ends_with('/')).then(|| (repo.to_string(), n))
-}
-
 // ---- finding them ----
 
 /// Every `github.com/<owner>/<repo>/pull/<n>` in `text`, in order, once each.
@@ -344,14 +337,16 @@ pub fn is_prod(base: &str) -> bool {
 }
 
 pub fn gate(pr: &Pr) -> Gate {
-    let mut g = Gate::default();
-    g.blocked = match () {
+    let mut g = Gate {
+        blocked: match () {
         _ if pr.state == "merged" => Some("It's merged already.".into()),
         _ if pr.state == "closed" => Some("It's closed.".into()),
         _ if pr.state != "open" => Some("GitHub hasn't said where it stands yet.".into()),
         _ if pr.draft => Some("It's a draft: mark it ready for review first.".into()),
         _ if pr.mergeable == "conflicting" => Some(format!("It has conflicts with {}: they need resolving first.", pr.base)),
         _ => None,
+        },
+        ..Default::default()
     };
     if pr.checks.state == "failing" {
         g.needs_override = Some(format!("{}. Merge anyway only if you know the failure is unrelated.", capital(&pr.checks_line())));
@@ -481,6 +476,13 @@ struct File {
 /// What changed, for whoever listens (the phones' `pr` event, the chat).
 pub type OnChange = Box<dyn Fn(&str, &Pr) + Send + Sync>;
 
+/// A PR merged (by mac, phone:<device>, or github for one its session
+/// waited on): the daemon tells the session and the brain.
+pub type OnMerged = Box<dyn Fn(&Pr, &str) + Send + Sync>;
+
+/// A phone's confirmation: the PR's key, the device, the head commit, until when.
+type Token = (String, String, String, u64);
+
 /// The PRs the tower knows, kept in `prs.json`; the daemon's is the only one writing.
 #[derive(Clone)]
 pub struct Prs {
@@ -489,8 +491,9 @@ pub struct Prs {
     inner: Arc<Mutex<BTreeMap<String, Pr>>>,
     version: Arc<AtomicU64>,
     on_change: Arc<OnceLock<OnChange>>,
+    on_merged: Arc<OnceLock<OnMerged>>,
     /// Phone confirmations: token → (key, device, head sha, until).
-    tokens: Arc<Mutex<BTreeMap<String, (String, String, String, u64)>>>,
+    tokens: Arc<Mutex<BTreeMap<String, Token>>>,
     /// Chat entries are written to the history (the daemon's; tests keep none).
     chat: bool,
 }
@@ -543,6 +546,7 @@ impl Prs {
             inner: Arc::new(Mutex::new(f.prs.into_iter().map(|p| (p.key(), p)).collect())),
             version: Arc::default(),
             on_change: Arc::default(),
+            on_merged: Arc::default(),
             tokens: Arc::default(),
             chat: false,
         }
@@ -558,6 +562,21 @@ impl Prs {
 
     pub fn on_change(&self, f: OnChange) {
         let _ = self.on_change.set(f);
+    }
+
+    pub fn on_merged(&self, f: OnMerged) {
+        let _ = self.on_merged.set(f);
+    }
+
+    /// The user merged `key` (from the Mac panel or a phone): GitHub is
+    /// asked, and when it says merged, the chip moves and the session and the
+    /// brain are told (`on_merged`), once.
+    pub fn report_merged(&self, k: &str, by: &str) -> Option<Pr> {
+        let pr = self.merged(k, by)?;
+        if let Some(f) = self.on_merged.get() {
+            f(&pr, by);
+        }
+        Some(pr)
     }
 
     pub fn gh(&self) -> &Path {
@@ -711,8 +730,16 @@ impl Prs {
             all.insert(pr.key(), pr.clone());
             self.save(&all);
         }
+        // Merged on GitHub while its session waited on it: told as a merge.
+        if closed_now
+            && pr.state == "merged"
+            && before.waiting
+            && let Some(f) = self.on_merged.get()
+        {
+            f(&Pr { waiting: true, ..pr.clone() }, "github");
+        }
         // As it was just now: whether its session was waiting on it.
-        closed_now.then(|| Pr { waiting: before.waiting, ..pr })
+        closed_now.then_some(Pr { waiting: before.waiting, ..pr })
     }
 
     /// Merged by the user (`by`: mac, phone:<device>): GitHub is asked; when
@@ -785,7 +812,7 @@ fn getrandom(buf: &mut [u8]) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -879,13 +906,6 @@ mod tests {
     }
 
     #[test]
-    fn keys_go_both_ways() {
-        assert_eq!(parse_key("eyzhub/app#12"), Some(("eyzhub/app".to_string(), 12)));
-        assert_eq!(parse_key("app#12"), None);
-        assert_eq!(parse_key("eyzhub/app#x"), None);
-    }
-
-    #[test]
     fn polled_gently_while_open_and_once_after_it_closes() {
         let mut pr = Pr { state: "open".into(), found_ms: 0, checked_ms: 10 * MIN, ..Default::default() };
         pr.checks.state = "pending".into();
@@ -905,7 +925,7 @@ mod tests {
     /// A fake `gh` in a folder of its own: `pr view N` answers `pr-N.json`,
     /// `repo view` says SQUASH, `pr merge N` marks `pr-N.json` merged; every
     /// call is logged to `calls.log`. Never the real gh: nothing is merged.
-    fn fake_gh(name: &str) -> PathBuf {
+    pub(crate) fn fake_gh(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("tower-prs-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -929,7 +949,7 @@ esac
         script
     }
 
-    fn serve(gh: &Path, n: u64, state: &str, checks: Value, sha: &str) {
+    pub(crate) fn serve(gh: &Path, n: u64, state: &str, checks: Value, sha: &str) {
         let mut v = gh_json(state, "MERGEABLE", checks);
         v["number"] = json!(n);
         v["url"] = json!(format!("https://github.com/o/app/pull/{n}"));
@@ -937,7 +957,7 @@ esac
         std::fs::write(gh.with_file_name(format!("pr-{n}.json")), serde_json::to_string(&v).unwrap()).unwrap();
     }
 
-    fn calls(gh: &Path) -> String {
+    pub(crate) fn calls(gh: &Path) -> String {
         std::fs::read_to_string(gh.with_file_name("calls.log")).unwrap_or_default()
     }
 

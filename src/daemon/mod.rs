@@ -167,17 +167,15 @@ pub fn run() -> Result<()> {
     }
     sendq.start();
     {
-        // Open PRs looked at gently; one merged on GitHub its session waited on: told as a merge.
-        let (prs, sendq, watches) = (prs.clone(), sendq.clone(), watches.clone());
+        // A merge (the user's, or on GitHub one its session waited on): the session and the brain are told.
+        let (sendq, watches) = (sendq.clone(), watches.clone());
+        prs.on_merged(Box::new(move |pr, by| after_merge(&sendq, &watches, pr, by)));
+        // Open PRs looked at gently.
+        let prs = prs.clone();
         thread::Builder::new().name("prs".into()).spawn(move || {
             loop {
                 for k in prs.due(crate::history::now_ms()) {
-                    if let Some(pr) = prs.poll(&k)
-                        && pr.state == "merged"
-                        && pr.waiting
-                    {
-                        after_merge(&sendq, &watches, &pr, "github");
-                    }
+                    prs.poll(&k);
                 }
                 thread::sleep(Duration::from_secs(10));
             }
@@ -375,11 +373,8 @@ impl Daemon {
             Request::BehaviorsChanged { by, change } => self.behaviors_changed(&by, &change),
             Request::PrMerged { pr, by } => {
                 // GitHub says whether it is merged; only then is anyone told.
-                return match self.prs.merged(&pr, &by) {
-                    Some(p) => {
-                        after_merge(&self.sendq, &self.watches, &p, &by);
-                        Response { ok: true, error: None, state: None }
-                    }
+                return match self.prs.report_merged(&pr, &by) {
+                    Some(_) => Response { ok: true, error: None, state: None },
                     None => Response::err(format!("{pr} isn't an open PR the tower knows, or GitHub doesn't say it's merged")),
                 };
             }

@@ -621,9 +621,57 @@ impl Lan {
             }
             // The main chat thread, as the panel shows it: newest last, in pages.
             ("GET", ["chat"]) => {
-                let all = crate::chat::thread(&crate::chat::load(), &crate::history::attachments_dir());
+                let all = crate::chat::thread_with(&crate::chat::load(), &crate::history::attachments_dir(), &self.ctx.prs.map());
                 let (messages, more) = crate::chat::page(&all, q("before"), limit(50).min(200));
                 Response::json(200, &json!({ "messages": messages, "more": more }))
+            }
+            // The PRs sessions opened (see docs/mobile-api.md, "PRs"): open ones and the last day's closed.
+            ("GET", ["prs"]) => {
+                let day_ago = crate::history::now_ms().saturating_sub(24 * 3_600_000);
+                let mut list: Vec<crate::prs::Pr> =
+                    self.ctx.prs.list().into_iter().filter(|p| p.open() || p.closed_ms.is_some_and(|c| c >= day_ago)).collect();
+                list.sort_by_key(|p| (!p.open(), !p.waiting, std::cmp::Reverse(p.found_ms)));
+                Response::json(200, &json!({ "prs": list.iter().map(crate::prs::Pr::view).collect::<Vec<_>>() }))
+            }
+            ("GET", ["prs", owner, repo, n]) => match self.ctx.prs.get(&format!("{owner}/{repo}#{n}")) {
+                Some(p) => Response::json(200, &json!({ "pr": p.view() })),
+                None => Response::error(404, "no_pr", "no PR the tower knows by that name"),
+            },
+            // Merging is the user's, in two steps: what it would do, then do it with the token.
+            ("POST", ["prs", owner, repo, n, "confirm"]) => {
+                let key = format!("{owner}/{repo}#{n}");
+                if self.ctx.prs.get(&key).is_none() {
+                    return Some(Response::error(404, "no_pr", "no PR the tower knows by that name"));
+                }
+                match self.ctx.prs.confirm(&key, &device.id) {
+                    Ok((token, pr, gate, method)) => Response::json(
+                        200,
+                        &json!({
+                            "token": token, "expires_ms": crate::history::now_ms() + 2 * 60_000, "pr": pr.view(), "method": method,
+                            "can": gate.blocked.is_none(), "blocked": gate.blocked, "needs_override": gate.needs_override, "warnings": gate.warnings,
+                        }),
+                    ),
+                    Err(e) => Response::error(503, "github", &format!("GitHub couldn't be asked: {e:#}")),
+                }
+            }
+            ("POST", ["prs", owner, repo, n, "merge"]) => {
+                let key = format!("{owner}/{repo}#{n}");
+                let body = req.json().unwrap_or_default();
+                let token = body["token"].as_str().unwrap_or("");
+                let Some(sha) = self.ctx.prs.take_token(token, &key, &device.id) else {
+                    return Some(Response::error(403, "bad_token", "confirm first (POST …/confirm): the token is missing, used, for another PR or device, or older than two minutes"));
+                };
+                let Some(number) = n.parse::<u64>().ok() else { return Some(Response::error(404, "no_pr", "bad PR number")) };
+                let repo_name = format!("{owner}/{repo}");
+                let override_failing = body["override"].as_bool().unwrap_or(false);
+                match crate::prs::merge(self.ctx.prs.gh(), &repo_name, number, &sha, override_failing) {
+                    Ok(_) => {
+                        eprintln!("[phone] {} merged {key}", device.name);
+                        let pr = self.ctx.prs.report_merged(&key, &format!("phone:{}", device.id)).or_else(|| self.ctx.prs.get(&key));
+                        Response::json(200, &json!({ "merged": true, "pr": pr.map(|p| p.view()) }))
+                    }
+                    Err(r) => Response::error(409, r.code(), r.message()),
+                }
             }
             // Clips this phone may have missed (no stream open): the last 15 minutes; none while muted.
             ("GET", ["audio"]) => {
@@ -1052,7 +1100,9 @@ impl Lan {
         let mut offset = std::fs::metadata(&history).map(|m| m.len()).unwrap_or(0);
         // The chat's latest messages as last sent: a new or changed one is a `chat` event.
         let mut chat = ChatTail::default();
-        chat.diff(&crate::chat::thread(&crate::chat::load(), &crate::history::attachments_dir()));
+        chat.diff(&crate::chat::thread_with(&crate::chat::load(), &crate::history::attachments_dir(), &self.ctx.prs.map()));
+        // A PR's chip changes without the history growing.
+        let mut prs_version = self.ctx.prs.version();
         let (mut last_ping, mut last_check, mut last_history) = (Instant::now(), Instant::now(), Instant::now());
         let (mut drained, mut last_unsent) = (Instant::now(), Instant::now());
         while ok && !stop.load(Ordering::SeqCst) {
@@ -1080,8 +1130,10 @@ impl Lan {
                     }
                     ok = send(w, "history", &e);
                 }
-                if grew {
-                    for (op, m) in chat.diff(&crate::chat::thread(&crate::chat::load(), &crate::history::attachments_dir())) {
+                let prs_changed = self.ctx.prs.version() != prs_version;
+                prs_version = self.ctx.prs.version();
+                if grew || prs_changed {
+                    for (op, m) in chat.diff(&crate::chat::thread_with(&crate::chat::load(), &crate::history::attachments_dir(), &self.ctx.prs.map())) {
                         if !ok {
                             break;
                         }
@@ -1940,6 +1992,10 @@ mod tests {
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     fn test_lan(name: &str) -> (Lan, std::path::PathBuf, SocketAddr, String) {
+        test_lan_with(name, test_prs())
+    }
+
+    fn test_lan_with(name: &str, prs: crate::prs::Prs) -> (Lan, std::path::PathBuf, SocketAddr, String) {
         let dir = std::env::temp_dir().join(format!("tower-lan-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let hub = Arc::new(Hub::default());
@@ -1947,7 +2003,7 @@ mod tests {
         std::mem::forget(rx);
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
-        let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs: test_prs() };
+        let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
         let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
@@ -1977,6 +2033,55 @@ mod tests {
         assert_eq!(call_head(addr, &fp, &wav, b"").unwrap().0, 413);
         let (st, v, _) = call_head(addr, &fp, &format!("POST /v1/hush HTTP/1.1\r\n{auth}Content-Length: 2\r\n\r\n"), b"{}").unwrap();
         assert_eq!((st, v["ok"].as_bool()), (200, Some(true)));
+        lan.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A phone merges a PR a session opened: listed, confirmed (a token for
+    /// this phone, this PR, this commit, once), refused without the second
+    /// confirmation while a check fails, then merged with it; gh is a fake.
+    #[test]
+    fn a_phone_merges_a_pr_in_two_steps() {
+        use crate::prs::tests::{calls, fake_gh, serve};
+        let gh = fake_gh("lan-merge");
+        serve(&gh, 12, "OPEN", json!([{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"FAILURE"}]), "abc");
+        let prs = crate::prs::Prs::at(gh.with_file_name("prs.json"), gh.clone());
+        let merged_hook = Arc::new(Mutex::new(Vec::<String>::new()));
+        let m2 = merged_hook.clone();
+        prs.on_merged(Box::new(move |pr, by| m2.lock().unwrap().push(format!("{} {by}", pr.key()))));
+        prs.found(&[("o/app".into(), 12)], "t58", "mediaroom", Some("b2c-tickets"), true);
+        let (lan, dir, addr, fp) = test_lan_with("prs", prs.clone());
+        let code = lan.pair().unwrap()["code"].as_str().unwrap().to_string();
+        let paired = call(addr, &fp, "POST", "/v1/pair", None, &format!(r#"{{"code":"{code}"}}"#)).unwrap().1;
+        let (token, device) = (paired["token"].as_str().unwrap().to_string(), paired["device"]["id"].as_str().unwrap_or("").to_string());
+        let t = Some(token.as_str());
+        let (st, v) = call(addr, &fp, "GET", "/v1/prs", t, "").unwrap();
+        assert_eq!((st, v["prs"][0]["key"].as_str(), v["prs"][0]["waiting"].as_bool()), (200, Some("o/app#12"), Some(true)));
+        assert_eq!(v["prs"][0]["merge"]["needs_override"].as_str(), Some("1 check failing: lint. Merge anyway only if you know the failure is unrelated."));
+        assert_eq!(call(addr, &fp, "GET", "/v1/prs/o/app/12", t, "").unwrap().1["pr"]["base"], "main");
+        assert_eq!(call(addr, &fp, "GET", "/v1/prs/o/app/99", t, "").unwrap().0, 404);
+        // No token: nothing happens.
+        let (st, v) = call(addr, &fp, "POST", "/v1/prs/o/app/12/merge", t, r#"{"token":"made-up"}"#).unwrap();
+        assert_eq!((st, v["error"]["code"].as_str()), (403, Some("bad_token")));
+        // Confirmed: what it would do; the failing check needs the second confirmation.
+        let (st, c) = call(addr, &fp, "POST", "/v1/prs/o/app/12/confirm", t, "{}").unwrap();
+        assert_eq!((st, c["can"].as_bool(), c["method"].as_str()), (200, Some(true), Some("squash")));
+        assert!(c["warnings"][0].as_str().unwrap().contains("into main"), "{c}");
+        let body = format!(r#"{{"token":"{}"}}"#, c["token"].as_str().unwrap());
+        let (st, v) = call(addr, &fp, "POST", "/v1/prs/o/app/12/merge", t, &body).unwrap();
+        assert_eq!((st, v["error"]["code"].as_str()), (409, Some("needs_override")));
+        // The token went with that try.
+        assert_eq!(call(addr, &fp, "POST", "/v1/prs/o/app/12/merge", t, &body).unwrap().0, 403);
+        assert!(!calls(&gh).contains("pr merge"));
+        // Again, saying the failure is unrelated: merged, the chip moves, the session and the brain are told.
+        let c = call(addr, &fp, "POST", "/v1/prs/o/app/12/confirm", t, "{}").unwrap().1;
+        let body = format!(r#"{{"token":"{}","override":true}}"#, c["token"].as_str().unwrap());
+        let (st, v) = call(addr, &fp, "POST", "/v1/prs/o/app/12/merge", t, &body).unwrap();
+        assert_eq!((st, v["merged"].as_bool(), v["pr"]["state"].as_str()), (200, Some(true), Some("merged")), "{v}");
+        assert_eq!(v["pr"]["merged_by"].as_str().map(String::from), Some(format!("phone:{device}")));
+        assert_eq!(*merged_hook.lock().unwrap(), [format!("o/app#12 phone:{device}")]);
+        let log = calls(&gh);
+        assert!(log.contains("pr merge 12 --repo o/app --squash --match-head-commit abc") && !log.contains("--admin"), "{log}");
         lan.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
