@@ -289,8 +289,17 @@ To connect it:
 
 It is HTTPS only, with a certificate the Mac makes for itself and the phone
 pins (its fingerprint is in the QR); it listens only on the Mac's private LAN
-address; and every call needs the paired phone's token, which the Mac keeps
-only as a hash. The API, the pairing flow and the security model:
+address, and on its **Tailscale** address too while Tailscale runs, so the
+phone reaches the tower from anywhere on your tailnet (never on `0.0.0.0`
+or a public address); and every call needs the paired phone's token, which
+the Mac keeps only as a hash. The QR carries every address (the LAN's
+first, then the tailnet's, with the Mac's MagicDNS name), and the app tries
+them in order. Tailscale is found through its CLI (Homebrew's, or the
+standalone app's own) and looked at again every 20 s: start or stop it and
+the tower follows. `[lan] tailscale = "off"` in config.toml keeps it to the
+LAN. `tower phone devices` and the panel's Settings say which addresses it
+listens on and whether Tailscale is running or stopped. The API, the
+pairing flow and the security model:
 [docs/mobile-api.md](docs/mobile-api.md).
 
 The panel does the same without a terminal: Settings (the gear at its top
@@ -308,7 +317,8 @@ tower ask "what's waiting for me?"   # typed instead of spoken
 tower say "hello"                    # speak anything
 tower agents                         # every agent on every machine, with its account (JSON when piped)
 tower accounts                       # the Claude accounts (from cca)
-tower phone pair                     # pair the Android app (tower phone enable first)
+tower phone pair                     # pair the Android app (tower phone enable first); --json for the payload
+tower phone devices                  # where the phone API listens (LAN, Tailscale), Tailscale running or stopped
 tower screenshot shot.png --caption "…"  # show a visual result in the panel and on the phone
 tower behavior list                  # how the tower works; add, edit, disable, remove, undo
 tower questions                      # what sessions ask now; tower answer <id> --json '[…]', tower dismiss <id>

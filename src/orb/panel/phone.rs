@@ -1,5 +1,5 @@
 //! The panel's Phone view: the phone API for the Android app (on or off,
-//! where it listens), pairing a phone with a QR code of the one-time link,
+//! every address it listens on, and Tailscale: running or stopped), pairing a phone with a QR code of the one-time link,
 //! and the paired phones, each revocable. Everything goes through
 //! `crate::phone`, as `tower phone` does. The code is never logged.
 
@@ -36,6 +36,8 @@ struct Pairing {
     code: String,
     host: String,
     port: u64,
+    /// Every address it carries after the first, as lines (`Tailscale 100.x:7843 (name)`).
+    more: Vec<String>,
     fingerprint: String,
     until: Instant,
     qr: Qr,
@@ -319,7 +321,7 @@ impl Panel {
 
         // On or off, and where.
         let (dot, line, sub) = match (&st.url, st.voice, st.enabled) {
-            (Some(url), _, _) => (0x6eeaa8, "On".to_string(), url.trim_start_matches("https://").to_string()),
+            (Some(url), _, _) => (0x6eeaa8, "On".to_string(), listening_line(url, &st.hosts)),
             (None, false, true) => (0xffcf70, "Enabled".to_string(), "It starts with the voice (tower up).".to_string()),
             (None, false, false) => (0x9aa3b2, "Off".to_string(), "The voice isn't running.".to_string()),
             (None, true, _) => (0x9aa3b2, "Off".to_string(), "Phones can't reach the tower.".to_string()),
@@ -343,6 +345,25 @@ impl Panel {
                 .child(
                     pill("phone-switch", if on { "Turn off" } else { "Turn on" }, !on, busy)
                         .on_click(cx.listener(move |this, _, _, cx| this.phone_switch(!on, cx))),
+                )
+                .into_any_element(),
+        );
+        // Tailscale: whether phones can reach the tower away from the local network.
+        let (ts_dot, ts_line, ts_sub) = tailscale_card(&st);
+        items.push(
+            h_flex()
+                .gap_3()
+                .items_center()
+                .p_3()
+                .rounded(px(14.0))
+                .bg(g.bubble_tower)
+                .child(div().size(px(9.0)).flex_none().rounded_full().bg(rgb(ts_dot)))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().text_base().font_weight(FontWeight::MEDIUM).child(ts_line))
+                        .child(div().text_sm().text_color(g.muted).child(ts_sub)),
                 )
                 .into_any_element(),
         );
@@ -390,6 +411,9 @@ impl Panel {
                                 p.port,
                                 crate::daemon::lan::tls::grouped(&p.fingerprint[..8.min(p.fingerprint.len())])
                             )))
+                            .children(p.more.iter().map(|m| {
+                                div().text_xs().font_family("Menlo").text_color(rgb(0x5b6475)).child(format!("or {m}"))
+                            }))
                             .child(
                                 h_flex()
                                     .gap_2()
@@ -575,12 +599,48 @@ fn pill(id: &'static str, text: &'static str, filled: bool, busy: bool) -> gpui:
 }
 
 /// The daemon's answer to `pair`, ready to show.
+/// Where it listens, in a line: `192.168.1.20:7843 · Tailscale 100.68.110.33:7843`.
+pub(super) fn listening_line(url: &str, hosts: &[crate::phone::Host]) -> String {
+    if hosts.is_empty() {
+        return url.trim_start_matches("https://").to_string();
+    }
+    hosts
+        .iter()
+        .map(|h| if h.kind == "tailscale" { format!("Tailscale {}:{}", h.host, h.port) } else { format!("{}:{}", h.host, h.port) })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// Tailscale's dot, title and line: green when phones can use it, amber
+/// when it runs but isn't listened on, grey when stopped, off or not there.
+pub(super) fn tailscale_card(st: &crate::phone::Status) -> (u32, String, String) {
+    let t = &st.tailscale;
+    let name = t.dns_name.clone().or_else(|| t.ip.clone()).unwrap_or_default();
+    match (t.installed, t.running) {
+        (false, _) => (0x9aa3b2, "Tailscale: not installed".into(), "Phones reach the tower on this network only.".into()),
+        _ if t.mode == "off" => (0x9aa3b2, "Tailscale: not used".into(), "[lan] tailscale = \"off\" in config.toml.".into()),
+        (true, false) => (
+            0x9aa3b2,
+            format!("Tailscale: {}", t.state),
+            "Phones reach the tower on this network only. Start Tailscale to reach it from anywhere.".into(),
+        ),
+        (true, true) if t.listening => (0x6eeaa8, "Tailscale: running".into(), format!("Phones reach the tower from anywhere too: {name}")),
+        (true, true) if st.url.is_none() => (0x6eeaa8, "Tailscale: running".into(), format!("{name}: used once the phone API is on.")),
+        (true, true) => (
+            0xffcf70,
+            "Tailscale: running, not listened on".into(),
+            t.error.clone().map(|e| format!("{e}. Tried again every 20 s.")).unwrap_or_else(|| "Tried again every 20 s.".into()),
+        ),
+    }
+}
+
 fn pairing_of(v: &Value, devices_before: Vec<String>) -> Option<Pairing> {
     let link = v["link"].as_str()?;
     Some(Pairing {
         code: v["code"].as_str()?.to_string(),
         host: v["host"].as_str().unwrap_or("").to_string(),
         port: v["port"].as_u64().unwrap_or(0),
+        more: v["hosts"].as_array().map(|a| a.iter().skip(1).filter_map(crate::phone::Host::of).map(|h| h.line()).collect()).unwrap_or_default(),
         fingerprint: v["fingerprint"].as_str().unwrap_or("").to_string(),
         until: Instant::now() + Duration::from_secs(v["expires_in_s"].as_u64().unwrap_or(CODE_SECS)),
         qr: Qr::new(link)?,
@@ -672,6 +732,7 @@ mod tests {
             url: url.map(String::from),
             pairing_expires_in_s: None,
             devices: ids.iter().map(|i| dev(i)).collect(),
+            ..Default::default()
         };
         let before = vec!["d1".to_string()];
         assert_eq!(pairing_outcome(&before, &st(Some("https://x:1"), &["d1"])), None);
@@ -687,5 +748,43 @@ mod tests {
         assert_eq!((p.code.as_str(), p.host.as_str(), p.port), ("ABCD2345", "10.0.0.2", 7843));
         assert!(p.until > Instant::now() + Duration::from_secs(299));
         assert!(pairing_of(&serde_json::json!({ "error": "off" }), vec![]).is_none());
+        // With the tailnet too: its line under the first address.
+        let v = serde_json::json!({ "code": "ABCD2345", "host": "10.0.0.2", "port": 7843, "fingerprint": "ff".repeat(32),
+            "hosts": [{"kind": "lan", "host": "10.0.0.2", "port": 7843}, {"kind": "tailscale", "host": "100.68.110.33", "port": 7843, "dns_name": "mac.ts.net"}],
+            "link": "herdertower://pair?h=10.0.0.2&p=7843&c=ABCD2345&fp=ff&hosts=lan:10.0.0.2:7843,tailscale:100.68.110.33:7843", "expires_in_s": 300 });
+        assert_eq!(pairing_of(&v, vec![]).unwrap().more, vec!["Tailscale 100.68.110.33:7843 (mac.ts.net)".to_string()]);
+    }
+
+    #[test]
+    fn settings_say_where_it_listens_and_what_tailscale_does() {
+        use crate::phone::{Host, Tailscale};
+        let lan = Host { kind: "lan".into(), host: "192.168.1.20".into(), port: 7843, dns_name: None };
+        let tail = Host { kind: "tailscale".into(), host: "100.68.110.33".into(), port: 7843, dns_name: Some("mac.ts.net".into()) };
+        assert_eq!(listening_line("https://192.168.1.20:7843", &[lan.clone(), tail.clone()]), "192.168.1.20:7843 · Tailscale 100.68.110.33:7843");
+        assert_eq!(listening_line("https://192.168.1.20:7843", &[]), "192.168.1.20:7843");
+        let ts = |installed, running, listening, mode: &str| Tailscale {
+            installed,
+            running,
+            state: if running { "running" } else if installed { "stopped" } else { "not installed" }.into(),
+            ip: Some("100.68.110.33".into()),
+            dns_name: Some("mac.ts.net".into()),
+            mode: mode.into(),
+            listening,
+            error: None,
+        };
+        let st = |t: Tailscale, on: bool| Status { url: on.then(|| "https://192.168.1.20:7843".to_string()), tailscale: t, ..Default::default() };
+        let card = |t, on| tailscale_card(&st(t, on));
+        assert_eq!(card(ts(false, false, false, "auto"), true).1, "Tailscale: not installed");
+        let stopped = card(ts(true, false, false, "auto"), true);
+        assert_eq!((stopped.1.as_str(), stopped.2.contains("Start Tailscale")), ("Tailscale: stopped", true));
+        let up = card(ts(true, true, true, "auto"), true);
+        assert_eq!((up.0, up.2.contains("mac.ts.net")), (0x6eeaa8, true));
+        assert_eq!(card(ts(true, true, false, "auto"), true).0, 0xffcf70, "running but not listened on: amber");
+        assert_eq!(card(ts(true, true, false, "off"), true).1, "Tailscale: not used");
+        // The same, in `tower phone status`.
+        assert!(ts(true, false, false, "auto").line(true).contains("stopped") && ts(true, false, false, "auto").line(true).contains("local network only"));
+        assert!(ts(true, true, true, "auto").line(true).contains("from anywhere"));
+        assert_eq!(lan.line(), "Local network 192.168.1.20:7843");
+        assert_eq!(tail.line(), "Tailscale 100.68.110.33:7843 (mac.ts.net)");
     }
 }

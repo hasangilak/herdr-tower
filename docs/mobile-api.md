@@ -1,6 +1,7 @@
 # The tower's phone API (v1)
 
-The Android app talks to the tower's voice daemon over the local network. It
+The Android app talks to the tower's voice daemon over the local network, and
+over Tailscale while it runs on the Mac (from anywhere on your tailnet). It
 can show everything the orb's panel shows, act on the tower the way the panel
 does, and be the tower's voice: you speak into the phone, the Mac's Whisper
 transcribes it, and the tower's replies come back as text and as Kokoro audio
@@ -17,7 +18,7 @@ The API is **off by default**.
 ```sh
 tower phone enable      # [lan] enabled = true in config.toml, and starts it if the voice runs
 tower phone pair        # a one-time code and a QR for the app
-tower phone devices     # paired phones, and whether one is the voice now
+tower phone devices     # paired phones, where it listens, Tailscale (running or stopped); --json for all of it
 tower phone revoke <id> # or `all`: those tokens stop working at once
 tower phone disable     # stops the API and ends open event streams (phones stay paired)
 ```
@@ -30,11 +31,34 @@ enabled = false
 port = 7843
 bind = "auto"         # this Mac's address on its default-route network, or an IP of this Mac
 allow_public = false  # refuse anything but private/link-local/100.64.0.0/10 (Tailscale) addresses
+tailscale = "auto"    # also listen on this Mac's Tailscale IPv4 while Tailscale runs; "off" not to
 ```
 
-The daemon's `state.json` (and `GET /v1/state`) has `lan`
-(`https://192.168.1.20:7843`, or `""` when off) and `phone` (the name of the
-phone that is the voice, or `null`).
+**Tailscale.** With `tailscale = "auto"` (the default) the API listens on
+two addresses, same port, same certificate: the LAN address as before, and
+this Mac's tailnet IPv4 (100.64.0.0/10) while Tailscale is running. The
+tower finds Tailscale through its CLI (`tailscale` on the PATH, the
+`/usr/local/bin/tailscale` shim, or the standalone app's
+`/Applications/Tailscale.app/Contents/MacOS/Tailscale`): `tailscale status
+--json` for `BackendState`, the IPv4 and the MagicDNS name (`Self.DNSName`),
+`tailscale ip -4` when the status has no address. It looks again every 20 s
+while the API is on: when Tailscale starts, the tailnet address is listened
+on within 20 s; when it stops, that listener closes (the LAN one never
+does). Stopped, logged out or not installed: the LAN only, and `tower phone
+devices` and the panel say so. With no LAN address (Wi-Fi off) but
+Tailscale up, the tailnet address alone. A default route over the tailnet
+(an exit node) is one address, the tailnet's (`kind: "tailscale"`). It never
+listens on `0.0.0.0` or a public address (a `bind` like that is refused,
+Tailscale or not).
+
+The daemon's `state.json` (and `GET /v1/state`) has `lan` (the first
+address, `https://192.168.1.20:7843`, or `""` when off), `lan_hosts` (every
+address, in order: `[{"kind": "lan", "host": "192.168.1.20", "port": 7843},
+{"kind": "tailscale", "host": "100.68.110.33", "port": 7843, "dns_name":
+"mac.tailnet.ts.net"}]`, `[]` when off), `tailscale` (`{"installed": true,
+"running": true, "state": "running", "ip": "100.68.110.33", "dns_name":
+"mac.tailnet.ts.net"}`, `null` until the API has started once) and `phone`
+(the name of the phone that is the voice, or `null`).
 
 ## Security model
 
@@ -43,8 +67,10 @@ machine (and approve what they ask). Whoever can call this API can do that.
 So:
 
 1. **Off unless enabled**, and it listens **only on this Mac's private LAN
-   address** (not `0.0.0.0`; a public address is refused unless
-   `allow_public = true`).
+   address**, plus its **Tailscale address** (100.64.0.0/10) while
+   Tailscale runs (not `0.0.0.0`; a public address is refused unless
+   `allow_public = true`). Over Tailscale, only devices on your tailnet can
+   reach the port at all (and they need a token like anyone else).
 2. **TLS always** (TLS 1.3 or 1.2, rustls). The Mac makes a self-signed
    ECDSA P-256 certificate once (`~/.config/herder-tower/lan/`, key mode
    0600). There is no CA: the phone **pins the certificate's SHA-256
@@ -88,24 +114,73 @@ runs on the port, and could try codes during the 5 minutes a code is open
 (5 tries from an address, 30 in all: at worst 1 in 3 million), or use up
 the 30 from several addresses so the code has to be made again. A phone that is stolen while paired holds a valid
 token until you revoke it (`tower phone revoke`). The certificate's private
-key is as safe as your Mac account. Off the local network (later: Tailscale,
-which `allow_public = false` already accepts as 100.64/10) the same model
-holds.
+key is as safe as your Mac account. Over Tailscale the same model holds:
+TLS with the pinned certificate inside the tailnet's own WireGuard tunnel,
+the same tokens, the same limits (the tailnet's address counts as private).
 
 ## Pairing flow
 
-1. On the Mac: `tower phone pair`. It prints a QR, the address, the code and
-   the certificate fingerprint. (The orb can show the same:
+1. On the Mac: `tower phone pair`. It prints a QR, every address, the code
+   and the certificate fingerprint. (The orb shows the same, from
    `tower phone pair --json`.) The QR is a link:
 
    ```
-   herdertower://pair?h=192.168.1.20&p=7843&c=<8 digits>&fp=<64 hex chars>
+   herdertower://pair?h=192.168.1.20&p=7843&c=<8 digits>&fp=<64 hex chars>&hosts=lan:192.168.1.20:7843,tailscale:100.68.110.33:7843&dns=mac.tailnet.ts.net
    ```
+
+   `h` and `p` are the first address, as before. `hosts` (only when there is
+   more than one address, or the one is the tailnet's) is every address in
+   the order to try them, comma-separated, each `<kind>:<IPv4>:<port>`;
+   `dns` (only while the tailnet address is listened on) is the Mac's
+   MagicDNS name. An app that doesn't know `hosts` and `dns` ignores them and
+   pairs over `h`/`p` exactly as before.
+
+   `tower phone pair --json` (the same in the daemon's `phone pair` answer):
+
+   ```json
+   {
+     "code": "12345678",
+     "host": "192.168.1.20",
+     "port": 7843,
+     "hosts": [
+       {"kind": "lan", "host": "192.168.1.20", "port": 7843},
+       {"kind": "tailscale", "host": "100.68.110.33", "port": 7843, "dns_name": "mac.tailnet.ts.net"}
+     ],
+     "magic_dns": "mac.tailnet.ts.net",
+     "fingerprint": "<64 hex chars, SHA-256 of the certificate's DER>",
+     "link": "herdertower://pair?h=192.168.1.20&p=7843&c=12345678&fp=<hex>&hosts=lan:192.168.1.20:7843,tailscale:100.68.110.33:7843&dns=mac.tailnet.ts.net",
+     "expires_in_s": 300,
+     "tailscale": {"installed": true, "running": true, "state": "running", "ip": "100.68.110.33", "dns_name": "mac.tailnet.ts.net"}
+   }
+   ```
+
+   Exactly:
+   - `host` (string), `port` (number): the first entry of `hosts`. Kept for
+     older apps.
+   - `hosts` (array, at least one entry, in order): `kind` is `"lan"` or
+     `"tailscale"` (other kinds may come later: skip what you don't know),
+     `host` an IPv4 address, `port` a number, and `dns_name` (string) on a
+     `tailscale` entry when Tailscale reports a MagicDNS name. The LAN entry
+     comes first when there is one; there is at most one of each kind.
+   - `magic_dns` (string or `null`): the Mac's MagicDNS name, set only while
+     a `tailscale` entry is in `hosts`.
+   - `tailscale` (object): `installed`, `running` (booleans), `state`
+     (`"running"`, `"stopped"`, `"needs login"`, `"not installed"`,
+     `"starting"`, …: for people), `ip`, `dns_name` (string or `null`). It
+     describes Tailscale on the Mac even when it isn't listened on (stopped:
+     `running: false`, and `hosts` has the LAN only).
+   - `code`, `fingerprint`, `link`, `expires_in_s`: as before. One
+     fingerprint for every address: it is one certificate.
+
+   Stopped Tailscale (or `[lan] tailscale = "off"`): `hosts` is the LAN
+   entry alone, `magic_dns` is `null`, and the link is the old one
+   (`h`, `p`, `c`, `fp` only).
 
 2. The app scans it (or the user types address and code; then the app shows
    the fingerprint of the certificate it got, grouped by four, and the user
    compares it with the one the Mac printed before the app goes on).
-3. The app calls, pinning `fp`:
+3. The app calls, pinning `fp`, on the first address that answers (in the
+   order of `hosts`):
 
    ```http
    POST /v1/pair
@@ -120,8 +195,15 @@ holds.
    403 {"error": {"code": "wrong_code", "message": "…", "tries_left": 4}}
    ```
 
-4. The app stores host, port, fingerprint and token, and from then on sends
-   the token with every call.
+4. The app stores every address (`hosts`, else `host`/`port`), the
+   MagicDNS name, the fingerprint and the token, and from then on sends the
+   token with every call. To connect it tries the addresses in order (the
+   LAN first: on the home network it is the direct path), moving on after a
+   short connect timeout (2 to 3 s); the MagicDNS name can stand in for the
+   tailscale entry's IP if that changed. The certificate pin is the same
+   for all of them; no hostname is checked. A paired app refreshes its
+   list from `GET /v1/state` (`lan_hosts`): a Mac that starts Tailscale
+   later, or moves to another LAN address, is found there.
 
 ## Conventions
 
@@ -182,7 +264,10 @@ The state (`GET /v1/state`, event `state`):
   "alerts": [{"at_ms": 0, "terminal": "t22", "text": "Claude in eyzflow is done", "level": "done"}],
   "agents": [{"address": "t22", "name": "Claude in eyzflow", "status": "working", "app": "claude-code", "account": "default"}],
   "error": "", "talk_key": "ctrl", "voice": "af_bella", "stt_model": "…",
-  "lan": "https://192.168.1.20:7843", "phone": "Pixel 9",
+  "lan": "https://192.168.1.20:7843",
+  "lan_hosts": [{"kind": "lan", "host": "192.168.1.20", "port": 7843}, {"kind": "tailscale", "host": "100.68.110.33", "port": 7843, "dns_name": "mac.tailnet.ts.net"}],
+  "tailscale": {"installed": true, "running": true, "state": "running", "ip": "100.68.110.33", "dns_name": "mac.tailnet.ts.net"},
+  "phone": "Pixel 9",
   "work": {"word": "Reading", "detail": "eyzflow", "since_ms": 1794158000000, "at_ms": 1794158004000, "done_ms": 0},
   "screenshots": [{"id": "1794160000000-login.png", "at": 1794160000000, "session": "t22", "name": "Claude in eyzflow", "space": "B2C support", "account": "default", "job": null, "caption": "The new login page", "path": "/Users/…/attachments/screenshots/1794160000000-login.png", "url": "/v1/screenshots/1794160000000-login.png"}]
 }

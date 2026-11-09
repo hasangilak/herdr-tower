@@ -3,14 +3,16 @@
 //! `docs/mobile-api.md`.
 //!
 //! Off unless `[lan] enabled = true` (`tower phone enable`). HTTPS only, on
-//! this Mac's private LAN address; every call but pairing needs a paired
-//! device's token.
+//! this Mac's private LAN address, and on its Tailscale address too while
+//! Tailscale runs (`[lan] tailscale = "auto"`, see `tailscale`); never on
+//! every interface. Every call but pairing needs a paired device's token.
 
 pub mod audio;
 pub mod auth;
 pub mod http;
 pub mod hub;
 pub mod multipart;
+pub mod tailscale;
 pub mod tls;
 
 use std::collections::HashMap;
@@ -62,11 +64,59 @@ pub struct Ctx {
     pub prs: crate::prs::Prs,
 }
 
-struct Running {
+/// Where the API can be reached: this Mac's local network, or its tailnet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Lan,
+    Tailscale,
+}
+
+impl Kind {
+    pub fn word(&self) -> &'static str {
+        match self {
+            Kind::Lan => "lan",
+            Kind::Tailscale => "tailscale",
+        }
+    }
+}
+
+/// One listening socket and the flag that ends its accept loop.
+struct Listener {
+    kind: Kind,
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
-    fingerprint: String,
 }
+
+struct Running {
+    /// The LAN's first (when there is one), then the tailnet's.
+    listeners: Vec<Listener>,
+    /// The whole API: every accept loop, open connection and event stream ends.
+    stop: Arc<AtomicBool>,
+    fingerprint: String,
+    tls: Arc<rustls::ServerConfig>,
+    cfg: crate::config::Lan,
+    /// Tailscale as last seen.
+    tailscale: tailscale::Tailscale,
+    /// Why the tailnet address isn't listened on though Tailscale runs (a bind that failed).
+    tailscale_error: Option<String>,
+}
+
+impl Running {
+    fn primary(&self) -> SocketAddr {
+        self.listeners[0].addr
+    }
+
+    fn of(&self, kind: Kind) -> Option<&Listener> {
+        self.listeners.iter().find(|l| l.kind == kind)
+    }
+}
+
+/// How the phone API asks about Tailscale (tests give their own).
+pub type Detect = Arc<dyn Fn() -> tailscale::Tailscale + Send + Sync>;
+
+/// Tailscale is looked at again this often while the API is on: it starts
+/// (or stops) listening on the tailnet as Tailscale comes and goes.
+const TAILSCALE_RECHECK: Duration = Duration::from_secs(20);
 
 #[derive(Clone)]
 pub struct Lan {
@@ -79,6 +129,7 @@ pub struct Lan {
     devices: Arc<auth::Store>,
     /// The certificate's folder (elsewhere in tests).
     identity_dir: std::path::PathBuf,
+    detect: Detect,
 }
 
 /// The connections open now, in all and by address.
@@ -263,9 +314,15 @@ pub fn is_private(ip: IpAddr) -> bool {
 }
 
 /// The address to listen on, as `[lan]` asks.
+#[cfg(test)]
 pub fn choose_ip(cfg: &crate::config::Lan) -> Result<IpAddr> {
+    choose_ip_from(cfg, if cfg.bind.is_empty() || cfg.bind == "auto" { lan_ip() } else { None })
+}
+
+/// `choose_ip` with this Mac's default-route address given (`auto`).
+pub fn choose_ip_from(cfg: &crate::config::Lan, auto: Option<IpAddr>) -> Result<IpAddr> {
     let ip = if cfg.bind.is_empty() || cfg.bind == "auto" {
-        lan_ip().context("this Mac has no network address (is Wi-Fi on?)")?
+        auto.context("this Mac has no network address (is Wi-Fi on?)")?
     } else {
         cfg.bind.parse().with_context(|| format!("[lan] bind = {:?} isn't an IP address", cfg.bind))?
     };
@@ -276,6 +333,98 @@ pub fn choose_ip(cfg: &crate::config::Lan) -> Result<IpAddr> {
         bail!("{ip} isn't a private address: the phone API listens only on the local network (see allow_public)");
     }
     Ok(ip)
+}
+
+/// Whether `[lan] tailscale` asks for the tailnet address: `auto` (or empty, or `on`) yes, `off` no.
+pub fn tailscale_wanted(cfg: &crate::config::Lan) -> Result<bool> {
+    match cfg.tailscale.trim() {
+        "" | "auto" | "on" => Ok(true),
+        "off" => Ok(false),
+        other => bail!("[lan] tailscale = {other:?}: use \"auto\" or \"off\""),
+    }
+}
+
+/// The tailnet address to listen on: Tailscale runs, it's wanted, and the address is in 100.64/10.
+pub fn tailscale_ip(cfg: &crate::config::Lan, ts: &tailscale::Tailscale) -> Option<IpAddr> {
+    let ip = ts.ipv4.filter(|ip| ts.running && tailscale::is_tailnet(*ip))?;
+    tailscale_wanted(cfg).unwrap_or(false).then_some(IpAddr::V4(ip))
+}
+
+/// Where to listen: the LAN address as `[lan]` says (`lan`: the default
+/// route's, for `auto`), then the tailnet's while Tailscale runs. Never an
+/// unspecified (every-interface) address, never a public one without
+/// `allow_public`. One of them is enough: no LAN (Wi-Fi off) with Tailscale
+/// up still listens on the tailnet. A default route over the tailnet (an
+/// exit node) is one address, the tailnet's.
+pub fn plan(cfg: &crate::config::Lan, lan: Option<IpAddr>, ts: &tailscale::Tailscale) -> Result<Vec<(Kind, IpAddr)>> {
+    tailscale_wanted(cfg)?;
+    let auto = cfg.bind.is_empty() || cfg.bind == "auto";
+    let lan = match choose_ip_from(cfg, lan) {
+        // No network address for `auto` (Wi-Fi off): the tailnet may stand in.
+        Err(e) if auto && lan.is_none() => Err(e),
+        // A `bind` that isn't allowed is an error, Tailscale or not.
+        Err(e) => return Err(e),
+        Ok(ip) => Ok(ip),
+    };
+    let tail = tailscale_ip(cfg, ts);
+    let out = match (lan, tail) {
+        (Ok(l), Some(t)) if l == t => vec![(Kind::Tailscale, t)],
+        (Ok(l), Some(t)) => vec![(Kind::Lan, l), (Kind::Tailscale, t)],
+        (Ok(l), None) => vec![(Kind::Lan, l)],
+        (Err(_), Some(t)) => vec![(Kind::Tailscale, t)],
+        (Err(e), None) => return Err(e),
+    };
+    for (_, ip) in &out {
+        if ip.is_unspecified() && !cfg.allow_public {
+            bail!("{ip} would listen on every network");
+        }
+    }
+    Ok(out)
+}
+
+/// The addresses as the pairing payload, `info` and `state.json` list them.
+fn hosts_value(listeners: &[(Kind, SocketAddr)], ts: &tailscale::Tailscale) -> Vec<Value> {
+    listeners
+        .iter()
+        .map(|(kind, a)| {
+            let mut h = json!({ "kind": kind.word(), "host": a.ip().to_string(), "port": a.port() });
+            if *kind == Kind::Tailscale
+                && let Some(n) = &ts.dns_name
+            {
+                h["dns_name"] = json!(n);
+            }
+            h
+        })
+        .collect()
+}
+
+/// What the Mac shows to pair a phone, and the link its QR carries: the
+/// first address as `host`/`port` (what older apps read), every address in
+/// order as `hosts`, and the MagicDNS name while the tailnet is listened on.
+pub fn pairing_payload(code: &str, listeners: &[(Kind, SocketAddr)], fingerprint: &str, ts: &tailscale::Tailscale, expires_in_s: u64) -> Value {
+    let hosts = hosts_value(listeners, ts);
+    let (host, port) = listeners.first().map(|(_, a)| (a.ip().to_string(), a.port())).unwrap_or_default();
+    let on_tailnet = listeners.iter().any(|(k, _)| *k == Kind::Tailscale);
+    let magic_dns = ts.dns_name.clone().filter(|_| on_tailnet);
+    let mut link = format!("herdertower://pair?h={host}&p={port}&c={code}&fp={fingerprint}");
+    if listeners.len() > 1 || on_tailnet {
+        let list: Vec<String> = listeners.iter().map(|(k, a)| format!("{}:{}:{}", k.word(), a.ip(), a.port())).collect();
+        link += &format!("&hosts={}", list.join(","));
+    }
+    if let Some(n) = &magic_dns {
+        link += &format!("&dns={n}");
+    }
+    json!({
+        "code": code,
+        "host": host,
+        "port": port,
+        "hosts": hosts,
+        "magic_dns": magic_dns,
+        "fingerprint": fingerprint,
+        "link": link,
+        "expires_in_s": expires_in_s,
+        "tailscale": ts.view(),
+    })
 }
 
 impl Lan {
@@ -297,73 +446,220 @@ impl Lan {
             pairing: Arc::new(Mutex::new(Pairing::default())),
             failures: Arc::new(Mutex::new(HashMap::new())),
             conns: Arc::new(Mutex::new(Conns::default())),
+            // Tests never ask this Mac's Tailscale unless they say so (`with_detect`).
+            detect: Arc::new(if cfg!(test) { tailscale::Tailscale::default } else { tailscale::detect as fn() -> tailscale::Tailscale }),
         }
     }
 
+    /// Another way to ask about Tailscale (tests).
+    #[cfg(test)]
+    pub fn with_detect(mut self, detect: impl Fn() -> tailscale::Tailscale + Send + Sync + 'static) -> Lan {
+        self.detect = Arc::new(detect);
+        self
+    }
+
+    /// Starts listening: on the LAN address, and the tailnet's while Tailscale
+    /// runs (re-checked every 20 s). Returns the first address.
     pub fn start(&self, cfg: &crate::config::Lan) -> Result<SocketAddr> {
         // One lock over the check and the start: two at once can't both bind.
         let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(r) = running.as_ref() {
-            return Ok(r.addr);
+            return Ok(r.primary());
         }
         let identity = Identity::load_or_create(&self.identity_dir)?;
         let tls = identity.server_config()?;
-        let ip = choose_ip(cfg)?;
-        let listener = TcpListener::bind((ip, cfg.port)).with_context(|| format!("listening on {ip}:{}", cfg.port))?;
+        let ts = if tailscale_wanted(cfg)? { (self.detect)() } else { tailscale::Tailscale::default() };
+        let auto = if cfg.bind.is_empty() || cfg.bind == "auto" { lan_ip() } else { None };
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut listeners = vec![];
+        let mut tailscale_error = None;
+        for (kind, ip) in plan(cfg, auto, &ts)? {
+            // The same port everywhere (the first one's, when it was 0).
+            let port = listeners.first().map(|l: &Listener| l.addr.port()).unwrap_or(cfg.port);
+            match self.listen(kind, ip, port, &tls, &stop) {
+                Ok(l) => listeners.push(l),
+                // The tailnet's address can't be had (Tailscale just stopped, say): the LAN goes on.
+                Err(e) if kind == Kind::Tailscale && !listeners.is_empty() => {
+                    eprintln!("[phone] not on the tailnet: {e:#}");
+                    tailscale_error = Some(format!("{e:#}"));
+                }
+                Err(e) => {
+                    for l in &listeners {
+                        Self::unlisten(l);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let fingerprint = identity.fingerprint();
+        *running = Some(Running { listeners, stop: stop.clone(), fingerprint: fingerprint.clone(), tls, cfg: cfg.clone(), tailscale: ts, tailscale_error });
+        let r = running.as_ref().expect("just set");
+        let addrs: Vec<String> = r.listeners.iter().map(|l| format!("https://{} ({})", l.addr, l.kind.word())).collect();
+        let primary = r.primary();
+        self.publish(r);
+        drop(running);
+        eprintln!("[phone] API on {} (certificate {})", addrs.join(", "), tls::grouped(&fingerprint[..16]));
+        if tailscale_wanted(cfg).unwrap_or(false) {
+            let me = self.clone();
+            thread::Builder::new()
+                .name("lan-tailscale".into())
+                .spawn(move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        let until = Instant::now() + TAILSCALE_RECHECK;
+                        while Instant::now() < until && !stop.load(Ordering::SeqCst) {
+                            thread::sleep(Duration::from_millis(250));
+                        }
+                        if !stop.load(Ordering::SeqCst) {
+                            me.recheck_tailscale(&stop);
+                        }
+                    }
+                })
+                .ok();
+        }
+        Ok(primary)
+    }
+
+    /// A socket on `ip:port` and its accept loop.
+    fn listen(&self, kind: Kind, ip: IpAddr, port: u16, tls: &Arc<rustls::ServerConfig>, api_stop: &Arc<AtomicBool>) -> Result<Listener> {
+        // Never every interface: `plan` refuses it, and so does this.
+        if ip.is_unspecified() {
+            bail!("refusing to listen on {ip}");
+        }
+        let listener = TcpListener::bind((ip, port)).with_context(|| format!("listening on {ip}:{port} ({})", kind.word()))?;
         let addr = listener.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
-        let me = self.clone();
-        let flag = stop.clone();
-        thread::Builder::new().name("lan".into()).spawn(move || {
+        let (me, tls, flag, all) = (self.clone(), tls.clone(), stop.clone(), api_stop.clone());
+        thread::Builder::new().name(format!("lan-{}", kind.word())).spawn(move || {
             for conn in listener.incoming() {
-                if flag.load(Ordering::SeqCst) {
+                if flag.load(Ordering::SeqCst) || all.load(Ordering::SeqCst) {
                     break;
                 }
                 let Ok(conn) = conn else { continue };
                 let ip = conn.peer_addr().map(|a| a.ip()).unwrap_or(IpAddr::from([0, 0, 0, 0]));
                 // Too many open: closed unanswered.
                 let Some(slot) = Slot::take(&me.conns, ip) else { continue };
-                let (me, tls, flag) = (me.clone(), tls.clone(), flag.clone());
+                let (me, tls, all) = (me.clone(), tls.clone(), all.clone());
                 let _ = thread::Builder::new().name("lan-conn".into()).spawn(move || {
                     let _slot = slot;
-                    let run = std::panic::AssertUnwindSafe(|| me.connection(conn, tls, &flag));
+                    let run = std::panic::AssertUnwindSafe(|| me.connection(conn, tls, &all));
                     if std::panic::catch_unwind(run).is_err() {
                         eprintln!("[phone] a call from {ip} failed inside the tower; its connection is closed");
                     }
                 });
             }
         })?;
-        *running = Some(Running { addr, stop, fingerprint: identity.fingerprint() });
-        drop(running);
-        self.ctx.shared.update(|s| s.lan = format!("https://{addr}"));
-        eprintln!("[phone] API on https://{addr} (certificate {})", tls::grouped(&identity.fingerprint()[..16]));
-        Ok(addr)
+        Ok(Listener { kind, addr, stop })
+    }
+
+    /// Ends a listener's accept loop (its open connections go on).
+    fn unlisten(l: &Listener) {
+        l.stop.store(true, Ordering::SeqCst);
+        // Wake the accept loop so it sees the flag.
+        let _ = TcpStream::connect_timeout(&l.addr, Duration::from_millis(300));
+    }
+
+    /// Where it listens, into the state (the panel, `state.json`, `GET /v1/state`).
+    fn publish(&self, r: &Running) {
+        let url = format!("https://{}", r.primary());
+        let hosts = hosts_value(&r.listeners.iter().map(|l| (l.kind, l.addr)).collect::<Vec<_>>(), &r.tailscale);
+        let ts = r.tailscale.view();
+        self.ctx.shared.update(|s| {
+            s.lan = url;
+            s.lan_hosts = hosts;
+            s.tailscale = Some(ts);
+        });
+    }
+
+    /// Tailscale again: listens on the tailnet once it runs, stops when it
+    /// stops or its address changes. The LAN listener is never touched.
+    fn recheck_tailscale(&self, api_stop: &Arc<AtomicBool>) {
+        let ts = (self.detect)();
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(r) = running.as_mut() else { return };
+        // Another start since (this watcher's API was stopped).
+        if !Arc::ptr_eq(&r.stop, api_stop) {
+            return;
+        }
+        let want = tailscale_ip(&r.cfg, &ts).filter(|ip| r.of(Kind::Lan).is_none_or(|l| l.addr.ip() != *ip));
+        let have = r.of(Kind::Tailscale).map(|l| l.addr.ip());
+        let mut changed = r.tailscale != ts;
+        r.tailscale = ts;
+        // Nothing to listen on: no error to keep (Tailscale stopped since a bind failed).
+        if want.is_none() && r.tailscale_error.take().is_some() {
+            changed = true;
+        }
+        if want == have {
+            if changed {
+                self.publish(r);
+            }
+            return;
+        }
+        // The old tailnet listener goes; the only one there is (no LAN) stays until another replaces it.
+        if let Some(pos) = r.listeners.iter().position(|l| l.kind == Kind::Tailscale)
+            && (r.listeners.len() > 1 || want.is_some())
+        {
+            let l = r.listeners.remove(pos);
+            Self::unlisten(&l);
+            eprintln!("[phone] no longer on the tailnet ({}): Tailscale is {}", l.addr, r.tailscale.word());
+        }
+        r.tailscale_error = None;
+        if let Some(ip) = want {
+            let port = r.primary().port();
+            match self.listen(Kind::Tailscale, ip, port, &r.tls, &r.stop) {
+                Ok(l) => {
+                    eprintln!("[phone] API on https://{} (tailscale)", l.addr);
+                    r.listeners.push(l);
+                }
+                Err(e) => {
+                    eprintln!("[phone] not on the tailnet: {e:#}");
+                    r.tailscale_error = Some(format!("{e:#}"));
+                }
+            }
+        }
+        self.publish(r);
     }
 
     pub fn stop(&self) {
         if let Some(r) = self.running.lock().unwrap_or_else(|e| e.into_inner()).take() {
             r.stop.store(true, Ordering::SeqCst);
-            // Wake the accept loop so it sees the flag.
-            let _ = TcpStream::connect_timeout(&r.addr, Duration::from_millis(300));
+            for l in &r.listeners {
+                Self::unlisten(l);
+            }
             // Open event streams end too: no phone stays the voice.
             self.ctx.hub.drop_all();
             self.pairing.lock().unwrap_or_else(|e| e.into_inner()).close();
             self.ctx.shared.update(|s| {
                 s.lan.clear();
+                s.lan_hosts.clear();
                 s.phone = None;
             });
             eprintln!("[phone] API off");
         }
     }
 
-    /// Where it listens and who is connected.
+    /// Where it listens and who is connected, and Tailscale (asked now when the API is off).
     pub fn info(&self) -> Value {
         let r = self.running.lock().unwrap_or_else(|e| e.into_inner());
         let (streams, voice) = self.ctx.hub.counts();
         let devices = self.devices.load();
+        let listeners: Vec<(Kind, SocketAddr)> = r.as_ref().map(|r| r.listeners.iter().map(|l| (l.kind, l.addr)).collect()).unwrap_or_default();
+        let ts = match r.as_ref() {
+            Some(r) => r.tailscale.clone(),
+            None => {
+                let wanted = crate::config::Config::load().map(|c| tailscale_wanted(&c.lan).unwrap_or(false)).unwrap_or(true);
+                if wanted { (self.detect)() } else { tailscale::Tailscale::default() }
+            }
+        };
+        let mode = r.as_ref().map(|r| r.cfg.tailscale.clone()).or_else(|| crate::config::Config::load().ok().map(|c| c.lan.tailscale)).unwrap_or_default();
+        let mut tailscale = ts.view();
+        tailscale["mode"] = json!(if mode.trim() == "off" { "off" } else { "auto" });
+        tailscale["listening"] = json!(listeners.iter().any(|(k, _)| *k == Kind::Tailscale));
+        tailscale["error"] = json!(r.as_ref().and_then(|r| r.tailscale_error.clone()));
         json!({
             "on": r.is_some(),
-            "url": r.as_ref().map(|r| format!("https://{}", r.addr)),
+            "url": r.as_ref().map(|r| format!("https://{}", r.primary())),
+            "hosts": hosts_value(&listeners, &ts),
+            "tailscale": tailscale,
             "fingerprint": r.as_ref().map(|r| r.fingerprint.clone()),
             "devices": devices.devices.iter().map(|d| json!({ "id": d.id, "name": d.name, "created_ms": d.created_ms, "last_seen_ms": d.last_seen_ms })).collect::<Vec<_>>(),
             "streams": streams,
@@ -377,18 +673,9 @@ impl Lan {
         let r = self.running.lock().unwrap_or_else(|e| e.into_inner());
         let Some(r) = r.as_ref() else { bail!("the phone API is off: tower phone enable") };
         let code = self.pairing.lock().unwrap_or_else(|e| e.into_inner()).open();
-        let host = r.addr.ip().to_string();
-        let port = r.addr.port();
-        let link = format!("herdertower://pair?h={host}&p={port}&c={code}&fp={}", r.fingerprint);
+        let listeners: Vec<(Kind, SocketAddr)> = r.listeners.iter().map(|l| (l.kind, l.addr)).collect();
         eprintln!("[phone] pairing open for {} s", auth::CODE_TTL.as_secs());
-        Ok(json!({
-            "code": code,
-            "host": host,
-            "port": port,
-            "fingerprint": r.fingerprint,
-            "link": link,
-            "expires_in_s": auth::CODE_TTL.as_secs(),
-        }))
+        Ok(pairing_payload(&code, &listeners, &r.fingerprint, &r.tailscale, auth::CODE_TTL.as_secs()))
     }
 
     /// A device was revoked (`tower phone revoke`): its open streams end.
@@ -1456,7 +1743,7 @@ mod tests {
         for ip in ["8.8.8.8", "172.32.0.1", "100.128.0.1", "2001:db8::1"] {
             assert!(!is_private(ip.parse().unwrap()), "{ip}");
         }
-        let cfg = |bind: &str, allow_public| crate::config::Lan { enabled: true, port: 7843, bind: bind.into(), allow_public };
+        let cfg = |bind: &str, allow_public| crate::config::Lan { enabled: true, port: 7843, bind: bind.into(), allow_public, tailscale: "off".into() };
         assert!(choose_ip(&cfg("8.8.8.8", false)).is_err(), "a public address needs allow_public");
         assert!(choose_ip(&cfg("0.0.0.0", false)).is_err(), "every interface needs allow_public");
         assert!(choose_ip(&cfg("nonsense", false)).is_err());
@@ -1567,7 +1854,7 @@ mod tests {
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
         let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs: test_prs() };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
-        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false }).unwrap();
+        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into() }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
 
         // Nothing without a token.
@@ -1672,7 +1959,7 @@ mod tests {
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
         let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub: hub.clone(), ack: None, stt, asks, prs: test_prs() };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
-        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false }).unwrap();
+        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into() }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
         let code = lan.pair().unwrap()["code"].as_str().unwrap().to_string();
         let token =
@@ -2005,9 +2292,166 @@ mod tests {
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
         let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
-        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false }).unwrap();
+        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into() }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
         (lan, dir, addr, fp)
+    }
+
+    fn ts(running: bool, ip: &str) -> tailscale::Tailscale {
+        tailscale::Tailscale {
+            cli: Some("/usr/local/bin/tailscale".into()),
+            backend: if running { "Running" } else { "Stopped" }.into(),
+            running,
+            ipv4: ip.parse().ok(),
+            dns_name: Some("mac.tail1234.ts.net".into()),
+            error: None,
+        }
+    }
+
+    fn lan_cfg(bind: &str, tailscale: &str) -> crate::config::Lan {
+        crate::config::Lan { enabled: true, port: 7843, bind: bind.into(), allow_public: false, tailscale: tailscale.into() }
+    }
+
+    #[test]
+    fn the_lan_and_a_running_tailnet_are_listened_on_and_nothing_else() {
+        let home: IpAddr = "192.168.1.20".parse().unwrap();
+        let tail: IpAddr = "100.68.110.33".parse().unwrap();
+        let up = ts(true, "100.68.110.33");
+        // Both, the LAN first.
+        assert_eq!(plan(&lan_cfg("auto", "auto"), Some(home), &up).unwrap(), vec![(Kind::Lan, home), (Kind::Tailscale, tail)]);
+        // Stopped, not installed, or off: the LAN only.
+        assert_eq!(plan(&lan_cfg("auto", "auto"), Some(home), &ts(false, "100.68.110.33")).unwrap(), vec![(Kind::Lan, home)]);
+        assert_eq!(plan(&lan_cfg("auto", "auto"), Some(home), &tailscale::Tailscale::default()).unwrap(), vec![(Kind::Lan, home)]);
+        assert_eq!(plan(&lan_cfg("auto", "off"), Some(home), &up).unwrap(), vec![(Kind::Lan, home)]);
+        // No LAN (Wi-Fi off): the tailnet alone; neither: an error.
+        assert_eq!(plan(&lan_cfg("auto", "auto"), None, &up).unwrap(), vec![(Kind::Tailscale, tail)]);
+        assert!(plan(&lan_cfg("auto", "auto"), None, &ts(false, "100.68.110.33")).is_err());
+        // The default route over the tailnet (an exit node): one listener.
+        assert_eq!(plan(&lan_cfg("auto", "auto"), Some(tail), &up).unwrap(), vec![(Kind::Tailscale, tail)]);
+        // A "tailnet" address outside 100.64/10 is never taken.
+        assert_eq!(plan(&lan_cfg("auto", "auto"), Some(home), &ts(true, "100.200.1.1")).unwrap(), vec![(Kind::Lan, home)]);
+        // Every interface or a public address: refused, Tailscale or not.
+        assert!(plan(&lan_cfg("0.0.0.0", "auto"), Some(home), &up).is_err());
+        assert!(plan(&lan_cfg("8.8.8.8", "auto"), Some(home), &up).is_err());
+        // The tailnet's address counts as private (100.64/10), as before.
+        assert!(is_private(tail));
+        assert!(plan(&lan_cfg("auto", "sometimes"), Some(home), &up).unwrap_err().to_string().contains("auto"));
+        assert!(tailscale_wanted(&lan_cfg("auto", "")).unwrap() && tailscale_wanted(&lan_cfg("auto", "on")).unwrap());
+    }
+
+    #[test]
+    fn the_pairing_payload_lists_every_address_and_keeps_host_and_port() {
+        let fp = "ab".repeat(32);
+        let both = [(Kind::Lan, "192.168.1.20:7843".parse().unwrap()), (Kind::Tailscale, "100.68.110.33:7843".parse().unwrap())];
+        let v = pairing_payload("12345678", &both, &fp, &ts(true, "100.68.110.33"), 300);
+        assert_eq!(
+            v,
+            json!({
+                "code": "12345678",
+                "host": "192.168.1.20",
+                "port": 7843,
+                "hosts": [
+                    {"kind": "lan", "host": "192.168.1.20", "port": 7843},
+                    {"kind": "tailscale", "host": "100.68.110.33", "port": 7843, "dns_name": "mac.tail1234.ts.net"}
+                ],
+                "magic_dns": "mac.tail1234.ts.net",
+                "fingerprint": fp,
+                "link": format!("herdertower://pair?h=192.168.1.20&p=7843&c=12345678&fp={fp}&hosts=lan:192.168.1.20:7843,tailscale:100.68.110.33:7843&dns=mac.tail1234.ts.net"),
+                "expires_in_s": 300,
+                "tailscale": {"installed": true, "running": true, "state": "running", "ip": "100.68.110.33", "dns_name": "mac.tail1234.ts.net"}
+            })
+        );
+        // The LAN only (Tailscale stopped): the link as older apps know it, no MagicDNS name.
+        let one = [(Kind::Lan, "192.168.1.20:7843".parse().unwrap())];
+        let v = pairing_payload("12345678", &one, &fp, &ts(false, "100.68.110.33"), 300);
+        assert_eq!(v["hosts"], json!([{"kind": "lan", "host": "192.168.1.20", "port": 7843}]));
+        assert_eq!(v["magic_dns"], Value::Null);
+        assert_eq!(v["link"], format!("herdertower://pair?h=192.168.1.20&p=7843&c=12345678&fp={fp}"));
+        assert_eq!(v["tailscale"]["state"], "stopped");
+        // The tailnet only: it is `host` too.
+        let tail = [(Kind::Tailscale, "100.68.110.33:7843".parse().unwrap())];
+        let v = pairing_payload("12345678", &tail, &fp, &ts(true, "100.68.110.33"), 300);
+        assert_eq!((v["host"].as_str(), v["hosts"].as_array().unwrap().len()), (Some("100.68.110.33"), 1));
+        assert!(v["link"].as_str().unwrap().ends_with("&hosts=tailscale:100.68.110.33:7843&dns=mac.tail1234.ts.net"));
+        // The QR still holds it.
+        assert!(qrcode::QrCode::new(pairing_payload("12345678", &both, &fp, &ts(true, "100.68.110.33"), 300)["link"].as_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn a_tailnet_address_that_cant_be_had_leaves_the_lan_listening() {
+        let dir = std::env::temp_dir().join(format!("tower-lan-ts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hub = Arc::new(Hub::default());
+        let (stt, rx) = std::sync::mpsc::channel();
+        std::mem::forget(rx);
+        let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
+        let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs: test_prs() };
+        // "Running", with an address no interface here has (as just after Tailscale stops).
+        let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan")).with_detect(|| ts(true, "100.100.100.100"));
+        let addr = lan.start(&crate::config::Lan { port: 0, ..lan_cfg("127.0.0.1", "auto") }).unwrap();
+        assert_eq!(addr.ip().to_string(), "127.0.0.1");
+        let info = lan.info();
+        assert_eq!(info["hosts"], json!([{"kind": "lan", "host": "127.0.0.1", "port": addr.port()}]));
+        assert_eq!(info["tailscale"]["running"], true);
+        assert_eq!(info["tailscale"]["listening"], false);
+        assert_eq!(info["tailscale"]["mode"], "auto");
+        assert!(info["tailscale"]["error"].as_str().unwrap().contains("100.100.100.100"), "{info}");
+        let st = shared.get();
+        assert_eq!(st.lan, format!("https://{addr}"));
+        assert_eq!(st.lan_hosts.len(), 1);
+        assert_eq!(st.tailscale.as_ref().unwrap()["ip"], "100.100.100.100");
+        let p = lan.pair().unwrap();
+        assert_eq!((p["host"].as_str(), p["hosts"].as_array().unwrap().len(), &p["magic_dns"]), (Some("127.0.0.1"), 1, &Value::Null));
+        // It answers over the LAN, pinned, as before.
+        let fp = info["fingerprint"].as_str().unwrap().to_string();
+        let (status, _) = call(addr, &fp, "GET", "/v1/hello", None, "").unwrap();
+        assert_eq!(status, 401, "no token: refused, but over TLS with the pinned certificate");
+        lan.stop();
+        assert!(shared.get().lan_hosts.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tailscale_coming_and_going_is_followed_without_touching_the_lan() {
+        let dir = std::env::temp_dir().join(format!("tower-lan-ts-follow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hub = Arc::new(Hub::default());
+        let (stt, rx) = std::sync::mpsc::channel();
+        std::mem::forget(rx);
+        let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
+        let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs: test_prs() };
+        let now = Arc::new(Mutex::new(ts(false, "100.100.100.100")));
+        let seen = now.clone();
+        let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan")).with_detect(move || seen.lock().unwrap().clone());
+        let addr = lan.start(&crate::config::Lan { port: 0, ..lan_cfg("127.0.0.1", "auto") }).unwrap();
+        let stop = lan.running.lock().unwrap().as_ref().unwrap().stop.clone();
+        assert_eq!(lan.info()["tailscale"]["state"], "stopped");
+        // It starts: the tower tries the tailnet address (none here has it: the error is kept, the LAN stays).
+        *now.lock().unwrap() = ts(true, "100.100.100.100");
+        lan.recheck_tailscale(&stop);
+        let info = lan.info();
+        assert_eq!((info["tailscale"]["running"].as_bool(), info["tailscale"]["listening"].as_bool()), (Some(true), Some(false)));
+        assert!(info["tailscale"]["error"].as_str().is_some_and(|e| e.contains("100.100.100.100")));
+        assert_eq!(info["hosts"], json!([{"kind": "lan", "host": "127.0.0.1", "port": addr.port()}]));
+        assert_eq!(shared.get().tailscale.unwrap()["state"], "running");
+        // It stops: the error goes, the LAN still answers.
+        *now.lock().unwrap() = ts(false, "100.100.100.100");
+        lan.recheck_tailscale(&stop);
+        let info = lan.info();
+        assert_eq!((info["tailscale"]["state"].as_str(), &info["tailscale"]["error"]), (Some("stopped"), &Value::Null));
+        let fp = info["fingerprint"].as_str().unwrap().to_string();
+        assert_eq!(call(addr, &fp, "GET", "/v1/hello", None, "").unwrap().0, 401);
+        // A watcher of an API stopped since does nothing to the next one.
+        lan.stop();
+        let addr2 = lan.start(&crate::config::Lan { port: 0, ..lan_cfg("127.0.0.1", "auto") }).unwrap();
+        *now.lock().unwrap() = ts(true, "100.100.100.100");
+        lan.recheck_tailscale(&stop);
+        assert_eq!(lan.info()["tailscale"]["error"], Value::Null, "the old watcher's look isn't this API's");
+        assert_eq!(lan.info()["url"], format!("https://{addr2}"));
+        lan.stop();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
