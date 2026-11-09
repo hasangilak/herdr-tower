@@ -601,7 +601,7 @@ impl Radar {
         let stopped_working = (was == working && status != working) || (turned && was != working);
         // A turn ended: its last message may ask the user something.
         if stopped_working && status.ready() {
-            self.asks.finished(&address, t);
+            self.asks.finished(&address, t, self.watches.watched(&address));
         }
         // Blocked on a dialog this machine can read: the questions go through
         // the brain (answered for the user, or told to them), not a plain notice.
@@ -815,20 +815,37 @@ impl Radar {
     fn fire_watch(&self, address: &str, name: &str, space: Option<String>, status: &SessionStatus, why: &str) -> bool {
         let fired = self.watches.fire(address, |w| {
             let (t, a) = (address.to_string(), w.note.clone());
+            // What it said at the end of its turn (its hook): often all the brain needs.
+            let said = super::sessions::registry().said_since(address, w.since_ms).filter(|_| !status.ended());
+            // It stopped to wait for the user (to merge, approve, test): not done.
+            let waits = said.as_deref().filter(|_| status.ready()).and_then(crate::questions::waits_for_user);
             // A status that says nothing for a job (none, a word not known): the turn is over, as the watch says.
-            let job = crate::history::JobState::of_session(status, true).unwrap_or(match status {
-                SessionStatus::Other(w) => crate::history::JobState::Other(w.clone()),
-                _ => crate::history::JobState::Done,
-            });
+            let job = match &waits {
+                Some(_) => crate::history::JobState::Blocked,
+                None => crate::history::JobState::of_session(status, true).unwrap_or(match status {
+                    SessionStatus::Other(w) => crate::history::JobState::Other(w.clone()),
+                    _ => crate::history::JobState::Done,
+                }),
+            };
             crate::history::later(move || crate::history::job_watched(&t, job, &a));
             let mut p = report(address, name, space.clone(), status, &w.note, why, "watch");
-            // What it said at the end of its turn (its hook): often all the brain needs.
-            if let Some(said) = super::sessions::registry().said_since(address, w.since_ms).filter(|_| !status.ended()) {
+            if let Some(said) = said {
                 let said: String = said.chars().take(1200).collect();
+                let ask = match &waits {
+                    Some(r) => format!(
+                        " It is waiting for the user to act: \"{}\". Tell the user plainly what they need to do (with the PR or link if there is one).",
+                        r.replace('"', "'")
+                    ),
+                    None => " Tell me what happened, briefly (read its screen only if that isn't enough).".to_string(),
+                };
                 p.msg = p.msg.replace(
                     " Read its screen and tell me what happened, briefly.",
-                    &format!(" It ended its turn saying: \"{}\" Tell me what happened, briefly (read its screen only if that isn't enough).", said.replace('"', "'")),
+                    &format!(" It ended its turn saying: \"{}\"{ask}", said.replace('"', "'")),
                 );
+            }
+            if let Some(r) = &waits {
+                p.status = "blocked".into();
+                p.speech = format!("{}.", crate::questions::wait_line(name, r));
             }
             p
         });

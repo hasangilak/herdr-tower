@@ -1161,6 +1161,139 @@ pub fn looks_like_question(message: &str) -> bool {
     listed.count() >= 2 && ["option", "choose", "pick", "prefer", "which"].iter().any(|w| lower.contains(w))
 }
 
+/// What a message's end waits on the user to do (merge, approve, review,
+/// test, decide, log in …), as the sentence that asks it, in plain words.
+/// None when it ends without handing anything to the user. A sentence
+/// counts when it is addressed to the user ("you", "the user"), names
+/// something to do, and asks or waits for it ("please", "must", "once you",
+/// "waiting for"); or says it waits on the user outright.
+pub fn waits_for_user(message: &str) -> Option<String> {
+    let plain = plain_words(message);
+    let chars: Vec<char> = plain.chars().collect();
+    let tail: String = chars[chars.len().saturating_sub(700)..].iter().collect();
+    let sentences: Vec<String> = split_sentences(&tail);
+    // The last few sentences: a request in the middle of a long report isn't where it stopped.
+    for s in sentences.iter().rev().take(4) {
+        if asks_the_user(s) {
+            // Links aren't read out: "merge it: https://…/pull/1250" says "merge it".
+            let words: Vec<&str> = s.split_whitespace().filter(|w| !w.contains("://")).collect();
+            let s = words.join(" ");
+            let s = s.trim().trim_start_matches(['-', '*', ' ']).trim_end_matches([':', ',', ' ']).trim();
+            let s: String = s.chars().take(220).collect();
+            return (!s.is_empty()).then_some(s);
+        }
+    }
+    None
+}
+
+/// Markdown and code out of the way, links as their text, one line.
+fn plain_words(message: &str) -> String {
+    let mut out = String::new();
+    let mut in_fence = false;
+    for line in message.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    // [text](url) → text; **bold** and `code` → their words.
+    let mut s = String::new();
+    let mut rest = out.as_str();
+    while let Some(i) = rest.find("](") {
+        let Some(j) = rest[i..].find(')') else { break };
+        s.push_str(&rest[..i]);
+        rest = &rest[i + j + 1..];
+    }
+    s.push_str(rest);
+    s.replace(['[', '*', '`', '_'], "").replace("  ", " ")
+}
+
+/// Sentences: ends at `.`, `!`, `?` before a space, and at line breaks.
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut cur = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '\n' {
+            if !cur.trim().is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            cur.clear();
+            continue;
+        }
+        cur.push(c);
+        let next = chars.get(i + 1).copied();
+        if matches!(c, '.' | '!' | '?') && next.is_none_or(char::is_whitespace) {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out.into_iter().map(|s| s.trim().to_string()).filter(|s| s.chars().any(char::is_alphanumeric)).collect()
+}
+
+/// One sentence hands something to the user.
+fn asks_the_user(sentence: &str) -> bool {
+    let l = format!(" {} ", sentence.to_lowercase().replace([',', ';', ':', '(', ')', '"', '\''], " "));
+    // Outright: it's the user's move.
+    let outright = [
+        "waiting for you", "waiting on you", "waiting for your", "waiting on your", "over to you", "your turn", "in your court",
+        "needs your", "need your", "pending your", "up to you", "ich warte auf dich", "warte auf deine", "du bist dran",
+    ];
+    // Nothing for them to do.
+    let nothing = ["don't need", "do not need", "no need", "nothing for you", "nothing to do", "no action", "you can ignore", "not needed"];
+    if nothing.iter().any(|n| l.contains(n)) {
+        return false;
+    }
+    if outright.iter().any(|p| l.contains(p)) {
+        return true;
+    }
+    let to_user = [" you ", " your ", " the user ", " du ", " dich ", " dein ", " deine "].iter().any(|w| l.contains(w));
+    let act = [
+        "merge", "approv", "review", "test", "decide", "decision", "confirm", "sign off", "sign-off", "log in", "login", "click", "verify",
+        "check", "look at", "restart", "install", "freigeb", "freigabe", "prüf", "entscheid", "bestätig", "teste",
+    ]
+    .iter()
+    .any(|w| l.contains(w));
+    let ask = [
+        " need to ", " needs to ", " must ", " please ", " once you", " when you", " after you", " as soon as you", "ready for you", "for you to ",
+        " have to ", " has to ", "can you ", "could you ", " wait for ", " waiting ", " i'll wait", " bitte ", " musst ", " sobald du", " warte ",
+    ]
+    .iter()
+    .any(|w| l.contains(w));
+    // "Please merge PR #1250.", "Bitte prüfe …": asked without a "you".
+    let imperative = [" please ", " bitte "].iter().any(|w| l.contains(w));
+    (to_user && act && ask) || (imperative && act)
+}
+
+/// A text set for a turn that waits on the user (`waits_for_user`): its
+/// question is the request, and it is the user's from the start (escalated,
+/// with why), so the brain isn't asked to answer it.
+pub fn wait_set(session: &str, name: &str, message: &str, request: &str, context: &str) -> QuestionSet {
+    let mut q = text_set(session, name, message, context);
+    q.title = request.to_string();
+    if let Some(t) = q.tabs.first_mut() {
+        t.question = request.to_string();
+    }
+    q.state.decision = crate::daemon::card::Decision::Escalated;
+    q.reason = WAITS.to_string();
+    q
+}
+
+/// A wait set's `reason`: what the card says about why it's the user's.
+pub const WAITS: &str = "it waits for you to do this";
+
+/// What is said of a turn that waits on the user.
+pub fn wait_line(name: &str, request: &str) -> String {
+    format!("{name} waits for you: {}", request.trim_end_matches(['.', '!']))
+}
+
 /// The question it seems to ask, until the brain says: the last sentence with a `?`.
 fn last_question(message: &str) -> String {
     let flat = message.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2364,5 +2497,41 @@ mod tests {
         let picks = first_picks(&set).unwrap();
         assert_eq!((picks.len(), picks[0].choice.clone()), (1, json!(0)));
         assert_eq!(picked_line(&set), "Which test runner? -> Vitest");
+    }
+
+    /// The missed release: t58 ended a turn waiting for the user to merge
+    /// the release PR, with no question mark, and nobody was told.
+    #[test]
+    fn a_turn_that_waits_for_the_user_says_what_they_must_do() {
+        let pr = "Dev is healthy: `GET /health` 200, and the old widget path still gets 409 `case_exists` with its `case` field.\n\n\
+                  PR #1250 (dev to main) is open and its checks passed. The merge command is blocked for me, so you need to merge it: \
+                  https://github.com/eyzhub/eyz-mediaroom-serverless/pull/1250. I'll wait, then verify prod.";
+        assert!(!looks_like_question(pr), "not a question: the old path missed it");
+        assert_eq!(waits_for_user(pr).as_deref(), Some("The merge command is blocked for me, so you need to merge it"));
+        for (msg, want) in [
+            ("Plan is ready. Waiting for your approval.", "Waiting for your approval."),
+            ("Once you merge #1250 into main, I'll verify the production deployment.", "Once you merge #1250 into main, I'll verify the production deployment."),
+            ("All green on dev.\n\nPlease merge [PR #1250](https://github.com/x/y/pull/1250) when you're ready.", "Please merge PR #1250 when you're ready."),
+            ("Fertig auf dev. Bitte merge den PR #1250, dann prüfe ich prod.", "Bitte merge den PR #1250, dann prüfe ich prod."),
+            ("The new APK is at /tmp/app.apk. You need to install it on the phone and test the header.", "You need to install it on the phone and test the header."),
+        ] {
+            assert_eq!(waits_for_user(msg).as_deref(), Some(want), "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_turn_that_only_reports_doesnt_wait_for_the_user() {
+        for msg in [
+            // t58's earlier turn: it waits on a deploy, not on the user.
+            "The dev deploy of #1248 is running (run 42645505320), and I'll get a notice when it finishes. Nothing is checked yet.",
+            "I merged PR #1248 and verified dev; prod is healthy.",
+            "Done. You don't need to do anything: the release is live and verified.",
+            "I'll wait for the deploy to finish, then check the logs.",
+            "If you want, I can also check the SDK later.",
+            "The user asked me to verify prod; it's verified and the smoke request passed.",
+            "Please note: the build takes 4 minutes.\nIt finished and all tests pass.\nThe APK is in the shots.\nNothing else changed.\nAll good.",
+        ] {
+            assert_eq!(waits_for_user(msg), None, "{msg}");
+        }
     }
 }

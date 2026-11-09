@@ -566,24 +566,54 @@ impl Asks {
     }
 
     /// A session finished a turn (`working` to idle or done): if its last
-    /// message seems to ask the user something, a text question set, for the
-    /// brain to read.
-    pub fn finished(&self, address: &str, t: &Value) {
+    /// message waits for the user to do something (merge, approve, test,
+    /// decide), it needs them as a blocked session does (`waiting`); if it
+    /// seems to ask something, a text question set, for the brain to read.
+    /// `watched`: the brain hears of this turn from its watch.
+    pub fn finished(&self, address: &str, t: &Value, watched: bool) {
         if super::watch::left_alone(t) {
             return;
         }
         let (me, address, t) = (self.clone(), address.to_string(), t.clone());
         std::thread::spawn(move || {
             let Some(message) = last_message(&address, &t) else { return };
+            let context = crate::history::jobs(&crate::history::load()).into_iter().find(|j| j.session == address).map(|j| j.title).unwrap_or_default();
+            if let Some(request) = questions::waits_for_user(&message) {
+                me.waiting(&address, &hc::spoken_name(&t), hc::created_ms(&t), &message, &request, &context, watched);
+                return;
+            }
             if !questions::looks_like_question(&message) {
                 return;
             }
-            let context = crate::history::jobs(&crate::history::load()).into_iter().find(|j| j.session == address).map(|j| j.title).unwrap_or_default();
             let mut set = questions::text_set(&address, &hc::spoken_name(&t), &message, &context);
             set.at_ms = crate::history::now_ms();
             set.created_ms = hc::created_ms(&t);
             me.upsert(set);
         });
+    }
+
+    /// A turn that ended waiting for the user to act: a card that goes
+    /// straight to them (the brain can't merge or test for them, so it isn't
+    /// asked to answer it), the session's open job blocked on it, and the
+    /// request said in plain words: by the tower, unless a watch reports
+    /// this turn to the brain (it says it then, naming the space).
+    #[allow(clippy::too_many_arguments)]
+    pub fn waiting(&self, address: &str, name: &str, created_ms: Option<u64>, message: &str, request: &str, context: &str, watched: bool) -> Option<QuestionSet> {
+        let mut set = questions::wait_set(address, name, message, request, context);
+        set.at_ms = crate::history::now_ms();
+        set.created_ms = created_ms;
+        let known = self.get(&set.id).is_some();
+        let set = self.upsert(set);
+        if known {
+            return None;
+        }
+        eprintln!("[questions] {address} ({name}) waits for the user: {request}");
+        let (a, r) = (address.to_string(), request.to_string());
+        crate::history::later(move || crate::history::job_follow(&a, crate::history::JobState::Blocked, &r));
+        if !watched {
+            self.tell(address, &questions::wait_line(name, request));
+        }
+        Some(set)
     }
 
     /// A set read from the session: new, the same one again (it keeps its
@@ -1255,6 +1285,34 @@ mod tests {
         }
         std::thread::sleep(std::time::Duration::from_millis(30));
         t.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The missed release: a turn that ends waiting for the user to merge
+    /// becomes a card that is theirs from the start (the brain isn't asked
+    /// to answer it), said in plain words unless a watch reports that turn,
+    /// and said once.
+    #[test]
+    fn a_turn_waiting_for_the_user_goes_straight_to_them() {
+        let (a, brain) = asks();
+        let user = Arc::new(Mutex::new(Vec::<String>::new()));
+        let u = user.clone();
+        a.set_notify(move |addr, text| u.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{addr}: {text}")));
+        let said = || user.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let msg = "PR #1250 (dev to main) is open and its checks passed. The merge command is blocked for me, so you need to merge it. I'll wait.";
+        let req = questions::waits_for_user(msg).unwrap();
+        let set = a.waiting("tw-wait-1", "mediaroom", None, msg, &req, "Release the ticket change", false).unwrap();
+        assert_eq!(set.title, "The merge command is blocked for me, so you need to merge it.");
+        assert_eq!((set.kind.as_str(), set.decision.as_deref(), set.status.as_str()), ("text", Some("escalate"), "open"));
+        assert_eq!(set.reason, questions::WAITS);
+        assert!(a.list().iter().any(|s| s.id == set.id), "on the panel and the phone as an open card");
+        assert_eq!(said(), vec!["tw-wait-1: mediaroom waits for you: The merge command is blocked for me, so you need to merge it"]);
+        assert!(told(&brain, 1).is_empty(), "the brain isn't asked to answer it");
+        // The same turn read again: nothing new, nothing said again.
+        assert!(a.waiting("tw-wait-1", "mediaroom", None, msg, &req, "", false).is_none());
+        assert_eq!(said().len(), 1);
+        // Watched: the card, but the watch's report says it (through the brain).
+        assert!(a.waiting("tw-wait-2", "sdk", None, msg, &req, "", true).is_some());
+        assert_eq!(said().len(), 1);
     }
 
     /// t41's two-tab dialog: read from the screen only (tab 1 has no question

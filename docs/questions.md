@@ -114,6 +114,30 @@ turn count; a dialog on the way doesn't count). It is typed only while the
 session is idle or done (read again just before; `hc send --if idle` when
 idle), never into a dialog.
 
+## Waiting for you
+
+A turn can also end handing something to the user without asking a
+question: "PR #1250 is open; the merge command is blocked for me, so you need
+to merge it. I'll wait." (`questions::waits_for_user`, checked before the
+question test). In its last few sentences, one addressed to the user ("you",
+"the user") that names something to do (merge, approve, review, test,
+decide, log in, install …) and asks or waits for it ("please", "must",
+"need to", "once you", "waiting for"), or a plain "waiting for your …",
+"over to you", "bitte …". Links are left out of it.
+
+It needs the user as a blocked session does:
+
+- a `text` question set whose question is that sentence, `decision:
+  escalate` from the start and `reason` "it waits for you to do this": the
+  brain is not sent `[question-text]` (it can't merge or test for them, and
+  mustn't answer for them). The user replies from the card ("merged, go
+  on") as to any text set;
+- the session's open job goes to `blocked`, with the request as its text;
+- it is said: "<name> waits for you: <request>", by the tower; from a space
+  out of focus, as "In <space>: …". When the brain watches that session, the
+  watch's report says it instead (`[watch] … It is waiting for the user to
+  act: "…"`), marked blocked, and the job is blocked rather than done.
+
 ## Recommendations
 
 When a new set appears, the daemon sends the tower's brain one line:
