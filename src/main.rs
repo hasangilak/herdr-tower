@@ -24,6 +24,7 @@ mod install;
 mod orb;
 mod phone;
 mod protocol;
+mod prs;
 mod questions;
 mod screenshots;
 mod selftest;
