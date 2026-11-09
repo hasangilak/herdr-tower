@@ -128,7 +128,37 @@ pub fn agent_event(app: &str, terminal: &str, v: &Value) -> Option<crate::daemon
         cwd: v["cwd"].as_str().unwrap_or("").into(),
         text: text.unwrap_or_default(),
         at_ms: crate::history::now_ms(),
+        pid: agent_pid(),
     })
+}
+
+/// The agent that ran this hook: the parent process, past the shell it
+/// runs hook commands in (`claude` ← `/bin/sh` ← this).
+fn agent_pid() -> u32 {
+    let parent = std::os::unix::process::parent_id();
+    match parent_of(parent) {
+        Some((grand, name)) if ["sh", "bash", "zsh", "dash"].contains(&name.as_str()) => grand,
+        _ => parent,
+    }
+}
+
+/// A process's parent and its name.
+#[cfg(target_os = "macos")]
+fn parent_of(pid: u32) -> Option<(u32, String)> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a plain C struct of exactly `size` bytes.
+    let n = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size) };
+    if n != size {
+        return None;
+    }
+    let name: Vec<u8> = info.pbi_comm.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+    Some((info.pbi_ppid, String::from_utf8_lossy(&name).into_owned()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn parent_of(_pid: u32) -> Option<(u32, String)> {
+    None
 }
 
 /// The brain's PreToolUse hook on Bash: an instruction for one session
@@ -320,6 +350,15 @@ fn last_assistant_text(path: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_agent_is_found_past_the_shell() {
+        // This test's parent is cargo (no shell between): the parent itself.
+        assert_eq!(agent_pid(), std::os::unix::process::parent_id());
+        let (ppid, name) = parent_of(std::process::id()).unwrap();
+        assert_eq!(ppid, std::os::unix::process::parent_id());
+        assert!(!name.is_empty());
+    }
 
     #[test]
     fn the_guard_reads_hand_offs() {

@@ -253,6 +253,12 @@ impl Daemon {
                 return self.queue(&action, &session, &text, id, &after);
             }
             Request::Agent { event } => {
+                // Only the terminal's own agent speaks for it (not a `claude -p` it runs).
+                let foreground = crate::hc::get(&event.terminal).and_then(|t| t["foreground"]["pid"].as_u64());
+                if !sessions::from_terminals_agent(&event, foreground) {
+                    eprintln!("[sessions] {}: {} from another agent inside it (pid {}): not the terminal's", event.terminal, event.event, event.pid);
+                    return Response { ok: true, error: None, state: None };
+                }
                 let change = sessions::registry().apply(&event);
                 if change != sessions::Change::Nothing {
                     self.watches.agent(&event, &change);

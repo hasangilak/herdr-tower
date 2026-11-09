@@ -42,6 +42,20 @@ pub struct AgentEvent {
     pub text: String,
     #[serde(default)]
     pub at_ms: u64,
+    /// The agent process that ran the hook (0: not known). Only the
+    /// terminal's own agent (Herdr's foreground process) speaks for it: a
+    /// `claude -p` run inside a session inherits its terminal, but isn't it.
+    #[serde(default)]
+    pub pid: u32,
+}
+
+/// Whether an event comes from the terminal's own agent: the hook's agent
+/// is the terminal's foreground process (either not known: it is).
+pub fn from_terminals_agent(ev: &AgentEvent, foreground_pid: Option<u64>) -> bool {
+    match foreground_pid {
+        Some(fg) if ev.pid != 0 => u64::from(ev.pid) == fg,
+        _ => true,
+    }
 }
 
 /// An agent session as its hooks describe it.
@@ -340,6 +354,18 @@ mod tests {
         assert_eq!(r.get("t5").unwrap().state, "done");
         assert!(!spool.exists());
         let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn a_nested_agent_is_not_the_terminal() {
+        let mut e = ev("end", "", 1);
+        e.pid = 52490;
+        assert!(!from_terminals_agent(&e, Some(48435)), "a claude -p run inside the session");
+        e.pid = 48435;
+        assert!(from_terminals_agent(&e, Some(48435)));
+        assert!(from_terminals_agent(&e, None), "foreground not known");
+        e.pid = 0;
+        assert!(from_terminals_agent(&e, Some(48435)), "pid not known");
     }
 
     #[test]
