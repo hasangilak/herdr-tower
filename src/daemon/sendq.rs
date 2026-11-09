@@ -422,7 +422,8 @@ impl Book {
     fn after_done(&self, item: &Item) -> Option<bool> {
         let mut all = true;
         for id in &item.after {
-            if self.cancelled.contains(id) {
+            // Cancelled, or parked so long it expired: it will never be done.
+            if self.cancelled.contains(id) || self.expired.iter().any(|i| i.id == *id) {
                 return None;
             }
             if self.items.iter().any(|i| i.id == *id) {
@@ -1540,6 +1541,23 @@ mod tests {
         q2.tick(&f);
         assert_eq!(f.sent(), vec!["deploy the billing fix"]);
         assert!(q2.lock().expired.is_empty());
+    }
+
+    #[test]
+    fn what_waits_for_an_expired_one_never_goes() {
+        let (q, _d) = queue();
+        let f = Fake::default();
+        f.set("t5", "working");
+        f.set("t6", "idle");
+        let (Added::Queued { id: a, .. }, _, _) = q.add_with(&f, "t5", "build it", &[]).unwrap() else { panic!() };
+        q.add_with(&f, "t6", "deploy what t5 built", &[a]).unwrap();
+        f.sessions.lock().unwrap().remove("t5");
+        q.tick(&f);
+        let parked_at = q.items().iter().find(|i| i.id == a).unwrap().parked_ms.unwrap();
+        q.expire_round(&f, parked_at + PARK_EXPIRE_MS);
+        q.tick(&f);
+        assert!(f.sent().is_empty(), "never as if what it waited for were done: {:?}", f.sent());
+        assert_eq!(q.items().iter().map(|i| i.parked.clone()).collect::<Vec<_>>(), [Some(ParkWhy::AfterCancelled)]);
     }
 
     #[test]

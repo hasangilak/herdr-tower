@@ -597,16 +597,6 @@ impl Radar {
         if was == status && !turned {
             return;
         }
-        // Its open job follows what it does: blocked, back to working, done, an
-        // error, ended. Only changes seen while the tower is up: what happened
-        // while it was down is the start's reconcile (it reports it, then moves the job).
-        if let Some(job) = crate::history::JobState::of_session(&status, live)
-            && before.is_some()
-            && (was != status || turned)
-        {
-            let a = address.clone();
-            crate::history::later(move || crate::history::job_follow(&a, job, ""));
-        }
         let working = SessionStatus::Working;
         let stopped_working = (was == working && status != working) || (turned && was != working);
         // A turn ended: its last message may ask the user something.
@@ -616,9 +606,25 @@ impl Radar {
         // Blocked on a dialog this machine can read: the questions go through
         // the brain (answered for the user, or told to them), not a plain notice.
         let handled = machine.is_none() && status == SessionStatus::Blocked && matches!(hc::block_kind(t), hc::BlockKind::Question | hc::BlockKind::Permission);
+        let fires = (stopped_working || (status == SessionStatus::Blocked && !handled) || !live) && self.watches.watched(&address);
+
+        // Its open job follows what it does: back to working, blocked on what
+        // only a person can answer, done, an error, ended. Not a dialog the
+        // tower handles (its card says so), nor a change a watch reports (the
+        // watch moves the job), nor what happened while the tower was down
+        // (the start's reconcile reports it, then moves the job).
+        if let Some(job) = crate::history::JobState::of_session(&status, live)
+            && before.is_some()
+            && (was != status || turned)
+            && !fires
+            && !(handled && job == crate::history::JobState::Blocked)
+        {
+            let a = address.clone();
+            crate::history::later(move || crate::history::job_follow(&a, job, ""));
+        }
 
         // The brain asked to hear when this one stops.
-        if (stopped_working || (status == SessionStatus::Blocked && !handled) || !live) && self.watches.watched(&address) {
+        if fires {
             let status = if live { status.clone() } else { SessionStatus::Exited };
             self.fire_watch(&address, &name, space.clone(), &status, "");
             return;
@@ -757,7 +763,7 @@ impl Radar {
         let r = report.clone();
         if self.watches.fire(address, move |_| r).is_some() {
             let a = address.to_string();
-            crate::history::later(move || crate::history::job_follow(&a, crate::history::JobState::Blocked, "asks to trust its folder"));
+            crate::history::later(move || crate::history::job_update(&a, crate::history::JobState::Blocked, "asks to trust its folder"));
         } else {
             self.watches.owe(report);
         }
@@ -777,8 +783,11 @@ impl Radar {
         // Gone while the tower looked: nothing owed at the next start for it.
         if removed.as_ref().is_some_and(|r| !r.app.is_empty()) {
             self.watches.seen(address, &SessionStatus::Gone);
-            let a = address.to_string();
-            crate::history::later(move || crate::history::job_follow(&a, crate::history::JobState::Exited, ""));
+            // A watched one's job is the watch's to move (below).
+            if !self.watches.watched(address) {
+                let a = address.to_string();
+                crate::history::later(move || crate::history::job_follow(&a, crate::history::JobState::Exited, ""));
+            }
         }
         if self.watches.watched(address) {
             let space = removed.as_ref().and_then(|r| r.space.clone());
@@ -792,7 +801,11 @@ impl Radar {
     fn fire_watch(&self, address: &str, name: &str, space: Option<String>, status: &SessionStatus, why: &str) -> bool {
         let fired = self.watches.fire(address, |w| {
             let (t, a) = (address.to_string(), w.note.clone());
-            let job = crate::history::JobState::of_session(status, true).unwrap_or(crate::history::JobState::Exited);
+            // A status that says nothing for a job (none, a word not known): the turn is over, as the watch says.
+            let job = crate::history::JobState::of_session(status, true).unwrap_or(match status {
+                SessionStatus::Other(w) => crate::history::JobState::Other(w.clone()),
+                _ => crate::history::JobState::Done,
+            });
             crate::history::later(move || crate::history::job_watched(&t, job, &a));
             let mut p = report(address, name, space.clone(), status, &w.note, why, "watch");
             // What it said at the end of its turn (its hook): often all the brain needs.
