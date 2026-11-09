@@ -124,6 +124,7 @@ mod now;
 mod gallery;
 mod questions;
 mod viewer;
+mod follow;
 
 use crate::orb::shots::{self, Shot};
 
@@ -173,7 +174,8 @@ pub struct Panel {
     jobs: Vec<Job>,
     loaded: Option<SystemTime>,
     chat: ScrollHandle,
-    shown: usize,
+    /// Keeps the chat at its newest message while you're at the bottom.
+    follow: follow::Follower,
     filter: Filter,
     scope: Scope,
     listening_since: Option<Instant>,
@@ -194,8 +196,6 @@ pub struct Panel {
     parting: Option<String>,
     /// The daemon was told the input holds a draft (see `draft`).
     holding: bool,
-    /// The brain's current turn (when it began), to scroll its working line into view.
-    turn: u64,
     /// The space opened in the Spaces view, and how far it had been read before.
     open_space: Option<String>,
     prev_read: u64,
@@ -231,14 +231,6 @@ impl Panel {
                 _ => {}
             }),
             cx.observe_in(&tower, window, |this, tower, window, cx| {
-                // A new turn: bring the working line into view.
-                let since = tower.read(cx).work.as_ref().map(|w| w.since_ms).unwrap_or(0);
-                if since != this.turn {
-                    this.turn = since;
-                    if since > 0 {
-                        this.chat.scroll_to_bottom();
-                    }
-                }
                 this.follow_voice(&tower, window, cx);
                 this.watch_sets(cx);
                 let listening = matches!(tower.read(cx).phase(), "listening" | "armed");
@@ -329,7 +321,7 @@ impl Panel {
             jobs: vec![],
             loaded: None,
             chat: ScrollHandle::new(),
-            shown: 0,
+            follow: Default::default(),
             filter: Filter::Active,
             scope: Scope::Everything,
             listening_since: None,
@@ -341,7 +333,6 @@ impl Panel {
             forgot: false,
             parting: None,
             holding: false,
-            turn: 0,
             open_space: None,
             prev_read: 0,
             live: vec![],
@@ -529,11 +520,6 @@ impl Panel {
         self.entries = history::load();
         self.jobs = history::jobs(&self.entries);
         self.shots = shots::load();
-        let n = chat_items(&self.entries).len();
-        if n != self.shown {
-            self.shown = n;
-            self.chat.scroll_to_bottom();
-        }
         cx.notify();
     }
 
@@ -661,6 +647,8 @@ impl Panel {
         let (text, files) = message_parts(&self.text.read(cx).content());
         self.sending = true;
         self.status = None;
+        // Your own message: down to it, even if you were reading further up.
+        self.follow.go_down();
         cx.notify();
         let job = cx.background_executor().spawn(async move {
             let kept: Vec<String> = files.iter().map(|p| history::keep_attachment(p).display().to_string()).collect();
@@ -1004,13 +992,51 @@ impl Panel {
                     .into_any_element(),
             );
         }
-        div()
+        let list = div()
             .id("chat")
-            .flex_1()
-            .min_h_0()
+            .size_full()
             .overflow_y_scroll()
             .track_scroll(&self.chat)
-            .child(v_flex().w_full().px_5().py_2().gap_3().children(rows))
+            .child(v_flex().w_full().px_5().py_2().gap_3().children(rows));
+        // Scrolled up to read when more came in: a way down to it.
+        let unseen = self.follow.unseen().then(|| {
+            h_flex()
+                .absolute()
+                .bottom(px(10.0))
+                .left_0()
+                .right_0()
+                .justify_center()
+                .child(
+                    h_flex()
+                        .id("new-messages")
+                        .gap_1()
+                        .items_center()
+                        .px_3()
+                        .py(px(5.0))
+                        .rounded_full()
+                        .bg(rgb(0xf4f6f9))
+                        .text_color(g.pill_text)
+                        .shadow_md()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(0xffffff)))
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(Icon::new(IconName::ArrowDown).xsmall())
+                        .child("New messages")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.follow.go_down();
+                            cx.notify();
+                        })),
+                )
+        });
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .child(list)
+            // After the list, so it sees the list as just laid out.
+            .child(self.follow.watch(&self.chat, self.loaded.is_some(), cx.entity_id()))
+            .children(unseen)
             .into_any_element()
     }
 
