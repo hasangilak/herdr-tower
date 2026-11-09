@@ -125,6 +125,7 @@ mod gallery;
 mod questions;
 mod viewer;
 mod follow;
+mod prchip;
 
 use crate::orb::shots::{self, Shot};
 
@@ -178,6 +179,8 @@ pub struct Panel {
     follow: follow::Follower,
     /// The chat's first message, fixed once the history is in (`chat_items`).
     chat_since: Option<u64>,
+    /// Where each PR chip's merge stands (by the PR's key).
+    pr_steps: HashMap<String, prchip::Step>,
     filter: Filter,
     scope: Scope,
     listening_since: Option<Instant>,
@@ -325,6 +328,7 @@ impl Panel {
             chat: ScrollHandle::new(),
             follow: Default::default(),
             chat_since: None,
+            pr_steps: HashMap::new(),
             filter: Filter::Active,
             scope: Scope::Everything,
             listening_since: None,
@@ -1001,6 +1005,10 @@ impl Panel {
                         rows.push(match e.kind.as_str() {
                             "request" | "answer" => bubble(e, &g),
                             "behavior" => self.behavior_chat_card(e, cx),
+                            "pr" => {
+                                let chip = self.pr_chip(e.id.as_deref().unwrap_or(""), &e.text, cx);
+                                h_flex().w_full().child(chip).into_any_element()
+                            }
                             _ => event_line(e, &g),
                         });
                     }
@@ -1631,6 +1639,7 @@ fn chat_items(entries: &[Entry], since: Option<u64>) -> Vec<&Entry> {
     let keep = |e: &&Entry| !e.held && match e.kind.as_str() {
         "request" | "answer" | "watch" | "alert" | "summary" | "answered" | "behavior" => true,
         "screenshot" => e.path.is_some(),
+        "pr" => e.id.is_some(),
         "job" => matches!(e.status.as_deref(), Some("done" | "failed" | "error" | "exited" | "blocked")) && !e.text.is_empty(),
         _ => false,
     };

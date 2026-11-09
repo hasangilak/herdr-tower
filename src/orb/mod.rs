@@ -71,6 +71,8 @@ struct Tower {
     work: Option<crate::activity::Work>,
     /// Focus, agendas and what's been read (`spaces.json`, beside state.json).
     spaces: crate::spaces::Spaces,
+    /// The PRs sessions opened (`prs.json`, beside state.json): the chat's chips.
+    prs: std::collections::BTreeMap<String, crate::prs::Pr>,
     alive: bool,
     /// We ran `tower up` and wait for the daemon to say it runs.
     starting: Option<Instant>,
@@ -78,7 +80,15 @@ struct Tower {
 
 impl Tower {
     fn new(ui_dir: &Path) -> Self {
-        let mut t = Self { file: ui_dir.join("state.json"), state: None, work: None, spaces: Default::default(), alive: false, starting: None };
+        let mut t = Self {
+            file: ui_dir.join("state.json"),
+            state: None,
+            work: None,
+            spaces: Default::default(),
+            prs: Default::default(),
+            alive: false,
+            starting: None,
+        };
         t.read();
         t
     }
@@ -95,6 +105,7 @@ impl Tower {
         self.work = std::fs::read_to_string(self.file.with_file_name("work.json")).ok().and_then(|t| serde_json::from_str(&t).ok());
         if let Some(dir) = self.file.parent() {
             self.spaces = crate::spaces::load_from(dir);
+            self.prs = crate::prs::load_from(dir);
         }
         self.check_alive();
     }
