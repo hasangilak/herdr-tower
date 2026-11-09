@@ -70,6 +70,12 @@ pub struct State {
     pub stt_model: String,
     /// The phone API's address (`https://192.168.1.20:7843`), or "" when it's off.
     pub lan: String,
+    /// Every address the phone API listens on, in the order a phone should
+    /// try them: `[{"kind": "lan"|"tailscale", "host", "port"}]` (empty when off).
+    pub lan_hosts: Vec<serde_json::Value>,
+    /// Tailscale on this Mac: `{installed, running, state, ip, dns_name}`
+    /// (null until the phone API has looked).
+    pub tailscale: Option<serde_json::Value>,
     /// The paired phone that is the tower's voice now (the Mac is silent), or null.
     pub phone: Option<String>,
     /// The latest screenshots sessions sent (`tower screenshot`), newest
@@ -137,6 +143,8 @@ impl State {
             voice: voice.into(),
             stt_model: stt_model.into(),
             lan: String::new(),
+            lan_hosts: vec![],
+            tailscale: None,
             phone: None,
             screenshots: vec![],
             questions: vec![],

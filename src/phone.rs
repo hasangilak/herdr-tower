@@ -20,11 +20,100 @@ pub struct Status {
     pub enabled: bool,
     /// The voice daemon is running (the API lives in it).
     pub voice: bool,
-    /// Where it listens (`https://ip:port`) while it's on.
+    /// Where it listens (`https://ip:port`) while it's on: the first of `hosts`.
     pub url: Option<String>,
+    /// Every address it listens on, in order (the LAN's, the tailnet's).
+    pub hosts: Vec<Host>,
+    /// Tailscale on this Mac.
+    pub tailscale: Tailscale,
     /// Seconds left on the open pairing code (none open: `None`).
     pub pairing_expires_in_s: Option<u64>,
     pub devices: Vec<Device>,
+}
+
+/// One address the API listens on.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Host {
+    /// `lan` or `tailscale`.
+    pub kind: String,
+    pub host: String,
+    pub port: u16,
+    /// The MagicDNS name, for the tailnet's.
+    pub dns_name: Option<String>,
+}
+
+impl Host {
+    pub fn of(v: &Value) -> Option<Host> {
+        Some(Host {
+            kind: v["kind"].as_str()?.to_string(),
+            host: v["host"].as_str()?.to_string(),
+            port: v["port"].as_u64()? as u16,
+            dns_name: v["dns_name"].as_str().map(String::from),
+        })
+    }
+
+    /// `Tailscale 100.68.110.33:7843 (mac.tail1234.ts.net)`.
+    pub fn line(&self) -> String {
+        let kind = if self.kind == "tailscale" { "Tailscale" } else { "Local network" };
+        let dns = self.dns_name.as_ref().map(|n| format!(" ({n})")).unwrap_or_default();
+        format!("{kind} {}:{}{dns}", self.host, self.port)
+    }
+}
+
+/// Tailscale as the phone API sees it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Tailscale {
+    pub installed: bool,
+    pub running: bool,
+    /// `running`, `stopped`, `needs login`, `not installed`, …
+    pub state: String,
+    pub ip: Option<String>,
+    pub dns_name: Option<String>,
+    /// `[lan] tailscale`: `auto` or `off`.
+    pub mode: String,
+    /// The API listens on the tailnet address now.
+    pub listening: bool,
+    /// Why it doesn't, though Tailscale runs.
+    pub error: Option<String>,
+}
+
+impl Tailscale {
+    fn of(v: &Value) -> Tailscale {
+        Tailscale {
+            installed: v["installed"].as_bool().unwrap_or(false),
+            running: v["running"].as_bool().unwrap_or(false),
+            state: v["state"].as_str().unwrap_or("not installed").to_string(),
+            ip: v["ip"].as_str().map(String::from),
+            dns_name: v["dns_name"].as_str().map(String::from),
+            mode: v["mode"].as_str().unwrap_or("auto").to_string(),
+            listening: v["listening"].as_bool().unwrap_or(false),
+            error: v["error"].as_str().map(String::from),
+        }
+    }
+
+    /// Asked here (the voice isn't running to ask).
+    fn here() -> Tailscale {
+        let mode = config::Config::load().map(|c| c.lan.tailscale).unwrap_or_else(|_| "auto".into());
+        let mut v = crate::daemon::lan::tailscale::detect().view();
+        v["mode"] = Value::from(if mode.trim() == "off" { "off" } else { "auto" });
+        Tailscale::of(&v)
+    }
+
+    /// One line for people: what Tailscale is doing and what that means for the phone.
+    pub fn line(&self, api_on: bool) -> String {
+        let ip = self.ip.as_deref().map(|i| format!(" ({i}{})", self.dns_name.as_ref().map(|n| format!(", {n}")).unwrap_or_default())).unwrap_or_default();
+        match (self.installed, self.running) {
+            (false, _) => "Tailscale: not installed. Phones reach the tower on the local network only.".into(),
+            _ if self.mode == "off" => format!("Tailscale: {}{ip}, but [lan] tailscale = \"off\": not listened on.", self.state),
+            (true, false) => format!("Tailscale: {}{ip}. Phones reach the tower on the local network only; start Tailscale to reach it from anywhere.", self.state),
+            (true, true) if self.listening => format!("Tailscale: running{ip}. Phones reach the tower over it too, from anywhere on the tailnet."),
+            (true, true) if !api_on => format!("Tailscale: running{ip}. The phone API listens on it too once it's on."),
+            (true, true) => format!(
+                "Tailscale: running{ip}, but not listened on{}.",
+                self.error.as_ref().map(|e| format!(" ({e}); it's tried again every 20 s")).unwrap_or_default()
+            ),
+        }
+    }
 }
 
 pub fn status() -> Status {
@@ -33,6 +122,11 @@ pub fn status() -> Status {
         enabled: config::Config::load().map(|c| c.lan.enabled).unwrap_or(false),
         voice: info.is_some(),
         url: info.as_ref().and_then(|v| v["url"].as_str().map(String::from)),
+        hosts: info.as_ref().and_then(|v| v["hosts"].as_array().map(|a| a.iter().filter_map(Host::of).collect())).unwrap_or_default(),
+        tailscale: match &info {
+            Some(v) => Tailscale::of(&v["tailscale"]),
+            None => Tailscale::here(),
+        },
         pairing_expires_in_s: info.as_ref().and_then(|v| v["pairing_expires_in_s"].as_u64()),
         devices: Devices::load_from(&Devices::path()).unwrap_or_default().devices,
     }
@@ -56,8 +150,10 @@ pub fn disable() -> Result<()> {
     Ok(())
 }
 
-/// Opens a one-time pairing code: `code`, `host`, `port`, `fingerprint`,
-/// `link` (what the QR carries), `expires_in_s`. Secret: never logged.
+/// Opens a one-time pairing code: `code`, `host`, `port` (the first
+/// address), `hosts` (every address, in order), `magic_dns`, `fingerprint`,
+/// `link` (what the QR carries), `expires_in_s`, `tailscale`
+/// (docs/mobile-api.md). Secret: never logged.
 pub fn pair() -> Result<Value> {
     daemon("pair", "")
 }
@@ -122,7 +218,14 @@ pub fn cmd(action: &str, id: Option<&str>, value: Option<&str>, json: bool) -> R
                 println!("{}", q.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(true).build());
             }
             println!("Scan this in the Tower app, or enter:");
-            println!("  address      {}:{}", v["host"].as_str().unwrap_or(""), v["port"]);
+            let hosts: Vec<Host> = v["hosts"].as_array().map(|a| a.iter().filter_map(Host::of).collect()).unwrap_or_default();
+            if hosts.len() > 1 {
+                for (i, h) in hosts.iter().enumerate() {
+                    println!("  {:<12} {}", if i == 0 { "address" } else { "or" }, h.line());
+                }
+            } else {
+                println!("  address      {}:{}", v["host"].as_str().unwrap_or(""), v["port"]);
+            }
             println!("  code         {} {}", &code[..4.min(code.len())], &code[4.min(code.len())..]);
             println!("  certificate  {}", tls::grouped(v["fingerprint"].as_str().unwrap_or("")));
             println!("The code works once, for {} minutes.", v["expires_in_s"].as_u64().unwrap_or(300) / 60);
@@ -130,12 +233,31 @@ pub fn cmd(action: &str, id: Option<&str>, value: Option<&str>, json: bool) -> R
         }
         "devices" | "status" | "ls" => {
             let info = daemon("status", "").ok();
+            let st = status();
+            if json {
+                let mut v = info.clone().unwrap_or_else(|| serde_json::json!({ "on": false }));
+                if info.is_none() {
+                    v["tailscale"] = serde_json::json!({
+                        "installed": st.tailscale.installed, "running": st.tailscale.running, "state": st.tailscale.state,
+                        "ip": st.tailscale.ip, "dns_name": st.tailscale.dns_name, "mode": st.tailscale.mode,
+                        "listening": false, "error": null,
+                    });
+                    v["hosts"] = serde_json::json!([]);
+                }
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
             match info.as_ref().and_then(|v| v["url"].as_str()) {
-                Some(url) => println!(
-                    "Phone API on at {url} ({} stream(s), {} as the voice).",
-                    info.as_ref().unwrap()["streams"],
-                    info.as_ref().unwrap()["voice_streams"]
-                ),
+                Some(url) => {
+                    println!(
+                        "Phone API on at {url} ({} stream(s), {} as the voice).",
+                        info.as_ref().unwrap()["streams"],
+                        info.as_ref().unwrap()["voice_streams"]
+                    );
+                    for h in &st.hosts {
+                        println!("  listening on {}", h.line());
+                    }
+                }
                 None => println!(
                     "Phone API off{}.",
                     if config::Config::load().map(|c| c.lan.enabled).unwrap_or(false) {
@@ -145,6 +267,7 @@ pub fn cmd(action: &str, id: Option<&str>, value: Option<&str>, json: bool) -> R
                     }
                 ),
             }
+            println!("{}", st.tailscale.line(st.url.is_some()));
             let d = Devices::load_from(&Devices::path())?;
             if d.devices.is_empty() {
                 println!("No paired phones.");

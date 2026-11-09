@@ -257,11 +257,14 @@ pub struct Lan {
     /// Listen on an address that isn't private (10/8, 172.16/12, 192.168/16,
     /// 100.64/10, link-local). Leave off.
     pub allow_public: bool,
+    /// Also listen on this Mac's Tailscale address (100.64/10), while
+    /// Tailscale runs: `auto` (the default) or `off`.
+    pub tailscale: String,
 }
 
 impl Default for Lan {
     fn default() -> Self {
-        Self { enabled: false, port: 7843, bind: "auto".into(), allow_public: false }
+        Self { enabled: false, port: 7843, bind: "auto".into(), allow_public: false, tailscale: "auto".into() }
     }
 }
 
