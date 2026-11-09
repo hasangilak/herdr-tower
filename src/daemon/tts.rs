@@ -347,10 +347,29 @@ pub struct Settings {
     pub on_mac: bool,
 }
 
+/// Opens the default speakers. rodio asks for about 50 ms of buffer
+/// (2048 frames at 44.1 kHz); some devices, such as Bluetooth headphones,
+/// take at most 1024, so smaller buffers are tried before giving up.
+fn open_speakers() -> Result<rodio::MixerDeviceSink> {
+    let first = match rodio::DeviceSinkBuilder::open_default_sink() {
+        Ok(sink) => return Ok(sink),
+        Err(e) => e,
+    };
+    for frames in [1024, 512, 256] {
+        let sink = rodio::DeviceSinkBuilder::from_default_device()
+            .and_then(|b| b.with_buffer_size(cpal::BufferSize::Fixed(frames)).open_stream());
+        if let Ok(sink) = sink {
+            eprintln!("[speech] speakers open with a {frames}-frame buffer ({first})");
+            return Ok(sink);
+        }
+    }
+    Err(first).context("opening the speakers")
+}
+
 /// Starts the speech thread. Kokoro loads (and on first use downloads,
 /// about 330 MB) before this returns, so the first sentence is quick.
 pub fn start(settings: Settings, shared: Shared, hub: Arc<Hub>) -> Result<Mouth> {
-    let sink = rodio::DeviceSinkBuilder::open_default_sink().context("opening the speakers")?;
+    let sink = open_speakers()?;
     let player = Arc::new(Player::connect_new(sink.mixer()));
     let bell = Player::connect_new(sink.mixer());
     let volume = settings.volume.clamp(0.0, 1.0);
