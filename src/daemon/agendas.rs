@@ -44,6 +44,12 @@ pub fn radar_note() -> Option<String> {
     RUNNING.get()?.lock().radar_note()
 }
 
+/// What `session` is on, from the agenda ledger: its latest unfinished task's instruction.
+pub fn task_of(session: &str) -> Option<String> {
+    let l = RUNNING.get()?.lock();
+    l.unfinished_on(session).map(|t| t.instruction.clone())
+}
+
 fn now_ms() -> u64 {
     crate::history::now_ms()
 }

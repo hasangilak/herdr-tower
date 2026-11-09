@@ -5,6 +5,7 @@ pub mod asks;
 pub mod card;
 mod book;
 pub mod hotkey;
+pub mod introduce;
 pub mod lan;
 pub mod mic;
 pub mod narrate;
@@ -44,6 +45,7 @@ struct Daemon {
     sendq: sendq::SendQueue,
     prs: crate::prs::Prs,
     agendas: agendas::Agendas,
+    introducer: introduce::Introducer,
 }
 
 pub fn run() -> Result<()> {
@@ -186,7 +188,10 @@ pub fn run() -> Result<()> {
     // The agenda ledger: what the user asked for, followed until it's done.
     let agendas = agendas::Agendas::open();
     agendas.start(agendas::Ctx { sendq: sendq.clone(), watches: watches.clone(), asks: asks.clone(), shared: shared.clone() });
-    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks, sendq, prs, agendas };
+    // Claude sessions in one space are told who the others are, as they join.
+    let introducer = introduce::Introducer::new(sendq.clone());
+    introducer.start();
+    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks, sendq, prs, agendas, introducer };
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let d = daemon.clone();
@@ -346,6 +351,17 @@ impl Daemon {
                 return self.queue(&action, &session, &text, id, &after, tag);
             }
             Request::Agenda { ledger } => return self.agendas.request(&ledger),
+            Request::Introduce { action, space, dry_run } => {
+                if action == "kick" {
+                    self.introducer.kick();
+                    return Response { ok: true, error: None, state: None };
+                }
+                let space = if action == "status" { String::new() } else { space };
+                return match self.introducer.request(&space, dry_run) {
+                    Ok(v) => Response { ok: true, error: None, state: Some(v) },
+                    Err(e) => Response::err(format!("{e:#}")),
+                };
+            }
             Request::Agent { event } => {
                 // Only the terminal's own agent speaks for it (not a `claude -p` it runs).
                 let foreground = crate::hc::get(&event.terminal).and_then(|t| t["foreground"]["pid"].as_u64());
@@ -359,6 +375,10 @@ impl Daemon {
                     self.sendq.kick();
                     // A turn that ends is judged at once, before the next instruction follows it in.
                     self.agendas.kick();
+                    // A new session: maybe someone joined a space.
+                    if change == sessions::Change::Started {
+                        self.introducer.kick();
+                    }
                 }
                 return Response { ok: true, error: None, state: None };
             }

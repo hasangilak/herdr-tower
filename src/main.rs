@@ -22,6 +22,7 @@ mod hc;
 mod history;
 mod hooks;
 mod install;
+mod introduce;
 mod orb;
 mod phone;
 mod protocol;
@@ -118,6 +119,16 @@ enum Cmd {
         /// new: the spaces it's about.
         #[arg(long)]
         space: Vec<String>,
+    },
+    /// Introduce the Claude sessions of a Herdr space to each other (the tower does it by itself when
+    /// one joins a space with others; `[sessions] introduce = false` turns that off). No space: each
+    /// space's Claude sessions and when they were introduced. `<space> --dry-run`: the messages it
+    /// would send. `<space>`: send them again now (queued: each session gets it once it's free).
+    Introduce {
+        /// The space (its name or a part of it).
+        space: Vec<String>,
+        #[arg(long)]
+        dry_run: bool,
     },
     /// What every agent session's hooks told the tower: its terminal, session id, prompt, last answer.
     Sessions {
@@ -532,6 +543,7 @@ fn run(cli: Cli) -> Result<()> {
             start(account.as_deref(), &name, cwd, on.as_deref(), space.as_deref(), no_watch, tag, &task.join(" "))
         }
         Cmd::Agenda { action, args, all, force, title, space } => agenda_cmd(&action, &args, all, force, title, space),
+        Cmd::Introduce { space, dry_run } => introduce_cmd(&space.join(" "), dry_run),
         Cmd::Accounts { on } => list_accounts(on.as_deref()),
         Cmd::Behavior { action, arg, title, category, summary, text, json } => behavior_cmd(&action, &arg, title, category, summary, text, json),
         Cmd::Questions { session } => {
@@ -999,6 +1011,10 @@ fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str
         _ => None,
     };
     let tracked = tracked.unwrap_or_default();
+    // A new session in a space with others: they're introduced to each other (once it settles).
+    if protocol::is_running() {
+        let _ = protocol::send(&Request::Introduce { action: "kick".into(), space: String::new(), dry_run: false });
+    }
     if std::io::stdout().is_terminal() {
         println!(
             "Started {name} as {address}{in_space}{on_account}.{}{}",
@@ -1065,6 +1081,65 @@ fn agenda_do(cmd: &agenda::Cmd) -> Result<Value> {
             .collect::<Vec<_>>());
     }
     Ok(v)
+}
+
+/// `tower introduce [<space>] [--dry-run]`.
+fn introduce_cmd(space: &str, dry_run: bool) -> Result<()> {
+    if !protocol::is_running() {
+        bail!("the tower's voice isn't running (tower up): it keeps what was introduced");
+    }
+    let action = if space.trim().is_empty() { "status" } else { "run" };
+    let r = protocol::send(&Request::Introduce { action: action.into(), space: space.trim().into(), dry_run })?;
+    if !r.ok {
+        bail!("{}", r.error.unwrap_or_default());
+    }
+    let v = r.state.unwrap_or_default();
+    if !std::io::stdout().is_terminal() {
+        print_json(&v);
+        return Ok(());
+    }
+    if action == "status" {
+        if v["enabled"] == false {
+            println!("Introducing sessions is off ([sessions] introduce = false in config.toml).");
+        }
+        let spaces = v["spaces"].as_array().cloned().unwrap_or_default();
+        if spaces.is_empty() {
+            println!("No Claude sessions in any space.");
+        }
+        for sp in spaces {
+            let names: Vec<String> = sp["sessions"]
+                .as_array()
+                .map(|a| a.iter().map(|m| format!("{} ({})", m["name"].as_str().unwrap_or(""), m["address"].as_str().unwrap_or(""))).collect())
+                .unwrap_or_default();
+            let when = match sp["introduced_ms"].as_u64() {
+                Some(t) if t > 0 => format!("introduced {}", phone::ago(t)),
+                _ => "never introduced".into(),
+            };
+            let note = if names.len() < 2 { "alone".to_string() } else if sp["up_to_date"] == true { when } else { format!("{when}; changed since") };
+            println!("{}: {} ({note})", sp["space"].as_str().unwrap_or(""), names.join(", "));
+        }
+        return Ok(());
+    }
+    if dry_run {
+        for m in v["messages"].as_array().cloned().unwrap_or_default() {
+            println!("── to {} ({}):\n{}\n", m["name"].as_str().unwrap_or(""), m["to"].as_str().unwrap_or(""), m["text"].as_str().unwrap_or(""));
+        }
+        println!("(dry run: nothing sent; `tower introduce {}` sends it)", v["space"].as_str().unwrap_or(space));
+        return Ok(());
+    }
+    for m in v["sent"].as_array().cloned().unwrap_or_default() {
+        match m["error"].as_str() {
+            Some(e) => println!("{} ({}): not queued: {e}", m["name"].as_str().unwrap_or(""), m["to"].as_str().unwrap_or("")),
+            None => println!(
+                "{} ({}): {} (#{})",
+                m["name"].as_str().unwrap_or(""),
+                m["to"].as_str().unwrap_or(""),
+                if m["sent"] == true { "sent" } else { "queued until it's free" },
+                m["queue_id"]
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// `tower agenda …`.

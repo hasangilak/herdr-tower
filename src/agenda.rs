@@ -729,7 +729,7 @@ impl Ledger {
     }
 
     /// The latest task on `session` that isn't settled, in an agenda still open.
-    fn unfinished_on(&self, session: &str) -> Option<&Task> {
+    pub fn unfinished_on(&self, session: &str) -> Option<&Task> {
         self.agendas
             .iter()
             .filter(|a| a.live())

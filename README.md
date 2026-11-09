@@ -334,6 +334,7 @@ tower dispatch --json '{"request":"…","tasks":[…]}'   # several tasks: each 
 tower agenda [--all] | tasks         # what the user asked for and isn't finished: each request, its tasks and their state
 tower agenda show|close|abandon|verify|fail|requeue <id> …   # one request (a3) or task (a3.2); close --force drops what's left
 tower sessions [<t>]                 # what each agent session's hooks said: prompt, last answer, state
+tower introduce [<space>] [--dry-run]  # the Claude sessions of a space, told who the others are (done by itself as one joins)
 tower hooks install|remove|status    # the hooks that let the tower see every Claude Code and Codex session
 tower status                         # the daemon's state
 tower doctor                         # check the setup
@@ -432,6 +433,17 @@ for **Herdr Core**, because the voice runs in a Herdr terminal.
   end with what is still open. Kept in
   `~/.local/state/herder-tower/agendas.json`, written whole (synced, then
   renamed) after every change, so it survives restarts.
+- Sessions in one space know each other: when a Claude session joins a
+  Herdr space that has other Claude sessions (`tower start`, `dispatch`, or
+  one you open), the tower sends each of them, through the send queue
+  (never into a working session), the others' names, addresses, folders
+  and tasks, and how to reach them (`tower queue <address> "…"`, `hc read
+  <address> --lines 60`). Once per change of who is there (a dispatch's
+  sessions are one introduction: the set must hold 30 s), kept in
+  `~/.local/state/herder-tower/introductions.json`; never the tower's own
+  terminals, Codex, or sessions in other spaces or on other machines; on the
+  first run what is already open is only recorded. `[sessions] introduce =
+  false` turns it off; `tower introduce <space> --dry-run` shows it.
 - Codex as the brain: `tower up --brain codex` (it uses Codex's `notify`
   instead of a hook, and runs with `--sandbox danger-full-access
   --ask-for-approval on-request` because `hc` talks to herdr-core over a Unix
