@@ -176,6 +176,8 @@ pub struct Panel {
     chat: ScrollHandle,
     /// Keeps the chat at its newest message while you're at the bottom.
     follow: follow::Follower,
+    /// The chat's first message, fixed once the history is in (`chat_items`).
+    chat_since: Option<u64>,
     filter: Filter,
     scope: Scope,
     listening_since: Option<Instant>,
@@ -322,6 +324,7 @@ impl Panel {
             loaded: None,
             chat: ScrollHandle::new(),
             follow: Default::default(),
+            chat_since: None,
             filter: Filter::Active,
             scope: Scope::Everything,
             listening_since: None,
@@ -520,6 +523,9 @@ impl Panel {
         self.entries = history::load();
         self.jobs = history::jobs(&self.entries);
         self.shots = shots::load();
+        if self.chat_since.is_none() {
+            self.chat_since = chat_items(&self.entries, None).first().map(|e| e.at);
+        }
         cx.notify();
     }
 
@@ -879,7 +885,7 @@ impl Panel {
 
     fn chat_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let g = glass();
-        let items: Vec<Entry> = chat_items(&self.entries).into_iter().cloned().collect();
+        let items: Vec<Entry> = chat_items(&self.entries, self.chat_since).into_iter().cloned().collect();
         let acc = Accounts::of_tower(self.tower.read(cx), self.default_account.clone());
         // Screenshots: on their own as they come, or under the message the
         // tower attached them to; the viewer goes through all of them.
@@ -1555,8 +1561,10 @@ fn tab_segment(id: &'static str, text: &str, count: usize, selected: bool) -> gp
         })
 }
 
-/// What the chat shows: requests and answers, and what came in between.
-fn chat_items(entries: &[Entry]) -> Vec<&Entry> {
+/// The chat's first message while the panel is open: from `since` (Unix
+/// ms) on, so what comes in adds at the bottom and nothing above you moves.
+/// Before that is known (`None`), the last 150; never more than 400.
+fn chat_items(entries: &[Entry], since: Option<u64>) -> Vec<&Entry> {
     // News held from an unfocused space waits in Spaces, not here.
     let keep = |e: &&Entry| !e.held && match e.kind.as_str() {
         "request" | "answer" | "watch" | "alert" | "summary" | "answered" | "behavior" => true,
@@ -1565,7 +1573,11 @@ fn chat_items(entries: &[Entry]) -> Vec<&Entry> {
         _ => false,
     };
     let all: Vec<&Entry> = entries.iter().filter(keep).collect();
-    let skip = all.len().saturating_sub(150);
+    let from = match since {
+        Some(at) => all.iter().position(|e| e.at >= at).unwrap_or(all.len()).min(all.len().saturating_sub(150)),
+        None => all.len().saturating_sub(150),
+    };
+    let skip = from.max(all.len().saturating_sub(400));
     all.into_iter().skip(skip).collect()
 }
 
@@ -2023,6 +2035,31 @@ mod voice_tests {
         assert_eq!(history::compose(&text, &["/tmp/a.png".into()]), "[Image #1] what is this [attached: /tmp/a.png]");
         // No draft: plain text.
         assert!(voice_content(&InputContent::new(""), "hello").tokens().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod chat_items_tests {
+    use super::*;
+
+    fn said(at: u64) -> Entry {
+        serde_json::from_value(serde_json::json!({ "at": at, "kind": "request", "text": "hi" })).unwrap()
+    }
+
+    #[test]
+    fn while_open_the_chat_grows_at_the_bottom_and_its_top_stays() {
+        let mut entries: Vec<Entry> = (0..200).map(said).collect();
+        let first = chat_items(&entries, None);
+        assert_eq!((first.len(), first[0].at), (150, 50));
+        // Fixed at 50: new messages add, the top doesn't move.
+        entries.extend((200..230).map(said));
+        let open = chat_items(&entries, Some(50));
+        assert_eq!((open.len(), open[0].at, open.last().unwrap().at), (180, 50, 229));
+        // Never more than 400.
+        entries.extend((230..700).map(said));
+        assert_eq!(chat_items(&entries, Some(50)).len(), 400);
+        // A history that was cut shorter than the mark: still the last 150.
+        assert_eq!(chat_items(&entries, Some(10_000)).len(), 150);
     }
 }
 
