@@ -201,6 +201,17 @@ impl Asks {
         std::thread::spawn(move || {
             // Let the dialog finish drawing.
             std::thread::sleep(std::time::Duration::from_millis(400));
+            // Claude Code writes the questions to its transcript a moment after it
+            // draws them: until then only the tab on screen is known (the others
+            // have no question), and the set's id changes once the rest is. It
+            // isn't shown, nor given to the brain, until it is whole (or after a
+            // few seconds, as much as there is).
+            for _ in 0..10 {
+                if !detect(&address).is_some_and(|s| s.kind == "claude-ask" && !s.exact) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(800));
+            }
             me.refresh(&address);
         });
     }
@@ -292,6 +303,20 @@ impl Asks {
                     false
                 }
                 Some(k) => {
+                    let old = &i.sets[k];
+                    if questions::redrawn(old, &set) {
+                        // The same dialog read again: its card carries on (the user
+                        // decides it still), with what was recommended for the
+                        // questions that didn't change.
+                        set.replaces = Some(old.id.clone());
+                        if old.decision.as_deref() == Some("escalate") {
+                            set.decision = old.decision.clone();
+                            set.reason = old.reason.clone();
+                        }
+                        set.recommendations = old.recommendations.as_ref().map(|recs| {
+                            recs.iter().filter(|r| matches!((old.tabs.get(r.tab), set.tabs.get(r.tab)), (Some(a), Some(b)) if questions::same_tab(a, b))).cloned().collect()
+                        });
+                    }
                     // Other questions now: the old ones may be told again if they come back.
                     let gone = std::mem::replace(&mut i.sets[k], set.clone()).id;
                     i.noted.retain(|n| *n != gone);
@@ -560,11 +585,31 @@ impl Asks {
             }
         }
         let address = known.as_ref().map(|s| s.session.clone()).unwrap_or_else(|| target.to_string());
-        let Some(now) = detect(&address) else { bail!("{address} shows no question it can answer now") };
+        let Some(mut now) = detect(&address) else {
+            if let Some(k) = &known {
+                // Answered in the session (or it moved on): the card goes, nothing is typed.
+                self.close_where(&address, |s| s.id == k.id, true);
+                bail!("already answered: {} isn't asking this any more (it was answered or closed in the session)", if k.name.is_empty() { &k.session } else { &k.name });
+            }
+            if is_set_id(target) {
+                // A card's id, no longer open: its dialog was answered (or closed) meanwhile.
+                bail!("already answered: {target} isn't open any more (it was answered or closed in the session)");
+            }
+            bail!("{address} shows no question it can answer now")
+        };
         if let Some(k) = &known
             && k.id != now.id
         {
-            bail!("the questions changed since they were shown (now {}); look again", now.id);
+            if questions::answers_still_fit(k, &now, answers) {
+                // The same dialog, read better since (a question it didn't have yet):
+                // what was answered is unchanged, so it goes in.
+                eprintln!("[questions] {} is {} read again; the answers still fit", k.id, now.id);
+                now = self.upsert(now);
+            } else {
+                // The card shows what the dialog asks now, keeping what still fits.
+                let shown = self.upsert(now.clone());
+                bail!("the questions changed since they were shown (now {}); the card shows them now: check it and submit again", shown.id);
+            }
         }
         let answers = if auto { self.recheck(&now, answers).map_err(Held)? } else { answers.to_vec() };
         // Checked and marked at once: a second answer (the phone, the panel, the tower) waits its turn.
@@ -688,6 +733,11 @@ fn last_message(address: &str, t: &Value) -> Option<String> {
 
 /// What the session `address` asks now, read from its screen (and its
 /// transcript for Claude's questions). None: not blocked on a dialog it reads.
+/// A question set's id (`q` and 12 hex digits, see `questions::id_of`), not a session's address.
+fn is_set_id(s: &str) -> bool {
+    s.len() == 13 && s.starts_with('q') && s[1..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
 pub fn detect(address: &str) -> Option<QuestionSet> {
     let t = hc::get(address)?;
     if hc::status_word(&t).as_deref() != Some("blocked") {
@@ -776,6 +826,89 @@ mod tests {
         }
         std::thread::sleep(std::time::Duration::from_millis(30));
         t.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// t41's two-tab dialog: read from the screen only (tab 1 has no question
+    /// yet), and read whole once the transcript has it.
+    fn gutter_sets() -> (QuestionSet, QuestionSet) {
+        let screen = questions::parse_screen(&fixture("claude-ask-gutter-wrapped.txt")).unwrap();
+        let opt = |l: &str, i: usize| questions::Opt { label: l.into(), description: String::new(), key: (i + 1).to_string() };
+        let tabs = vec![
+            questions::Tab {
+                title: "Commit".into(),
+                question: screen.question.clone(),
+                options: ["Commit on a new branch (Recommended)", "Commit on main", "Don't commit"].iter().enumerate().map(|(i, l)| opt(l, i)).collect(),
+                allows_other: true,
+                ..Default::default()
+            },
+            questions::Tab {
+                title: "Unmute test".into(),
+                question: "Your tower is muted. Do you want it run on your real tower?".into(),
+                options: ["Yes, unmute and test", "No, leave it muted"].iter().enumerate().map(|(i, l)| opt(l, i)).collect(),
+                allows_other: true,
+                ..Default::default()
+            },
+        ];
+        (questions::build("t41", "review", false, &screen, None, "", ""), questions::build("t41", "review", false, &screen, Some(tabs), "", ""))
+    }
+
+    #[test]
+    fn a_dialog_read_again_keeps_its_card_and_what_still_fits() {
+        let (a, t) = asks();
+        let (half, whole) = gutter_sets();
+        assert!(!half.exact && half.tabs[1].question.is_empty() && half.tabs[1].options.is_empty());
+        assert_ne!(half.id, whole.id);
+        a.upsert(half.clone());
+        assert_eq!(told(&t, 1).len(), 1);
+        let recs = json!([
+            {"tab": 0, "options": [{"label": "Commit on a new branch", "why": "", "choice": 0}]},
+            {"tab": 1, "options": [{"label": "Skip", "why": "", "choice": {"other": "Skip"}}]},
+        ]);
+        let _ = a.recommend(&half.id, &recs, Some("escalate"), "the user decides", false);
+        {
+            // Recommended for both tabs (the brain may not get to; the rule decided first).
+            let mut i = a.inner.lock().unwrap_or_else(|e| e.into_inner());
+            i.sets[0].recommendations = Some(questions::parse_recs(&recs, &half).unwrap());
+        }
+        let before = a.get(&half.id).unwrap();
+        assert_eq!(before.decision.as_deref(), Some("escalate"));
+
+        // Read whole: the same dialog, under a new id that replaces the old one.
+        let shown = a.upsert(whole.clone());
+        assert_eq!(shown.replaces.as_deref(), Some(half.id.as_str()));
+        assert_eq!((shown.decision.as_deref(), shown.reason.as_str()), (Some("escalate"), before.reason.as_str()), "still the user's to decide");
+        let kept: Vec<usize> = shown.recommendations.iter().flatten().map(|r| r.tab).collect();
+        assert_eq!(kept, [0], "what was recommended for a question nobody had read (\"Skip\") goes");
+        assert_eq!(a.list().iter().map(|s| s.id.clone()).collect::<Vec<_>>(), [whole.id.clone()], "one card, the new one");
+        assert_eq!(told(&t, 2).len(), 1, "the brain isn't asked again for a card that is the user's");
+
+        // Answers to the old card: tab 0's still fit; tab 1's was to a question not shown.
+        let ans = |tab: usize, choice: Value| questions::Answer { tab, choice, attachments: vec![] };
+        assert!(questions::answers_still_fit(&half, &whole, &[ans(0, json!(0))]));
+        assert!(!questions::answers_still_fit(&half, &whole, &[ans(0, json!(0)), ans(1, json!({"other": "Skip"}))]));
+
+        // Another dialog in the same session isn't a redraw: no carrying over.
+        let mut other = whole.clone();
+        other.tabs[0].title = "Deploy".into();
+        other.id = "qother".into();
+        let shown = a.upsert(other);
+        assert!(shown.replaces.is_none() && shown.decision.is_none());
+    }
+
+    #[test]
+    fn answering_a_card_whose_dialog_is_gone_closes_it() {
+        let (a, _t) = asks();
+        let (_, mut whole) = gutter_sets();
+        // A session that doesn't exist: no dialog to read now.
+        whole.session = "t-qfix-nowhere-0".into();
+        a.upsert(whole.clone());
+        let e = a.answer(&whole.id, &[questions::Answer { tab: 0, choice: json!(0), attachments: vec![] }], true).unwrap_err();
+        assert!(format!("{e:#}").starts_with("already answered"), "{e:#}");
+        assert!(a.list().is_empty(), "the card is gone, not left failing");
+        // Its id again, once closed (the radar closed it first): still "already answered".
+        let e = a.answer(&whole.id, &[questions::Answer { tab: 0, choice: json!(0), attachments: vec![] }], true).unwrap_err();
+        assert!(format!("{e:#}").starts_with("already answered"), "{e:#}");
+        assert!(is_set_id(&whole.id) && !is_set_id("t4q") && !is_set_id("m5/t3"));
     }
 
     #[test]

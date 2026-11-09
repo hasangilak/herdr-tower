@@ -140,9 +140,43 @@ pub(super) struct Card {
     others: Vec<Option<InputContent>>,
     sending: bool,
     error: Option<String>,
+    /// Said under the card, not an error ("read again: check this one").
+    note: Option<String>,
+    /// The questions as the card last showed them, to tell what changed
+    /// when the set is read again under a new id.
+    tabs: Vec<Tab>,
     /// The dialog's own options are showing (folded away while there are
     /// recommendations, so the card fits).
     options_open: bool,
+}
+
+/// A tab of a Claude dialog whose question wasn't read yet (only the
+/// screen's tab was, before the session's transcript had the rest).
+pub(super) fn unread(set: &QuestionSet, t: usize) -> bool {
+    set.kind == "claude-ask" && set.tabs.get(t).is_some_and(|tab| tab.question.trim().is_empty() || tab.options.is_empty())
+}
+
+/// A card carried over to its set read again (`new.replaces` it): what was
+/// chosen stays for the questions that didn't change; the others start
+/// over, the card shows the first of them, and says so.
+pub(super) fn carry_card(mut card: Card, new: &QuestionSet) -> Card {
+    let n = new.tabs.len();
+    let changed: Vec<usize> = (0..n).filter(|t| !card.tabs.get(*t).is_some_and(|old| crate::questions::same_tab(old, &new.tabs[*t]))).collect();
+    card.choices.resize(n, Choice::None);
+    card.others.resize(n, None);
+    for t in &changed {
+        card.choices[*t] = Choice::None;
+        card.others[*t] = None;
+    }
+    card.error = None;
+    card.sending = false;
+    card.note = changed.first().map(|t| {
+        card.step = *t;
+        let title = &new.tabs[*t].title;
+        if title.is_empty() { "The session's questions were read again: check this one, then submit.".to_string() } else { format!("The session's questions were read again: check “{title}”, then submit.") }
+    });
+    card.tabs = new.tabs.clone();
+    card
 }
 
 /// The panel's question cards.
@@ -176,6 +210,20 @@ impl Panel {
     pub(super) fn watch_sets(&mut self, cx: &App) {
         let sets = self.open_sets(cx);
         let open: HashSet<String> = sets.iter().map(|s| s.id.clone()).collect();
+        // A set read again under a new id: its card carries on (what was chosen, the open field).
+        for set in &sets {
+            let Some(old) = set.replaces.as_ref().filter(|old| !open.contains(*old)) else { continue };
+            if let Some(card) = self.asks.cards.remove(old) {
+                self.asks.cards.insert(set.id.clone(), carry_card(card, set));
+            }
+            if let Some((oid, _, _)) = self.asks.other.as_mut().filter(|(oid, _, _)| oid == old) {
+                *oid = set.id.clone();
+            }
+            if self.asks.dismissed.contains(old) {
+                self.asks.dismissed.insert(set.id.clone());
+            }
+            self.asks.seen.insert(set.id.clone());
+        }
         if open.iter().any(|id| !self.asks.seen.contains(id)) {
             self.chat.scroll_to_bottom();
         }
@@ -261,6 +309,9 @@ impl Panel {
         let card = self.asks.cards.get(&set.id);
         let mut out = vec![];
         for (t, tab) in set.tabs.iter().enumerate() {
+            if unread(set, t) {
+                return Err(t);
+            }
             let recs = set.recommendations.as_ref().and_then(|r| r.iter().find(|r| r.tab == t));
             let choice = card.and_then(|c| c.choices.get(t)).cloned().unwrap_or_default();
             let (text, files) = message_parts(&self.other_of(&set.id, t, cx));
@@ -277,7 +328,12 @@ impl Panel {
             Err(t) => {
                 let card = self.asks.cards.entry(set.id.clone()).or_default();
                 card.step = t;
-                card.error = Some("This one needs an answer first.".into());
+                card.note = None;
+                card.error = Some(if unread(set, t) {
+                    "This question hasn't been read yet: it shows here in a moment, or answer it in the session.".into()
+                } else {
+                    "This one needs an answer first.".into()
+                });
                 cx.notify();
                 return;
             }
@@ -285,6 +341,7 @@ impl Panel {
         let card = self.asks.cards.entry(set.id.clone()).or_default();
         card.sending = true;
         card.error = None;
+        card.note = None;
         let id = set.id.clone();
         let task = cx.background_executor().spawn({
             let id = id.clone();
@@ -322,10 +379,13 @@ impl Panel {
         let g = glass();
         let n = set.tabs.len();
         let id = set.id.clone();
-        let (step, sending, error) = {
+        let (step, sending, error, note) = {
             let c = self.asks.cards.entry(id.clone()).or_default();
             c.step = c.step.min(if n > 1 { n } else { 0 });
-            (c.step, c.sending, c.error.clone())
+            if c.tabs.is_empty() {
+                c.tabs = set.tabs.clone();
+            }
+            (c.step, c.sending, c.error.clone(), c.note.clone())
         };
         let busy = sending || matches!(set.status.as_str(), "answering" | "queued");
         let who = if set.name.is_empty() { set.session.clone() } else { set.name.clone() };
@@ -406,7 +466,7 @@ impl Panel {
                     .into_any_element(),
             )
         } else {
-            None
+            note.map(|n| div().text_xs().text_color(g.muted).child(n).into_any_element())
         };
         body.extend(status);
         // Back, Next, Submit.
@@ -459,6 +519,17 @@ impl Panel {
         let chosen = self.asks.cards.get(&id).and_then(|c| c.choices.get(t)).cloned().unwrap_or_default();
         let now = effective(&chosen, recs.as_ref());
         let mut out: Vec<AnyElement> = vec![];
+        if unread(set, t) && set.tabs.len() > 1 {
+            out.push(div().text_base().font_weight(FontWeight::MEDIUM).child(tab.title.clone()).into_any_element());
+            out.push(
+                div()
+                    .text_sm()
+                    .text_color(g.muted)
+                    .child("The tower hasn't read this question yet. It shows here in a moment; or answer it in the session.")
+                    .into_any_element(),
+            );
+            return out;
+        }
         let question = if tab.question.is_empty() { set.title.clone() } else { tab.question.clone() };
         out.push(div().text_base().font_weight(FontWeight::MEDIUM).line_height(px(22.0)).child(question).into_any_element());
         if t == 0 && !set.detail.is_empty() {
@@ -790,6 +861,32 @@ fn button(id: &str, text: &str, filled: bool, busy: bool) -> gpui::Stateful<gpui
 mod tests {
     use super::*;
     use crate::questions::{Opt, Rec};
+
+    #[test]
+    fn a_card_carries_over_to_its_dialog_read_again() {
+        let known = Tab { title: "Commit".into(), ..tab(false) };
+        let unread_tab = Tab { title: "Unmute test".into(), allows_other: true, ..Default::default() };
+        let read = Tab { title: "Unmute test".into(), question: "Run it on the real tower?".into(), ..tab(false) };
+        let half = QuestionSet { id: "qhalf".into(), kind: "claude-ask".into(), tabs: vec![known.clone(), unread_tab], ..Default::default() };
+        assert!(!unread(&half, 0) && unread(&half, 1));
+        let whole = QuestionSet { id: "qwhole".into(), kind: "claude-ask".into(), tabs: vec![known, read], replaces: Some("qhalf".into()), ..Default::default() };
+        let card = Card {
+            step: 2,
+            choices: vec![Choice::Opts(vec![1]), Choice::Rec(0)],
+            error: Some("the questions changed since they were shown".into()),
+            tabs: half.tabs.clone(),
+            ..Default::default()
+        };
+        let c = carry_card(card, &whole);
+        assert_eq!(c.choices, [Choice::Opts(vec![1]), Choice::None], "tab 0's answer stays; tab 1 starts over");
+        assert_eq!(c.step, 1, "it shows the question that is new");
+        assert!(c.error.is_none());
+        assert!(c.note.as_deref().is_some_and(|n| n.contains("Unmute test")), "{:?}", c.note);
+        assert!(!unread(&whole, 1));
+        // Nothing changed: all kept, no note.
+        let same = carry_card(Card { step: 2, choices: vec![Choice::Opts(vec![0]), Choice::Opts(vec![2])], tabs: whole.tabs.clone(), ..Default::default() }, &whole);
+        assert_eq!((same.step, same.note.is_none(), same.choices.len()), (2, true, 2));
+    }
 
     fn tab(multi: bool) -> Tab {
         let opt = |l: &str| Opt { label: l.into(), description: String::new(), key: String::new() };

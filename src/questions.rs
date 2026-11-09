@@ -105,6 +105,34 @@ pub struct QuestionSet {
     pub reason: String,
     /// What the tower answered for the user, when it did.
     pub answered_with: String,
+    /// The set this one replaces: the same dialog, read again (its question
+    /// on a tab is known now, say). Its card carries on as this one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<String>,
+}
+
+/// The same question on both: its title, wording, kind and options (a
+/// question not read yet is never the same).
+pub fn same_tab(a: &Tab, b: &Tab) -> bool {
+    !a.question.trim().is_empty()
+        && a.title == b.title
+        && same_question(&a.question, &b.question)
+        && a.multi == b.multi
+        && a.allows_other == b.allows_other
+        && a.options.iter().map(|o| &o.label).eq(b.options.iter().map(|o| &o.label))
+}
+
+/// `new` is `old`'s dialog read again: the same session, kind and tabs (by
+/// title), whatever more is known of their questions now.
+pub fn redrawn(old: &QuestionSet, new: &QuestionSet) -> bool {
+    old.session == new.session && old.kind == new.kind && old.tabs.iter().map(|t| &t.title).eq(new.tabs.iter().map(|t| &t.title))
+}
+
+/// Answers given to `old` are good for `new`: it is the same dialog and every
+/// tab they answer asks just what it asked (so nobody answers a question
+/// they didn't see).
+pub fn answers_still_fit(old: &QuestionSet, new: &QuestionSet, answers: &[Answer]) -> bool {
+    redrawn(old, new) && answers.iter().all(|a| matches!((old.tabs.get(a.tab), new.tabs.get(a.tab)), (Some(o), Some(n)) if same_tab(o, n)))
 }
 
 // ---- reading the screen ----
@@ -239,6 +267,24 @@ fn tab_bar(l: &str) -> Option<(Vec<(String, bool)>, bool)> {
     (!tabs.is_empty()).then_some((tabs, has_submit))
 }
 
+/// A line of the question without the `│ ` gutter Claude Code draws it behind.
+fn ungutter(l: &str) -> &str {
+    let t = l.trim();
+    t.strip_prefix('│').map(str::trim).unwrap_or(t)
+}
+
+/// Whether the dialog's question (as read off the screen: wrapped to the
+/// terminal's width, maybe cut with `…`) is this question. Spaces don't
+/// count: a wrap may fall anywhere.
+pub fn same_question(on_screen: &str, question: &str) -> bool {
+    let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let (s, q) = (squash(on_screen), squash(question));
+    if s.is_empty() || q.is_empty() {
+        return s == q;
+    }
+    s == q || s.strip_suffix('…').is_some_and(|head| head.chars().count() >= 12 && q.starts_with(head))
+}
+
 /// What dialog the screen shows, if any it knows.
 pub fn parse_screen(screen: &str) -> Option<Screen> {
     let lines: Vec<&str> = screen.lines().map(|l| l.trim_end()).collect();
@@ -253,7 +299,7 @@ pub fn parse_screen(screen: &str) -> Option<Screen> {
         let (tabs, has_submit) = tab_bar(lines[best])?;
         if let Some(r) = review.filter(|r| *r > best) {
             let end = last_index(&lines, |l| l.trim() == "Ready to submit your answers?").filter(|e| *e > r).unwrap_or(lines.len());
-            let review: Vec<String> = lines[r + 1..end].iter().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+            let review: Vec<String> = lines[r + 1..end].iter().map(|l| ungutter(l).to_string()).filter(|l| !l.is_empty()).collect();
             return Some(Screen {
                 kind: "review".into(),
                 unanswered: review.iter().any(|l| l.contains("not answered all questions")),
@@ -265,11 +311,15 @@ pub fn parse_screen(screen: &str) -> Option<Screen> {
             });
         }
         let q = lines[best + 1..].iter().position(|l| !l.trim().is_empty()).map(|i| best + 1 + i)?;
-        let options = options_from(&lines, q + 1);
+        // The question runs until the first blank line or option: it may wrap
+        // over several lines, behind a `│` gutter (newer Claude Code).
+        let end = lines[q..].iter().position(|l| l.trim().is_empty() || option_line(l).is_some()).map(|i| q + i).unwrap_or(lines.len());
+        let question = lines[q..end].iter().map(|l| ungutter(l)).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ");
+        let options = options_from(&lines, end);
         if options.is_empty() {
             return None;
         }
-        return Some(Screen { kind: "ask".into(), tabs, has_submit, question: lines[q].trim().to_string(), options, ..Default::default() });
+        return Some(Screen { kind: "ask".into(), tabs, has_submit, question, options, ..Default::default() });
     }
     let block = |from: usize, to: usize| -> String {
         lines[from..to].iter().map(|l| l.trim()).filter(|l| !l.is_empty() && !is_rule(l)).collect::<Vec<_>>().join("\n")
@@ -453,7 +503,7 @@ pub fn build(session: &str, name: &str, codex: bool, screen: &Screen, transcript
                 q.current_tab = q.tabs.len();
                 q.submit_state = "review".into();
             } else {
-                q.current_tab = q.tabs.iter().position(|t| t.question == screen.question).unwrap_or(0);
+                q.current_tab = q.tabs.iter().position(|t| same_question(&screen.question, &t.question)).unwrap_or(0);
                 q.submit_state = if screen.has_submit { "answering".into() } else { "single".into() };
                 let cur = &mut q.tabs[q.current_tab];
                 if !q.exact {
@@ -730,7 +780,17 @@ fn tab_index(s: &Screen, set: &QuestionSet) -> Option<usize> {
     if s.kind == "review" {
         return Some(set.tabs.len());
     }
-    set.tabs.iter().position(|t| t.question == s.question)
+    set.tabs.iter().position(|t| same_question(&s.question, &t.question))
+}
+
+/// `tab_index`, where the dialog should be at `guess`: a question the set
+/// doesn't know yet (read from the screen only, before the transcript had it)
+/// is taken for that tab, so moving across it works.
+fn tab_index_at(s: &Screen, set: &QuestionSet, guess: Option<usize>) -> Option<usize> {
+    tab_index(s, set).or_else(|| {
+        let g = guess?;
+        (s.kind == "ask" && set.tabs.get(g).is_some_and(|t| t.question.trim().is_empty())).then_some(g)
+    })
 }
 
 /// The cursor is on typed text (keys would go into it): Up leaves it.
@@ -743,20 +803,25 @@ fn leave_text(term: &mut dyn Term, s: &Screen, step: &str) -> Result<Screen, Sto
     Ok(s.clone())
 }
 
-fn go_to(term: &mut dyn Term, set: &QuestionSet, target: usize) -> Result<Screen, Stopped> {
-    let step = if target == set.tabs.len() { "the review tab".to_string() } else { format!("tab {} ({})", target + 1, set.tabs[target].title) };
+/// Moves the dialog to tab `target`; `at`: the tab it should be on now.
+fn go_to(term: &mut dyn Term, set: &QuestionSet, target: usize, at: usize) -> Result<Screen, Stopped> {
+    let step = if target == set.tabs.len() { "the review tab".to_string() } else { format!("tab {target} ({})", set.tabs[target].title) };
     let mut s = now(term, &step)?;
+    // Where the dialog should be, then one step at a time.
+    let mut guess = Some(at);
     for _ in 0..(2 * set.tabs.len() + 4) {
         s = leave_text(term, &s, &step)?;
-        let Some(cur) = tab_index(&s, set) else {
+        let Some(cur) = tab_index_at(&s, set, guess) else {
             return Err(Stopped { step, message: "the dialog shows a question that isn't in this set".into() });
         };
         if cur == target {
             return Ok(s);
         }
         let key = if cur < target { "right" } else { "left" };
+        let next = if cur < target { cur + 1 } else { cur - 1 };
         term.keys(&[key]).map_err(|e| Stopped { step: step.clone(), message: e.to_string() })?;
-        s = expect(term, &step, "the next tab", |x| tab_index(x, set) != Some(cur))?;
+        s = expect(term, &step, "the next tab", |x| tab_index_at(x, set, Some(next)) != Some(cur))?;
+        guess = Some(next);
     }
     Err(Stopped { step, message: "couldn't reach it with the arrow keys".into() })
 }
@@ -766,11 +831,11 @@ fn first_line(t: &str) -> String {
 }
 
 /// Answers one tab of a Claude question dialog.
-fn answer_tab(term: &mut dyn Term, set: &QuestionSet, t: usize, pick: &Pick) -> Result<(), Stopped> {
+fn answer_tab(term: &mut dyn Term, set: &QuestionSet, t: usize, pick: &Pick, at: usize) -> Result<(), Stopped> {
     let tab = &set.tabs[t];
-    let step = format!("tab {} ({})", t + 1, tab.title);
+    let step = format!("tab {t} ({})", tab.title);
     let err = |m: String| Stopped { step: step.clone(), message: m };
-    let s = go_to(term, set, t)?;
+    let s = go_to(term, set, t, at)?;
     let other_n = tab.options.len() + 1;
     if !tab.multi {
         let n = match &pick.other {
@@ -779,12 +844,12 @@ fn answer_tab(term: &mut dyn Term, set: &QuestionSet, t: usize, pick: &Pick) -> 
         };
         let single = set.submit_state == "single";
         // Picked: the tab is ticked and the dialog moved on (or, for one question, went away).
-        let moved_on = |x: &Screen| tab_index(x, set) != Some(t) || x.tabs.get(t).is_some_and(|(_, a)| *a) && x.question != tab.question;
+        let moved_on = |x: &Screen| tab_index(x, set) != Some(t) || x.tabs.get(t).is_some_and(|(_, a)| *a) && !same_question(&x.question, &tab.question);
         term.keys(&[&n.to_string()]).map_err(|e| err(e.to_string()))?;
         match &pick.other {
             Some(text) => {
                 // The number moves to "Type something"; the pasted text (and its Enter) answers.
-                expect(term, &step, &format!("the cursor on option {n}"), |x| x.cursor() == Some(n) && x.question == tab.question)?;
+                expect(term, &step, &format!("the cursor on option {n}"), |x| x.cursor() == Some(n) && same_question(&x.question, &tab.question))?;
                 term.paste(text).map_err(|e| err(e.to_string()))?;
             }
             None => {
@@ -797,7 +862,7 @@ fn answer_tab(term: &mut dyn Term, set: &QuestionSet, t: usize, pick: &Pick) -> 
                     }
                 } else {
                     term.settle();
-                    let still = parse_screen(&term.read()).filter(|x| x.kind == "ask" && x.question == tab.question);
+                    let still = parse_screen(&term.read()).filter(|x| x.kind == "ask" && same_question(&x.question, &tab.question));
                     if still.as_ref().is_some_and(|x| x.cursor() == Some(n)) {
                         term.keys(&["enter"]).map_err(|e| err(e.to_string()))?;
                     }
@@ -809,7 +874,7 @@ fn answer_tab(term: &mut dyn Term, set: &QuestionSet, t: usize, pick: &Pick) -> 
             for _ in 0..8 {
                 term.settle();
                 let text = term.read();
-                if parse_screen(&text).is_none_or(|x| x.kind != "ask" || x.question != tab.question) {
+                if parse_screen(&text).is_none_or(|x| x.kind != "ask" || !same_question(&x.question, &tab.question)) {
                     return Ok(());
                 }
             }
@@ -877,8 +942,8 @@ pub fn drive(term: &mut dyn Term, set: &QuestionSet, answers: &[Answer], submit:
     let mut picks: Vec<(usize, Pick)> = vec![];
     for a in answers {
         let tab = set.tabs.get(a.tab).ok_or_else(|| bad(format!("there is no tab {}", a.tab)))?;
-        if tab.options.is_empty() && set.kind == "claude-ask" {
-            return Err(bad(format!("tab {} isn't known yet (open it in the session once)", a.tab)));
+        if (tab.options.is_empty() || tab.question.trim().is_empty()) && set.kind == "claude-ask" {
+            return Err(bad(format!("tab {} ({}) hasn't been read yet: look again in a moment, or answer it in the session", a.tab, tab.title)));
         }
         picks.push((a.tab, pick_of(a, tab).map_err(|e| bad(e.to_string()))?));
     }
@@ -915,13 +980,16 @@ pub fn drive(term: &mut dyn Term, set: &QuestionSet, answers: &[Answer], submit:
         }
         return Err(Stopped { step, message: "the prompt is still there after Enter".into() });
     }
+    // The tab the dialog is on: where the set was read; a single-choice answer moves it on.
+    let mut at = set.current_tab;
     for (t, p) in &picks {
-        answer_tab(term, set, *t, p)?;
+        answer_tab(term, set, *t, p, at)?;
+        at = if set.tabs[*t].multi { *t } else { *t + 1 };
     }
     if set.submit_state == "single" || !submit {
         return Ok(());
     }
-    let s = go_to(term, set, set.tabs.len())?;
+    let s = go_to(term, set, set.tabs.len(), at)?;
     let step = "the review tab".to_string();
     let answered_all = picks.len() == set.tabs.len() || set.tabs.iter().enumerate().all(|(i, t)| t.answered || picks.iter().any(|(j, _)| *j == i));
     if s.unanswered && answered_all {
@@ -930,11 +998,13 @@ pub fn drive(term: &mut dyn Term, set: &QuestionSet, answers: &[Answer], submit:
     if s.unanswered {
         return Err(Stopped { step, message: "not every question has an answer yet; nothing sent".into() });
     }
-    let review = s.review.join("\n");
+    // Wrapped to the terminal's width, maybe behind a gutter: compared without spaces.
+    let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace() && *c != '│').collect::<String>();
+    let review = squash(&s.review.join(" "));
     for (t, p) in &picks {
         for want in review_text(&set.tabs[*t], p) {
-            if !review.contains(&want) {
-                return Err(Stopped { step: step.clone(), message: format!("the review doesn't show \"{want}\" for tab {}; nothing sent", t + 1) });
+            if !review.contains(&squash(&want)) {
+                return Err(Stopped { step: step.clone(), message: format!("the review doesn't show \"{want}\" for tab {t}; nothing sent") });
             }
         }
     }
@@ -1678,6 +1748,8 @@ mod tests {
         editing: bool,
         submitted: bool,
         log: Vec<String>,
+        /// Questions wrapped to this width behind a `│ ` gutter, as newer Claude Code draws them.
+        wrap: Option<usize>,
     }
 
     impl Sim {
@@ -1703,7 +1775,50 @@ mod tests {
                 editing: false,
                 submitted: false,
                 log: vec![],
+                wrap: None,
             }
+        }
+        /// Two single-choice tabs with long questions, drawn wrapped behind a gutter
+        /// (the shape of the dialog that once stopped with "a question that isn't in this set").
+        fn two_long() -> Sim {
+            let t = |title, q, opts: Vec<&'static str>| SimTab { title, q, checked: vec![false; opts.len()], opts, multi: false, picked: None, other: None, other_on: false };
+            Sim {
+                tabs: vec![
+                    t(
+                        "Commit",
+                        "All the tower fixes, the new Herdr/Claude/Codex hooks and the queue/dispatch work are uncommitted on `main` (36 changed files, 4 new ones). Should I commit them?",
+                        vec!["Commit on a new branch (Recommended)", "Commit on main", "Don't commit"],
+                    ),
+                    t(
+                        "Unmute test",
+                        "Your tower is muted. To hear the \"While you were muted: N updates\" line on the real tower, I'd unmute it after an alert arrives while muted, so it speaks aloud on the Mac or your phone. It has already been verified silently on a test daemon. Do you want it run on your real tower?",
+                        vec!["Yes, unmute and test", "No, leave it muted"],
+                    ),
+                ],
+                cur: 0,
+                cursor: 1,
+                editing: false,
+                submitted: false,
+                log: vec![],
+                wrap: Some(60),
+            }
+        }
+        /// Text as the dialog draws it: as is, or wrapped behind the gutter.
+        fn draw(&self, text: &str, indent: &str) -> String {
+            let Some(w) = self.wrap else { return format!("{indent}{text}\n") };
+            let mut out = String::new();
+            let mut line = String::new();
+            for word in text.split(' ') {
+                if !line.is_empty() && line.len() + 1 + word.len() > w {
+                    out += &format!("│ {line}\n");
+                    line.clear();
+                }
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(word);
+            }
+            out + &format!("│ {line}\n")
         }
         fn answered(t: &SimTab) -> bool {
             t.picked.is_some() || t.checked.iter().any(|c| *c) || t.other_on || (!t.multi && t.other.is_some())
@@ -1727,13 +1842,15 @@ mod tests {
                     if t.other_on || (!t.multi && t.other.is_some()) {
                         a.push(t.other.clone().unwrap_or_default());
                     }
-                    s += &format!(" ● {}\n   → {}\n", t.q, a.join(", "));
+                    s += &self.draw(t.q, " ● ");
+                    s += &self.draw(&format!("→ {}", a.join(", ")), "   ");
                 }
                 s += &format!("\nReady to submit your answers?\n\n{} 1. Submit answers\n{} 2. Cancel\n", c(self.cursor == 1), c(self.cursor == 2));
                 return s;
             }
             let t = &self.tabs[self.cur];
-            s += &format!("{}\n\n", t.q);
+            s += &self.draw(t.q, "");
+            s += "\n";
             for (i, o) in t.opts.iter().enumerate() {
                 let n = i + 1;
                 let box_ = if t.multi { format!("[{}] ", if t.checked[i] { "✔" } else { " " }) } else { String::new() };
@@ -1910,13 +2027,91 @@ mod tests {
         let set = sim_set(&mut sim);
         let mut stuck = Stuck(sim);
         let e = drive(&mut stuck, &set, &[Answer { tab: 1, choice: json!({"options": [0]}), attachments: vec![] }], true).unwrap_err();
-        assert!(e.step.starts_with("tab 2"), "{e}");
+        assert!(e.step.starts_with("tab 1 (Features)"), "counted from 0, as answers are: {e}");
         assert!(!stuck.0.submitted);
         // A set that doesn't match the dialog at all.
         let mut other = set.clone();
         other.tabs[0].question = "Something else?".into();
         let mut sim = Sim::new();
         assert!(drive(&mut sim, &other, &[Answer { tab: 0, choice: json!(0), attachments: vec![] }], true).is_err());
+    }
+
+    fn two_long_tabs() -> Vec<Tab> {
+        Sim::two_long()
+            .tabs
+            .iter()
+            .map(|t| Tab {
+                title: t.title.into(),
+                question: t.q.into(),
+                options: t.opts.iter().enumerate().map(|(i, o)| Opt { label: o.to_string(), description: String::new(), key: (i + 1).to_string() }).collect(),
+                allows_other: true,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reads_a_question_wrapped_behind_a_gutter() {
+        // A real screen (Claude Code 2.1.319): the question wraps over two lines behind `│ `.
+        let s = parse_screen(&fixture("claude-ask-gutter-wrapped.txt")).unwrap();
+        assert_eq!(s.kind, "ask");
+        assert_eq!(s.tabs, vec![("Commit".into(), false), ("Unmute test".into(), false)]);
+        assert_eq!(s.question, "All the tower fixes, the new Herdr/Claude/Codex hooks and the queue/dispatch work are uncommitted on `main` (36 changed files, 4 new ones). Should I commit them?");
+        assert_eq!(s.options.iter().map(|o| o.label.as_str()).collect::<Vec<_>>(), ["Commit on a new branch (Recommended)", "Commit on main", "Don't commit", "Type something."]);
+        assert!(s.options[0].description.starts_with("Create a branch"));
+        let set = build("t41", "review", false, &s, Some(two_long_tabs()), "", "");
+        assert!(set.exact);
+        assert_eq!((set.current_tab, tab_index(&s, &set)), (0, Some(0)), "the dialog's question is tab 0 of the set");
+    }
+
+    #[test]
+    fn questions_match_however_the_screen_wraps_them() {
+        let q = "Should I commit the 36 changed files on `main`?";
+        assert!(same_question("Should I commit the 36 changed\nfiles on `main`?", q));
+        assert!(same_question("Should I commit the 36 changed fi les on `main`?", q), "a wrap inside a word");
+        assert!(same_question("Should I commit the 36…", q), "cut short");
+        assert!(!same_question("Should I…", "Should I push?"), "too short to tell");
+        assert!(!same_question("Should I commit the 36 changed files on `dev`?", q));
+        assert!(!same_question("", q));
+    }
+
+    #[test]
+    fn answers_two_long_questions_drawn_behind_a_gutter_and_submits() {
+        let mut sim = Sim::two_long();
+        let set = build("t41", "review", false, &parse_screen(&sim.render()).unwrap(), Some(two_long_tabs()), "", "");
+        assert_eq!(set.current_tab, 0);
+        let answers = vec![Answer { tab: 0, choice: json!(0), attachments: vec![] }, Answer { tab: 1, choice: json!(0), attachments: vec![] }];
+        drive(&mut sim, &set, &answers, true).unwrap_or_else(|e| panic!("{e} ({:?})", sim.log));
+        assert!(sim.submitted, "{:?}", sim.log);
+        assert_eq!((sim.tabs[0].picked, sim.tabs[1].picked), (Some(0), Some(0)));
+
+        // A typed answer, long enough to wrap on the review tab, is still found there.
+        let mut sim = Sim::two_long();
+        let long = "Commit on a branch named tower-hooks-and-fixes, then show me the diff stat before anything else";
+        let answers = vec![Answer { tab: 0, choice: json!({"other": long}), attachments: vec![] }, Answer { tab: 1, choice: json!(1), attachments: vec![] }];
+        drive(&mut sim, &set, &answers, true).unwrap_or_else(|e| panic!("{e} ({:?})", sim.log));
+        assert!(sim.submitted);
+        assert_eq!(sim.tabs[0].other.as_deref(), Some(long));
+    }
+
+    #[test]
+    fn crosses_a_tab_whose_question_isnt_read_yet() {
+        // The set as read from the screen alone: tab 1 has no question yet.
+        let mut sim = Sim::two_long();
+        let set = build("t41", "review", false, &parse_screen(&sim.render()).unwrap(), None, "", "");
+        assert!(!set.exact && set.tabs[1].question.is_empty());
+        let a0 = Answer { tab: 0, choice: json!(0), attachments: vec![] };
+        // Tab 0 goes in; on the way to the review it passes tab 1, then stops there
+        // because it has no answer: not "a question that isn't in this set".
+        let e = drive(&mut sim, &set, std::slice::from_ref(&a0), true).unwrap_err();
+        assert_eq!(sim.tabs[0].picked, Some(0));
+        assert!(e.message.contains("not every question"), "{e}");
+        assert!(!sim.submitted);
+        // Answering the unread tab is refused before any key, and says why.
+        let mut sim = Sim::two_long();
+        let e = drive(&mut sim, &set, &[a0, Answer { tab: 1, choice: json!({"other": "Skip"}), attachments: vec![] }], true).unwrap_err();
+        assert!(e.message.contains("hasn't been read yet"), "{e}");
+        assert!(sim.log.is_empty(), "nothing typed: {:?}", sim.log);
     }
 
     #[test]

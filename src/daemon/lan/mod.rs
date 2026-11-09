@@ -938,6 +938,8 @@ impl Lan {
                 let msg = format!("{e:#}");
                 let code = if msg.starts_with("stopped at") {
                     "stopped"
+                } else if msg.starts_with("already answered") {
+                    "answered"
                 } else if msg.contains("changed") {
                     "changed"
                 } else {

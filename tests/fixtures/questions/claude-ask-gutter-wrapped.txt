@@ -1,0 +1,19 @@
+⏺ The checker is now asking for things only you can decide, so I'll ask rather than act on them.
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Commit  ☐ Unmute test  ✔ Submit  →
+
+│ All the tower fixes, the new Herdr/Claude/Codex hooks and the queue/dispatch work are uncommitted on `main` (36 changed
+│ files, 4 new ones). Should I commit them?
+
+❯ 1. Commit on a new branch (Recommended)
+     Create a branch (e.g. tower-hooks-and-fixes) from main and commit everything there; main stays as it is. No push.
+  2. Commit on main
+     Commit directly on main. No push.
+  3. Don't commit
+     Leave everything in the working tree; you'll review and commit yourself.
+  4. Type something.
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+───────────────────────────────────────────────────────────────────────────────────────────────────────── m5-tower-review ─
