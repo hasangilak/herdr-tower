@@ -389,6 +389,8 @@ impl Panel {
         };
         let busy = sending || matches!(set.status.as_str(), "answering" | "queued");
         let who = if set.name.is_empty() { set.session.clone() } else { set.name.clone() };
+        // A turn that stopped for the user to act (merge, test): no answers are coming.
+        let waits = set.reason == crate::questions::WAITS;
 
         let mut body: Vec<AnyElement> = vec![];
         // Who asks, and about what.
@@ -397,7 +399,11 @@ impl Panel {
                 .gap_2()
                 .items_center()
                 .child(div().size(px(8.0)).flex_none().rounded_full().bg(rgb(AMBER)))
-                .child(div().min_w_0().truncate().text_sm().font_weight(FontWeight::MEDIUM).child(format!("{who} asks")))
+                .child(div().min_w_0().truncate().text_sm().font_weight(FontWeight::MEDIUM).child(if waits {
+                    format!("{who} waits for you")
+                } else {
+                    format!("{who} asks")
+                }))
                 .children(acc.of(&set.session).map(|a| acc.badge(a, &g)))
                 .child(div().flex_1())
                 .child(div().flex_none().text_xs().text_color(g.faint).child(kind_word(&set.kind, n)))
@@ -548,6 +554,10 @@ impl Panel {
         }
         // The tower's three.
         match &recs {
+            // No answers are asked for: say what it waits on, and reply when it's done.
+            None if set.reason == crate::questions::WAITS => out.push(
+                div().text_sm().text_color(g.muted).child("It waits for you to do this. Reply when it's done (\"merged, go on\").").into_any_element(),
+            ),
             None => out.push(working("Thinking of answers… you can answer already.")),
             Some(r) => {
                 for (i, rec) in r.options.iter().enumerate().take(3) {
