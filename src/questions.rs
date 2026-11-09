@@ -1173,17 +1173,33 @@ pub fn waits_for_user(message: &str) -> Option<String> {
     let tail: String = chars[chars.len().saturating_sub(700)..].iter().collect();
     let sentences: Vec<String> = split_sentences(&tail);
     // The last few sentences: a request in the middle of a long report isn't where it stopped.
-    for s in sentences.iter().rev().take(4) {
+    for (i, s) in sentences.iter().enumerate().rev().take(4) {
         if asks_the_user(s) {
+            // "… so you need to merge it": what "it" is, from the sentence before.
+            let s = match i.checked_sub(1).map(|p| &sentences[p]) {
+                Some(prev) if refers_back(s) => format!("{prev} {s}"),
+                _ => s.clone(),
+            };
             // Links aren't read out: "merge it: https://…/pull/1250" says "merge it".
             let words: Vec<&str> = s.split_whitespace().filter(|w| !w.contains("://")).collect();
             let s = words.join(" ");
             let s = s.trim().trim_start_matches(['-', '*', ' ']).trim_end_matches([':', ',', ' ']).trim();
-            let s: String = s.chars().take(220).collect();
+            let s: String = s.chars().take(300).collect();
             return (!s.is_empty()).then_some(s);
         }
     }
     None
+}
+
+/// A sentence that names what it is about only by "it", "this", "them":
+/// no PR or issue number, link or file of its own.
+fn refers_back(sentence: &str) -> bool {
+    // A link isn't said, so it doesn't name anything.
+    let sentence: String = sentence.split_whitespace().filter(|w| !w.contains("://")).collect::<Vec<_>>().join(" ");
+    let l = format!(" {} ", sentence.to_lowercase().replace([',', ';', ':', '.', '!', '?'], " "));
+    let pronoun = [" it ", " this ", " that ", " them ", " these ", " es ", " ihn "].iter().any(|w| l.contains(w));
+    let concrete = sentence.contains('#') || sentence.contains('/') || l.contains(" pr ") || l.contains(" apk ");
+    pronoun && !concrete
 }
 
 /// Markdown and code out of the way, links as their text, one line.
@@ -2507,13 +2523,17 @@ mod tests {
                   PR #1250 (dev to main) is open and its checks passed. The merge command is blocked for me, so you need to merge it: \
                   https://github.com/eyzhub/eyz-mediaroom-serverless/pull/1250. I'll wait, then verify prod.";
         assert!(!looks_like_question(pr), "not a question: the old path missed it");
-        assert_eq!(waits_for_user(pr).as_deref(), Some("The merge command is blocked for me, so you need to merge it"));
+        assert_eq!(
+            waits_for_user(pr).as_deref(),
+            Some("PR #1250 (dev to main) is open and its checks passed. The merge command is blocked for me, so you need to merge it")
+        );
         for (msg, want) in [
             ("Plan is ready. Waiting for your approval.", "Waiting for your approval."),
             ("Once you merge #1250 into main, I'll verify the production deployment.", "Once you merge #1250 into main, I'll verify the production deployment."),
             ("All green on dev.\n\nPlease merge [PR #1250](https://github.com/x/y/pull/1250) when you're ready.", "Please merge PR #1250 when you're ready."),
             ("Fertig auf dev. Bitte merge den PR #1250, dann prüfe ich prod.", "Bitte merge den PR #1250, dann prüfe ich prod."),
-            ("The new APK is at /tmp/app.apk. You need to install it on the phone and test the header.", "You need to install it on the phone and test the header."),
+            ("The new APK is at /tmp/app.apk. You need to install it on the phone and test the header.", "The new APK is at /tmp/app.apk. You need to install it on the phone and test the header."),
+            ("Fix is in. Please review PR #77 before I deploy.", "Please review PR #77 before I deploy."),
         ] {
             assert_eq!(waits_for_user(msg).as_deref(), Some(want), "{msg}");
         }

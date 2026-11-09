@@ -222,12 +222,15 @@ struct Radar {
     watches: Watches,
     asks: super::asks::Asks,
     seen: Arc<Mutex<HashMap<String, Seen>>>,
+    /// Sessions that stopped to wait for the user (a watch's report said so):
+    /// their job stays blocked until they work again or end.
+    waiting: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 pub fn start(shared: Shared, mouth: Mouth, alerts: Alerts, watches: Watches, asks: super::asks::Asks) {
     // What was known when the last run ended, before this run's first look updates it.
     let before = watches.snapshot();
-    let radar = Radar { shared, mouth, alerts, watches: watches.clone(), asks, seen: Arc::new(Mutex::new(HashMap::new())) };
+    let radar = Radar { shared, mouth, alerts, watches: watches.clone(), asks, seen: Arc::new(Mutex::new(HashMap::new())), waiting: Arc::default() };
     let _ = watches.radar.set(radar.clone());
     let r = radar.clone();
     radar.asks.set_notify(move |address, text| r.announce(address, text));
@@ -601,7 +604,7 @@ impl Radar {
         let stopped_working = (was == working && status != working) || (turned && was != working);
         // A turn ended: its last message may ask the user something.
         if stopped_working && status.ready() {
-            self.asks.finished(&address, t, self.watches.watched(&address));
+            self.asks.finished(&address, t, self.waiting.clone());
         }
         // Blocked on a dialog this machine can read: the questions go through
         // the brain (answered for the user, or told to them), not a plain notice.
@@ -613,10 +616,18 @@ impl Radar {
         // tower handles (its card says so), nor a change a watch reports (the
         // watch moves the job), nor what happened while the tower was down
         // (the start's reconcile reports it, then moves the job).
+        // Waiting for the user (to merge, approve, test): the job stays
+        // blocked through the turn's end as Herdr sees it, until the session
+        // works again or ends.
+        if status == SessionStatus::Working || !live {
+            lock(&self.waiting).remove(&address);
+        }
+        let waits = status.ready() && (lock(&self.waiting).contains(&address) || self.asks.waits_on(&address));
         if let Some(job) = crate::history::JobState::of_session(&status, live)
             && before.is_some()
             && (was != status || turned)
             && !fires
+            && !waits
             && !(handled && job == crate::history::JobState::Blocked)
         {
             let a = address.clone();
@@ -844,6 +855,7 @@ impl Radar {
                 );
             }
             if let Some(r) = &waits {
+                lock(&self.waiting).insert(address.to_string());
                 p.status = "blocked".into();
                 p.speech = format!("{}.", crate::questions::wait_line(name, r));
             }

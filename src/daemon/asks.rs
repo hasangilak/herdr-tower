@@ -401,6 +401,11 @@ impl Asks {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).sets.clone()
     }
 
+    /// The session waits for the user to act (an open wait card: `waiting`).
+    pub fn waits_on(&self, address: &str) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).sets.iter().any(|s| s.session == address && s.reason == questions::WAITS)
+    }
+
     pub fn get(&self, id: &str) -> Option<QuestionSet> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).sets.iter().find(|s| s.id == id).cloned()
     }
@@ -569,16 +574,19 @@ impl Asks {
     /// message waits for the user to do something (merge, approve, test,
     /// decide), it needs them as a blocked session does (`waiting`); if it
     /// seems to ask something, a text question set, for the brain to read.
-    /// `watched`: the brain hears of this turn from its watch.
-    pub fn finished(&self, address: &str, t: &Value, watched: bool) {
+    /// `reported`: sessions whose watch's report told the brain of their
+    /// wait (it says it then); looked at once the turn's message is in.
+    pub fn finished(&self, address: &str, t: &Value, reported: Arc<Mutex<std::collections::HashSet<String>>>) {
         if super::watch::left_alone(t) {
             return;
         }
         let (me, address, t) = (self.clone(), address.to_string(), t.clone());
+        let ended_ms = crate::history::now_ms();
         std::thread::spawn(move || {
-            let Some(message) = last_message(&address, &t) else { return };
+            let Some(message) = turn_message(&address, &t, ended_ms) else { return };
             let context = crate::history::jobs(&crate::history::load()).into_iter().find(|j| j.session == address).map(|j| j.title).unwrap_or_default();
             if let Some(request) = questions::waits_for_user(&message) {
+                let watched = reported.lock().unwrap_or_else(|e| e.into_inner()).contains(&address);
                 me.waiting(&address, &hc::spoken_name(&t), hc::created_ms(&t), &message, &request, &context, watched);
                 return;
             }
@@ -1177,6 +1185,22 @@ fn send_args(address: &str, text: &str, status: &SessionStatus) -> Result<Vec<St
 }
 
 /// The last message a session wrote: its transcript (Claude Code here), else its screen.
+/// What a session said at the end of the turn that ended at `ended_ms`:
+/// its Stop hook's message (exactly that turn's), waited for a moment since
+/// Herdr can see the turn end first; else its transcript or screen. (Read
+/// right at the end, the transcript can lack the turn's last message, or
+/// still end with the one before.)
+fn turn_message(address: &str, t: &Value, ended_ms: u64) -> Option<String> {
+    let since = ended_ms.saturating_sub(5_000);
+    for _ in 0..6 {
+        if let Some(said) = super::sessions::registry().said_since(address, since) {
+            return Some(said);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    last_message(address, t)
+}
+
 fn last_message(address: &str, t: &Value) -> Option<String> {
     if hc::agent_app(t).as_deref() == Some("claude-code")
         && !address.contains('/')
@@ -1301,11 +1325,11 @@ mod tests {
         let msg = "PR #1250 (dev to main) is open and its checks passed. The merge command is blocked for me, so you need to merge it. I'll wait.";
         let req = questions::waits_for_user(msg).unwrap();
         let set = a.waiting("tw-wait-1", "mediaroom", None, msg, &req, "Release the ticket change", false).unwrap();
-        assert_eq!(set.title, "The merge command is blocked for me, so you need to merge it.");
+        assert_eq!(set.title, "PR #1250 (dev to main) is open and its checks passed. The merge command is blocked for me, so you need to merge it.");
         assert_eq!((set.kind.as_str(), set.decision.as_deref(), set.status.as_str()), ("text", Some("escalate"), "open"));
         assert_eq!(set.reason, questions::WAITS);
         assert!(a.list().iter().any(|s| s.id == set.id), "on the panel and the phone as an open card");
-        assert_eq!(said(), vec!["tw-wait-1: mediaroom waits for you: The merge command is blocked for me, so you need to merge it"]);
+        assert_eq!(said(), vec!["tw-wait-1: mediaroom waits for you: PR #1250 (dev to main) is open and its checks passed. The merge command is blocked for me, so you need to merge it"]);
         assert!(told(&brain, 1).is_empty(), "the brain isn't asked to answer it");
         // The same turn read again: nothing new, nothing said again.
         assert!(a.waiting("tw-wait-1", "mediaroom", None, msg, &req, "", false).is_none());
@@ -1313,6 +1337,8 @@ mod tests {
         // Watched: the card, but the watch's report says it (through the brain).
         assert!(a.waiting("tw-wait-2", "sdk", None, msg, &req, "", true).is_some());
         assert_eq!(said().len(), 1);
+        // Its job stays blocked while the card is open (the radar asks).
+        assert!(a.waits_on("tw-wait-1") && a.waits_on("tw-wait-2") && !a.waits_on("tw-other"));
     }
 
     /// t41's two-tab dialog: read from the screen only (tab 1 has no question
