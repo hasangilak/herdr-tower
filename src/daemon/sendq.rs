@@ -196,6 +196,11 @@ pub struct Item {
     /// instead of a session to type into (`session` is empty until then).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub start: Vec<String>,
+    /// A note for the session, not work (an introduction to the others in
+    /// its space): delivered like any instruction, but not watched, not told
+    /// to the brain, and dropped (not parked) if its session ends.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quiet: bool,
 }
 
 impl Item {
@@ -379,8 +384,9 @@ impl Book {
         item
     }
 
+    /// Instructions waiting for a session (quiet notes aren't work: not counted).
     fn waiting_for(&self, session: &str) -> usize {
-        self.items.iter().filter(|i| i.session == session && !matches!(i.state(), ItemState::Parked(_))).count()
+        self.items.iter().filter(|i| i.session == session && !i.quiet && !matches!(i.state(), ItemState::Parked(_))).count()
     }
 
     /// The sessions to look at: those with something waiting, then those
@@ -542,6 +548,44 @@ impl SendQueue {
     /// queued before it), else kept until it is. `after`: ids to wait for.
     pub fn add(&self, session: &str, text: &str, after: &[u64]) -> Result<(Added, String, String)> {
         self.add_with(&Herdr, session, text, after)
+    }
+
+    /// A quiet note for `session` (see `Item::quiet`): it waits its turn like
+    /// an instruction, so a working session is never interrupted.
+    pub fn add_note(&self, session: &str, text: &str) -> Result<(Added, String, String)> {
+        self.add_note_with(&Herdr, session, text)
+    }
+
+    fn add_note_with(&self, h: &dyn Sessions, session: &str, text: &str) -> Result<(Added, String, String)> {
+        let text = hc::clean(text.trim());
+        let s = match h.look(session) {
+            Look::Live(s) => s,
+            Look::Finished => bail!("{session} has ended"),
+            Look::Gone => bail!("no session {session}"),
+            Look::Unreachable(e) => bail!("can't reach {session} right now ({e})"),
+        };
+        let now = crate::history::now_ms();
+        let item = {
+            let mut b = self.lock();
+            if let Some(i) = b.items.iter().find(|i| i.session == s.address && i.text == text) {
+                return Ok((Added::Queued { id: i.id, position: 1, status: s.status.word().to_string() }, s.address, s.name));
+            }
+            let pos = b.items.len();
+            let mut item = b.push(&s, &text, &[], now);
+            item.quiet = true;
+            b.items[pos].quiet = true;
+            if let Err(e) = self.save(&b) {
+                b.items.retain(|i| i.id != item.id);
+                return Err(e);
+            }
+            item
+        };
+        self.work(h, &s.address, Some(&s));
+        let b = self.lock();
+        if b.delivered.iter().any(|d| d.id == item.id) {
+            return Ok((Added::Sent { id: item.id }, s.address, s.name));
+        }
+        Ok((Added::Queued { id: item.id, position: 1, status: s.status.word().to_string() }, s.address, s.name))
     }
 
     fn add_with(&self, h: &dyn Sessions, session: &str, text: &str, after: &[u64]) -> Result<(Added, String, String)> {
@@ -1125,6 +1169,11 @@ impl SendQueue {
             taken: false,
             finished: false,
         });
+        if item.quiet {
+            // A note, not work: nothing to watch or tell.
+            h.record(&s.address, &format!("Told {}: {}", s.name, item.text), "note");
+            return;
+        }
         let left = b.waiting_for(&s.address);
         h.watch(&s.address, &item.text);
         h.record(&s.address, &format!("Delivered to {}: {}", s.name, item.text), "delivered");
@@ -1145,6 +1194,8 @@ impl SendQueue {
     /// What waits for a session that ended (or whose address is another
     /// terminal's now) goes nowhere by itself; the brain hears it once.
     fn park(&self, h: &dyn Sessions, b: &mut Book, session: &str, why: ParkWhy, name: &str) {
+        // A note for a session that's gone is moot: dropped, not parked.
+        b.items.retain(|i| !(i.session == session && i.quiet && matches!(i.state(), ItemState::Waiting | ItemState::WaitingFor(_))));
         let mut ids = vec![];
         let mut untold = false;
         let now = crate::history::now_ms();
@@ -1441,6 +1492,31 @@ mod tests {
         h.sessions.lock().unwrap().remove("t2");
         q.session_round(&h, "t2");
         assert_eq!(q.fact(waiting), QueueFact::Waiting { session: "t2".into(), parked: Some("gone".into()), start: false });
+    }
+
+    #[test]
+    fn a_note_waits_for_a_working_session_and_is_neither_watched_nor_told() {
+        let (q, _d) = queue();
+        let h = Fake::default();
+        h.set("t1", "working");
+        let (Added::Queued { id, .. }, ..) = q.add_note_with(&h, "t1", "the others in this space").unwrap() else { panic!("t1 works") };
+        assert!(h.sent().is_empty(), "never typed into a working session");
+        // The same note again: the same item.
+        let (Added::Queued { id: again, .. }, ..) = q.add_note_with(&h, "t1", "the others in this space").unwrap() else { panic!() };
+        assert_eq!(id, again);
+        assert!(q.items()[0].quiet);
+        h.set("t1", "idle");
+        q.session_round(&h, "t1");
+        assert_eq!(h.sent(), vec!["the others in this space".to_string()]);
+        assert!(h.watched.lock().unwrap().is_empty(), "a note isn't watched");
+        assert!(h.notes().is_empty(), "nor told to the brain");
+        // One for a session that ends is dropped, not parked.
+        h.set("t2", "working");
+        q.add_note_with(&h, "t2", "hello").unwrap();
+        h.sessions.lock().unwrap().remove("t2");
+        q.session_round(&h, "t2");
+        assert!(q.items().is_empty());
+        assert!(h.notes().is_empty());
     }
 
     #[test]

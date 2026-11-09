@@ -122,6 +122,8 @@ pub struct Config {
     pub alerts: Alerts,
     /// The phone API (`tower phone`): off unless enabled.
     pub lan: Lan,
+    /// The agent sessions themselves (`[sessions]`).
+    pub sessions: Sessions,
     /// How session questions are handled (`tower policy`): `normal` (the
     /// tower answers routine ones itself, the user decides the rest),
     /// `keep-moving` (it answers more), `ask-everything`.
@@ -217,6 +219,7 @@ impl Default for Config {
             vad: Vad::default(),
             alerts: Alerts::default(),
             lan: Lan::default(),
+            sessions: Sessions::default(),
             question_policy: "normal".into(),
             max_spoken_chars: 900,
             ack: ["Got it.", "Okay.", "Sure."].map(String::from).to_vec(),
@@ -245,6 +248,21 @@ impl Default for Vad {
 }
 
 /// The phone API, for the Android app (docs/mobile-api.md).
+/// `[sessions]` in config.toml.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Sessions {
+    /// When a Claude session joins a Herdr space that has others, tell every
+    /// Claude session there who the others are (`tower introduce`).
+    pub introduce: bool,
+}
+
+impl Default for Sessions {
+    fn default() -> Self {
+        Self { introduce: true }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Lan {

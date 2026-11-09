@@ -129,6 +129,17 @@ pub enum Request {
     PrMerged { pr: String, by: String },
     /// `normal`, `keep-moving` or `ask-everything`.
     Policy { policy: String },
+    /// Introducing related sessions (`tower introduce`): `status` (every
+    /// space's Claude sessions and what was sent), `run` (`space`, shown with
+    /// `dry_run` or sent again), `kick` (a session was just started: look now).
+    Introduce {
+        #[serde(default)]
+        action: String,
+        #[serde(default)]
+        space: String,
+        #[serde(default)]
+        dry_run: bool,
+    },
     /// A screenshot was added (`tower screenshot`): the state's list is re-read.
     Screenshots,
     Status,
