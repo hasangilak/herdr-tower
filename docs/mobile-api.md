@@ -152,6 +152,8 @@ holds.
 | `GET /v1/chat?before=h120&limit=50` | `{"messages":[…], "more": bool}`: **the main chat thread**, the same one the Mac panel shows, newest last; `before` pages back (the first message's `id`), `more` says older ones remain. See "The chat" below. |
 | `GET /v1/questions` | `{"questions":[…]}`: what blocked sessions ask, as question sets (see [questions.md](questions.md)); also in the state (`questions`; each agent's `question` id). A set with `kind: "text"`, `decision: "escalate"` and `reason: "it waits for you to do this"` is a session that stopped for the user to act (merge, approve, test, decide): its `title` is the request; no recommendations will come (show "waits for you" and a reply box, not a spinner). |
 | `GET /v1/questions/{id}` | One set. `404 no_question`. |
+| `GET /v1/prs` | `{"prs":[…]}`: the PRs the tower's sessions opened, open ones and those closed in the last day, waiting ones first (see "PRs" below). |
+| `GET /v1/prs/{owner}/{repo}/{number}` | `{"pr":{…}}`. `404 no_pr`. |
 | `GET /v1/questions-policy` | `{"policy": "normal"\|"keep-moving"\|"ask-everything"}`: how questions are handled (also `question_policy` in the state). |
 | `GET /v1/behaviors` | The user's behaviors (how the tower works), the fixed core and a summary; add, edit, enable/disable, remove, preview, undo and history: see [behaviors.md](behaviors.md). |
 | `GET /v1/accounts` | `{"default": name, "accounts":[{"name","email"}]}`, the default first (from the claude-accounts mod; names are not fixed: colour by name). |
@@ -215,6 +217,8 @@ may be added later: ignore them.
 | `POST /v1/questions/{id}/answer` | `{"answers":[{"tab":0,"choice":1},{"tab":1,"choice":{"options":[0,2],"other":"…"}}],"submit":true}`; or multipart: that JSON as a part named `json`, files for tab N's typed answer as parts named `tab<N>` | Types the answers into the session's dialog, checking the screen after each step, then submits after checking the review. `200 {"ok":true,"id","submitted"}`; `409 {"error":{"code":"stopped"\|"changed"\|"answered"\|"cannot_answer","message":"where and why"}}` (`answered`: the dialog was answered in the session meanwhile, and the set is closed; `changed`: the dialog asks something else now, and the set under its new id is in the questions, with `replaces` naming the old one when it is the same dialog read again); `400 bad_tab` (an answer for a tab the set doesn't have; nothing is typed or saved); `404`. Every tab's files are checked before any is saved. |
 | `DELETE /v1/questions/{id}` | | Dismisses it (a text question that isn't one, or one the user answers in the terminal). |
 | `PUT /v1/questions-policy` | `{"policy": "normal"\|"keep-moving"\|"ask-everything"}` | Saved in the Mac's config. |
+| `POST /v1/prs/{owner}/{repo}/{number}/confirm` | `{}` | Step one of a merge: GitHub is asked again, and the answer says what merging would do: `{"token","expires_ms","pr":{…},"method":"merge"\|"squash"\|"rebase","can":bool,"blocked":null\|"why","needs_override":null\|"what fails","warnings":["…"]}`. Show it to the user; the token is for this phone, this PR and its head commit as shown, for two minutes, once. `404 no_pr`, `503 github`. |
+| `POST /v1/prs/{owner}/{repo}/{number}/merge` | `{"token":"…"}` or `{"token":"…","override":true}` | Step two: merges with the repo's default method, pinned to the commit confirmed, never forced. `override: true` only after the user said a second time that the failing checks are unrelated. `200 {"merged":true,"pr":{…}}`; `403 bad_token` (missing, used, another PR or device, expired: confirm again); `409 {"error":{"code":"blocked"\|"needs_override"\|"changed"\|"merge_failed","message":"…"}}` (`changed`: new commits since the confirmation; `merge_failed`: GitHub refused, e.g. a required review). The token is used up either way. |
 | `POST /v1/questions/{id}/interpret` | `{"tab":0,"text":"the second one"}` | `{"tab","choice":{"options":[1],"other":null}}`: a spoken answer as a choice, to show before sending. |
 | `POST /v1/questions/{id}/voice?tab=N` | a WAV take | `{"tab","heard","choice"}`: transcribed by the Mac's Whisper, then as `interpret`. |
 | `DELETE /v1/device` | | Unpairs this phone (its token stops working). |
@@ -297,6 +301,10 @@ A message:
 - **screenshots**: a card of screenshots a session sent (several sent by
   the same session within two minutes make one card; `updated_at` moves
   when one joins). `session`, `name`.
+- **pr**: a PR a session opened (see "PRs"): `text` is its title when
+  found, `pr` the PR as it is now. It changes in place: a `chat` `update`
+  (and a `pr` event) when its checks finish or it's merged or closed,
+  never a new message. `session`, `name`, `space`.
 - **event**: news the panel shows between messages (a watched session
   finished, a job done or blocked, an alert, a summary), `text` as the
   panel words it; `session`, `name`, `status`.
@@ -304,6 +312,63 @@ A message:
 `id` is `h<line>`: stable, unique, in order. What the tower is writing
 right now isn't a message yet: the state's `work` (its working line) and
 `said` (what it is saying) show it until the answer lands.
+
+## PRs
+
+Every PR the tower's sessions open is a chip in the chat (a message of
+`role` `pr`), the same on the Mac and every phone, from when it's found
+(a `github.com/…/pull/N` link in what a session says at the end of a turn,
+or what its `gh pr create` printed) until it's merged or closed. The Mac
+asks GitHub about each open one every 30 s while its checks run, every
+90 s otherwise. A PR:
+
+```json
+{
+  "key": "eyzhub/eyz-mediaroom-serverless#1250",
+  "repo": "eyzhub/eyz-mediaroom-serverless", "number": 1250,
+  "url": "https://github.com/eyzhub/eyz-mediaroom-serverless/pull/1250",
+  "title": "release: support tickets can open a new request beside an open one",
+  "base": "main", "head": "dev", "head_sha": "0dcd66e…",
+  "state": "open",                   // open | merged | closed
+  "draft": false,
+  "mergeable": "mergeable",          // mergeable | conflicting | unknown (GitHub still working it out)
+  "checks": {"state": "failing",     // pending | passing | failing | none
+             "failing": ["CI / lint"], "pending": [], "passed": 4, "total": 5},
+  "session": "t58", "name": "b2c tickets mediaroom", "space": "b2c-tickets",
+  "waiting": true,                   // its session ended its turn on it, or asked the user to merge
+  "found_ms": 1794238300000, "checked_ms": 1794238390000,
+  "closed_ms": null,
+  "merged_by": null,                 // mac | phone:<device> | github, once merged
+  "merge": {                         // whether the Merge button works now
+    "can": true,
+    "blocked": null,                 // why not at all: merged, closed, a draft, conflicts
+    "needs_override": "1 check failing: CI / lint. Merge anyway only if you know the failure is unrelated.",
+    "warnings": ["It merges into main: that ships to production."]
+  }
+}
+```
+
+Show "Waiting for you" when `waiting` and `state` is `open`. The Merge
+button: disabled with `merge.blocked` as the reason when it's set. Tapping
+it calls `…/confirm` and shows the answer (repo, number, `base`, the
+checks, `method`, every warning); "Merge into <base>" then calls `…/merge`
+with the token. When `needs_override` is set, that button first shows it
+and asks once more ("Merge anyway: the failure is unrelated"), and only
+then sends `override: true`. Afterwards the chip changes by itself (`pr`
+event, chat `update`); the Mac tells the session ("The user merged PR #N
+…", queued) and the brain. The brain never merges.
+
+Example:
+
+```
+POST /v1/prs/eyzhub/eyz-mediaroom-serverless/1250/confirm   {}
+→ 200 {"token":"9f2c…","expires_ms":1794238510000,"method":"merge","can":true,"blocked":null,
+       "needs_override":null,"warnings":["It merges into main: that ships to production."],"pr":{…}}
+POST /v1/prs/eyzhub/eyz-mediaroom-serverless/1250/merge     {"token":"9f2c…"}
+→ 200 {"merged":true,"pr":{…,"state":"merged","merged_by":"phone:d_9fce5c6c"}}
+event pr   {"op":"closed","pr":{…,"state":"merged"}}
+event chat {"op":"update","message":{"id":"h1840","role":"pr",…,"pr":{…,"state":"merged"}}}
+```
 
 ## Live updates: `GET /v1/events`
 
@@ -317,6 +382,7 @@ line of JSON `data`. A comment line `: ping` comes every 10 s.
 | `hello` | `{"api":1,"device":"d_…","voice":bool}`, first |
 | `state` | the whole state, first right after `hello`, then whenever it changes (at most 4 a second) |
 | `history` | one new history entry (as in `/v1/history`), as it's written |
+| `pr` | `{"op": "open"\|"update"\|"closed", "pr": {…}}`: a PR a session opened appeared, changed (checks, mergeable, waiting) or closed (merged or closed). |
 | `question` | `{"op": "open"\|"update"\|"closed", "id", "question": {…}}`: a question set appeared, changed (recommendations arrived, the dialog moved to another tab, answering started, finished or stopped) or closed (the session moved on). |
 | `behaviors` | a change: `{at, op, id, title, by, undid, diff}` (the chat also gets a `behavior` card with the diff) |
 | `chat` | `{"op": "add"\|"update", "message": {…}}`: a message joined the thread (from the Mac or any phone), or one changed (a screenshot card grew). Messages the phone sent itself come back this way too. |
