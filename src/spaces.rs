@@ -2,11 +2,20 @@
 //!
 //! The user works in several spaces at once ("B2B ticketing", "B2C
 //! support"), each with its own sessions. With a space in focus, its news is
-//! spoken as always; news from every other space is held: not spoken, not
-//! handed to the brain, kept as unread for the panel and for "what did I
-//! miss". Only someone needing the user gets through, as a bell and a short
-//! "B2C support needs you" (`alerts.held_urgent`). No focus: everything is
-//! spoken, as before.
+//! spoken as always. From every other space, focus quiets what merely
+//! happened there, and never what the user is waiting on:
+//!
+//! - **Asked for**: a report on work the brain handed out (a watch, an open
+//!   job) reaches the brain wherever it is, marked as from a space out of
+//!   focus, and the brain says it in one short line naming the space.
+//! - **Needs you**: someone there is blocked on the user or waits for them
+//!   (to merge, approve, test, decide): a bell and the request, in a line
+//!   that names the space (`alerts.held_urgent`).
+//! - **Ambient**: everything else (a session finishing that nobody watched,
+//!   the send queue's notes): held, not spoken, kept as unread for the
+//!   panel, the phone and "what did I miss".
+//!
+//! No focus: everything is spoken, as before.
 //!
 //! `spaces.json` (beside `state.json`, which the orb watches) keeps the
 //! focus, each space's agenda, and how far its held news has been read.
@@ -60,27 +69,70 @@ pub fn save(s: &Spaces) {
     save_to(&config::ui_dir(), s)
 }
 
+/// What a piece of news is to the user, for the focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum News {
+    /// Something happened there that nobody asked to hear about.
+    Ambient,
+    /// A report on work the user asked for: the brain watches only what it
+    /// handed out (a watch, or an open job).
+    Asked,
+    /// Someone there is blocked on the user, or waits for them.
+    NeedsYou,
+}
+
+impl News {
+    /// A report's kind (`watch`, `job`, `alert`, `queue`) and status.
+    pub fn of(kind: &str, status: &str) -> News {
+        match (kind, status) {
+            ("watch" | "job", _) => News::Asked,
+            (_, "blocked") => News::NeedsYou,
+            _ => News::Ambient,
+        }
+    }
+}
+
 /// What to do with news from a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gate {
     /// Say it, as always.
     Speak,
+    /// Say it, though its space is out of focus: work the user asked for.
+    /// The brain is told so (`out_of_focus`) and names the space.
+    Through,
     /// Keep it for later: unread, not spoken.
     Hold,
-    /// Keep it, but a bell and "<space> needs you" now.
+    /// Keep it, but a bell and the request, naming the space, now.
     Urgent,
 }
 
 /// News from `space` (None: a session in no space), with `focus` set or not.
-/// `needs_you`: an agent is blocked on the user. `urgent_cue`: such news
-/// breaks through the focus (config `alerts.held_urgent`).
-pub fn gate(space: Option<&str>, focus: Option<&str>, needs_you: bool, urgent_cue: bool) -> Gate {
+/// `urgent_cue`: someone needing the user breaks through the focus (config
+/// `alerts.held_urgent`).
+pub fn gate(space: Option<&str>, focus: Option<&str>, news: News, urgent_cue: bool) -> Gate {
     match (focus, space) {
         (None, _) | (_, None) => Gate::Speak,
         (Some(f), Some(s)) if f == s => Gate::Speak,
-        _ if needs_you && urgent_cue => Gate::Urgent,
-        _ => Gate::Hold,
+        _ => match news {
+            News::Asked => Gate::Through,
+            News::NeedsYou if urgent_cue => Gate::Urgent,
+            _ => Gate::Hold,
+        },
     }
+}
+
+/// What the brain is told after a report that comes through the focus.
+pub fn out_of_focus(space: &str, focus: &str) -> String {
+    format!(
+        " This is from the space {space}, not the one in focus ({focus}), but it's work the user asked for: tell them in one short line that starts with \"In {space}\" (and what they need to do, if anything)."
+    )
+}
+
+/// The short line said when someone in an unfocused space needs the user:
+/// the request itself when it's short, else just that they're needed.
+pub fn needs_you_line(space: &str, text: &str) -> String {
+    let t = text.trim().trim_end_matches(['.', '!']);
+    if t.is_empty() || t.chars().count() > 160 { format!("{space} needs you.") } else { format!("In {space}: {t}.") }
 }
 
 /// The space a terminal is in: Herdr's `where` label reads "<space> / <tab>".
@@ -515,16 +567,46 @@ fn picks_a_space_by_part_of_its_name() {
 
 #[test]
     fn focus_holds_other_spaces() {
+        use News::*;
         // No focus: everything is spoken.
-        assert_eq!(gate(Some("B2C support"), None, false, true), Gate::Speak);
-        assert_eq!(gate(Some("B2C support"), None, true, true), Gate::Speak);
+        assert_eq!(gate(Some("B2C support"), None, Ambient, true), Gate::Speak);
+        assert_eq!(gate(Some("B2C support"), None, NeedsYou, true), Gate::Speak);
         // The focused space is spoken; a session in no space too.
-        assert_eq!(gate(Some("B2B ticketing"), Some("B2B ticketing"), false, true), Gate::Speak);
-        assert_eq!(gate(None, Some("B2B ticketing"), false, true), Gate::Speak);
+        assert_eq!(gate(Some("B2B ticketing"), Some("B2B ticketing"), Ambient, true), Gate::Speak);
+        assert_eq!(gate(None, Some("B2B ticketing"), Ambient, true), Gate::Speak);
         // Another space: held, unless someone there needs the user.
-        assert_eq!(gate(Some("B2C support"), Some("B2B ticketing"), false, true), Gate::Hold);
-        assert_eq!(gate(Some("B2C support"), Some("B2B ticketing"), true, true), Gate::Urgent);
-        assert_eq!(gate(Some("B2C support"), Some("B2B ticketing"), true, false), Gate::Hold);
+        assert_eq!(gate(Some("B2C support"), Some("B2B ticketing"), Ambient, true), Gate::Hold);
+        assert_eq!(gate(Some("B2C support"), Some("B2B ticketing"), NeedsYou, true), Gate::Urgent);
+        assert_eq!(gate(Some("B2C support"), Some("B2B ticketing"), NeedsYou, false), Gate::Hold);
+    }
+
+    /// The missed release (t58 in b2c-tickets, focus on B2C support): a
+    /// watch's report on work the user asked for came in done and was held,
+    /// so neither the brain nor the user heard the PR waited for them.
+    #[test]
+    fn work_the_user_asked_for_comes_through_the_focus() {
+        // A watch's or an open job's report, done or blocked: through.
+        assert_eq!(News::of("watch", "done"), News::Asked);
+        assert_eq!(News::of("job", "idle"), News::Asked);
+        assert_eq!(News::of("watch", "blocked"), News::Asked);
+        assert_eq!(gate(Some("b2c-tickets"), Some("B2C support"), News::of("watch", "done"), true), Gate::Through);
+        // ... even with the urgent cue off: it's an answer to the user, not an alert.
+        assert_eq!(gate(Some("b2c-tickets"), Some("B2C support"), News::of("watch", "done"), false), Gate::Through);
+        // A finish nobody watched, the queue's notes: still held.
+        assert_eq!(gate(Some("b2c-tickets"), Some("B2C support"), News::of("alert", "done"), true), Gate::Hold);
+        assert_eq!(gate(Some("b2c-tickets"), Some("B2C support"), News::of("queue", "news"), true), Gate::Hold);
+        // Blocked there: the urgent cue.
+        assert_eq!(gate(Some("b2c-tickets"), Some("B2C support"), News::of("alert", "blocked"), true), Gate::Urgent);
+        // The brain is told where it's from and to name it.
+        let note = out_of_focus("b2c-tickets", "B2C support");
+        assert!(note.contains("b2c-tickets") && note.contains("B2C support") && note.contains("\"In b2c-tickets\""), "{note}");
+    }
+
+    #[test]
+    fn needing_you_elsewhere_says_what_is_needed() {
+        assert_eq!(needs_you_line("b2c-tickets", "mediaroom waits for you to merge PR #1250."), "In b2c-tickets: mediaroom waits for you to merge PR #1250.");
+        assert_eq!(needs_you_line("b2c-tickets", ""), "b2c-tickets needs you.");
+        assert_eq!(needs_you_line("b2c-tickets", &"x".repeat(200)), "b2c-tickets needs you.");
     }
 
     #[test]

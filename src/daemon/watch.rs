@@ -673,23 +673,37 @@ impl Radar {
         }
     }
 
+    /// How news of `kind` and `status` from `space` goes with the focus as
+    /// it is now, and the focus (empty: none).
+    fn gate(&self, space: Option<&str>, status: &str, kind: &str) -> (crate::spaces::Gate, String) {
+        let focus = crate::spaces::load().focus;
+        let news = crate::spaces::News::of(kind, status);
+        (crate::spaces::gate(space, focus.as_deref(), news, self.alerts.held_urgent), focus.unwrap_or_default())
+    }
+
     /// With a space in focus, news from another space is kept for later
     /// instead of spoken (or handed to the brain): true when it was. An agent
-    /// there needing the user still gets a bell and "<space> needs you".
+    /// there needing the user still gets a bell and what it needs.
     fn held(&self, address: &str, name: &str, space: Option<&str>, text: &str, status: &str, kind: &str) -> bool {
-        let focus = crate::spaces::load().focus;
-        let gate = crate::spaces::gate(space, focus.as_deref(), status == "blocked", self.alerts.held_urgent);
-        if gate == crate::spaces::Gate::Speak {
+        let (gate, focus) = self.gate(space, status, kind);
+        self.keep(gate, &focus, address, name, space, text, status, kind)
+    }
+
+    /// Keeps news the gate holds: true when it did.
+    #[allow(clippy::too_many_arguments)]
+    fn keep(&self, gate: crate::spaces::Gate, focus: &str, address: &str, name: &str, space: Option<&str>, text: &str, status: &str, kind: &str) -> bool {
+        use crate::spaces::Gate;
+        if matches!(gate, Gate::Speak | Gate::Through) {
             return false;
         }
         let space = space.unwrap_or("");
         let (a, n, sp, t, st, k) =
             (address.to_string(), name.to_string(), space.to_string(), text.to_string(), status.to_string(), kind.to_string());
         crate::history::later(move || crate::spaces::hold(&k, &a, &n, &sp, &t, Some(&st)));
-        if gate == crate::spaces::Gate::Urgent {
-            self.mouth.alert(format!("{space} needs you."), Some((address, status)));
+        if gate == Gate::Urgent {
+            self.mouth.alert(crate::spaces::needs_you_line(space, text), Some((address, status)));
         }
-        eprintln!("[radar] held for {space} (focus: {}): {text}", focus.unwrap_or_default());
+        eprintln!("[radar] held for {space} (focus: {focus}): {text}");
         true
     }
 
@@ -829,14 +843,27 @@ impl Radar {
     }
 
     /// Hands what's owed to the brain: kept in the outbox until it takes it
-    /// (said out loud once meanwhile). News from a space out of focus is held instead.
+    /// (said out loud once meanwhile). From a space out of focus, a report
+    /// on work the user asked for goes through, marked so; other news is held.
     fn deliver_now(&self) {
         self.watches.deliver(|p| {
             let news = p.msg.trim_start_matches("[watch] ").trim_start_matches("[queue] ").to_string();
-            if self.held(&p.address, &p.name, p.space.as_deref(), &news, &p.status, &p.kind) {
+            let (gate, focus) = self.gate(p.space.as_deref(), &p.status, &p.kind);
+            if self.keep(gate, &focus, &p.address, &p.name, p.space.as_deref(), &news, &p.status, &p.kind) {
                 return true;
             }
-            match brain::note(&p.msg) {
+            let through = (gate == crate::spaces::Gate::Through).then(|| p.space.clone().unwrap_or_default());
+            let msg = match &through {
+                Some(space) => format!("{}{}", p.msg, crate::spaces::out_of_focus(space, &focus)),
+                None => p.msg.clone(),
+            };
+            if let Some(space) = &through {
+                eprintln!("[radar] through the focus ({focus}) from {space}: work the user asked for");
+                if !p.speech.is_empty() && !p.speech.starts_with("In ") {
+                    p.speech = format!("In {space}, {}", lower_first(&p.speech));
+                }
+            }
+            match brain::note(&msg) {
                 Ok(()) => {
                     if !p.spoken && p.kind != "queue" {
                         self.shared.alert(&p.address, &format!("{} is {}", p.name, say_status(&p.status)), &p.status);
@@ -1024,6 +1051,15 @@ pub fn test_daemon() -> bool {
 /// daemon, so the two never answer, announce or report the same session.
 pub fn left_alone(t: &Value) -> bool {
     is_test(t) != test_daemon()
+}
+
+/// "Mediaroom is done." → "mediaroom is done." (after "In <space>, ").
+fn lower_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) if c.clone().next().is_some_and(char::is_lowercase) => f.to_lowercase().chain(c).collect(),
+        _ => s.to_string(),
+    }
 }
 
 fn say_status(status: &str) -> &str {
