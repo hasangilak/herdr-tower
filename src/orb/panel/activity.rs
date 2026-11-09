@@ -15,7 +15,7 @@ use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
 
 use super::{AMBER, Accounts, CYAN, Filter, NAVY, PALE, Panel, ROSE, Scope, activity_row, ago, day_label, glass, job_card, span};
-use crate::history::{Entry, Job};
+use crate::history::{Entry, Job, JobState};
 use crate::spaces::Live;
 
 /// Sessions not heard from for this long are "older" (hidden until asked for).
@@ -135,7 +135,7 @@ impl Panel {
 
     /// What needs you, counted for the tab: questions waiting, blocked jobs.
     pub(super) fn needs_you(&self, cx: &gpui::App) -> usize {
-        let blocked = dedupe(&self.jobs).iter().filter(|j| j.status == "blocked" && !is_test(&j.name)).count();
+        let blocked = dedupe(&self.jobs).iter().filter(|j| j.status == JobState::Blocked && !is_test(&j.name)).count();
         self.open_sets(cx).len() + blocked
     }
 
@@ -406,10 +406,10 @@ impl Panel {
                 }))
                 .into_any_element();
         }
-        let (dot, when): (AnyElement, String) = match j.status.as_str() {
-            "working" => (div().size(px(8.0)).rounded_full().bg(rgb(CYAN)).into_any_element(), span(now.saturating_sub(j.started))),
-            "blocked" => (div().size(px(8.0)).rounded_full().bg(rgb(AMBER)).into_any_element(), "needs you".into()),
-            "done" | "idle" => (Icon::new(IconName::Check).xsmall().text_color(g.faint).into_any_element(), ago(j.updated)),
+        let (dot, when): (AnyElement, String) = match j.status {
+            JobState::Working => (div().size(px(8.0)).rounded_full().bg(rgb(CYAN)).into_any_element(), span(now.saturating_sub(j.started))),
+            JobState::Blocked => (div().size(px(8.0)).rounded_full().bg(rgb(AMBER)).into_any_element(), "needs you".into()),
+            JobState::Done => (Icon::new(IconName::Check).xsmall().text_color(g.faint).into_any_element(), ago(j.updated)),
             _ => (div().size(px(8.0)).rounded_full().bg(rgb(ROSE)).into_any_element(), ago(j.updated)),
         };
         let shots = all_shots.iter().filter(|s| super::gallery::of_job(s, j)).count();
@@ -438,7 +438,7 @@ impl Panel {
                         h_flex()
                             .gap_2()
                             .child(div().flex_1().min_w_0().truncate().text_sm().child(title))
-                            .child(div().flex_none().text_xs().text_color(if j.status == "working" { rgb(CYAN).into() } else { g.faint }).child(when)),
+                            .child(div().flex_none().text_xs().text_color(if j.status == JobState::Working { rgb(CYAN).into() } else { g.faint }).child(when)),
                     )
                     .child(
                         h_flex()
@@ -476,7 +476,7 @@ impl Panel {
         let filter = self.filter;
         if matches!(filter, Filter::Active | Filter::All) {
             // Now: what needs you, then what runs.
-            let blocked: Vec<&Job> = running.iter().filter(|j| j.status == "blocked").collect();
+            let blocked: Vec<&Job> = running.iter().filter(|j| j.status == JobState::Blocked).collect();
             if !sets.is_empty() || !blocked.is_empty() {
                 items.push(section("Needs you"));
                 for s in &sets {
@@ -488,7 +488,7 @@ impl Panel {
                     }
                 }
             }
-            let working: Vec<Job> = running.iter().filter(|j| j.status != "blocked").cloned().collect();
+            let working: Vec<Job> = running.iter().filter(|j| j.status != JobState::Blocked).cloned().collect();
             if !working.is_empty() {
                 items.push(section("Running"));
                 for j in &working {
@@ -581,7 +581,7 @@ mod tests {
             space: String::new(),
             account: None,
             title: title.into(),
-            status: "done".into(),
+            status: JobState::Done,
             summary: String::new(),
             started: at,
             updated: at,

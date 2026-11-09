@@ -36,7 +36,7 @@ use gpui_kit::component::{Icon, IconName, Sizable as _, Theme, ThemeMode, h_flex
 
 use super::Tower;
 use crate::config;
-use crate::history::{self, Entry, Job};
+use crate::history::{self, Entry, Job, JobState};
 
 /// The panel's size, in points.
 pub const W: f32 = 380.0;
@@ -1622,16 +1622,16 @@ fn event_line(e: &Entry, g: &Glass) -> AnyElement {
 /// A job: what was asked, of whom, and where it stands.
 fn job_card(j: &Job, g: &Glass, now: u64, acc: &Accounts, shots: Option<AnyElement>) -> AnyElement {
     let who = if j.name.is_empty() { j.session.clone() } else { j.name.clone() };
-    let (mark, color): (AnyElement, Hsla) = match j.status.as_str() {
-        "working" => (div().size(px(8.0)).rounded_full().bg(rgb(CYAN)).into_any_element(), rgb(CYAN).into()),
-        "blocked" => (Icon::new(IconName::TriangleAlert).small().text_color(rgb(AMBER)).into_any_element(), rgb(AMBER).into()),
-        "done" | "idle" => (Icon::new(IconName::CircleCheck).small().text_color(rgb(PALE)).into_any_element(), rgb(PALE).into()),
+    let (mark, color): (AnyElement, Hsla) = match j.status {
+        JobState::Working => (div().size(px(8.0)).rounded_full().bg(rgb(CYAN)).into_any_element(), rgb(CYAN).into()),
+        JobState::Blocked => (Icon::new(IconName::TriangleAlert).small().text_color(rgb(AMBER)).into_any_element(), rgb(AMBER).into()),
+        JobState::Done => (Icon::new(IconName::CircleCheck).small().text_color(rgb(PALE)).into_any_element(), rgb(PALE).into()),
         _ => (Icon::new(IconName::CircleX).small().text_color(rgb(ROSE)).into_any_element(), rgb(ROSE).into()),
     };
-    let when = match j.status.as_str() {
-        "working" => format!("running {}", span(now.saturating_sub(j.started))),
-        "blocked" => format!("waiting for you · {}", span(now.saturating_sub(j.started))),
-        s => format!("{} {} · took {}", status_word(s), ago(j.updated), span(j.updated.saturating_sub(j.started))),
+    let when = match &j.status {
+        JobState::Working => format!("running {}", span(now.saturating_sub(j.started))),
+        JobState::Blocked => format!("waiting for you · {}", span(now.saturating_sub(j.started))),
+        s => format!("{} {} · took {}", status_word(s.word()), ago(j.updated), span(j.updated.saturating_sub(j.started))),
     };
     let mut meta = vec![who.clone()];
     if !j.space.is_empty() {

@@ -577,8 +577,12 @@ fn run(cli: Cli) -> Result<()> {
             let text = text.join(" ");
             match action.as_str() {
                 "start" => println!("{}", history::job_start(&terminal, &text)),
-                "done" | "failed" => history::job_update(&terminal, if action == "done" { "done" } else { "failed" }, &text),
-                "update" => history::job_update(&terminal, status.as_deref().unwrap_or("working"), &text),
+                "done" => history::job_update(&terminal, history::JobState::Done, &text),
+                "failed" => history::job_update(&terminal, history::JobState::Failed, &text),
+                "update" => match history::JobState::parse(status.as_deref().unwrap_or("working")) {
+                    history::JobState::Other(s) => bail!("tower job update --status {s}: use working, blocked, done, failed, error or exited"),
+                    st => history::job_update(&terminal, st, &text),
+                },
                 other => bail!("tower job {other}: use start, done, failed or update"),
             }
             Ok(())

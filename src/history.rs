@@ -258,9 +258,110 @@ pub fn job_start_on(session: &str, title: &str, account: Option<String>) -> Stri
     id
 }
 
-/// Where a session's latest job stands now (`done`, `blocked`, ...), with
-/// what happened. Starts a job if the session has none.
-pub fn job_update(session: &str, status: &str, text: &str) {
+/// Where a job stands. In the history it is its word (`working`,
+/// `blocked`, `done`, `failed`, `error`, `exited`); older words fold in
+/// (`idle` was recorded for a finish, `gone` for an end), and a word this
+/// version doesn't know is kept, as a finished job. See docs/state-machines.md, section 4.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum JobState {
+    #[default]
+    Working,
+    /// Waiting on a person (a question, a permission, a first-run trust).
+    Blocked,
+    Done,
+    /// Recorded by hand: it didn't work out.
+    Failed,
+    /// The session hit an error.
+    Error,
+    /// The session ended.
+    Exited,
+    Other(String),
+}
+
+impl JobState {
+    pub fn parse(s: &str) -> JobState {
+        match s {
+            "working" => JobState::Working,
+            "blocked" => JobState::Blocked,
+            "done" | "idle" => JobState::Done,
+            "failed" => JobState::Failed,
+            "error" => JobState::Error,
+            "exited" | "gone" => JobState::Exited,
+            other => JobState::Other(other.to_string()),
+        }
+    }
+
+    pub fn word(&self) -> &str {
+        match self {
+            JobState::Working => "working",
+            JobState::Blocked => "blocked",
+            JobState::Done => "done",
+            JobState::Failed => "failed",
+            JobState::Error => "error",
+            JobState::Exited => "exited",
+            JobState::Other(s) => s,
+        }
+    }
+
+    pub fn open(&self) -> bool {
+        matches!(self, JobState::Working | JobState::Blocked)
+    }
+
+    /// What a session doing `status` (its status word; "" none yet) means
+    /// for its job. None: nothing to say (no status yet).
+    pub fn of_session(status: &str, live: bool) -> Option<JobState> {
+        if !live {
+            return Some(JobState::Exited);
+        }
+        match status {
+            "" => None,
+            "working" => Some(JobState::Working),
+            "blocked" => Some(JobState::Blocked),
+            "idle" | "done" => Some(JobState::Done),
+            "error" => Some(JobState::Error),
+            "exited" | "gone" => Some(JobState::Exited),
+            _ => None,
+        }
+    }
+
+    /// Where `ev` takes a job in this state: by hand anywhere; from what the
+    /// session does only while the job is open, and only to somewhere else.
+    pub fn next(&self, ev: &JobEv) -> Result<JobState, JobRefused> {
+        match ev {
+            JobEv::ByHand(to) => Ok(to.clone()),
+            JobEv::Session(_) if !self.open() => Err(JobRefused::Over),
+            JobEv::Session(to) if to == self => Err(JobRefused::Same),
+            JobEv::Session(to) => Ok(to.clone()),
+        }
+    }
+}
+
+impl std::fmt::Display for JobState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.word())
+    }
+}
+
+/// What moves a job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobEv {
+    /// The brain (or the user) says so: `tower job done|failed|update`.
+    ByHand(JobState),
+    /// Its session did something (the radar saw it, a watch fired, the start's reconcile).
+    Session(JobState),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobRefused {
+    /// The job is over: what the session does next is another job's.
+    Over,
+    /// It is there already.
+    Same,
+}
+
+/// Where a session's latest job stands now, by hand (`tower job done`,
+/// `failed`, `update`), with what happened. Starts a job if the session has none.
+pub fn job_update(session: &str, status: JobState, text: &str) {
     let jobs = jobs(&load());
     let mut e = about("job", session, text);
     let addr = e.session.clone().unwrap_or_else(|| session.into());
@@ -269,19 +370,43 @@ pub fn job_update(session: &str, status: &str, text: &str) {
         Some(j) => j.id.clone(),
         None => format!("{}-{}", addr.replace('/', "_"), now_ms()),
     });
-    e.status = Some(status.into());
+    // By hand, any job may go anywhere (the table never refuses it).
+    let next = job.map(|j| j.status.clone()).unwrap_or_default().next(&JobEv::ByHand(status.clone())).unwrap_or(status);
+    e.status = Some(next.word().to_string());
+    append(e);
+}
+
+/// The entry that moves `session`'s open job to `to` because of what the
+/// session did, if it moves (see `JobState::next`): none for a session
+/// with no open job, or a job there already.
+pub fn follow(jobs: &[Job], session: &str, to: &JobState, text: &str) -> Option<Entry> {
+    let job = jobs.iter().filter(|j| j.session == session && j.open()).max_by_key(|j| j.started)?;
+    let next = job.status.next(&JobEv::Session(to.clone())).ok()?;
+    Some(Entry { kind: "job".into(), session: Some(session.into()), job: Some(job.id.clone()), status: Some(next.word().into()), text: text.into(), ..Default::default() })
+}
+
+/// A session's job follows what the session does (the radar sees it): back
+/// to working after a question, done when it stops, exited when it ends.
+/// Nothing for a session without an open job.
+/// `session` is its address as Herdr gives it (Herdr is asked about it only
+/// when a job moves).
+pub fn job_follow(session: &str, to: JobState, text: &str) {
+    let Some(f) = follow(&jobs(&load()), session, &to, text) else { return };
+    let mut e = about("job", session, text);
+    e.job = f.job;
+    e.status = f.status;
     append(e);
 }
 
 /// A watched session stopped (`status`): ends its open job, or, when the
 /// watch began before any job was recorded, records the job (titled with
 /// what was asked) and its end.
-pub fn job_watched(session: &str, status: &str, asked: &str) {
+pub fn job_watched(session: &str, status: JobState, asked: &str) {
     let addr = hc::get(session).and_then(|t| t["address"].as_str().map(String::from)).unwrap_or_else(|| session.into());
     if !jobs(&load()).iter().any(|j| j.session == addr && j.open()) {
         job_start(session, asked);
     }
-    job_update(session, status, "");
+    job_follow(&addr, status, "");
 }
 
 /// Every entry, oldest first. Lines that don't parse are skipped.
@@ -300,7 +425,7 @@ pub struct Job {
     pub account: Option<String>,
     /// What was asked.
     pub title: String,
-    pub status: String,
+    pub status: JobState,
     /// The latest word on it (a watch report or `tower job done`).
     pub summary: String,
     pub started: u64,
@@ -309,7 +434,7 @@ pub struct Job {
 
 impl Job {
     pub fn open(&self) -> bool {
-        matches!(self.status.as_str(), "working" | "blocked")
+        self.status.open()
     }
 }
 
@@ -321,7 +446,7 @@ pub fn jobs(entries: &[Entry]) -> Vec<Job> {
         match out.iter_mut().find(|j| &j.id == id) {
             Some(j) => {
                 if let Some(s) = &e.status {
-                    j.status = s.clone();
+                    j.status = JobState::parse(s);
                 }
                 if !e.text.is_empty() {
                     j.summary = e.text.clone();
@@ -338,7 +463,7 @@ pub fn jobs(entries: &[Entry]) -> Vec<Job> {
                 space: e.space.clone().unwrap_or_default(),
                 account: e.account.clone(),
                 title: e.text.clone(),
-                status: e.status.clone().unwrap_or_else(|| "working".into()),
+                status: e.status.as_deref().map(JobState::parse).unwrap_or_default(),
                 summary: String::new(),
                 started: e.at,
                 updated: e.at,
@@ -354,7 +479,7 @@ impl Job {
     pub fn row(&self) -> serde_json::Value {
         serde_json::json!({
             "job": self.id, "session": self.session, "name": self.name, "space": self.space, "account": self.account,
-            "status": self.status, "asked": self.title, "summary": self.summary, "started_ms": self.started, "updated_ms": self.updated,
+            "status": self.status.word(), "asked": self.title, "summary": self.summary, "started_ms": self.started, "updated_ms": self.updated,
         })
     }
 }
@@ -525,7 +650,59 @@ mod tests {
         let j = jobs(&[first, e(5, "done", "all 40 pass")]);
         assert_eq!(j.len(), 1);
         assert_eq!(j[0].account.as_deref(), Some("work"), "the job keeps the account it started on");
-        assert_eq!((j[0].title.as_str(), j[0].status.as_str(), j[0].summary.as_str()), ("run the tests", "done", "all 40 pass"));
+        assert_eq!((j[0].title.as_str(), j[0].status.word(), j[0].summary.as_str()), ("run the tests", "done", "all 40 pass"));
         assert!(!j[0].open());
+        // Older lines: a finish recorded raw as `idle`, an end as `gone`; a word not known yet.
+        assert_eq!(jobs(&[e(1, "working", "x"), e(2, "idle", "")])[0].status, JobState::Done);
+        assert_eq!(jobs(&[e(1, "working", "x"), e(2, "gone", "")])[0].status, JobState::Exited);
+        let odd = jobs(&[e(1, "working", "x"), e(2, "paused", "")]);
+        assert_eq!((odd[0].status.word(), odd[0].open()), ("paused", false), "kept as it was, and not open forever");
+        assert_eq!(odd[0].row()["status"], "paused");
+    }
+
+    #[test]
+    fn the_jobs_table() {
+        use JobState::*;
+        let s = |st: &JobState, to: JobState| st.next(&JobEv::Session(to));
+        assert_eq!(s(&Working, Blocked), Ok(Blocked));
+        assert_eq!(s(&Blocked, Working), Ok(Working), "blocked goes back to working when the session carries on");
+        assert_eq!(s(&Blocked, Done), Ok(Done));
+        assert_eq!(s(&Working, Error), Ok(Error));
+        assert_eq!(s(&Working, Exited), Ok(Exited));
+        assert_eq!(s(&Working, Working), Err(JobRefused::Same), "nothing to record");
+        assert_eq!(s(&Done, Working), Err(JobRefused::Over), "what the session does next is another job's");
+        assert_eq!(s(&Failed, Done), Err(JobRefused::Over));
+        assert_eq!(Done.next(&JobEv::ByHand(Failed)), Ok(Failed), "by hand, anywhere");
+        assert_eq!(Exited.next(&JobEv::ByHand(Done)), Ok(Done));
+        // The session's words, in one place.
+        assert_eq!(JobState::of_session("idle", true), Some(Done));
+        assert_eq!(JobState::of_session("done", true), Some(Done));
+        assert_eq!(JobState::of_session("blocked", true), Some(Blocked));
+        assert_eq!(JobState::of_session("working", false), Some(Exited), "an ended program is an end, whatever it said last");
+        assert_eq!(JobState::of_session("gone", true), Some(Exited));
+        assert_eq!(JobState::of_session("", true), None, "no status yet: nothing to say");
+        for w in ["working", "blocked", "done", "failed", "error", "exited"] {
+            assert_eq!(JobState::parse(w).word(), w);
+        }
+    }
+
+    #[test]
+    fn a_session_moves_only_its_open_job() {
+        let e = |at, job: &str, session: &str, status: &str| Entry {
+            at,
+            kind: "job".into(),
+            session: Some(session.into()),
+            job: Some(job.into()),
+            status: Some(status.into()),
+            text: "t".into(),
+            ..Default::default()
+        };
+        let all = jobs(&[e(1, "t3-1", "t3", "working"), e(2, "t3-1", "t3", "done"), e(3, "t3-2", "t3", "working"), e(4, "t3-2", "t3", "blocked")]);
+        let f = follow(&all, "t3", &JobState::Working, "").unwrap();
+        assert_eq!((f.job.as_deref(), f.status.as_deref()), (Some("t3-2"), Some("working")), "the open one, back to work");
+        assert!(follow(&all, "t3", &JobState::Blocked, "").is_none(), "there already");
+        assert!(follow(&all, "t4", &JobState::Done, "").is_none(), "no job");
+        let done = jobs(&[e(1, "t3-1", "t3", "working"), e(2, "t3-1", "t3", "idle")]);
+        assert!(follow(&done, "t3", &JobState::Working, "").is_none(), "a finished job isn't reopened");
     }
 }

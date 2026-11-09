@@ -403,7 +403,7 @@ mod tests {
             space: String::new(),
             account: None,
             title: title.into(),
-            status: "working".into(),
+            status: crate::history::JobState::Working,
             summary: String::new(),
             started,
             updated: started,

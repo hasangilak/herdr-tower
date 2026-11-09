@@ -289,7 +289,7 @@ mod tests {
             space: String::new(),
             account: None,
             title: String::new(),
-            status: "done".into(),
+            status: crate::history::JobState::Done,
             summary: String::new(),
             started: 100,
             updated: 200,

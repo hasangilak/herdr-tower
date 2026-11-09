@@ -163,8 +163,8 @@ pub struct Now {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenJob {
     pub session: String,
-    /// The job's own status (`working` or `blocked`).
-    pub status: String,
+    /// The job's own status (working or blocked).
+    pub status: crate::history::JobState,
     pub title: String,
 }
 
@@ -210,7 +210,7 @@ pub fn reconcile(book: &Book, jobs: &[OpenJob], now: &BTreeMap<String, Now>, rea
         }
         done.push(a);
         // Where it stood when last seen; the job's own word when never seen.
-        let was = book.seen.get(a).cloned().unwrap_or_else(|| j.status.clone());
+        let was = book.seen.get(a).cloned().unwrap_or_else(|| j.status.word().to_string());
         let status = match now.get(a) {
             None => "gone".to_string(),
             Some(n) if !n.live => "exited".into(),
@@ -222,7 +222,7 @@ pub fn reconcile(book: &Book, jobs: &[OpenJob], now: &BTreeMap<String, Now>, rea
             // Finished since it was last seen working.
             "done" | "idle" | "error" => was == "working",
             // Newly waiting on someone (a job already marked blocked was told).
-            "blocked" => j.status != "blocked" && was != "blocked",
+            "blocked" => j.status != crate::history::JobState::Blocked && was != "blocked",
             _ => false,
         };
         if owed {
@@ -283,7 +283,7 @@ mod tests {
         b.seen.insert("t1".into(), "working".into());
         b.seen.insert("t2".into(), "done".into());
         b.watches.insert("t6".into(), watch("watched", "working"));
-        let job = |s: &str, st: &str| OpenJob { session: s.into(), status: st.into(), title: format!("job on {s}") };
+        let job = |s: &str, st: &str| OpenJob { session: s.into(), status: crate::history::JobState::parse(st), title: format!("job on {s}") };
         b.seen.insert("t8".into(), "gone".into());
         let jobs = [
             job("t1", "working"),

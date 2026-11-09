@@ -597,6 +597,16 @@ impl Radar {
         if was == status && !turned {
             return;
         }
+        // Its open job follows what it does: blocked, back to working, done, an
+        // error, ended. Only changes seen while the tower is up: what happened
+        // while it was down is the start's reconcile (it reports it, then moves the job).
+        if let Some(job) = crate::history::JobState::of_session(&status, live)
+            && before.is_some()
+            && (was != status || turned)
+        {
+            let a = address.clone();
+            crate::history::later(move || crate::history::job_follow(&a, job, ""));
+        }
         let stopped_working = (was == "working" && status != "working") || (turned && was != "working");
         // A turn ended: its last message may ask the user something.
         if stopped_working && matches!(status.as_str(), "idle" | "done") {
@@ -745,7 +755,7 @@ impl Radar {
         let r = report.clone();
         if self.watches.fire(address, move |_| r).is_some() {
             let a = address.to_string();
-            crate::history::later(move || crate::history::job_update(&a, "blocked", "asks to trust its folder"));
+            crate::history::later(move || crate::history::job_follow(&a, crate::history::JobState::Blocked, "asks to trust its folder"));
         } else {
             self.watches.owe(report);
         }
@@ -765,6 +775,8 @@ impl Radar {
         // Gone while the tower looked: nothing owed at the next start for it.
         if removed.as_ref().is_some_and(|r| !r.app.is_empty()) {
             self.watches.seen(address, "gone");
+            let a = address.to_string();
+            crate::history::later(move || crate::history::job_follow(&a, crate::history::JobState::Exited, ""));
         }
         if self.watches.watched(address) {
             let space = removed.as_ref().and_then(|r| r.space.clone());
@@ -778,7 +790,8 @@ impl Radar {
     fn fire_watch(&self, address: &str, name: &str, space: Option<String>, status: &str, why: &str) -> bool {
         let fired = self.watches.fire(address, |w| {
             let (t, st, a) = (address.to_string(), status.to_string(), w.note.clone());
-            crate::history::later(move || crate::history::job_watched(&t, if st == "gone" { "exited" } else { &st }, &a));
+            let job = crate::history::JobState::of_session(&st, true).unwrap_or(crate::history::JobState::Exited);
+            crate::history::later(move || crate::history::job_watched(&t, job, &a));
             let mut p = report(address, name, space.clone(), status, &w.note, why, "watch");
             // What it said at the end of its turn (its hook): often all the brain needs.
             if let Some(said) = super::sessions::registry().said_since(address, w.since_ms).filter(|_| status != "exited" && status != "gone") {
@@ -906,14 +919,10 @@ impl Radar {
                 Owed::Job { address, status, was, title } => {
                     let name = name_of(&address);
                     let p = report(&address, &name, space_of(&address), &status, &title, &down_why(&status, &was), "watch");
-                    if self.watches.owe(p) {
-                        let job_status = match status.as_str() {
-                            "gone" | "exited" => "exited",
-                            "idle" => "done",
-                            s => s,
-                        }
-                        .to_string();
-                        crate::history::later(move || crate::history::job_update(&address, &job_status, ""));
+                    if self.watches.owe(p)
+                        && let Some(job) = crate::history::JobState::of_session(&status, true)
+                    {
+                        crate::history::later(move || crate::history::job_follow(&address, job, ""));
                     }
                 }
             }
