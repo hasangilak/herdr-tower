@@ -231,6 +231,8 @@ pub fn start(shared: Shared, mouth: Mouth, alerts: Alerts, watches: Watches, ask
     let _ = watches.radar.set(radar.clone());
     let r = radar.clone();
     radar.asks.set_notify(move |address, text| r.announce(address, text));
+    // The cards the last run left, settled before the first look reads the dialogs again.
+    radar.asks.restore();
     let r = radar.clone();
     thread::Builder::new().name("reconcile".into()).spawn(move || r.reconcile(before)).ok();
     let r = radar.clone();

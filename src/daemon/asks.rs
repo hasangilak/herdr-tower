@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::card::{self, Answerer, CloseWhy, Decision, Ev, Phase, Refused};
@@ -30,7 +31,7 @@ type Note = Arc<dyn Fn(&str) + Send + Sync>;
 const REPLY_TTL_MS: u64 = 30 * 60 * 1000;
 
 /// A reply to a text question, waiting for its session to stop working.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Reply {
     /// The question set it answers.
     set: String,
@@ -42,6 +43,12 @@ struct Reply {
     turn: Option<u64>,
     /// The session's status when last seen.
     last: String,
+    /// When the session's terminal was made: the reply is for that one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_ms: Option<u64>,
+    /// The session's name, to tell the user if it doesn't go in.
+    #[serde(default)]
+    name: String,
 }
 
 impl Reply {
@@ -140,9 +147,85 @@ impl Inner {
     }
 }
 
+/// What `questions.json` keeps (in the state folder), so a restart picks
+/// the cards up where they were: the open sets in their state (as their
+/// wire words), the dialogs dismissed, the replies waiting, and which sets
+/// the brain was told about.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Saved {
+    sets: Vec<SavedSet>,
+    dismissed: Vec<(String, String)>,
+    replies: HashMap<String, Reply>,
+    noted: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedSet {
+    #[serde(flatten)]
+    set: QuestionSet,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_ms: Option<u64>,
+}
+
+impl Saved {
+    fn load(path: &std::path::Path) -> Saved {
+        let Ok(text) = std::fs::read_to_string(path) else { return Saved::default() };
+        serde_json::from_str(&text).unwrap_or_else(|e| {
+            let aside = path.with_extension(format!("bad-{}.json", crate::history::now_ms()));
+            let _ = std::fs::copy(path, &aside);
+            eprintln!("[questions] {} unreadable ({e}); kept as {}", path.display(), aside.display());
+            Saved::default()
+        })
+    }
+
+    fn write(&self, path: &std::path::Path) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+}
+
+/// A session's terminal as Herdr has it, for settling what a restart left.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Terminal {
+    Live { created_ms: Option<u64>, status: String },
+    /// The terminal is there; its program ended.
+    Ended,
+    Gone,
+    /// hc couldn't say.
+    Unknown,
+}
+
+impl Terminal {
+    fn of(address: &str) -> Terminal {
+        match hc::lookup(address) {
+            hc::Lookup::Found(t) if t["state"] == "live" => Terminal::Live { created_ms: hc::created_ms(&t), status: hc::status_word(&t).unwrap_or_default() },
+            hc::Lookup::Found(_) => Terminal::Ended,
+            hc::Lookup::Gone => Terminal::Gone,
+            hc::Lookup::Unreachable(_) => Terminal::Unknown,
+        }
+    }
+
+    /// Still the terminal `created_ms` says (when both say).
+    fn same(&self, created_ms: Option<u64>) -> bool {
+        match self {
+            Terminal::Live { created_ms: now, .. } => !matches!((created_ms, *now), (Some(a), Some(b)) if a != b),
+            Terminal::Unknown => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Asks {
     inner: Arc<Mutex<Inner>>,
+    /// `questions.json`, when the cards are kept (the daemon's; tests keep none).
+    store: Option<Arc<(std::path::PathBuf, Mutex<()>)>>,
     shared: Shared,
     hub: Arc<Hub>,
     /// Tells the user (address, one sentence): the radar's alert, held for other spaces as usual.
@@ -158,9 +241,136 @@ impl Asks {
                 eprintln!("[questions] the brain can't take it: {e:#}");
             }
         });
-        let me = Asks { inner: Arc::new(Mutex::new(Inner::default())), shared, hub, notify: Arc::new(std::sync::OnceLock::new()), brain };
+        let me = Asks { inner: Arc::new(Mutex::new(Inner::default())), store: None, shared, hub, notify: Arc::new(std::sync::OnceLock::new()), brain };
         me.set_policy(policy);
         me
+    }
+
+    /// Keeps the cards in `path` from now on (`restore` reads them back).
+    pub fn stored_at(mut self, path: std::path::PathBuf) -> Asks {
+        self.store = Some(Arc::new((path, Mutex::new(()))));
+        self
+    }
+
+    pub fn path() -> std::path::PathBuf {
+        crate::config::state_dir().join("questions.json")
+    }
+
+    /// Writes what a restart needs (every change to the cards ends here).
+    fn save(&self) {
+        let Some(store) = &self.store else { return };
+        let _one = store.1.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = {
+            let i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            Saved {
+                sets: i.sets.iter().map(|s| SavedSet { set: s.clone(), created_ms: s.created_ms }).collect(),
+                dismissed: i.dismissed.clone(),
+                replies: i.replies.clone(),
+                noted: i.noted.clone(),
+            }
+        };
+        if let Err(e) = saved.write(&store.0) {
+            eprintln!("[questions] can't keep the cards in {}: {e:#}", store.0.display());
+        }
+    }
+
+    /// At start, before the radar's first look: the cards the last run left,
+    /// settled against Herdr. A set whose session still shows it on the same
+    /// terminal comes back as it was (decision, recommendations, dismissal),
+    /// so the brain isn't told again nor the user asked again; the radar's
+    /// first read then keeps it, or replaces it when it reads differently.
+    /// The rest is over: dropped quietly. A waiting reply whose session is
+    /// still there waits again; otherwise the user hears it didn't go in.
+    pub fn restore(&self) {
+        let Some(store) = &self.store else { return };
+        let saved = Saved::load(&store.0);
+        if saved.sets.is_empty() && saved.replies.is_empty() && saved.dismissed.is_empty() {
+            return;
+        }
+        let mut looked: HashMap<String, Terminal> = HashMap::new();
+        let mut look = |a: &str| looked.entry(a.to_string()).or_insert_with(|| Terminal::of(a)).clone();
+        self.restore_from(saved, &mut look, crate::history::now_ms());
+    }
+
+    fn restore_from(&self, saved: Saved, look: &mut dyn FnMut(&str) -> Terminal, now_ms: u64) {
+        let mut kept: Vec<QuestionSet> = vec![];
+        let mut over: Vec<QuestionSet> = vec![];
+        for s in saved.sets {
+            let mut set = s.set;
+            set.created_ms = s.created_ms;
+            set.state = card::SetState::from_wire(&set.status, set.decision.as_deref(), set.error.as_deref());
+            card::sync(&mut set);
+            let t = look(&set.session);
+            let why = match &t {
+                _ if !t.same(set.created_ms) => Some(CloseWhy::SessionGone),
+                Terminal::Live { status, .. } if set.kind != "text" && status != "blocked" => Some(over_why(&set, false)),
+                Terminal::Live { status, .. } if set.kind == "text" && (status == "working" || status.is_empty()) => Some(over_why(&set, false)),
+                _ => None,
+            };
+            match why {
+                Some(why) => {
+                    let _ = card::apply(&mut set, &Ev::Close(why));
+                    over.push(set);
+                }
+                None => kept.push(set),
+            }
+        }
+        let mut dropped: Vec<(String, Reply)> = vec![];
+        let mut replies = HashMap::new();
+        for (a, r) in saved.replies {
+            if look(&a).same(r.created_ms) && r.stale(now_ms, None, "").is_none() {
+                replies.insert(a, r);
+            } else {
+                dropped.push((a, r));
+            }
+        }
+        let dismissed: Vec<(String, String)> =
+            saved.dismissed.into_iter().filter(|(a, _)| matches!(look(a), Terminal::Live { ref status, .. } if status == "blocked") || look(a) == Terminal::Unknown).collect();
+        eprintln!("[questions] start: {} card(s) back, {} over, {} reply(ies) waiting, {} dropped", kept.len(), over.len(), replies.len(), dropped.len());
+        {
+            let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            i.sets = kept.clone();
+            i.replies = replies;
+            i.dismissed = dismissed;
+            i.noted = saved.noted;
+            for o in over {
+                i.noted.retain(|n| *n != o.id);
+                i.remember(o);
+            }
+        }
+        self.publish();
+        for (a, r) in dropped {
+            let who = if r.name.is_empty() { a.clone() } else { r.name.clone() };
+            eprintln!("[questions] {a}: the waiting reply to {} is dropped at start", r.set);
+            self.tell(&a, &format!("Your reply to {who} didn't go in: the tower restarted and {who} isn't there as it was."));
+        }
+        for set in kept.into_iter().filter(|s| s.kind != "text" && s.state.phase == Phase::Open) {
+            match set.state.decision {
+                // The brain was told, and may never answer now: the usual wait, from when it was read.
+                Decision::Deciding => {
+                    let wait = 40_000u64.saturating_sub(now_ms.saturating_sub(set.at_ms)).max(5_000);
+                    let (me, id) = (self.clone(), set.id.clone());
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(wait));
+                        if me.get(&id).is_some_and(|s| s.state == card::SetState::default()) {
+                            me.escalate(&id, "no recommendation came in time");
+                        }
+                    });
+                }
+                // The tower was to answer it, and stopped first: not typed after a
+                // restart without a look; it goes to the user.
+                Decision::Auto => {
+                    let (me, id) = (self.clone(), set.id.clone());
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        if me.get(&id).is_some_and(|s| s.state.phase == Phase::Open && s.state.decision == Decision::Auto) {
+                            me.escalate(&id, "the tower restarted before it could answer it");
+                        }
+                    });
+                }
+                Decision::Escalated => {}
+            }
+        }
     }
 
     pub fn set_notify(&self, f: impl Fn(&str, &str) + Send + Sync + 'static) {
@@ -199,6 +409,7 @@ impl Asks {
     }
 
     fn publish(&self) {
+        self.save();
         let sets = self.list();
         let by_session: HashMap<String, String> = sets.iter().map(|s| (s.session.clone(), s.id.clone())).collect();
         self.shared.update(|st| {
@@ -245,7 +456,7 @@ impl Asks {
             if status == "working" || gone {
                 self.close_where(address, |s| s.kind == "text", |s| over_why(s, gone), true);
             }
-            if let Some(r) = self.due_reply(address, status, turn_of(t), crate::history::now_ms()) {
+            if let Some(r) = self.due_reply(address, status, turn_of(t), hc::created_ms(t), crate::history::now_ms()) {
                 match type_into(address, &r.text) {
                     Ok(()) => eprintln!("[questions] {address}: the waiting reply to {} went in", r.set),
                     Err(e) => eprintln!("[questions] {address}: the waiting reply to {} didn't go in: {e:#}", r.set),
@@ -293,27 +504,44 @@ impl Asks {
     /// A waiting reply's session has `status` now: stopping for a dialog
     /// isn't the turn's end the reply waits for (its count goes up by one).
     fn reply_sees(&self, address: &str, status: &str) {
-        if let Some(r) = self.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.get_mut(address) {
-            if status == "blocked" && r.last != "blocked" {
-                r.turn = r.turn.map(|n| n + 1);
+        let changed = match self.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.get_mut(address) {
+            Some(r) if r.last != status => {
+                if status == "blocked" && r.last != "blocked" {
+                    r.turn = r.turn.map(|n| n + 1);
+                }
+                r.last = status.to_string();
+                true
             }
-            r.last = status.to_string();
+            _ => false,
+        };
+        if changed {
+            self.save();
         }
     }
 
     /// A reply waiting for `address`, taken when it may go in now (`status`
-    /// idle or done). Dropped (and logged) when the session is gone, it is
-    /// too old, or the session moved on without it.
-    fn due_reply(&self, address: &str, status: &str, turn: Option<u64>, now_ms: u64) -> Option<Reply> {
-        let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let r = i.replies.get(address)?;
-        let why = if status.is_empty() { Some("the session is gone") } else { r.stale(now_ms, turn, status) };
-        if let Some(why) = why {
-            let r = i.replies.remove(address)?;
+    /// idle or done). Dropped when the session is gone (or another terminal
+    /// is at its address now), it is too old, or the session moved on
+    /// without it: logged, and the user, who was told it would go in, hears it didn't.
+    fn due_reply(&self, address: &str, status: &str, turn: Option<u64>, created_ms: Option<u64>, now_ms: u64) -> Option<Reply> {
+        let (taken, dropped) = {
+            let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let r = i.replies.get(address)?;
+            let other = matches!((r.created_ms, created_ms), (Some(a), Some(b)) if a != b);
+            let why = if status.is_empty() || other { Some("the session is gone") } else { r.stale(now_ms, turn, status) };
+            match why {
+                Some(why) => (None, i.replies.remove(address).map(|r| (r, why))),
+                None if matches!(status, "idle" | "done") => (i.replies.remove(address), None),
+                None => return None,
+            }
+        };
+        self.save();
+        if let Some((r, why)) = dropped {
             eprintln!("[questions] {address}: the waiting reply to {} is dropped: {why}", r.set);
-            return None;
+            let who = if r.name.is_empty() { address.to_string() } else { r.name.clone() };
+            self.tell(address, &format!("Your reply to {who} didn't go in: {why}"));
         }
-        if matches!(status, "idle" | "done") { i.replies.remove(address) } else { None }
+        taken
     }
 
     /// Reads a session's dialog again (after an answer, or a new status line).
@@ -367,8 +595,19 @@ impl Asks {
             if i.dismissed.iter().any(|(a, id)| *a == set.session && *id == set.id) {
                 return set;
             }
-            let old = i.sets.iter().position(|s| s.session == set.session && (s.kind == "text") == (set.kind == "text"));
+            let mut old = i.sets.iter().position(|s| s.session == set.session && (s.kind == "text") == (set.kind == "text"));
             let mut closed = None;
+            // Another terminal at the address now: the old card went with its session.
+            if let Some(k) = old
+                && matches!((i.sets[k].created_ms, set.created_ms), (Some(a), Some(b)) if a != b)
+            {
+                let mut o = i.sets.remove(k);
+                let _ = card::apply(&mut o, &Ev::Close(CloseWhy::SessionGone));
+                i.noted.retain(|n| *n != o.id);
+                i.remember(o.clone());
+                closed = Some(o);
+                old = None;
+            }
             let new = match old {
                 Some(k) if i.sets[k].id == set.id => {
                     // The same questions: keep what came for them, and where it stands.
@@ -824,8 +1063,16 @@ impl Asks {
             });
         }
         if queued {
-            let turn = hc::get(&set.session).as_ref().and_then(turn_of);
-            let r = Reply { set: set.id.clone(), text: text.clone(), at_ms: crate::history::now_ms(), turn, last: status.clone() };
+            let t = hc::get(&set.session);
+            let r = Reply {
+                set: set.id.clone(),
+                text: text.clone(),
+                at_ms: crate::history::now_ms(),
+                turn: t.as_ref().and_then(turn_of),
+                last: status.clone(),
+                created_ms: t.as_ref().and_then(hc::created_ms).or(set.created_ms),
+                name: set.name.clone(),
+            };
             self.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.insert(set.session.clone(), r);
         } else {
             type_into(&set.session, &text)?;
@@ -1268,6 +1515,135 @@ mod tests {
     }
 
     #[test]
+    fn another_terminal_at_the_address_is_another_card() {
+        let (a, t) = asks();
+        let mut set = perm("approve Bash: touch /tmp/qfix-perm-test");
+        set.created_ms = Some(100);
+        a.upsert(set.clone());
+        a.start_answering(&set.id, Answerer::User).unwrap();
+        a.transition(&set.id, &Ev::Submitted).unwrap();
+        // The same dialog (same id) in a new terminal at t37: new, not "answered".
+        let mut again = set.clone();
+        again.created_ms = Some(200);
+        let shown = a.upsert(again);
+        assert_eq!((shown.status.as_str(), shown.created_ms), ("open", Some(200)));
+        assert_eq!(told(&t, 2).len(), 2, "told to the brain as the new question it is");
+    }
+
+    struct Tmp(std::path::PathBuf);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn tmp(tag: &str) -> Tmp {
+        let d = std::env::temp_dir().join(format!("tower-asks-{tag}-{}-{}", std::process::id(), crate::history::now_ms()));
+        std::fs::create_dir_all(&d).unwrap();
+        Tmp(d)
+    }
+    fn stored(path: &std::path::Path) -> (Asks, Arc<Mutex<Vec<String>>>) {
+        let (a, t) = asks();
+        (a.stored_at(path.to_path_buf()), t)
+    }
+
+    #[test]
+    fn a_restart_picks_the_cards_up_where_they_were() {
+        let dir = tmp("restart");
+        let path = dir.0.join("questions.json");
+        let now = crate::history::now_ms();
+        let live = |c: u64, st: &str| Terminal::Live { created_ms: Some(c), status: st.into() };
+        let with = |mut s: QuestionSet, session: &str| {
+            s.session = session.into();
+            s.created_ms = Some(1);
+            s.at_ms = now;
+            s
+        };
+        {
+            let (a, t) = stored(&path);
+            // t37: told to the brain, decided: the user's.
+            let p = with(perm("approve Bash: touch /tmp/qfix-perm-test"), "t37");
+            a.upsert(p.clone());
+            let recs = json!([{"tab": 0, "options": [{"label": "Yes", "why": "", "choice": 0}]}]);
+            a.recommend(&p.id, &recs, Some("escalate"), "the user decides", false).unwrap();
+            // t38: dismissed while it is up.
+            let d = with(perm("approve Bash: rm -rf /tmp/qfix-x"), "t38");
+            a.upsert(d.clone());
+            a.dismiss(&d.id).unwrap();
+            // t39: a reply waiting for the session to stop; t40: one for a terminal that will be another.
+            for (addr, created) in [("t39", 1), ("t40", 1)] {
+                a.inner.lock().unwrap().replies.insert(
+                    addr.into(),
+                    Reply { set: format!("q-{addr}"), text: "yes".into(), at_ms: now, turn: Some(3), last: "working".into(), created_ms: Some(created), name: format!("{addr} name") },
+                );
+            }
+            // t41: open when the tower stopped, idle by its start (answered in the terminal meanwhile).
+            a.upsert(with(perm("approve Bash: ls /tmp/qfix"), "t41"));
+            // t42: its session ended meanwhile; t43: keys going in when the tower stopped.
+            a.upsert(with(perm("approve Bash: ls /tmp/qfix-2"), "t42"));
+            let typing = with(perm("approve Bash: ls /tmp/qfix-3"), "t43");
+            a.upsert(typing.clone());
+            a.start_answering(&typing.id, Answerer::User).unwrap();
+            assert_eq!(told(&t, 5).len(), 5);
+        }
+        let (b, t) = stored(&path);
+        let heard = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let h = heard.clone();
+        b.set_notify(move |a, text| h.lock().unwrap().push((a.to_string(), text.to_string())));
+        let mut look = |a: &str| match a {
+            "t37" | "t38" | "t43" => live(1, "blocked"),
+            "t39" => live(1, "working"),
+            "t40" => live(2, "idle"),
+            "t41" => live(1, "idle"),
+            _ => Terminal::Gone,
+        };
+        b.restore_from(Saved::load(&path), &mut look, now);
+        let cards: Vec<(String, String, Option<String>)> = b.list().iter().map(|s| (s.session.clone(), s.status.clone(), s.decision.clone())).collect();
+        assert_eq!(
+            cards,
+            [("t37".into(), "open".into(), Some("escalate".into())), ("t43".into(), "failed".into(), None)],
+            "the user's card comes back decided; the one being typed failed part-way"
+        );
+        let p = b.list()[0].clone();
+        assert_eq!(p.reason, "the user decides");
+        assert!(p.recommendations.is_some());
+        // The radar's first look reads the same dialogs again: nothing is told or asked twice.
+        b.upsert(with(perm("approve Bash: touch /tmp/qfix-perm-test"), "t37"));
+        b.upsert(with(perm("approve Bash: rm -rf /tmp/qfix-x"), "t38"));
+        assert_eq!(b.list().len(), 2, "the dismissed dialog stays away");
+        assert!(told(&t, 1).is_empty(), "the brain isn't told again");
+        // Over while the tower was down.
+        let over = |addr: &str| b.inner.lock().unwrap().past.iter().find(|s| s.session == addr).map(|s| s.state.phase.clone());
+        assert_eq!(over("t41"), Some(Phase::Closed { why: CloseWhy::Unblocked }));
+        assert_eq!(over("t42"), Some(Phase::Closed { why: CloseWhy::SessionGone }));
+        let replies: Vec<String> = b.inner.lock().unwrap().replies.keys().cloned().collect();
+        assert_eq!(replies, ["t39"], "the reply for a terminal that is another one now is dropped");
+        let heard = heard.lock().unwrap().clone();
+        assert_eq!(heard.len(), 1, "{heard:?}");
+        assert_eq!(heard[0].0, "t40");
+        assert!(heard[0].1.starts_with("Your reply to t40 name didn't go in"), "the user was told it would go in: {heard:?}");
+        // Saved again as it is now: a second restart sees the same.
+        let again = Saved::load(&path);
+        assert_eq!(again.sets.len(), 2);
+        assert_eq!(again.replies.len(), 1);
+    }
+
+    #[test]
+    fn a_broken_or_old_file_never_stops_the_start() {
+        let dir = tmp("broken");
+        let path = dir.0.join("questions.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let (a, _) = stored(&path);
+        a.restore_from(Saved::load(&path), &mut |_| Terminal::Unknown, 1);
+        assert!(a.list().is_empty());
+        assert!(std::fs::read_dir(&dir.0).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().contains("bad-")), "kept aside");
+        // Words this tower doesn't know, and fields it doesn't have: loaded as open, undecided.
+        std::fs::write(&path, r#"{"sets": [{"id": "q1", "session": "t9", "kind": "claude-permission", "status": "pondering", "decision": "later", "future": 1}], "extra": true}"#).unwrap();
+        a.restore_from(Saved::load(&path), &mut |_| Terminal::Live { created_ms: None, status: "blocked".into() }, 1);
+        let s = a.get("q1").unwrap();
+        assert_eq!((s.status.as_str(), s.decision.as_deref()), ("open", None));
+    }
+
+    #[test]
     fn answers_for_the_user_are_checked_again_on_the_screen() {
         let (a, _) = asks();
         let set = perm("approve Bash: touch /tmp/qfix-perm-test");
@@ -1283,7 +1659,7 @@ mod tests {
 
     #[test]
     fn waiting_replies_expire() {
-        let r = Reply { set: "q1".into(), text: "yes".into(), at_ms: 1_000, turn: Some(4), last: "working".into() };
+        let r = Reply { set: "q1".into(), text: "yes".into(), at_ms: 1_000, turn: Some(4), last: "working".into(), created_ms: None, name: String::new() };
         assert_eq!(r.stale(2_000, Some(4), "working"), None, "still on the turn it waits for");
         assert_eq!(r.stale(2_000, Some(5), "idle"), None, "that turn ended: it goes in");
         assert!(r.stale(2_000, Some(5), "working").is_some(), "stopped and started again on its own");
@@ -1293,21 +1669,21 @@ mod tests {
 
         let (a, _) = asks();
         a.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.insert("t5".into(), r.clone());
-        assert_eq!(a.due_reply("t5", "working", Some(4), 2_000), None);
-        assert_eq!(a.due_reply("t5", "idle", Some(5), 2_000), Some(r.clone()));
-        assert_eq!(a.due_reply("t5", "idle", Some(5), 2_000), None, "taken once");
+        assert_eq!(a.due_reply("t5", "working", Some(4), None, 2_000), None);
+        assert_eq!(a.due_reply("t5", "idle", Some(5), None, 2_000), Some(r.clone()));
+        assert_eq!(a.due_reply("t5", "idle", Some(5), None, 2_000), None, "taken once");
         // A dialog on the way (the count goes up for it): still the turn it waits for.
         a.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.insert("t5".into(), r.clone());
         for st in ["blocked", "blocked", "working"] {
             a.reply_sees("t5", st);
         }
-        assert_eq!(a.due_reply("t5", "working", Some(5), 2_000), None);
-        assert_eq!(a.due_reply("t5", "idle", Some(6), 2_000).map(|r| r.set), Some("q1".into()), "it goes in after the dialog");
+        assert_eq!(a.due_reply("t5", "working", Some(5), None, 2_000), None);
+        assert_eq!(a.due_reply("t5", "idle", Some(6), None, 2_000).map(|r| r.set), Some("q1".into()), "it goes in after the dialog");
         a.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.insert("t5".into(), r.clone());
         a.seen("t5", &Value::Null, "");
         assert!(a.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.is_empty(), "the session is gone: dropped");
         a.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.insert("t5".into(), r);
-        assert_eq!(a.due_reply("t5", "done", Some(5), 1_000 + REPLY_TTL_MS + 1), None);
+        assert_eq!(a.due_reply("t5", "done", Some(5), None, 1_000 + REPLY_TTL_MS + 1), None);
         assert!(a.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.is_empty(), "too old: dropped");
     }
 

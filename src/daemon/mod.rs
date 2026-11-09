@@ -55,7 +55,7 @@ pub fn run() -> Result<()> {
     let model_name = cfg.whisper_model.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let shared = Shared::new(State::new(&cfg.mode, &cfg.voice, &model_name));
     let hub = std::sync::Arc::new(lan::hub::Hub::default());
-    let asks = asks::Asks::new(shared.clone(), hub.clone(), &cfg.question_policy);
+    let asks = asks::Asks::new(shared.clone(), hub.clone(), &cfg.question_policy).stored_at(asks::Asks::path());
     eprintln!("[tower] loading Kokoro ({}) ...", cfg.voice);
     let mouth = tts::start(
         tts::Settings {
