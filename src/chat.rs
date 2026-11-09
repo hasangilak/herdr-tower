@@ -93,14 +93,26 @@ fn event_text(e: &Entry) -> String {
         ("answered", _) => format!("{who}: {}", e.text),
         ("behavior", _) => e.text.clone(),
         ("summary", _) => format!("{who}: {}", e.text),
-        _ => {
-            let mut t = e.text.clone();
-            for cut in [" Read its screen and tell me what happened, briefly.", " Tell me briefly.", " Ask me before you answer it."] {
-                t = t.replace(cut, "");
-            }
-            t
-        }
+        _ => report_text(&e.text),
     }
+}
+
+/// A report for the brain as the chat shows it: the news, without what it
+/// tells the brain to do (read the screen, how to say it, that its space is
+/// out of focus).
+pub fn report_text(text: &str) -> String {
+    let mut t = text.split(" This is from the space ").next().unwrap_or("").to_string();
+    for cut in [
+        " Read its screen and tell me what happened, briefly.",
+        " Tell me what happened, briefly (read its screen only if that isn't enough).",
+        " Tell the user plainly what they need to do (with the PR or link if there is one).",
+        " Tell the user in one short line only if there's something more for them to do.",
+        " Tell me briefly.",
+        " Ask me before you answer it.",
+    ] {
+        t = t.replace(cut, "");
+    }
+    t
 }
 
 /// The thread, oldest first. `root`: the attachments folder (for picture
@@ -277,6 +289,16 @@ mod tests {
         let t2 = thread_with(&lines, Path::new("/a"), &prs);
         assert_eq!((t2.len(), t2[1]["id"].as_str(), t2[1]["pr"]["state"].as_str()), (2, Some("h2"), Some("merged")));
         assert_eq!(t2[1]["pr"]["merge"]["can"], false);
+    }
+
+    #[test]
+    fn reports_show_the_news_not_the_brains_instructions() {
+        let merged = "t67 (rel): the user merged PR #42 into main (o/app) from the Mac. I queued it \"The user merged PR #42 (o/app) into main.\", so it carries on from there. Tell the user in one short line only if there's something more for them to do. This is from the space Space B, not the one in focus (Space A), but it's work the user asked for: tell them in one short line that starts with \"In Space B\".";
+        assert_eq!(
+            report_text(merged),
+            "t67 (rel): the user merged PR #42 into main (o/app) from the Mac. I queued it \"The user merged PR #42 (o/app) into main.\", so it carries on from there."
+        );
+        assert_eq!(report_text("t3 (api) is now done. You had asked it: x. Read its screen and tell me what happened, briefly."), "t3 (api) is now done. You had asked it: x.");
     }
 
     #[test]

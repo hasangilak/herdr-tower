@@ -1594,11 +1594,7 @@ fn working_line(w: &crate::activity::Work, now: u64, g: &Glass) -> AnyElement {
 
 /// A session's report without the instructions the tower gave the brain with it.
 fn report(text: &str) -> String {
-    let mut t = text.to_string();
-    for cut in [" Read its screen and tell me what happened, briefly.", " Tell me briefly.", " Ask me before you answer it."] {
-        t = t.replace(cut, "");
-    }
-    t
+    crate::chat::report_text(text)
 }
 
 /// One choice in a segmented control on the glass.
