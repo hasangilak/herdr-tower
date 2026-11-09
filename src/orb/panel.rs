@@ -754,8 +754,65 @@ impl Render for Panel {
 }
 
 impl Panel {
+    /// Held news, a chip per space (the ones that matter first: work you
+    /// asked for, someone needing you, marked amber); a click opens it.
+    fn held_row(&mut self, spaces: &crate::spaces::Spaces, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let g = glass();
+        let list = crate::spaces::held(&self.entries, spaces);
+        if list.is_empty() {
+            return None;
+        }
+        let more = list.len().saturating_sub(3);
+        let chips = list.into_iter().take(3).enumerate().map(|(i, h)| {
+            let name = h.space.clone();
+            let tip = match (h.asked, h.needs_you) {
+                (0, 0) => String::new(),
+                (a, 0) => format!(" · {a} asked"),
+                (0, n) => format!(" · {n} need you"),
+                (a, n) => format!(" · {a} asked · {n} need you"),
+            };
+            h_flex()
+                .id(SharedString::from(format!("held-{i}")))
+                .flex_none()
+                .gap(px(5.0))
+                .items_center()
+                .px_2()
+                .py(px(2.0))
+                .rounded_full()
+                .border_1()
+                .border_color(if h.matters() { rgba(0xffcf7066).into() } else { g.edge })
+                .bg(rgba(0xffffff14))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgba(0xffffff29)))
+                .text_xs()
+                .when(h.matters(), |el| el.child(div().size(px(6.0)).rounded_full().bg(rgb(AMBER))))
+                .child(format!("{} {}{tip}", h.space, h.total))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.phone_leave();
+                    this.view = View::Spaces;
+                    this.open(&name, cx);
+                }))
+        });
+        Some(
+            h_flex()
+                .pt_1()
+                .gap(px(6.0))
+                .items_center()
+                .overflow_x_hidden()
+                .text_color(g.muted)
+                .child(div().flex_none().text_xs().text_color(g.faint).child("Held"))
+                .children(chips)
+                .when(more > 0, |el| el.child(div().flex_none().text_xs().text_color(g.faint).child(format!("+{more}"))))
+                .into_any_element(),
+        )
+    }
+
     fn header(&mut self, now: AnyElement, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let g = glass();
+        let held_row = {
+            let spaces = self.tower.read(cx).spaces.clone();
+            self.held_row(&spaces, cx)
+        };
         let t = self.tower.read(cx);
         let phase = if t.starting.is_some() { "starting".to_string() } else { t.phase().to_string() };
         // What the tower is doing right now, and how many sessions are at work.
@@ -846,6 +903,8 @@ impl Panel {
                             .child(div().size(px(7.0)).flex_none().rounded_full().bg(dot))
                             .child(div().min_w_0().truncate().child(line)),
                     )
+                    // What other spaces hold for you, so it can't be forgotten.
+                    .children(held_row)
                     // The sessions at work right now, at a glance.
                     .child(div().pt_1().child(now)),
             )

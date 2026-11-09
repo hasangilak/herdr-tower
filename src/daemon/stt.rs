@@ -319,14 +319,21 @@ pub fn deliver_from(shared: &Shared, mouth: &Mouth, text: &str, ack: Option<Dura
     }
 }
 
-/// One line: every agent the radar sees and its status.
+/// One line: every agent the radar sees and its status; then what spaces
+/// out of focus hold that the user would want and hasn't been told.
 fn radar(shared: &Shared) -> String {
     let agents = shared.with(|s| s.agents.clone());
-    if agents.is_empty() {
-        return "[radar] no agents running".into();
+    let line = if agents.is_empty() {
+        "[radar] no agents running".to_string()
+    } else {
+        let list: Vec<String> = agents.iter().map(radar_entry).collect();
+        format!("[radar] {}", list.join("; "))
+    };
+    let spaces = crate::spaces::load();
+    match crate::spaces::radar_note(&crate::spaces::held(&crate::history::load(), &spaces), spaces.focus.as_deref()) {
+        Some(note) => format!("{line} {note}"),
+        None => line,
     }
-    let list: Vec<String> = agents.iter().map(radar_entry).collect();
-    format!("[radar] {}", list.join("; "))
 }
 
 /// `t5 fix login [eyzflow]: working, 2 queued`: who, in which project, doing what.

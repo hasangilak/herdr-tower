@@ -166,6 +166,68 @@ pub fn unread<'a>(entries: &'a [Entry], s: &Spaces) -> BTreeMap<String, Vec<&'a 
     out
 }
 
+/// What one space holds for the user, unread: in all, reports on work they
+/// asked for (`News::Asked`: a watch's or a job's), and someone needing them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Held {
+    pub space: String,
+    pub total: usize,
+    pub asked: usize,
+    pub needs_you: usize,
+}
+
+impl Held {
+    pub fn of(space: &str, items: &[&Entry]) -> Held {
+        let news = |e: &Entry| News::of(&e.kind, e.status.as_deref().unwrap_or(""));
+        Held {
+            space: space.to_string(),
+            total: items.len(),
+            asked: items.iter().filter(|e| news(e) == News::Asked).count(),
+            needs_you: items.iter().filter(|e| e.status.as_deref() == Some("blocked")).count(),
+        }
+    }
+
+    /// Worth telling: work the user asked for, or someone needing them.
+    pub fn matters(&self) -> bool {
+        self.asked > 0 || self.needs_you > 0
+    }
+}
+
+/// Every space's unread held news, the ones that matter first, then the most.
+pub fn held(entries: &[Entry], s: &Spaces) -> Vec<Held> {
+    let mut out: Vec<Held> = unread(entries, s).iter().map(|(space, items)| Held::of(space, items)).collect();
+    out.sort_by_key(|h| (!h.matters(), std::cmp::Reverse(h.needs_you), std::cmp::Reverse(h.asked), std::cmp::Reverse(h.total)));
+    out
+}
+
+/// For the brain's radar line: spaces out of focus holding news the user
+/// would want (work they asked for, someone needing them), not told yet.
+pub fn radar_note(held: &[Held], focus: Option<&str>) -> Option<String> {
+    let parts: Vec<String> = held
+        .iter()
+        .filter(|h| h.matters() && Some(h.space.as_str()) != focus)
+        .take(4)
+        .map(|h| {
+            let mut what = vec![];
+            if h.asked > 0 {
+                what.push(format!("{} on work the user asked for", h.asked));
+            }
+            if h.needs_you > 0 {
+                what.push(format!("{} needing them", h.needs_you));
+            }
+            format!("{} {} held ({})", h.space, h.total, what.join(", "))
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let focus = focus.map(|f| format!(" (focus: {f})")).unwrap_or_default();
+    Some(format!(
+        "[held]{focus} not told yet: {}. If the request is about one of these spaces, or the user asks what's new, `tower digest --space <space>` reads it.",
+        parts.join("; ")
+    ))
+}
+
 /// How pressing a space's news is: someone needs the user (0), something
 /// went wrong (1), work finished (2), anything else (3).
 fn urgency(items: &[&Entry]) -> u8 {
@@ -402,6 +464,9 @@ fn rows() -> (Option<String>, Vec<Value>) {
                 "focus": s.focus.as_ref() == Some(n),
                 "agenda": s.agendas.get(n),
                 "unread": unread.get(n).map(|v| v.len()).unwrap_or(0),
+                // Of those: reports on work the user asked for, and someone needing them.
+                "unread_asked": unread.get(n).map(|v| Held::of(n, v).asked).unwrap_or(0),
+                "unread_needs_you": unread.get(n).map(|v| Held::of(n, v).needs_you).unwrap_or(0),
                 "running_jobs": running,
                 "sessions": sessions
                     .iter()
@@ -600,6 +665,32 @@ fn picks_a_space_by_part_of_its_name() {
         // The brain is told where it's from and to name it.
         let note = out_of_focus("b2c-tickets", "B2C support");
         assert!(note.contains("b2c-tickets") && note.contains("B2C support") && note.contains("\"In b2c-tickets\""), "{note}");
+    }
+
+    #[test]
+    fn held_news_is_counted_by_what_it_is_and_named_to_the_brain() {
+        let mut held_watch = e(10, "b2c-tickets", Some("done"), true);
+        held_watch.kind = "watch".into();
+        let mut queue = e(11, "b2c-tickets", Some("news"), true);
+        queue.kind = "queue".into();
+        let mut blocked = e(12, "eyz-mediaroom-serverless", Some("blocked"), true);
+        blocked.kind = "alert".into();
+        let mut chatter = e(13, "M5 Pro", Some("done"), true);
+        chatter.kind = "alert".into();
+        let entries = vec![held_watch, queue, blocked, chatter];
+        let s = Spaces { focus: Some("B2C support".into()), ..Default::default() };
+        let h = held(&entries, &s);
+        // What matters first: someone needing the user, then asked-for work.
+        assert_eq!(h[0], Held { space: "eyz-mediaroom-serverless".into(), total: 1, asked: 0, needs_you: 1 });
+        assert_eq!(h[1], Held { space: "b2c-tickets".into(), total: 2, asked: 1, needs_you: 0 });
+        assert_eq!(h[2], Held { space: "M5 Pro".into(), total: 1, asked: 0, needs_you: 0 });
+        let note = radar_note(&h, s.focus.as_deref()).unwrap();
+        assert!(note.starts_with("[held] (focus: B2C support) not told yet: "), "{note}");
+        assert!(note.contains("eyz-mediaroom-serverless 1 held (1 needing them)"), "{note}");
+        assert!(note.contains("b2c-tickets 2 held (1 on work the user asked for)"), "{note}");
+        assert!(!note.contains("M5 Pro"), "chatter alone isn't named: {note}");
+        // Only chatter held: nothing to say.
+        assert_eq!(radar_note(&h[2..], s.focus.as_deref()), None);
     }
 
     #[test]
