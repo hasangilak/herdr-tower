@@ -65,6 +65,7 @@ pub fn run() -> Result<()> {
             cue: cfg.alert_cue,
             alert_wait: Duration::from_millis(cfg.alert_wait_ms),
             alert_max_age: Duration::from_secs(cfg.alert_max_age_secs),
+            on_mac: cfg.voice_on_mac,
         },
         shared.clone(),
         hub.clone(),
@@ -221,6 +222,22 @@ impl Daemon {
                 };
                 if let Err(e) = done {
                     return Response::err(format!("{e:#}"));
+                }
+            }
+            Request::MacVoice { action } => {
+                let on = match action.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    "toggle" => !self.mouth.on_mac(),
+                    "status" | "" => self.mouth.on_mac(),
+                    _ => return Response::err("mac-voice is on, off, toggle or status"),
+                };
+                if on != self.mouth.on_mac() {
+                    // Kept first: what the tower says and what it keeps agree.
+                    if let Err(e) = crate::phone::set_voice_on_mac(on) {
+                        return Response::err(format!("keeping it in config.toml: {e:#}"));
+                    }
+                    self.mouth.set_on_mac(on);
                 }
             }
             Request::Talk { action } => self.ears.control(mic::Ctl::Talk(action)),

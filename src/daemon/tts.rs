@@ -91,6 +91,8 @@ pub struct Mouth {
     mute_lock: Arc<Mutex<()>>,
     /// The file that keeps the mute (see `mute_file`).
     mute_path: PathBuf,
+    /// Everything plays here, never on a phone (`voice_on_mac`).
+    on_mac: Arc<AtomicBool>,
     shared: Shared,
 }
 
@@ -134,6 +136,21 @@ fn save_mute(path: &Path, on: bool) -> Result<()> {
 impl Mouth {
     pub fn muted(&self) -> bool {
         self.muted.load(Ordering::SeqCst)
+    }
+
+    /// Whether everything said plays on this Mac.
+    pub fn on_mac(&self) -> bool {
+        self.on_mac.load(Ordering::SeqCst)
+    }
+
+    /// Plays everything on this Mac (`on`), or lets the phones have it as
+    /// they route it. From the next sound on: what a phone is playing ends
+    /// there. (Kept in config.toml by the caller.)
+    pub fn set_on_mac(&self, on: bool) {
+        if self.on_mac.swap(on, Ordering::SeqCst) != on {
+            eprintln!("[speech] {}", if on { "voice on this Mac: nothing goes to the phones" } else { "voice goes to the phones as they route it" });
+        }
+        self.shared.update(|s| s.voice_on_mac = on);
     }
 
     /// Mutes the tower (`on`) or lets it talk again. Muting stops what is
@@ -298,6 +315,7 @@ impl Mouth {
             muted: Arc::new(AtomicBool::new(muted)),
             mute_lock: Arc::new(Mutex::new(())),
             mute_path,
+            on_mac: Arc::new(AtomicBool::new(false)),
             shared,
         };
         (mouth, rx)
@@ -325,6 +343,8 @@ pub struct Settings {
     pub alert_wait: Duration,
     /// An alert older than this is dropped unsaid.
     pub alert_max_age: Duration,
+    /// Everything plays on this Mac, never on a phone (at start).
+    pub on_mac: bool,
 }
 
 /// Starts the speech thread. Kokoro loads (and on first use downloads,
@@ -368,8 +388,13 @@ pub fn start(settings: Settings, shared: Shared, hub: Arc<Hub>) -> Result<Mouth>
         muted: Arc::new(AtomicBool::new(muted)),
         mute_lock: Arc::new(Mutex::new(())),
         mute_path,
+        on_mac: Arc::new(AtomicBool::new(settings.on_mac)),
         shared: shared.clone(),
     };
+    shared.update(|s| s.voice_on_mac = settings.on_mac);
+    if settings.on_mac {
+        eprintln!("[speech] voice on this Mac: nothing goes to the phones");
+    }
     let speech = Speech {
         engine: Some(engine),
         q: Queue::new(settings.alert_max_age),
@@ -380,6 +405,7 @@ pub fn start(settings: Settings, shared: Shared, hub: Arc<Hub>) -> Result<Mouth>
         generation: mouth.generation.clone(),
         held: mouth.held.clone(),
         muted: mouth.muted.clone(),
+        on_mac: mouth.on_mac.clone(),
         shared,
         playing: VecDeque::new(),
         hub,
@@ -415,6 +441,8 @@ struct Speech {
     held: Arc<AtomicU8>,
     /// Muted (`tower mute`): what comes in is dropped unsaid.
     muted: Arc<AtomicBool>,
+    /// Everything plays here, never on a phone.
+    on_mac: Arc<AtomicBool>,
     shared: Shared,
     /// The kind of each sound in the player, oldest (playing) first.
     playing: VecDeque<Kind>,
@@ -743,7 +771,7 @@ impl Speech {
     }
 
     /// Plays a sound: here, or on the phone that is the voice (the Mac
-    /// stays silent). `text` is what it says; `label` what it is (`reply`,
+    /// stays silent); always here with the voice on this Mac. `text` is what it says; `label` what it is (`reply`,
     /// `alert`, `ack`, `cue`), for the phone. Nothing, while muted (a
     /// sentence made just before the mute).
     fn append(&mut self, kind: Kind, samples: Vec<f32>, text: &str, label: &str) {
@@ -751,9 +779,11 @@ impl Speech {
             self.q.clear();
             return;
         }
-        // A reply to what a phone sent: that phone only. Else a phone that is the voice, or here.
-        let to_phone = if kind == Kind::Reply { self.turn_phone.clone() } else { None };
-        if to_phone.is_some() || self.hub.voice() {
+        // The voice on this Mac: here, whatever the phones want. Else a reply
+        // to what a phone sent: that phone only. Else a phone that is the voice, or here.
+        let on_mac = self.on_mac.load(Ordering::SeqCst);
+        let to_phone = if kind == Kind::Reply && !on_mac { self.turn_phone.clone() } else { None };
+        if !on_mac && (to_phone.is_some() || self.hub.voice()) {
             let dur = Duration::from_secs_f32(samples.len() as f32 / RATE as f32);
             let start = self.routed.back().map(|(end, _)| *end).filter(|end| *end > Instant::now()).unwrap_or_else(Instant::now);
             self.hub.push_audio(label, text, &samples, RATE, to_phone.as_deref());
@@ -890,6 +920,7 @@ mod tests {
                 cue: true,
                 alert_wait: Duration::from_secs(10),
                 alert_max_age: Duration::from_secs(60),
+                on_mac: false,
             },
             acks: vec![("Got it.".into(), vec![0.0; 10])],
             player: mouth.player.clone(),
@@ -897,6 +928,7 @@ mod tests {
             generation: mouth.generation.clone(),
             held: mouth.held.clone(),
             muted: mouth.muted.clone(),
+            on_mac: mouth.on_mac.clone(),
             shared: mouth.shared.clone(),
             playing: VecDeque::new(),
             hub,
@@ -1016,6 +1048,49 @@ mod tests {
         // A sentence made before the mute, appended after it, doesn't stay.
         speech.unless_stopped(generation);
         assert_eq!(speech.player.len(), 0);
+    }
+
+    #[test]
+    fn the_voice_on_this_mac_keeps_everything_off_the_phones() {
+        let (mouth, mut speech, _rx) = pair();
+        // A phone is the voice, and the user just asked from another phone.
+        let (_, phone) = speech.hub.subscribe("d_voice", true, true);
+        let (_, asker) = speech.hub.subscribe("d_asker", false, true);
+        speech.turn_phone = Some("d_asker".into());
+        let samples = || vec![0.0; 240];
+
+        // Off (the default): as before, the phones have it.
+        assert!(!mouth.on_mac() && !mouth.shared.get().voice_on_mac);
+        speech.append(Kind::Alert, samples(), "News.", "alert");
+        speech.append(Kind::Reply, samples(), "Done.", "reply");
+        assert_eq!((speech.player.len(), speech.routed.len()), (0, 2));
+        assert_eq!(phone.try_recv().unwrap().data["text"], "News.");
+        assert_eq!(asker.try_recv().unwrap().data["text"], "Done.", "a phone hears its own reply");
+
+        // On: everything plays here, the phones get nothing.
+        mouth.set_on_mac(true);
+        assert!(mouth.on_mac() && mouth.shared.get().voice_on_mac);
+        speech.append(Kind::Alert, samples(), "More news.", "alert");
+        speech.append(Kind::Reply, samples(), "Done again.", "reply");
+        assert_eq!((speech.player.len(), speech.routed.len()), (2, 2));
+        assert!(phone.try_recv().is_err() && asker.try_recv().is_err());
+
+        // Off again: back to the phones.
+        mouth.set_on_mac(false);
+        speech.append(Kind::Alert, samples(), "Later news.", "alert");
+        assert_eq!(phone.try_recv().unwrap().data["text"], "Later news.");
+    }
+
+    #[test]
+    fn the_voice_on_this_mac_is_kept_in_config() {
+        let text = "voice = \"af_bella\"\n\n[lan]\nenabled = true\n";
+        let on = crate::phone::with_top_level(text, "voice_on_mac", "true");
+        let cfg: crate::config::Config = toml::from_str(&on).unwrap();
+        assert!(cfg.voice_on_mac && cfg.lan.enabled, "{on}");
+        let off = crate::phone::with_top_level(&on, "voice_on_mac", "false");
+        assert_eq!(off.matches("voice_on_mac").count(), 1, "{off}");
+        assert!(!toml::from_str::<crate::config::Config>(&off).unwrap().voice_on_mac);
+        assert!(!toml::from_str::<crate::config::Config>("").unwrap().voice_on_mac, "off unless set");
     }
 
     #[test]

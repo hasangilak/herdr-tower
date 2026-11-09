@@ -35,6 +35,8 @@ pub struct State {
     pub speaking: bool,
     /// The tower is muted (`tower mute`): it says nothing, here or on a phone.
     pub muted: bool,
+    /// Everything said plays on this Mac (`tower mac-voice`), never on a phone.
+    pub voice_on_mac: bool,
     /// What is being said is an alert, not a reply to the user.
     pub announcing: bool,
     /// The brain terminal's status (`idle`, `working`, `blocked`, ...) or `absent`.
@@ -116,6 +118,7 @@ impl State {
             transcribing: false,
             speaking: false,
             muted: false,
+            voice_on_mac: false,
             announcing: false,
             brain: "absent".into(),
             brain_app: String::new(),

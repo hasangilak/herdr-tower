@@ -256,12 +256,60 @@ impl Panel {
         .detach();
     }
 
+    /// Settings: where the tower's voice plays.
+    fn voice_items(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let g = glass();
+        let on = self.tower.read(cx).voice_on_mac();
+        let about = if on {
+            "Everything the tower says plays here, even while a phone is the voice or asked it something."
+        } else {
+            "Off: a phone that is the voice plays it, and a phone hears its own replies. This Mac otherwise."
+        };
+        // A switch: the track, and its knob at the end that is on.
+        let switch = div()
+            .flex_none()
+            .w(px(38.0))
+            .h(px(22.0))
+            .p(px(2.0))
+            .flex()
+            .items_center()
+            .rounded_full()
+            .when(on, |el| el.bg(rgb(super::NAVY)).justify_end())
+            .when(!on, |el| el.bg(rgba(0xffffff26)).justify_start())
+            .child(div().size(px(18.0)).rounded_full().bg(if on { rgb(super::PALE) } else { rgb(0xffffff) }));
+        vec![
+            div().pt_2().text_xs().font_weight(FontWeight::MEDIUM).text_color(g.faint).child("VOICE").into_any_element(),
+            h_flex()
+                .id("voice-on-mac")
+                .gap_3()
+                .items_center()
+                .px_3()
+                .py_2()
+                .rounded(px(14.0))
+                .cursor_pointer()
+                .when(on, |el| el.bg(rgb(super::PALE)).text_color(rgb(super::NAVY)))
+                .when(!on, |el| el.bg(g.bubble_tower).hover(|s| s.bg(rgba(0xffffff33))))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(px(2.0))
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Play voice on this Mac"))
+                        .child(div().text_xs().opacity(0.8).child(about)),
+                )
+                .child(switch)
+                .on_click(cx.listener(|_, _, _, cx| crate::orb::toggle_mac_voice(cx)))
+                .into_any_element(),
+        ]
+    }
+
     pub(super) fn phone_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let g = glass();
         let section = |t: &str| div().pt_2().text_xs().font_weight(FontWeight::MEDIUM).text_color(g.faint).child(t.to_uppercase());
         // Settings: how questions are handled, then the phone app.
         let mut items: Vec<AnyElement> = vec![self.behaviors_entry(cx)];
         items.extend(self.policy_items(cx));
+        items.extend(self.voice_items(cx));
         let busy = self.phone.busy;
         let Some(st) = self.phone.status.clone() else {
             items.push(div().pt_4().text_sm().text_color(g.muted).child("Looking…").into_any_element());

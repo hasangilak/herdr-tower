@@ -139,6 +139,10 @@ pub struct Config {
     pub narrate: bool,
     /// Speech volume, 0 to 1.
     pub volume: f32,
+    /// Play everything the tower says on this Mac, even while a phone is
+    /// the voice or a phone asked (`tower mac-voice`; off: the phones
+    /// play it, as they route it).
+    pub voice_on_mac: bool,
     /// A soft bell before an alert (an agent needs you, a watch reports
     /// back), so you know it isn't the answer to what you asked.
     pub alert_cue: bool,
@@ -216,6 +220,7 @@ impl Default for Config {
             ack_delay_ms: 0,
             narrate: true,
             volume: 1.0,
+            voice_on_mac: false,
             alert_cue: true,
             alert_wait_ms: 20_000,
             alert_max_age_secs: 90,

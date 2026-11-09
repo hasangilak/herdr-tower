@@ -55,6 +55,7 @@ tower up --show     # ... and show the brain in a Herdr tab
 tower up --no-orb   # ... without the orb
 tower down          # stop the voice and the brain (the orb stays, faded: click it to start again)
 tower mute on|off|toggle|status   # the tower says nothing, on the Mac or a phone; text and chat go on (kept across restarts)
+tower mac-voice on|off|toggle|status   # play everything it says on this Mac, never on a phone (panel: Settings > Voice; kept in config.toml)
 tower orb           # just the orb
 ```
 

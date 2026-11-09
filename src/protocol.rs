@@ -28,6 +28,11 @@ pub enum Request {
     Mute {
         action: String,
     },
+    /// Where speech plays: `on` (always this Mac), `off` (the phones as
+    /// routed), `toggle` or `status`. Kept in config.toml.
+    MacVoice {
+        action: String,
+    },
     /// Press-to-talk: `toggle`, `start` or `stop` (stop transcribes what was heard).
     Talk {
         action: String,

@@ -417,6 +417,10 @@ Change it with `PUT /v1/device/audio`, in the Mac panel's Phone section, or
   `voice=1` stream open, which takes the voice as before (a route-`mac`
   phone's voice stream doesn't).
 - `hush`, `pause` and `resume` go to every open stream.
+- **Voice on this Mac** (`voice_on_mac`; `tower mac-voice on`, or the
+  panel's Settings > Voice): everything is spoken on the Mac and no phone
+  gets an `audio` clip, whatever its route or `voice=1` stream. Off by
+  default; `state.voice_on_mac` says which.
 
 ### The tower speaking on the phone
 

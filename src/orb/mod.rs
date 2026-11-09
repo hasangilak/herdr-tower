@@ -141,6 +141,11 @@ impl Tower {
         self.alive && self.s("muted").as_bool() == Some(true)
     }
 
+    /// Everything said plays on this Mac, never on a phone (`tower mac-voice`).
+    fn voice_on_mac(&self) -> bool {
+        self.s("voice_on_mac").as_bool() == Some(true)
+    }
+
     fn needs_you(&self) -> bool {
         self.alive && (self.phase() == "blocked" || self.blocked_agents() > 0)
     }
@@ -198,6 +203,11 @@ fn pid_alive(pid: i32) -> bool {
 /// Mutes the tower, or unmutes it.
 fn toggle_mute(cx: &mut App) {
     tower(&["mute", "toggle"], cx);
+}
+
+/// Everything said plays on this Mac, or the phones have it as routed (`tower mac-voice`).
+fn toggle_mac_voice(cx: &mut App) {
+    tower(&["mac-voice", "toggle"], cx);
 }
 
 /// `tower <args>`; a failure becomes a notification.

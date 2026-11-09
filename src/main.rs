@@ -110,6 +110,13 @@ enum Cmd {
         #[arg(default_value = "status")]
         action: String,
     },
+    /// Play everything the tower says on this Mac, never on a phone (`on`), or
+    /// let paired phones play it as they route it (`off`, the default). Kept across restarts.
+    MacVoice {
+        /// on, off, toggle or status (default).
+        #[arg(default_value = "status")]
+        action: String,
+    },
     /// What the tower is doing.
     Status,
     /// Every agent on every machine (JSON when piped).
@@ -440,6 +447,34 @@ fn run(cli: Cli) -> Result<()> {
             }
             let muted = r.state.as_ref().and_then(|s| s["muted"].as_bool()).unwrap_or(false);
             println!("{}", if muted { "Muted: the tower says nothing (tower mute off to hear it again)." } else { "Not muted: the tower talks." });
+            Ok(())
+        }
+        Cmd::MacVoice { action } => {
+            let on = if protocol::is_running() {
+                let r = protocol::send(&Request::MacVoice { action })?;
+                if !r.ok {
+                    bail!("{}", r.error.unwrap_or_default());
+                }
+                r.state.as_ref().and_then(|s| s["voice_on_mac"].as_bool()).unwrap_or(false)
+            } else {
+                // The voice isn't running: kept for when it starts.
+                let now = config::Config::load()?.voice_on_mac;
+                let on = match action.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    "toggle" => !now,
+                    "status" | "" => now,
+                    _ => bail!("tower mac-voice on|off|toggle|status"),
+                };
+                if on != now {
+                    phone::set_voice_on_mac(on)?;
+                }
+                on
+            };
+            println!(
+                "{}",
+                if on { "Voice on this Mac: everything the tower says plays here, never on a phone." } else { "Voice as routed: a phone that is the voice plays it (this Mac otherwise)." }
+            );
             Ok(())
         }
         Cmd::Restart => {

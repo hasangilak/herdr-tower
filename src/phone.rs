@@ -200,6 +200,15 @@ pub fn set_question_policy(policy: &str) -> Result<()> {
     Ok(())
 }
 
+/// Where speech plays, kept in config.toml (`voice_on_mac`).
+pub fn set_voice_on_mac(on: bool) -> Result<()> {
+    config::Config::write_default_if_missing()?;
+    let path = config::config_file();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    std::fs::write(&path, with_top_level(&text, "voice_on_mac", if on { "true" } else { "false" }))?;
+    Ok(())
+}
+
 /// Sets a top-level `key = value` (before any `[section]`), keeping the rest.
 pub fn with_top_level(text: &str, key: &str, value: &str) -> String {
     let line = format!("{key} = {value}");
