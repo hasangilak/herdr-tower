@@ -50,6 +50,112 @@ const UNREACHABLE_TELL_MS: u64 = 10 * 60_000;
 const RETRY_MS: u64 = 10 * 60_000;
 /// Deliveries remembered (for retries and `after`).
 const KEEP_DELIVERED: usize = 300;
+/// A parked instruction nobody retargets or cancels moves to `expired` after this long.
+const PARK_EXPIRE_MS: u64 = 7 * 24 * 3_600_000;
+
+/// Why an instruction won't go on its own. On disk (and on the wire) it is
+/// its word, as before: `gone`, `replaced`, `after-cancelled`, `start-failed`;
+/// a word this version doesn't know is kept as it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum ParkWhy {
+    /// Its session ended.
+    Gone,
+    /// Its address is another terminal's now.
+    Replaced,
+    /// An instruction it waited for was cancelled.
+    AfterCancelled,
+    /// The session it was to start didn't start (three tries).
+    StartFailed,
+    Other(String),
+}
+
+impl ParkWhy {
+    pub fn word(&self) -> &str {
+        match self {
+            ParkWhy::Gone => "gone",
+            ParkWhy::Replaced => "replaced",
+            ParkWhy::AfterCancelled => "after-cancelled",
+            ParkWhy::StartFailed => "start-failed",
+            ParkWhy::Other(s) => s,
+        }
+    }
+}
+
+impl From<String> for ParkWhy {
+    fn from(s: String) -> ParkWhy {
+        match s.as_str() {
+            "gone" => ParkWhy::Gone,
+            "replaced" => ParkWhy::Replaced,
+            "after-cancelled" => ParkWhy::AfterCancelled,
+            "start-failed" => ParkWhy::StartFailed,
+            _ => ParkWhy::Other(s),
+        }
+    }
+}
+
+impl From<ParkWhy> for String {
+    fn from(p: ParkWhy) -> String {
+        p.word().to_string()
+    }
+}
+
+impl std::fmt::Display for ParkWhy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.word())
+    }
+}
+
+/// Where a queued instruction stands (derived from its fields: storage is
+/// as it was). See docs/state-machines.md, section 3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemState {
+    /// A session to start once what it waits for is done (`session` empty).
+    ToStart,
+    /// Waits for these ids to be done first.
+    WaitingFor(Vec<u64>),
+    /// Waits for its session to be ready (idle or done, the gap and take rules).
+    Waiting,
+    /// Claimed on disk before typing; after a crash `turn_before` says whether it went in.
+    Claimed { since_ms: u64, turn_before: Option<u64> },
+    /// Won't go on its own; the brain was told once.
+    Parked(ParkWhy),
+}
+
+/// What happens to a queued instruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemEv {
+    /// About to be typed (or started): on disk first.
+    Claim { now_ms: u64, turn: Option<u64> },
+    /// The hand-over failed: it waits again, one try more.
+    Failed,
+    /// The claim is let go without a try (it couldn't be saved; a restart found it didn't go in).
+    Release,
+    Park { why: ParkWhy, now_ms: u64 },
+    /// `tower queue retarget`: another session, a fresh start.
+    Retarget { session: String, name: String, created_ms: Option<u64> },
+}
+
+/// A move the queue doesn't allow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemRefused {
+    /// It is being typed right now.
+    GoingIn,
+    /// It won't go on its own (claimed only after a retarget).
+    Parked(ParkWhy),
+    /// A hand-over's result for an instruction nobody claimed.
+    NotClaimed,
+}
+
+impl std::fmt::Display for ItemRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ItemRefused::GoingIn => f.write_str("it is going in right now"),
+            ItemRefused::Parked(why) => write!(f, "it is parked ({why})"),
+            ItemRefused::NotClaimed => f.write_str("it isn't going in"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Item {
@@ -66,9 +172,13 @@ pub struct Item {
     /// When the terminal was made: which terminal at that address it's for.
     #[serde(default)]
     pub created_ms: Option<u64>,
-    /// Why it won't go on its own (`gone`, `replaced`, `after-cancelled`).
+    /// Why it won't go on its own (`gone`, `replaced`, `after-cancelled`, `start-failed`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parked: Option<String>,
+    pub parked: Option<ParkWhy>,
+    /// Since when it is parked (it expires a week later). Parked by an
+    /// older version: counted from when this one first saw it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_ms: Option<u64>,
     /// Ids that must be done first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub after: Vec<u64>,
@@ -85,6 +195,78 @@ pub struct Item {
     /// instead of a session to type into (`session` is empty until then).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub start: Vec<String>,
+}
+
+impl Item {
+    /// Its state, as far as the item itself tells (`Book::state` also knows
+    /// whether what it waits for is done).
+    pub fn state(&self) -> ItemState {
+        if let Some(why) = &self.parked {
+            return ItemState::Parked(why.clone());
+        }
+        if let Some(since_ms) = self.sending_ms {
+            return ItemState::Claimed { since_ms, turn_before: self.turn_before };
+        }
+        if !self.after.is_empty() {
+            return ItemState::WaitingFor(self.after.clone());
+        }
+        if !self.start.is_empty() { ItemState::ToStart } else { ItemState::Waiting }
+    }
+
+    /// The whole table: moves the item by `ev`, or says why not.
+    pub fn apply(&mut self, ev: ItemEv) -> Result<(), ItemRefused> {
+        match (ev, self.state()) {
+            (ItemEv::Claim { .. }, ItemState::Claimed { .. }) => Err(ItemRefused::GoingIn),
+            (ItemEv::Claim { .. }, ItemState::Parked(why)) => Err(ItemRefused::Parked(why)),
+            (ItemEv::Claim { now_ms, turn }, _) => {
+                self.sending_ms = Some(now_ms);
+                if self.start.is_empty() {
+                    self.turn_before = turn;
+                }
+                Ok(())
+            }
+            (ItemEv::Failed, ItemState::Claimed { .. }) => {
+                self.sending_ms = None;
+                self.tries += 1;
+                Ok(())
+            }
+            (ItemEv::Release, ItemState::Claimed { .. }) => {
+                self.sending_ms = None;
+                Ok(())
+            }
+            (ItemEv::Failed | ItemEv::Release, _) => Err(ItemRefused::NotClaimed),
+            // Never parked while its keys go in: it is in, or it waits again, first.
+            (ItemEv::Park { .. } | ItemEv::Retarget { .. }, ItemState::Claimed { .. }) => Err(ItemRefused::GoingIn),
+            (ItemEv::Park { why, now_ms }, _) => {
+                if self.parked.as_ref() != Some(&why) {
+                    self.parked = Some(why);
+                    self.parked_ms = Some(now_ms);
+                }
+                Ok(())
+            }
+            (ItemEv::Retarget { session, name, created_ms }, _) => {
+                self.session = session;
+                self.name = name;
+                self.created_ms = created_ms;
+                self.parked = None;
+                self.parked_ms = None;
+                self.gone_told = false;
+                self.tries = 0;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Where a delivery stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryState {
+    /// Typed; the session hasn't shown it took it yet.
+    Sent,
+    /// Its turn count moved: it is working on it.
+    Taken,
+    /// ... and stopped since (or the session ended).
+    Finished,
 }
 
 /// An instruction that went in.
@@ -105,6 +287,30 @@ pub struct Delivered {
     pub finished: bool,
 }
 
+impl Delivered {
+    pub fn state(&self) -> DeliveryState {
+        match (self.taken, self.finished) {
+            (_, true) => DeliveryState::Finished,
+            (true, false) => DeliveryState::Taken,
+            (false, false) => DeliveryState::Sent,
+        }
+    }
+
+    /// The session took it (Sent -> Taken). False: nothing changed.
+    fn take(&mut self) -> bool {
+        let moved = self.state() == DeliveryState::Sent;
+        self.taken |= moved;
+        moved
+    }
+
+    /// Its turn is over (Sent/Taken -> Finished). False: nothing changed.
+    fn finish(&mut self) -> bool {
+        let moved = self.state() != DeliveryState::Finished;
+        self.finished = true;
+        moved
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Book {
     next_id: u64,
@@ -122,6 +328,10 @@ struct Book {
     /// Sessions in a status nothing goes into (`error`, ...), told once.
     #[serde(default)]
     stuck: BTreeMap<String, String>,
+    /// Parked for a week with nobody retargeting or cancelling them: out of
+    /// the way, not deleted (newest last).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    expired: Vec<Item>,
 }
 
 impl Book {
@@ -169,19 +379,19 @@ impl Book {
     }
 
     fn waiting_for(&self, session: &str) -> usize {
-        self.items.iter().filter(|i| i.session == session && i.parked.is_none()).count()
+        self.items.iter().filter(|i| i.session == session && !matches!(i.state(), ItemState::Parked(_))).count()
     }
 
     /// The sessions to look at: those with something waiting, then those
     /// whose last delivery isn't finished yet (something may wait on it).
     fn sessions(&self, now: u64) -> Vec<String> {
         let mut out: Vec<String> = vec![];
-        for i in self.items.iter().filter(|i| i.parked.is_none() && i.start.is_empty()) {
+        for i in self.items.iter().filter(|i| !matches!(i.state(), ItemState::Parked(_)) && i.start.is_empty()) {
             if !out.contains(&i.session) {
                 out.push(i.session.clone());
             }
         }
-        for d in self.delivered.iter().filter(|d| !d.finished && now.saturating_sub(d.at_ms) < 24 * 3_600_000) {
+        for d in self.delivered.iter().filter(|d| d.state() != DeliveryState::Finished && now.saturating_sub(d.at_ms) < 24 * 3_600_000) {
             if !out.contains(&d.session) {
                 out.push(d.session.clone());
             }
@@ -237,14 +447,10 @@ impl Book {
     fn follow(&mut self, s: &Session) -> bool {
         let Some(d) = self.delivered.iter_mut().rev().find(|d| d.session == s.address) else { return false };
         let moved = matches!((s.turn, d.turn_before), (Some(now), Some(before)) if now > before);
-        let mut changed = false;
-        if moved && !d.taken {
-            d.taken = true;
-            changed = true;
-        }
-        if (d.taken || d.turn_before.is_none()) && !d.finished && ready(&s.status) && (moved || d.turn_before.is_none()) {
-            d.finished = true;
-            changed = true;
+        let mut changed = moved && d.take();
+        // Taken and ready again; or, with no turn count to go by, ready again.
+        if (moved || d.turn_before.is_none()) && ready(&s.status) {
+            changed |= d.finish();
         }
         changed
     }
@@ -452,18 +658,19 @@ impl SendQueue {
             let mut ready = vec![];
             let now = crate::history::now_ms();
             let ids: Vec<u64> =
-                b.items.iter().filter(|i| !i.start.is_empty() && i.parked.is_none() && i.sending_ms.is_none()).map(|i| i.id).collect();
+                b.items.iter().filter(|i| !i.start.is_empty() && matches!(i.state(), ItemState::WaitingFor(_) | ItemState::ToStart)).map(|i| i.id).collect();
             for id in ids {
                 let Some(pos) = b.items.iter().position(|i| i.id == id) else { continue };
                 let item = b.items[pos].clone();
                 match b.after_done(&item) {
                     Some(true) => {
-                        b.items[pos].sending_ms = Some(now);
-                        ready.push(b.items[pos].clone());
+                        if b.items[pos].apply(ItemEv::Claim { now_ms: now, turn: None }).is_ok() {
+                            ready.push(b.items[pos].clone());
+                        }
                     }
                     Some(false) => {}
                     None => {
-                        b.items[pos].parked = Some("after-cancelled".into());
+                        let _ = b.items[pos].apply(ItemEv::Park { why: ParkWhy::AfterCancelled, now_ms: now });
                         b.items[pos].gone_told = true;
                         h.tell(Note {
                             session: String::new(),
@@ -479,7 +686,7 @@ impl SendQueue {
             {
                 eprintln!("[queue] {e:#}");
                 for i in b.items.iter_mut().filter(|i| ready.iter().any(|r| r.id == i.id)) {
-                    i.sending_ms = None;
+                    let _ = i.apply(ItemEv::Release);
                 }
                 return;
             }
@@ -515,10 +722,9 @@ impl SendQueue {
                 }
                 Err(e) => {
                     if let Some(i) = b.items.iter_mut().find(|i| i.id == item.id) {
-                        i.sending_ms = None;
-                        i.tries += 1;
+                        let _ = i.apply(ItemEv::Failed);
                         if i.tries >= 3 {
-                            i.parked = Some("start-failed".into());
+                            let _ = i.apply(ItemEv::Park { why: ParkWhy::StartFailed, now_ms: now });
                             i.gone_told = true;
                             h.tell(Note {
                                 session: String::new(),
@@ -547,8 +753,13 @@ impl SendQueue {
     /// Takes one out by hand (the only way one leaves undelivered).
     pub fn cancel(&self, id: u64) -> Result<Item> {
         let mut b = self.lock();
-        let Some(pos) = b.items.iter().position(|i| i.id == id) else { bail!("nothing queued with id {id}") };
-        if b.items[pos].sending_ms.is_some() {
+        let Some(pos) = b.items.iter().position(|i| i.id == id) else {
+            if b.expired.iter().any(|i| i.id == id) {
+                bail!("#{id} expired already (parked for a week); it went nowhere")
+            }
+            bail!("nothing queued with id {id}")
+        };
+        if let ItemState::Claimed { .. } = b.items[pos].state() {
             bail!("#{id} is going in right now");
         }
         let item = b.items.remove(pos);
@@ -569,16 +780,15 @@ impl SendQueue {
         let Look::Live(s) = h.look(session) else { bail!("no live session {session}") };
         let item = {
             let mut b = self.lock();
-            let Some(i) = b.items.iter_mut().find(|i| i.id == id) else { bail!("nothing queued with id {id}") };
-            if i.sending_ms.is_some() {
-                bail!("#{id} is going in right now");
+            // An expired one can be sent after all: back in the queue.
+            if let Some(pos) = b.expired.iter().position(|i| i.id == id) {
+                let i = b.expired.remove(pos);
+                b.items.push(i);
             }
-            i.session = s.address.clone();
-            i.name = s.name.clone();
-            i.created_ms = s.created_ms;
-            i.parked = None;
-            i.gone_told = false;
-            i.tries = 0;
+            let Some(i) = b.items.iter_mut().find(|i| i.id == id) else { bail!("nothing queued with id {id}") };
+            if let Err(e) = i.apply(ItemEv::Retarget { session: s.address.clone(), name: s.name.clone(), created_ms: s.created_ms }) {
+                bail!("#{id}: {e}");
+            }
             let item = i.clone();
             // Behind what already waits for that session.
             b.items.retain(|i| i.id != id);
@@ -599,7 +809,7 @@ impl SendQueue {
     fn recover(&self, h: &dyn Sessions) {
         let (claimed, notes): (Vec<Item>, Vec<String>) = {
             let mut b = self.lock();
-            (b.items.iter().filter(|i| i.sending_ms.is_some()).cloned().collect(), std::mem::take(&mut b.notes))
+            (b.items.iter().filter(|i| matches!(i.state(), ItemState::Claimed { .. })).cloned().collect(), std::mem::take(&mut b.notes))
         };
         for n in notes {
             h.tell(Note { session: String::new(), name: String::new(), msg: n, speech: String::new() });
@@ -627,7 +837,7 @@ impl SendQueue {
                     }
                     None => {
                         if let Some(i) = b.items.iter_mut().find(|i| i.id == item.id) {
-                            i.sending_ms = None;
+                            let _ = i.apply(ItemEv::Release);
                         }
                     }
                 }
@@ -646,7 +856,7 @@ impl SendQueue {
                     self.went_in(h, &mut b, &item, s, crate::history::now_ms());
                 }
             } else if let Some(i) = b.items.iter_mut().find(|i| i.id == item.id) {
-                i.sending_ms = None;
+                let _ = i.apply(ItemEv::Release);
             }
             if let Err(e) = self.save(&b) {
                 eprintln!("[queue] {e:#}");
@@ -658,6 +868,7 @@ impl SendQueue {
     /// One round: each session with something to do, each in its own thread
     /// (a slow machine never holds up the others).
     fn tick(&self, h: &dyn Sessions) {
+        self.expire_round(h, crate::history::now_ms());
         self.start_round(h);
         let sessions = self.lock().sessions(crate::history::now_ms());
         thread::scope(|scope| {
@@ -671,6 +882,43 @@ impl SendQueue {
                 });
             }
         });
+    }
+
+    /// Parked a week with nobody retargeting or cancelling them: out of the
+    /// queue into `expired` (kept, not deleted), and the brain reminded once.
+    /// One parked by an older version (no `parked_ms`) counts from now.
+    fn expire_round(&self, h: &dyn Sessions, now: u64) {
+        let mut b = self.lock();
+        let mut changed = false;
+        for i in b.items.iter_mut().filter(|i| i.parked.is_some() && i.parked_ms.is_none()) {
+            i.parked_ms = Some(now);
+            changed = true;
+        }
+        let old = |i: &Item| matches!(i.state(), ItemState::Parked(_)) && i.parked_ms.is_some_and(|t| now.saturating_sub(t) >= PARK_EXPIRE_MS);
+        if b.items.iter().any(old) {
+            let (gone, keep): (Vec<Item>, Vec<Item>) = std::mem::take(&mut b.items).into_iter().partition(old);
+            b.items = keep;
+            let list: Vec<String> = gone.iter().map(|i| format!("#{} for {} ({}): {}", i.id, i.session, i.parked.as_ref().map(ParkWhy::word).unwrap_or(""), i.text)).collect();
+            h.tell(Note {
+                session: String::new(),
+                name: String::new(),
+                msg: format!(
+                    "[queue] parked for a week, so out of the queue now (kept as expired): {}. `tower queue retarget <id> <session>` still sends one.",
+                    list.join("; ")
+                ),
+                speech: String::new(),
+            });
+            eprintln!("[queue] expired {} parked instruction(s)", gone.len());
+            b.expired.extend(gone);
+            if b.expired.len() > KEEP_DELIVERED {
+                let n = b.expired.len() - KEEP_DELIVERED;
+                b.expired.drain(..n);
+            }
+            changed = true;
+        }
+        if changed && let Err(e) = self.save(&b) {
+            eprintln!("[queue] {e:#}");
+        }
     }
 
     /// `add`'s immediate try: the same round, for one session, now.
@@ -700,7 +948,7 @@ impl SendQueue {
                         .iter()
                         .filter(|i| {
                             i.session == session
-                                && i.parked.is_none()
+                                && !matches!(i.state(), ItemState::Parked(_))
                                 && i.created_ms.is_some()
                                 && s.created_ms.is_some()
                                 && i.created_ms != s.created_ms
@@ -708,7 +956,7 @@ impl SendQueue {
                         .map(|i| i.id)
                         .collect();
                     if !replaced.is_empty() {
-                        self.park(h, &mut b, session, "replaced", &s.name);
+                        self.park(h, &mut b, session, ParkWhy::Replaced, &s.name);
                         changed = true;
                     }
                     // Nothing goes into this status; the brain hears it once.
@@ -741,9 +989,9 @@ impl SendQueue {
                 let name = b.items.iter().find(|i| i.session == session).map(|i| i.name.clone()).unwrap_or_else(|| session.to_string());
                 // Its last delivery is over, one way or another.
                 if let Some(d) = b.delivered.iter_mut().rev().find(|d| d.session == session) {
-                    d.finished = true;
+                    d.finish();
                 }
-                self.park(h, &mut b, session, "gone", &name);
+                self.park(h, &mut b, session, ParkWhy::Gone, &name);
                 let _ = self.save(&b);
             }
             Look::Unreachable(e) => {
@@ -774,13 +1022,13 @@ impl SendQueue {
             if !b.may_send(s, now) {
                 return;
             }
-            let Some(pos) = b.items.iter().position(|i| i.session == s.address && i.parked.is_none()) else { return };
+            let Some(pos) = b.items.iter().position(|i| i.session == s.address && !matches!(i.state(), ItemState::Parked(_))) else { return };
             let item = b.items[pos].clone();
             match b.after_done(&item) {
                 Some(true) => {}
                 Some(false) => return,
                 None => {
-                    b.items[pos].parked = Some("after-cancelled".into());
+                    let _ = b.items[pos].apply(ItemEv::Park { why: ParkWhy::AfterCancelled, now_ms: now });
                     b.items[pos].gone_told = true;
                     h.tell(Note {
                         session: s.address.clone(),
@@ -795,8 +1043,8 @@ impl SendQueue {
                     return;
                 }
             }
-            // A claim that never finished (the hand-over failed): did it go in after all?
-            if item.sending_ms.is_some() {
+            // Claimed: being typed this moment (or a restart's recover has it).
+            if let ItemState::Claimed { .. } = item.state() {
                 return;
             }
             if let (Some(before), Some(turn)) = (item.turn_before, s.turn)
@@ -808,10 +1056,12 @@ impl SendQueue {
                 return;
             }
             // Claimed, on disk, before it's typed.
-            b.items[pos].sending_ms = Some(now);
-            b.items[pos].turn_before = s.turn;
+            if let Err(e) = b.items[pos].apply(ItemEv::Claim { now_ms: now, turn: s.turn }) {
+                eprintln!("[queue] not sending #{}: {e}", item.id);
+                return;
+            }
             if let Err(e) = self.save(&b) {
-                b.items[pos].sending_ms = None;
+                let _ = b.items[pos].apply(ItemEv::Release);
                 eprintln!("[queue] not sending #{}: {e:#}", item.id);
                 return;
             }
@@ -826,8 +1076,7 @@ impl SendQueue {
             }
             Err(e) => {
                 if let Some(i) = b.items.iter_mut().find(|i| i.id == item.id) {
-                    i.sending_ms = None;
-                    i.tries += 1;
+                    let _ = i.apply(ItemEv::Failed);
                     if i.tries == 1 || i.tries.is_multiple_of(20) {
                         eprintln!("[queue] #{} to {} didn't go in ({e:#}); trying again", item.id, s.address);
                     }
@@ -871,11 +1120,15 @@ impl SendQueue {
 
     /// What waits for a session that ended (or whose address is another
     /// terminal's now) goes nowhere by itself; the brain hears it once.
-    fn park(&self, h: &dyn Sessions, b: &mut Book, session: &str, why: &str, name: &str) {
+    fn park(&self, h: &dyn Sessions, b: &mut Book, session: &str, why: ParkWhy, name: &str) {
         let mut ids = vec![];
         let mut untold = false;
-        for i in b.items.iter_mut().filter(|i| i.session == session && i.parked.is_none() && i.sending_ms.is_none()) {
-            i.parked = Some(why.into());
+        let now = crate::history::now_ms();
+        for i in b.items.iter_mut().filter(|i| i.session == session && matches!(i.state(), ItemState::Waiting | ItemState::WaitingFor(_))) {
+            // A claimed one isn't parked: it went in, or waits again first.
+            if i.apply(ItemEv::Park { why: why.clone(), now_ms: now }).is_err() {
+                continue;
+            }
             untold |= !i.gone_told;
             i.gone_told = true;
             ids.push(format!("#{}", i.id));
@@ -883,7 +1136,7 @@ impl SendQueue {
         if ids.is_empty() || !untold {
             return;
         }
-        let what = if why == "replaced" { "is a different terminal now" } else { "is gone" };
+        let what = if why == ParkWhy::Replaced { "is a different terminal now" } else { "is gone" };
         h.tell(Note {
             session: session.into(),
             name: name.into(),
@@ -950,7 +1203,7 @@ pub fn current_items() -> Vec<Item> {
 pub fn waiting_counts() -> BTreeMap<String, usize> {
     let mut out = BTreeMap::new();
     if let Some(q) = RUNNING.get() {
-        for i in q.lock().items.iter().filter(|i| i.parked.is_none() && i.start.is_empty()) {
+        for i in q.lock().items.iter().filter(|i| !matches!(i.state(), ItemState::Parked(_)) && i.start.is_empty()) {
             *out.entry(i.session.clone()).or_insert(0) += 1;
         }
     }
@@ -1027,9 +1280,12 @@ pub fn describe(items: &[Item], status_of: impl Fn(&str) -> Option<String>) -> V
     items
         .iter()
         .map(|i| {
-            let status = match &i.parked {
-                Some(why) => format!("parked: {why}"),
-                None => status_of(&i.session).unwrap_or_else(|| "gone".into()),
+            let status = match i.state() {
+                ItemState::Parked(why) => format!("parked: {why}"),
+                ItemState::Claimed { .. } => "going in now".into(),
+                ItemState::ToStart => "starts when it may".into(),
+                ItemState::WaitingFor(_) if i.session.is_empty() => "starts when it may".into(),
+                ItemState::WaitingFor(_) | ItemState::Waiting => status_of(&i.session).unwrap_or_else(|| "gone".into()),
             };
             let ago = crate::phone::ago(i.at_ms);
             let after = if i.after.is_empty() {
@@ -1204,12 +1460,120 @@ mod tests {
         q.tick(&f);
         assert_eq!(f.notes().iter().filter(|n| n.contains("is gone")).count(), 1);
         assert_eq!(q.items().len(), 1);
-        assert_eq!(q.items()[0].parked.as_deref(), Some("gone"));
+        assert_eq!(q.items()[0].parked, Some(ParkWhy::Gone));
 
         // Only a cancel takes it out.
         let id = q.items()[0].id;
         q.cancel(id).unwrap();
         assert!(q.items().is_empty());
+    }
+
+    #[test]
+    fn the_items_table() {
+        let mut i = Item { id: 1, session: "t5".into(), text: "x".into(), ..Default::default() };
+        assert_eq!(i.state(), ItemState::Waiting);
+        assert_eq!(i.apply(ItemEv::Failed), Err(ItemRefused::NotClaimed));
+        assert_eq!(i.apply(ItemEv::Release), Err(ItemRefused::NotClaimed));
+        i.apply(ItemEv::Claim { now_ms: 5, turn: Some(3) }).unwrap();
+        assert_eq!(i.state(), ItemState::Claimed { since_ms: 5, turn_before: Some(3) });
+        assert_eq!(i.apply(ItemEv::Claim { now_ms: 6, turn: Some(3) }), Err(ItemRefused::GoingIn), "claimed once");
+        assert_eq!(i.apply(ItemEv::Park { why: ParkWhy::Gone, now_ms: 6 }), Err(ItemRefused::GoingIn), "never parked while typed");
+        assert_eq!(i.apply(ItemEv::Retarget { session: "t6".into(), name: "n".into(), created_ms: None }), Err(ItemRefused::GoingIn));
+        i.apply(ItemEv::Failed).unwrap();
+        assert_eq!((i.state(), i.tries), (ItemState::Waiting, 1), "the hand-over failed: waits again, one try more");
+        i.apply(ItemEv::Park { why: ParkWhy::Gone, now_ms: 7 }).unwrap();
+        assert_eq!((i.state(), i.parked_ms), (ItemState::Parked(ParkWhy::Gone), Some(7)));
+        assert_eq!(i.apply(ItemEv::Claim { now_ms: 8, turn: None }), Err(ItemRefused::Parked(ParkWhy::Gone)), "parked goes nowhere");
+        i.apply(ItemEv::Park { why: ParkWhy::Gone, now_ms: 99 }).unwrap();
+        assert_eq!(i.parked_ms, Some(7), "parked again for the same reason: since when it first was");
+        i.apply(ItemEv::Retarget { session: "t6".into(), name: "t6-name".into(), created_ms: Some(4) }).unwrap();
+        assert_eq!((i.state(), i.session.as_str(), i.tries, i.parked_ms), (ItemState::Waiting, "t6", 0, None));
+        let start = Item { start: vec!["--name".into(), "x".into()], after: vec![1], ..Default::default() };
+        assert_eq!(start.state(), ItemState::WaitingFor(vec![1]));
+        assert_eq!(Item { after: vec![], ..start }.state(), ItemState::ToStart);
+
+        let mut d = Delivered { id: 1, session: "t5".into(), text: "x".into(), at_ms: 0, turn_before: Some(1), taken: false, finished: false };
+        assert_eq!(d.state(), DeliveryState::Sent);
+        assert!(d.take() && !d.take(), "taken once");
+        assert_eq!(d.state(), DeliveryState::Taken);
+        assert!(d.finish() && !d.finish());
+        assert_eq!(d.state(), DeliveryState::Finished);
+        assert!(!d.take(), "finished stays finished");
+    }
+
+    #[test]
+    fn old_queue_files_load_and_save_the_same_words() {
+        let old = r#"{"next_id": 3, "items": [
+            {"id": 1, "session": "t5", "name": "a", "text": "x", "at_ms": 1, "parked": "gone"},
+            {"id": 2, "session": "t6", "name": "b", "text": "y", "at_ms": 1, "parked": "something-newer"},
+            {"id": 3, "session": "t7", "name": "c", "text": "z", "at_ms": 1, "sending_ms": 5, "turn_before": 2}
+        ], "delivered": [{"id": 0, "session": "t5", "text": "w", "at_ms": 1, "taken": true}]}"#;
+        let b: Book = serde_json::from_str(old).unwrap();
+        assert_eq!(b.items[0].state(), ItemState::Parked(ParkWhy::Gone));
+        assert_eq!(b.items[1].state(), ItemState::Parked(ParkWhy::Other("something-newer".into())));
+        assert_eq!(b.items[2].state(), ItemState::Claimed { since_ms: 5, turn_before: Some(2) });
+        assert_eq!(b.delivered[0].state(), DeliveryState::Taken);
+        let again = serde_json::to_value(&b).unwrap();
+        assert_eq!(again["items"][0]["parked"], "gone");
+        assert_eq!(again["items"][1]["parked"], "something-newer", "a word it doesn't know is kept");
+        assert!(again.get("expired").is_none(), "nothing new on disk until something expires");
+        // The CLI reads the daemon's items the same way.
+        let items: Vec<Item> = serde_json::from_value(again["items"].clone()).unwrap();
+        assert_eq!(items, b.items);
+    }
+
+    #[test]
+    fn a_parked_instruction_expires_after_a_week_and_is_kept() {
+        let (q, _d) = queue();
+        let f = Fake::default();
+        f.set("t5", "working");
+        q.add_with(&f, "t5", "deploy the billing fix", &[]).unwrap();
+        f.sessions.lock().unwrap().remove("t5");
+        q.tick(&f);
+        let parked_at = q.items()[0].parked_ms.unwrap();
+        let notes = f.notes().len();
+        q.expire_round(&f, parked_at + PARK_EXPIRE_MS - 1);
+        assert_eq!(q.items().len(), 1, "not yet");
+        q.expire_round(&f, parked_at + PARK_EXPIRE_MS);
+        assert!(q.items().is_empty());
+        assert_eq!(f.notes().len(), notes + 1, "the brain is reminded once");
+        assert!(f.notes().last().unwrap().contains("#1 for t5 (gone): deploy the billing fix"), "{:?}", f.notes());
+        q.expire_round(&f, parked_at + 2 * PARK_EXPIRE_MS);
+        assert_eq!(f.notes().len(), notes + 1, "and only once");
+        // Kept: on disk after a restart, and it can still be sent.
+        let q2 = SendQueue::at(q.path.clone());
+        assert_eq!(q2.lock().expired.len(), 1);
+        assert!(format!("{:#}", q2.cancel(1).unwrap_err()).contains("expired already"));
+        f.set("t9", "idle");
+        q2.retarget_with(&f, 1, "t9").unwrap();
+        q2.tick(&f);
+        assert_eq!(f.sent(), vec!["deploy the billing fix"]);
+        assert!(q2.lock().expired.is_empty());
+    }
+
+    #[test]
+    fn parked_by_an_older_version_expires_a_week_after_this_one_sees_it() {
+        let (q, _d) = queue();
+        let f = Fake::default();
+        q.lock().items.push(Item { id: 4, session: "t5".into(), text: "x".into(), parked: Some(ParkWhy::Gone), ..Default::default() });
+        q.expire_round(&f, 1_000_000_000_000);
+        assert_eq!(q.items()[0].parked_ms, Some(1_000_000_000_000), "counted from now, not dropped");
+        assert!(f.notes().is_empty());
+    }
+
+    #[test]
+    fn the_list_says_where_each_stands() {
+        let items = vec![
+            Item { id: 1, session: "t5".into(), name: "a".into(), text: "x".into(), ..Default::default() },
+            Item { id: 2, session: "t5".into(), name: "a".into(), text: "y".into(), sending_ms: Some(1), ..Default::default() },
+            Item { id: 3, session: "t6".into(), name: "b".into(), text: "z".into(), parked: Some(ParkWhy::Replaced), ..Default::default() },
+            Item { id: 4, session: String::new(), name: "c".into(), text: "w".into(), after: vec![1], start: vec!["c".into()], ..Default::default() },
+        ];
+        let lines = describe(&items, |s| (s == "t5").then(|| "working".to_string()));
+        assert!(lines[0].contains("(a, working)"), "{lines:?}");
+        assert!(lines[1].contains("going in now"), "{lines:?}");
+        assert!(lines[2].contains("parked: replaced"), "{lines:?}");
+        assert!(lines[3].contains("starts when it may, after #1"), "a session to start isn't \"gone\": {lines:?}");
     }
 
     #[test]
@@ -1242,7 +1606,7 @@ mod tests {
         f.replace("t5", 555);
         q.tick(&f);
         assert!(f.sent().is_empty());
-        assert_eq!(q.items()[0].parked.as_deref(), Some("replaced"));
+        assert_eq!(q.items()[0].parked, Some(ParkWhy::Replaced));
         assert!(f.notes().iter().any(|n| n.contains("a different terminal now")));
     }
 
@@ -1371,7 +1735,7 @@ mod tests {
         q.cancel(first).unwrap();
         q.tick(&f);
         assert!(f.sent().is_empty());
-        assert_eq!(q.items()[0].parked.as_deref(), Some("after-cancelled"));
+        assert_eq!(q.items()[0].parked, Some(ParkWhy::AfterCancelled));
     }
 
     #[test]
