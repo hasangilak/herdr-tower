@@ -133,7 +133,7 @@ pub fn run() -> Result<()> {
             tell: Box::new(move |note| {
                 // A test session's queue news never reaches the brain (as with its alerts).
                 let test_name = note.name.starts_with("qfix ") || note.name.starts_with("qfix-");
-                if test_name || (!note.session.is_empty() && crate::hc::get(&note.session).is_some_and(|t| watch::is_test(&t))) {
+                if (test_name && !watch::test_daemon()) || (!note.session.is_empty() && crate::hc::get(&note.session).is_some_and(|t| watch::left_alone(&t))) {
                     eprintln!("[queue] (test session) {}", note.msg);
                     return;
                 }
@@ -141,7 +141,7 @@ pub fn run() -> Result<()> {
             }),
             watch: Box::new(move |session, text| {
                 // Test sessions are never watched (nothing would ever report on them).
-                if crate::hc::get(session).is_some_and(|t| watch::is_test(&t)) {
+                if crate::hc::get(session).is_some_and(|t| watch::left_alone(&t)) {
                     return;
                 }
                 if let Err(e) = watch.add(session, text, None) {

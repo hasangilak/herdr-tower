@@ -556,7 +556,7 @@ impl Asks {
                 // Blocked on something it can't read: the plain notice, as before.
                 if !had
                     && let Some(t) = hc::get(address).filter(|t| hc::status(t) == SessionStatus::Blocked)
-                    && !super::watch::is_test(&t)
+                    && !super::watch::left_alone(&t)
                 {
                     self.tell(address, &blocked_notice(&hc::spoken_name(&t), &t["status"]));
                 }
@@ -569,7 +569,7 @@ impl Asks {
     /// message seems to ask the user something, a text question set, for the
     /// brain to read.
     pub fn finished(&self, address: &str, t: &Value) {
-        if super::watch::is_test(t) {
+        if super::watch::left_alone(t) {
             return;
         }
         let (me, address, t) = (self.clone(), address.to_string(), t.clone());
@@ -887,6 +887,7 @@ impl Asks {
             s.reason = why.to_string();
             s.clone()
         };
+        eprintln!("[questions] {id} goes to the user: {why}");
         self.publish();
         self.event("update", Some(&set), id);
         self.tell_escalated(&set);

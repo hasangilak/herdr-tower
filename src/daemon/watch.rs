@@ -409,7 +409,7 @@ impl Radar {
         use super::sessions::Change;
         let address = ev.terminal.as_str();
         // A test session's hooks never fire anything (as with its alerts).
-        if self.watches.watched(address) && hc::get(address).is_some_and(|t| is_test(&t)) {
+        if self.watches.watched(address) && hc::get(address).is_some_and(|t| left_alone(&t)) {
             return;
         }
         match change {
@@ -564,7 +564,7 @@ impl Radar {
             return;
         }
         // A test session (the tower's own fixtures): seen, never announced.
-        if is_test(t) {
+        if left_alone(t) {
             if live && status != SessionStatus::Starting {
                 self.watches.seen(&address, &status);
             }
@@ -713,7 +713,7 @@ impl Radar {
     /// question (trusting its folder) holds it: treat that as needing a person.
     fn check_startup(&self, address: &str, t: &Value) {
         let program = t["argv"][0].as_str().unwrap_or("").rsplit('/').next().unwrap_or("").to_string();
-        if !["claude", "codex"].contains(&program.as_str()) || t["name"].as_str() == Some(brain::NAME) || is_test(t) {
+        if !["claude", "codex"].contains(&program.as_str()) || t["name"].as_str() == Some(brain::NAME) || left_alone(t) {
             return;
         }
         let me = self.clone();
@@ -998,6 +998,19 @@ fn down_why(status: &SessionStatus, was: &SessionStatus) -> String {
 /// `hc run --label tower.test=1 --name qfix-…`).
 pub fn is_test(t: &Value) -> bool {
     t["labels"].get("tower.test").is_some() || t["name"].as_str().is_some_and(|n| n.starts_with("qfix-"))
+}
+
+/// A daemon started to test the tower (`HERDER_TOWER_TEST=1`, beside the
+/// real one, with its own HERDER_TOWER_HOME/STATE/DATA).
+pub fn test_daemon() -> bool {
+    std::env::var_os("HERDER_TOWER_TEST").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// A session this daemon leaves alone (no alerts, cards, reports or jobs):
+/// test sessions for the real tower, and every other session for a test
+/// daemon, so the two never answer, announce or report the same session.
+pub fn left_alone(t: &Value) -> bool {
+    is_test(t) != test_daemon()
 }
 
 fn say_status(status: &str) -> &str {

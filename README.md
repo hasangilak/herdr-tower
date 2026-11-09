@@ -406,6 +406,18 @@ for **Herdr Core**, because the voice runs in a Herdr terminal.
   instead of a hook, and runs with `--sandbox danger-full-access
   --ask-for-approval on-request` because `hc` talks to herdr-core over a Unix
   socket).
+- State machines: question cards, queued instructions, jobs and session
+  status each have one enum and one transition table
+  (docs/state-machines.md); question cards are kept in
+  `~/.local/state/herder-tower/questions.json` across restarts.
+- Testing beside the real tower: test sessions (named `qfix-…` or labelled
+  `tower.test`) are left alone by the real tower. A test daemon
+  (`HERDER_TOWER_TEST=1`, with its own `HERDER_TOWER_HOME`, a short
+  `HERDER_TOWER_STATE` path for its socket, `HERDER_TOWER_DATA`, and
+  `HERDER_TOWER_BRAIN` naming a terminal that doesn't exist) handles only
+  test sessions, so the two never answer, announce or report the same one.
+  Give it a config with `talk_key = "off"`, `[lan] enabled = false` and the
+  alerts off.
 
 ## Limits
 
