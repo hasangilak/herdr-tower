@@ -41,6 +41,7 @@ struct Daemon {
     lan: lan::Lan,
     asks: asks::Asks,
     sendq: sendq::SendQueue,
+    prs: crate::prs::Prs,
 }
 
 pub fn run() -> Result<()> {
@@ -86,7 +87,21 @@ pub fn run() -> Result<()> {
         shared.clone(),
         mouth.clone(),
     )?;
-    let lan = lan::Lan::new(lan::Ctx { shared: shared.clone(), mouth: mouth.clone(), hub: hub.clone(), ack: ack_delay(&cfg), stt: utt_tx.clone(), asks: asks.clone() });
+    // The PRs sessions open: every change goes to the phones (`pr` event).
+    let prs = crate::prs::Prs::open_daemon();
+    {
+        let hub = hub.clone();
+        prs.on_change(Box::new(move |op, pr| hub.broadcast("pr", serde_json::json!({ "op": op, "pr": pr.view() }))));
+    }
+    let lan = lan::Lan::new(lan::Ctx {
+        shared: shared.clone(),
+        mouth: mouth.clone(),
+        hub: hub.clone(),
+        ack: ack_delay(&cfg),
+        stt: utt_tx.clone(),
+        asks: asks.clone(),
+        prs: prs.clone(),
+    });
     let ears = mic::start(cfg.mode.clone(), cfg.input_device.clone(), cfg.vad.clone(), shared.clone(), mouth.clone(), utt_tx)?;
     hotkey::start(&cfg.talk_key, ears.clone(), shared.clone(), mouth.clone());
     let watches = watch::Watches::default();
@@ -151,7 +166,24 @@ pub fn run() -> Result<()> {
         });
     }
     sendq.start();
-    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks, sendq };
+    {
+        // Open PRs looked at gently; one merged on GitHub its session waited on: told as a merge.
+        let (prs, sendq, watches) = (prs.clone(), sendq.clone(), watches.clone());
+        thread::Builder::new().name("prs".into()).spawn(move || {
+            loop {
+                for k in prs.due(crate::history::now_ms()) {
+                    if let Some(pr) = prs.poll(&k)
+                        && pr.state == "merged"
+                        && pr.waiting
+                    {
+                        after_merge(&sendq, &watches, &pr, "github");
+                    }
+                }
+                thread::sleep(Duration::from_secs(10));
+            }
+        })?;
+    }
+    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks, sendq, prs };
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let d = daemon.clone();
@@ -162,6 +194,43 @@ pub fn run() -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// A PR its session made was merged (`by`: mac, phone:<device>, github):
+/// the session is queued that it was, so it can carry on, and the brain is
+/// told (as a report on work it handed out: through the focus).
+fn after_merge(sendq: &sendq::SendQueue, watches: &watch::Watches, pr: &crate::prs::Pr, by: &str) {
+    let (who, whom) = match by {
+        "mac" => ("the user", " from the Mac"),
+        b if b.starts_with("phone:") => ("the user", " from their phone"),
+        _ => ("someone", " on GitHub"),
+    };
+    let note = if who == "the user" {
+        format!("The user merged PR #{} ({}) into {}.", pr.number, pr.repo, pr.base)
+    } else {
+        format!("PR #{} ({}) into {} was merged on GitHub.", pr.number, pr.repo, pr.base)
+    };
+    let queued = !pr.session.is_empty()
+        && match sendq.add(&pr.session, &note, &[]) {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("[prs] couldn't tell {}: {e:#}", pr.session);
+                false
+            }
+        };
+    eprintln!("[prs] {} merged by {by}; {} {}", pr.key(), pr.session, if queued { "queued" } else { "not told" });
+    let then = if queued {
+        format!("I queued it \"{note}\", so it carries on from there.")
+    } else {
+        "Its session couldn't be told (it has ended or can't be reached).".to_string()
+    };
+    let msg = format!(
+        "[watch] {} ({}): {who} merged {}{whom}. {then} Tell the user in one short line only if there's something more for them to do.",
+        pr.session,
+        pr.name,
+        pr.short()
+    );
+    watches.news(&pr.session, &pr.name, pr.space.clone(), msg, format!("{} is merged.", pr.short()));
 }
 
 impl Daemon {
@@ -304,6 +373,16 @@ impl Daemon {
                 };
             }
             Request::BehaviorsChanged { by, change } => self.behaviors_changed(&by, &change),
+            Request::PrMerged { pr, by } => {
+                // GitHub says whether it is merged; only then is anyone told.
+                return match self.prs.merged(&pr, &by) {
+                    Some(p) => {
+                        after_merge(&self.sendq, &self.watches, &p, &by);
+                        Response { ok: true, error: None, state: None }
+                    }
+                    None => Response::err(format!("{pr} isn't an open PR the tower knows, or GitHub doesn't say it's merged")),
+                };
+            }
             Request::Dismiss { id } => {
                 return match self.asks.dismiss(&id) {
                     Ok(()) => Response { ok: true, error: None, state: None },

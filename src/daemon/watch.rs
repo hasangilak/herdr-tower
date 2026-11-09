@@ -125,6 +125,26 @@ impl Watches {
         }
     }
 
+    /// News for the brain about work it handed out (a PR the user merged):
+    /// through the outbox as a report of kind `pr`, so a space out of focus
+    /// doesn't hold it.
+    pub fn news(&self, address: &str, name: &str, space: Option<String>, msg: String, speech: String) {
+        let p = Pending {
+            address: address.into(),
+            name: name.into(),
+            space,
+            status: "news".into(),
+            msg,
+            speech,
+            kind: "pr".into(),
+            at_ms: crate::history::now_ms(),
+            spoken: false,
+        };
+        if self.owe(p) {
+            self.kick();
+        }
+    }
+
     /// What an agent session's hook said (see `sessions`).
     pub fn agent(&self, ev: &super::sessions::AgentEvent, change: &super::sessions::Change) {
         if let Some(r) = self.radar.get() {
@@ -828,8 +848,15 @@ impl Radar {
             let (t, a) = (address.to_string(), w.note.clone());
             // What it said at the end of its turn (its hook): often all the brain needs.
             let said = super::sessions::registry().said_since(address, w.since_ms).filter(|_| !status.ended());
-            // It stopped to wait for the user (to merge, approve, test): not done.
-            let waits = said.as_deref().filter(|_| status.ready()).and_then(crate::questions::waits_for_user);
+            // It stopped to wait for the user (to merge, approve, test), or
+            // ended its turn on a PR (it waits for their merge): not done.
+            let waits = said.as_deref().filter(|_| status.ready()).and_then(|s| {
+                crate::questions::waits_for_user(s).or_else(|| {
+                    crate::prs::links(s)
+                        .first()
+                        .map(|(repo, n)| format!("Merge PR #{n} ({repo}), which it opened: the chat shows it with a Merge button"))
+                })
+            });
             // A status that says nothing for a job (none, a word not known): the turn is over, as the watch says.
             let job = match &waits {
                 Some(_) => crate::history::JobState::Blocked,
@@ -894,7 +921,7 @@ impl Radar {
             }
             match brain::note(&msg) {
                 Ok(()) => {
-                    if !p.spoken && p.kind != "queue" {
+                    if !p.spoken && p.kind != "queue" && p.kind != "pr" {
                         self.shared.alert(&p.address, &format!("{} is {}", p.name, say_status(&p.status)), &p.status);
                     }
                     true
@@ -902,7 +929,7 @@ impl Radar {
                 Err(e) => {
                     if !p.spoken {
                         eprintln!("[radar] the brain can't take it yet ({e:#}): {}", p.msg);
-                        if p.kind != "queue" {
+                        if p.kind != "queue" && p.kind != "pr" {
                             self.shared.alert(&p.address, &format!("{} is {}", p.name, say_status(&p.status)), &p.status);
                         }
                         if !p.speech.is_empty() {

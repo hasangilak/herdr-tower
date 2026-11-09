@@ -585,8 +585,25 @@ impl Asks {
         std::thread::spawn(move || {
             let Some(message) = turn_message(&address, &t, ended_ms) else { return };
             let context = crate::history::jobs(&crate::history::load()).into_iter().find(|j| j.session == address).map(|j| j.title).unwrap_or_default();
-            if let Some(request) = questions::waits_for_user(&message) {
-                let watched = reported.lock().unwrap_or_else(|e| e.into_inner()).contains(&address);
+            let waits = questions::waits_for_user(&message);
+            let watched = reported.lock().unwrap_or_else(|e| e.into_inner()).contains(&address);
+            // PRs it opened (or ends on): chips in the chat, waiting for the user's merge.
+            let found = crate::prs::links(&format!("{message}\n{}", turn_transcript(&address, &t)));
+            if !found.is_empty()
+                && let Some(store) = crate::prs::daemon()
+            {
+                let name = hc::spoken_name(&t);
+                let open = store.found(&found, &address, &name, crate::spaces::space_of(&t).as_deref(), true);
+                // Its wait is the merge (or it just ended on the PR): the chip is what the user acts on.
+                let on_merge = waits.as_deref().is_none_or(|r| r.to_lowercase().contains("merg"));
+                if !open.is_empty() && on_merge {
+                    if !watched {
+                        me.tell(&address, &pr_line(&name, &open));
+                    }
+                    return;
+                }
+            }
+            if let Some(request) = waits {
                 me.waiting(&address, &hc::spoken_name(&t), hc::created_ms(&t), &message, &request, &context, watched);
                 return;
             }
@@ -1201,6 +1218,37 @@ fn turn_message(address: &str, t: &Value, ended_ms: u64) -> Option<String> {
     last_message(address, t)
 }
 
+/// What this machine's Claude Code session's turn said and its `gh pr
+/// create` printed (`prs::turn_text`), from its transcript; empty otherwise.
+fn turn_transcript(address: &str, t: &Value) -> String {
+    if hc::agent_app(t).as_deref() == Some("claude-code")
+        && !address.contains('/')
+        && let Some(pid) = t["foreground"]["pid"].as_u64()
+        && let Some(j) = questions::transcript_of(pid as u32)
+    {
+        return crate::prs::turn_text(&j);
+    }
+    String::new()
+}
+
+/// What is said of a session's turn that ended on open PRs: they wait for
+/// the user's merge (from the chip in the chat).
+pub fn pr_line(name: &str, open: &[crate::prs::Pr]) -> String {
+    let each: Vec<String> = open
+        .iter()
+        .map(|p| {
+            let trouble = match (p.checks.state.as_str(), p.mergeable.as_str()) {
+                (_, "conflicting") => ", but it has conflicts".to_string(),
+                ("failing", _) => format!(", but {}", p.checks_line()),
+                _ => String::new(),
+            };
+            format!("PR #{} into {}{trouble}", p.number, if p.base.is_empty() { "?" } else { &p.base })
+        })
+        .collect();
+    let it = if open.len() == 1 { "it waits" } else { "they wait" };
+    format!("{name} opened {}: {it} for your merge, in the chat", each.join(" and "))
+}
+
 fn last_message(address: &str, t: &Value) -> Option<String> {
     if hc::agent_app(t).as_deref() == Some("claude-code")
         && !address.contains('/')
@@ -1309,6 +1357,24 @@ mod tests {
         }
         std::thread::sleep(std::time::Duration::from_millis(30));
         t.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    #[test]
+    fn a_turn_ending_on_a_pr_says_it_waits_for_the_merge() {
+        let pr = |n: u64, base: &str, checks: &str, mergeable: &str| crate::prs::Pr {
+            repo: "o/app".into(),
+            number: n,
+            base: base.into(),
+            state: "open".into(),
+            mergeable: mergeable.into(),
+            checks: crate::prs::Checks { state: checks.into(), failing: vec!["lint".into()], ..Default::default() },
+            ..Default::default()
+        };
+        assert_eq!(pr_line("mediaroom", &[pr(1250, "main", "passing", "mergeable")]), "mediaroom opened PR #1250 into main: it waits for your merge, in the chat");
+        assert_eq!(
+            pr_line("sdk", &[pr(88, "dev", "failing", "mergeable"), pr(89, "main", "pending", "conflicting")]),
+            "sdk opened PR #88 into dev, but 1 check failing: lint and PR #89 into main, but it has conflicts: they wait for your merge, in the chat"
+        );
     }
 
     /// The missed release: a turn that ends waiting for the user to merge

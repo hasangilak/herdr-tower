@@ -113,6 +113,11 @@ pub enum Request {
     BehaviorsChanged { by: String, change: serde_json::Value },
     /// The user dismissed a question set.
     Dismiss { id: String },
+    /// The user merged a PR (`pr`: `owner/repo#n`; `by`: `mac` or
+    /// `phone:<device>`), from its chip. Only a report: the daemon asks
+    /// GitHub, and only a merge it sees moves the chip and tells the session
+    /// and the brain. Nothing merges through the socket.
+    PrMerged { pr: String, by: String },
     /// `normal`, `keep-moving` or `ask-everything`.
     Policy { policy: String },
     /// A screenshot was added (`tower screenshot`): the state's list is re-read.

@@ -124,7 +124,8 @@ impl News {
     /// A report's kind (`watch`, `job`, `alert`, `queue`) and status.
     pub fn of(kind: &str, status: &str) -> News {
         match (kind, status) {
-            ("watch" | "job", _) => News::Asked,
+            // A watch's or a job's report; a PR the user merged from a session's work.
+            ("watch" | "job" | "pr", _) => News::Asked,
             (_, "blocked") => News::NeedsYou,
             _ => News::Ambient,
         }

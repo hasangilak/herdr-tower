@@ -58,6 +58,8 @@ pub struct Ctx {
     pub stt: Sender<Utterance>,
     /// The open question sets (blocked sessions' dialogs).
     pub asks: super::asks::Asks,
+    /// The PRs the sessions opened (`crate::prs`).
+    pub prs: crate::prs::Prs,
 }
 
 struct Running {
@@ -1511,7 +1513,7 @@ mod tests {
         let (stt, _rx) = std::sync::mpsc::channel();
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
-        let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks };
+        let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs: test_prs() };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
         let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
@@ -1616,7 +1618,7 @@ mod tests {
         let (stt, _rx) = std::sync::mpsc::channel();
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
-        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub: hub.clone(), ack: None, stt, asks };
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub: hub.clone(), ack: None, stt, asks, prs: test_prs() };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
         let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
@@ -1929,6 +1931,14 @@ mod tests {
         Ok((status, serde_json::from_str(text.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap_or(Value::Null), t.elapsed()))
     }
 
+    /// A PR store of its own for a test (no gh: nothing is looked up).
+    fn test_prs() -> crate::prs::Prs {
+        let dir = std::env::temp_dir().join(format!("tower-lan-prs-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        crate::prs::Prs::at(dir.join("prs.json"), std::path::PathBuf::from("/nonexistent/gh"))
+    }
+
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
     fn test_lan(name: &str) -> (Lan, std::path::PathBuf, SocketAddr, String) {
         let dir = std::env::temp_dir().join(format!("tower-lan-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1937,7 +1947,7 @@ mod tests {
         std::mem::forget(rx);
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
-        let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks };
+        let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs: test_prs() };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
         let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
