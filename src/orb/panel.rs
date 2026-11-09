@@ -423,6 +423,8 @@ impl Panel {
                     self.put_voice(&field, &text, &current, window, cx);
                 }
                 self.voice = None;
+                // Your own message, spoken: down to it, as a typed one.
+                self.follow.go_down();
                 self.parting = Some(text.clone());
                 cx.spawn_in(window, async move |this, cx| {
                     cx.background_executor().timer(Duration::from_millis(1200)).await;
