@@ -14,8 +14,6 @@ use crate::hc;
 
 pub const NAME: &str = "tower";
 pub const VOICE_NAME: &str = "tower-voice";
-/// The fixed part of the brain's instructions (the rest are the user's behaviors).
-pub const PROMPT: &str = crate::behaviors::CORE;
 
 /// The brain's terminal: `tower`, or `HERDER_TOWER_BRAIN` (a second tower
 /// beside the first, for trying changes out).
@@ -58,7 +56,11 @@ pub fn write_files() -> Result<()> {
             "Notification": [{ "hooks": [{ "type": "command", "command": format!("'{tower}' hook claude-notify") }] }],
             // What the brain is doing, for the orb's working line.
             "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": format!("'{tower}' hook activity-prompt") }] }],
-            "PreToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": format!("'{tower}' hook activity-pre") }] }],
+            "PreToolUse": [
+                { "matcher": "*", "hooks": [{ "type": "command", "command": format!("'{tower}' hook activity-pre") }] },
+                // One hand-off per task: a bundle for several projects is turned back.
+                { "matcher": "Bash", "hooks": [{ "type": "command", "command": format!("'{tower}' hook brain-guard"), "timeout": 5 }] },
+            ],
             "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": format!("'{tower}' hook activity-post") }] }],
         },
         "permissions": {
@@ -85,7 +87,9 @@ pub fn launch(cfg: &Config, which: &str) -> Result<String> {
     let tower = config::tower_bin().display().to_string();
     let mut argv: Vec<String> = match which {
         "claude" => {
-            let mut a = vec!["claude".into(), "-n".into(), "tower".into(), "--append-system-prompt".into(), PROMPT.into()];
+            // Its instructions are CLAUDE.md in its folder (the core and the
+            // behaviors, read again when they change): not a second copy here.
+            let mut a = vec!["claude".into(), "-n".into(), "tower".into()];
             // Every step the brain takes is silence for the user: these
             // matter more for a voice than for a terminal.
             if !cfg.claude_model.is_empty() {
@@ -186,13 +190,32 @@ fn trust_answer(screen: &str) -> Option<Vec<&'static str>> {
 /// agent (`radar`, may be empty), so a status question needs no lookup.
 /// `source`: `mac`, `voice` or `phone:<device id>`, for the chat.
 pub fn ask(text: &str, radar: &str, source: &str) -> Result<()> {
-    let msg = if radar.is_empty() { format!("[voice] {text}") } else { format!("[voice] {text} {radar}") };
+    let mut msg = if radar.is_empty() { format!("[voice] {text}") } else { format!("[voice] {text} {radar}") };
+    if let Some(hint) = split_hint(text, &crate::dispatch::known_projects()) {
+        msg.push(' ');
+        msg.push_str(&hint);
+    }
     note(&msg)?;
     set_question_turn(false);
     crate::activity::start();
     let (text, source) = (text.to_string(), source.to_string());
     crate::history::later(move || crate::history::record_request(&text, &source));
     Ok(())
+}
+
+/// A note after a request that reads as separate tasks for different
+/// projects: `[split?] 1) eyzflow: "..." 2) herder tower: "..."`.
+pub fn split_hint(text: &str, projects: &[crate::split::Project]) -> Option<String> {
+    let parts = crate::split::separate(text, projects)?;
+    let list: Vec<String> = parts
+        .iter()
+        .enumerate()
+        .map(|(i, (folder, part))| {
+            let name = projects.iter().find(|p| &p.folder == folder).map(|p| p.name().to_string()).unwrap_or_else(|| folder.clone());
+            format!("{}) {name}: \"{part}\"", i + 1)
+        })
+        .collect();
+    Some(format!("[split?] {}", list.join(" ")))
 }
 
 /// The brain's turn is a watch reporting back (not a reply to the user):
@@ -219,6 +242,13 @@ pub fn question_turn() -> bool {
     QUESTION_TURN.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// A note that is news for the user, not a request: a watch's report, or
+/// the send queue saying what it delivered. (`contains`: `hc send` from
+/// inside Herdr wraps a note in `<hc from="...">`.)
+pub fn is_news_prompt(text: &str) -> bool {
+    !text.contains("[voice]") && (text.contains("[watch]") || text.contains("[queue]"))
+}
+
 /// A turn's prompt is the tower's own quiet note (`[question]`,
 /// `[question-text]`, `[behaviors]`), not something the user said.
 pub fn is_question_prompt(prompt: &str) -> bool {
@@ -242,7 +272,7 @@ pub fn note(text: &str) -> Result<()> {
     }
     // A busy brain takes it after its turn; the transcript says when.
     if status.as_deref() != Some("working") {
-        set_watch_turn(text.starts_with("[watch]"));
+        set_watch_turn(is_news_prompt(text));
         set_question_turn(text.starts_with("[question") || text.starts_with("[behaviors]"));
     }
     Ok(())
@@ -307,6 +337,22 @@ pub fn brain_dir_exists() -> bool {
 #[cfg(test)]
 mod tests {
     use super::trust_answer;
+
+    #[test]
+    fn separate_tasks_get_a_hint() {
+        let projects: Vec<crate::split::Project> =
+            ["/w/eyzflow", "/w/herder-tower"].iter().filter_map(|f| crate::split::Project::of_folder(f)).collect();
+        let h = super::split_hint("fix the login in eyzflow and also add a mute button to herder tower", &projects).unwrap();
+        assert!(h.starts_with("[split?] 1) eyzflow: ") && h.contains("2) herder tower: "), "{h}");
+        assert!(super::split_hint("fix the login in eyzflow", &projects).is_none());
+    }
+
+    #[test]
+    fn news_is_watch_and_queue_notes_only() {
+        assert!(super::is_news_prompt("<hc from=\"t3\">[queue] delivered to t5 (api): x"));
+        assert!(super::is_news_prompt("[watch] t5 is now done."));
+        assert!(!super::is_news_prompt("[voice] what did the [watch] say"));
+    }
 
     #[test]
     fn answers_claude_trust() {

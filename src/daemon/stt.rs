@@ -32,7 +32,11 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
         let mut state = match ctx.create_state() {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[stt] {e}");
+                // Not silently: every take is turned down, out loud.
+                let msg = format!("speech recognition didn't start: {e}");
+                eprintln!("[stt] {msg}");
+                shared.update(|s| s.error = msg.clone());
+                refuse_all(&rx, &shared, &mouth, &msg);
                 return;
             }
         };
@@ -124,10 +128,10 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
                     }
                 }
                 Source::HandsFree { over_speech } => {
-                    if over_speech || shared.get().speaking {
+                    if over_speech || shared.speaking() {
                         // Probably the tower hearing itself; only a stop word
                         // it isn't saying itself counts.
-                        let said = text::normalize(&shared.get().said);
+                        let said = shared.with(|s| text::normalize(&s.said));
                         if is_stop || heard_stop(&norm, &said, &settings.stop_words) {
                             mouth.hush();
                         }
@@ -163,6 +167,38 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
     })?;
     Ok(())
 }
+
+/// The transcriber couldn't start: each take gets the error, shown and (for
+/// one asked of the tower) said, instead of vanishing.
+fn refuse_all(rx: &Receiver<Utterance>, shared: &Shared, mouth: &Mouth, msg: &str) {
+    for utt in rx.iter() {
+        refuse(utt, shared, mouth, msg);
+    }
+}
+
+fn refuse(utt: Utterance, shared: &Shared, mouth: &Mouth, msg: &str) {
+    match utt.source {
+        Source::Partial => super::mic::partial_done(),
+        Source::Ptt => {
+            shared.update(|s| {
+                s.hearing.clear();
+                s.error = msg.to_string();
+            });
+            mouth.nothing_asked();
+            mouth.say(REFUSED, false);
+        }
+        // Nothing heard: the phone says so.
+        Source::Phone { reply, .. } => {
+            shared.update(|s| s.error = msg.to_string());
+            let _ = reply.send(String::new());
+        }
+        // Not asked of the tower (no wake word heard): the error shows.
+        Source::HandsFree { .. } => shared.update(|s| s.error = msg.to_string()),
+    }
+}
+
+/// Said for a take while speech recognition is down.
+const REFUSED: &str = "I can't understand speech right now: speech recognition didn't start. Type to me instead.";
 
 /// The next utterance to transcribe. A partial is only worth it while
 /// nothing newer waits behind it (a newer partial, or the take's end).
@@ -241,8 +277,7 @@ fn transcribe(state: &mut whisper_rs::WhisperState, samples: &[f32], language: &
 
 /// Names Whisper should expect: the tower's words and the agents' names.
 fn vocabulary(shared: &Shared) -> String {
-    let s = shared.get();
-    let mut names: Vec<String> = s.agents.iter().map(|a| a.name.clone()).collect();
+    let mut names: Vec<String> = shared.with(|s| s.agents.iter().map(|a| a.name.clone()).collect());
     names.sort();
     names.dedup();
     names.truncate(30);
@@ -286,13 +321,25 @@ pub fn deliver_from(shared: &Shared, mouth: &Mouth, text: &str, ack: Option<Dura
 
 /// One line: every agent the radar sees and its status.
 fn radar(shared: &Shared) -> String {
-    let agents = shared.get().agents;
+    let agents = shared.with(|s| s.agents.clone());
     if agents.is_empty() {
         return "[radar] no agents running".into();
     }
-    let list: Vec<String> =
-        agents.iter().map(|a| format!("{} {}: {}", a.address, a.name, if a.status.is_empty() { "starting" } else { &a.status })).collect();
+    let list: Vec<String> = agents.iter().map(radar_entry).collect();
     format!("[radar] {}", list.join("; "))
+}
+
+/// `t5 fix login [eyzflow]: working, 2 queued`: who, in which project, doing what.
+fn radar_entry(a: &super::state::AgentLine) -> String {
+    let folder = a.folder.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    let folder = if folder.is_empty() || crate::split::normalize(folder) == crate::split::normalize(&a.name) {
+        String::new()
+    } else {
+        format!(" [{folder}]")
+    };
+    let status = if a.status.is_empty() { "starting" } else { &a.status };
+    let queued = if a.queued > 0 { format!(", {} queued", a.queued) } else { String::new() };
+    format!("{} {}{folder}: {status}{queued}", a.address, a.name)
 }
 
 fn is_only_stop(norm: &str, stop_words: &[String]) -> bool {
@@ -358,6 +405,22 @@ mod tests {
 
     fn wakes() -> Vec<String> {
         ["hey tower", "okay tower", "tower"].map(String::from).to_vec()
+    }
+
+    #[test]
+    fn takes_are_turned_down_out_loud_when_whisper_is_down() {
+        let shared = Shared::new(super::super::state::State::new("ptt", "test", "test"));
+        let mouth = Mouth::silent(std::sync::Arc::new(super::super::lan::hub::Hub::default()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (reply, heard) = std::sync::mpsc::channel();
+        tx.send(utt(Source::Ptt)).unwrap();
+        let phone = Source::Phone { reply, attachments: vec![], markers: vec![], send: true, phone: None, device: "d".into() };
+        tx.send(utt(phone)).unwrap();
+        drop(tx);
+        refuse_all(&rx, &shared, &mouth, "speech recognition didn't start: no GPU");
+        assert_eq!(shared.get().error, "speech recognition didn't start: no GPU");
+        // The phone hears back at once: nothing was heard.
+        assert_eq!(heard.try_recv().unwrap(), "");
     }
 
     #[test]

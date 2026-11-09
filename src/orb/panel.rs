@@ -795,6 +795,26 @@ impl Panel {
                         h_flex()
                             .items_center()
                             .child(div().flex_1().text_lg().font_weight(FontWeight::MEDIUM).child("Tower"))
+                            .when(t.alive, |el| {
+                                // The tower-wide mute (`tower mute`): nothing is said, on the Mac or a phone.
+                                let muted = t.muted();
+                                el.child(
+                                    div()
+                                        .id("mute")
+                                        .h(px(26.0))
+                                        .px_3()
+                                        .mr_2()
+                                        .flex()
+                                        .items_center()
+                                        .rounded_full()
+                                        .cursor_pointer()
+                                        .text_sm()
+                                        .when(muted, |el| el.bg(rgb(PALE)).text_color(rgb(NAVY)))
+                                        .when(!muted, |el| el.text_color(g.muted).border_1().border_color(rgba(0xffffff33)).hover(|s| s.bg(rgba(0xffffff1f))))
+                                        .child(if muted { "Muted" } else { "Mute" })
+                                        .on_click(cx.listener(|_, _, _, cx| super::toggle_mute(cx))),
+                                )
+                            })
                             .child(
                                 // Settings: questions, the phone app.
                                 div()

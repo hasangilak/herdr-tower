@@ -78,7 +78,8 @@ pub struct Utterance {
 enum Event {
     Audio(Vec<f32>),
     Ctl(Ctl),
-    StreamError(String),
+    /// The stream with this number failed.
+    StreamError(u64, String),
 }
 
 #[derive(Clone)]
@@ -112,6 +113,8 @@ pub fn start(mode: String, device: String, vad: Vad, shared: Shared, mouth: Mout
             seg: None,
             take: None,
             speech_ended: None,
+            retry: None,
+            opened: 0,
         };
         mic.apply_mode();
         mic.run(rx);
@@ -182,6 +185,20 @@ struct Mic {
     take: Option<Take>,
     /// When the tower last stopped talking: its echo can trail a little.
     speech_ended: Option<Instant>,
+    /// Hands-free lost its microphone: when to try opening it again, and
+    /// how many tries so far.
+    retry: Option<(Instant, usize)>,
+    /// Streams opened so far: an error from an old one is old news.
+    opened: u64,
+}
+
+/// Hands-free tries the microphone again after these many seconds, then
+/// every last one, until it opens.
+const RETRY_SECS: [u64; 5] = [1, 2, 5, 10, 30];
+
+/// How long to wait before try number `n` (0 first).
+fn retry_after(n: usize) -> Duration {
+    Duration::from_secs(RETRY_SECS[n.min(RETRY_SECS.len() - 1)])
 }
 
 impl Mic {
@@ -192,6 +209,7 @@ impl Mic {
                 Ok(Event::Audio(chunk)) => self.audio(&chunk),
                 Ok(Event::Ctl(Ctl::Mode(m))) => {
                     self.mode = m;
+                    self.retry = None;
                     self.shared.update(|s| s.mode = self.mode.clone());
                     self.apply_mode();
                 }
@@ -208,14 +226,20 @@ impl Mic {
                     });
                     self.after_take();
                 }
-                Ok(Event::StreamError(e)) => {
-                    eprintln!("[mic] stream error: {e}");
-                    self.shared.update(|s| s.error = format!("microphone: {e}"));
+                Ok(Event::StreamError(n, e)) => {
+                    if n == self.opened {
+                        self.stream_error(&e);
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
             }
-            let speaking = self.shared.get().speaking;
+            if let Some((at, _)) = self.retry
+                && Instant::now() >= at
+            {
+                self.apply_mode();
+            }
+            let speaking = self.shared.speaking();
             if was_speaking && !speaking {
                 self.speech_ended = Some(Instant::now());
             }
@@ -232,6 +256,29 @@ impl Mic {
                 self.shared.update(|s| s.error = "I didn't hear anything.".into());
                 self.after_take();
             }
+        }
+    }
+
+    /// The stream died (the microphone or AirPods went away): it is
+    /// closed, a take on it is dropped, and hands-free opens one again.
+    fn stream_error(&mut self, e: &str) {
+        eprintln!("[mic] stream error: {e}");
+        if self.stream.is_none() {
+            return;
+        }
+        if let Some(t) = self.take.take() {
+            log_take("lost", &t.samples, self.floor);
+            self.mouth.chime(false);
+            self.mouth.take_ended(false);
+            self.shared.update(|s| s.hearing.clear());
+        }
+        self.close();
+        self.shared.update(|s| {
+            s.armed = false;
+            s.error = format!("microphone: {e}");
+        });
+        if self.mode == "handsfree" {
+            self.retry = Some((Instant::now() + retry_after(0), 0));
         }
     }
 
@@ -313,12 +360,27 @@ impl Mic {
     fn apply_mode(&mut self) {
         match self.mode.as_str() {
             "handsfree" => match self.open() {
-                Ok(()) => self.shared.update(|s| {
-                    if s.mic == "closed" {
-                        s.mic = "waiting".into();
+                Ok(()) => {
+                    if self.retry.take().is_some() {
+                        eprintln!("[mic] back");
                     }
-                }),
-                Err(e) => self.shared.update(|s| s.error = format!("microphone: {e:#}")),
+                    self.shared.update(|s| {
+                        if s.mic == "closed" {
+                            s.mic = "waiting".into();
+                        }
+                        if s.error.starts_with("microphone:") {
+                            s.error.clear();
+                        }
+                    });
+                }
+                Err(e) => {
+                    // Tried again later, less and less often.
+                    let n = self.retry.map_or(0, |(_, n)| n + 1);
+                    let wait = retry_after(n);
+                    eprintln!("[mic] {e:#}: trying again in {}s", wait.as_secs());
+                    self.retry = Some((Instant::now() + wait, n));
+                    self.shared.update(|s| s.error = format!("microphone: {e:#}"));
+                }
             },
             _ => {
                 if self.take.is_none() {
@@ -346,8 +408,9 @@ impl Mic {
         self.resampler = Some(Resampler::new(rate, RATE));
         let tx = self.tx.clone();
         let err_tx = self.tx.clone();
+        let n = self.opened + 1;
         let err = move |e: cpal::Error| {
-            let _ = err_tx.send(Event::StreamError(e.to_string()));
+            let _ = err_tx.send(Event::StreamError(n, e.to_string()));
         };
         macro_rules! build {
             ($t:ty, $conv:expr) => {
@@ -374,6 +437,7 @@ impl Mic {
         let name = device.description().map(|d| d.name().to_string()).unwrap_or_default();
         eprintln!("[mic] open: {name} at {rate} Hz, {channels} channel(s)");
         self.stream = Some(stream);
+        self.opened = n;
         Ok(())
     }
 
@@ -444,8 +508,7 @@ impl Mic {
         match self.seg.as_mut() {
             None => {
                 if speech {
-                    let over_speech =
-                        self.shared.get().speaking || self.speech_ended.is_some_and(|t| t.elapsed() < Duration::from_millis(700));
+                    let over_speech = self.shared.speaking() || self.speech_ended.is_some_and(|t| t.elapsed() < Duration::from_millis(700));
                     let mut samples: Vec<f32> = self.preroll.iter().flatten().copied().collect();
                     samples.extend_from_slice(&frame);
                     self.seg = Some(Segment { samples, speech_frames: 1, silence_run: 0, started: Instant::now(), over_speech });
@@ -572,6 +635,12 @@ mod tests {
         assert!(take_over(false, true, BREATH_MS, cap + 10, cap, 1400, 0, None));
         // ...but never past twice the cap.
         assert!(take_over(false, true, 0, cap * 2, cap, 1400, 0, None));
+    }
+
+    #[test]
+    fn a_lost_microphone_is_tried_again_less_and_less_often() {
+        let secs: Vec<u64> = (0..7).map(|n| retry_after(n).as_secs()).collect();
+        assert_eq!(secs, [1, 2, 5, 10, 30, 30, 30]);
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::Value;
 
 use super::queue::Kind;
+use super::state::lock;
 use super::timing;
 use super::tts::Mouth;
 use crate::config;
@@ -85,7 +86,7 @@ impl Narrator {
         if n.is_empty() {
             return false;
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock(&self.inner);
         inner.heard.retain(|h| h.at.elapsed() < KEEP);
         if let Some(i) = inner.heard.iter().position(|h| !h.by_hook && h.text == n) {
             inner.heard.remove(i);
@@ -101,7 +102,7 @@ impl Narrator {
     }
 
     fn poll(&self, force: bool) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock(&self.inner);
         let rescan = force || inner.scanned.is_none_or(|t| t.elapsed() > Duration::from_millis(700));
         if rescan {
             inner.scanned = Some(Instant::now());
@@ -162,7 +163,7 @@ impl Narrator {
                     timing::mark("the brain has it");
                 }
                 // What it says this turn is news for the user, not an answer.
-                crate::brain::set_watch_turn(prompt.contains("[watch]"));
+                crate::brain::set_watch_turn(is_news_prompt(&prompt));
                 crate::brain::set_question_turn(crate::brain::is_question_prompt(&prompt));
             }
             Some("assistant") => {
@@ -198,6 +199,8 @@ impl Narrator {
     }
 }
 
+use crate::brain::is_news_prompt;
+
 /// What the brain is saying now: an answer, or a watch's news.
 pub fn turn_kind() -> Kind {
     if crate::brain::watch_turn() { Kind::Alert } else { Kind::Reply }
@@ -226,6 +229,23 @@ fn list(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_queue_note_is_news_too() {
+        let hub = Arc::new(super::super::lan::hub::Hub::default());
+        let dir = std::env::temp_dir().join(format!("tower-narrate-{}", std::process::id()));
+        let inner = Inner { dir, offsets: HashMap::new(), current: None, scanned: None, heard: vec![], hushes: 0 };
+        let n = Narrator { inner: Arc::new(Mutex::new(inner)), mouth: Mouth::silent(hub), max_chars: 300, enabled: false };
+        let user = |text: &str| serde_json::json!({ "type": "user", "message": { "content": text } });
+        let mut inner = lock(&n.inner);
+        n.line(&mut inner, &user("<hc from=\"tower\">[queue] delivered \"run the tests\" to eyzflow"));
+        assert!(crate::brain::watch_turn());
+        assert_eq!(turn_kind(), Kind::Alert);
+        n.line(&mut inner, &user("[watch] eyzflow finished"));
+        assert!(crate::brain::watch_turn());
+        n.line(&mut inner, &user("[voice] what's running?"));
+        assert!(!crate::brain::watch_turn());
+    }
 
     #[test]
     fn transcript_folder() {

@@ -19,7 +19,7 @@ tower phone enable      # [lan] enabled = true in config.toml, and starts it if 
 tower phone pair        # a one-time code and a QR for the app
 tower phone devices     # paired phones, and whether one is the voice now
 tower phone revoke <id> # or `all`: those tokens stop working at once
-tower phone disable     # stops the API (phones stay paired)
+tower phone disable     # stops the API and ends open event streams (phones stay paired)
 ```
 
 `config.toml`:
@@ -53,8 +53,10 @@ So:
    (someone in between, another machine) fails the handshake. Hostname
    checks are not used (the certificate's name is `herder-tower`).
 3. **Pairing by a one-time code shown on the Mac**: 8 digits, valid 5
-   minutes, one use, void after 5 wrong tries (each wrong try also waits a
-   second). Opening a new code replaces the old one.
+   minutes, one use. Wrong tries are counted by address: after 5 from one
+   address the code is void for that address (others can still pair), and
+   after 30 in all it is void for everyone. Each wrong try also waits a
+   second. Opening a new code replaces the old one.
 4. **A long-lived random token per device** (`htk_` + 256 random bits,
    base64url), returned once at pairing. The Mac stores only its SHA-256
    (`~/.config/herder-tower/devices.json`, mode 0600) and compares in
@@ -68,12 +70,23 @@ So:
    event streams of that device close within 5 seconds.
 7. **Abuse limits**: 20 failed logins (bad token or code) from one address in
    a minute and it's refused for the rest of the minute; 32 connections at
-   most; request heads up to 16 KiB, bodies up to 24 MiB, recordings 0.2 to
-   120 s.
+   most, 8 from one address (more are closed unanswered); the TLS handshake
+   and the request head must arrive within 10 s; request heads up to
+   16 KiB. The token is checked from the head, **before any body is read**,
+   and each call has its own body limit (`413 too_large` beyond it):
+   `POST /v1/pair` 4 KiB; a plain WAV (`/v1/voice`, `/v1/transcribe`,
+   `/v1/questions/{id}/voice`) 24 MiB; multipart (`/v1/ask`, the voice
+   calls, `/v1/questions/{id}/answer`) 100 MiB; every other call 1 MiB.
+   Recordings are 0.2 to 120 s (checked from the WAV header).
+8. **Text from the phone** that is typed into a session (`/v1/ask` text,
+   typed answers to questions, an approve/refuse note) loses its control
+   characters (C0 and C1, escape sequences' introducers among them), except
+   newlines and tabs. An address must start with a letter or digit.
 
 What's left, honestly: anyone on the same network can see that a TLS server
 runs on the port, and could try codes during the 5 minutes a code is open
-(5 tries, 1 in 20 million). A phone that is stolen while paired holds a valid
+(5 tries from an address, 30 in all: at worst 1 in 3 million), or use up
+the 30 from several addresses so the code has to be made again. A phone that is stolen while paired holds a valid
 token until you revoke it (`tower phone revoke`). The certificate's private
 key is as safe as your Mac account. Off the local network (later: Tailscale,
 which `allow_public = false` already accepts as 100.64/10) the same model
@@ -115,12 +128,16 @@ holds.
 - Base: `https://<host>:<port>/v1`. JSON in and out (UTF-8), except audio.
 - One request per connection (`Connection: close`); bodies need
   `Content-Length` (no chunked uploads). OkHttp does both by default.
+  Send the `Authorization` header with the body's call: a call without a
+  valid token is answered `401` from its head alone, its body unread.
 - Times are Unix milliseconds (`*_ms`).
 - Errors: `{"error": {"code": "<word>", "message": "<for a person>"}}` with
   status 400 (bad request), 401 `unauthorized` (missing, unknown or revoked
-  token: re-pair), 403 (pairing), 404, 413/415 (audio), 429
+  token: re-pair), 403 (pairing), 404, 413 (a body over the call's limit,
+  `too_large`; files), 415 (audio, files), 429
   `too_many_failures`, 503 (the brain, `hc`, or the transcriber isn't there).
-- Addresses (`t3`, `vps/t3`) are URL-encoded in paths: `vps%2Ft3`.
+- Addresses (`t3`, `vps/t3`) are URL-encoded in paths: `vps%2Ft3`. A `+`
+  in a path is a plus; only in a query string is it a space.
 
 ## Reading: what the panel shows
 
@@ -189,10 +206,13 @@ may be added later: ignore them.
 | `POST /v1/focus` | `{"space": "B2C support"}` or `{"space": null}` | Focuses a space (its news is spoken, others held) or clears focus. `200 {"focus": name or null}`; `404 no_space`. |
 | `GET /v1/device/audio` | | `200 {"route": "phone"\|"mac"}`: where this phone's replies are heard (below). |
 | `PUT /v1/device/audio` | `{"route": "phone"\|"mac"}` | Sets it (kept in the Mac's devices.json, so it survives restarts). `400 bad_route`. Also in `hello` and the state as `audio_route`. |
-| `GET /v1/audio?after=a17` | | `{"clips": [{"id","kind","text","ms","url","at_ms"}]}`: clips meant for this phone (its own and the voice's) from the last 15 minutes, after clip `after`: what it missed while no stream was open. |
+| `GET /v1/audio?after=<id>` | | `{"clips": [{"id","kind","text","ms","url","at_ms"}]}`: clips meant for this phone (its own and the voice's) from the last 15 minutes, after clip `after`: what it missed while no stream was open. Empty while the tower is muted. |
 | `POST /v1/hush` | | Stops speaking now, and drops what's queued (the phone gets `hush`). |
+| `GET /v1/queue` | | `{"items": [{"id","session","name","text","at_ms","tries","parked"?,"after"?}]}`: instructions the send queue holds for busy sessions (`tower queue`), oldest first. `parked` says why one won't go on its own (`gone`, `replaced`, `after-cancelled`, `start-failed`). Each agent in the state also has `folder` and `queued` (how many wait for it). |
+| `GET /v1/mute` | | `{"muted": bool}`: the tower-wide mute (`tower mute`). The state has it too (`muted`). |
+| `POST /v1/mute` | `{"muted": true}` | Mutes the tower (or unmutes it with `false`): it stops talking now (the phones get `hush`), the clips waiting to be fetched are dropped, and it says nothing on the Mac or any phone until unmuted. Text, chat and questions go on. Kept across restarts. |
 | `POST /v1/mode` | `{"mode": "ptt"\|"handsfree"\|"off"}` | The Mac microphone's mode. |
-| `POST /v1/questions/{id}/answer` | `{"answers":[{"tab":0,"choice":1},{"tab":1,"choice":{"options":[0,2],"other":"…"}}],"submit":true}`; or multipart: that JSON as a part named `json`, files for tab N's typed answer as parts named `tab<N>` | Types the answers into the session's dialog, checking the screen after each step, then submits after checking the review. `200 {"ok":true,"id","submitted"}`; `409 {"error":{"code":"stopped"\|"changed"\|"cannot_answer","message":"where and why"}}`; `404`. |
+| `POST /v1/questions/{id}/answer` | `{"answers":[{"tab":0,"choice":1},{"tab":1,"choice":{"options":[0,2],"other":"…"}}],"submit":true}`; or multipart: that JSON as a part named `json`, files for tab N's typed answer as parts named `tab<N>` | Types the answers into the session's dialog, checking the screen after each step, then submits after checking the review. `200 {"ok":true,"id","submitted"}`; `409 {"error":{"code":"stopped"\|"changed"\|"cannot_answer","message":"where and why"}}`; `400 bad_tab` (an answer for a tab the set doesn't have; nothing is typed or saved); `404`. Every tab's files are checked before any is saved. |
 | `DELETE /v1/questions/{id}` | | Dismisses it (a text question that isn't one, or one the user answers in the terminal). |
 | `PUT /v1/questions-policy` | `{"policy": "normal"\|"keep-moving"\|"ask-everything"}` | Saved in the Mac's config. |
 | `POST /v1/questions/{id}/interpret` | `{"tab":0,"text":"the second one"}` | `{"tab","choice":{"options":[1],"other":null}}`: a spoken answer as a choice, to show before sending. |
@@ -223,8 +243,10 @@ what's wrong on this page? [Image #1]
 --…--
 ```
 
-The Mac saves them as the panel saves its attachments
-(`~/.local/share/herder-tower/attachments/<ms>-phone/<n>-<name>.<ext>`;
+Every file is checked before any is saved (one refused file: nothing is
+saved). The Mac saves them as the panel saves its attachments, in a new
+folder per message
+(`~/.local/share/herder-tower/attachments/<ms>-phone-<8 hex>/<n>-<name>.<ext>`;
 attachments are never pruned) and the tower gets exactly what the panel
 sends: `[voice] <text> [attached: <path 1> | <path 2>]`, where the text has
 the panel's token for the Nth file: `[Image #N]`, `[Video #N]` or
@@ -234,13 +256,13 @@ on this page? [Image #1]`; a `[File #N:` token counts by its number). Text
 may be empty when there are files.
 
 ```json
-202 {"sent": "[Image #2] what's wrong on this page? [Image #1]", "attachments": ["/Users/…/attachments/1794165000000-phone/1-login.png", "…/2-console.jpg"]}
+202 {"sent": "[Image #2] what's wrong on this page? [Image #1]", "attachments": ["/Users/…/attachments/1794165000000-phone-3fa9c2e1/1-login.png", "…/2-console.jpg"]}
 413 {"error": {"code": "too_many_files" | "image_too_large" | "file_too_large", …}}
 415 {"error": {"code": "not_an_image", …}}
 400 {"error": {"code": "bad_multipart" | "empty", …}}
 ```
 
-Bodies are 100 MB at most.
+A multipart body is 100 MiB at most; a JSON ask 1 MiB.
 
 ## The chat
 
@@ -298,9 +320,9 @@ line of JSON `data`. A comment line `: ping` comes every 10 s.
 | `question` | `{"op": "open"\|"update"\|"closed", "id", "question": {…}}`: a question set appeared, changed (recommendations arrived, the dialog moved to another tab, answering started, finished or stopped) or closed (the session moved on). |
 | `behaviors` | a change: `{at, op, id, title, by, undid, diff}` (the chat also gets a `behavior` card with the diff) |
 | `chat` | `{"op": "add"\|"update", "message": {…}}`: a message joined the thread (from the Mac or any phone), or one changed (a screenshot card grew). Messages the phone sent itself come back this way too. |
-| `audio` | voice streams only: `{"id":"a17","kind":"reply"\|"alert"\|"ack"\|"cue","text":"…","ms":1840,"url":"/v1/audio/a17"}` |
-| `hush` | voice streams only: stop playing and drop everything queued |
-| `pause` / `resume` | voice streams only: someone is talking at the Mac (hold playback, then go on) |
+| `audio` | `{"id":"a17-9c2e1a0b4d3f5e6a","kind":"reply"\|"alert"\|"ack"\|"cue","text":"…","ms":1840,"url":"/v1/audio/a17-9c2e1a0b4d3f5e6a"}`: on voice streams for what the voice says, and on every stream of the phone a turn of its own is for (see "Where replies are heard") |
+| `hush` | every stream: stop playing and drop everything queued |
+| `pause` / `resume` | every stream: someone is talking at the Mac (hold playback, then go on) |
 
 `?voice=1` makes this phone **the tower's voice** for as long as the stream
 is open (see below). Without it, the stream is just the panel's feed.
@@ -401,14 +423,18 @@ Change it with `PUT /v1/device/audio`, in the Mac panel's Phone section, or
 - While **any** stream with `voice=1` is open (of a phone whose route is
   `phone`), everything the tower says goes to the phones as `audio` clips
   and **the Mac stays silent**. When the last
-  voice stream closes (the app disconnects, or the network drops: noticed
-  within ~10 s, on the next write), the Mac speaks again. A clip already
+  voice stream closes (the app disconnects, the API is turned off, or the
+  network drops: noticed within about 30 s, when what was sent stays
+  unacknowledged), the Mac speaks again. A clip already
   sent when the phone vanished is not replayed on the Mac.
 - Clip kinds: `ack` (the canned "Okay." the moment a request reaches the
   tower), `reply`, `alert` (news nobody asked for), `cue` (the soft bell
   before an alert, `text` empty). Play them in event order, gapless.
 - Clips are WAV, 24 kHz, mono, 16-bit, kept 15 minutes (or the last 200).
-  Fetch each with the bearer token; play from memory (`AudioTrack` in
+  A clip's id is opaque (in order, with a random part): take it from the
+  `audio` event or `GET /v1/audio`. A clip for another phone's turn is
+  `404` to this one, and so is any clip while the tower is muted. Fetch
+  each with the bearer token; play from memory (`AudioTrack` in
   `MODE_STREAM`, or `MediaPlayer` with a `MediaDataSource`), since Android's
   players can't add headers to an HTTPS URL by themselves.
 - `hush`: stop now and drop the queue (the user pressed hush, or started

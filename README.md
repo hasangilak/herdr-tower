@@ -54,6 +54,7 @@ tower up            # the orb, the voice (Herdr terminal tower-voice) and the br
 tower up --show     # ... and show the brain in a Herdr tab
 tower up --no-orb   # ... without the orb
 tower down          # stop the voice and the brain (the orb stays, faded: click it to start again)
+tower mute on|off|toggle|status   # the tower says nothing, on the Mac or a phone; text and chat go on (kept across restarts)
 tower orb           # just the orb
 ```
 
@@ -315,6 +316,12 @@ tower start --name n --cwd d "task"  # a new Claude session on an account (--acc
 tower history [--jobs open|finished] [--session t3]   # what the tower has done (JSON when piped)
 tower job start|done|failed <t> "…"  # record a job (the brain does this)
 tower summary <t> "…"                # record what a session has done (the brain does this)
+tower queue <t> "…"                  # an instruction for a session: now if it's free, else the moment it stops working; watched
+tower queue <t> --after 3 "…"        # ... once instruction #3 (on any session) is done
+tower queue list | cancel <id> | retarget <id> <t>   # what waits (in order, kept across restarts, sent once)
+tower dispatch --json '{"tasks":[…]}'   # several tasks: each to its project's session or a new one (--dry-run)
+tower sessions [<t>]                 # what each agent session's hooks said: prompt, last answer, state
+tower hooks install|remove|status    # the hooks that let the tower see every Claude Code and Codex session
 tower status                         # the daemon's state
 tower doctor                         # check the setup
 tower selftest                       # Kokoro speaks, Whisper listens: no mic needed
@@ -332,7 +339,10 @@ tower up
 `install` puts the binary in `~/.local/bin/tower`, writes
 `~/.config/herder-tower/config.toml` (voice, Whisper model, wake words,
 alerts) and the brain's folder `~/.config/herder-tower/brain/` (its
-instructions and Claude Code hooks). The first `tower up`
+instructions and Claude Code hooks), and adds the tower's agent hooks to
+`~/.claude/settings.json` and `~/.codex/hooks.json`, beside whatever is
+there (each file backed up first as `*.tower-backup`; `tower hooks remove`
+takes them out again). The first `tower up`
 downloads Kokoro (~330 MB) to `~/.cache/loqui`. The Whisper model is
 `~/.local/share/herder-tower/models/ggml-large-v3-turbo-q5_0.bin` (from
 `huggingface.co/ggerganov/whisper.cpp`). macOS asks once for microphone access
@@ -360,6 +370,37 @@ for **Herdr Core**, because the voice runs in a Herdr terminal.
   for sessions with an open job. A watch leaves the file in the same write
   that queues its report, so each finish is told once, and a report waits
   (said out loud once) until the brain is there to take it.
+- Every agent session's hooks (`tower hook agent claude|codex`, on
+  SessionStart, UserPromptSubmit, Notification, PermissionRequest, Stop,
+  StopFailure and SessionEnd) tell the daemon what each one does the moment
+  it does it, tied to its Herdr terminal by `HC_TERMINAL_ID` (and a
+  `tower.session` label on the terminal). A watch fires on the Stop hook,
+  with what the session said; the send queue sees a session take its
+  instruction; `tower sessions` shows it all. With no daemon running, hooks
+  leave their events in `~/.local/state/herder-tower/agent-events.jsonl` for
+  its next start. They never print, never fail the agent, and give up after
+  1.5 seconds.
+- The radar follows Herdr's own event stream (`hc events`) and keeps track:
+  a gap in its sequence numbers, or a restarted stream, means looking at
+  every terminal again (`hc ls`), and it does that every half minute anyway.
+  A terminal is known by its address and when it was made, so an address
+  that comes back for another terminal is another session (its watches and
+  queued instructions don't follow). A turn counted by Herdr that ended
+  since the last look is a finish, even if nobody saw it working.
+- The send queue (`tower queue`) claims an instruction on disk before it
+  types it, and after a restart checks Herdr's turn count: moved means it
+  went in, so nothing is typed twice. A session that ends parks what waits
+  for it (`retarget` or `cancel`); a machine out of reach is waited for,
+  not given up on.
+- `tower dispatch` takes a plan from the brain (tasks with their project
+  folders and what each waits for), sends each to the session in its
+  folder (queued behind its work) or starts a named one, in a git worktree
+  with `isolate`, and holds a task until what it waits for is done. The
+  brain's Bash hook (`tower hook brain-guard`) turns back a single
+  `tower queue` or `hc send` that bundles tasks for different projects, and
+  a request that reads that way reaches the brain with a `[split?]` note.
+  Project names come from the sessions' folders, plus aliases in
+  `~/.config/herder-tower/aliases.json` (`{"dashboard": "~/Work/eyz/eyzflow"}`).
 - Codex as the brain: `tower up --brain codex` (it uses Codex's `notify`
   instead of a hook, and runs with `--sandbox danger-full-access
   --ask-for-approval on-request` because `hc` talks to herdr-core over a Unix

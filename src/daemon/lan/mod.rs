@@ -14,9 +14,10 @@ pub mod multipart;
 pub mod tls;
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::os::fd::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -28,7 +29,7 @@ use serde_json::{Value, json};
 use super::mic::{RATE, Source, Utterance};
 use super::state::{Shared, now_ms};
 use super::tts::Mouth;
-use auth::{Devices, PairError, Pairing};
+use auth::{PairError, Pairing};
 use http::{Request, Response};
 use hub::Hub;
 use tls::Identity;
@@ -36,6 +37,14 @@ use tls::Identity;
 /// The API version in every path (`/v1/...`).
 pub const API: u32 = 1;
 const MAX_CONNECTIONS: usize = 32;
+/// Connections open at once from one address.
+const MAX_PER_IP: usize = 8;
+/// The TLS handshake and the request head must arrive within this, however slowly they trickle.
+const HEAD_DEADLINE: Duration = Duration::from_secs(10);
+/// Longest wait for a read once the caller is known.
+const READ_TIMEOUT: Duration = Duration::from_secs(20);
+/// An event stream whose phone hasn't taken what was sent for this long is gone.
+const STREAM_STUCK: Duration = Duration::from_secs(30);
 /// Failed logins (bad token or code) from one address per minute before it's refused for the minute.
 const MAX_FAILURES: u32 = 20;
 
@@ -63,10 +72,173 @@ pub struct Lan {
     running: Arc<Mutex<Option<Running>>>,
     pairing: Arc<Mutex<Pairing>>,
     failures: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
-    connections: Arc<AtomicUsize>,
-    /// `devices.json` and the certificate's folder (elsewhere in tests).
-    devices_path: std::path::PathBuf,
+    conns: Arc<Mutex<Conns>>,
+    /// `devices.json` (elsewhere in tests).
+    devices: Arc<auth::Store>,
+    /// The certificate's folder (elsewhere in tests).
     identity_dir: std::path::PathBuf,
+}
+
+/// The connections open now, in all and by address.
+#[derive(Default)]
+struct Conns {
+    total: usize,
+    by_ip: HashMap<IpAddr, usize>,
+    /// When a refused connection was last logged.
+    warned: Option<Instant>,
+}
+
+/// A connection's place in `Conns`, given back when it's dropped (however
+/// the connection ends, a panic included).
+struct Slot {
+    conns: Arc<Mutex<Conns>>,
+    ip: IpAddr,
+}
+
+impl Slot {
+    /// None: too many open, in all or from this address.
+    fn take(conns: &Arc<Mutex<Conns>>, ip: IpAddr) -> Option<Slot> {
+        let mut c = conns.lock().unwrap_or_else(|e| e.into_inner());
+        let mine = c.by_ip.get(&ip).copied().unwrap_or(0);
+        if c.total >= MAX_CONNECTIONS || mine >= MAX_PER_IP {
+            if c.warned.is_none_or(|w| w.elapsed() > Duration::from_secs(60)) {
+                c.warned = Some(Instant::now());
+                eprintln!("[phone] refusing connections from {ip}: {mine} open from there, {} in all", c.total);
+            }
+            return None;
+        }
+        c.total += 1;
+        *c.by_ip.entry(ip).or_insert(0) += 1;
+        Some(Slot { conns: conns.clone(), ip })
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut c = self.conns.lock().unwrap_or_else(|e| e.into_inner());
+        c.total = c.total.saturating_sub(1);
+        if let Some(n) = c.by_ip.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                c.by_ip.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// A connection's socket. Until the caller is known, its reads share one
+/// deadline (a client that trickles a byte at a time can't hold it open).
+struct Sock {
+    tcp: TcpStream,
+    deadline: Option<Instant>,
+}
+
+impl Sock {
+    fn no_deadline(&mut self) {
+        self.deadline = None;
+        let _ = self.tcp.set_read_timeout(Some(READ_TIMEOUT));
+    }
+}
+
+impl Read for Sock {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(d) = self.deadline {
+            let left = d.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "too slow"));
+            }
+            self.tcp.set_read_timeout(Some(left.min(READ_TIMEOUT)))?;
+        }
+        self.tcp.read(buf)
+    }
+}
+
+impl Write for Sock {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.tcp.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
+type Stream = rustls::StreamOwned<rustls::ServerConnection, Sock>;
+
+/// TCP keepalive, and a cap on how long sent data may go unacknowledged:
+/// a phone that vanished (Wi-Fi off, out of range) is noticed in about 30 s.
+fn keepalive(tcp: &TcpStream) {
+    let fd = tcp.as_raw_fd();
+    let set = |level: libc::c_int, name: libc::c_int, v: libc::c_int| unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            &v as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+    #[cfg(target_os = "macos")]
+    {
+        // `TCP_RXT_CONNDROPTIME` (netinet/tcp.h): drop after retransmitting this many seconds.
+        const TCP_RXT_CONNDROPTIME: libc::c_int = 0x80;
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPALIVE, 10);
+        set(libc::IPPROTO_TCP, TCP_RXT_CONNDROPTIME, STREAM_STUCK.as_secs() as libc::c_int);
+    }
+    #[cfg(target_os = "linux")]
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 10);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 5);
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3);
+    }
+}
+
+/// Bytes written to the socket that the phone hasn't acknowledged yet (macOS).
+fn unsent(fd: RawFd) -> Option<i32> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut v: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let r =
+            unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_NWRITE, &mut v as *mut libc::c_int as *mut libc::c_void, &mut len) };
+        (r == 0).then_some(v)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
+/// Text from the phone without control characters (but newlines and tabs):
+/// it is typed into terminals, where an escape sequence would be obeyed.
+pub fn clean_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect()
+}
+
+/// `clean_text` on every string in a JSON value.
+fn clean_json(v: &mut Value) {
+    match v {
+        Value::String(s) => *s = clean_text(s),
+        Value::Array(a) => a.iter_mut().for_each(clean_json),
+        Value::Object(o) => o.values_mut().for_each(clean_json),
+        _ => {}
+    }
+}
+
+/// The largest body a call may send: tiny before a device is known, a
+/// recording's worth for a WAV, the most for multipart files, else JSON.
+fn body_limit(req: &Request, seg: &[&str]) -> usize {
+    let multipart = req.header("content-type").and_then(multipart::boundary).is_some();
+    match (req.method.as_str(), seg.get(1..).unwrap_or(&[])) {
+        ("POST", ["pair"]) => http::MAX_PAIR_BODY,
+        ("POST", ["voice"] | ["transcribe"] | ["questions", _, "voice"]) if !multipart => http::MAX_VOICE_BODY,
+        ("POST", ["ask"] | ["voice"] | ["transcribe"] | ["questions", _, "voice"] | ["questions", _, "answer"]) if multipart => {
+            http::MAX_BODY
+        }
+        _ => http::MAX_JSON_BODY,
+    }
 }
 
 /// This Mac's address on the network its default route uses (no packet is sent).
@@ -111,23 +283,25 @@ impl Lan {
     }
 
     pub fn new(ctx: Ctx) -> Lan {
-        Self::with_paths(ctx, Devices::path(), Identity::dir())
+        Self::with_paths(ctx, auth::Devices::path(), Identity::dir())
     }
 
     pub fn with_paths(ctx: Ctx, devices_path: std::path::PathBuf, identity_dir: std::path::PathBuf) -> Lan {
         Lan {
-            devices_path,
+            devices: Arc::new(auth::Store::new(devices_path)),
             identity_dir,
             ctx,
             running: Arc::new(Mutex::new(None)),
             pairing: Arc::new(Mutex::new(Pairing::default())),
             failures: Arc::new(Mutex::new(HashMap::new())),
-            connections: Arc::new(AtomicUsize::new(0)),
+            conns: Arc::new(Mutex::new(Conns::default())),
         }
     }
 
     pub fn start(&self, cfg: &crate::config::Lan) -> Result<SocketAddr> {
-        if let Some(r) = self.running.lock().unwrap().as_ref() {
+        // One lock over the check and the start: two at once can't both bind.
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = running.as_ref() {
             return Ok(r.addr);
         }
         let identity = Identity::load_or_create(&self.identity_dir)?;
@@ -136,36 +310,42 @@ impl Lan {
         let listener = TcpListener::bind((ip, cfg.port)).with_context(|| format!("listening on {ip}:{}", cfg.port))?;
         let addr = listener.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
-        *self.running.lock().unwrap() = Some(Running { addr, stop: stop.clone(), fingerprint: identity.fingerprint() });
-        self.ctx.shared.update(|s| s.lan = format!("https://{addr}"));
         let me = self.clone();
+        let flag = stop.clone();
         thread::Builder::new().name("lan".into()).spawn(move || {
             for conn in listener.incoming() {
-                if stop.load(Ordering::SeqCst) {
+                if flag.load(Ordering::SeqCst) {
                     break;
                 }
                 let Ok(conn) = conn else { continue };
-                if me.connections.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
-                    continue;
-                }
-                let (me, tls) = (me.clone(), tls.clone());
-                me.connections.fetch_add(1, Ordering::SeqCst);
-                thread::spawn(move || {
-                    me.connection(conn, tls);
-                    me.connections.fetch_sub(1, Ordering::SeqCst);
+                let ip = conn.peer_addr().map(|a| a.ip()).unwrap_or(IpAddr::from([0, 0, 0, 0]));
+                // Too many open: closed unanswered.
+                let Some(slot) = Slot::take(&me.conns, ip) else { continue };
+                let (me, tls, flag) = (me.clone(), tls.clone(), flag.clone());
+                let _ = thread::Builder::new().name("lan-conn".into()).spawn(move || {
+                    let _slot = slot;
+                    let run = std::panic::AssertUnwindSafe(|| me.connection(conn, tls, &flag));
+                    if std::panic::catch_unwind(run).is_err() {
+                        eprintln!("[phone] a call from {ip} failed inside the tower; its connection is closed");
+                    }
                 });
             }
         })?;
+        *running = Some(Running { addr, stop, fingerprint: identity.fingerprint() });
+        drop(running);
+        self.ctx.shared.update(|s| s.lan = format!("https://{addr}"));
         eprintln!("[phone] API on https://{addr} (certificate {})", tls::grouped(&identity.fingerprint()[..16]));
         Ok(addr)
     }
 
     pub fn stop(&self) {
-        if let Some(r) = self.running.lock().unwrap().take() {
+        if let Some(r) = self.running.lock().unwrap_or_else(|e| e.into_inner()).take() {
             r.stop.store(true, Ordering::SeqCst);
             // Wake the accept loop so it sees the flag.
             let _ = TcpStream::connect_timeout(&r.addr, Duration::from_millis(300));
-            self.pairing.lock().unwrap().close();
+            // Open event streams end too: no phone stays the voice.
+            self.ctx.hub.drop_all();
+            self.pairing.lock().unwrap_or_else(|e| e.into_inner()).close();
             self.ctx.shared.update(|s| {
                 s.lan.clear();
                 s.phone = None;
@@ -176,9 +356,9 @@ impl Lan {
 
     /// Where it listens and who is connected.
     pub fn info(&self) -> Value {
-        let r = self.running.lock().unwrap();
+        let r = self.running.lock().unwrap_or_else(|e| e.into_inner());
         let (streams, voice) = self.ctx.hub.counts();
-        let devices = Devices::load_from(&self.devices_path);
+        let devices = self.devices.load();
         json!({
             "on": r.is_some(),
             "url": r.as_ref().map(|r| format!("https://{}", r.addr)),
@@ -186,15 +366,15 @@ impl Lan {
             "devices": devices.devices.iter().map(|d| json!({ "id": d.id, "name": d.name, "created_ms": d.created_ms, "last_seen_ms": d.last_seen_ms })).collect::<Vec<_>>(),
             "streams": streams,
             "voice_streams": voice,
-            "pairing_expires_in_s": self.pairing.lock().unwrap().expires_in().map(|d| d.as_secs()),
+            "pairing_expires_in_s": self.pairing.lock().unwrap_or_else(|e| e.into_inner()).expires_in().map(|d| d.as_secs()),
         })
     }
 
     /// Opens a pairing code: what the Mac shows (and the QR carries).
     pub fn pair(&self) -> Result<Value> {
-        let r = self.running.lock().unwrap();
+        let r = self.running.lock().unwrap_or_else(|e| e.into_inner());
         let Some(r) = r.as_ref() else { bail!("the phone API is off: tower phone enable") };
-        let code = self.pairing.lock().unwrap().open();
+        let code = self.pairing.lock().unwrap_or_else(|e| e.into_inner()).open();
         let host = r.addr.ip().to_string();
         let port = r.addr.port();
         let link = format!("herdertower://pair?h={host}&p={port}&c={code}&fp={}", r.fingerprint);
@@ -214,14 +394,15 @@ impl Lan {
         self.ctx.hub.drop_device(device);
     }
 
-    fn connection(&self, tcp: TcpStream, tls: Arc<rustls::ServerConfig>) {
+    fn connection(&self, tcp: TcpStream, tls: Arc<rustls::ServerConfig>, stop: &AtomicBool) {
         let peer = tcp.peer_addr().map(|a| a.ip()).unwrap_or(IpAddr::from([0, 0, 0, 0]));
-        let _ = tcp.set_read_timeout(Some(Duration::from_secs(20)));
+        keepalive(&tcp);
         let _ = tcp.set_write_timeout(Some(Duration::from_secs(10)));
         let _ = tcp.set_nodelay(true);
+        let fd = tcp.as_raw_fd();
         let Ok(conn) = rustls::ServerConnection::new(tls) else { return };
-        let mut stream = rustls::StreamOwned::new(conn, tcp);
-        let req = match http::read_request(&mut stream) {
+        let mut stream = rustls::StreamOwned::new(conn, Sock { tcp, deadline: Some(Instant::now() + HEAD_DEADLINE) });
+        let (mut req, rest) = match http::read_head(&mut stream) {
             Ok(r) => r,
             Err(e) => {
                 // A TLS failure (a phone that doesn't trust us yet, a scanner) has nothing to answer.
@@ -236,7 +417,7 @@ impl Lan {
             let _ = http::write_response(&mut stream, &Response::error(429, "too_many_failures", "too many failed logins; wait a minute"));
             return;
         }
-        let resp = self.route(&req, peer, &mut stream);
+        let resp = self.handle(&mut req, rest, peer, &mut stream, fd, stop);
         if let Some(resp) = resp {
             let _ = http::write_response(&mut stream, &resp);
         }
@@ -244,42 +425,80 @@ impl Lan {
         let _ = stream.flush();
     }
 
-    fn refused(&self, ip: IpAddr) -> bool {
-        let f = self.failures.lock().unwrap();
-        f.get(&ip).is_some_and(|(n, since)| *n >= MAX_FAILURES && since.elapsed() < Duration::from_secs(60))
-    }
-
-    fn failed(&self, ip: IpAddr) {
-        let mut f = self.failures.lock().unwrap();
-        let e = f.entry(ip).or_insert((0, Instant::now()));
-        if e.1.elapsed() > Duration::from_secs(60) {
-            *e = (0, Instant::now());
-        }
-        e.0 += 1;
-    }
-
-    /// The answer, or None when the handler wrote its own (the event stream).
-    fn route(&self, req: &Request, peer: IpAddr, stream: &mut impl Write) -> Option<Response> {
+    /// Who is calling first, from the head alone; then the body, as much as that call may send; then the call.
+    fn handle(
+        &self,
+        req: &mut Request,
+        rest: Vec<u8>,
+        peer: IpAddr,
+        stream: &mut Stream,
+        fd: RawFd,
+        stop: &AtomicBool,
+    ) -> Option<Response> {
         let seg = req.segments();
         let seg: Vec<&str> = seg.iter().map(String::as_str).collect();
         if seg.first() != Some(&"v1") {
             return Some(Response::error(404, "not_found", "the API is under /v1"));
         }
-        let m = req.method.as_str();
-        if (m, &seg[1..]) == ("POST", &["pair"][..]) {
-            return Some(self.pair_device(req, peer));
-        }
-        // Everything else: a paired device only.
-        let devices = Devices::load_from(&self.devices_path);
-        let device = match auth::authorize(&devices, req.header("authorization")) {
-            Ok(d) => d,
-            Err(e) => {
-                self.failed(peer);
-                thread::sleep(Duration::from_millis(300));
-                return Some(Response::error(401, "unauthorized", &e.to_string()));
+        let pairing = (req.method.as_str(), &seg[1..]) == ("POST", &["pair"][..]);
+        // Everything but pairing: a paired device only.
+        let device = if pairing {
+            None
+        } else {
+            match auth::authorize(&self.devices.load(), req.header("authorization")) {
+                Ok(d) => {
+                    // Known: it may take its time from here (an upload, the event stream).
+                    stream.sock.no_deadline();
+                    Some(d)
+                }
+                Err(e) => {
+                    self.failed(peer);
+                    thread::sleep(Duration::from_millis(300));
+                    return Some(Response::error(401, "unauthorized", &e.to_string()));
+                }
             }
         };
-        self.seen(&device);
+        let max = body_limit(req, &seg);
+        if req.content_length > max {
+            return Some(Response::error(413, "too_large", &format!("this call takes a body of {} KiB at most", max / 1024)));
+        }
+        if let Err(e) = http::read_body(stream, req, rest, max) {
+            return Some(Response::error(400, "bad_request", &format!("{e:#}")));
+        }
+        match device {
+            None => Some(self.pair_device(req, peer)),
+            Some(device) => {
+                self.seen(&device);
+                self.route(req, &device, stream, Some(fd), stop)
+            }
+        }
+    }
+
+    fn refused(&self, ip: IpAddr) -> bool {
+        let f = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        f.get(&ip).is_some_and(|(n, since)| *n >= MAX_FAILURES && since.elapsed() < Duration::from_secs(60))
+    }
+
+    fn failed(&self, ip: IpAddr) {
+        let mut f = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        // A minute on, an address starts again (and the map doesn't grow without end).
+        f.retain(|_, (_, since)| since.elapsed() <= Duration::from_secs(60));
+        f.entry(ip).or_insert((0, Instant::now())).0 += 1;
+    }
+
+    /// A paired device's call: the answer, or None when the handler wrote
+    /// its own (the event stream). `fd`: the socket, to notice a phone that vanished.
+    fn route(
+        &self,
+        req: &Request,
+        device: &auth::Device,
+        stream: &mut impl Write,
+        fd: Option<RawFd>,
+        stop: &AtomicBool,
+    ) -> Option<Response> {
+        let seg = req.segments();
+        let seg: Vec<&str> = seg.iter().map(String::as_str).collect();
+        let m = req.method.as_str();
         let q = |k: &str| req.query.get(k).map(String::as_str);
         let limit = |default: usize| q("limit").and_then(|l| l.parse().ok()).unwrap_or(default).min(1000);
         let resp = match (m, &seg[1..]) {
@@ -311,7 +530,8 @@ impl Lan {
             // The user's behaviors (see docs/behaviors.md).
             ("GET", ["behaviors"]) => Response::json(200, &crate::behaviors::listing()),
             ("GET", ["behaviors", "history"]) => {
-                let changes: Vec<Value> = crate::behaviors::Store::open().history().iter().rev().take(limit(50)).map(|c| c.view()).collect();
+                let changes: Vec<Value> =
+                    crate::behaviors::Store::open().history().iter().rev().take(limit(50)).map(|c| c.view()).collect();
                 Response::json(200, &json!({ "changes": changes }))
             }
             ("GET", ["behaviors", id]) => match crate::behaviors::Store::open().get(id) {
@@ -321,12 +541,19 @@ impl Lan {
             ("POST", ["behaviors"]) => {
                 let v = req.json().unwrap_or_default();
                 let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
-                behavior_change(crate::behaviors::Op::Add { title: s("title"), category: s("category"), summary: s("summary"), text: s("text") })
+                behavior_change(crate::behaviors::Op::Add {
+                    title: s("title"),
+                    category: s("category"),
+                    summary: s("summary"),
+                    text: s("text"),
+                })
             }
             ("POST", ["behaviors", "undo"]) => behavior_change(crate::behaviors::Op::Undo),
             // What an edit would change, without saving it.
             ("POST", ["behaviors", id, "preview"]) => {
-                let Some(b) = crate::behaviors::Store::open().get(id) else { return Some(Response::error(404, "no_behavior", "no behavior with that id")) };
+                let Some(b) = crate::behaviors::Store::open().get(id) else {
+                    return Some(Response::error(404, "no_behavior", "no behavior with that id"));
+                };
                 let text = req.json().unwrap_or_default()["text"].as_str().unwrap_or(&b.text).to_string();
                 Response::json(200, &json!({ "id": id, "diff": crate::behaviors::diff(&b.text, &text) }))
             }
@@ -366,7 +593,9 @@ impl Lan {
             }
             // A spoken answer for a tab: text (from /v1/transcribe), or a WAV take.
             ("POST", ["questions", id, "interpret"]) => {
-                let Some(set) = self.ctx.asks.get(id) else { return Some(Response::error(404, "no_question", "no open question set with that id")) };
+                let Some(set) = self.ctx.asks.get(id) else {
+                    return Some(Response::error(404, "no_question", "no open question set with that id"));
+                };
                 let body = req.json().unwrap_or_default();
                 let tab = body["tab"].as_u64().unwrap_or(0) as usize;
                 let Some(t) = set.tabs.get(tab) else { return Some(Response::error(400, "bad_tab", "no such tab")) };
@@ -374,7 +603,9 @@ impl Lan {
                 Response::json(200, &json!({ "tab": tab, "choice": { "options": p.options, "other": p.other } }))
             }
             ("POST", ["questions", id, "voice"]) => {
-                let Some(set) = self.ctx.asks.get(id) else { return Some(Response::error(404, "no_question", "no open question set with that id")) };
+                let Some(set) = self.ctx.asks.get(id) else {
+                    return Some(Response::error(404, "no_question", "no open question set with that id"));
+                };
                 let tab = q("tab").and_then(|t| t.parse::<usize>().ok()).unwrap_or(0);
                 let Some(t) = set.tabs.get(tab).cloned() else { return Some(Response::error(400, "bad_tab", "no such tab")) };
                 let heard = self.voice(req, false, &device);
@@ -392,8 +623,11 @@ impl Lan {
                 let (messages, more) = crate::chat::page(&all, q("before"), limit(50).min(200));
                 Response::json(200, &json!({ "messages": messages, "more": more }))
             }
-            // Clips this phone may have missed (no stream open): the last 15 minutes.
-            ("GET", ["audio"]) => Response::json(200, &json!({ "clips": self.ctx.hub.clips_for(&device.id, q("after")) })),
+            // Clips this phone may have missed (no stream open): the last 15 minutes; none while muted.
+            ("GET", ["audio"]) => {
+                let clips = if self.ctx.mouth.muted() { vec![] } else { self.ctx.hub.clips_for(&device.id, q("after")) };
+                Response::json(200, &json!({ "clips": clips }))
+            }
             ("GET", ["attachments", folder, name]) => attachment(&crate::history::attachments_dir(), folder, name),
             ("GET", ["agents"]) => Response::json(200, &crate::agents_value(q("all") == Some("1"))),
             ("GET", ["spaces"]) => Response::json(200, &crate::spaces::spaces_value()),
@@ -479,12 +713,13 @@ impl Lan {
                     Err(_) => Response::error(404, "no_screenshot", "no such screenshot (they are kept for 30 days)"),
                 }
             }
-            ("GET", ["audio", id]) => match self.ctx.hub.clip(id) {
+            // Only a clip meant for this phone (or the voice's), and none while muted.
+            ("GET", ["audio", id]) => match self.ctx.hub.clip(id, &device.id).filter(|_| !self.ctx.mouth.muted()) {
                 Some(wav) => Response::bytes("audio/wav", wav),
                 None => Response::error(404, "no_clip", "that clip is gone (they are kept for 15 minutes)"),
             },
             ("GET", ["events"]) => {
-                self.events(&device, q("voice") == Some("1"), stream);
+                self.events(&device, q("voice") == Some("1"), stream, fd, stop);
                 return None;
             }
             ("POST", ["ask"]) => {
@@ -518,7 +753,13 @@ impl Lan {
                     Some("refuse") => "Refuse",
                     _ => return Some(Response::error(400, "bad_decision", "decision is approve or refuse")),
                 };
-                let note = body["note"].as_str().map(str::trim).filter(|n| !n.is_empty()).map(|n| format!(" {n}")).unwrap_or_default();
+                let note = body["note"]
+                    .as_str()
+                    .map(clean_text)
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty())
+                    .map(|n| format!(" {n}"))
+                    .unwrap_or_default();
                 self.ask(&device, &format!("{verb} what {address} is asking for.{note}"))
             }
             ("POST", ["focus"]) => {
@@ -531,6 +772,26 @@ impl Lan {
             ("POST", ["hush"]) => {
                 self.ctx.mouth.hush();
                 Response::json(200, &json!({ "ok": true }))
+            }
+            ("GET", ["mute"]) => Response::json(200, &json!({ "muted": self.ctx.mouth.muted() })),
+            // What waits in the send queue (`tower queue list`).
+            ("GET", ["queue"]) => Response::json(200, &json!({ "items": crate::daemon::sendq::current_items() })),
+            // The tower-wide mute (`tower mute`): JSON `{"muted": true|false}`.
+            ("POST", ["mute"]) | ("PUT", ["mute"]) => {
+                let body = req.json().unwrap_or_default();
+                let Some(on) = body["muted"].as_bool() else {
+                    return Some(Response::error(400, "bad_mute", "send {\"muted\": true} or {\"muted\": false}"));
+                };
+                match self.ctx.mouth.set_muted(on) {
+                    Ok(()) => {
+                        // What was said before the mute isn't fetched after it.
+                        if on {
+                            self.ctx.hub.drop_clips();
+                        }
+                        Response::json(200, &json!({ "muted": on }))
+                    }
+                    Err(e) => Response::error(503, "save", &format!("{e:#}")),
+                }
             }
             ("POST", ["mode"]) => {
                 let body = req.json().unwrap_or_default();
@@ -548,9 +809,7 @@ impl Lan {
             ("POST", ["voice"]) => self.voice(req, q("send") != Some("0"), &device),
             ("POST", ["transcribe"]) => self.voice(req, false, &device),
             ("DELETE", ["device"]) => {
-                let mut d = Devices::load_from(&self.devices_path);
-                d.revoke(&device.id);
-                if let Err(e) = d.save_to(&self.devices_path) {
+                if let Err(e) = self.devices.update(|d| d.revoke(&device.id)) {
                     return Some(Response::error(503, "save", &format!("{e:#}")));
                 }
                 self.ctx.hub.drop_device(&device.id);
@@ -564,16 +823,15 @@ impl Lan {
     fn pair_device(&self, req: &Request, peer: IpAddr) -> Response {
         let body = req.json().unwrap_or_default();
         let code = body["code"].as_str().unwrap_or("");
-        let taken = self.pairing.lock().unwrap().take(code);
+        let taken = self.pairing.lock().unwrap_or_else(|e| e.into_inner()).take(code, peer);
         match taken {
             Ok(()) => {
-                let mut d = Devices::load_from(&self.devices_path);
-                let (device, token) = d.add(body["name"].as_str().unwrap_or("phone"), now_ms());
-                if let Err(e) = d.save_to(&self.devices_path) {
-                    return Response::error(503, "save", &format!("{e:#}"));
-                }
+                let (device, token) = match self.devices.update(|d| d.add(body["name"].as_str().unwrap_or("phone"), now_ms())) {
+                    Ok(x) => x,
+                    Err(e) => return Response::error(503, "save", &format!("{e:#}")),
+                };
                 eprintln!("[phone] paired {} ({}) from {peer}", device.name, device.id);
-                let fp = self.running.lock().unwrap().as_ref().map(|r| r.fingerprint.clone());
+                let fp = self.running.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|r| r.fingerprint.clone());
                 Response::json(
                     200,
                     &json!({ "token": token, "device": { "id": device.id, "name": device.name }, "fingerprint": fp, "api": API }),
@@ -600,11 +858,12 @@ impl Lan {
         if now.saturating_sub(device.last_seen_ms) < 60_000 {
             return;
         }
-        let mut d = Devices::load_from(&self.devices_path);
-        if let Some(x) = d.devices.iter_mut().find(|x| x.id == device.id) {
-            x.last_seen_ms = now;
-            let _ = d.save_to(&self.devices_path);
-        }
+        // Under the lock, on the file as it is now: a device revoked meanwhile stays revoked.
+        let _ = self.devices.update(|d| {
+            if let Some(x) = d.devices.iter_mut().find(|x| x.id == device.id) {
+                x.last_seen_ms = now;
+            }
+        });
     }
 
     fn ask(&self, device: &auth::Device, text: &str) -> Response {
@@ -616,8 +875,6 @@ impl Lan {
         }
     }
 
-    /// A recording from the phone: transcribed by the tower's Whisper, then
-    /// handed to the brain like a press-to-talk take.
     /// The state with what the brain is doing now (`work`, the panel's working line).
     fn state(&self, device: &auth::Device) -> Value {
         let mut s = self.ctx.shared.json();
@@ -630,9 +887,9 @@ impl Lan {
     /// multipart with that JSON as a `json` part and files for a tab's typed
     /// answer as parts named `tab<N>` (saved like the panel's attachments).
     fn answer_questions(&self, req: &Request, id: &str) -> Response {
-        if self.ctx.asks.get(id).is_none() {
+        let Some(set) = self.ctx.asks.get(id) else {
             return Response::error(404, "no_question", "no open question set with that id");
-        }
+        };
         let (body, files): (Value, Vec<multipart::Part>) = match req.header("content-type").and_then(multipart::boundary) {
             Some(b) => match multipart::parse(&req.body, &b) {
                 Ok(parts) => {
@@ -640,25 +897,37 @@ impl Lan {
                     let Some(j) = json_part.into_iter().next() else {
                         return Response::error(400, "no_json", "a multipart answer needs a `json` part with {answers, submit}");
                     };
-                    (serde_json::from_slice(&j.data).unwrap_or_default(), rest)
+                    (serde_json::from_slice(j.data).unwrap_or_default(), rest)
                 }
                 Err(e) => return Response::error(400, "bad_multipart", &format!("{e:#}")),
             },
             None => (req.json().unwrap_or_default(), vec![]),
         };
-        let mut answers: Vec<crate::questions::Answer> = match serde_json::from_value(body["answers"].clone()) {
+        // Typed answers go into a terminal: no control characters.
+        let mut raw = body.get("answers").cloned().unwrap_or(Value::Null);
+        clean_json(&mut raw);
+        let mut answers: Vec<crate::questions::Answer> = match serde_json::from_value(raw) {
             Ok(a) => a,
             Err(e) => return Response::error(400, "bad_answers", &format!("answers: {e}")),
         };
-        // Files for tab N: saved, then attached to that tab's typed answer.
-        for a in answers.iter_mut() {
-            let mine: Vec<multipart::Part> =
-                files.iter().filter(|p| p.name == format!("tab{}", a.tab)).map(|p| multipart::Part { name: p.name.clone(), filename: p.filename.clone(), content_type: p.content_type.clone(), data: p.data.clone() }).collect();
-            if mine.is_empty() {
-                continue;
+        if answers.iter().any(|a| a.tab >= set.tabs.len()) {
+            return Response::error(400, "bad_tab", "no such tab");
+        }
+        // Files for tab N: every tab's checked before any is saved, then attached to that tab's typed answer.
+        let by_tab: Vec<(usize, Vec<multipart::Part>)> = answers
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (i, files.iter().filter(|p| p.name == format!("tab{}", a.tab)).cloned().collect::<Vec<_>>()))
+            .filter(|(_, mine)| !mine.is_empty())
+            .collect();
+        for (_, mine) in &by_tab {
+            if let Err(r) = check_files(mine) {
+                return r;
             }
+        }
+        for (i, mine) in by_tab {
             match save_files(&mine, &crate::history::attachments_dir(), now_ms()) {
-                Ok(saved) => a.attachments.extend(saved.into_iter().map(|s| s.path)),
+                Ok(saved) => answers[i].attachments.extend(saved.into_iter().map(|s| s.path)),
                 Err(r) => return r,
             }
         }
@@ -667,7 +936,13 @@ impl Lan {
             Ok(set) => Response::json(200, &json!({ "ok": true, "id": set.id, "submitted": submit })),
             Err(e) => {
                 let msg = format!("{e:#}");
-                let code = if msg.starts_with("stopped at") { "stopped" } else if msg.contains("changed") { "changed" } else { "cannot_answer" };
+                let code = if msg.starts_with("stopped at") {
+                    "stopped"
+                } else if msg.contains("changed") {
+                    "changed"
+                } else {
+                    "cannot_answer"
+                };
                 Response::error(409, code, &msg)
             }
         }
@@ -675,11 +950,9 @@ impl Lan {
 
     /// Sets where a device's replies are heard, on file and for its open streams.
     pub fn set_route(&self, id: &str, route: &str) -> Result<()> {
-        let mut d = Devices::load_from(&self.devices_path);
-        if !d.set_route(id, route) {
+        if !self.devices.update(|d| d.set_route(id, route))? {
             bail!("no paired device {id}, or route {route:?} isn't phone or mac");
         }
-        d.save_to(&self.devices_path)?;
         self.ctx.hub.set_route(id, route == "phone");
         eprintln!("[phone] {id} hears its replies on the {route}");
         Ok(())
@@ -687,14 +960,17 @@ impl Lan {
 
     /// Another process changed the route on file (`tower phone route`, the panel).
     pub fn route_changed(&self, id: &str) {
-        if let Some(d) = Devices::load_from(&self.devices_path).devices.iter().find(|d| d.id == id) {
+        if let Some(d) = self.devices.load().devices.iter().find(|d| d.id == id) {
             self.ctx.hub.set_route(id, d.audio_route == "phone");
         }
     }
 
+    /// A recording from the phone: transcribed by the tower's Whisper, then
+    /// handed to the brain like a press-to-talk take (`send`), or only
+    /// transcribed. Everything is checked before a file is saved.
     fn voice(&self, req: &Request, send: bool, device: &auth::Device) -> Response {
         // A WAV body, or multipart: the WAV as `audio`, files beside it.
-        let (wav, images): (Vec<u8>, Vec<multipart::Part>) = match req.header("content-type").and_then(multipart::boundary) {
+        let (wav, files): (&[u8], Vec<multipart::Part>) = match req.header("content-type").and_then(multipart::boundary) {
             Some(b) => match multipart::parse(&req.body, &b) {
                 Ok(parts) => {
                     let (audio, rest): (Vec<_>, Vec<_>) = parts.into_iter().partition(|p| p.name == "audio");
@@ -705,10 +981,20 @@ impl Lan {
                 }
                 Err(e) => return Response::error(400, "bad_multipart", &format!("{e:#}")),
             },
-            None => (req.body.clone(), vec![]),
+            None => (&req.body, vec![]),
         };
+        let wav = match audio::Wav::parse(wav) {
+            Ok(w) => w,
+            Err(e) => return Response::error(415, "bad_audio", &format!("{e:#}: send audio/wav, 16-bit PCM, mono, 16 kHz preferred")),
+        };
+        // From the header: a long recording is refused before it's decoded.
+        if !(0.2..=120.0).contains(&wav.seconds()) {
+            return Response::error(400, "bad_length", "a recording is 0.2 to 120 seconds");
+        }
+        let (samples, rate) = (wav.decode(), wav.rate);
+        // Only now, with the take known good: checked, then saved (nothing is saved if one is refused).
         let saved = if send {
-            match save_files(&images, &crate::history::attachments_dir(), now_ms()) {
+            match save_files(&files, &crate::history::attachments_dir(), now_ms()) {
                 Ok(p) => p,
                 Err(r) => return r,
             }
@@ -717,17 +1003,16 @@ impl Lan {
         };
         let attachments: Vec<String> = saved.iter().map(|f| f.path.clone()).collect();
         let markers: Vec<String> = saved.iter().map(|f| f.marker.clone()).collect();
-        let (samples, rate) = match audio::wav_decode(&wav) {
-            Ok(x) => x,
-            Err(e) => return Response::error(415, "bad_audio", &format!("{e:#}: send audio/wav, 16-bit PCM, mono, 16 kHz preferred")),
-        };
-        let secs = samples.len() as f32 / rate as f32;
-        if !(0.2..=120.0).contains(&secs) {
-            return Response::error(400, "bad_length", "a recording is 0.2 to 120 seconds");
-        }
         let samples = if rate == RATE { samples } else { super::mic::resample(&samples, rate, RATE) };
         let (tx, rx) = std::sync::mpsc::channel();
-        let source = Source::Phone { reply: tx, attachments: attachments.clone(), markers, send, phone: heard_on_phone(device), device: device.id.clone() };
+        let source = Source::Phone {
+            reply: tx,
+            attachments: attachments.clone(),
+            markers,
+            send,
+            phone: heard_on_phone(device),
+            device: device.id.clone(),
+        };
         if self.ctx.stt.send(Utterance { samples, source }).is_err() {
             return Response::error(503, "stt", "the transcriber isn't running");
         }
@@ -740,7 +1025,9 @@ impl Lan {
     }
 
     /// `GET /v1/events`: the panel's live feed, and with `voice=1` the tower's voice.
-    fn events(&self, device: &auth::Device, voice: bool, w: &mut impl Write) {
+    /// It ends when the phone goes (a write fails, or what was sent isn't
+    /// taken for `STREAM_STUCK`), the device is revoked, or the API is turned off.
+    fn events(&self, device: &auth::Device, voice: bool, w: &mut impl Write, fd: Option<RawFd>, stop: &AtomicBool) {
         if http::write_sse_head(w).is_err() {
             return;
         }
@@ -763,7 +1050,8 @@ impl Lan {
         let mut chat = ChatTail::default();
         chat.diff(&crate::chat::thread(&crate::chat::load(), &crate::history::attachments_dir()));
         let (mut last_ping, mut last_check, mut last_history) = (Instant::now(), Instant::now(), Instant::now());
-        while ok {
+        let (mut drained, mut last_unsent) = (Instant::now(), Instant::now());
+        while ok && !stop.load(Ordering::SeqCst) {
             match rx.recv_timeout(Duration::from_millis(250)) {
                 Ok(out) => ok = send(w, &out.event, &out.data),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -801,10 +1089,22 @@ impl Lan {
                 last_ping = Instant::now();
                 ok = w.write_all(b": ping\n\n").and_then(|_| w.flush()).is_ok();
             }
+            // The phone vanished: what was sent (the pings at least) stays unacknowledged.
+            if let Some(fd) = fd.filter(|_| last_unsent.elapsed() >= Duration::from_secs(1)) {
+                last_unsent = Instant::now();
+                match unsent(fd) {
+                    Some(0) | None => drained = Instant::now(),
+                    Some(_) if drained.elapsed() > STREAM_STUCK => {
+                        eprintln!("[phone] {} stopped taking its event stream: closing it", device.name);
+                        break;
+                    }
+                    Some(_) => {}
+                }
+            }
             // Revoked from the terminal meanwhile.
             if last_check.elapsed() > Duration::from_secs(5) {
                 last_check = Instant::now();
-                if !Devices::load_from(&self.devices_path).devices.iter().any(|d| d.id == device.id) {
+                if !self.devices.load().devices.iter().any(|d| d.id == device.id) {
                     break;
                 }
             }
@@ -836,7 +1136,8 @@ impl ChatTail {
             }
         }
         if self.seen.len() > 500 {
-            let keep: std::collections::HashSet<String> = thread.iter().rev().take(60).filter_map(|m| m["id"].as_str().map(String::from)).collect();
+            let keep: std::collections::HashSet<String> =
+                thread.iter().rev().take(60).filter_map(|m| m["id"].as_str().map(String::from)).collect();
             self.seen.retain(|k, _| keep.contains(k));
         }
         out
@@ -873,7 +1174,9 @@ pub const MAX_FILE_BYTES: usize = 50 * 1024 * 1024;
 /// `{word, detail, since_ms, at_ms, done_ms}`, or null between turns.
 fn work_value() -> Value {
     match crate::activity::read() {
-        Some(w) if w.since_ms > 0 => json!({ "word": w.word, "detail": w.detail, "since_ms": w.since_ms, "at_ms": w.at_ms, "done_ms": w.done_ms }),
+        Some(w) if w.since_ms > 0 => {
+            json!({ "word": w.word, "detail": w.detail, "since_ms": w.since_ms, "at_ms": w.at_ms, "done_ms": w.done_ms })
+        }
         _ => Value::Null,
     }
 }
@@ -885,16 +1188,19 @@ fn is_file_part(p: &multipart::Part) -> bool {
 
 /// The text and files of `POST /v1/ask`: JSON `{"text"}`, or multipart with
 /// a `text` field and file parts.
-fn ask_body(req: &Request) -> Result<(String, Vec<multipart::Part>), Response> {
+fn ask_body(req: &Request) -> Result<(String, Vec<multipart::Part<'_>>), Response> {
     match req.header("content-type").and_then(multipart::boundary) {
         Some(b) => {
             let parts = multipart::parse(&req.body, &b).map_err(|e| Response::error(400, "bad_multipart", &format!("{e:#}")))?;
-            let text = parts.iter().find(|p| p.name == "text" && p.filename.is_none()).map(|p| String::from_utf8_lossy(&p.data).trim().to_string());
+            let text = parts
+                .iter()
+                .find(|p| p.name == "text" && p.filename.is_none())
+                .map(|p| clean_text(&String::from_utf8_lossy(p.data)).trim().to_string());
             Ok((text.unwrap_or_default(), parts.into_iter().filter(|p| p.name != "text" && is_file_part(p)).collect()))
         }
         None => {
             let body = req.json().map_err(|_| Response::error(400, "bad_json", "send {\"text\": \"...\"}"))?;
-            Ok((body["text"].as_str().unwrap_or("").trim().to_string(), vec![]))
+            Ok((clean_text(body["text"].as_str().unwrap_or("")).trim().to_string(), vec![]))
         }
     }
 }
@@ -910,9 +1216,13 @@ pub enum FileKind {
 /// by name or type, anything else is a file.
 pub fn file_kind(name: &str, content_type: Option<&str>, head: &[u8]) -> FileKind {
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
-    if crate::screenshots::kind_of(head).is_some() || matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "bmp" | "tiff") {
+    if crate::screenshots::kind_of(head).is_some()
+        || matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "bmp" | "tiff")
+    {
         FileKind::Image
-    } else if matches!(ext.as_str(), "mov" | "mp4" | "m4v" | "webm" | "mkv" | "avi") || content_type.is_some_and(|t| t.starts_with("video/")) {
+    } else if matches!(ext.as_str(), "mov" | "mp4" | "m4v" | "webm" | "mkv" | "avi")
+        || content_type.is_some_and(|t| t.starts_with("video/"))
+    {
         FileKind::Video
     } else {
         FileKind::Other
@@ -957,14 +1267,10 @@ pub struct Saved {
     pub marker: String,
 }
 
-/// Checks files and saves them as the panel saves its attachments:
-/// `<attachments>/<ms>-phone/<n>-<name>`, never pruned. Six at most; an
-/// image is a real PNG, JPEG, WebP or GIF of 15 MB at most; a video or other
-/// file is 50 MB at most.
-pub fn save_files(parts: &[multipart::Part], attachments: &std::path::Path, at_ms: u64) -> Result<Vec<Saved>, Response> {
-    if parts.is_empty() {
-        return Ok(vec![]);
-    }
+/// Checks files as `save_files` saves them: six at most; an image is a real
+/// PNG, JPEG, WebP or GIF of 15 MB at most; a video or other file is 50 MB
+/// at most. For each: its kind, its name as sent, and the extension to save it with.
+pub fn check_files(parts: &[multipart::Part]) -> Result<Vec<(FileKind, String, String)>, Response> {
     if parts.len() > MAX_FILES {
         return Err(Response::error(413, "too_many_files", &format!("{MAX_FILES} files at most")));
     }
@@ -979,7 +1285,11 @@ pub fn save_files(parts: &[multipart::Part], attachments: &std::path::Path, at_m
                     return Err(Response::error(413, "image_too_large", &format!("file {} is an image over 15 MB", i + 1)));
                 }
                 let Some(ext) = crate::screenshots::kind_of(head) else {
-                    return Err(Response::error(415, "not_an_image", &format!("file {} is named as an image but isn't a PNG, JPEG, WebP or GIF", i + 1)));
+                    return Err(Response::error(
+                        415,
+                        "not_an_image",
+                        &format!("file {} is named as an image but isn't a PNG, JPEG, WebP or GIF", i + 1),
+                    ));
                 };
                 ext.to_string()
             }
@@ -987,21 +1297,43 @@ pub fn save_files(parts: &[multipart::Part], attachments: &std::path::Path, at_m
                 if p.data.len() > MAX_FILE_BYTES {
                     return Err(Response::error(413, "file_too_large", &format!("file {} is over 50 MB", i + 1)));
                 }
-                let e: String = original.rsplit_once('.').map(|(_, e)| e).unwrap_or("").chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
+                let e: String =
+                    original.rsplit_once('.').map(|(_, e)| e).unwrap_or("").chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
                 if e.is_empty() { "bin".into() } else { e.to_ascii_lowercase() }
             }
         };
         plan.push((kind, original, ext));
     }
-    let dir = attachments.join(format!("{at_ms}-phone"));
-    std::fs::create_dir_all(&dir).map_err(|e| Response::error(503, "save", &e.to_string()))?;
+    Ok(plan)
+}
+
+/// Checks files (`check_files`) and saves them as the panel saves its
+/// attachments: `<attachments>/<ms>-phone-<random>/<n>-<name>`, a new
+/// folder each time, never pruned.
+pub fn save_files(parts: &[multipart::Part], attachments: &std::path::Path, at_ms: u64) -> Result<Vec<Saved>, Response> {
+    let plan = check_files(parts)?;
+    if plan.is_empty() {
+        return Ok(vec![]);
+    }
+    let fail = |e: std::io::Error| Response::error(503, "save", &e.to_string());
+    std::fs::create_dir_all(attachments).map_err(fail)?;
+    // A folder of its own, even for two messages in the same millisecond.
+    let dir = loop {
+        let dir = attachments.join(format!("{at_ms}-phone-{}", auth::hex(&auth::random_bytes::<4>())));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => break dir,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(fail(e)),
+        }
+    };
     let mut out = vec![];
     for (i, (p, (kind, original, ext))) in parts.iter().zip(plan).enumerate() {
         // `<ms>-<name>.<ext>` from the screenshot naming, without the ms (the folder has it).
         let name = crate::screenshots::stored_name(0, std::path::Path::new(&original), &ext);
         let name = format!("{}-{}", i + 1, name.trim_start_matches("0-"));
         let path = dir.join(&name);
-        std::fs::write(&path, &p.data).map_err(|e| Response::error(503, "save", &e.to_string()))?;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(fail)?;
+        f.write_all(p.data).map_err(fail)?;
         let shown = std::path::Path::new(&original).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name);
         out.push(Saved { path: path.to_string_lossy().into_owned(), marker: marker(kind, i + 1, &shown) });
     }
@@ -1047,9 +1379,13 @@ fn new_history(path: &std::path::Path, offset: u64) -> (Vec<Value>, u64) {
     (text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect(), offset + last_nl as u64 + 1)
 }
 
-/// `t3`, `vps/t3`, a name: letters, digits, `-`, `_`, one `/`.
+/// `t3`, `vps/t3`, a name: letters, digits, `-`, `_`, one `/`, starting
+/// with a letter or digit (never `-`, which a command would take as an option).
 fn valid_address(a: &str) -> bool {
-    !a.is_empty() && a.len() <= 64 && a.matches('/').count() <= 1 && a.chars().all(|c| c.is_ascii_alphanumeric() || "-_/".contains(c))
+    a.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && a.len() <= 64
+        && a.matches('/').count() <= 1
+        && a.chars().all(|c| c.is_ascii_alphanumeric() || "-_/".contains(c))
 }
 
 #[cfg(test)]
@@ -1151,7 +1487,11 @@ mod tests {
         let tcp = TcpStream::connect(addr)?;
         tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
         let mut s = rustls::StreamOwned::new(conn, tcp);
-        write!(s, "{method} {path} HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n", body.len())?;
+        write!(
+            s,
+            "{method} {path} HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )?;
         s.write_all(body)?;
         s.flush()?;
         let mut out = Vec::new();
@@ -1226,7 +1566,10 @@ mod tests {
         assert_eq!(call(addr, &fp, "GET", "/v1/questions/qnope", Some(&token), "").unwrap().0, 404);
         let (st, v) = call(addr, &fp, "POST", "/v1/questions/qnope/answer", Some(&token), r#"{"answers":[{"tab":0,"choice":0}]}"#).unwrap();
         assert_eq!((st, v["error"]["code"].as_str()), (404, Some("no_question")));
-        assert_eq!(call(addr, &fp, "POST", "/v1/questions/qnope/interpret", Some(&token), r#"{"tab":0,"text":"the first"}"#).unwrap().0, 404);
+        assert_eq!(
+            call(addr, &fp, "POST", "/v1/questions/qnope/interpret", Some(&token), r#"{"tab":0,"text":"the first"}"#).unwrap().0,
+            404
+        );
         // Where this phone hears its replies: the phone by default, kept on file.
         let (st, v) = call(addr, &fp, "GET", "/v1/device/audio", Some(&token), "").unwrap();
         assert_eq!((st, v["route"].as_str()), (200, Some("phone")));
@@ -1334,12 +1677,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tower-lan-att-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let png: &[u8] = b"\x89PNG\r\n\x1a\n....";
-        let part = |f: &str, ct: Option<&str>, d: &[u8]| multipart::Part {
-            name: "file".into(),
-            filename: Some(f.into()),
-            content_type: ct.map(String::from),
-            data: d.to_vec(),
-        };
+        fn part<'a>(f: &str, ct: Option<&str>, d: &'a [u8]) -> multipart::Part<'a> {
+            multipart::Part { name: "file".into(), filename: Some(f.into()), content_type: ct.map(String::from), data: d }
+        }
         let saved = save_files(
             &[
                 part("../../etc/Screen Shot.png", None, png),
@@ -1351,8 +1691,15 @@ mod tests {
             42,
         )
         .unwrap();
-        let tail = |s: &Saved| s.path.rsplit_once("/42-phone/").map(|(_, t)| t.to_string()).unwrap();
-        assert_eq!(saved.iter().map(tail).collect::<Vec<_>>(), ["1-Screen-Shot.png", "2-clip.mov", "3-Q3-report--final.pdf", "4-noext.bin"]);
+        let tail = |s: &Saved| {
+            let (folder, name) = s.path.rsplit_once('/').unwrap();
+            assert!(folder.rsplit_once('/').unwrap().1.starts_with("42-phone-"), "{folder}");
+            name.to_string()
+        };
+        assert_eq!(
+            saved.iter().map(tail).collect::<Vec<_>>(),
+            ["1-Screen-Shot.png", "2-clip.mov", "3-Q3-report--final.pdf", "4-noext.bin"]
+        );
         assert_eq!(
             saved.iter().map(|s| s.marker.as_str()).collect::<Vec<_>>(),
             ["[Image #1]", "[Video #2]", "[File #3: Q3 report final.pdf]", "[File #4: noext]"],
@@ -1363,7 +1710,17 @@ mod tests {
         assert_eq!(save_files(&[part("x.png", None, b"text")], &dir, 43).unwrap_err().status, 415, "named as an image, isn't one");
         let seven: Vec<_> = (0..7).map(|i| part(&format!("{i}.png"), None, png)).collect();
         assert_eq!(save_files(&seven, &dir, 44).unwrap_err().status, 413);
-        assert_eq!(save_files(&[part("big.mp4", None, &vec![0; MAX_FILE_BYTES + 1])], &dir, 46).unwrap_err().status, 413);
+        let big = vec![0; MAX_FILE_BYTES + 1];
+        assert_eq!(save_files(&[part("big.mp4", None, &big)], &dir, 46).unwrap_err().status, 413);
+        // Two messages in the same millisecond: two folders, nothing overwritten.
+        let a = save_files(&[part("a.png", None, png)], &dir, 47).unwrap();
+        let b = save_files(&[part("a.png", None, b"\x89PNG\r\n\x1a\nother")], &dir, 47).unwrap();
+        assert_ne!(a[0].path, b[0].path);
+        assert_eq!(std::fs::read(&a[0].path).unwrap(), png);
+        // Nothing is saved when one file of several is refused.
+        let before = std::fs::read_dir(&dir).unwrap().count();
+        assert!(save_files(&[part("ok.png", None, png), part("x.png", None, b"text")], &dir, 48).is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), before);
         assert!(save_files(&[], &dir, 45).unwrap().is_empty());
         // Screenshot pruning never looks here.
         assert_eq!(crate::screenshots::prune(&dir, Duration::from_secs(0)), 0);
@@ -1374,8 +1731,15 @@ mod tests {
     fn markers_like_the_panel() {
         let m = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(with_markers("what is this?", &m(&["[Image #1]", "[Video #2]"])), "[Image #1] [Video #2] what is this?");
-        assert_eq!(with_markers("see [File #2: a.pdf] and [Image #1]", &m(&["[Image #1]", "[File #2: a.pdf]"])), "see [File #2: a.pdf] and [Image #1]");
-        assert_eq!(with_markers("see [File #1: renamed.pdf]", &m(&["[File #1: a.pdf]"])), "see [File #1: renamed.pdf]", "a file token counts by its number");
+        assert_eq!(
+            with_markers("see [File #2: a.pdf] and [Image #1]", &m(&["[Image #1]", "[File #2: a.pdf]"])),
+            "see [File #2: a.pdf] and [Image #1]"
+        );
+        assert_eq!(
+            with_markers("see [File #1: renamed.pdf]", &m(&["[File #1: a.pdf]"])),
+            "see [File #1: renamed.pdf]",
+            "a file token counts by its number"
+        );
         assert_eq!(with_markers("", &m(&["[File #1: a.pdf]"])), "[File #1: a.pdf]");
         assert_eq!(with_markers("x", &m(&["[Image #1]", "[Image #2]"])), crate::history::with_image_markers("x", 2));
         assert_eq!(with_markers("plain", &[]), "plain");
@@ -1412,7 +1776,11 @@ mod tests {
         let json_req = Request { body: br#"{"text":" hi "}"#.to_vec(), ..Default::default() };
         let (t, imgs) = ask_body(&json_req).ok().unwrap();
         assert_eq!((t.as_str(), imgs.len()), ("hi", 0));
-        let body = multipart::build("BB", &[("text", "what's this?")], &[("image", "a.png", "image/png", b"\x89PNG\r\n\x1a\n"), ("images", "b.gif", "image/gif", b"GIF89a")]);
+        let body = multipart::build(
+            "BB",
+            &[("text", "what's this?")],
+            &[("image", "a.png", "image/png", b"\x89PNG\r\n\x1a\n"), ("images", "b.gif", "image/gif", b"GIF89a")],
+        );
         let mut req = Request { body, ..Default::default() };
         req.headers.insert("content-type".into(), "multipart/form-data; boundary=BB".into());
         let (t, files) = ask_body(&req).ok().unwrap();
@@ -1435,6 +1803,10 @@ mod tests {
     fn addresses() {
         assert!(valid_address("t3") && valid_address("vps/t2a") && valid_address("feed-filters"));
         assert!(!valid_address("") && !valid_address("a/b/c") && !valid_address("t3;rm") && !valid_address("../x"));
+        assert!(
+            !valid_address("-h") && !valid_address("--lines") && !valid_address("/t3") && !valid_address("_x"),
+            "an address never reads as an option"
+        );
     }
 
     #[test]
@@ -1452,6 +1824,210 @@ mod tests {
         f.write_all(b"}\n").unwrap();
         let (e, _) = new_history(&p, off2);
         assert_eq!(e[0]["kind"], "c");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn text_from_the_phone_has_no_control_characters() {
+        assert_eq!(clean_text("ls\u{1b}[2J\u{1b}]0;x\u{7}\r\nok\tdone\u{9b}31m\u{0}"), "ls[2J]0;x\nok\tdone31m");
+        assert_eq!(clean_text("Grüße, 日本 ✓"), "Grüße, 日本 ✓");
+        let mut v = json!([{ "tab": 0, "choice": { "other": "yes\u{1b}[A\u{3}" } }]);
+        clean_json(&mut v);
+        assert_eq!(v[0]["choice"]["other"], "yes[A");
+        let req = Request { body: br#"{"text":"hi\u001b[31m there\r"}"#.to_vec(), ..Default::default() };
+        assert_eq!(ask_body(&req).ok().unwrap().0, "hi[31m there");
+    }
+
+    #[test]
+    fn each_call_has_its_body_limit() {
+        let req = |m: &str, ctype: Option<&str>| {
+            let mut r = Request { method: m.into(), ..Default::default() };
+            if let Some(c) = ctype {
+                r.headers.insert("content-type".into(), c.into());
+            }
+            r
+        };
+        let mp = Some("multipart/form-data; boundary=x");
+        assert_eq!(body_limit(&req("POST", None), &["v1", "pair"]), http::MAX_PAIR_BODY);
+        assert_eq!(body_limit(&req("POST", mp), &["v1", "pair"]), http::MAX_PAIR_BODY, "multipart doesn't widen pairing");
+        assert_eq!(body_limit(&req("POST", Some("audio/wav")), &["v1", "voice"]), http::MAX_VOICE_BODY);
+        assert_eq!(body_limit(&req("POST", None), &["v1", "questions", "q1", "voice"]), http::MAX_VOICE_BODY);
+        assert_eq!(body_limit(&req("POST", mp), &["v1", "voice"]), http::MAX_BODY);
+        assert_eq!(body_limit(&req("POST", mp), &["v1", "ask"]), http::MAX_BODY);
+        assert_eq!(body_limit(&req("POST", mp), &["v1", "questions", "q1", "answer"]), http::MAX_BODY);
+        assert_eq!(body_limit(&req("POST", None), &["v1", "ask"]), http::MAX_JSON_BODY);
+        assert_eq!(body_limit(&req("PUT", mp), &["v1", "behaviors", "b1"]), http::MAX_JSON_BODY);
+    }
+
+    #[test]
+    fn connections_are_capped_by_address_and_given_back() {
+        let conns = Arc::new(Mutex::new(Conns::default()));
+        let a: IpAddr = "192.168.1.20".parse().unwrap();
+        let b: IpAddr = "192.168.1.21".parse().unwrap();
+        let mine: Vec<Slot> = (0..MAX_PER_IP).map(|_| Slot::take(&conns, a).unwrap()).collect();
+        assert!(Slot::take(&conns, a).is_none(), "one address can't take every connection");
+        let theirs = Slot::take(&conns, b).unwrap();
+        drop(mine);
+        assert!(Slot::take(&conns, a).is_some(), "given back when dropped");
+        // A handler that panics gives its place back too.
+        let slot = Slot::take(&conns, b).unwrap();
+        let t = thread::spawn(move || {
+            let _slot = slot;
+            panic!("a bug");
+        });
+        assert!(t.join().is_err());
+        drop(theirs);
+        let c = conns.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!((c.total, c.by_ip.len()), (0, 0));
+    }
+
+    #[test]
+    fn a_slow_client_meets_one_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            // A byte every 100 ms: each read is quick, the whole never ends.
+            let mut c = TcpStream::connect(addr).unwrap();
+            for _ in 0..30 {
+                if c.write_all(b"G").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let (tcp, _) = listener.accept().unwrap();
+        tcp.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+        let mut sock = Sock { tcp, deadline: Some(Instant::now() + Duration::from_millis(500)) };
+        let t = Instant::now();
+        let err = http::read_head(&mut sock).unwrap_err();
+        assert!(t.elapsed() < Duration::from_secs(2), "{err:#} after {:?}", t.elapsed());
+        drop(sock);
+        client.join().unwrap();
+    }
+
+    /// Writes a request's head (and `body`), and reads the status.
+    fn call_head(addr: SocketAddr, pin: &str, head: &str, body: &[u8]) -> Result<(u16, Value, Duration)> {
+        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Pin(pin.to_string())))
+            .with_no_client_auth();
+        let conn = rustls::ClientConnection::new(Arc::new(cfg), rustls::pki_types::ServerName::try_from("herder-tower")?.to_owned())?;
+        let tcp = TcpStream::connect(addr)?;
+        tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let mut s = rustls::StreamOwned::new(conn, tcp);
+        let t = Instant::now();
+        s.write_all(head.as_bytes())?;
+        s.write_all(body)?;
+        s.flush()?;
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        let text = String::from_utf8_lossy(&out);
+        let status: u16 = text.split(' ').nth(1).unwrap_or("0").parse()?;
+        Ok((status, serde_json::from_str(text.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap_or(Value::Null), t.elapsed()))
+    }
+
+    fn test_lan(name: &str) -> (Lan, std::path::PathBuf, SocketAddr, String) {
+        let dir = std::env::temp_dir().join(format!("tower-lan-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hub = Arc::new(Hub::default());
+        let (stt, rx) = std::sync::mpsc::channel();
+        std::mem::forget(rx);
+        let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
+        let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
+        let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks };
+        let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
+        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false }).unwrap();
+        let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
+        (lan, dir, addr, fp)
+    }
+
+    #[test]
+    fn who_is_calling_is_known_before_the_body_is_read() {
+        let (lan, dir, addr, fp) = test_lan("body");
+        // No token, a huge body promised and never sent: refused at once, nothing waited for.
+        let (st, _, took) =
+            call_head(addr, &fp, &format!("POST /v1/ask HTTP/1.1\r\nContent-Length: {}\r\n\r\n", http::MAX_BODY), b"").unwrap();
+        assert_eq!(st, 401);
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        // Pairing takes a small body only.
+        let (st, v, _) = call_head(addr, &fp, "POST /v1/pair HTTP/1.1\r\nContent-Length: 100000\r\n\r\n", b"").unwrap();
+        assert_eq!((st, v["error"]["code"].as_str()), (413, Some("too_large")));
+        // A paired phone: JSON calls are small too, and a body that is short of what it said is refused.
+        let code = lan.pair().unwrap()["code"].as_str().unwrap().to_string();
+        let token =
+            call(addr, &fp, "POST", "/v1/pair", None, &format!(r#"{{"code":"{code}"}}"#)).unwrap().1["token"].as_str().unwrap().to_string();
+        let auth = format!("Authorization: Bearer {token}\r\n");
+        let big = format!("POST /v1/ask HTTP/1.1\r\n{auth}Content-Length: {}\r\n\r\n", http::MAX_JSON_BODY + 1);
+        assert_eq!(call_head(addr, &fp, &big, b"").unwrap().0, 413);
+        let wav =
+            format!("POST /v1/voice HTTP/1.1\r\n{auth}Content-Type: audio/wav\r\nContent-Length: {}\r\n\r\n", http::MAX_VOICE_BODY + 1);
+        assert_eq!(call_head(addr, &fp, &wav, b"").unwrap().0, 413);
+        let (st, v, _) = call_head(addr, &fp, &format!("POST /v1/hush HTTP/1.1\r\n{auth}Content-Length: 2\r\n\r\n"), b"{}").unwrap();
+        assert_eq!((st, v["ok"].as_bool()), (200, Some(true)));
+        lan.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pairing_tries_are_counted_by_address() {
+        let (lan, dir, addr, fp) = test_lan("tries");
+        let code = lan.pair().unwrap()["code"].as_str().unwrap().to_string();
+        let wrong = if code == "00000000" { "11111111" } else { "00000000" };
+        // Five wrong tries from here: the code is gone for this address only.
+        for left in (0..auth::CODE_TRIES).rev() {
+            let (st, v) = call(addr, &fp, "POST", "/v1/pair", None, &format!(r#"{{"code":"{wrong}"}}"#)).unwrap();
+            assert_eq!((st, v["error"]["tries_left"].as_u64()), (403, Some(left as u64)));
+        }
+        assert_eq!(
+            call(addr, &fp, "POST", "/v1/pair", None, &format!(r#"{{"code":"{code}"}}"#)).unwrap().1["error"]["code"],
+            "pairing_closed"
+        );
+        assert!(lan.pairing.lock().unwrap_or_else(|e| e.into_inner()).take(&code, "192.168.1.30".parse().unwrap()).is_ok(), "another phone can still pair");
+        lan.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn turning_it_off_ends_every_stream() {
+        let (lan, dir, addr, fp) = test_lan("off");
+        let code = lan.pair().unwrap()["code"].as_str().unwrap().to_string();
+        let token =
+            call(addr, &fp, "POST", "/v1/pair", None, &format!(r#"{{"code":"{code}"}}"#)).unwrap().1["token"].as_str().unwrap().to_string();
+        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Pin(fp.clone())))
+            .with_no_client_auth();
+        let conn =
+            rustls::ClientConnection::new(Arc::new(cfg), rustls::pki_types::ServerName::try_from("herder-tower").unwrap().to_owned())
+                .unwrap();
+        let tcp = TcpStream::connect(addr).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut s = rustls::StreamOwned::new(conn, tcp);
+        write!(s, "GET /v1/events?voice=1 HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n").unwrap();
+        s.flush().unwrap();
+        let mut seen = String::new();
+        let mut buf = [0u8; 4096];
+        while !seen.contains("event: state") {
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0);
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        assert!(lan.ctx.hub.voice());
+        lan.stop();
+        assert!(!lan.ctx.hub.voice(), "off: the Mac is the voice again");
+        assert!(lan.ctx.shared.get().phone.is_none());
+        // The stream ends (its end, or an error once the server is gone).
+        let t = Instant::now();
+        loop {
+            match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => assert!(t.elapsed() < Duration::from_secs(3), "the stream goes on after the API is off"),
+            }
+        }
+        assert!(t.elapsed() < Duration::from_secs(3));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

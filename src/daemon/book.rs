@@ -27,6 +27,14 @@ pub struct Watch {
     pub last: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    /// When the terminal was made: the watch is for that one (an address can
+    /// come back for another terminal).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_ms: Option<u64>,
+    /// Its turn count when watched: a turn that ended since is a finish, even
+    /// if nobody saw it working.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u64>,
 }
 
 /// A report owed to the brain.
@@ -79,7 +87,7 @@ impl Book {
 
     /// Written whole, through a temporary file: a crash leaves the old book or the new one.
     pub fn save_to(&self, path: &Path) {
-        let tmp = path.with_extension("json.tmp");
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -97,12 +105,30 @@ impl Book {
         Some(p)
     }
 
-    /// A report owed without a watch (an open job). Once per address and status.
+    /// A report owed without a watch (an open job). Once per address and
+    /// status; a note (the send queue's) once per text.
     pub fn owe(&mut self, p: Pending) -> bool {
-        if self.outbox.iter().any(|o| o.address == p.address && o.status == p.status) {
+        let same = |o: &Pending| if p.kind == "queue" { o.msg == p.msg } else { o.address == p.address && o.status == p.status && o.kind != "queue" };
+        if self.outbox.iter().any(same) {
             return false;
         }
         self.outbox.push(p);
+        true
+    }
+
+    /// Remembers a session's last status, forgetting the oldest ended ones
+    /// past a few hundred (the book stays small).
+    pub fn note_seen(&mut self, address: &str, status: &str) -> bool {
+        if self.seen.get(address).map(String::as_str) == Some(status) {
+            return false;
+        }
+        self.seen.insert(address.to_string(), status.to_string());
+        if self.seen.len() > 400 {
+            let ended: Vec<String> = self.seen.iter().filter(|(a, s)| s.as_str() == "gone" && !self.watches.contains_key(*a)).map(|(a, _)| a.clone()).collect();
+            for a in ended.into_iter().take(self.seen.len() - 400) {
+                self.seen.remove(&a);
+            }
+        }
         true
     }
 
@@ -127,6 +153,10 @@ impl Book {
 pub struct Now {
     pub live: bool,
     pub status: String,
+    /// When its terminal was made (another terminal at the same address is another session).
+    pub created_ms: Option<u64>,
+    /// Its turn count.
+    pub turn: Option<u64>,
 }
 
 /// An open job in the history (no watch needed).
@@ -160,10 +190,14 @@ pub fn reconcile(book: &Book, jobs: &[OpenJob], now: &BTreeMap<String, Now>, rea
             continue;
         }
         let was = book.seen.get(address).cloned().unwrap_or_else(|| w.last.clone());
+        let other = |n: &Now| matches!((w.created_ms, n.created_ms), (Some(a), Some(b)) if a != b);
+        let turned = |n: &Now| matches!((w.turn, n.turn), (Some(a), Some(b)) if b > a);
         match now.get(address) {
             None => out.push(Owed::Watch { address: address.clone(), status: "gone".into(), was }),
-            Some(n) if !n.live => out.push(Owed::Watch { address: address.clone(), status: "exited".into(), was }),
-            Some(n) if stopped(&n.status) => out.push(Owed::Watch { address: address.clone(), status: n.status.clone(), was }),
+            Some(n) if !n.live || other(n) => out.push(Owed::Watch { address: address.clone(), status: "exited".into(), was }),
+            Some(n) if stopped(&n.status) && (was == "working" || turned(n) || w.turn.is_none() || n.status == "blocked") => {
+                out.push(Owed::Watch { address: address.clone(), status: n.status.clone(), was })
+            }
             // Still working, or not reporting yet (a first-run question: the trust check has it).
             Some(_) => {}
         }
@@ -203,11 +237,11 @@ mod tests {
     use super::*;
 
     fn now(list: &[(&str, bool, &str)]) -> BTreeMap<String, Now> {
-        list.iter().map(|(a, live, s)| (a.to_string(), Now { live: *live, status: s.to_string() })).collect()
+        list.iter().map(|(a, live, s)| (a.to_string(), Now { live: *live, status: s.to_string(), created_ms: None, turn: None })).collect()
     }
 
     fn watch(note: &str, last: &str) -> Watch {
-        Watch { note: note.into(), since_ms: 1, last: last.into(), account: None }
+        Watch { note: note.into(), since_ms: 1, last: last.into(), ..Default::default() }
     }
 
     fn report(address: &str, status: &str) -> Pending {
@@ -351,6 +385,47 @@ mod tests {
         assert!(reconcile(&b, &[], &herdr, |_| true).is_empty());
         assert!(!b.deliver(400, |_| panic!("nothing left to send")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn another_terminal_at_the_address_ends_the_watch() {
+        let mut b = Book::default();
+        b.watches.insert("t1".into(), Watch { note: "x".into(), last: "working".into(), created_ms: Some(10), turn: Some(3), ..Default::default() });
+        b.watches.insert("t2".into(), Watch { note: "y".into(), last: "done".into(), created_ms: Some(20), turn: Some(3), ..Default::default() });
+        b.watches.insert("t3".into(), Watch { note: "z".into(), last: "done".into(), created_ms: Some(30), turn: Some(3), ..Default::default() });
+        let mut n = now(&[("t1", true, "idle"), ("t2", true, "done"), ("t3", true, "done")]);
+        n.get_mut("t1").unwrap().created_ms = Some(99);
+        // t2 took a turn and finished it while nobody looked; t3 hasn't moved.
+        n.get_mut("t2").unwrap().turn = Some(4);
+        n.get_mut("t3").unwrap().turn = Some(3);
+        let owed = reconcile(&b, &[], &n, |_| true);
+        assert_eq!(
+            owed,
+            vec![
+                Owed::Watch { address: "t1".into(), status: "exited".into(), was: "working".into() },
+                Owed::Watch { address: "t2".into(), status: "done".into(), was: "done".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn queue_notes_are_owed_once_per_text() {
+        let mut b = Book::default();
+        let note = |m: &str| Pending { address: "t1".into(), status: "news".into(), msg: m.into(), kind: "queue".into(), ..Default::default() };
+        assert!(b.owe(note("[queue] delivered to t1: a")));
+        assert!(b.owe(note("[queue] delivered to t1: b")));
+        assert!(!b.owe(note("[queue] delivered to t1: a")));
+        assert!(b.owe(report("t1", "news")), "a job report isn't a queue note");
+    }
+
+    #[test]
+    fn seen_stays_small() {
+        let mut b = Book::default();
+        for i in 0..500 {
+            b.note_seen(&format!("t{i}"), "gone");
+        }
+        assert!(b.seen.len() <= 401);
+        assert!(!b.note_seen("t499", "gone"));
     }
 
     #[test]

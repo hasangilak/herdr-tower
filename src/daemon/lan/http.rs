@@ -1,5 +1,7 @@
 //! Just enough HTTP/1.1 for the phone API: one request per connection
 //! (`Connection: close`), a body by `Content-Length` only, bounded sizes.
+//! The head is read first (`read_head`) so the caller can check who is
+//! calling before it reads a body (`read_body`) of the size that call allows.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -8,8 +10,14 @@ use anyhow::{Result, bail};
 use serde_json::Value;
 
 pub const MAX_HEAD: usize = 16 * 1024;
-/// Six 15 MB images and a recording, with room for the framing.
+/// A multipart call: six files and a recording, with room for the framing.
 pub const MAX_BODY: usize = 100 * 1024 * 1024;
+/// A plain WAV upload (two minutes of 48 kHz stereo 16-bit fit).
+pub const MAX_VOICE_BODY: usize = 24 * 1024 * 1024;
+/// A JSON call.
+pub const MAX_JSON_BODY: usize = 1024 * 1024;
+/// Before a device is known: `POST /v1/pair`.
+pub const MAX_PAIR_BODY: usize = 4 * 1024;
 
 #[derive(Debug, Default)]
 pub struct Request {
@@ -19,6 +27,8 @@ pub struct Request {
     pub query: HashMap<String, String>,
     /// Lowercase names.
     pub headers: HashMap<String, String>,
+    /// What `Content-Length` says the body is.
+    pub content_length: usize,
     pub body: Vec<u8>,
 }
 
@@ -34,11 +44,12 @@ impl Request {
     }
     /// Path segments: `/v1/agents/t3/answer` -> ["v1", "agents", "t3", "answer"].
     pub fn segments(&self) -> Vec<String> {
-        self.path.split('/').filter(|s| !s.is_empty()).map(decode).collect()
+        self.path.split('/').filter(|s| !s.is_empty()).map(|s| decode(s, false)).collect()
     }
 }
 
-fn decode(s: &str) -> String {
+/// Percent-decoding; `+` is a space only in a query (`plus`).
+fn decode(s: &str, plus: bool) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -52,7 +63,7 @@ fn decode(s: &str) -> String {
                 }
                 Err(_) => out.push(b'%'),
             },
-            b'+' => out.push(b' '),
+            b'+' if plus => out.push(b' '),
             c => out.push(c),
         }
         i += 1;
@@ -60,8 +71,10 @@ fn decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Reads one request. Errors are the client's fault (answer 400 and close).
-pub fn read_request(r: &mut impl Read) -> Result<Request> {
+/// Reads a request's head. The body is left unread: what came with the head
+/// is returned beside it, for `read_body`. Errors are the client's fault
+/// (answer 400 and close).
+pub fn read_head(r: &mut impl Read) -> Result<(Request, Vec<u8>)> {
     let mut buf = Vec::with_capacity(2048);
     let mut byte = [0u8; 1024];
     let head_end = loop {
@@ -93,7 +106,7 @@ pub fn read_request(r: &mut impl Read) -> Result<Request> {
     req.path = path.to_string();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        req.query.insert(decode(k), decode(v));
+        req.query.insert(decode(k, true), decode(v, true));
     }
     for line in lines {
         let Some((k, v)) = line.split_once(':') else { bail!("bad header line") };
@@ -102,23 +115,38 @@ pub fn read_request(r: &mut impl Read) -> Result<Request> {
     if req.headers.get("transfer-encoding").is_some_and(|t| !t.eq_ignore_ascii_case("identity")) {
         bail!("send a Content-Length body, not chunked");
     }
-    let len: usize = match req.headers.get("content-length") {
+    req.content_length = match req.headers.get("content-length") {
         Some(v) => v.parse().map_err(|_| anyhow::anyhow!("bad Content-Length"))?,
         None => 0,
     };
-    if len > MAX_BODY {
+    let mut rest = buf.split_off(head_end + 4);
+    rest.truncate(req.content_length);
+    Ok((req, rest))
+}
+
+/// Reads the body after `read_head` (`rest`: what came with the head), at
+/// most `max` bytes. It grows as bytes arrive: a big `Content-Length` alone
+/// reserves nothing.
+pub fn read_body(r: &mut impl Read, req: &mut Request, mut rest: Vec<u8>, max: usize) -> Result<()> {
+    let len = req.content_length;
+    if len > max {
         bail!("body too large");
     }
-    let mut body = buf[head_end + 4..].to_vec();
-    if body.len() > len {
-        body.truncate(len);
+    if rest.len() < len {
+        r.take((len - rest.len()) as u64).read_to_end(&mut rest)?;
     }
-    if body.len() < len {
-        let start = body.len();
-        body.resize(len, 0);
-        r.read_exact(&mut body[start..])?;
+    if rest.len() < len {
+        bail!("connection closed before the body was complete");
     }
-    req.body = body;
+    req.body = rest;
+    Ok(())
+}
+
+/// Reads one whole request, its body up to `MAX_BODY`.
+#[cfg(test)]
+pub fn read_request(r: &mut impl Read) -> Result<Request> {
+    let (mut req, rest) = read_head(r)?;
+    read_body(r, &mut req, rest, MAX_BODY)?;
     Ok(req)
 }
 
@@ -131,18 +159,17 @@ pub struct Response {
     pub status: u16,
     pub content_type: &'static str,
     pub body: Vec<u8>,
-    pub extra: Vec<(&'static str, String)>,
 }
 
 impl Response {
     pub fn json(status: u16, v: &Value) -> Response {
-        Response { status, content_type: "application/json", body: serde_json::to_vec(v).unwrap_or_default(), extra: vec![] }
+        Response { status, content_type: "application/json", body: serde_json::to_vec(v).unwrap_or_default() }
     }
     pub fn error(status: u16, code: &str, message: &str) -> Response {
         Self::json(status, &serde_json::json!({ "error": { "code": code, "message": message } }))
     }
     pub fn bytes(content_type: &'static str, body: Vec<u8>) -> Response {
-        Response { status: 200, content_type, body, extra: vec![] }
+        Response { status: 200, content_type, body }
     }
 }
 
@@ -166,17 +193,13 @@ pub fn reason(status: u16) -> &'static str {
 }
 
 pub fn write_response(w: &mut impl Write, r: &Response) -> Result<()> {
-    let mut head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n",
+    let head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         r.status,
         reason(r.status),
         r.content_type,
         r.body.len()
     );
-    for (k, v) in &r.extra {
-        head.push_str(&format!("{k}: {v}\r\n"));
-    }
-    head.push_str("\r\n");
     w.write_all(head.as_bytes())?;
     w.write_all(&r.body)?;
     w.flush()?;
@@ -219,6 +242,32 @@ mod tests {
         let huge = format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(MAX_HEAD + 10));
         assert!(read_request(&mut huge.as_bytes()).is_err());
         assert!(read_request(&mut &b"GET / HTTP/1.1\r\nContent-Length: 5\r\n\r\nab"[..]).is_err(), "body cut short");
+    }
+
+    #[test]
+    fn plus_is_a_space_only_in_the_query() {
+        let raw = b"GET /v1/sessions/a+b%2Bc/show?q=x+y%2Bz HTTP/1.1\r\n\r\n";
+        let r = read_request(&mut &raw[..]).unwrap();
+        assert_eq!(r.segments(), ["v1", "sessions", "a+b+c", "show"]);
+        assert_eq!(r.query["q"], "x y+z");
+    }
+
+    #[test]
+    fn the_head_comes_before_the_body() {
+        // A huge Content-Length: the head reads, nothing is reserved, and the body is refused by its limit.
+        let raw = format!("POST /v1/pair HTTP/1.1\r\nContent-Length: {}\r\n\r\n{{\"code\":", MAX_BODY);
+        let mut r = raw.as_bytes();
+        let (mut req, rest) = read_head(&mut r).unwrap();
+        assert_eq!((req.content_length, rest.as_slice()), (MAX_BODY, &b"{\"code\":"[..]));
+        assert!(read_body(&mut r, &mut req, rest, MAX_PAIR_BODY).is_err());
+        assert!(req.body.is_empty());
+        // What came with the head, and the rest after it.
+        let raw = b"POST / HTTP/1.1\r\nContent-Length: 6\r\n\r\nabcdefEXTRA";
+        let mut r = &raw[..];
+        let (mut req, rest) = read_head(&mut r).unwrap();
+        assert_eq!(rest, b"abcdef", "nothing past Content-Length");
+        read_body(&mut r, &mut req, rest, 6).unwrap();
+        assert_eq!(req.body, b"abcdef");
     }
 
     #[test]

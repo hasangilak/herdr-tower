@@ -137,7 +137,7 @@ pub fn of_pid(pid: u32) -> Option<String> {
     if !alive(pid) {
         return None;
     }
-    let mut mem = PIDS.lock().unwrap();
+    let mut mem = PIDS.lock().unwrap_or_else(|e| e.into_inner());
     let map = mem.get_or_insert_with(|| {
         let c: Cache = std::fs::read_to_string(cache_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
         c.pids.into_iter().filter_map(|(k, v)| k.parse::<u32>().ok().map(|p| (p, v))).collect()

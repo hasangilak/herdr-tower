@@ -21,7 +21,7 @@ use core_graphics::event::{
 };
 
 use super::mic::{Ctl, Ears};
-use super::state::Shared;
+use super::state::{Shared, lock};
 use super::tts::{Hold, Mouth};
 
 const HOLD: Duration = Duration::from_millis(400);
@@ -65,7 +65,7 @@ pub fn start(which: &str, ears: Ears, shared: Shared, mouth: Mouth) {
             .spawn(move || {
                 loop {
                     thread::sleep(Duration::from_millis(30));
-                    let mut k = key.lock().unwrap();
+                    let mut k = lock(&key);
                     if let Some(t) = k.down_at
                         && !k.other
                         && !k.holding
@@ -151,7 +151,7 @@ fn on_event(
     etype: CGEventType,
     event: &core_graphics::event::CGEvent,
 ) {
-    let mut k = key.lock().unwrap();
+    let mut k = lock(key);
     match etype {
         CGEventType::FlagsChanged => {
             let code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
@@ -178,7 +178,7 @@ fn on_event(
                         eprintln!("[hotkey] tap: talk");
                         // A take is starting: keep quiet until it has, so the
                         // paused sentence doesn't resume for a moment first.
-                        if shared.get().mic != "recording" {
+                        if shared.with(|s| s.mic != "recording") {
                             mouth.hold(Hold::Take, true);
                         }
                         ears.control(Ctl::Talk("toggle".into()));

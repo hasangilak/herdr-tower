@@ -115,10 +115,54 @@ pub fn about(kind: &str, session: &str, text: &str) -> Entry {
     e
 }
 
-/// Runs `f` on its own thread: the daemon's threads never wait for history
-/// (filling in a session's name asks herdr-core).
+/// Runs `f` on the history's own thread: the daemon's threads never wait
+/// for history (filling in a session's name asks herdr-core), and entries
+/// go in the order they came (one writer, one at a time).
 pub fn later(f: impl FnOnce() + Send + 'static) {
-    let _ = std::thread::Builder::new().name("history".into()).spawn(f);
+    type Job = Box<dyn FnOnce() + Send>;
+    static WRITER: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = std::sync::OnceLock::new();
+    let tx = WRITER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let _ = std::thread::Builder::new().name("history".into()).spawn(move || {
+            for job in rx {
+                job();
+            }
+        });
+        std::sync::Mutex::new(tx)
+    });
+    let sent = tx.lock().unwrap_or_else(|e| e.into_inner()).send(Box::new(f));
+    if let Err(e) = sent {
+        // The writer is gone (it can't be, short of a panic): run it here.
+        (e.0)();
+    }
+}
+
+/// The history past `max_bytes` is compacted: the whole file is kept aside
+/// (`history-<ms>.jsonl`), and the live one keeps the last `keep` entries
+/// plus every entry of a job still open. Returns how many entries went.
+pub fn compact(path: &std::path::Path, max_bytes: u64, keep: usize) -> std::io::Result<usize> {
+    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) <= max_bytes {
+        return Ok(0);
+    }
+    let text = std::fs::read_to_string(path)?;
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let entries: Vec<Option<Entry>> = lines.iter().map(|l| serde_json::from_str(l).ok()).collect();
+    let all: Vec<Entry> = entries.iter().flatten().cloned().collect();
+    let open: std::collections::HashSet<String> = jobs(&all).into_iter().filter(|j| j.open()).map(|j| j.id).collect();
+    let from = lines.len().saturating_sub(keep);
+    let kept: Vec<&str> = lines
+        .iter()
+        .zip(&entries)
+        .enumerate()
+        .filter(|(i, (_, e))| *i >= from || e.as_ref().and_then(|e| e.job.as_ref()).is_some_and(|j| open.contains(j)))
+        .map(|(_, (l, _))| *l)
+        .collect();
+    let aside = path.with_file_name(format!("history-{}.jsonl", now_ms()));
+    std::fs::copy(path, &aside)?;
+    let tmp = path.with_extension(format!("jsonl.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, kept.join("\n") + "\n")?;
+    std::fs::rename(&tmp, path)?;
+    Ok(lines.len() - kept.len())
 }
 
 pub fn record(kind: &str, text: &str) {
@@ -363,6 +407,47 @@ pub fn keep_attachment(src: &std::path::Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn later_keeps_the_order() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for i in 0..50 {
+            let tx = tx.clone();
+            later(move || {
+                let _ = tx.send(i);
+            });
+        }
+        let got: Vec<i32> = (0..50).map(|_| rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()).collect();
+        assert_eq!(got, (0..50).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn compacting_keeps_recent_and_open_jobs_and_loses_nothing() {
+        let dir = std::env::temp_dir().join(format!("tower-history-compact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("history.jsonl");
+        let mut lines = vec![];
+        // An old job still open, an old job that ended, then lots of notes.
+        let job = |id: &str, status: &str| Entry { at: 1, kind: "job".into(), job: Some(id.into()), session: Some("t1".into()), status: Some(status.into()), text: id.into(), ..Default::default() };
+        lines.push(serde_json::to_string(&job("j-open", "working")).unwrap());
+        lines.push(serde_json::to_string(&job("j-done", "working")).unwrap());
+        lines.push(serde_json::to_string(&job("j-done", "done")).unwrap());
+        for i in 0..100 {
+            lines.push(serde_json::to_string(&Entry { at: 2, kind: "note".into(), text: format!("n{i}"), ..Default::default() }).unwrap());
+        }
+        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
+        assert_eq!(compact(&p, u64::MAX, 10).unwrap(), 0, "small enough: untouched");
+        let gone = compact(&p, 10, 10).unwrap();
+        let left: Vec<Entry> = std::fs::read_to_string(&p).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(left.len(), 11);
+        assert_eq!(gone, 103 - 11);
+        assert_eq!(left[0].job.as_deref(), Some("j-open"));
+        assert_eq!(left.last().unwrap().text, "n99");
+        let aside: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("history-")).collect();
+        assert_eq!(aside.len(), 1, "the whole file is kept aside");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn image_markers_like_the_panel() {

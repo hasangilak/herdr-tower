@@ -7,6 +7,8 @@ pub mod lan;
 pub mod mic;
 pub mod narrate;
 pub mod queue;
+pub mod sendq;
+pub mod sessions;
 pub mod state;
 pub mod stt;
 pub mod timing;
@@ -37,6 +39,7 @@ struct Daemon {
     watches: watch::Watches,
     lan: lan::Lan,
     asks: asks::Asks,
+    sendq: sendq::SendQueue,
 }
 
 pub fn run() -> Result<()> {
@@ -109,7 +112,44 @@ pub fn run() -> Result<()> {
             }
         })?;
     }
-    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks };
+    // A history grown large is compacted (the whole file kept aside).
+    match crate::history::compact(&crate::history::path(), 16 << 20, 20_000) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("[tower] history: {n} old entries moved aside"),
+        Err(e) => eprintln!("[tower] history: couldn't compact it: {e}"),
+    }
+    // What agent sessions' hooks left while no daemon ran.
+    let spooled = sessions::registry().take_spool(&sessions::spool_path());
+    if spooled > 0 {
+        eprintln!("[sessions] {spooled} hook event(s) from while the voice was down");
+    }
+    let sendq = sendq::SendQueue::open();
+    {
+        // What the queue delivers is watched; what it has to say goes through the radar's outbox.
+        let (tell, watch) = (watches.clone(), watches.clone());
+        sendq::wire(sendq::Wiring {
+            tell: Box::new(move |note| {
+                // A test session's queue news never reaches the brain (as with its alerts).
+                let test_name = note.name.starts_with("qfix ") || note.name.starts_with("qfix-");
+                if test_name || (!note.session.is_empty() && crate::hc::get(&note.session).is_some_and(|t| watch::is_test(&t))) {
+                    eprintln!("[queue] (test session) {}", note.msg);
+                    return;
+                }
+                tell.tell(note)
+            }),
+            watch: Box::new(move |session, text| {
+                // Test sessions are never watched (nothing would ever report on them).
+                if crate::hc::get(session).is_some_and(|t| watch::is_test(&t)) {
+                    return;
+                }
+                if let Err(e) = watch.add(session, text, None) {
+                    eprintln!("[queue] couldn't watch {session}: {e:#}");
+                }
+            }),
+        });
+    }
+    sendq.start();
+    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks, sendq };
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let d = daemon.clone();
@@ -170,6 +210,19 @@ impl Daemon {
                 }
             }
             Request::Hush => self.mouth.hush(),
+            Request::Mute { action } => {
+                // The toggle reads and flips under the mouth's lock: two at once can't both read "unmuted".
+                let done = match action.as_str() {
+                    "on" => self.mouth.set_muted(true),
+                    "off" => self.mouth.set_muted(false),
+                    "toggle" => self.mouth.toggle_muted().map(|_| ()),
+                    "status" | "" => Ok(()),
+                    _ => return Response::err("mute is on, off, toggle or status"),
+                };
+                if let Err(e) = done {
+                    return Response::err(format!("{e:#}"));
+                }
+            }
             Request::Talk { action } => self.ears.control(mic::Ctl::Talk(action)),
             Request::Cancel => self.ears.control(mic::Ctl::Cancel),
             Request::Mode { mode } => {
@@ -184,7 +237,33 @@ impl Daemon {
                     return Response::err(brain::spoken_error(&format!("{e:#}")));
                 }
             }
-            Request::Watch { terminal, note, account } => self.watches.add(&terminal, &note, account),
+            Request::Watch { terminal, note, account } => {
+                return match self.watches.add(&terminal, &note, account) {
+                    Ok(address) => Response { ok: true, error: None, state: Some(serde_json::json!({ "address": address })) },
+                    Err(e) => Response::err(format!("{e:#}")),
+                };
+            }
+            Request::Queue { action, session, text, id, after, start } => {
+                if action == "start" {
+                    return match self.sendq.add_start(&session, &text, &start, &after) {
+                        Ok(id) => Response { ok: true, error: None, state: Some(serde_json::json!({ "id": id, "name": session })) },
+                        Err(e) => Response::err(format!("{e:#}")),
+                    };
+                }
+                return self.queue(&action, &session, &text, id, &after);
+            }
+            Request::Agent { event } => {
+                let change = sessions::registry().apply(&event);
+                if change != sessions::Change::Nothing {
+                    self.watches.agent(&event, &change);
+                    self.sendq.kick();
+                }
+                return Response { ok: true, error: None, state: None };
+            }
+            Request::Sessions => {
+                let all = sessions::registry().all();
+                return Response { ok: true, error: None, state: Some(serde_json::json!({ "sessions": all })) };
+            }
             Request::Status => {}
             Request::Questions => {
                 let v: Vec<serde_json::Value> = self.asks.list().iter().map(|s| serde_json::to_value(s).unwrap_or_default()).collect();
@@ -308,6 +387,38 @@ impl Daemon {
             std::thread::spawn(move || {
                 let _ = crate::brain::note(&note);
             });
+        }
+    }
+}
+
+impl Daemon {
+    /// `tower queue`: add (sent now when the session is free), list, cancel.
+    fn queue(&self, action: &str, session: &str, text: &str, id: Option<u64>, after: &[u64]) -> Response {
+        let ok = |v: serde_json::Value| Response { ok: true, error: None, state: Some(v) };
+        match action {
+            "retarget" => match id.map(|id| self.sendq.retarget(id, session)) {
+                Some(Ok(item)) => ok(serde_json::json!({ "retargeted": item })),
+                Some(Err(e)) => Response::err(format!("{e:#}")),
+                None => Response::err("retarget needs an id and a session"),
+            },
+            "track" => match self.sendq.track(session, text) {
+                Ok(id) => ok(serde_json::json!({ "id": id, "session": session })),
+                Err(e) => Response::err(format!("{e:#}")),
+            },
+            "add" => match self.sendq.add(session, text, after) {
+                Ok((sendq::Added::Sent { id }, address, name)) => ok(serde_json::json!({ "sent": true, "id": id, "session": address, "name": name })),
+                Ok((sendq::Added::Queued { id, position, status }, address, name)) => {
+                    ok(serde_json::json!({ "sent": false, "id": id, "position": position, "status": status, "session": address, "name": name }))
+                }
+                Err(e) => Response::err(format!("{e:#}")),
+            },
+            "list" => ok(serde_json::json!({ "items": self.sendq.items() })),
+            "cancel" => match id.map(|id| self.sendq.cancel(id)) {
+                Some(Ok(item)) => ok(serde_json::json!({ "cancelled": item })),
+                Some(Err(e)) => Response::err(format!("{e:#}")),
+                None => Response::err("cancel needs an id"),
+            },
+            _ => Response::err("queue is add, list, cancel or retarget"),
         }
     }
 }

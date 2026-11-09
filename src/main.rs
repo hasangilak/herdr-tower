@@ -15,6 +15,7 @@ mod brain;
 mod chat;
 mod config;
 mod daemon;
+mod dispatch;
 mod draft;
 mod hc;
 mod history;
@@ -27,6 +28,7 @@ mod questions;
 mod screenshots;
 mod selftest;
 mod spaces;
+mod split;
 mod text;
 
 use std::io::IsTerminal;
@@ -74,6 +76,40 @@ enum Cmd {
     },
     /// Stop and start the voice (after a config change). The brain keeps running.
     Restart,
+    /// Send a session an instruction now if it's free, or queue it until it stops working
+    /// (delivered in order, kept across restarts). `tower queue list`, `tower queue cancel <id>`.
+    Queue {
+        /// <session> "<instruction>", or list, or cancel <id>.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
+    /// Hand out a request with several tasks: each to the session in its project's folder, or a
+    /// new one, each watched, `after` for one that waits for another:
+    /// `tower dispatch --json '{"tasks":[{"id":"a","project":"~/w/api","instruction":"…"},{"id":"b","project":"~/w/web","instruction":"…","after":["a"]}]}'`
+    Dispatch {
+        /// The plan (tasks: id, title, project, instruction, after, session, name, space, account, on, isolate).
+        #[arg(long)]
+        json: String,
+        /// Only say where each task would go.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// What every agent session's hooks told the tower: its terminal, session id, prompt, last answer.
+    Sessions {
+        /// One terminal.
+        terminal: Option<String>,
+    },
+    /// The agent hooks that let the tower see every Claude Code and Codex session: install, remove or status.
+    Hooks {
+        #[arg(default_value = "status")]
+        action: String,
+    },
+    /// Mute the tower: nothing is said on the Mac or the phones (text and chat go on). Kept across restarts.
+    Mute {
+        /// on, off, toggle or status (default).
+        #[arg(default_value = "status")]
+        action: String,
+    },
     /// What the tower is doing.
     Status,
     /// Every agent on every machine (JSON when piped).
@@ -369,6 +405,43 @@ fn run(cli: Cli) -> Result<()> {
             println!("Tower stopped.");
             Ok(())
         }
+        Cmd::Queue { args } => queue_cmd(&args),
+        Cmd::Dispatch { json, dry_run } => dispatch::run(&json, dry_run),
+        Cmd::Sessions { terminal } => {
+            let v = protocol::send(&Request::Sessions)?.state.unwrap_or_default();
+            let all = v["sessions"].as_array().cloned().unwrap_or_default();
+            // A name means its terminal's address.
+            let want = terminal.as_deref().map(|t| hc::get(t).and_then(|v| v["address"].as_str().map(String::from)).unwrap_or_else(|| t.to_string()));
+            let mine: Vec<Value> = all.into_iter().filter(|s| want.as_deref().is_none_or(|t| s["terminal"] == t)).collect();
+            if std::io::stdout().is_terminal() {
+                for s in &mine {
+                    let said = s["said"].as_str().unwrap_or("");
+                    let said: String = said.chars().take(100).collect();
+                    println!(
+                        "{:<6} {:<12} {:<8} {}  prompt: {}  said: {}",
+                        s["terminal"].as_str().unwrap_or(""),
+                        s["app"].as_str().unwrap_or(""),
+                        s["state"].as_str().unwrap_or(""),
+                        s["cwd"].as_str().unwrap_or(""),
+                        s["prompt"].as_str().unwrap_or("").chars().take(60).collect::<String>(),
+                        said
+                    );
+                }
+            } else {
+                print_json(&json!(mine));
+            }
+            Ok(())
+        }
+        Cmd::Hooks { action } => install::agent_hooks(&action),
+        Cmd::Mute { action } => {
+            let r = protocol::send(&Request::Mute { action })?;
+            if !r.ok {
+                bail!("{}", r.error.unwrap_or_default());
+            }
+            let muted = r.state.as_ref().and_then(|s| s["muted"].as_bool()).unwrap_or(false);
+            println!("{}", if muted { "Muted: the tower says nothing (tower mute off to hear it again)." } else { "Not muted: the tower talks." });
+            Ok(())
+        }
         Cmd::Restart => {
             let _ = protocol::send(&Request::Quit);
             brain::stop(brain::VOICE_NAME);
@@ -525,6 +598,10 @@ fn run(cli: Cli) -> Result<()> {
                 "activity-prompt" => activity::hook("prompt"),
                 "activity-pre" => activity::hook("pre"),
                 "activity-post" => activity::hook("post"),
+                // Every agent session's hooks: `tower hook agent claude|codex`.
+                "agent" => hooks::agent(arg.as_deref().unwrap_or("claude")),
+                // The brain's Bash calls: one hand-off per task.
+                "brain-guard" => hooks::brain_guard(),
                 _ => {}
             }
             Ok(())
@@ -576,6 +653,90 @@ fn ok(req: Request) -> Result<()> {
     let r = protocol::send(&req)?;
     if !r.ok {
         bail!("{}", r.error.unwrap_or_default());
+    }
+    Ok(())
+}
+
+/// An id as `tower queue list` prints it (`#3` or `3`).
+fn queue_id(s: &str) -> Result<u64> {
+    s.trim_start_matches('#').parse().map_err(|_| anyhow::anyhow!("{s} isn't an id (tower queue list shows them)"))
+}
+
+fn queue_cmd(args: &[String]) -> Result<()> {
+    let q = |action: &str, session: &str, text: String, id: Option<u64>, after: Vec<u64>| Request::Queue {
+        action: action.into(),
+        session: session.into(),
+        text,
+        id,
+        after,
+        start: vec![],
+    };
+    let usage = "usage: tower queue <session> [--after <id>[,<id>]] \"<instruction>\" | list | cancel <id> | retarget <id> <session>";
+    let req = match args.first().map(String::as_str) {
+        Some("list") if args.len() == 1 => q("list", "", String::new(), None, vec![]),
+        Some("cancel") if args.len() == 2 => q("cancel", "", String::new(), Some(queue_id(&args[1])?), vec![]),
+        Some("retarget") if args.len() == 3 => q("retarget", &args[2], String::new(), Some(queue_id(&args[1])?), vec![]),
+        Some(session) if args.len() >= 2 => {
+            let mut rest = &args[1..];
+            let mut after = vec![];
+            loop {
+                match rest.first().map(String::as_str) {
+                    Some("--after") if rest.len() >= 3 => {
+                        for id in rest[1].split(',').filter(|s| !s.is_empty()) {
+                            after.push(queue_id(id)?);
+                        }
+                        rest = &rest[2..];
+                    }
+                    // One task, though it reads like several (the brain's guard lets it through).
+                    Some("--whole") => rest = &rest[1..],
+                    _ => break,
+                }
+            }
+            q("add", session, rest.join(" "), None, after)
+        }
+        _ => bail!("{usage}"),
+    };
+    let action = match &req {
+        Request::Queue { action, .. } => action.clone(),
+        _ => unreachable!(),
+    };
+    let r = protocol::send(&req)?;
+    if !r.ok {
+        bail!("{}", r.error.unwrap_or_default());
+    }
+    let v = r.state.unwrap_or_default();
+    if !std::io::stdout().is_terminal() {
+        print_json(&v);
+        return Ok(());
+    }
+    match action.as_str() {
+        "add" if v["sent"] == true => println!(
+            "Sent #{} to {} ({}): it was free. Watching it: you'll get a [watch] message when it stops working.",
+            v["id"],
+            v["session"].as_str().unwrap_or(""),
+            v["name"].as_str().unwrap_or("")
+        ),
+        "retarget" => println!("#{} now waits for {}.", v["retargeted"]["id"], v["retargeted"]["session"].as_str().unwrap_or("")),
+        "add" => println!(
+            "Queued #{} for {} ({}, {}): position {}. It goes in when the session stops working and is watched then; the brain hears \"[queue] delivered to {}\".",
+            v["id"],
+            v["session"].as_str().unwrap_or(""),
+            v["name"].as_str().unwrap_or(""),
+            v["status"].as_str().unwrap_or(""),
+            v["position"],
+            v["session"].as_str().unwrap_or("")
+        ),
+        "cancel" => println!("Cancelled #{}: {}", v["cancelled"]["id"], v["cancelled"]["text"].as_str().unwrap_or("")),
+        _ => {
+            let items: Vec<daemon::sendq::Item> = serde_json::from_value(v["items"].clone()).unwrap_or_default();
+            if items.is_empty() {
+                println!("Nothing queued.");
+            }
+            let status = |s: &str| hc::get(s).filter(|t| t["state"] == "live").map(|t| hc::status_word(&t).unwrap_or_default());
+            for line in daemon::sendq::describe(&items, status) {
+                println!("{line}");
+            }
+        }
     }
     Ok(())
 }
@@ -720,7 +881,7 @@ fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str
         // No voice running (or no watch wanted): keep the job in the history all the same.
         history::job_start_on(&address, task, account.clone());
     }
-    if std::io::stdout().is_terminal() || !watched {
+    if std::io::stdout().is_terminal() {
         println!(
             "Started {name} as {address}{in_space}{on_account}.{}",
             if watched { " Watching it: you'll get a [watch] message when it stops working. End your turn now." } else { "" }

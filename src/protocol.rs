@@ -24,6 +24,10 @@ pub enum Request {
     },
     /// Stop speaking, and drop what was queued.
     Hush,
+    /// The tower-wide mute: `on`, `off`, `toggle` or `status`.
+    Mute {
+        action: String,
+    },
     /// Press-to-talk: `toggle`, `start` or `stop` (stop transcribes what was heard).
     Talk {
         action: String,
@@ -47,6 +51,30 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<String>,
     },
+    /// The send queue: `add` (`session`, `text`, `after`), `list`, `cancel`
+    /// (`id`), `retarget` (`id` to `session`), `track` (`session`, `text`:
+    /// a session started with that task, for `after`).
+    Queue {
+        action: String,
+        #[serde(default)]
+        session: String,
+        #[serde(default)]
+        text: String,
+        #[serde(default)]
+        id: Option<u64>,
+        /// Ids that must be done first.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        after: Vec<u64>,
+        /// `start`: the `tower start` arguments for a session started once `after` is done.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        start: Vec<String>,
+    },
+    /// An agent session's hook fired (`tower hook agent`).
+    Agent {
+        event: crate::daemon::sessions::AgentEvent,
+    },
+    /// What the agent sessions' hooks said (`tower sessions`).
+    Sessions,
     /// The phone API: `on`, `off`, `pair`, `revoked` (arg: device id), `status`.
     Phone {
         action: String,
@@ -104,10 +132,25 @@ impl Response {
 }
 
 pub fn send(req: &Request) -> Result<Response> {
+    send_within(req, wait_for(req))
+}
+
+/// How long an answer may take: typing a dialog's answers, a queue that
+/// reaches another machine, and a dispatch take longer than the rest.
+fn wait_for(req: &Request) -> Duration {
+    match req {
+        Request::Answer { .. } => Duration::from_secs(180),
+        Request::Queue { .. } => Duration::from_secs(90),
+        _ => Duration::from_secs(10),
+    }
+}
+
+pub fn send_within(req: &Request, wait: Duration) -> Result<Response> {
     let path = config::socket_path();
     let mut stream = UnixStream::connect(&path)
         .with_context(|| format!("the tower's voice isn't running (no {}); start it with `tower up`", path.display()))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(wait))?;
+    stream.set_write_timeout(Some(wait))?;
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
     stream.write_all(line.as_bytes())?;

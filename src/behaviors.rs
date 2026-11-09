@@ -401,7 +401,7 @@ impl Store {
                 s += &format!("\n## {}\n", b.category);
                 last = b.category.clone();
             }
-            s += &format!("\n### {}\n\n{}", b.title, b.text.trim_end());
+            s += &format!("\n### {}\n\n{}", b.title, without_links(&b.text).trim_end());
             s += "\n";
         }
         s
@@ -560,6 +560,35 @@ pub fn brain_memory_dir() -> PathBuf {
     let dir = crate::config::brain_dir();
     let escaped: String = dir.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
     crate::config::home().join(".claude/projects").join(escaped).join("memory")
+}
+
+/// A behavior's text for the brain, without the memory notes' `[[links]]`
+/// (they point at notes it doesn't have): "See [[x]]." goes, `[[x]]` reads x.
+pub fn without_links(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        let mut l = line.to_string();
+        // A whole "See [[a]], [[b]]." sentence.
+        while let Some(start) = l.find("See [[") {
+            let end = l[start..].find("]].").map(|e| start + e + 3).or_else(|| l[start..].rfind("]]").map(|e| start + e + 2)).unwrap_or(l.len());
+            l.replace_range(start..end, "");
+        }
+        while let (Some(a), Some(b)) = (l.find("[["), l.find("]]")) {
+            if b < a {
+                break;
+            }
+            let inner = l[a + 2..b].to_string();
+            l.replace_range(a..b + 2, &inner);
+        }
+        out.push_str(l.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+#[test]
+fn memory_links_are_not_in_the_prompt() {
+    assert_eq!(without_links("Say which space. See [[claude-accounts-default-orca]].\nkeep [[this]] word").trim(), "Say which space.\nkeep this word");
 }
 
 #[cfg(test)]

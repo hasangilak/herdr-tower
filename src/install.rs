@@ -47,8 +47,130 @@ pub fn install(keys: bool) -> Result<()> {
     // 3. The orb has the tower's keys now; take the old mod's out of Herdr.
     let _ = keys;
     tidy_keys()?;
+
+    // 4. Every agent session's hooks, so the tower sees what each one does.
+    agent_hooks("install")?;
     Ok(())
 }
+
+/// The agent events the tower follows, per program (Claude Code's and
+/// Codex's hook names). Tool calls are left out: far too many.
+const CLAUDE_EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit", "Notification", "PermissionRequest", "Stop", "StopFailure", "SessionEnd"];
+const CODEX_EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit", "PermissionRequest", "Stop"];
+
+/// Where each program keeps its hooks.
+fn hook_files() -> Vec<(&'static str, PathBuf, &'static [&'static str])> {
+    let claude = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| config::home().join(".claude"));
+    let codex = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| config::home().join(".codex"));
+    vec![("claude", claude.join("settings.json"), CLAUDE_EVENTS), ("codex", codex.join("hooks.json"), CODEX_EVENTS)]
+}
+
+/// `tower hooks install|remove|status`: the tower's hook in every agent
+/// session's settings (Claude Code's `~/.claude/settings.json`, Codex's
+/// `~/.codex/hooks.json`), beside whatever else is there. A file is backed up
+/// before its first change.
+pub fn agent_hooks(action: &str) -> Result<()> {
+    let tower = config::tower_bin();
+    for (app, path, events) in hook_files() {
+        let command = hook_command(&tower.display().to_string(), app);
+        // Codex not installed: nothing to hook.
+        if app == "codex" && !path.parent().is_some_and(|d| d.exists()) {
+            if action == "status" {
+                println!("- codex: not installed");
+            }
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let before: Value = if text.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&text).with_context(|| format!("reading {}", path.display()))?
+        };
+        let after = match action {
+            "install" => with_hooks(&before, events, &command),
+            "remove" | "uninstall" => without_hooks(&before),
+            "status" => {
+                let missing = missing_events(&before, events);
+                if missing.is_empty() {
+                    println!("✓ {app}: the tower follows every session ({})", path.display());
+                } else {
+                    println!("✗ {app}: not following {} ({}): run `tower hooks install`", missing.join(", "), path.display());
+                }
+                continue;
+            }
+            other => anyhow::bail!("tower hooks {other}: use install, remove or status"),
+        };
+        if after == before {
+            println!("✓ {app}: hooks {} ({})", if action == "install" { "in place" } else { "already out" }, path.display());
+            continue;
+        }
+        if path.exists() {
+            let backup = path.with_extension("json.tower-backup");
+            if !backup.exists() {
+                std::fs::copy(&path, &backup).with_context(|| format!("backing up {}", path.display()))?;
+            }
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension("json.tower-tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(&after)? + "\n")?;
+        std::fs::rename(&tmp, &path)?;
+        println!("✓ {app}: hooks {} ({})", if action == "install" { "installed" } else { "removed" }, path.display());
+    }
+    Ok(())
+}
+
+fn hook_command(tower: &str, app: &str) -> String {
+    format!("'{tower}' hook agent {app}")
+}
+
+/// One of the tower's own hook entries.
+fn is_ours(entry: &Value) -> bool {
+    entry["hooks"].as_array().is_some_and(|hs| hs.iter().any(|h| h["command"].as_str().is_some_and(|c| c.contains(" hook agent "))))
+}
+
+/// The settings with the tower's hook on each event (once; an older one,
+/// say from another install path, is replaced).
+fn with_hooks(settings: &Value, events: &[&str], command: &str) -> Value {
+    let mut v = settings.clone();
+    if !v.is_object() {
+        v = serde_json::json!({});
+    }
+    if !v["hooks"].is_object() {
+        v["hooks"] = serde_json::json!({});
+    }
+    for event in events {
+        let list = v["hooks"][*event].as_array().cloned().unwrap_or_default();
+        let mut list: Vec<Value> = list.into_iter().filter(|e| !is_ours(e)).collect();
+        list.push(serde_json::json!({ "hooks": [{ "type": "command", "command": command, "timeout": 5 }] }));
+        v["hooks"][*event] = Value::Array(list);
+    }
+    v
+}
+
+/// The settings without any of the tower's agent hooks.
+fn without_hooks(settings: &Value) -> Value {
+    let mut v = settings.clone();
+    if let Some(hooks) = v.get_mut("hooks").and_then(Value::as_object_mut) {
+        for (_, list) in hooks.iter_mut() {
+            if let Some(a) = list.as_array_mut() {
+                a.retain(|e| !is_ours(e));
+            }
+        }
+        hooks.retain(|_, list| list.as_array().is_none_or(|a| !a.is_empty()));
+    }
+    v
+}
+
+fn missing_events(settings: &Value, events: &[&str]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|e| !settings["hooks"][**e].as_array().is_some_and(|a| a.iter().any(is_ours)))
+        .map(|e| e.to_string())
+        .collect()
+}
+
 
 /// Takes the keys earlier versions added for the old mod out of Herdr's
 /// keys.json (only where they still say what the tower put there).
@@ -92,6 +214,8 @@ pub fn doctor() -> Result<()> {
     check(b.is_some(), format!("brain {}", b.as_ref().and_then(hc::status_word).unwrap_or_else(|| "not running".into())));
     let machines = hc::machines();
     println!("  machines: {}", if machines.is_empty() { "none added (hc machine add <ssh host>)".into() } else { machines.join(", ") });
+    // Whether the tower sees every agent session (their hooks).
+    agent_hooks("status")?;
     Ok(())
 }
 
@@ -101,4 +225,30 @@ fn which(name: &str) -> bool {
 
 fn yes(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hooks_go_in_beside_others_once_and_come_out_clean() {
+        let others = serde_json::json!({
+            "model": "opus",
+            "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "rtk hook claude" }] }] }
+        });
+        let cmd = hook_command("/Users/me/.local/bin/tower", "claude");
+        let once = with_hooks(&others, CLAUDE_EVENTS, &cmd);
+        let twice = with_hooks(&once, CLAUDE_EVENTS, &cmd);
+        assert_eq!(once, twice, "installing again changes nothing");
+        assert_eq!(once["hooks"]["Stop"].as_array().unwrap().len(), 2, "the other Stop hook stays");
+        assert_eq!(once["model"], "opus");
+        assert!(missing_events(&once, CLAUDE_EVENTS).is_empty());
+        assert_eq!(missing_events(&others, &["Stop"]), vec!["Stop"]);
+        // Another install path replaces the old entry.
+        let moved = with_hooks(&once, CLAUDE_EVENTS, &hook_command("/opt/tower", "claude"));
+        assert_eq!(moved["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+        let out = without_hooks(&moved);
+        assert_eq!(out, others, "removing leaves exactly what was there");
+    }
 }

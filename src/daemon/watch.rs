@@ -4,10 +4,10 @@
 //! and fires the brain's watches.
 
 use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -24,6 +24,12 @@ use crate::hc;
 struct Seen {
     name: String,
     status: String,
+    /// When its terminal was made (another one at the same address is another session).
+    created_ms: Option<u64>,
+    /// Its turn count.
+    turn: Option<u64>,
+    /// The folder it works in.
+    cwd: String,
     app: String,
     /// The Claude account it runs under (see `accounts`), when known.
     account: Option<String>,
@@ -41,6 +47,8 @@ pub struct Watches {
     radar: Arc<OnceLock<Radar>>,
     /// One delivery at a time, so no report goes out twice.
     sending: Arc<Mutex<()>>,
+    /// Wakes the outbox thread (a report is owed now).
+    kick: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl Default for Watches {
@@ -49,8 +57,13 @@ impl Default for Watches {
             book: Arc::new(Mutex::new(Book::load_from(&Book::path()))),
             radar: Arc::new(OnceLock::new()),
             sending: Arc::new(Mutex::new(())),
+            kick: Arc::new((Mutex::new(false), Condvar::new())),
         }
     }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl Watches {
@@ -58,26 +71,78 @@ impl Watches {
         book.save_to(&Book::path());
     }
 
-    pub fn add(&self, terminal: &str, note: &str, account: Option<String>) {
-        let (t, n, acc) = (terminal.to_string(), note.to_string(), account.clone());
+    /// Watches a session (by its address or name): the brain hears when it
+    /// stops. Returns its address. A session hc says isn't there is an error;
+    /// one on a machine out of reach is watched as asked.
+    pub fn add(&self, terminal: &str, note: &str, account: Option<String>) -> anyhow::Result<String> {
+        let (address, created_ms, turn, status) = match hc::lookup(terminal) {
+            hc::Lookup::Found(t) if t["state"] == "live" => (
+                t["address"].as_str().unwrap_or(terminal).to_string(),
+                hc::created_ms(&t),
+                hc::turn(&t),
+                hc::status_word(&t).unwrap_or_default(),
+            ),
+            hc::Lookup::Found(_) => anyhow::bail!("{terminal} has ended: nothing to watch"),
+            hc::Lookup::Gone => anyhow::bail!("no session {terminal}"),
+            hc::Lookup::Unreachable(e) => {
+                eprintln!("[radar] watching {terminal}, out of reach right now: {e}");
+                (terminal.to_string(), None, None, String::new())
+            }
+        };
+        let (t, n, acc) = (address.clone(), note.to_string(), account.clone());
         crate::history::later(move || {
             crate::history::job_start_on(&t, &n, acc);
         });
         {
-            let mut b = self.book.lock().unwrap();
-            let last = b.seen.get(terminal).cloned().unwrap_or_default();
-            b.watches.insert(terminal.to_string(), Watch { note: note.to_string(), since_ms: crate::history::now_ms(), last, account });
+            let mut b = lock(&self.book);
+            let last = if status.is_empty() { b.seen.get(&address).cloned().unwrap_or_default() } else { status };
+            b.watches.insert(address.clone(), Watch { note: note.to_string(), since_ms: crate::history::now_ms(), last, account, created_ms, turn });
             Self::save(&b);
         }
         if let Some(r) = self.radar.get() {
-            r.recheck(terminal);
+            r.recheck(&address);
         }
+        Ok(address)
+    }
+
+    /// A note from the send queue for the brain: through the outbox, so it
+    /// waits for a brain that's away and a space out of focus holds it.
+    pub fn tell(&self, note: super::sendq::Note) {
+        let space = self.radar.get().and_then(|r| lock(&r.seen).get(&note.session).and_then(|s| s.space.clone()));
+        let p = Pending {
+            address: note.session,
+            name: note.name,
+            space,
+            status: "news".into(),
+            msg: note.msg,
+            speech: note.speech,
+            kind: "queue".into(),
+            at_ms: crate::history::now_ms(),
+            spoken: false,
+        };
+        if self.owe(p) {
+            self.kick();
+        }
+    }
+
+    /// What an agent session's hook said (see `sessions`).
+    pub fn agent(&self, ev: &super::sessions::AgentEvent, change: &super::sessions::Change) {
+        if let Some(r) = self.radar.get() {
+            r.agent(ev, change);
+        }
+    }
+
+    /// The outbox thread: deliver now.
+    fn kick(&self) {
+        let (m, cv) = &*self.kick;
+        *lock(m) = true;
+        cv.notify_all();
     }
 
     /// The watch fires: out of the watches, its report into the outbox, in
     /// one write. None when it had fired already (each finish is told once).
     fn fire(&self, address: &str, report: impl FnOnce(&Watch) -> Pending) -> Option<Pending> {
-        let mut b = self.book.lock().unwrap();
+        let mut b = lock(&self.book);
         let p = b.fire(address, report)?;
         Self::save(&b);
         Some(p)
@@ -85,7 +150,7 @@ impl Watches {
 
     /// A report owed without a watch.
     fn owe(&self, p: Pending) -> bool {
-        let mut b = self.book.lock().unwrap();
+        let mut b = lock(&self.book);
         let added = b.owe(p);
         if added {
             Self::save(&b);
@@ -95,11 +160,8 @@ impl Watches {
 
     /// Remembers a session's status (for the next start's reconcile).
     fn seen(&self, address: &str, status: &str) {
-        let mut b = self.book.lock().unwrap();
-        let mut changed = b.seen.get(address).map(String::as_str) != Some(status);
-        if changed {
-            b.seen.insert(address.to_string(), status.to_string());
-        }
+        let mut b = lock(&self.book);
+        let mut changed = b.note_seen(address, status);
         if let Some(w) = b.watches.get_mut(address)
             && w.last != status
         {
@@ -112,24 +174,27 @@ impl Watches {
     }
 
     fn watched(&self, terminal: &str) -> bool {
-        self.book.lock().unwrap().watches.contains_key(terminal)
+        lock(&self.book).watches.contains_key(terminal)
+    }
+    fn watch(&self, terminal: &str) -> Option<Watch> {
+        lock(&self.book).watches.get(terminal).cloned()
     }
     fn snapshot(&self) -> Book {
-        self.book.lock().unwrap().clone()
+        lock(&self.book).clone()
     }
     fn remote(&self) -> Vec<String> {
-        self.book.lock().unwrap().watches.keys().filter(|k| k.contains('/')).cloned().collect()
+        lock(&self.book).watches.keys().filter(|k| k.contains('/')).cloned().collect()
     }
     fn all(&self) -> Vec<String> {
-        self.book.lock().unwrap().watches.keys().cloned().collect()
+        lock(&self.book).watches.keys().cloned().collect()
     }
 
     /// Hands the outbox to `send`, outside the lock (it talks to Herdr);
     /// what it couldn't hand over stays for the next try.
     fn deliver(&self, send: impl FnMut(&mut Pending) -> bool) {
-        let _one = self.sending.lock().unwrap();
+        let _one = lock(&self.sending);
         let mut pending = {
-            let b = self.book.lock().unwrap();
+            let b = lock(&self.book);
             if b.outbox.is_empty() {
                 return;
             }
@@ -139,7 +204,7 @@ impl Watches {
         if !pending.deliver(crate::history::now_ms(), send) {
             return;
         }
-        let mut b = self.book.lock().unwrap();
+        let mut b = lock(&self.book);
         // Keep reports added meanwhile; drop the ones taken (or gone stale).
         b.outbox.retain(|p| !tried.contains(p));
         let mut rest = pending.outbox;
@@ -173,8 +238,13 @@ pub fn start(shared: Shared, mouth: Mouth, alerts: Alerts, watches: Watches, ask
         .name("outbox".into())
         .spawn(move || {
             loop {
-                thread::sleep(Duration::from_secs(5));
-                r.deliver();
+                // Every few seconds, or at once when a report is owed.
+                let (m, cv) = &*r.watches.kick;
+                let kicked = lock(m);
+                let mut kicked = cv.wait_timeout_while(kicked, Duration::from_secs(5), |k| !*k).map(|g| g.0).unwrap_or_else(|e| e.into_inner().0);
+                *kicked = false;
+                drop(kicked);
+                r.deliver_now();
             }
         })
         .ok();
@@ -185,7 +255,9 @@ pub fn start(shared: Shared, mouth: Mouth, alerts: Alerts, watches: Watches, ask
 }
 
 impl Radar {
-    /// `hc events`, restarted whenever it ends.
+    /// `hc events`, restarted whenever it ends. Each event carries Herdr's
+    /// sequence number: a gap (events missed) or a restarted stream means
+    /// looking at every terminal again, so none is lost track of.
     fn follow_local(&self) {
         loop {
             let child = Command::new(config::hc_bin())
@@ -202,23 +274,42 @@ impl Radar {
                     continue;
                 }
             };
-            let stdout = child.stdout.take().unwrap();
+            let Some(stdout) = child.stdout.take() else { continue };
+            let mut last: Option<u64> = None;
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-                self.event(&v);
+                let seq = v["seq"].as_u64().or_else(|| v["params"]["seq"].as_u64());
+                if let (Some(prev), Some(seq)) = (last, seq)
+                    && seq > prev + 1
+                    && v["terminals"].is_null()
+                {
+                    eprintln!("[radar] missed {} event(s) from Herdr: looking at every terminal again", seq - prev - 1);
+                    self.event(&v);
+                    self.resync_local();
+                } else {
+                    self.event(&v);
+                }
+                if seq.is_some() {
+                    last = seq;
+                }
             }
+            let _ = child.kill();
             let _ = child.wait();
+            eprintln!("[radar] hc events ended; following again");
             thread::sleep(Duration::from_secs(2));
         }
     }
 
     fn event(&self, v: &Value) {
-        // The first line: a snapshot of every terminal.
+        // The first line: a snapshot of every terminal. One the tower knew
+        // that isn't in it ended while the stream was down.
         if let Some(list) = v["terminals"].as_array() {
+            let first = lock(&self.seen).keys().all(|k| k.contains('/'));
             for t in list {
-                self.observe(t, None, false);
+                self.observe(t, None, !first);
             }
+            self.drop_missing_local(list);
             self.publish();
             return;
         }
@@ -234,13 +325,132 @@ impl Radar {
             "finished" | "removed" | "lost" => self.gone(address),
             "status" | "turn" | "title" | "labels" | "restarted" => {
                 // Re-read the terminal: events carry only what changed.
-                if let Some(t) = hc::get(address) {
-                    self.observe(&t, None, true);
+                match hc::lookup(address) {
+                    hc::Lookup::Found(t) => self.observe(&t, None, true),
+                    hc::Lookup::Gone => self.gone(address),
+                    // hc didn't answer: what the event says, on what we knew.
+                    hc::Lookup::Unreachable(e) => {
+                        eprintln!("[radar] {address}: couldn't re-read it ({e}); going by the event");
+                        if let Some(t) = self.with_event(address, p["type"].as_str().unwrap_or(""), data) {
+                            self.observe(&t, None, true);
+                        }
+                    }
                 }
             }
             _ => return,
         }
         self.publish();
+    }
+
+    /// A terminal's facts from what the radar last knew and one event's data
+    /// (when hc can't be asked again).
+    fn with_event(&self, address: &str, kind: &str, data: &Value) -> Option<Value> {
+        let s = lock(&self.seen).get(address).cloned()?;
+        let mut t = serde_json::json!({
+            "address": address,
+            "state": if s.live { "live" } else { "finished" },
+            "status": { "state": s.status, "app": s.app },
+            "created_ms": s.created_ms,
+            "turn": s.turn,
+            "name": s.name,
+        });
+        match kind {
+            "status" => {
+                if let Some(st) = data["status"].as_object() {
+                    t["status"] = Value::Object(st.clone());
+                } else if let Some(st) = data["status"].as_str().or_else(|| data["state"].as_str()) {
+                    t["status"]["state"] = Value::String(st.into());
+                }
+            }
+            "turn" => {
+                if let Some(n) = data["turn"].as_u64() {
+                    t["turn"] = n.into();
+                }
+            }
+            _ => {}
+        }
+        Some(t)
+    }
+
+    /// Every live terminal here, looked at again (after missed events, and
+    /// every half minute): what changed is told, what's gone is gone.
+    fn resync_local(&self) {
+        match hc::list_on(None) {
+            Ok(list) => {
+                for t in &list {
+                    self.observe(t, None, true);
+                }
+                self.drop_missing_local(&list);
+                self.publish();
+            }
+            Err(e) => eprintln!("[radar] hc ls: {e:#}"),
+        }
+    }
+
+    /// The local terminals the radar knows that aren't in `list` (all of this
+    /// machine's live ones) have ended.
+    fn drop_missing_local(&self, list: &[Value]) {
+        let live: HashSet<String> = list
+            .iter()
+            .filter(|t| t["state"].as_str().is_none_or(|s| s == "live"))
+            .filter_map(|t| t["address"].as_str().map(String::from))
+            .collect();
+        let gone: Vec<String> = lock(&self.seen).keys().filter(|k| !k.contains('/') && !live.contains(*k)).cloned().collect();
+        for g in gone {
+            self.gone(&g);
+        }
+    }
+
+    /// What an agent session's hook said: it says so before (or instead of)
+    /// Herdr's status catching up.
+    fn agent(&self, ev: &super::sessions::AgentEvent, change: &super::sessions::Change) {
+        use super::sessions::Change;
+        let address = ev.terminal.as_str();
+        // A test session's hooks never fire anything (as with its alerts).
+        if self.watches.watched(address) && hc::get(address).is_some_and(|t| is_test(&t)) {
+            return;
+        }
+        match change {
+            Change::Started => {
+                // Herdr keeps the tie between terminal and agent session, across tower restarts.
+                let (a, label) = (address.to_string(), format!("tower.session={}", ev.session_id));
+                thread::spawn(move || {
+                    let _ = hc::run(&["label", &a, &label]);
+                });
+            }
+            Change::Stopped(_) => {
+                // Herdr may still say working for a moment: the watch fires now.
+                if self.watches.watched(address) {
+                    let (name, space) = self.name_space(address);
+                    self.fire_watch(address, &name, space, if ev.event == "stop-failed" { "error" } else { "done" }, "");
+                }
+                self.recheck_soon(address);
+            }
+            Change::Waiting => self.recheck_soon(address),
+            Change::Ended => {
+                if self.watches.watched(address) {
+                    let (name, space) = self.name_space(address);
+                    self.fire_watch(address, &name, space, "exited", "");
+                }
+            }
+            Change::Prompted | Change::Nothing => {}
+        }
+    }
+
+    fn name_space(&self, address: &str) -> (String, Option<String>) {
+        lock(&self.seen).get(address).map(|s| (s.name.clone(), s.space.clone())).unwrap_or_else(|| (address.to_string(), None))
+    }
+
+    /// Reads a terminal again in a moment (a hook ran ahead of Herdr).
+    fn recheck_soon(&self, address: &str) {
+        let (me, address) = (self.clone(), address.to_string());
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(700));
+            if let Some(t) = hc::get(&address) {
+                me.observe(&t, None, true);
+                me.publish();
+            }
+        });
     }
 
     /// Other machines: their terminals by polling, and remote watches.
@@ -253,7 +463,13 @@ impl Radar {
                 self.check_startup(&w, &t);
             }
         }
+        let mut last_resync = std::time::Instant::now();
         loop {
+            // This machine too, now and then: whatever the event stream missed.
+            if last_resync.elapsed() >= Duration::from_secs(30) {
+                last_resync = std::time::Instant::now();
+                self.resync_local();
+            }
             let machines = if self.alerts.remote_poll_secs == 0 { vec![] } else { hc::machines() };
             for m in machines {
                 match hc::list_on(Some(&m)) {
@@ -267,7 +483,7 @@ impl Radar {
                         // Terminals that went away there.
                         let prefix = format!("{m}/");
                         let gone: Vec<String> =
-                            self.seen.lock().unwrap().keys().filter(|k| k.starts_with(&prefix) && !live.contains(k)).cloned().collect();
+                            lock(&self.seen).keys().filter(|k| k.starts_with(&prefix) && !live.contains(k)).cloned().collect();
                         for g in gone {
                             self.gone(&g);
                         }
@@ -282,7 +498,7 @@ impl Radar {
             }
             // A watched remote terminal may sit on a machine not listed yet.
             for w in self.watches.remote() {
-                if !self.seen.lock().unwrap().contains_key(&w)
+                if !lock(&self.seen).contains_key(&w)
                     && let Some(t) = hc::get(&w)
                 {
                     let m = w.split('/').next().map(String::from);
@@ -312,9 +528,26 @@ impl Radar {
         let is_voice = machine.is_none() && t["name"].as_str() == Some(brain::VOICE_NAME);
         let space = crate::spaces::space_of(t);
         let account = if machine.is_none() { crate::accounts::of_terminal(t) } else { None };
-        let before = self.seen.lock().unwrap().insert(
+        let (created_ms, turn) = (hc::created_ms(t), hc::turn(t));
+        // Another terminal at an address the radar knew: the old one ended.
+        let replaced = lock(&self.seen).get(&address).is_some_and(|s| matches!((s.created_ms, created_ms), (Some(a), Some(b)) if a != b));
+        if replaced {
+            eprintln!("[radar] {address} is a new terminal now: the old one ended");
+            self.gone(&address);
+        }
+        let before = lock(&self.seen).insert(
             address.clone(),
-            Seen { name: name.clone(), status: status.clone(), app: app.clone(), account, live, space: space.clone() },
+            Seen {
+                name: name.clone(),
+                status: status.clone(),
+                created_ms,
+                turn,
+                cwd: t["foreground"]["cwd"].as_str().or_else(|| t["cwd"].as_str()).unwrap_or("").to_string(),
+                app: app.clone(),
+                account,
+                live,
+                space: space.clone(),
+            },
         );
 
         if is_brain {
@@ -341,11 +574,28 @@ impl Radar {
         if machine.is_none() {
             self.asks.seen(&address, t, if live { status.as_str() } else { "" });
         }
-        let was = before.as_ref().map(|b| b.status.as_str()).unwrap_or("");
-        if was == status {
+        // First sight of a watched session (a machine just reached, a start):
+        // how it stood when the watch was set.
+        let watch = self.watches.watch(&address);
+        let was = match &before {
+            Some(b) => b.status.clone(),
+            None => watch.as_ref().map(|w| w.last.clone()).unwrap_or_default(),
+        };
+        let was = was.as_str();
+        // A turn that ended since the last look, even if nobody saw it working.
+        let before_turn = before.as_ref().and_then(|b| b.turn).or_else(|| watch.as_ref().and_then(|w| w.turn));
+        let turned = matches!((before_turn, turn), (Some(a), Some(b)) if b > a) && matches!(status.as_str(), "idle" | "done");
+        // A watch on another terminal that had this address: that one ended.
+        if let Some(w) = &watch
+            && matches!((w.created_ms, created_ms), (Some(a), Some(b)) if a != b)
+        {
+            self.fire_watch(&address, &name, space.clone(), "exited", "");
             return;
         }
-        let stopped_working = was == "working" && status != "working";
+        if was == status && !turned {
+            return;
+        }
+        let stopped_working = (was == "working" && status != "working") || (turned && was != "working");
         // A turn ended: its last message may ask the user something.
         if stopped_working && matches!(status.as_str(), "idle" | "done") {
             self.asks.finished(&address, t);
@@ -393,7 +643,7 @@ impl Radar {
     /// A question a session asks, told to the user (`asks`): as a blocked
     /// session's notice, held for another space in focus as usual.
     fn announce(&self, address: &str, text: &str) {
-        let (name, space) = self.seen.lock().unwrap().get(address).map(|s| (s.name.clone(), s.space.clone())).unwrap_or_else(|| (address.to_string(), None));
+        let (name, space) = self.name_space(address);
         if self.held(address, &name, space.as_deref(), text, "blocked", "alert") {
             return;
         }
@@ -497,13 +747,14 @@ impl Radar {
         } else {
             self.watches.owe(report);
         }
-        self.deliver();
+        self.watches.kick();
         true
     }
 
     fn gone(&self, address: &str) {
         self.asks.seen(address, &Value::Null, "");
-        let removed = self.seen.lock().unwrap().remove(address);
+        super::sessions::registry().forget(address);
+        let removed = lock(&self.seen).remove(address);
         if (address == brain::NAME || removed.as_ref().is_some_and(|_| hc::get(brain::NAME).is_none()))
             && hc::get(brain::NAME).filter(|t| t["state"] == "live").is_none()
         {
@@ -526,27 +777,38 @@ impl Radar {
         let fired = self.watches.fire(address, |w| {
             let (t, st, a) = (address.to_string(), status.to_string(), w.note.clone());
             crate::history::later(move || crate::history::job_watched(&t, if st == "gone" { "exited" } else { &st }, &a));
-            report(address, name, space.clone(), status, &w.note, why, "watch")
+            let mut p = report(address, name, space.clone(), status, &w.note, why, "watch");
+            // What it said at the end of its turn (its hook): often all the brain needs.
+            if let Some(said) = super::sessions::registry().said_since(address, w.since_ms).filter(|_| status != "exited" && status != "gone") {
+                let said: String = said.chars().take(1200).collect();
+                p.msg = p.msg.replace(
+                    " Read its screen and tell me what happened, briefly.",
+                    &format!(" It ended its turn saying: \"{}\" Tell me what happened, briefly (read its screen only if that isn't enough).", said.replace('"', "'")),
+                );
+            }
+            p
         });
         if fired.is_none() {
             return false;
         }
         eprintln!("[radar] watch on {address} fired: {status}{why}");
-        self.deliver();
+        // The outbox thread hands it over (typing into the brain can take a
+        // while; this thread follows Herdr's events).
+        self.watches.kick();
         true
     }
 
     /// Hands what's owed to the brain: kept in the outbox until it takes it
     /// (said out loud once meanwhile). News from a space out of focus is held instead.
-    fn deliver(&self) {
+    fn deliver_now(&self) {
         self.watches.deliver(|p| {
-            let news = p.msg.trim_start_matches("[watch] ").to_string();
+            let news = p.msg.trim_start_matches("[watch] ").trim_start_matches("[queue] ").to_string();
             if self.held(&p.address, &p.name, p.space.as_deref(), &news, &p.status, &p.kind) {
                 return true;
             }
             match brain::note(&p.msg) {
                 Ok(()) => {
-                    if !p.spoken {
+                    if !p.spoken && p.kind != "queue" {
                         self.shared.alert(&p.address, &format!("{} is {}", p.name, say_status(&p.status)), &p.status);
                     }
                     true
@@ -554,8 +816,12 @@ impl Radar {
                 Err(e) => {
                     if !p.spoken {
                         eprintln!("[radar] the brain can't take it yet ({e:#}): {}", p.msg);
-                        self.shared.alert(&p.address, &format!("{} is {}", p.name, say_status(&p.status)), &p.status);
-                        self.mouth.alert(p.speech.clone(), Some((p.address.as_str(), p.status.as_str())));
+                        if p.kind != "queue" {
+                            self.shared.alert(&p.address, &format!("{} is {}", p.name, say_status(&p.status)), &p.status);
+                        }
+                        if !p.speech.is_empty() {
+                            self.mouth.alert(p.speech.clone(), Some((p.address.as_str(), p.status.as_str())));
+                        }
                         p.spoken = true;
                     }
                     false
@@ -574,7 +840,8 @@ impl Radar {
             thread::sleep(Duration::from_secs(3));
             let Some(t) = hc::get(&terminal) else { return };
             let status = hc::status_word(&t).unwrap_or_default();
-            if t["state"] == "live" && !matches!(status.as_str(), "done" | "blocked" | "error") {
+            let turned = me.watches.watch(&terminal).and_then(|w| w.turn).zip(hc::turn(&t)).is_some_and(|(a, b)| b > a);
+            if t["state"] == "live" && !matches!(status.as_str(), "done" | "blocked" | "error") && !(turned && status == "idle") {
                 return;
             }
             let status = if t["state"] == "live" { status } else { "exited".into() };
@@ -605,7 +872,12 @@ impl Radar {
                 let Some(a) = t["address"].as_str().map(String::from) else { continue };
                 now.insert(
                     a.clone(),
-                    Now { live: t["state"].as_str().is_none_or(|s| s == "live"), status: hc::status_word(&t).unwrap_or_default() },
+                    Now {
+                        live: t["state"].as_str().is_none_or(|s| s == "live"),
+                        status: hc::status_word(&t).unwrap_or_default(),
+                        created_ms: hc::created_ms(&t),
+                        turn: hc::turn(&t),
+                    },
                 );
                 facts.insert(a, t);
             }
@@ -644,14 +916,11 @@ impl Radar {
                 }
             }
         }
-        self.deliver();
+        self.watches.kick();
     }
 
     fn publish(&self) {
-        let mut agents: Vec<AgentLine> = self
-            .seen
-            .lock()
-            .unwrap()
+        let mut agents: Vec<AgentLine> = lock(&self.seen)
             .iter()
             .filter(|(_, s)| s.live && !s.app.is_empty())
             .map(|(a, s)| AgentLine {
@@ -661,9 +930,15 @@ impl Radar {
                 app: s.app.clone(),
                 account: s.account.clone(),
                 question: None,
+                folder: s.cwd.clone(),
+                queued: 0,
             })
             .filter(|a| !a.name.starts_with("tower"))
             .collect();
+        let waiting = super::sendq::waiting_counts();
+        for a in &mut agents {
+            a.queued = waiting.get(&a.address).copied().unwrap_or(0);
+        }
         agents.sort_by(|a, b| a.address.cmp(&b.address));
         for set in self.asks.list() {
             if let Some(a) = agents.iter_mut().find(|a| a.address == set.session) {

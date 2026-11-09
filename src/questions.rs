@@ -402,8 +402,10 @@ fn config_dir_of(pid: u32) -> Option<std::path::PathBuf> {
 
 // ---- the question set ----
 
-fn id_of(session: &str, kind: &str, tabs: &[Tab], title: &str) -> String {
-    let mut s = format!("{session}|{kind}|{title}");
+/// The set's id: its session, kind, title, detail (the command, the plan)
+/// and questions, so a different command or plan is a different set.
+fn id_of(session: &str, kind: &str, tabs: &[Tab], title: &str, detail: &str) -> String {
+    let mut s = format!("{session}|{kind}|{title}|{detail}");
     for t in tabs {
         s.push('|');
         s.push_str(&t.question);
@@ -493,7 +495,7 @@ pub fn build(session: &str, name: &str, codex: bool, screen: &Screen, transcript
             q.submit_state = "single".into();
         }
     }
-    q.id = id_of(session, &q.kind, &q.tabs, &q.title);
+    q.id = id_of(session, &q.kind, &q.tabs, &q.title, &q.detail);
     q
 }
 
@@ -594,7 +596,7 @@ pub fn pick_of(a: &Answer, tab: &Tab) -> Result<Pick> {
                 if let Some(i) = o.get("option").and_then(Value::as_u64) {
                     options.push(i as usize);
                 }
-                Pick { options, other: o.get("other").and_then(Value::as_str).map(String::from).filter(|t| !t.trim().is_empty()) }
+                Pick { options, other: o.get("other").and_then(Value::as_str).map(clean_text).filter(|t| !t.trim().is_empty()) }
             }
         }
         _ => bail!("tab {}: choice is an option index, {{\"options\": [...]}}, {{\"other\": \"text\"}} or {{\"spoken\": \"...\"}}", a.tab),
@@ -608,6 +610,8 @@ pub fn pick_of(a: &Answer, tab: &Tab) -> Result<Pick> {
     if p.other.is_some() && !tab.allows_other {
         bail!("tab {} takes one of its options, not typed text", a.tab);
     }
+    // Typed into a terminal: no control characters (a spoken answer's text included).
+    p.other = p.other.map(|t| clean_text(&t)).filter(|t| !t.trim().is_empty());
     if p.options.is_empty() && p.other.is_none() {
         bail!("tab {}: no answer", a.tab);
     }
@@ -630,6 +634,13 @@ pub fn pick_of(a: &Answer, tab: &Tab) -> Result<Pick> {
         p.other = Some(crate::history::compose(&crate::daemon::lan::with_markers(&text, &markers), &a.attachments));
     }
     Ok(p)
+}
+
+/// Text as it may be typed into a terminal: without control characters
+/// (C0, DEL, C1), which a terminal would take as keys or escapes; line
+/// breaks and tabs stay (`\r\n` and a lone `\r` become `\n`).
+pub fn clean_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n").chars().filter(|c| *c == '\n' || *c == '\t' || !c.is_control()).collect()
 }
 
 // ---- driving the dialog ----
@@ -665,8 +676,10 @@ impl Term for Hc {
     fn paste(&mut self, text: &str) -> Result<()> {
         // Without the caller's terminal: hc then types the text as it is
         // (from a terminal it would wrap it in a note saying who sent it).
+        // `--`: a text that starts with `-` isn't taken for a flag.
+        let text = clean_text(text);
         let out = std::process::Command::new(crate::config::hc_bin())
-            .args(["send", "--force", &self.address, text])
+            .args(["send", "--force", "--", &self.address, &text])
             .env_remove("HC_TERMINAL_ID")
             .env_remove("HC_SCOPE")
             .stdin(std::process::Stdio::null())
@@ -1098,7 +1111,7 @@ pub fn text_set(session: &str, name: &str, message: &str, context: &str) -> Ques
         status: "open".into(),
         ..Default::default()
     };
-    q.id = id_of(session, "text", &[], &q.detail);
+    q.id = id_of(session, "text", &[], &q.detail, "");
     q
 }
 
@@ -1192,8 +1205,11 @@ pub fn compose_reply(set: &QuestionSet, answers: &[Answer]) -> Result<String> {
 
 /// Why a question set must go to the user whatever the brain says: it
 /// deploys or releases, pushes or merges to a shared branch, deletes or
-/// overwrites, touches infrastructure, secrets or money. None: the brain may
-/// answer it itself if it's routine.
+/// overwrites, rewrites git history, runs as root, kills processes, skips
+/// the checks, touches infrastructure, secrets or money. None: the brain may
+/// answer it itself if it's routine. Words are matched whole ("prod" isn't
+/// "prompt", "push" isn't "pushd"); a permission prompt's command is in its
+/// title and detail, so the command itself is checked.
 pub fn must_escalate(set: &QuestionSet) -> Option<&'static str> {
     let mut text = format!("{}\n{}\n{}", set.title, set.detail, set.context);
     for t in &set.tabs {
@@ -1207,23 +1223,182 @@ pub fn must_escalate(set: &QuestionSet) -> Option<&'static str> {
         }
     }
     let raw = text.to_lowercase();
-    let words = format!(" {} ", norm(&text));
+    let flat = norm(&text);
+    let ws: Vec<&str> = flat.split(' ').collect();
+    let words = format!(" {flat} ");
+    // A word, or words in a row ("go live").
     let word = |w: &str| words.contains(&format!(" {w} "));
     let any = |ws: &[&str]| ws.iter().any(|w| word(w));
     let raw_any = |ps: &[&str]| ps.iter().any(|p| raw.contains(p));
+    // Word `a` with the next word as `f` wants it.
+    let then = |a: &str, f: &dyn Fn(Option<&str>) -> bool| ws.iter().enumerate().any(|(i, w)| *w == a && f(ws.get(i + 1).copied()));
     // A Yes/No about one of these is the same as doing it.
-    if any(&["deploy", "deploys", "deploying", "deployment", "redeploy", "production", "prod", "go live", "rollout", "publish", "publishing"])
-        || (any(&["release", "releasing"]) && !raw.contains("release notes"))
+    // A release build (`--release`) or release notes aren't a release.
+    let released = {
+        let r = ["--release", "release notes", "release build", "release mode", "release profile"]
+            .iter()
+            .fold(raw.clone(), |r, p| r.replace(p, " "));
+        let r = format!(" {} ", norm(&r));
+        r.contains(" release ") || r.contains(" releasing ")
+    };
+    if any(&[
+        "deploy",
+        "deploys",
+        "deploying",
+        "deployment",
+        "redeploy",
+        "production",
+        "prod",
+        "go live",
+        "rollout",
+        "publish",
+        "publishing",
+    ]) || released
     {
         return Some("it deploys or releases");
     }
-    if raw_any(&["git push", "push to", "push the", "push origin", "force push", "--force", "merge into main", "merge to main", "into main", "into master", "merge into prod", "into prod"]) {
+    // "push", but not `git stash push` or push notifications.
+    let pushes = ws.iter().enumerate().any(|(i, w)| {
+        matches!(*w, "push" | "pushes" | "pushing")
+            && !(i > 0 && ws[i - 1] == "stash")
+            && !ws.get(i + 1).is_some_and(|n| n.starts_with("notif"))
+    });
+    let merges = any(&["merge", "merges", "merging"])
+        && any(&[
+            "pr",
+            "prs",
+            "pull",
+            "mr",
+            "git",
+            "branch",
+            "main",
+            "master",
+            "prod",
+            "production",
+            "develop",
+            "dev",
+            "release",
+            "into",
+            "upstream",
+            "origin",
+            "remote",
+        ]);
+    if pushes
+        || merges
+        || raw_any(&[
+            "git push",
+            "push to",
+            "push the",
+            "push origin",
+            "force push",
+            "--force",
+            "merge into main",
+            "merge to main",
+            "into main",
+            "into master",
+            "merge into prod",
+            "into prod",
+        ])
+    {
         return Some("it pushes or merges to a shared branch");
     }
-    if any(&["delete", "deletes", "deleting", "remove the branch", "drop", "truncate", "overwrite", "overwrites", "wipe", "destroy", "purge", "irreversible"])
-        || raw_any(&["rm -rf", "rm -r ", "reset --hard", "drop table", "drop database", "branch -d", "branch -d "])
+    // "remove" alone is often routine (an import); with files or data it isn't.
+    let removes = any(&["remove", "removes", "removing"])
+        && any(&[
+            "file",
+            "files",
+            "folder",
+            "folders",
+            "directory",
+            "directories",
+            "dir",
+            "dirs",
+            "data",
+            "database",
+            "db",
+            "table",
+            "tables",
+            "branch",
+            "branches",
+            "tag",
+            "tags",
+            "repo",
+            "repository",
+            "old",
+            "everything",
+            "backup",
+            "backups",
+            "logs",
+            "records",
+            "rows",
+            "users",
+            "accounts",
+            "volume",
+            "volumes",
+            "container",
+            "containers",
+            "images",
+        ]);
+    if removes
+        || any(&[
+            "delete",
+            "deletes",
+            "deleting",
+            "remove the branch",
+            "drop",
+            "truncate",
+            "overwrite",
+            "overwrites",
+            "wipe",
+            "destroy",
+            "purge",
+            "prune",
+            "irreversible",
+            "rm",
+            "rmdir",
+            "rmi",
+            "unlink",
+            "shred",
+        ])
+        || raw_any(&[
+            "rm -rf",
+            "rm -r ",
+            "reset --hard",
+            "drop table",
+            "drop database",
+            "branch -d",
+            "branch -d ",
+            "git clean",
+            "git checkout -- ",
+            "git checkout .",
+            "git checkout -f",
+            "git restore",
+            "git reset",
+            "git stash drop",
+            "git stash clear",
+            "delete from",
+            "down -v",
+        ])
     {
         return Some("it deletes or overwrites");
+    }
+    // A rebase (not one going on: --continue, --abort) or a history filter.
+    if then("rebase", &|n| !matches!(n, Some("continue" | "abort" | "skip" | "quit"))) || raw_any(&["filter-branch", "filter-repo"]) {
+        return Some("it rewrites git history");
+    }
+    if any(&["sudo", "doas", "chown", "chgrp"])
+        || raw_any(&["chmod -r", "chmod --recursive", "chmod 777", "chmod 666", "chmod a+w", "chmod o+w"])
+    {
+        return Some("it runs as root or changes permissions");
+    }
+    if any(&["pkill", "killall", "taskkill"])
+        || then("kill", &|n| n.is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()) || n.starts_with("sig")))
+        || raw_any(&["kill -", "kill $(", "docker kill"])
+    {
+        return Some("it kills processes");
+    }
+    if raw_any(&["--no-verify"]) {
+        return Some("it skips the checks");
     }
     if any(&["aws", "s3", "ec2", "terraform", "kubernetes", "kubectl", "dns", "cloudflare", "infrastructure", "servers", "firewall", "iam"]) {
         return Some("it touches infrastructure");
@@ -1237,8 +1412,80 @@ pub fn must_escalate(set: &QuestionSet) -> Option<&'static str> {
     None
 }
 
+/// A menu option that answers more than this once: it turns on auto mode,
+/// always allows, stops asking, or holds for the rest of the session.
+pub fn widens(o: &Opt) -> bool {
+    let t = format!(" {} ", norm(&format!("{} {}", o.label, o.description).replace('’', "'")));
+    [
+        "auto mode",
+        "automode",
+        "auto accept",
+        "accept edits",
+        "accept all",
+        "allow all",
+        "always",
+        "don t ask",
+        "dont ask",
+        "do not ask",
+        "never ask",
+        "this session",
+        "the session",
+        "bypass",
+        "skip permissions",
+        "yolo",
+    ]
+    .iter()
+    .any(|p| t.contains(&format!(" {p} ")))
+}
+
+/// A plain one-time yes: "Yes", "Yes, proceed (y)", "Yes, manually approve edits".
+fn plain_yes(o: &Opt) -> bool {
+    let l = norm(&o.label);
+    (l == "yes" || l.starts_with("yes ")) && !widens(o)
+}
+
+/// The tower swapped the brain's pick for the plain yes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Swap {
+    pub from: String,
+    pub to: String,
+}
+
+/// What the tower may answer by itself on a menu (permission, plan, Codex):
+/// only a plain one-time yes. A pick that would stop future prompts (auto
+/// mode, always allow, don't ask again) becomes the plain yes when there is
+/// one (the swap is returned), else the answer goes to the user (Err: why).
+/// Claude's questions and text replies are taken as they are.
+pub fn safe_auto(set: &QuestionSet, answers: &[Answer]) -> Result<(Vec<Answer>, Option<Swap>), String> {
+    if matches!(set.kind.as_str(), "claude-ask" | "text") {
+        return Ok((answers.to_vec(), None));
+    }
+    let Some(tab) = set.tabs.first() else { return Err("the prompt has no options".into()) };
+    let Some(a) = answers.iter().find(|a| a.tab == 0) else { return Err("no answer for the prompt".into()) };
+    let p = pick_of(a, tab).map_err(|e| e.to_string())?;
+    let (Some(&i), None, 1) = (p.options.first(), &p.other, p.options.len()) else {
+        return Err("this prompt takes one of its options".into());
+    };
+    let o = &tab.options[i];
+    if plain_yes(o) {
+        return Ok((answers.to_vec(), None));
+    }
+    if !widens(o) {
+        return Err(format!("only a plain yes is answered for you on a prompt like this, and it would pick \"{}\"", o.label));
+    }
+    match tab.options.iter().position(plain_yes) {
+        Some(j) => {
+            let swap = Swap { from: o.label.clone(), to: tab.options[j].label.clone() };
+            Ok((vec![Answer { tab: 0, choice: json!(j), attachments: vec![] }], Some(swap)))
+        }
+        None => Err(format!("\"{}\" would stop future prompts, and there is no plain yes", o.label)),
+    }
+}
+
 /// The decision that holds: the user's policy first, then the rule, then the brain.
-/// `policy`: `normal`, `keep-moving` or `ask-everything`.
+/// `policy`: `normal`, `keep-moving` or `ask-everything`. On a menu the
+/// brain's first recommendation must be one the tower may give (`safe_auto`),
+/// whatever the policy.
 pub fn decide(set: &QuestionSet, brain: Option<&str>, brain_reason: &str, policy: &str) -> (String, String) {
     if policy == "ask-everything" {
         return ("escalate".into(), "you asked to decide everything yourself".into());
@@ -1247,12 +1494,20 @@ pub fn decide(set: &QuestionSet, brain: Option<&str>, brain_reason: &str, policy
         return ("escalate".into(), why.into());
     }
     match brain {
-        Some("auto") => ("auto".into(), brain_reason.to_string()),
+        Some("auto") => {
+            if let Some(answers) = first_picks(set)
+                && let Err(why) = safe_auto(set, &answers)
+            {
+                return ("escalate".into(), why);
+            }
+            ("auto".into(), brain_reason.to_string())
+        }
         _ => ("escalate".into(), if brain_reason.is_empty() { "it needs your call".into() } else { brain_reason.to_string() }),
     }
 }
 
-/// The answers the tower gives by itself: recommendation 1 for every question.
+/// The answers the tower gives by itself: recommendation 1 for every question
+/// (on a menu, checked with `safe_auto` before it is typed).
 pub fn first_picks(set: &QuestionSet) -> Option<Vec<Answer>> {
     let recs = set.recommendations.as_ref()?;
     (0..set.tabs.len())
@@ -1758,6 +2013,31 @@ mod tests {
             (q("", "Which AWS region for the new bucket?", &["eu-central-1", "us-east-1"]), "it touches infrastructure"),
             (q("", "Should I put the API key in .env and commit it?", &[]), "it involves secrets or credentials"),
             (q("", "Enable the paid plan for more build minutes?", &[]), "it spends money"),
+            (q("", "push?", &[]), "it pushes or merges to a shared branch"),
+            (q("", "Commit and push these?", &[]), "it pushes or merges to a shared branch"),
+            (q("", "Merge the PR?", &[]), "it pushes or merges to a shared branch"),
+            (q("Allow Bash: gh pr merge 12?", "Do you want to proceed?", &["Yes", "No"]), "it pushes or merges to a shared branch"),
+            (q("", "Should I remove the old files?", &[]), "it deletes or overwrites"),
+            (q("Allow Bash: rm db.sqlite?", "Do you want to proceed?", &["Yes", "No"]), "it deletes or overwrites"),
+            (q("Allow Bash: rm -fr build?", "Do you want to proceed?", &["Yes", "No"]), "it deletes or overwrites"),
+            (q("Allow Bash: git clean -fd?", "Do you want to proceed?", &["Yes", "No"]), "it deletes or overwrites"),
+            (q("Allow Bash: git checkout -- .?", "Do you want to proceed?", &["Yes", "No"]), "it deletes or overwrites"),
+            (q("Allow Bash: git reset HEAD~3?", "Do you want to proceed?", &["Yes", "No"]), "it deletes or overwrites"),
+            (q("Allow Bash: git restore src/app.rs?", "Do you want to proceed?", &["Yes", "No"]), "it deletes or overwrites"),
+            (q("Allow Bash: docker system prune -a?", "Do you want to proceed?", &["Yes", "No"]), "it deletes or overwrites"),
+            (q("Allow Bash: docker rm web?", "Do you want to proceed?", &["Yes", "No"]), "it deletes or overwrites"),
+            (q("Allow Bash: psql -c 'DROP SCHEMA app CASCADE'?", "Do you want to proceed?", &["Yes", "No"]), "it deletes or overwrites"),
+            (q("Allow Bash: sqlite3 app.db 'DELETE FROM users'?", "Do you want to proceed?", &["Yes", "No"]), "it deletes or overwrites"),
+            (q("Allow Bash: git rebase -i HEAD~5?", "Do you want to proceed?", &["Yes", "No"]), "it rewrites git history"),
+            (q("", "Should I rebase onto main?", &[]), "it rewrites git history"),
+            (q("Allow Bash: sudo make install?", "Do you want to proceed?", &["Yes", "No"]), "it runs as root or changes permissions"),
+            (q("Allow Bash: chmod -R 755 .?", "Do you want to proceed?", &["Yes", "No"]), "it runs as root or changes permissions"),
+            (q("Allow Bash: chown me:staff app?", "Do you want to proceed?", &["Yes", "No"]), "it runs as root or changes permissions"),
+            (q("Allow Bash: kill -9 4242?", "Do you want to proceed?", &["Yes", "No"]), "it kills processes"),
+            (q("Allow Bash: pkill node?", "Do you want to proceed?", &["Yes", "No"]), "it kills processes"),
+            (q("Allow Bash: npm publish?", "Do you want to proceed?", &["Yes", "No"]), "it deploys or releases"),
+            (q("Allow Bash: cargo publish?", "Do you want to proceed?", &["Yes", "No"]), "it deploys or releases"),
+            (q("Allow Bash: git commit --no-verify -m wip?", "Do you want to proceed?", &["Yes", "No"]), "it skips the checks"),
         ] {
             assert_eq!(must_escalate(&set), Some(why), "{}", set.tabs[0].question);
             assert_eq!(decide(&set, Some("auto"), "routine", "normal").0, "escalate", "the rule wins over the brain");
@@ -1770,6 +2050,17 @@ mod tests {
             q("", "Should I name it useCaseFilters or useFilters?", &[]),
             q("", "Want me to add the release notes to CHANGELOG.md?", &[]),
             q("", "Should I commit this locally?", &[]),
+            q("Allow Bash: cargo build?", "Do you want to proceed?", &["Yes", "No"]),
+            q("Allow Bash: cargo build --release?", "Do you want to proceed?", &["Yes", "No"]),
+            q("Allow Bash: git status?", "Do you want to proceed?", &["Yes", "No"]),
+            q("Allow Bash: git diff?", "Do you want to proceed?", &["Yes", "No"]),
+            q("Allow Bash: git rebase --continue?", "Do you want to proceed?", &["Yes", "No"]),
+            q("Allow Bash: ls -la?", "Do you want to proceed?", &["Yes", "No"]),
+            q("Allow Bash: pushd src && cargo test?", "Do you want to proceed?", &["Yes", "No"]),
+            q("Allow Bash: chmod +x scripts/run.sh?", "Do you want to proceed?", &["Yes", "No"]),
+            q("", "Should I tighten the prompt for the summary?", &[]),
+            q("", "Want me to remove the unused import?", &[]),
+            q("", "Should I add push notifications to the settings page?", &[]),
         ] {
             assert_eq!(must_escalate(&set), None, "{}", set.tabs[0].question);
             assert_eq!(decide(&set, Some("auto"), "routine choice", "normal"), ("auto".into(), "routine choice".into()));
@@ -1777,6 +2068,86 @@ mod tests {
             assert_eq!(decide(&set, None, "", "normal").0, "escalate", "no word from the brain: ask");
             assert_eq!(decide(&set, Some("auto"), "routine", "ask-everything").0, "escalate", "the user's toggle wins");
         }
+    }
+
+    fn screen_set(name: &str, msg: &str) -> QuestionSet {
+        build("t1", "x", name.starts_with("codex"), &parse_screen(&fixture(name)).unwrap(), None, msg, "")
+    }
+
+    fn rec(set: &mut QuestionSet, choice: usize) {
+        let label = set.tabs[0].options[choice].label.clone();
+        set.recommendations = Some(vec![TabRecs { tab: 0, options: vec![Rec { label, why: "".into(), choice: json!(choice) }] }]);
+    }
+
+    #[test]
+    fn real_prompts_are_routine() {
+        for (name, msg) in [
+            ("claude-permission.txt", "approve Bash: touch /tmp/qfix-perm-test"),
+            ("claude-plan.txt", "approve plan"),
+            ("codex-approval.txt", ""),
+        ] {
+            assert_eq!(must_escalate(&screen_set(name, msg)), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_tower_never_turns_prompts_off() {
+        let a = |i: usize| vec![Answer { tab: 0, choice: json!(i), attachments: vec![] }];
+        let swap = |from: &str, to: &str| Some(Swap { from: from.into(), to: to.into() });
+        // Claude's permission prompt: 1 Yes, 2 always allow /tmp, 3 auto mode, 4 No.
+        let p = screen_set("claude-permission.txt", "approve Bash: touch /tmp/qfix-perm-test");
+        assert_eq!(safe_auto(&p, &a(0)), Ok((a(0), None)));
+        let always = p.tabs[0].options[1].label.clone();
+        assert_eq!(safe_auto(&p, &a(1)), Ok((a(0), swap(&always, "Yes"))));
+        assert_eq!(safe_auto(&p, &a(2)).unwrap().0, a(0), "auto mode: the plain yes instead");
+        assert!(safe_auto(&p, &a(3)).is_err(), "only a yes is given for the user");
+        // The plan: 1 auto mode, 2 approve edits by hand, 3 tell Claude.
+        let plan = screen_set("claude-plan.txt", "approve plan");
+        assert_eq!(safe_auto(&plan, &a(0)), Ok((a(1), swap("Yes, and use auto mode", "Yes, manually approve edits"))));
+        assert!(safe_auto(&plan, &a(2)).is_err());
+        // Codex: 1 yes, 2 don't ask again, 3 no.
+        let c = screen_set("codex-approval.txt", "");
+        assert_eq!(safe_auto(&c, &a(1)).unwrap().0, a(0));
+        // No plain yes to fall back on: it goes to the user.
+        let only = Opt { label: "Yes, and don't ask again for this command".into(), key: "1".into(), ..Default::default() };
+        let mut menu = p.clone();
+        menu.tabs[0].options = vec![only, Opt { label: "No".into(), key: "2".into(), ..Default::default() }];
+        assert!(safe_auto(&menu, &a(0)).is_err());
+        for l in [
+            "Yes, allow all edits during this session (shift+tab)",
+            "Yes, and auto-accept edits",
+            "Yes, and bypass permissions",
+            "Yes, don’t ask again",
+        ] {
+            assert!(widens(&Opt { label: l.into(), ..Default::default() }), "{l}");
+        }
+        assert!(!widens(&Opt { label: "Yes, proceed (y)".into(), ..Default::default() }));
+        // Claude's own questions are taken as they are.
+        let ask = q("", "Always use tabs?", &["Always", "Never"]);
+        assert_eq!(safe_auto(&QuestionSet { kind: "claude-ask".into(), ..ask }, &a(0)).unwrap().0, a(0));
+
+        // The brain's decision on a menu, whatever the policy.
+        for policy in ["normal", "keep-moving"] {
+            let mut p = p.clone();
+            rec(&mut p, 2);
+            assert_eq!(decide(&p, Some("auto"), "routine", policy).0, "auto", "swapped for the plain yes when typed");
+            rec(&mut p, 3);
+            assert_eq!(decide(&p, Some("auto"), "routine", policy).0, "escalate", "No: the user's");
+            rec(&mut menu, 0);
+            assert_eq!(decide(&menu, Some("auto"), "routine", policy).0, "escalate", "nothing safe to pick");
+        }
+    }
+
+    #[test]
+    fn typed_text_has_no_control_characters() {
+        assert_eq!(clean_text("ok\x1b[2J\x07 then\r\nmore\tx\u{9b}31m\u{7f}"), "ok[2J then\nmore\tx31m");
+        let tab = Tab { allows_other: true, ..Default::default() };
+        let p = pick_of(&Answer { tab: 0, choice: json!({"other": "fine\x1b[A"}), attachments: vec![] }, &tab).unwrap();
+        assert_eq!(p.other.as_deref(), Some("fine[A"));
+        assert!(
+            pick_of(&Answer { tab: 0, choice: json!({"other": "\x1b\x03"}), attachments: vec![] }, &tab).is_err(),
+            "nothing left: no answer"
+        );
     }
 
     #[test]

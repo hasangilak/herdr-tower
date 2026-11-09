@@ -1,7 +1,8 @@
 //! What the tower is doing, shared by the daemon's threads and published to
 //! `~/.local/state/herder-tower/ui/state.json` for the Herdr mod.
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -16,7 +17,7 @@ pub struct Alert {
     pub level: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct State {
     pub version: u64,
     pub updated_ms: u64,
@@ -32,6 +33,8 @@ pub struct State {
     pub armed: bool,
     pub transcribing: bool,
     pub speaking: bool,
+    /// The tower is muted (`tower mute`): it says nothing, here or on a phone.
+    pub muted: bool,
     /// What is being said is an alert, not a reply to the user.
     pub announcing: bool,
     /// The brain terminal's status (`idle`, `working`, `blocked`, ...) or `absent`.
@@ -52,6 +55,9 @@ pub struct State {
     pub said: String,
     pub said_ms: u64,
     pub alerts: Vec<Alert>,
+    /// Alerts that came in while muted, unsaid (newest last, at most
+    /// `MISSED_MAX`). Cleared when the tower is unmuted.
+    pub missed_while_muted: Vec<String>,
     /// Agents on every machine: (address, spoken name, status).
     pub agents: Vec<AgentLine>,
     pub error: String,
@@ -89,6 +95,12 @@ pub struct AgentLine {
     pub account: Option<String>,
     /// The id of its open question set, when it is blocked on one.
     pub question: Option<String>,
+    /// The folder it works in.
+    #[serde(default)]
+    pub folder: String,
+    /// Instructions waiting for it in the send queue.
+    #[serde(default)]
+    pub queued: usize,
 }
 
 impl State {
@@ -103,6 +115,7 @@ impl State {
             armed: false,
             transcribing: false,
             speaking: false,
+            muted: false,
             announcing: false,
             brain: "absent".into(),
             brain_app: String::new(),
@@ -114,6 +127,7 @@ impl State {
             said: String::new(),
             said_ms: 0,
             alerts: vec![],
+            missed_while_muted: vec![],
             agents: vec![],
             error: String::new(),
             talk_key: "off".into(),
@@ -156,28 +170,51 @@ pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+/// How many unsaid alerts are kept while muted.
+pub const MISSED_MAX: usize = 20;
+
+/// Locks a mutex, even one a panicking thread left poisoned: what it holds
+/// is still the latest, and one thread's panic shouldn't stop the others.
+pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[derive(Clone)]
-pub struct Shared(Arc<Mutex<State>>);
+pub struct Shared {
+    state: Arc<Mutex<State>>,
+    /// The version last written to state.json: one writer at a time, and
+    /// never an older snapshot over a newer one.
+    written: Arc<Mutex<Option<u64>>>,
+}
 
 impl Shared {
     pub fn new(state: State) -> Self {
-        let s = Self(Arc::new(Mutex::new(state)));
+        let s = Self { state: Arc::new(Mutex::new(state)), written: Arc::new(Mutex::new(None)) };
         s.publish();
         s
     }
 
     pub fn get(&self) -> State {
-        self.0.lock().unwrap().clone()
+        lock(&self.state).clone()
+    }
+
+    /// Reads a part of the state without copying all of it.
+    pub fn with<R>(&self, f: impl FnOnce(&State) -> R) -> R {
+        f(&lock(&self.state))
+    }
+
+    /// Whether the tower is talking (read often: cheap).
+    pub fn speaking(&self) -> bool {
+        self.with(|s| s.speaking)
     }
 
     /// Changes the state; publishes it when something changed.
     pub fn update(&self, f: impl FnOnce(&mut State)) {
         let changed = {
-            let mut s = self.0.lock().unwrap();
-            let before = serde_json::to_string(&*s).unwrap_or_default();
+            let mut s = lock(&self.state);
+            let before = s.clone();
             f(&mut s);
-            let after = serde_json::to_string(&*s).unwrap_or_default();
-            if before != after {
+            if *s != before {
                 s.version += 1;
                 s.updated_ms = now_ms();
                 true
@@ -202,9 +239,7 @@ impl Shared {
 
     pub fn json(&self) -> serde_json::Value {
         let s = self.get();
-        let mut v = serde_json::to_value(&s).unwrap_or_default();
-        v["phase"] = serde_json::Value::String(s.phase().into());
-        v
+        to_json(&s)
     }
 
     fn publish(&self) {
@@ -212,14 +247,61 @@ impl Shared {
         if cfg!(test) {
             return;
         }
-        let v = self.json();
+        // One writer at a time, and the snapshot is taken in turn: the
+        // newest always lands last.
+        let mut written = lock(&self.written);
+        let s = self.get();
+        if written.is_some_and(|v| s.version <= v) {
+            return;
+        }
+        let v = to_json(&s);
         let dir = config::ui_dir();
         let _ = std::fs::create_dir_all(&dir);
         // Written beside the watched folder, then moved in: the mod wakes once.
-        let tmp = config::state_dir().join(".state.json.tmp");
+        // Its own name, so no other writer (another process) clobbers it.
+        static N: AtomicU64 = AtomicU64::new(0);
+        let tmp = config::state_dir().join(format!(".state.json.{}.{}.tmp", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let path = dir.join("state.json");
         if std::fs::write(&tmp, serde_json::to_vec_pretty(&v).unwrap_or_default()).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+            if std::fs::rename(&tmp, &path).is_ok() {
+                *written = Some(s.version);
+            } else {
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
+    }
+}
+
+/// The state as JSON, with its phase.
+fn to_json(s: &State) -> serde_json::Value {
+    let mut v = serde_json::to_value(s).unwrap_or_default();
+    v["phase"] = serde_json::Value::String(s.phase().into());
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_update_that_changes_nothing_keeps_the_version() {
+        let shared = Shared::new(State::new("ptt", "test", "test"));
+        shared.update(|s| s.speaking = false);
+        assert_eq!(shared.get().version, 0);
+        shared.update(|s| s.speaking = true);
+        assert_eq!(shared.get().version, 1);
+        assert!(shared.speaking());
+        shared.update(|s| s.behaviors = serde_json::json!({ "count": 1 }));
+        shared.update(|s| s.behaviors = serde_json::json!({ "count": 1 }));
+        assert_eq!(shared.get().version, 2);
+    }
+
+    #[test]
+    fn a_poisoned_lock_still_opens() {
+        let shared = Shared::new(State::new("ptt", "test", "test"));
+        let s2 = shared.clone();
+        let _ = std::thread::spawn(move || s2.update(|_| panic!("a thread dies holding the state"))).join();
+        shared.update(|s| s.said = "still here".into());
+        assert_eq!(shared.get().said, "still here");
     }
 }

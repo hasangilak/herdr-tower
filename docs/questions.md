@@ -51,9 +51,13 @@ A screen it can't read gives no question set: the user answers as before,
 through the tower ("approve it", "say no").
 
 Every change of herdr-core's status line (a new tab, a new question) reads
-the screen again; the set's `id` (a hash of the session, kind and questions)
-stays the same while the questions do, so recommendations stay with it. When
-the session stops being blocked, its set closes.
+the screen again; the set's `id` (a hash of the session, kind, title, detail
+and questions: another command or plan is another set) stays the same while
+the questions do, so recommendations stay with it. When the session stops
+being blocked, its set closes, and the same dialog asked again later (the
+next "Allow Bash: npm test?") is a new question: told to the brain again,
+with its own 40-second timer. A dialog the user dismissed stays away while
+the session still shows it.
 
 ## The question set
 
@@ -103,7 +107,12 @@ Its answer is **one reply** typed into the session as the user would (no
 sender note): the chosen recommendation's text or the user's own words
 (typed or spoken, with files attached as the panel does), several questions
 numbered `1.`, `2.`, …. If the session is working again by then, the reply
-waits (`status: queued`) and goes in when it stops.
+waits (`status: queued`) and goes in when that turn ends. A waiting reply
+is dropped (and logged) when the session is gone, after 30 minutes, or when
+the session finished and started a turn of its own meanwhile (herdr-core's
+turn count; a dialog on the way doesn't count). It is typed only while the
+session is idle or done (read again just before; `hc send --if idle` when
+idle), never into a dialog.
 
 ## Recommendations
 
@@ -130,6 +139,14 @@ With its recommendations the brain gives a decision: `tower recommend <id>
   question (it is always the default pick), once, and writes a history entry
   (`kind: answered`): "answered for you: Which test runner? -> Vitest,
   because …". It shows in the chat as a small event and is never spoken.
+  On a menu (permission, plan, Codex) it only ever gives a plain one-time
+  yes (`questions::safe_auto`): an option that would stop future prompts
+  ("Yes, and use auto mode", "Yes, and always allow access to /tmp",
+  "Yes, and don't ask again for …", "allow all edits during this session",
+  bypass permissions, auto-accept edits) is swapped for the plain yes ("Yes",
+  "Yes, proceed", "Yes, manually approve edits"), and the swap is logged; with
+  no plain yes, or any other pick ("No", "Tell Claude what to change"), it
+  escalates. This holds for every policy.
 - **escalate**: the card stays for the user, who hears one sentence: "The
   web session asks: Should I deploy to production? I'd say: Not yet." (held
   for later if another space is in focus, as notices are).
@@ -140,9 +157,19 @@ project, lint, local commits, the safe default; for the user: deploys,
 pushes, merges to main or prod, deleting or overwriting, infrastructure,
 secrets, money, outside the project, security, big scope or product
 decisions, anything surprising or uncertain). The daemon enforces the hard
-part whatever the brain says (`questions::must_escalate`): a question about
-deploying or releasing, pushing or merging to a shared branch, deleting or
-overwriting, infrastructure, secrets or money always escalates.
+part whatever the brain says (`questions::must_escalate`, on the title, the
+detail, which holds a prompt's command, the context and the options, words
+matched whole so "prompt" isn't "prod" and `pushd` isn't a push): a question
+about deploying or releasing (`npm publish`, `cargo publish`; not `cargo
+build --release` or release notes), pushing (a bare "push?") or merging (a PR,
+`gh pr merge`), deleting or overwriting (`rm`, removing files or data, `git
+clean`, `git checkout -- .`, `git reset`, `git restore`, `docker rm`, `docker
+system prune`, `DROP`, `DELETE FROM`), rewriting git history (`git rebase`),
+running as root or changing permissions (`sudo`, `chmod -R`, `chown`), killing
+processes (`kill -9`, `pkill`), skipping the checks (`--no-verify`),
+infrastructure, secrets or money always escalates. Right before an answer is
+typed for the user the dialog is read again, and the policy, this rule and
+the menu check run on what it shows now; if one fails, it escalates instead.
 
 The user's policy (`tower policy`, `PUT /v1/questions-policy`, kept in
 config.toml as `question_policy`): `normal`; `keep-moving` (the brain answers
@@ -193,7 +220,15 @@ key:
 On any surprise it stops and says where (`status: failed`, `error`), and
 the user can finish in the terminal. Text is typed with `hc send` without
 the tower's terminal identity, so it goes in as it is (from a terminal hc
-would wrap it in a note saying who sent it).
+would wrap it in a note saying who sent it), with `--` before the terminal
+and the text (a reply like "- yes" isn't a flag), and without control
+characters (C0, DEL, C1; line breaks and tabs stay).
+
+One answer at a time: a set is marked `answering` in the same step that
+checks it isn't already, so the phone, the panel and the tower can't type
+into one dialog together, and keys for a session go in under its typing
+guard (`hc::typing(address)`), held while a dialog is driven or a reply is
+typed.
 
 ## By voice
 

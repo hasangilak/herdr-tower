@@ -2,8 +2,16 @@
 //! long random token the device keeps. The tower keeps only the token's
 //! SHA-256 (`devices.json`, mode 0600), so a copy of that file can't be used
 //! to call the API. A device is paired with a one-time code shown on the Mac.
+//!
+//! The daemon and `tower phone` both change `devices.json`: every change is
+//! a whole read, change and write under a lock (`update`), so two writers
+//! never undo each other (a revoked phone can't come back).
 
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -12,8 +20,10 @@ use serde::{Deserialize, Serialize};
 
 /// A pairing code lasts this long.
 pub const CODE_TTL: Duration = Duration::from_secs(5 * 60);
-/// Wrong codes before the code is void (a new one must be made on the Mac).
+/// Wrong codes from one address before the code is void for it.
 pub const CODE_TRIES: u32 = 5;
+/// Wrong codes from all addresses before the code is void (a new one must be made on the Mac).
+pub const CODE_TRIES_ALL: u32 = 30;
 
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
@@ -85,21 +95,36 @@ impl Devices {
         crate::config::config_dir().join("devices.json")
     }
 
-    pub fn load_from(path: &Path) -> Devices {
-        std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    /// What is on file: none when there is no file yet, an error when it
+    /// can't be read whole (never "no devices" for a broken file).
+    pub fn load_from(path: &Path) -> Result<Devices> {
+        match std::fs::read_to_string(path) {
+            Ok(t) => serde_json::from_str(&t).with_context(|| format!("{} is damaged", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Devices::default()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
     }
 
-    /// Owner-only, written whole through a temporary file.
+    /// Owner-only, written whole through a temporary file of its own.
     pub fn save_to(&self, path: &Path) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
+        static N: AtomicU64 = AtomicU64::new(0);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = path.with_extension("json.tmp");
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-        std::io::Write::write_all(&mut f, serde_json::to_string_pretty(self)?.as_bytes())?;
-        std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        let tmp = path.with_extension(format!("json.{}.{}.tmp", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        let write = || -> Result<()> {
+            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+            std::io::Write::write_all(&mut f, serde_json::to_string_pretty(self)?.as_bytes())?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, path)?;
+            Ok(())
+        };
+        write()
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })
+            .with_context(|| format!("writing {}", path.display()))
     }
 
     /// The device this token belongs to.
@@ -157,15 +182,98 @@ impl Devices {
     }
 }
 
-/// The pairing code on offer: one at a time, one use, a few minutes, a few tries.
+/// Every change to `devices.json` in this process waits here; other
+/// processes (`tower phone`) wait on the lock file beside it.
+static WRITING: Mutex<()> = Mutex::new(());
+
+/// Changes `devices.json`: read, `change`, written back if it changed, all
+/// under the lock. A damaged file is an error and stays as it is.
+pub fn update<T>(path: &Path, change: impl FnOnce(&mut Devices) -> T) -> Result<T> {
+    let _held = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    let _file = lock_file(path)?;
+    let before = Devices::load_from(path)?;
+    let mut d = before.clone();
+    let out = change(&mut d);
+    if d != before {
+        d.save_to(path)?;
+    }
+    Ok(out)
+}
+
+/// An exclusive `flock` on `<path>.lock`, held until the file is dropped.
+fn lock_file(path: &Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let lock = path.with_extension("json.lock");
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock)
+        .with_context(|| format!("opening {}", lock.display()))?;
+    loop {
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(f);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e).with_context(|| format!("locking {}", lock.display()));
+        }
+    }
+}
+
+/// `devices.json` as the daemon reads it on every call: the file as it is
+/// now, or, while it can't be read, the last copy that could (a damaged
+/// file doesn't unpair every phone).
+#[derive(Debug)]
+pub struct Store {
+    path: PathBuf,
+    last_good: Mutex<Option<Devices>>,
+}
+
+impl Store {
+    pub fn new(path: PathBuf) -> Store {
+        Store { path, last_good: Mutex::new(None) }
+    }
+
+    pub fn load(&self) -> Devices {
+        let mut last = self.last_good.lock().unwrap_or_else(|e| e.into_inner());
+        match Devices::load_from(&self.path) {
+            Ok(d) => {
+                *last = Some(d.clone());
+                d
+            }
+            Err(e) => {
+                eprintln!("[phone] {e:#}: using the last good copy");
+                last.clone().unwrap_or_default()
+            }
+        }
+    }
+
+    /// `update` on this file.
+    pub fn update<T>(&self, change: impl FnOnce(&mut Devices) -> T) -> Result<T> {
+        update(&self.path, change)
+    }
+}
+
+/// The pairing code on offer: one at a time, one use, a few minutes, a few
+/// tries from each address (so one address can't burn it for the others).
 #[derive(Debug, Default)]
 pub struct Pairing {
-    code: Option<(String, Instant, u32)>,
+    code: Option<(String, Instant)>,
+    /// Wrong tries for this code, by address.
+    tries: HashMap<IpAddr, u32>,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum PairError {
-    /// No code on offer (none made, used, expired or burned).
+    /// No code on offer (none made, used, expired or burned), or none for
+    /// this address any more.
     NoCode,
     Wrong {
         left: u32,
@@ -177,40 +285,47 @@ impl Pairing {
     pub fn open(&mut self) -> String {
         let n = u64::from_le_bytes(random_bytes::<8>()) % 100_000_000;
         let code = format!("{n:08}");
-        self.code = Some((code.clone(), Instant::now(), 0));
+        self.code = Some((code.clone(), Instant::now()));
+        self.tries.clear();
         code
     }
 
     pub fn close(&mut self) {
         self.code = None;
+        self.tries.clear();
     }
 
     /// When the code on offer expires, if one is.
     pub fn expires_in(&self) -> Option<Duration> {
-        let (_, made, _) = self.code.as_ref()?;
+        let (_, made) = self.code.as_ref()?;
         CODE_TTL.checked_sub(made.elapsed())
     }
 
-    /// Takes the code (spaces and dashes don't matter). Right: it's used up.
-    pub fn take(&mut self, given: &str) -> Result<(), PairError> {
-        self.take_at(given, Instant::now())
+    /// Takes the code (spaces and dashes don't matter) from `from`. Right: it's used up.
+    pub fn take(&mut self, given: &str, from: IpAddr) -> Result<(), PairError> {
+        self.take_at(given, from, Instant::now())
     }
 
-    fn take_at(&mut self, given: &str, now: Instant) -> Result<(), PairError> {
-        let Some((code, made, tries)) = self.code.as_mut() else { return Err(PairError::NoCode) };
+    fn take_at(&mut self, given: &str, from: IpAddr, now: Instant) -> Result<(), PairError> {
+        let Some((code, made)) = self.code.as_ref() else { return Err(PairError::NoCode) };
         if now.duration_since(*made) > CODE_TTL {
-            self.code = None;
+            self.close();
+            return Err(PairError::NoCode);
+        }
+        if self.tries.get(&from).is_some_and(|t| *t >= CODE_TRIES) {
             return Err(PairError::NoCode);
         }
         let given: String = given.chars().filter(|c| c.is_ascii_digit()).collect();
         if same(given.as_bytes(), code.as_bytes()) {
-            self.code = None;
+            self.close();
             return Ok(());
         }
+        let tries = self.tries.entry(from).or_insert(0);
         *tries += 1;
         let left = CODE_TRIES.saturating_sub(*tries);
-        if left == 0 {
-            self.code = None;
+        if self.tries.values().sum::<u32>() >= CODE_TRIES_ALL {
+            self.close();
+            return Err(PairError::Wrong { left: 0 });
         }
         Err(PairError::Wrong { left })
     }
@@ -302,22 +417,78 @@ mod tests {
         let (_, token) = d.add("Pixel", 5);
         d.save_to(&path).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        let back = Devices::load_from(&path);
+        let back = Devices::load_from(&path).unwrap();
         assert_eq!(back, d);
         assert!(back.find(&token).is_some());
+        let leftovers: Vec<_> =
+            std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).collect();
+        assert!(leftovers.is_empty(), "no temporary file is left behind");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
+    fn a_damaged_devices_file_is_an_error_not_an_empty_list() {
+        let dir = std::env::temp_dir().join(format!("tower-devices-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("devices.json");
+        assert_eq!(Devices::load_from(&path).unwrap(), Devices::default(), "no file yet: no devices");
+        let store = Store::new(path.clone());
+        let token = store.update(|d| d.add("Pixel", 1).1).unwrap();
+        assert!(store.load().find(&token).is_some());
+        // Cut short, as a writer that didn't use the temporary file would leave it.
+        let whole = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, &whole[..whole.len() / 2]).unwrap();
+        assert!(Devices::load_from(&path).is_err());
+        assert!(store.load().find(&token).is_some(), "the last good copy still lets the phone in");
+        assert!(store.update(|d| d.add("Other", 2)).is_err(), "no change is written over a damaged file");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), whole[..whole.len() / 2], "the damaged file is left for the user");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn changes_from_many_writers_are_all_kept() {
+        let dir = std::env::temp_dir().join(format!("tower-devices-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("devices.json");
+        let (first, _) = update(&path, |d| d.add("first", 1)).unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    update(&path, |d| d.add(&format!("p{i}"), 1)).unwrap();
+                })
+            })
+            .collect();
+        // A revoke racing a `seen` that read before it: the device stays gone.
+        update(&path, |d| d.revoke(&first.id)).unwrap();
+        update(&path, |d| {
+            if let Some(x) = d.devices.iter_mut().find(|x| x.id == first.id) {
+                x.last_seen_ms = 99;
+            }
+        })
+        .unwrap();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let d = Devices::load_from(&path).unwrap();
+        assert_eq!(d.devices.len(), 8, "every pairing is on file");
+        assert!(d.devices.iter().all(|x| x.id != first.id), "the revoked device didn't come back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const A: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 20));
+    const B: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 21));
+
+    #[test]
     fn pairing_codes_are_one_time() {
         let mut p = Pairing::default();
-        assert_eq!(p.take("12345678"), Err(PairError::NoCode), "no code on offer");
+        assert_eq!(p.take("12345678", A), Err(PairError::NoCode), "no code on offer");
         let code = p.open();
         assert_eq!(code.len(), 8);
         assert!(p.expires_in().is_some());
         let spaced = format!("{} {}", &code[..4], &code[4..]);
-        assert_eq!(p.take(&spaced), Ok(()));
-        assert_eq!(p.take(&code), Err(PairError::NoCode), "used up");
+        assert_eq!(p.take(&spaced, A), Ok(()));
+        assert_eq!(p.take(&code, A), Err(PairError::NoCode), "used up");
     }
 
     #[test]
@@ -326,20 +497,40 @@ mod tests {
         let code = p.open();
         let wrong = if code == "00000000" { "11111111" } else { "00000000" };
         for left in (0..CODE_TRIES).rev() {
-            assert_eq!(p.take(wrong), Err(PairError::Wrong { left }));
+            assert_eq!(p.take(wrong, A), Err(PairError::Wrong { left }));
         }
-        assert_eq!(p.take(&code), Err(PairError::NoCode), "burned: even the right code fails now");
+        assert_eq!(p.take(&code, A), Err(PairError::NoCode), "burned for that address: even the right code fails there");
+        assert_eq!(p.take(&code, B), Ok(()), "another address still pairs");
 
         let code = p.open();
         let later = Instant::now() + CODE_TTL + Duration::from_secs(1);
-        assert_eq!(p.take_at(&code, later), Err(PairError::NoCode), "expired");
+        assert_eq!(p.take_at(&code, A, later), Err(PairError::NoCode), "expired");
         // A new code replaces the old one.
         let first = p.open();
         let second = p.open();
         if first != second {
-            assert!(matches!(p.take(&first), Err(PairError::Wrong { .. })));
+            assert!(matches!(p.take(&first, A), Err(PairError::Wrong { .. })));
         }
-        assert_eq!(p.take(&second), Ok(()));
+        assert_eq!(p.take(&second, A), Ok(()));
+    }
+
+    #[test]
+    fn many_addresses_burn_the_code_at_last() {
+        let mut p = Pairing::default();
+        let code = p.open();
+        let wrong = if code == "00000000" { "11111111" } else { "00000000" };
+        let mut n = 0;
+        'all: for host in 1..=255u8 {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, host));
+            for _ in 0..CODE_TRIES {
+                n += 1;
+                if p.take(wrong, ip) == Err(PairError::Wrong { left: 0 }) && n == CODE_TRIES_ALL {
+                    break 'all;
+                }
+            }
+        }
+        assert_eq!(n, CODE_TRIES_ALL);
+        assert_eq!(p.take(&code, B), Err(PairError::NoCode), "void for everyone");
     }
 
     #[test]

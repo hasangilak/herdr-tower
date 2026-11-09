@@ -5,6 +5,7 @@
 //!   click        the panel: type to the tower (with pictures, videos,
 //!                links), and its history of jobs and activity
 //!   right-click  show the tower's own terminal
+//!   ⌥-click      mute the tower, or unmute it (the panel's Mute does the same)
 //!   drag         put it anywhere; it stays there next time
 //!   ⌘⇧K          show or hide it, from anywhere
 //!   ⌘⇧Space      talk, from anywhere (as a click)
@@ -135,6 +136,11 @@ impl Tower {
     }
 
     /// The red dot: the brain or any agent is waiting for a person.
+    /// Muted (`tower mute`): it says nothing.
+    fn muted(&self) -> bool {
+        self.alive && self.s("muted").as_bool() == Some(true)
+    }
+
     fn needs_you(&self) -> bool {
         self.alive && (self.phase() == "blocked" || self.blocked_agents() > 0)
     }
@@ -188,6 +194,11 @@ fn pid_alive(pid: i32) -> bool {
 
 // ---------------------------------------------------------------------------
 // Running `tower` and `hc`, off the UI thread.
+
+/// Mutes the tower, or unmutes it.
+fn toggle_mute(cx: &mut App) {
+    tower(&["mute", "toggle"], cx);
+}
 
 /// `tower <args>`; a failure becomes a notification.
 fn tower(args: &'static [&'static str], cx: &mut App) {
@@ -541,6 +552,7 @@ impl Render for Orb {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dark = is_dark(window.appearance());
         let needs_you = self.tower.read(cx).needs_you();
+        let muted = self.tower.read(cx).muted();
         let colors = palette(dark);
         let me = cx.entity();
 
@@ -552,7 +564,18 @@ impl Render for Orb {
             .items_center()
             .justify_center()
             .cursor_pointer()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, _| this.mouse_down()))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                    // ⌥-click: mute or unmute, nothing else.
+                    if e.modifiers.alt {
+                        cx.stop_propagation();
+                        toggle_mute(cx);
+                        return;
+                    }
+                    this.mouse_down()
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|_, _: &MouseDownEvent, _, cx| {
@@ -561,6 +584,25 @@ impl Render for Orb {
                 }),
             )
             // The orb itself is drawn underneath, by `render`.
+            // Muted: a small mark at the bottom left (the red dot keeps the top right).
+            .when(muted, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .bottom(px(2.0))
+                        .left(px(2.0))
+                        .size(px(16.0))
+                        .rounded(px(8.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(colors.popover)
+                        .border_1()
+                        .border_color(colors.border)
+                        .text_size(px(9.0))
+                        .child("🔇"),
+                )
+            })
             .when(needs_you, |el| {
                 el.child(
                     div()

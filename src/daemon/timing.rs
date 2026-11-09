@@ -14,13 +14,13 @@ static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
 
 /// A request begins: the take ended, or text was asked.
 pub fn start(what: &str) {
-    *CLOCK.lock().unwrap() = Some(Clock { start: Instant::now(), marked: vec![] });
+    *CLOCK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Clock { start: Instant::now(), marked: vec![] });
     eprintln!("[time] {} +    0 ms {what}", wall());
 }
 
 /// A step of the current request happened.
 pub fn mark(step: &'static str) {
-    let mut clock = CLOCK.lock().unwrap();
+    let mut clock = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(c) = clock.as_mut() else { return };
     // A step this late belongs to something else (an alert, a watch).
     if c.marked.contains(&step) || c.start.elapsed() > Duration::from_secs(300) {

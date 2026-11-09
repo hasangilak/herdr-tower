@@ -7,7 +7,10 @@ use anyhow::{Result, bail};
 use serde_json::Value;
 
 use crate::config;
-use crate::daemon::lan::{auth::{Device, Devices}, tls};
+use crate::daemon::lan::{
+    auth::{self, Device, Devices},
+    tls,
+};
 use crate::protocol::{self, Request};
 
 /// Where the phone API stands, for the panel.
@@ -31,7 +34,7 @@ pub fn status() -> Status {
         voice: info.is_some(),
         url: info.as_ref().and_then(|v| v["url"].as_str().map(String::from)),
         pairing_expires_in_s: info.as_ref().and_then(|v| v["pairing_expires_in_s"].as_u64()),
-        devices: Devices::load_from(&Devices::path()).devices,
+        devices: Devices::load_from(&Devices::path()).unwrap_or_default().devices,
     }
 }
 
@@ -62,13 +65,14 @@ pub fn pair() -> Result<Value> {
 /// Forgets a paired phone (or `all`): its token stops working and its open
 /// streams close. How many were revoked.
 pub fn revoke(id: &str) -> Result<usize> {
-    let mut d = Devices::load_from(&Devices::path());
-    let ids: Vec<String> = d.devices.iter().filter(|x| id == "all" || x.id == id).map(|x| x.id.clone()).collect();
-    let n = d.revoke(id);
+    // Under the lock the daemon takes too, so a phone's `last seen` can't put it back.
+    let (n, ids) = auth::update(&Devices::path(), |d| {
+        let ids: Vec<String> = d.devices.iter().filter(|x| id == "all" || x.id == id).map(|x| x.id.clone()).collect();
+        (d.revoke(id), ids)
+    })?;
     if n == 0 {
         bail!("no paired device {id}");
     }
-    d.save_to(&Devices::path())?;
     for i in ids {
         let _ = daemon("revoked", &i);
     }
@@ -78,14 +82,12 @@ pub fn revoke(id: &str) -> Result<usize> {
 /// Where a paired phone's replies are heard: `phone` (on the phone only; the
 /// Mac stays silent for what it sends) or `mac`. Kept in devices.json.
 pub fn set_route(id: &str, route: &str) -> Result<()> {
-    if !crate::daemon::lan::auth::valid_route(route) {
+    if !auth::valid_route(route) {
         bail!("where to hear replies: phone or mac, not {route:?}");
     }
-    let mut d = Devices::load_from(&Devices::path());
-    if !d.set_route(id, route) {
+    if !auth::update(&Devices::path(), |d| d.set_route(id, route))? {
         bail!("no paired device {id}");
     }
-    d.save_to(&Devices::path())?;
     let _ = daemon("route", id);
     Ok(())
 }
@@ -143,7 +145,7 @@ pub fn cmd(action: &str, id: Option<&str>, value: Option<&str>, json: bool) -> R
                     }
                 ),
             }
-            let d = Devices::load_from(&Devices::path());
+            let d = Devices::load_from(&Devices::path())?;
             if d.devices.is_empty() {
                 println!("No paired phones.");
             }
@@ -275,8 +277,14 @@ mod tests {
     #[test]
     fn top_level_keys_stay_above_the_tables() {
         use super::with_top_level;
-        assert_eq!(with_top_level("voice = \"x\"\n[lan]\nenabled = true\n", "question_policy", "\"keep-moving\""), "voice = \"x\"\nquestion_policy = \"keep-moving\"\n[lan]\nenabled = true\n");
-        assert_eq!(with_top_level("question_policy = \"normal\"\n[lan]\nquestion_policy = 1\n", "question_policy", "\"ask-everything\""), "question_policy = \"ask-everything\"\n[lan]\nquestion_policy = 1\n");
+        assert_eq!(
+            with_top_level("voice = \"x\"\n[lan]\nenabled = true\n", "question_policy", "\"keep-moving\""),
+            "voice = \"x\"\nquestion_policy = \"keep-moving\"\n[lan]\nenabled = true\n"
+        );
+        assert_eq!(
+            with_top_level("question_policy = \"normal\"\n[lan]\nquestion_policy = 1\n", "question_policy", "\"ask-everything\""),
+            "question_policy = \"ask-everything\"\n[lan]\nquestion_policy = 1\n"
+        );
         let t = with_top_level("", "question_policy", "\"normal\"");
         let v: toml::Value = toml::from_str(&t).unwrap();
         assert_eq!(v["question_policy"].as_str(), Some("normal"));

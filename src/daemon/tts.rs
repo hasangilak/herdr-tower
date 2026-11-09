@@ -11,12 +11,17 @@
 //! (`hush`). What comes in while they talk is held, and afterwards only
 //! what is still news is said. The listening chimes play on their own
 //! player, so a pause never swallows them.
+//!
+//! Muted (`tower mute`), nothing makes a sound: no words, no bell, no
+//! chimes. What it would have said still shows (`said`), and alerts are
+//! counted, so unmuting can say how many were missed.
 
 use std::collections::VecDeque;
 use std::num::NonZero;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,7 +31,7 @@ use rodio::buffer::SamplesBuffer;
 
 use super::lan::hub::Hub;
 use super::queue::{Kind, Queue};
-use super::state::{Shared, now_ms};
+use super::state::{MISSED_MAX, Shared, lock, now_ms};
 use super::timing;
 
 pub enum Msg {
@@ -49,6 +54,10 @@ pub enum Msg {
     },
     /// Everything queued is dropped (the player was cleared already).
     Hush,
+    /// Muted (`true`: what was playing and queued goes, the player was
+    /// cleared already) or unmuted. Sent in turn with everything else, so
+    /// the speech thread applies it in order.
+    Mute(bool),
     /// A take was sent (`true`: its answer is coming), or came to nothing.
     Expect(bool),
     /// A request reached the brain (`true`: the user took something back,
@@ -75,9 +84,102 @@ pub struct Mouth {
     player: Arc<Player>,
     /// Paired phones; while one is the voice, speech goes there instead.
     hub: Arc<Hub>,
+    /// Muted (`tower mute`): nothing is said, here or on a phone.
+    muted: Arc<AtomicBool>,
+    /// Held while the mute changes: the file, the flag and the state
+    /// change together.
+    mute_lock: Arc<Mutex<()>>,
+    /// The file that keeps the mute (see `mute_file`).
+    mute_path: PathBuf,
+    shared: Shared,
+}
+
+/// Where the mute is kept: the file is there while the tower is muted.
+/// Tests keep theirs in a temporary folder.
+pub fn mute_file() -> PathBuf {
+    if cfg!(test) {
+        return std::env::temp_dir().join(format!("herder-tower-test-{}", std::process::id())).join("muted");
+    }
+    crate::config::state_dir().join("muted")
+}
+
+/// Whether the tower was left muted (the file is there), into the state.
+fn muted_at_start(path: &Path, shared: &Shared) -> bool {
+    let muted = path.exists();
+    shared.update(|s| s.muted = muted);
+    if muted {
+        eprintln!("[speech] muted (tower mute off to hear it again)");
+    }
+    muted
+}
+
+/// Keeps the mute on disk. A failure is only a warning: the mute holds
+/// all the same, until the voice restarts.
+fn save_mute(path: &Path, on: bool) -> Result<()> {
+    if on {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        std::fs::write(path, "muted\n").with_context(|| format!("writing {}", path.display()))?;
+    } else {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
+        }
+    }
+    Ok(())
 }
 
 impl Mouth {
+    pub fn muted(&self) -> bool {
+        self.muted.load(Ordering::SeqCst)
+    }
+
+    /// Mutes the tower (`on`) or lets it talk again. Muting stops what is
+    /// being said, here and on the phones, and from then on nothing makes
+    /// a sound: no replies, alerts, acknowledgements, bells or listening
+    /// chimes. Text and chat go on as before (`said` still shows what it
+    /// would have said), and alerts missed meanwhile are counted, for one
+    /// short line on unmuting. It is kept on disk, so a restarted voice
+    /// stays muted; if the file can't be written the mute holds all the
+    /// same (a warning in the log), only not past a restart. Never fails:
+    /// the `Result` is for callers that print errors.
+    pub fn set_muted(&self, on: bool) -> Result<()> {
+        let _held = lock(&self.mute_lock);
+        self.apply_mute(on);
+        Ok(())
+    }
+
+    /// Flips the mute; returns whether it is muted now.
+    pub fn toggle_muted(&self) -> Result<bool> {
+        let _held = lock(&self.mute_lock);
+        let on = !self.muted();
+        self.apply_mute(on);
+        Ok(on)
+    }
+
+    /// `set_muted`, with `mute_lock` held.
+    fn apply_mute(&self, on: bool) {
+        if let Err(e) = save_mute(&self.mute_path, on) {
+            eprintln!("[speech] warning: {e:#}: the {} holds until the voice restarts", if on { "mute" } else { "unmute" });
+        }
+        let was = self.muted.swap(on, Ordering::SeqCst);
+        self.shared.update(|s| s.muted = on);
+        if was == on {
+            return;
+        }
+        eprintln!("[speech] {}", if on { "muted: nothing is said until unmuted" } else { "unmuted" });
+        if on {
+            // Quiet now, but not a hush: the narrator carries on after an
+            // unmute in the middle of a turn.
+            self.stop_audio();
+            // And no phone plays a clip made before the mute, later.
+            self.hub.drop_clips();
+        }
+        let _ = self.tx.send(Msg::Mute(on));
+    }
+
     /// The brain's words to the user.
     pub fn say(&self, text: impl Into<String>, interrupt: bool) {
         self.say_as(text, Kind::Reply, interrupt);
@@ -122,13 +224,19 @@ impl Mouth {
     /// Stops speaking now and drops everything queued.
     pub fn hush(&self) {
         self.hushes.fetch_add(1, Ordering::SeqCst);
+        self.stop_audio();
+        let _ = self.tx.send(Msg::Hush);
+    }
+
+    /// Stops what is playing, here and on the phones. A sentence being
+    /// made is let go (its generation is over).
+    fn stop_audio(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.player.clear();
         if self.held.load(Ordering::SeqCst) == 0 {
             self.player.play();
         }
         self.hub.broadcast("hush", serde_json::json!({}));
-        let _ = self.tx.send(Msg::Hush);
     }
 
     /// The user is about to talk (`on`), or isn't any more: speech pauses at
@@ -167,19 +275,41 @@ impl Mouth {
 impl Mouth {
     /// A mouth that says nothing (no speakers, no Kokoro), for tests.
     pub fn silent(hub: Arc<Hub>) -> Mouth {
-        let (tx, rx) = channel();
+        let (mouth, rx) = Mouth::for_test(hub, test_mute_path());
         // Messages are dropped unread.
         std::mem::forget(rx);
+        mouth
+    }
+
+    /// A mouth with its messages, and its own mute file at `mute_path`
+    /// (read as at start-up).
+    fn for_test(hub: Arc<Hub>, mute_path: PathBuf) -> (Mouth, Receiver<Msg>) {
+        let (tx, rx) = channel();
         let (player, _out) = Player::new();
-        Mouth {
+        let shared = Shared::new(super::state::State::new("ptt", "test", "test"));
+        let muted = muted_at_start(&mute_path, &shared);
+        let mouth = Mouth {
             tx,
             generation: Arc::new(AtomicU64::new(0)),
             hushes: Arc::new(AtomicU64::new(0)),
             held: Arc::new(AtomicU8::new(0)),
             player: Arc::new(player),
             hub,
-        }
+            muted: Arc::new(AtomicBool::new(muted)),
+            mute_lock: Arc::new(Mutex::new(())),
+            mute_path,
+            shared,
+        };
+        (mouth, rx)
     }
+}
+
+/// A mute file of its own for each test mouth, under `mute_file`'s folder.
+#[cfg(test)]
+fn test_mute_path() -> PathBuf {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = mute_file().with_file_name(format!("mouth-{}", N.fetch_add(1, Ordering::SeqCst)));
+    dir.join("muted")
 }
 
 pub struct Settings {
@@ -226,6 +356,8 @@ pub fn start(settings: Settings, shared: Shared, hub: Arc<Hub>) -> Result<Mouth>
         .collect();
 
     let (tx, rx) = channel();
+    let mute_path = mute_file();
+    let muted = muted_at_start(&mute_path, &shared);
     let mouth = Mouth {
         tx,
         generation: Arc::new(AtomicU64::new(0)),
@@ -233,9 +365,13 @@ pub fn start(settings: Settings, shared: Shared, hub: Arc<Hub>) -> Result<Mouth>
         held: Arc::new(AtomicU8::new(0)),
         player: player.clone(),
         hub: hub.clone(),
+        muted: Arc::new(AtomicBool::new(muted)),
+        mute_lock: Arc::new(Mutex::new(())),
+        mute_path,
+        shared: shared.clone(),
     };
     let speech = Speech {
-        engine,
+        engine: Some(engine),
         q: Queue::new(settings.alert_max_age),
         settings,
         acks,
@@ -243,6 +379,7 @@ pub fn start(settings: Settings, shared: Shared, hub: Arc<Hub>) -> Result<Mouth>
         bell,
         generation: mouth.generation.clone(),
         held: mouth.held.clone(),
+        muted: mouth.muted.clone(),
         shared,
         playing: VecDeque::new(),
         hub,
@@ -267,7 +404,8 @@ pub fn start(settings: Settings, shared: Shared, hub: Arc<Hub>) -> Result<Mouth>
 }
 
 struct Speech {
-    engine: loqui::Engine,
+    /// None in tests: nothing is made.
+    engine: Option<loqui::Engine>,
     q: Queue,
     settings: Settings,
     acks: Vec<(String, Vec<f32>)>,
@@ -275,6 +413,8 @@ struct Speech {
     bell: Player,
     generation: Arc<AtomicU64>,
     held: Arc<AtomicU8>,
+    /// Muted (`tower mute`): what comes in is dropped unsaid.
+    muted: Arc<AtomicBool>,
     shared: Shared,
     /// The kind of each sound in the player, oldest (playing) first.
     playing: VecDeque<Kind>,
@@ -343,9 +483,9 @@ impl Speech {
                 }
             }
             if let Some(since) = self.awaiting {
-                let brain = self.shared.get().brain;
+                let gone = self.shared.with(|s| s.brain == "blocked" || s.brain == "absent");
                 // The answer is overdue, or isn't coming.
-                if since.elapsed() > self.settings.alert_wait || brain == "blocked" || brain == "absent" {
+                if since.elapsed() > self.settings.alert_wait || gone {
                     self.awaiting = None;
                 }
             }
@@ -361,14 +501,29 @@ impl Speech {
 
     fn message(&mut self, m: Msg) {
         match m {
-            Msg::Chime(on) => self.bell.append(chime(on)),
+            Msg::Chime(on) => {
+                if !self.is_muted() {
+                    self.bell.append(chime(on));
+                }
+            }
             Msg::Ack { delay } => {
                 self.acked = false;
-                if !self.acks.is_empty() {
+                if !self.acks.is_empty() && !self.is_muted() {
                     self.ack = Some((Instant::now() + delay, self.replies_started));
                 }
             }
             Msg::Say { text, kind, interrupt } => {
+                if self.is_muted() {
+                    // Not heard, but it shows; news (a watch's report the brain tells) is kept as missed.
+                    if !text.trim().is_empty() {
+                        eprintln!("[speech] muted: not saying {text:?}");
+                        self.show_said(&text);
+                        if kind == Kind::Alert {
+                            self.missed(&text);
+                        }
+                    }
+                    return;
+                }
                 if kind == Kind::Reply && self.dismissed && !text.trim().is_empty() && crate::text::is_short_reply(&text) {
                     eprintln!("[speech] you said never mind: not saying {text:?}");
                     return;
@@ -381,10 +536,7 @@ impl Speech {
                     Some(Some(t)) => t,
                     None => text,
                 };
-                self.shared.update(|s| {
-                    s.said = text.clone();
-                    s.said_ms = now_ms();
-                });
+                self.show_said(&text);
                 let item = self.q.item(kind, &text, None);
                 if interrupt {
                     self.generation.fetch_add(1, Ordering::SeqCst);
@@ -401,10 +553,13 @@ impl Speech {
                 }
             }
             Msg::Alert { text, about } => {
-                self.shared.update(|s| {
-                    s.said = text.clone();
-                    s.said_ms = now_ms();
-                });
+                self.show_said(&text);
+                if self.is_muted() {
+                    // Kept, so unmuting can say what was missed.
+                    eprintln!("[speech] muted: not saying the alert {text:?}");
+                    self.missed(&text);
+                    return;
+                }
                 let item = self.q.item(Kind::Alert, &text, about);
                 if self.q.push(item) {
                     eprintln!("[speech] alert queued: {text:?} ({} waiting)", self.q.len());
@@ -417,6 +572,33 @@ impl Speech {
                     eprintln!("[speech] hushed: dropped {n} waiting");
                 }
                 self.ack = None;
+            }
+            Msg::Mute(true) => {
+                // Anything made or queued before the mute goes.
+                self.player.clear();
+                if self.held.load(Ordering::SeqCst) == 0 {
+                    self.player.play();
+                }
+                self.routed.clear();
+                let n = self.q.clear();
+                if n > 0 {
+                    eprintln!("[speech] muted: dropped {n} waiting");
+                }
+                self.ack = None;
+            }
+            Msg::Mute(false) => {
+                // Muted again since: the missed stay for the next unmute.
+                if self.is_muted() {
+                    return;
+                }
+                let mut missed = vec![];
+                self.shared.update(|s| missed = std::mem::take(&mut s.missed_while_muted));
+                if let Some(line) = missed_line(missed.len()) {
+                    eprintln!("[speech] missed while muted: {missed:?}");
+                    self.show_said(&line);
+                    let item = self.q.item(Kind::Alert, &line, None);
+                    self.q.push(item);
+                }
             }
             Msg::Expect(true) => {
                 // A new question is on its way: what came in for the old
@@ -446,9 +628,22 @@ impl Speech {
         }
     }
 
+    /// What it is saying (or would, unmuted), for the orb.
+    fn show_said(&self, text: &str) {
+        self.shared.update(|s| {
+            s.said = text.to_string();
+            s.said_ms = now_ms();
+        });
+    }
+
     /// The acknowledgement, if nothing was said since the request.
     fn maybe_ack(&mut self) {
         let Some((at, before)) = self.ack else { return };
+        let generation = self.generation.load(Ordering::SeqCst);
+        if self.is_muted() {
+            self.ack = None;
+            return;
+        }
         if Instant::now() < at {
             return;
         }
@@ -459,13 +654,17 @@ impl Speech {
         let (text, clip) = self.acks[self.next_ack % self.acks.len()].clone();
         self.next_ack += 1;
         self.append(Kind::Reply, clip, &text, "ack");
+        self.unless_stopped(generation);
         self.acked = true;
         timing::mark("acknowledged");
     }
 
     fn speak_next(&mut self) {
+        if self.engine.is_none() {
+            return;
+        }
         let alerts_may = self.awaiting.is_none();
-        let agents = if self.q.has_alerts() && alerts_may { self.shared.get().agents } else { vec![] };
+        let agents = if self.q.has_alerts() && alerts_may { self.shared.with(|s| s.agents.clone()) } else { vec![] };
         let status = |address: &str| agents.iter().find(|a| a.address == address).map(|a| a.status.clone());
         let Some(next) = self.q.next(alerts_may, status) else { return };
         let generation = self.generation.load(Ordering::SeqCst);
@@ -485,7 +684,8 @@ impl Speech {
             ..loqui::SpeakRequest::new(next.text.clone())
         };
         let t = Instant::now();
-        match self.engine.speak(&req) {
+        let Some(made) = self.engine.as_ref().map(|e| e.speak(&req)) else { return };
+        match made {
             Ok(speech) => {
                 eprintln!(
                     "[tts] {}{:.1}s of speech in {} ms",
@@ -493,12 +693,14 @@ impl Speech {
                     speech.duration_secs,
                     t.elapsed().as_millis()
                 );
-                // Hushed while it was being made.
+                // Hushed while it was being made (its bell goes too).
                 if self.generation.load(Ordering::SeqCst) != generation {
+                    self.unless_stopped(generation);
                     return;
                 }
                 let label = if next.kind == Kind::Alert { "alert" } else { "reply" };
                 self.append(next.kind, pcm(&speech.audio), &next.text, label);
+                self.unless_stopped(generation);
                 if next.kind == Kind::Reply {
                     timing::mark("first words playing");
                 }
@@ -507,10 +709,48 @@ impl Speech {
         }
     }
 
+    /// News not heard while muted, kept (the newest few) for the unmute.
+    fn missed(&self, text: &str) {
+        let text = text.to_string();
+        self.shared.update(|s| {
+            s.missed_while_muted.push(text);
+            let over = s.missed_while_muted.len().saturating_sub(MISSED_MAX);
+            s.missed_while_muted.drain(..over);
+        });
+    }
+
+    fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::SeqCst)
+    }
+
+    /// A hush or a mute came from another thread between the last check and
+    /// the append: what was just added goes too, so nothing plays after it.
+    /// (They bump the generation before clearing the player, so one of the
+    /// two always sees the other.)
+    fn unless_stopped(&mut self, generation: u64) {
+        if self.generation.load(Ordering::SeqCst) == generation && !self.is_muted() {
+            return;
+        }
+        self.player.clear();
+        if self.held.load(Ordering::SeqCst) == 0 {
+            self.player.play();
+        }
+        if !self.routed.is_empty() {
+            self.routed.clear();
+            self.hub.broadcast("hush", serde_json::json!({}));
+        }
+        self.publish();
+    }
+
     /// Plays a sound: here, or on the phone that is the voice (the Mac
     /// stays silent). `text` is what it says; `label` what it is (`reply`,
-    /// `alert`, `ack`, `cue`), for the phone.
+    /// `alert`, `ack`, `cue`), for the phone. Nothing, while muted (a
+    /// sentence made just before the mute).
     fn append(&mut self, kind: Kind, samples: Vec<f32>, text: &str, label: &str) {
+        if self.is_muted() {
+            self.q.clear();
+            return;
+        }
         // A reply to what a phone sent: that phone only. Else a phone that is the voice, or here.
         let to_phone = if kind == Kind::Reply { self.turn_phone.clone() } else { None };
         if to_phone.is_some() || self.hub.voice() {
@@ -551,6 +791,15 @@ impl Speech {
             s.speaking = speaking;
             s.announcing = announcing;
         });
+    }
+}
+
+/// What unmuting says about the alerts missed meanwhile (none: nothing).
+fn missed_line(n: usize) -> Option<String> {
+    match n {
+        0 => None,
+        1 => Some("While you were muted: 1 update. Ask me for it.".into()),
+        n => Some(format!("While you were muted: {n} updates. Ask me for them.")),
     }
 }
 
@@ -618,7 +867,243 @@ fn cue() -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cue, quick_start};
+    use super::*;
+
+    /// A mouth and its speech thread's state, without speakers or Kokoro:
+    /// messages are handed over by `deliver`.
+    fn pair() -> (Mouth, Speech, Receiver<Msg>) {
+        pair_at(test_mute_path())
+    }
+
+    fn pair_at(mute_path: PathBuf) -> (Mouth, Speech, Receiver<Msg>) {
+        let hub = Arc::new(Hub::default());
+        let (mouth, rx) = Mouth::for_test(hub.clone(), mute_path);
+        let (bell, _out) = Player::new();
+        let speech = Speech {
+            engine: None,
+            q: Queue::new(Duration::from_secs(60)),
+            settings: Settings {
+                voice: "test".into(),
+                speed: 1.0,
+                volume: 1.0,
+                acks: vec!["Got it.".into()],
+                cue: true,
+                alert_wait: Duration::from_secs(10),
+                alert_max_age: Duration::from_secs(60),
+            },
+            acks: vec![("Got it.".into(), vec![0.0; 10])],
+            player: mouth.player.clone(),
+            bell,
+            generation: mouth.generation.clone(),
+            held: mouth.held.clone(),
+            muted: mouth.muted.clone(),
+            shared: mouth.shared.clone(),
+            playing: VecDeque::new(),
+            hub,
+            routed: VecDeque::new(),
+            awaiting: None,
+            ack: None,
+            acked: false,
+            dismissed: false,
+            turn_phone: None,
+            replies_started: 0,
+            next_ack: 0,
+            last_alert: None,
+            published: None,
+        };
+        (mouth, speech, rx)
+    }
+
+    /// The speech thread takes what was sent.
+    fn deliver(speech: &mut Speech, rx: &Receiver<Msg>) {
+        while let Ok(m) = rx.try_recv() {
+            speech.message(m);
+        }
+    }
+
+    #[test]
+    fn nothing_makes_a_sound_while_muted() {
+        let (mouth, mut speech, rx) = pair();
+        mouth.set_muted(true).unwrap();
+        mouth.say("The tests pass.", false);
+        mouth.alert("Eyzflow finished.", Some(("t22", "done")));
+        mouth.ack(Duration::ZERO);
+        mouth.chime(true);
+        deliver(&mut speech, &rx);
+        assert_eq!(speech.q.len(), 0);
+        assert!(speech.ack.is_none());
+        assert_eq!(speech.bell.len(), 0);
+        speech.maybe_ack();
+        assert_eq!(speech.player.len(), 0);
+        // Unmuted, the same are heard.
+        mouth.set_muted(false).unwrap();
+        mouth.say("The tests pass.", false);
+        mouth.chime(true);
+        mouth.ack(Duration::from_secs(60));
+        deliver(&mut speech, &rx);
+        assert_eq!(speech.q.len(), 2, "the missed line and the reply");
+        assert_eq!(speech.bell.len(), 1);
+        assert!(speech.ack.is_some());
+    }
+
+    #[test]
+    fn what_it_would_say_still_shows_while_muted() {
+        let (mouth, mut speech, rx) = pair();
+        mouth.set_muted(true).unwrap();
+        mouth.say("Two sessions are working.", false);
+        deliver(&mut speech, &rx);
+        let s = mouth.shared.get();
+        assert_eq!(s.said, "Two sessions are working.");
+        assert!(s.said_ms > 0);
+        mouth.alert("The orb session needs you.", None);
+        deliver(&mut speech, &rx);
+        assert_eq!(mouth.shared.get().said, "The orb session needs you.");
+    }
+
+    #[test]
+    fn news_the_brain_tells_counts_as_missed_too() {
+        let (mouth, mut speech, rx) = pair();
+        mouth.set_muted(true).unwrap();
+        // `tower say --alert`, and a [watch] report the brain tells.
+        mouth.say_as("The api session finished.", Kind::Alert, false);
+        // A reply to the user is no missed update.
+        mouth.say_as("Two sessions are working.", Kind::Reply, false);
+        deliver(&mut speech, &rx);
+        assert_eq!(mouth.shared.get().missed_while_muted, vec!["The api session finished.".to_string()]);
+    }
+
+    #[test]
+    fn unmuting_says_how_many_updates_were_missed() {
+        let (mouth, mut speech, rx) = pair();
+        mouth.set_muted(true).unwrap();
+        for i in 0..25 {
+            mouth.alert(format!("Session {i} finished."), None);
+        }
+        deliver(&mut speech, &rx);
+        let missed = mouth.shared.get().missed_while_muted;
+        assert_eq!(missed.len(), MISSED_MAX);
+        assert_eq!(missed.last().unwrap(), "Session 24 finished.");
+        mouth.set_muted(false).unwrap();
+        deliver(&mut speech, &rx);
+        assert!(mouth.shared.get().missed_while_muted.is_empty());
+        let said: Vec<String> = std::iter::from_fn(|| speech.q.next(true, |_| None)).map(|n| n.text).collect();
+        assert_eq!(said.join(" "), "While you were muted: 20 updates. Ask me for them.");
+        // Nothing missed: nothing said.
+        mouth.set_muted(true).unwrap();
+        mouth.set_muted(false).unwrap();
+        deliver(&mut speech, &rx);
+        assert_eq!(speech.q.len(), 0);
+        assert_eq!(missed_line(1).as_deref(), Some("While you were muted: 1 update. Ask me for it."));
+    }
+
+    #[test]
+    fn muting_drops_what_was_queued_and_is_not_a_hush() {
+        let (mouth, mut speech, rx) = pair();
+        mouth.say("One. Two. Three.", false);
+        deliver(&mut speech, &rx);
+        assert_eq!(speech.q.len(), 1);
+        let generation = mouth.generation.load(Ordering::SeqCst);
+        mouth.set_muted(true).unwrap();
+        deliver(&mut speech, &rx);
+        assert_eq!(speech.q.len(), 0);
+        assert_eq!(mouth.generation.load(Ordering::SeqCst), generation + 1);
+        // The narrator's count of hushes is left alone.
+        assert_eq!(mouth.hushes(), 0);
+        // Muting again changes nothing: no second stop.
+        mouth.set_muted(true).unwrap();
+        assert_eq!(mouth.generation.load(Ordering::SeqCst), generation + 1);
+        assert!(rx.try_recv().is_err());
+        // A sentence made before the mute, appended after it, doesn't stay.
+        speech.unless_stopped(generation);
+        assert_eq!(speech.player.len(), 0);
+    }
+
+    #[test]
+    fn toggle_flips_and_is_kept_on_disk() {
+        let (mouth, _speech, _rx) = pair();
+        let file = mouth.mute_path.clone();
+        assert!(!mouth.muted());
+        assert!(mouth.toggle_muted().unwrap());
+        assert!(mouth.muted() && mouth.shared.get().muted && file.exists());
+        assert!(!mouth.toggle_muted().unwrap());
+        assert!(!mouth.muted() && !mouth.shared.get().muted && !file.exists());
+        // Unmuting with no file is fine.
+        mouth.set_muted(false).unwrap();
+    }
+
+    #[test]
+    fn a_mute_that_cant_be_saved_still_holds() {
+        // Its folder is a file: the mute file can't be written.
+        let dir = test_mute_path().with_file_name("not-a-folder");
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        std::fs::write(&dir, "").unwrap();
+        let (mouth, _speech, _rx) = pair_at(dir.join("muted"));
+        mouth.set_muted(true).unwrap();
+        assert!(mouth.muted() && mouth.shared.get().muted);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn a_restarted_voice_stays_muted() {
+        let path = test_mute_path();
+        let (mouth, _speech, _rx) = pair_at(path.clone());
+        assert!(!mouth.muted());
+        mouth.set_muted(true).unwrap();
+        // Started again with the file there.
+        let (again, _speech, _rx) = pair_at(path.clone());
+        assert!(again.muted() && again.shared.get().muted);
+        again.set_muted(false).unwrap();
+        let (third, _speech, _rx) = pair_at(path);
+        assert!(!third.muted() && !third.shared.get().muted);
+    }
+
+    #[test]
+    fn toggles_at_once_agree_in_the_end() {
+        let (mouth, _speech, _rx) = pair();
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let m = mouth.clone();
+                std::thread::spawn(move || {
+                    for j in 0..25 {
+                        if (i + j) % 3 == 0 {
+                            m.set_muted(j % 2 == 0).unwrap();
+                        } else {
+                            m.toggle_muted().unwrap();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let on = mouth.muted();
+        assert_eq!(mouth.shared.get().muted, on);
+        assert_eq!(mouth.mute_path.exists(), on);
+        // 200 plain toggles from an even start end where they began.
+        let before = mouth.muted();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let m = mouth.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        m.toggle_muted().unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(mouth.muted(), before);
+        assert_eq!(mouth.shared.get().muted, before);
+        assert_eq!(mouth.mute_path.exists(), before);
+    }
+
+    #[test]
+    fn tests_never_touch_the_real_mute_file() {
+        assert!(mute_file().starts_with(std::env::temp_dir()));
+    }
 
     #[test]
     fn cuts_a_long_first_sentence() {
