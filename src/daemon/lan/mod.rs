@@ -80,11 +80,13 @@ impl Kind {
     }
 }
 
-/// One listening socket and the flag that ends its accept loop.
+/// One listening socket: the flag that ends its accept loop, and that loop,
+/// which owns the socket (it's closed when the loop ends).
 struct Listener {
     kind: Kind,
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 struct Running {
@@ -117,6 +119,12 @@ pub type Detect = Arc<dyn Fn() -> tailscale::Tailscale + Send + Sync>;
 /// Tailscale is looked at again this often while the API is on: it starts
 /// (or stops) listening on the tailnet as Tailscale comes and goes.
 const TAILSCALE_RECHECK: Duration = Duration::from_secs(20);
+
+/// How often an accept loop looks at its stop flag. The loop never blocks in
+/// `accept`: a listener whose address is gone (Tailscale stopped) can't be
+/// woken by connecting to it, and a loop that never woke kept its socket, so
+/// the address couldn't be listened on again when it came back.
+const ACCEPT_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Clone)]
 pub struct Lan {
@@ -346,8 +354,19 @@ pub fn tailscale_wanted(cfg: &crate::config::Lan) -> Result<bool> {
 
 /// The tailnet address to listen on: Tailscale runs, it's wanted, and the address is in 100.64/10.
 pub fn tailscale_ip(cfg: &crate::config::Lan, ts: &tailscale::Tailscale) -> Option<IpAddr> {
-    let ip = ts.ipv4.filter(|ip| ts.running && tailscale::is_tailnet(*ip))?;
+    let ip = ts.ipv4.filter(|ip| ts.running && (tailscale::is_tailnet(*ip) || loopback_tailnet(*ip)))?;
     tailscale_wanted(cfg).unwrap_or(false).then_some(IpAddr::V4(ip))
+}
+
+/// Tests may let 127.0.0.1 stand for the tailnet (no 100.x address here); never otherwise.
+#[cfg(test)]
+fn loopback_tailnet(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_loopback() && tests::LOOPBACK_TAILNET.with(|c| c.get())
+}
+
+#[cfg(not(test))]
+fn loopback_tailnet(_: std::net::Ipv4Addr) -> bool {
+    false
 }
 
 /// Where to listen: the LAN address as `[lan]` says (`lan`: the default
@@ -484,7 +503,7 @@ impl Lan {
                     tailscale_error = Some(format!("{e:#}"));
                 }
                 Err(e) => {
-                    for l in &listeners {
+                    for l in listeners.drain(..) {
                         Self::unlisten(l);
                     }
                     return Err(e);
@@ -527,14 +546,31 @@ impl Lan {
         }
         let listener = TcpListener::bind((ip, port)).with_context(|| format!("listening on {ip}:{port} ({})", kind.word()))?;
         let addr = listener.local_addr()?;
+        // Polled (see `ACCEPT_POLL`), so stopping never depends on reaching the address.
+        listener.set_nonblocking(true).with_context(|| format!("listening on {addr} ({})", kind.word()))?;
         let stop = Arc::new(AtomicBool::new(false));
         let (me, tls, flag, all) = (self.clone(), tls.clone(), stop.clone(), api_stop.clone());
-        thread::Builder::new().name(format!("lan-{}", kind.word())).spawn(move || {
-            for conn in listener.incoming() {
-                if flag.load(Ordering::SeqCst) || all.load(Ordering::SeqCst) {
-                    break;
+        let thread = thread::Builder::new().name(format!("lan-{}", kind.word())).spawn(move || {
+            // The socket is dropped (closed) when this loop ends.
+            let listener = listener;
+            while !flag.load(Ordering::SeqCst) && !all.load(Ordering::SeqCst) {
+                let conn = match listener.accept() {
+                    Ok((conn, _)) => conn,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(ACCEPT_POLL);
+                        continue;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    // The address went away under it, or too many files: look again shortly.
+                    Err(_) => {
+                        thread::sleep(ACCEPT_POLL);
+                        continue;
+                    }
+                };
+                // On macOS an accepted socket inherits the listener's non-blocking mode.
+                if conn.set_nonblocking(false).is_err() {
+                    continue;
                 }
-                let Ok(conn) = conn else { continue };
                 let ip = conn.peer_addr().map(|a| a.ip()).unwrap_or(IpAddr::from([0, 0, 0, 0]));
                 // Too many open: closed unanswered.
                 let Some(slot) = Slot::take(&me.conns, ip) else { continue };
@@ -548,14 +584,19 @@ impl Lan {
                 });
             }
         })?;
-        Ok(Listener { kind, addr, stop })
+        Ok(Listener { kind, addr, stop, thread: Some(thread) })
     }
 
-    /// Ends a listener's accept loop (its open connections go on).
-    fn unlisten(l: &Listener) {
+    /// Ends a listener's accept loop and closes its socket before returning,
+    /// so its address can be listened on again at once (its open connections
+    /// go on). Never needs the address to be reachable.
+    fn unlisten(mut l: Listener) {
         l.stop.store(true, Ordering::SeqCst);
-        // Wake the accept loop so it sees the flag.
-        let _ = TcpStream::connect_timeout(&l.addr, Duration::from_millis(300));
+        if let Some(t) = l.thread.take()
+            && t.thread().id() != thread::current().id()
+        {
+            let _ = t.join();
+        }
     }
 
     /// Where it listens, into the state (the panel, `state.json`, `GET /v1/state`).
@@ -599,8 +640,8 @@ impl Lan {
             && (r.listeners.len() > 1 || want.is_some())
         {
             let l = r.listeners.remove(pos);
-            Self::unlisten(&l);
             eprintln!("[phone] no longer on the tailnet ({}): Tailscale is {}", l.addr, r.tailscale.word());
+            Self::unlisten(l);
         }
         r.tailscale_error = None;
         if let Some(ip) = want {
@@ -622,7 +663,7 @@ impl Lan {
     pub fn stop(&self) {
         if let Some(r) = self.running.lock().unwrap_or_else(|e| e.into_inner()).take() {
             r.stop.store(true, Ordering::SeqCst);
-            for l in &r.listeners {
+            for l in r.listeners {
                 Self::unlisten(l);
             }
             // Open event streams end too: no phone stays the voice.
@@ -1735,6 +1776,11 @@ fn valid_address(a: &str) -> bool {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// This test thread lets 127.0.0.1 stand for the tailnet (`loopback_tailnet`).
+        pub static LOOPBACK_TAILNET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     #[test]
     fn listens_only_on_private_addresses() {
         for ip in ["192.168.1.20", "10.0.0.5", "172.16.3.4", "100.101.102.103", "169.254.1.1", "fd00::1"] {
@@ -2451,6 +2497,115 @@ mod tests {
         assert_eq!(lan.info()["tailscale"]["error"], Value::Null, "the old watcher's look isn't this API's");
         assert_eq!(lan.info()["url"], format!("https://{addr2}"));
         lan.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stopped_listener_has_closed_its_socket_when_unlisten_returns() {
+        let (lan, dir, _, _) = test_lan("unlisten");
+        let (tls, api_stop) = {
+            let r = lan.running.lock().unwrap();
+            let r = r.as_ref().unwrap();
+            (r.tls.clone(), r.stop.clone())
+        };
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let mut port = 0;
+        // Listened on, stopped, and the same address again at once, round after round:
+        // the old socket is never still there (no "Address already in use").
+        for _ in 0..20 {
+            let l = lan.listen(Kind::Tailscale, ip, port, &tls, &api_stop).unwrap();
+            let addr = l.addr;
+            port = addr.port();
+            Lan::unlisten(l);
+            assert!(TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_err(), "{addr} still answers");
+        }
+        lan.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_listener_whose_address_cant_be_reached_still_lets_its_socket_go() {
+        let (lan, dir, _, _) = test_lan("unreachable");
+        let (tls, api_stop) = {
+            let r = lan.running.lock().unwrap();
+            let r = r.as_ref().unwrap();
+            (r.tls.clone(), r.stop.clone())
+        };
+        let l = lan.listen(Kind::Tailscale, "127.0.0.1".parse().unwrap(), 0, &tls, &api_stop).unwrap();
+        let addr = l.addr;
+        // Told to stop, and nothing connects to wake it (as when Tailscale stopped and its
+        // address is gone): the loop still ends and closes the socket, so the address can
+        // be listened on again (it was "Address already in use" against our own socket).
+        l.stop.store(true, Ordering::SeqCst);
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            match TcpListener::bind(addr) {
+                Ok(_) => break,
+                Err(_) if Instant::now() < until => thread::sleep(Duration::from_millis(20)),
+                Err(e) => panic!("{addr} is still held by the stopped listener: {e}"),
+            }
+        }
+        Lan::unlisten(l);
+        lan.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_tailnet_is_listened_on_again_each_time_tailscale_comes_back() {
+        LOOPBACK_TAILNET.with(|c| c.set(true));
+        let dir = std::env::temp_dir().join(format!("tower-lan-ts-again-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hub = Arc::new(Hub::default());
+        let (stt, rx) = std::sync::mpsc::channel();
+        std::mem::forget(rx);
+        let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
+        let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs: test_prs() };
+        // 127.0.0.1 is the tailnet here; the LAN is ::1.
+        let now = Arc::new(Mutex::new(ts(false, "127.0.0.1")));
+        let seen = now.clone();
+        let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan")).with_detect(move || seen.lock().unwrap().clone());
+        let addr = lan.start(&crate::config::Lan { port: 0, ..lan_cfg("::1", "auto") }).unwrap();
+        let stop = lan.running.lock().unwrap().as_ref().unwrap().stop.clone();
+        let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
+        let tail = SocketAddr::from(([127, 0, 0, 1], addr.port()));
+        let tailnet = json!({"kind": "tailscale", "host": "127.0.0.1", "port": addr.port(), "dns_name": "mac.tail1234.ts.net"});
+        // Off and on again, as the user does: each time it's listened on, never "Address already in use".
+        for round in 0..3 {
+            *now.lock().unwrap() = ts(true, "127.0.0.1");
+            lan.recheck_tailscale(&stop);
+            let info = lan.info();
+            let seen = (info["tailscale"]["listening"].as_bool(), &info["tailscale"]["error"]);
+            assert_eq!(seen, (Some(true), &Value::Null), "round {round}: {info}");
+            assert_eq!(info["hosts"][1], tailnet, "round {round}");
+            assert_eq!(call(tail, &fp, "GET", "/v1/hello", None, "").unwrap().0, 401, "round {round}: answers on the tailnet");
+            *now.lock().unwrap() = ts(false, "127.0.0.1");
+            lan.recheck_tailscale(&stop);
+            let info = lan.info();
+            let seen = (info["tailscale"]["listening"].as_bool(), &info["tailscale"]["error"]);
+            assert_eq!(seen, (Some(false), &Value::Null), "round {round}");
+            assert!(TcpStream::connect_timeout(&tail, Duration::from_millis(300)).is_err(), "round {round}: the old socket is closed");
+            assert_eq!(call(addr, &fp, "GET", "/v1/hello", None, "").unwrap().0, 401, "round {round}: the LAN goes on");
+        }
+        // Its address changes while it runs: the old socket goes, the new address is tried.
+        *now.lock().unwrap() = ts(true, "127.0.0.1");
+        lan.recheck_tailscale(&stop);
+        assert_eq!(lan.info()["tailscale"]["listening"], true);
+        *now.lock().unwrap() = ts(true, "100.100.100.100");
+        lan.recheck_tailscale(&stop);
+        let info = lan.info();
+        assert_eq!(info["tailscale"]["listening"], false);
+        assert!(info["tailscale"]["error"].as_str().is_some_and(|e| e.contains("100.100.100.100")), "{info}");
+        assert!(TcpStream::connect_timeout(&tail, Duration::from_millis(300)).is_err(), "the old address is let go");
+        // And back to the first: listened on again.
+        *now.lock().unwrap() = ts(true, "127.0.0.1");
+        lan.recheck_tailscale(&stop);
+        let info = lan.info();
+        assert_eq!((info["tailscale"]["listening"].as_bool(), &info["tailscale"]["error"]), (Some(true), &Value::Null), "{info}");
+        lan.stop();
+        assert!(TcpStream::connect_timeout(&tail, Duration::from_millis(300)).is_err(), "stopping closes every socket");
+        assert!(TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_err(), "stopping closes every socket");
+        LOOPBACK_TAILNET.with(|c| c.set(false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
