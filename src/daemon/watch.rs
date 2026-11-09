@@ -145,6 +145,26 @@ impl Watches {
         }
     }
 
+    /// A note from the agenda ledger for the brain: through the outbox, as
+    /// work the user asked for (a space out of focus marks it, and lets it through).
+    pub fn tell_agenda(&self, note: crate::agenda::Note) {
+        let space = note.space.or_else(|| self.radar.get().and_then(|r| lock(&r.seen).get(&note.session).and_then(|s| s.space.clone())));
+        let p = Pending {
+            address: note.session,
+            name: note.name,
+            space,
+            status: "news".into(),
+            msg: note.msg,
+            speech: note.speech,
+            kind: "agenda".into(),
+            at_ms: crate::history::now_ms(),
+            spoken: false,
+        };
+        if self.owe(p) {
+            self.kick();
+        }
+    }
+
     /// What an agent session's hook said (see `sessions`).
     pub fn agent(&self, ev: &super::sessions::AgentEvent, change: &super::sessions::Change) {
         if let Some(r) = self.radar.get() {
@@ -903,7 +923,7 @@ impl Radar {
     /// on work the user asked for goes through, marked so; other news is held.
     fn deliver_now(&self) {
         self.watches.deliver(|p| {
-            let news = p.msg.trim_start_matches("[watch] ").trim_start_matches("[queue] ").to_string();
+            let news = p.msg.trim_start_matches("[watch] ").trim_start_matches("[queue] ").trim_start_matches("[agenda] ").to_string();
             let (gate, focus) = self.gate(p.space.as_deref(), &p.status, &p.kind);
             if self.keep(gate, &focus, &p.address, &p.name, p.space.as_deref(), &news, &p.status, &p.kind) {
                 return true;
@@ -921,7 +941,7 @@ impl Radar {
             }
             match brain::note(&msg) {
                 Ok(()) => {
-                    if !p.spoken && p.kind != "queue" && p.kind != "pr" {
+                    if !p.spoken && p.kind != "queue" && p.kind != "pr" && p.kind != "agenda" {
                         self.shared.alert(&p.address, &format!("{} is {}", p.name, say_status(&p.status)), &p.status);
                     }
                     true
@@ -929,7 +949,7 @@ impl Radar {
                 Err(e) => {
                     if !p.spoken {
                         eprintln!("[radar] the brain can't take it yet ({e:#}): {}", p.msg);
-                        if p.kind != "queue" && p.kind != "pr" {
+                        if p.kind != "queue" && p.kind != "pr" && p.kind != "agenda" {
                             self.shared.alert(&p.address, &format!("{} is {}", p.name, say_status(&p.status)), &p.status);
                         }
                         if !p.speech.is_empty() {

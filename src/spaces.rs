@@ -124,8 +124,8 @@ impl News {
     /// A report's kind (`watch`, `job`, `alert`, `queue`) and status.
     pub fn of(kind: &str, status: &str) -> News {
         match (kind, status) {
-            // A watch's or a job's report; a PR the user merged from a session's work.
-            ("watch" | "job" | "pr", _) => News::Asked,
+            // A watch's or a job's report; a PR the user merged from a session's work; the agenda ledger's notes.
+            ("watch" | "job" | "pr" | "agenda", _) => News::Asked,
             (_, "blocked") => News::NeedsYou,
             _ => News::Ambient,
         }
@@ -572,6 +572,23 @@ fn chrono_hm(ms: u64) -> String {
     format!("{:02}:{:02}", t.tm_hour, t.tm_min)
 }
 
+/// What the user asked for and isn't finished (the agenda ledger), at the end of a
+/// digest: those touching `space`, or all of them.
+fn agenda_tail(space: Option<&str>) {
+    let ledger = crate::agenda::Ledger::load_from(&crate::agenda::path());
+    let lines = crate::agenda::digest_lines(&ledger, space);
+    if lines.is_empty() {
+        return;
+    }
+    match space {
+        Some(sp) => println!("Unfinished from the user's requests, touching {sp} (`tower agenda show <id>`; tell the user these too):"),
+        None => println!("Unfinished from the user's requests (`tower agenda show <id>`; tell the user these too):"),
+    }
+    for l in lines {
+        println!("{l}");
+    }
+}
+
 /// `tower digest`: one space's held news at a time, the most pressing first;
 /// what is delivered is marked read. `--list` only says which spaces have
 /// news; `--skip` passes over the next one (or `--space`).
@@ -587,6 +604,7 @@ pub fn cmd_digest(list: bool, skip: bool, space: Option<String>, peek: bool) -> 
         for sp in &order {
             println!("{sp}: {} update{}", unread[sp].len(), if unread[sp].len() == 1 { "" } else { "s" });
         }
+        agenda_tail(None);
         return Ok(());
     }
     let target = match space {
@@ -596,6 +614,7 @@ pub fn cmd_digest(list: bool, skip: bool, space: Option<String>, peek: bool) -> 
                 Some(n) => n,
                 None => {
                     println!("No held news from {w}.");
+                    agenda_tail(Some(&w));
                     return Ok(());
                 }
             }
@@ -604,6 +623,7 @@ pub fn cmd_digest(list: bool, skip: bool, space: Option<String>, peek: bool) -> 
             Some(n) => n.clone(),
             None => {
                 println!("Nothing held: no news waiting from any space.");
+                agenda_tail(None);
                 return Ok(());
             }
         },
@@ -616,6 +636,7 @@ pub fn cmd_digest(list: bool, skip: bool, space: Option<String>, peek: bool) -> 
         println!("Skipped {target} for now (still unread).");
     } else {
         print!("{}", digest_text(&target, &items, &s));
+        agenda_tail(Some(&target));
         if !peek {
             let latest = items.iter().map(|e| e.at).max().unwrap_or_else(history::now_ms);
             s.read_ms.insert(target.clone(), latest);
@@ -704,6 +725,8 @@ fn picks_a_space_by_part_of_its_name() {
         // A finish nobody watched, the queue's notes: still held.
         assert_eq!(gate(Some("b2c-tickets"), Some("B2C support"), News::of("alert", "done"), true), Gate::Hold);
         assert_eq!(gate(Some("b2c-tickets"), Some("B2C support"), News::of("queue", "news"), true), Gate::Hold);
+        // The agenda ledger's notes are work the user asked for: through the focus, marked.
+        assert_eq!(gate(Some("b2c-tickets"), Some("B2C support"), News::of("agenda", "news"), true), Gate::Through);
         // Blocked there: the urgent cue.
         assert_eq!(gate(Some("b2c-tickets"), Some("B2C support"), News::of("alert", "blocked"), true), Gate::Urgent);
         // The brain is told where it's from and to name it.

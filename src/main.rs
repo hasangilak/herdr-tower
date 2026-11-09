@@ -8,6 +8,7 @@
 extern crate gpui_kit as gpui;
 
 mod accounts;
+mod agenda;
 mod answers;
 mod activity;
 mod behaviors;
@@ -95,6 +96,29 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// The agenda ledger: every request of the user's and the tasks handed out for it, until each
+    /// is verified or dropped. `tower agenda` (open ones), `tasks` (what's unfinished), `show <id>`,
+    /// `new "<the user's words>"`, `close <id> [--force]`, `abandon <id|task>`, `verify <task>`,
+    /// `fail <task> "<why>"`, `requeue <task> [<session>]`.
+    Agenda {
+        /// list | tasks | show | new | close | abandon | verify | fail | requeue
+        #[arg(default_value = "list")]
+        action: String,
+        /// The agenda or task (`a3`, `a3.2`), then words (why, a note) or, for requeue, a session.
+        args: Vec<String>,
+        /// list: closed and done ones too.
+        #[arg(long)]
+        all: bool,
+        /// close: abandon what's unfinished and close it anyway.
+        #[arg(long)]
+        force: bool,
+        /// new: a few words for it.
+        #[arg(long)]
+        title: Option<String>,
+        /// new: the spaces it's about.
+        #[arg(long)]
+        space: Vec<String>,
+    },
     /// What every agent session's hooks told the tower: its terminal, session id, prompt, last answer.
     Sessions {
         /// One terminal.
@@ -148,6 +172,18 @@ enum Cmd {
         /// Don't watch it (by default you get a [watch] message when it stops working).
         #[arg(long)]
         no_watch: bool,
+        /// The agenda its task belongs to (`a3`; default: the user's latest request's).
+        #[arg(long)]
+        agenda: Option<String>,
+        /// Its task's title in the agenda.
+        #[arg(long, hide = true)]
+        title: Option<String>,
+        /// Its task's id in a dispatch plan.
+        #[arg(long, hide = true)]
+        plan_id: Option<String>,
+        /// Not into the ledger: a queued start stands for it already.
+        #[arg(long, hide = true)]
+        no_track: bool,
         /// Its first task.
         task: Vec<String>,
     },
@@ -491,9 +527,11 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Agents { all } => agents(all),
-        Cmd::Start { account, name, cwd, on, space, no_watch, task } => {
-            start(account.as_deref(), &name, cwd, on.as_deref(), space.as_deref(), no_watch, &task.join(" "))
+        Cmd::Start { account, name, cwd, on, space, no_watch, agenda, title, plan_id, no_track, task } => {
+            let tag = (!no_track).then(|| agenda::Tag { agenda, title: title.unwrap_or_default(), plan_id: plan_id.unwrap_or_default(), ..Default::default() });
+            start(account.as_deref(), &name, cwd, on.as_deref(), space.as_deref(), no_watch, tag, &task.join(" "))
         }
+        Cmd::Agenda { action, args, all, force, title, space } => agenda_cmd(&action, &args, all, force, title, space),
         Cmd::Accounts { on } => list_accounts(on.as_deref()),
         Cmd::Behavior { action, arg, title, category, summary, text, json } => behavior_cmd(&action, &arg, title, category, summary, text, json),
         Cmd::Questions { session } => {
@@ -578,8 +616,14 @@ fn run(cli: Cli) -> Result<()> {
             let text = text.join(" ");
             match action.as_str() {
                 "start" => println!("{}", history::job_start(&terminal, &text)),
-                "done" => history::job_update(&terminal, history::JobState::Done, &text),
-                "failed" => history::job_update(&terminal, history::JobState::Failed, &text),
+                "done" => {
+                    history::job_update(&terminal, history::JobState::Done, &text);
+                    agenda_judged(&terminal, true, &text);
+                }
+                "failed" => {
+                    history::job_update(&terminal, history::JobState::Failed, &text);
+                    agenda_judged(&terminal, false, &text);
+                }
                 "update" => match history::JobState::parse(status.as_deref().unwrap_or("working")) {
                     history::JobState::Other(s) => bail!("tower job update --status {s}: use working, blocked, done, failed, error or exited"),
                     st => history::job_update(&terminal, st, &text),
@@ -710,8 +754,9 @@ fn queue_cmd(args: &[String]) -> Result<()> {
         id,
         after,
         start: vec![],
+        tag: None,
     };
-    let usage = "usage: tower queue <session> [--after <id>[,<id>]] \"<instruction>\" | list | cancel <id> | retarget <id> <session>";
+    let usage = "usage: tower queue <session> [--after <id>[,<id>]] [--agenda <id>] \"<instruction>\" | list | cancel <id> | retarget <id> <session>";
     let req = match args.first().map(String::as_str) {
         Some("list") if args.len() == 1 => q("list", "", String::new(), None, vec![]),
         Some("cancel") if args.len() == 2 => q("cancel", "", String::new(), Some(queue_id(&args[1])?), vec![]),
@@ -719,8 +764,13 @@ fn queue_cmd(args: &[String]) -> Result<()> {
         Some(session) if args.len() >= 2 => {
             let mut rest = &args[1..];
             let mut after = vec![];
+            let mut agenda_id = None;
             loop {
                 match rest.first().map(String::as_str) {
+                    Some("--agenda") if rest.len() >= 3 => {
+                        agenda_id = Some(rest[1].clone());
+                        rest = &rest[2..];
+                    }
                     Some("--after") if rest.len() >= 3 => {
                         for id in rest[1].split(',').filter(|s| !s.is_empty()) {
                             after.push(queue_id(id)?);
@@ -732,7 +782,11 @@ fn queue_cmd(args: &[String]) -> Result<()> {
                     _ => break,
                 }
             }
-            q("add", session, rest.join(" "), None, after)
+            let mut req = q("add", session, rest.join(" "), None, after);
+            if let Request::Queue { tag, .. } = &mut req {
+                *tag = Some(agenda::Tag { agenda: agenda_id, ..Default::default() });
+            }
+            req
         }
         _ => bail!("{usage}"),
     };
@@ -751,20 +805,22 @@ fn queue_cmd(args: &[String]) -> Result<()> {
     }
     match action.as_str() {
         "add" if v["sent"] == true => println!(
-            "Sent #{} to {} ({}): it was free. Watching it: you'll get a [watch] message when it stops working.",
+            "Sent #{} to {} ({}): it was free. Watching it: you'll get a [watch] message when it stops working.{}",
             v["id"],
             v["session"].as_str().unwrap_or(""),
-            v["name"].as_str().unwrap_or("")
+            v["name"].as_str().unwrap_or(""),
+            agenda_said(&v)
         ),
         "retarget" => println!("#{} now waits for {}.", v["retargeted"]["id"], v["retargeted"]["session"].as_str().unwrap_or("")),
         "add" => println!(
-            "Queued #{} for {} ({}, {}): position {}. It goes in when the session stops working and is watched then; the brain hears \"[queue] delivered to {}\".",
+            "Queued #{} for {} ({}, {}): position {}. It goes in when the session stops working and is watched then; the brain hears \"[queue] delivered to {}\".{}",
             v["id"],
             v["session"].as_str().unwrap_or(""),
             v["name"].as_str().unwrap_or(""),
             v["status"].as_str().unwrap_or(""),
             v["position"],
-            v["session"].as_str().unwrap_or("")
+            v["session"].as_str().unwrap_or(""),
+            agenda_said(&v)
         ),
         "cancel" => println!("Cancelled #{}: {}", v["cancelled"]["id"], v["cancelled"]["text"].as_str().unwrap_or("")),
         _ => {
@@ -860,7 +916,8 @@ fn agent_rows(all: bool) -> (Vec<Value>, Vec<Value>) {
 }
 
 /// `tower start`: a Claude Code session on an account, through `cca <account>`.
-fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str>, space: Option<&str>, no_watch: bool, task: &str) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str>, space: Option<&str>, no_watch: bool, tag: Option<agenda::Tag>, task: &str) -> Result<()> {
     // The space first: it may say which machine the session runs on.
     let spaces = if space.is_some() { spaces::windows() } else { vec![] };
     let target = match space {
@@ -921,15 +978,202 @@ fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str
         // No voice running (or no watch wanted): keep the job in the history all the same.
         history::job_start_on(&address, task, account.clone());
     }
+    // Into the agenda ledger, with an id later instructions can wait for (`after`).
+    let tracked = match tag {
+        Some(mut tag) if !task.trim().is_empty() && protocol::is_running() => {
+            tag.space = placed.clone();
+            tag.project = cwd.clone().unwrap_or_default();
+            protocol::send(&Request::Queue {
+                action: "track".into(),
+                session: address.clone(),
+                text: task.to_string(),
+                id: None,
+                after: vec![],
+                start: vec![],
+                tag: Some(tag),
+            })
+            .ok()
+            .filter(|r| r.ok)
+            .and_then(|r| r.state)
+        }
+        _ => None,
+    };
+    let tracked = tracked.unwrap_or_default();
     if std::io::stdout().is_terminal() {
         println!(
-            "Started {name} as {address}{in_space}{on_account}.{}",
-            if watched { " Watching it: you'll get a [watch] message when it stops working. End your turn now." } else { "" }
+            "Started {name} as {address}{in_space}{on_account}.{}{}",
+            if watched { " Watching it: you'll get a [watch] message when it stops working. End your turn now." } else { "" },
+            agenda_said(&tracked)
         );
     } else {
-        print_json(&json!({ "address": address, "name": name, "space": placed, "account": account, "watching": watched }));
+        print_json(&json!({
+            "address": address, "name": name, "space": placed, "account": account, "watching": watched,
+            "queue_id": tracked["id"], "agenda": tracked["agenda"], "task": tracked["task"],
+        }));
     }
     Ok(())
+}
+
+/// " Agenda a3, task a3.2." when the answer says where its task went.
+fn agenda_said(v: &Value) -> String {
+    match (v["agenda"].as_str(), v["task"].as_str()) {
+        (Some(a), Some(t)) => format!(" Agenda {a}, task {t}."),
+        _ => String::new(),
+    }
+}
+
+/// `tower job done|failed <t>`: the brain's word moves the session's agenda task too.
+fn agenda_judged(terminal: &str, ok: bool, text: &str) {
+    let session = hc::get(terminal).and_then(|t| t["address"].as_str().map(String::from)).unwrap_or_else(|| terminal.to_string());
+    let cmd = agenda::Cmd { action: "judge".into(), session, ok, text: text.into(), ..Default::default() };
+    let v = match agenda_do(&cmd) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("tower: the agenda ledger: {e:#}");
+            return;
+        }
+    };
+    if let Some(t) = v["task"].as_str() {
+        println!("Agenda task {t} is {}.", if ok { "verified" } else { "failed" });
+    }
+}
+
+/// A `tower agenda` command: by the voice's ledger when it runs, else on the file.
+fn agenda_do(cmd: &agenda::Cmd) -> Result<Value> {
+    if protocol::is_running() {
+        let r = protocol::send(&Request::Agenda { ledger: cmd.clone() })?;
+        if !r.ok {
+            bail!("{}", r.error.unwrap_or_default());
+        }
+        return Ok(r.state.unwrap_or_default());
+    }
+    if cmd.action == "requeue" {
+        bail!("requeue needs the voice running (`tower up`): it goes through the send queue");
+    }
+    let path = agenda::path();
+    let mut l = agenda::Ledger::load_from(&path);
+    let acted = agenda::act(&mut l, cmd, &agenda::Heard::default(), history::now_ms())?;
+    if acted.changed {
+        l.save_to(&path)?;
+    }
+    let mut v = acted.value;
+    if !acted.cancel.is_empty() {
+        v["not_cancelled"] = json!(acted
+            .cancel
+            .iter()
+            .map(|id| format!("#{id}: the voice isn't running; `tower queue cancel {id}` once it is"))
+            .collect::<Vec<_>>());
+    }
+    Ok(v)
+}
+
+/// `tower agenda …`.
+fn agenda_cmd(action: &str, args: &[String], all: bool, force: bool, title: Option<String>, space: Vec<String>) -> Result<()> {
+    let action = match action {
+        "ls" => "list",
+        "open" => "new",
+        "drop" => "abandon",
+        a => a,
+    };
+    let mut c = agenda::Cmd { action: action.into(), all, force, title: title.unwrap_or_default(), spaces: space, ..Default::default() };
+    let need = |what: &str| -> Result<String> {
+        match args.first() {
+            Some(t) => Ok(t.clone()),
+            None => bail!("tower agenda {action} <{what}> (`tower agenda` lists them)"),
+        }
+    };
+    match action {
+        "list" | "tasks" => {}
+        "show" | "close" | "abandon" | "verify" | "fail" => {
+            c.target = need("agenda or task")?;
+            c.text = args[1..].join(" ");
+        }
+        "requeue" => {
+            c.target = need("task")?;
+            c.session = args.get(1).cloned().unwrap_or_default();
+            c.text = args.get(2..).map(|r| r.join(" ")).unwrap_or_default();
+        }
+        "new" => c.text = args.join(" "),
+        other => bail!("tower agenda {other}: use list, tasks, show, new, close, abandon, verify, fail or requeue"),
+    }
+    let v = agenda_do(&c)?;
+    if !std::io::stdout().is_terminal() {
+        print_json(&v);
+        return Ok(());
+    }
+    let agendas = |key: &str| -> Vec<agenda::Agenda> { serde_json::from_value(v[key].clone()).unwrap_or_default() };
+    match action {
+        "list" => {
+            let list = agendas("agendas");
+            if list.is_empty() {
+                println!("{}", if all { "No agendas yet." } else { "No open agendas: everything the user asked for is done, closed or dropped." });
+            }
+            for a in &list {
+                print!("{}", agenda::render(a, false));
+            }
+        }
+        "tasks" => {
+            let rows = v["tasks"].as_array().cloned().unwrap_or_default();
+            if rows.is_empty() {
+                println!("Nothing unfinished.");
+            }
+            for r in rows {
+                let t: agenda::Task = serde_json::from_value(r["task"].clone()).unwrap_or_default();
+                let why = match t.state {
+                    agenda::TaskState::Blocked => t.question.clone(),
+                    agenda::TaskState::DoneClaimed => format!("said: {}", t.said),
+                    _ => t.why.clone(),
+                };
+                println!(
+                    "{} {:<12} {} on {} ({}): \"{}\"{}",
+                    t.id,
+                    t.state.word(),
+                    t.title,
+                    if t.name.is_empty() { t.session.clone() } else { format!("{} {}", t.name, t.session) },
+                    r["agenda"].as_str().unwrap_or(""),
+                    agenda::clip(r["words"].as_str().unwrap_or(""), 80),
+                    if why.is_empty() { String::new() } else { format!(": {}", agenda::clip(&why, 140)) }
+                );
+            }
+        }
+        "show" => match serde_json::from_value::<agenda::Agenda>(v["agenda"].clone()) {
+            Ok(a) => print!("{}", agenda::render(&a, true)),
+            Err(_) => println!("Nothing to show."),
+        },
+        "new" => println!("Opened {}: \"{}\". Hand out its tasks with --agenda {}.", v["id"].as_str().unwrap_or(""), v["words"].as_str().unwrap_or(""), v["id"].as_str().unwrap_or("")),
+        "close" => {
+            println!("Closed {}.", v["closed"].as_str().unwrap_or(""));
+            list_line("Abandoned with it", &v["abandoned"]);
+            list_line("Cancelled in the queue", &v["cancelled"]);
+        }
+        "abandon" => {
+            list_line("Abandoned", &v["abandoned"]);
+            list_line("Cancelled in the queue", &v["cancelled"]);
+        }
+        "verify" | "fail" => list_line(if action == "verify" { "Verified" } else { "Failed" }, &v["moved"]),
+        "requeue" => println!(
+            "{} {} as #{} for {} ({}).",
+            v["task"].as_str().unwrap_or(""),
+            if v["sent"] == true { "sent again" } else { "queued again" },
+            v["queue_id"],
+            v["session"].as_str().unwrap_or(""),
+            v["name"].as_str().unwrap_or("")
+        ),
+        _ => print_json(&v),
+    }
+    if let Some(left) = v["not_cancelled"].as_array() {
+        for l in left {
+            println!("Not cancelled: {}", l.as_str().unwrap_or(""));
+        }
+    }
+    Ok(())
+}
+
+fn list_line(what: &str, v: &Value) {
+    let items: Vec<String> = v.as_array().map(|a| a.iter().map(|x| x.as_str().map(String::from).unwrap_or_else(|| x.to_string())).collect()).unwrap_or_default();
+    if !items.is_empty() {
+        println!("{what}: {}.", items.join(", "));
+    }
 }
 
 /// A new tab in `sp` running the session (Herdr's `tab.new`), and the window

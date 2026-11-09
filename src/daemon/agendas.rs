@@ -1,0 +1,352 @@
+//! The agenda ledger in the daemon (see `crate::agenda`): held in memory,
+//! written to `agendas.json` after every change, and moved by a reconciler
+//! that looks every 20 seconds (and at once when a hook fires or a task
+//! registers) at what the send queue, Herdr, the agents' hooks and the
+//! question cards say about each open task.
+//!
+//! What it has to say goes to the brain through the radar's outbox, like a
+//! watch's report: it waits for a brain that's away (said out loud once
+//! meanwhile), and a space out of focus marks it, as work the user asked for.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
+
+use serde_json::json;
+
+use crate::agenda::{self, Action, Facts, Heard, HookFact, Ledger, Live, Probe, Reg, TaskEv};
+use crate::hc;
+use crate::protocol::Response;
+
+/// What the reconciler reads and acts through (set once at the daemon's start).
+#[derive(Clone)]
+pub struct Ctx {
+    pub sendq: super::sendq::SendQueue,
+    pub watches: super::watch::Watches,
+    pub asks: super::asks::Asks,
+    pub shared: super::state::Shared,
+}
+
+#[derive(Clone)]
+pub struct Agendas {
+    ledger: Arc<Mutex<Ledger>>,
+    path: PathBuf,
+    wake: Arc<(Mutex<bool>, Condvar)>,
+    ctx: Arc<OnceLock<Ctx>>,
+}
+
+static RUNNING: OnceLock<Agendas> = OnceLock::new();
+
+/// What is still open, for the brain's `[radar]` line (None: nothing, or no daemon here).
+pub fn radar_note() -> Option<String> {
+    RUNNING.get()?.lock().radar_note()
+}
+
+fn now_ms() -> u64 {
+    crate::history::now_ms()
+}
+
+impl Agendas {
+    pub fn open() -> Agendas {
+        Self::at(agenda::path())
+    }
+
+    pub fn at(path: PathBuf) -> Agendas {
+        Agendas {
+            ledger: Arc::new(Mutex::new(Ledger::load_from(&path))),
+            path,
+            wake: Arc::new((Mutex::new(false), Condvar::new())),
+            ctx: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Ledger> {
+        self.ledger.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn save(&self, l: &Ledger) {
+        if let Err(e) = l.save_to(&self.path) {
+            eprintln!("[agenda] {e:#}");
+        }
+    }
+
+    /// The reconciler, from now on.
+    pub fn start(&self, ctx: Ctx) {
+        let _ = self.ctx.set(ctx);
+        let _ = RUNNING.set(self.clone());
+        let me = self.clone();
+        thread::Builder::new()
+            .name("agendas".into())
+            .spawn(move || {
+                // The radar's and the queue's own look at what the last run left comes first.
+                thread::sleep(Duration::from_secs(6));
+                {
+                    let l = me.lock();
+                    let open = l.open_agendas();
+                    if !open.is_empty() {
+                        let tasks: usize = open.iter().map(|a| a.unfinished().len()).sum();
+                        eprintln!("[agenda] {} open agenda(s), {tasks} unfinished task(s), from before", open.len());
+                    }
+                }
+                let mut round: u64 = 0;
+                loop {
+                    me.tick(round);
+                    round += 1;
+                    let (m, cv) = &*me.wake;
+                    let woken = m.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut woken =
+                        cv.wait_timeout_while(woken, Duration::from_secs(20), |w| !*w).map(|r| r.0).unwrap_or_else(|e| e.into_inner().0);
+                    *woken = false;
+                }
+            })
+            .ok();
+    }
+
+    /// Something happened (a hook, a registration): look now.
+    pub fn kick(&self) {
+        let (m, cv) = &*self.wake;
+        *m.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        cv.notify_all();
+    }
+
+    /// The user's latest request, as the daemon heard it.
+    fn heard(&self) -> Heard {
+        match self.ctx.get() {
+            Some(c) => c.shared.with(|s| Heard { text: s.heard.clone(), at_ms: s.heard_ms }),
+            None => Heard::default(),
+        }
+    }
+
+    /// A task for what the send queue took on (`tower queue`, `dispatch`, `start`).
+    pub fn register(&self, reg: Reg) -> Option<agenda::Registered> {
+        if reg.queue_id == 0 || reg.text.trim().is_empty() {
+            return None;
+        }
+        // The real tower and a test one never follow each other's sessions.
+        if !reg.session.is_empty() && hc::get(&reg.session).is_some_and(|t| super::watch::left_alone(&t)) {
+            return None;
+        }
+        if reg.session == crate::brain::name() {
+            return None;
+        }
+        let heard = self.heard();
+        let r = {
+            let mut l = self.lock();
+            let r = l.register(&reg, &heard, now_ms())?;
+            self.save(&l);
+            r
+        };
+        eprintln!("[agenda] #{} is {} in {} ({})", reg.queue_id, r.task, r.agenda, r.how);
+        self.kick();
+        Some(r)
+    }
+
+    /// One round: facts for every open task, moves, re-prompts, news.
+    fn tick(&self, round: u64) {
+        let Some(ctx) = self.ctx.get() else { return };
+        let now = now_ms();
+        let (probes, wants_jobs) = {
+            let l = self.lock();
+            (l.probes(now), l.wants_jobs(now, 15 * 60_000))
+        };
+        // The history only now and then (it can be large), while a new task has no job yet.
+        let jobs: Vec<(String, String, u64)> = if wants_jobs && round.is_multiple_of(3) {
+            crate::history::jobs(&crate::history::load()).into_iter().filter(|j| now.saturating_sub(j.started) < 3_600_000).map(|j| (j.session, j.id, j.started)).collect()
+        } else {
+            vec![]
+        };
+        let facts = if probes.is_empty() { BTreeMap::new() } else { gather(ctx, &probes) };
+        let (actions, notes) = {
+            let mut l = self.lock();
+            let before = l.clone();
+            let actions = l.step(&facts, now);
+            l.attach_jobs(&jobs);
+            let notes = l.news(now);
+            let pruned = l.prune(now);
+            if pruned > 0 {
+                eprintln!("[agenda] {pruned} settled agenda(s) older than a month dropped");
+            }
+            if *l != before {
+                self.save(&l);
+            }
+            (actions, notes)
+        };
+        for a in actions {
+            self.reprompt(ctx, a);
+        }
+        for n in notes {
+            eprintln!("[agenda] telling the brain: {}", agenda::clip(&n.msg, 200));
+            ctx.watches.tell_agenda(n);
+        }
+    }
+
+    /// The session never took its instruction: it goes in once more, through the queue.
+    fn reprompt(&self, ctx: &Ctx, a: Action) {
+        let Action::Reprompt { task, session, text } = a;
+        let now = now_ms();
+        match ctx.sendq.add(&session, &text, &[]) {
+            Ok((added, address, name)) => {
+                let id = match added {
+                    super::sendq::Added::Sent { id } | super::sendq::Added::Queued { id, .. } => id,
+                };
+                let note = {
+                    let mut l = self.lock();
+                    l.reprompted(&task, id, now);
+                    self.save(&l);
+                    let t = l.task(&task).cloned().unwrap_or_default();
+                    agenda::Note {
+                        session: address.clone(),
+                        name: name.clone(),
+                        space: t.space.clone(),
+                        msg: format!(
+                            "[agenda] {task} \"{}\": {address} ({name}) hadn't taken its instruction {} min after it went in, so the tower sent it again (#{id}). Nothing to tell the user unless it stalls.",
+                            t.title,
+                            agenda::REPROMPT_MS / 60_000
+                        ),
+                        speech: String::new(),
+                    }
+                };
+                eprintln!("[agenda] {task}: sent again to {address} as #{id}");
+                ctx.watches.tell_agenda(note);
+            }
+            Err(e) => {
+                let mut l = self.lock();
+                let _ = l.apply(&task, TaskEv::Stall { why: format!("it never took the instruction, and sending it again failed: {e:#}") }, now);
+                // Told once by the next round's news, so it isn't sent again.
+                if let Some(t) = l.agendas.iter_mut().flat_map(|a| a.tasks.iter_mut()).find(|t| t.id == task) {
+                    t.reprompts += 1;
+                }
+                self.save(&l);
+            }
+        }
+    }
+
+    /// `tower agenda …` (and `tower job done|failed`, as `judge`).
+    pub fn request(&self, c: &agenda::Cmd) -> Response {
+        let ok = |v: serde_json::Value| Response { ok: true, error: None, state: Some(v) };
+        let now = now_ms();
+        if c.action == "requeue" {
+            return match self.requeue(c, now) {
+                Ok(v) => ok(v),
+                Err(e) => Response::err(format!("{e:#}")),
+            };
+        }
+        let heard = self.heard();
+        let acted = {
+            let mut l = self.lock();
+            match agenda::act(&mut l, c, &heard, now) {
+                Ok(a) => {
+                    if a.changed {
+                        self.save(&l);
+                    }
+                    a
+                }
+                Err(e) => return Response::err(format!("{e:#}")),
+            }
+        };
+        // Dropped work leaves the queue too, so it doesn't go in after all.
+        let mut value = acted.value;
+        if let Some(ctx) = self.ctx.get() {
+            let mut left = vec![];
+            for id in &acted.cancel {
+                if let Err(e) = ctx.sendq.cancel(*id) {
+                    left.push(format!("#{id}: {e:#}"));
+                }
+            }
+            if !left.is_empty() {
+                value["not_cancelled"] = json!(left);
+            }
+        }
+        if acted.changed {
+            self.kick();
+        }
+        ok(value)
+    }
+
+    /// `tower agenda requeue <task> [<session>]`: its instruction (or its latest follow-up) again.
+    fn requeue(&self, c: &agenda::Cmd, now: u64) -> anyhow::Result<serde_json::Value> {
+        let Some(ctx) = self.ctx.get() else { anyhow::bail!("the reconciler isn't running yet") };
+        let (task, session, text) = {
+            let l = self.lock();
+            let agenda::Target::Task(id) = l.resolve(&c.target)? else {
+                anyhow::bail!("requeue takes a task (a3.2), not an agenda: `tower agenda show {}` lists its tasks", c.target)
+            };
+            let t = l.task(&id).cloned().unwrap_or_default();
+            let session = if c.session.trim().is_empty() { t.session.clone() } else { c.session.trim().to_string() };
+            if session.is_empty() {
+                anyhow::bail!("{id} never had a session: give one (`tower agenda requeue {id} <session>`)");
+            }
+            let text = if c.text.trim().is_empty() { t.followups.last().cloned().unwrap_or(t.instruction.clone()) } else { c.text.trim().to_string() };
+            (id, session, text)
+        };
+        let (added, address, name) = ctx.sendq.add(&session, &text, &[])?;
+        let (id, sent) = match added {
+            super::sendq::Added::Sent { id } => (id, true),
+            super::sendq::Added::Queued { id, .. } => (id, false),
+        };
+        {
+            let mut l = self.lock();
+            l.requeue(&task, id, if c.text.trim().is_empty() { "" } else { &text }, now);
+            self.save(&l);
+        }
+        self.kick();
+        Ok(json!({ "task": task, "queue_id": id, "session": address, "name": name, "sent": sent }))
+    }
+}
+
+/// What Herdr says about a session now.
+fn look(session: &str) -> Live {
+    match hc::lookup(session) {
+        hc::Lookup::Found(t) if t["state"] == "live" => Live::Here {
+            status: hc::status(&t),
+            created_ms: hc::created_ms(&t),
+            turn: hc::turn(&t),
+            name: hc::spoken_name(&t),
+            space: crate::spaces::space_of(&t),
+        },
+        hc::Lookup::Found(_) => Live::Exited,
+        hc::Lookup::Gone => Live::Gone,
+        hc::Lookup::Unreachable(_) => Live::Unreachable,
+    }
+}
+
+/// The facts for each probed task: one look per session, outside the ledger's lock.
+fn gather(ctx: &Ctx, probes: &[Probe]) -> BTreeMap<String, Facts> {
+    let mut lives: BTreeMap<String, Live> = BTreeMap::new();
+    let questions = ctx.asks.list();
+    let mut out = BTreeMap::new();
+    for p in probes {
+        let queue = p.queue_id.map(|id| ctx.sendq.fact(id)).unwrap_or_default();
+        let session = match &queue {
+            agenda::QueueFact::Delivered { session, .. } => session.clone(),
+            agenda::QueueFact::Waiting { session, .. } if !session.is_empty() => session.clone(),
+            _ => p.session.clone(),
+        };
+        if session.is_empty() {
+            out.insert(p.task.clone(), Facts { queue, ..Default::default() });
+            continue;
+        }
+        let live = lives.entry(session.clone()).or_insert_with(|| look(&session)).clone();
+        let hook = super::sessions::registry().get(&session).map(|s| HookFact {
+            state: s.state,
+            event: s.event,
+            event_ms: s.event_ms,
+            prompt_ms: s.prompt_ms,
+            said: s.said,
+            said_ms: s.said_ms,
+            notice: s.notice,
+            started_ms: s.started_ms,
+        });
+        let question = questions.iter().find(|q| q.session == session).map(|q| {
+            if !q.title.trim().is_empty() { q.title.clone() } else { q.tabs.first().map(|t| t.question.clone()).unwrap_or_default() }
+        });
+        let working = matches!(&live, Live::Here { status: hc::SessionStatus::Working, .. });
+        let screen = (p.look && working)
+            .then(|| hc::run(&["read", &session, "--lines", "30"]).ok().filter(|o| o.code == 0).map(|o| agenda::screen_hash(&o.stdout)))
+            .flatten();
+        out.insert(p.task.clone(), Facts { queue, live: Some(live), hook, question, screen });
+    }
+    out
+}
