@@ -1,9 +1,8 @@
 # State machines for the tower daemon (design)
 
-Status: proposal, not implemented. It describes the code as it is on
-`tower-hooks-and-fixes` (with the uncommitted question-card fixes), and how
-to move each loose status string to an explicit Rust enum with its
-transitions in one place.
+Status: **implemented** on `tower-sm-impl` (see "As built" at the end for
+where the code differs from this design). The sections below are the design
+as proposed; the tables still describe the moves the code makes.
 
 ## Why
 
@@ -354,3 +353,50 @@ wire strings unchanged.
 
 Step 1 is small (one file plus tests) and directly hardens the cards that
 broke today. Steps 3–5 are independent of each other.
+
+---
+
+## As built
+
+| Entity | Type and table | Stored as |
+|---|---|---|
+| Question set | `daemon/card.rs`: `SetState { phase, decision }`, `SetState::next(&Ev)`; `card::apply` is the only writer of `status`/`decision`/`error` | `questions.json` (new): the sets' wire words, plus `created_ms`, dismissed dialogs, waiting replies, `noted` |
+| Queued instruction | `sendq.rs`: `Item::state() -> ItemState`, `Item::apply(ItemEv)`, `ParkWhy`, `Delivered::state/take/finish` | `queue.json` as before; new optional `parked_ms`, `expired` |
+| Job | `history.rs`: `JobState`, `JobState::next(&JobEv)`, `follow`/`job_follow` | `history.jsonl` as before (job words) |
+| Session status | `hc.rs`: `SessionStatus`, `status`, `status_live`, `block_kind` | its word everywhere (`watches.json`, `sessions.json`, `questions.json`, the state's agents) |
+
+Where it differs from the design above:
+
+- **Question sets: phase and decision are two fields of one state**, not one
+  flat enum. The decision has to outlive the phase it was made in (a card
+  the user decides stays `escalate` while it is answered, fails, is tried
+  again), and the wire keeps both. Deciding/Auto/Escalated are
+  `Phase::Open` with `Decision::{Deciding, Auto, Escalated}`. The escalation
+  reason stays in the set's `reason` field.
+- **Reading** is held per session (`Inner::reading`: one reader per dialog
+  screen), not as a set state: a set has no stable id until it is read whole.
+- **Closed sets** are removed from the list as before, and remembered (last
+  100, in memory) with why, so a late answer says how it ended. A late
+  answer to a *replaced* card follows it to the screen and goes in when its
+  tabs didn't change; a late answer to a *dismissed* dialog still up goes in.
+  After a restart only the sets that closed at the restore are remembered.
+- **Restart**: a restored set the brain never decided gets its 40 s wait
+  again; one decided `auto` but not typed goes to the user (the tower doesn't
+  type after a restart without a fresh look); one being typed comes back
+  `failed`, to try again. Any dropped waiting reply (too old, moved on,
+  gone, other terminal) is now told to the user, not only logged.
+- **SessionStatus::Blocked has no kind inside**: the kind is read with
+  `hc::block_kind`, so a status compares equal exactly when the old strings
+  did. Unknown words are kept (`Other(String)`) rather than mapped away, in
+  `SessionStatus`, `JobState` and `ParkWhy`, so nothing on disk is lost.
+- **Jobs**: the radar moves an open job only on changes it sees while up
+  (not on its first look at a session), so the start's `reconcile` still
+  reports what happened while the tower was down before the job moves.
+- **Queue**: parked items expire after 7 days into `expired` (kept,
+  retargetable; `cancel` says it expired). One parked by an older version
+  counts from when this version first sees it.
+- Report and alert words (`Pending.status` with `news`, alert levels) are a
+  different vocabulary and stay strings.
+- **Testing**: `HERDER_TOWER_TEST=1` makes a daemon handle only test sessions
+  (`qfix-…`, `tower.test`), the ones the real tower leaves alone (README,
+  "How it fits together").
