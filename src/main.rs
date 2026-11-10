@@ -26,6 +26,7 @@ mod introduce;
 mod orb;
 mod phone;
 mod protocol;
+mod projects;
 mod prs;
 mod questions;
 mod screenshots;
@@ -170,16 +171,22 @@ enum Cmd {
         /// The session's name (a-z 0-9 - _), unique among live terminals.
         #[arg(long)]
         name: String,
-        /// Its working folder (default: here; with --on, that machine's home).
+        /// Its working folder, or a project's name ("sandbox"): a folder that
+        /// doesn't exist is matched to the best project folder, and the answer
+        /// says which (default: here; with --on, that machine's home).
         #[arg(long)]
         cwd: Option<String>,
         /// Another machine (`hc machine ls`).
         #[arg(long)]
         on: Option<String>,
-        /// The Herdr space to put it in, by its name or a part of it (default:
-        /// a new tab in the space the window shows).
+        /// The Herdr space to put it in, by its name or a part of it; made when
+        /// none has that name (default: a new tab in the space the window shows).
         #[arg(long)]
         space: Option<String>,
+        /// The user asked for a new space: --space is its name, made unless a
+        /// space has exactly that name (a space it's only part of doesn't count).
+        #[arg(long)]
+        new_space: bool,
         /// Don't watch it (by default you get a [watch] message when it stops working).
         #[arg(long)]
         no_watch: bool,
@@ -197,6 +204,12 @@ enum Cmd {
         no_track: bool,
         /// Its first task.
         task: Vec<String>,
+    },
+    /// The folder a project's name means ("sandbox project", "mediaroom"): the
+    /// best match under ~/Work (and one level below), and what else came close.
+    Project {
+        /// The name as the user said it.
+        name: Vec<String>,
     },
     /// The Claude accounts the claude-accounts mod (`cca`) knows; the first is the default.
     Accounts {
@@ -538,13 +551,24 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Agents { all } => agents(all),
-        Cmd::Start { account, name, cwd, on, space, no_watch, agenda, title, plan_id, no_track, task } => {
+        Cmd::Start { account, name, cwd, on, space, new_space, no_watch, agenda, title, plan_id, no_track, task } => {
             let tag = (!no_track).then(|| agenda::Tag { agenda, title: title.unwrap_or_default(), plan_id: plan_id.unwrap_or_default(), ..Default::default() });
-            start(account.as_deref(), &name, cwd, on.as_deref(), space.as_deref(), no_watch, tag, &task.join(" "))
+            let space = space.map(|s| spaces::Asked { name: s, new: new_space });
+            start(account.as_deref(), &name, cwd, on.as_deref(), space.as_ref(), no_watch, tag, &task.join(" "))
         }
         Cmd::Agenda { action, args, all, force, title, space } => agenda_cmd(&action, &args, all, force, title, space),
         Cmd::Introduce { space, dry_run } => introduce_cmd(&space.join(" "), dry_run),
         Cmd::Accounts { on } => list_accounts(on.as_deref()),
+        Cmd::Project { name } => {
+            let asked = name.join(" ");
+            match projects::best(&asked) {
+                Some((m, others)) => {
+                    print_json(&json!({ "folder": m.folder, "others": others.iter().map(|o| &o.folder).collect::<Vec<_>>() }));
+                    Ok(())
+                }
+                None => bail!("no project folder fits {asked:?} under {}", projects::roots().iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", ")),
+            }
+        }
         Cmd::Behavior { action, arg, title, category, summary, text, json } => behavior_cmd(&action, &arg, title, category, summary, text, json),
         Cmd::Questions { session } => {
             let v = match session {
@@ -929,12 +953,22 @@ fn agent_rows(all: bool) -> (Vec<Value>, Vec<Value>) {
 
 /// `tower start`: a Claude Code session on an account, through `cca <account>`.
 #[allow(clippy::too_many_arguments)]
-fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str>, space: Option<&str>, no_watch: bool, tag: Option<agenda::Tag>, task: &str) -> Result<()> {
-    // The space first: it may say which machine the session runs on.
+fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str>, space: Option<&spaces::Asked>, no_watch: bool, tag: Option<agenda::Tag>, task: &str) -> Result<()> {
+    // The space first: it may say which machine the session runs on. One
+    // that doesn't exist yet is made below; of several, the closest is taken.
     let spaces = if space.is_some() { spaces::windows() } else { vec![] };
-    let target = match space {
-        Some(want) => Some(spaces::pick_window(want, &spaces)?.clone()),
-        None => None,
+    let mut notes: Vec<String> = vec![];
+    let (target, new_space) = match space {
+        Some(want) => match spaces::best_window(want, &spaces) {
+            spaces::Placing::One(w) | spaces::Placing::Closest(w, _) if want.new && !w.name.eq_ignore_ascii_case(want.name.trim()) => (None, Some(want.name.trim().to_string())),
+            spaces::Placing::One(w) => (Some(w.clone()), None),
+            spaces::Placing::Closest(w, others) => {
+                notes.push(format!("\"{}\" matched several spaces ({}): took \"{}\"", want.name, others.join(", "), w.name));
+                (Some(w.clone()), None)
+            }
+            spaces::Placing::New(name) => (None, Some(name)),
+        },
+        None => (None, None),
     };
     let machine: Option<String> = match (on, target.as_ref().and_then(|t| t.machine.clone())) {
         (Some(m), Some(sm)) if m != sm => bail!("space \"{}\" runs on {sm}, not {m}", target.as_ref().map(|t| t.name.as_str()).unwrap_or("")),
@@ -956,11 +990,34 @@ fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str
         Some(rest) if on.is_none() => dirs::home_dir().unwrap_or_default().join(rest).to_string_lossy().into_owned(),
         _ => c,
     });
+    // A folder that isn't there is a project's name ("sandbox", or a guessed
+    // path): take the best-matching project folder and say so, never stop.
+    let mut chosen: Option<(String, Vec<String>)> = None;
+    let cwd = match cwd {
+        Some(c) if on.is_none() && !std::path::Path::new(&c).is_dir() => match projects::best(&c) {
+            Some((m, others)) => {
+                let others: Vec<String> = others.into_iter().map(|o| o.folder).collect();
+                notes.push(format!(
+                    "no folder {c}: took {}, the best match{}",
+                    m.folder,
+                    if others.is_empty() { String::new() } else { format!(" (also close: {})", others.join(", ")) }
+                ));
+                chosen = Some((m.folder.clone(), others));
+                Some(m.path.to_string_lossy().into_owned())
+            }
+            None => bail!("no folder {c}, and no project folder fits that name under {}", projects::roots().iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", ")),
+        },
+        c => c,
+    };
     let cca = cca.unwrap_or_else(|| "cca".into());
     let how = accounts::Start { name, cwd: cwd.as_deref(), on, task, account: account.as_deref(), cca: &cca };
-    let (address, placed) = match &target {
-        Some(sp) => (start_in_space(sp, &how, &spaces)?, Some(sp.name.clone())),
-        None => {
+    let (address, placed) = match (&target, &new_space) {
+        (Some(sp), _) => (start_in_space(sp, &how, &spaces)?, Some(sp.name.clone())),
+        (None, Some(name)) => {
+            notes.push(format!("made the space \"{name}\""));
+            (new_space_with(name, &how, &spaces)?, Some(name.clone()))
+        }
+        (None, None) => {
             let args = accounts::hc_run_args(&how);
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let out = hc::run(&refs)?;
@@ -1017,15 +1074,27 @@ fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str
     }
     if std::io::stdout().is_terminal() {
         println!(
-            "Started {name} as {address}{in_space}{on_account}.{}{}",
+            "Started {name} as {address}{in_space}{on_account}.{}{}{}",
+            notes.iter().map(|n| format!(" {}{}.", n[..1].to_uppercase(), &n[1..])).collect::<String>(),
             if watched { " Watching it: you'll get a [watch] message when it stops working. End your turn now." } else { "" },
             agenda_said(&tracked)
         );
     } else {
-        print_json(&json!({
+        let mut v = json!({
             "address": address, "name": name, "space": placed, "account": account, "watching": watched,
             "queue_id": tracked["id"], "agenda": tracked["agenda"], "task": tracked["task"],
-        }));
+        });
+        if new_space.is_some() {
+            v["space_made"] = json!(true);
+        }
+        if let Some((folder, others)) = chosen {
+            v["folder"] = json!(folder);
+            v["other_folders"] = json!(others);
+        }
+        if !notes.is_empty() {
+            v["chose"] = json!(notes.join("; "));
+        }
+        print_json(&v);
     }
     Ok(())
 }
@@ -1279,6 +1348,39 @@ fn start_in_space(sp: &spaces::Window, how: &accounts::Start, all: &[spaces::Win
     if let Some(was) = all.iter().find(|s| s.active)
         && was.id != sp.id
     {
+        let _ = std::process::Command::new("herdr-app").args(["do", "space.select", "--id", &was.id]).output();
+    }
+    Ok(address)
+}
+
+/// A new space called `name`, its first tab the session (as `tab.new` would
+/// make it in a space that exists): its address.
+fn new_space_with(name: &str, how: &accounts::Start, all: &[spaces::Window]) -> Result<String> {
+    let argv = serde_json::to_string(&accounts::command(how))?;
+    let folder = how.cwd.map(String::from).unwrap_or_default();
+    let mut args = vec!["do", "space.new", "--name", name, "--tab", how.name, "--argv", &argv];
+    if !folder.is_empty() {
+        args.extend(["--folder", &folder]);
+    }
+    if let Some(m) = how.on {
+        args.extend(["--machine", m]);
+    }
+    let out = match std::process::Command::new("herdr-app").args(&args).stdin(std::process::Stdio::null()).output() {
+        Ok(o) => o,
+        Err(e) => bail!("herdr-app: {e}"),
+    };
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let Some(terminal) = v["terminal"].as_str() else {
+        bail!("herdr-app space.new: {}{}", String::from_utf8_lossy(&out.stdout).trim(), String::from_utf8_lossy(&out.stderr).trim());
+    };
+    let address = match how.on {
+        Some(m) if !terminal.contains('/') => format!("{m}/{terminal}"),
+        _ => terminal.to_string(),
+    };
+    let label = format!("tower.name={}", how.name);
+    let _ = hc::run(&["label", &address, &label]);
+    // space.new shows the new space; give the window back to the one it showed.
+    if let Some(was) = all.iter().find(|s| s.active) {
         let _ = std::process::Command::new("herdr-app").args(["do", "space.select", "--id", &was.id]).output();
     }
     Ok(address)

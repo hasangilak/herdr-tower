@@ -106,10 +106,31 @@ pub fn resolve(want: Option<&str>, list: &[Account]) -> Result<Option<String>> {
             if list.is_empty() {
                 bail!("no Claude account {w:?}: the claude-accounts mod (cca) isn't installed, so there are no accounts to pick from");
             }
+            // "second", "my 2nd account": by its place in the list.
+            if let Some(n) = ordinal(w)
+                && let Some(a) = list.get(n)
+            {
+                return Ok(Some(a.name.clone()));
+            }
+            // Part of a name, when only one has it.
+            let lw = w.to_lowercase();
+            let part: Vec<&Account> = list.iter().filter(|a| a.name.to_lowercase().contains(&lw) || lw.contains(&a.name.to_lowercase())).collect();
+            if let [one] = part.as_slice() {
+                return Ok(Some(one.name.clone()));
+            }
             let names: Vec<&str> = list.iter().map(|a| a.name.as_str()).collect();
             bail!("no Claude account {w:?} (the claude-accounts mod has: {})", names.join(", "))
         }
     }
+}
+
+/// "second" -> 1, "my 3rd account" -> 2, "1" -> 0.
+fn ordinal(w: &str) -> Option<usize> {
+    const WORDS: &[&str] = &["first", "second", "third", "fourth", "fifth"];
+    const SHORT: &[&str] = &["1st", "2nd", "3rd", "4th", "5th"];
+    w.to_lowercase().split(|c: char| !c.is_alphanumeric()).find_map(|t| {
+        WORDS.iter().position(|x| *x == t).or_else(|| SHORT.iter().position(|x| *x == t)).or_else(|| t.parse::<usize>().ok().filter(|n| (1..=9).contains(n)).map(|n| n - 1))
+    })
 }
 
 // ---- which account a running session uses ----
@@ -276,6 +297,12 @@ mod tests {
         assert_eq!(resolve(Some(" "), &l).unwrap().as_deref(), Some("default"));
         assert_eq!(resolve(Some("work"), &l).unwrap().as_deref(), Some("work"));
         assert_eq!(resolve(Some("Side"), &l).unwrap().as_deref(), Some("side"));
+        // "my second claude account": by place; a part of one name.
+        assert_eq!(resolve(Some("second"), &l).unwrap().as_deref(), Some("work"));
+        assert_eq!(resolve(Some("my second claude account"), &l).unwrap().as_deref(), Some("work"));
+        assert_eq!(resolve(Some("3rd"), &l).unwrap().as_deref(), Some("side"));
+        assert_eq!(resolve(Some("wor"), &l).unwrap().as_deref(), Some("work"));
+        assert!(resolve(Some("ninth"), &l).is_err());
         let e = resolve(Some("nope"), &l).unwrap_err().to_string();
         assert!(e.contains("\"nope\"") && e.contains("default, work, side"), "{e}");
         assert_eq!(resolve(None, &[]).unwrap(), None);

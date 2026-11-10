@@ -228,9 +228,13 @@ pub fn route(plan: &Plan, order: &[usize], live: &[Live]) -> Result<BTreeMap<Str
             out.insert(t.id.clone(), Route::Queue { session: s.clone() });
             continue;
         }
-        let cwd = expand(&t.project);
+        let mut cwd = expand(&t.project);
         if t.on.is_none() && !Path::new(&cwd).is_dir() {
-            bail!("task {}: no folder {cwd}", t.id);
+            // A project's name, or a guessed path: the best-matching folder (it's said in the result).
+            match crate::projects::best(&t.project) {
+                Some((m, _)) => cwd = m.path.to_string_lossy().into_owned(),
+                None => bail!("task {}: no folder {cwd}, and no project folder fits {:?}", t.id, t.project),
+            }
         }
         // The one in that folder: a free one first, then a working one, then any.
         let rank = |l: &Live| match l.status.as_str() {

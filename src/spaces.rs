@@ -369,6 +369,48 @@ pub fn pick_window<'a>(want: &str, list: &'a [Window]) -> Result<&'a Window> {
     }
 }
 
+/// The space `tower start` was asked for: its name, and whether the user
+/// asked for a new one.
+#[derive(Debug, Clone)]
+pub struct Asked {
+    pub name: String,
+    pub new: bool,
+}
+
+impl std::ops::Deref for Asked {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Where `tower start --space` puts a session.
+#[derive(Debug, PartialEq)]
+pub enum Placing<'a> {
+    /// The space that name means.
+    One(&'a Window),
+    /// Several fit: the closest (the name starts with it, else the shortest
+    /// name), and the names of all that fit.
+    Closest(&'a Window, Vec<String>),
+    /// None fits: a new space, called that.
+    New(String),
+}
+
+/// Like `pick_window`, but never an error to ask about: several matches
+/// take the closest, none makes a new space.
+pub fn best_window<'a>(want: &str, list: &'a [Window]) -> Placing<'a> {
+    let w = want.trim().to_lowercase();
+    if let Ok(one) = pick_window(want, list) {
+        return Placing::One(one);
+    }
+    let part: Vec<&Window> = list.iter().filter(|s| !w.is_empty() && s.name.to_lowercase().contains(&w)).collect();
+    if part.is_empty() {
+        return Placing::New(want.trim().to_string());
+    }
+    let best = part.iter().min_by_key(|s| (!s.name.to_lowercase().starts_with(&w), s.name.len())).copied().unwrap_or(part[0]);
+    Placing::Closest(best, part.iter().map(|s| format!("\"{}\"", s.name)).collect())
+}
+
 /// A space as Herdr's window has it now.
 #[derive(Debug, Clone, Default)]
 pub struct Live {
@@ -693,6 +735,30 @@ fn picks_a_space_by_part_of_its_name() {
     assert!(e.contains("no space matches") && e.contains("\"M5 Pro\""), "{e}");
     assert!(pick_window("x", &[]).unwrap_err().to_string().contains("isn't open"));
     assert!(pick_window(" ", &l).is_err());
+}
+
+/// "Open … in a new space called sandbox": `tower start --space` makes it,
+/// and several matches take the closest, so opening never stops to ask.
+#[test]
+fn starting_in_a_space_never_stops_to_ask() {
+    let v = json!({ "spaces": [
+        { "id": "sp1", "name": "M5 Pro", "folder": "/u", "active": false },
+        { "id": "sp2", "name": "B2B ticketing", "folder": "/w/a", "active": false },
+        { "id": "sp3", "name": "B2C support", "folder": "/w/b", "active": true },
+        { "id": "sp5", "name": "b2c-tickets", "folder": "/w/d", "active": false },
+    ]});
+    let l = windows_from(&v);
+    assert!(matches!(best_window("ticket", &l), Placing::Closest(w, _) if w.id == "sp5"));
+    assert!(matches!(best_window("B2B ticketing", &l), Placing::One(w) if w.id == "sp2"));
+    match best_window("b2", &l) {
+        Placing::Closest(w, all) => {
+            assert_eq!(w.id, "sp3", "the shortest that starts with it, the first of equals");
+            assert_eq!(all.len(), 3);
+        }
+        p => panic!("{p:?}"),
+    }
+    assert_eq!(best_window(" sandbox ", &l), Placing::New("sandbox".into()));
+    assert_eq!(best_window("sandbox", &[]), Placing::New("sandbox".into()));
 }
 
 #[test]

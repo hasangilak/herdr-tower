@@ -168,15 +168,25 @@ tower start --name fix-login --cwd ~/w/app "look at the login bug"
 tower start --account <name> --name fix-login --cwd ~/w/app "..."
 tower start --on vps --name x "..." # uses cca on that machine, if it has it
 tower start --space ticket --name x "..."  # in the space whose name has "ticket" in it
+tower start --space sandbox --cwd sandbox --account second --name x "..."  # makes the space, picks ~/Work/eyz/eyzflow-sandbox
+tower project the sandbox project   # the folder a project's name means, and what else came close
 ```
 
 `tower start` runs `hc run --bg --outlive-parent ... -- cca <account> -n
 <name> "<task>"`: cca sets (or unsets) `CLAUDE_CONFIG_DIR` and `CCA_ACCOUNT`
 and starts claude. It records a job in the history with the account, and
 watches the session (`--no-watch` not to). `--space <name>` puts it in a new
-tab of that Herdr space (its whole name or a part of it; none or several
-matching is an error that lists them), through Herdr's `tab.new`, running the
-same `cca` command; the window stays on the space it showed. Without
+tab of that Herdr space (its whole name or a part of it), through Herdr's
+`tab.new`, running the same `cca` command; the window stays on the space it
+showed. Opening a session never stops to ask: a space no one has yet is made
+(Herdr's `space.new`, the session as its first tab; `space_made` in the
+output), and of several matching spaces the closest is taken; `--new-space` makes
+one unless a space has exactly that name. A `--cwd` that
+isn't a folder is a project's name ("sandbox", or a guessed path): the tower
+takes the best-matching folder under `~/Work` and one level below
+(`HERDER_TOWER_PROJECTS` for other roots), preferring a project's own
+checkout over a `wt-…` worktree copy, and says what it took in `chose`.
+`--account` takes a name, part of one, or a place ("second"). Without
 `--space` it gets a tab in the space the window shows. Either way it says which
 space the session went to. An account cca doesn't know is an
 error that lists the ones it does. Without the mod, sessions start as plain
