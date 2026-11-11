@@ -45,13 +45,15 @@ fn enabled() -> bool {
 /// latest prompt when that was the user's own (`typed`: not one the tower
 /// or another session typed). None: the last request of the user's it had
 /// stands (`Book::tasks_for`).
-fn task_now(address: &str) -> Option<String> {
-    super::agendas::users_task_of(address).and_then(|t| introduce::users_task(&t)).or_else(|| {
+fn task_now(address: &str) -> Option<(String, bool)> {
+    let on = super::agendas::users_task_of(address).and_then(|t| introduce::users_task(&t)).or_else(|| {
         if !super::typed::users_turn(address) {
             return None;
         }
         super::sessions::registry().get(address).and_then(|s| introduce::users_task(&s.prompt))
-    })
+    });
+    // Else what the user last asked it for (the agenda ledger keeps it), over by now.
+    on.map(|t| (t, false)).or_else(|| super::agendas::users_last_task_of(address, |t| introduce::users_task(t).is_some()).and_then(|t| introduce::users_task(&t)).map(|t| (t, true)))
 }
 
 impl Introducer {
@@ -139,7 +141,18 @@ impl Introducer {
         let mut groups = introduce::group(members);
         // Each one's task: what it's on now, else the last real task it had.
         let mut b = lock(&self.book);
-        let mut changed = b.tasks_for(&mut groups, |m| task_now(&m.address));
+        let done = std::cell::RefCell::new(std::collections::HashSet::new());
+        let mut changed = b.tasks_for(&mut groups, |m| {
+            task_now(&m.address).map(|(t, over)| {
+                if over {
+                    done.borrow_mut().insert(m.key());
+                }
+                t
+            })
+        });
+        for m in groups.values_mut().flatten() {
+            m.task_done |= done.borrow().contains(&m.key());
+        }
         // Who had an introduction is kept while their terminals are seen.
         let present: std::collections::BTreeSet<String> = groups.values().flatten().map(Member::key).collect();
         changed |= b.keep_introduced(&present, crate::history::now_ms());

@@ -960,6 +960,16 @@ impl Ledger {
             .max_by_key(|t| (t.delivered_ms, t.created_at_ms))
     }
 
+    /// The newest task on `session`, done or not, of what the user asked for
+    /// (no message from another session) and that `is_request` takes.
+    pub fn latest_users_on(&self, session: &str, is_request: impl Fn(&str) -> bool) -> Option<&Task> {
+        self.agendas
+            .iter()
+            .flat_map(|a| a.tasks.iter())
+            .filter(|t| !session.is_empty() && t.session == session && !t.is_message() && is_request(&t.instruction))
+            .max_by_key(|t| (t.delivered_ms, t.created_at_ms))
+    }
+
     /// `unfinished_on`, of what the tower handed out: the user's own work in
     /// a session's terminal (origin `terminal`) is theirs, and what the
     /// tower sends that session is never more of it.

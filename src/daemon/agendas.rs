@@ -57,6 +57,13 @@ pub fn users_task_of(session: &str) -> Option<String> {
     l.unfinished_users_on(session).map(|t| t.instruction.clone())
 }
 
+/// What the user last asked `session` for, done or not: the newest task on
+/// it that is no message from another session and passes `is_request`.
+pub fn users_last_task_of(session: &str, is_request: impl Fn(&str) -> bool) -> Option<String> {
+    let l = RUNNING.get()?.lock();
+    l.latest_users_on(session, is_request).map(|t| t.instruction.clone())
+}
+
 /// What was asked of `session` lately: the instruction of the task it is
 /// on, or was until a minute ago (None: nothing, or no daemon here).
 pub fn working_on(session: &str) -> Option<String> {

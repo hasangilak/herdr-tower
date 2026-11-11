@@ -40,6 +40,8 @@ pub struct Member {
     pub created_ms: Option<u64>,
     /// What it's on (the agenda's task, its last prompt), or empty.
     pub task: String,
+    /// That task is over: it is what the user last asked it for.
+    pub task_done: bool,
 }
 
 impl Member {
@@ -95,7 +97,7 @@ pub fn member_of(listed: &Value, full: Option<&Value>) -> Option<Member> {
     if crate::brains::is_brain_folder(&folder) {
         return None;
     }
-    Some(Member { address: listed["address"].as_str()?.to_string(), name, folder, space, created_ms: crate::hc::created_ms(t), task: String::new() })
+    Some(Member { address: listed["address"].as_str()?.to_string(), name, folder, space, created_ms: crate::hc::created_ms(t), task: String::new(), task_done: false })
 }
 
 /// Members by space, each space's in address order.
@@ -361,7 +363,17 @@ pub fn task_from_prompt(prompt: &str) -> Option<String> {
 /// t7h: …", "From Shop › web (t7h): …") nor the session's own notice that
 /// background work finished (`<task-notification>`).
 pub fn users_task(text: &str) -> Option<String> {
-    task_from_prompt(text).filter(|t| crate::peers::sender_in(t).is_none() && !t.starts_with("<task-notification>"))
+    task_from_prompt(text).filter(|t| crate::peers::sender_in(t).is_none() && !t.starts_with("<task-notification>") && !bare_reply(t))
+}
+
+/// An answer to a question, not a request: "yeah", "ok", "2", "go on".
+fn bare_reply(text: &str) -> bool {
+    const REPLIES: [&str; 22] = [
+        "y", "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "k", "n", "no", "nope", "go", "go on", "go ahead", "do it", "continue", "proceed",
+        "thanks", "thank you", "done", "cool",
+    ];
+    let t: String = text.trim().trim_end_matches(['.', '!', '?']).to_lowercase();
+    REPLIES.contains(&t.as_str()) || (!t.is_empty() && t.len() <= 2 && t.chars().all(|c| c.is_ascii_digit()))
 }
 
 impl Book {
@@ -384,7 +396,11 @@ impl Book {
                     }
                     m.task = t;
                 }
-                None => m.task = self.tasks.get(&key).cloned().unwrap_or_default(),
+                None => {
+                    // The last of the user's requests it had: over by now, as far as the tower knows.
+                    m.task = self.tasks.get(&key).cloned().unwrap_or_default();
+                    m.task_done = true;
+                }
             }
             keys.insert(key);
         }
@@ -406,7 +422,13 @@ pub fn compose(space: &str, to: &Member, members: &[Member]) -> String {
         if others.len() == 1 { " is" } else { "s are" }
     );
     for m in &others {
-        let task = if m.task.trim().is_empty() { "no task reported yet".to_string() } else { format!("working on: {}", clip(&m.task, 160)) };
+        let task = if m.task.trim().is_empty() {
+            "no task reported yet".to_string()
+        } else if m.task_done {
+            format!("last asked for: {}", clip(&m.task, 160))
+        } else {
+            format!("working on: {}", clip(&m.task, 160))
+        };
         out += &format!("- {} ({}), in {}: {task}\n", m.label(), m.address, tilde(&m.folder));
     }
     out += "Talk to them when you need their help, and ask for changes in their layer instead of editing their repos. \
@@ -429,6 +451,7 @@ mod tests {
             space: space.into(),
             created_ms: Some(100),
             task: String::new(),
+            task_done: false,
         }
     }
 
@@ -615,6 +638,10 @@ mod tests {
         assert_eq!(users_task("<hc from=\"t7p\">From t7p (Mac tower). Installed now</hc>"), None);
         assert_eq!(users_task("<task-notification> <summary>done</summary>"), None);
         assert_eq!(users_task(&compose("B2C", &m("t1", "B2C"), &[m("t1", "B2C"), m("t2", "B2C")])), None);
+        for reply in ["yeah", "Yes.", "ok", "2", "go ahead", "Do it!"] {
+            assert_eq!(users_task(reply), None, "{reply} answers a question");
+        }
+        assert_eq!(users_task("fix login").as_deref(), Some("fix login"));
         // A message an older tower kept as a session's task is dropped; the user's stays.
         let mut book = seeded();
         let (a, b) = (m("t1", "B2C"), m("t2", "B2C"));
@@ -626,6 +653,11 @@ mod tests {
         assert_eq!(g["B2C"][1].task, "commit everything and push. then give me the release");
         assert!(!book.tasks.contains_key(&a.key()));
         assert!(compose("B2C", &b, &g["B2C"]).contains("(t1), in /w/t1: no task reported yet"));
+        // The kept one is what the user last asked; one it is on now is what it is working on.
+        assert!(compose("B2C", &a, &g["B2C"]).contains("(t2), in /w/t2: last asked for: commit everything and push."));
+        let mut g = groups(&[a.clone(), b.clone()]);
+        book.tasks_for(&mut g, |m| (m.address == "t2").then(|| "port the billing page".to_string()));
+        assert!(compose("B2C", &a, &g["B2C"]).contains("(t2), in /w/t2: working on: port the billing page"));
     }
 
     #[test]
