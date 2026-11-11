@@ -10,11 +10,12 @@
 //!   count of what is the user's; each open space with its mark (an amber
 //!   count, an outline when muted, a pulse at work, a tick at rest) and a
 //!   small line (its sessions, "standing", "ready to close"); "New space";
-//!   the quiet spaces folded into one line; Record, Shots and Settings at
-//!   the foot.
+//!   the quiet spaces folded into one line; Record, Shots, Projects and
+//!   Settings at the foot.
 //! - **The main pane** shows what the sidebar picked (`crate::orb::nav`):
 //!   every space (here: the queue beside the missions), one space (`space`),
 //!   the launcher (`launch`), the record (`record`), the screenshots, the
+//!   projects (`projects`), the
 //!   settings (`settings`) with the behaviors and the phone (`Scope::Phone`
 //!   opens Settings at its Phone card), one session (`session`).
 //! - **The input** under the queue goes to the main tower; under a space, to
@@ -33,7 +34,7 @@ use gpui::{AnyElement, App, Context, FontWeight, SharedString, Window, div, prel
 use gpui_kit::component::{h_flex, v_flex};
 
 use super::home::{LINE, SOFT, bay_label, cstat, mbtn, minimize_mark, sign, tg};
-use super::{CYAN, Panel, cli, glass, launch, record, space};
+use super::{CYAN, Panel, cli, glass, launch, projects, record, space};
 use crate::history;
 use crate::orb::model::{self, Decision, Missions};
 use crate::orb::nav::{Scope, Side};
@@ -49,6 +50,8 @@ pub(super) struct FullUi {
     shown: Option<Scope>,
     /// The launcher.
     pub launch: launch::LaunchUi,
+    /// The projects' page: the form while one is added or changed.
+    pub projects: projects::ProjectsUi,
     /// A space's goal while it is being changed.
     pub edit: Option<space::GoalEdit>,
     /// What a command said, by where it shows (`tell`, `space:<name>`,
@@ -94,6 +97,7 @@ impl FullUi {
         Self {
             shown: None,
             launch: launch::LaunchUi::new(window, cx),
+            projects: projects::ProjectsUi::default(),
             edit: None,
             notes: HashMap::new(),
             busy: HashSet::new(),
@@ -383,7 +387,7 @@ impl Panel {
                     self.phone_pair(cx);
                 }
             }
-            Scope::New => self.read_setups(cx),
+            Scope::New | Scope::Projects => self.read_setups(cx),
             Scope::Space(_) => self.learn_space_tower(cx),
             _ => {}
         }
@@ -463,6 +467,7 @@ fn scope_key(scope: &Scope) -> String {
         Scope::New => "new".into(),
         Scope::Record => "record".into(),
         Scope::Shots => "shots".into(),
+        Scope::Projects => "projects".into(),
         Scope::Settings => "settings".into(),
         Scope::Behaviors => "behaviors".into(),
         Scope::Phone => "phone".into(),
@@ -498,7 +503,7 @@ impl Panel {
                 (h, b, Some(Some(name.clone())), true)
             }
             Scope::New => {
-                let (h, b) = self.launch_view(&missions, cx);
+                let (h, b) = self.launch_view(&missions, window, cx);
                 (h, b, None, false)
             }
             Scope::Record => {
@@ -507,6 +512,10 @@ impl Panel {
             }
             Scope::Shots => {
                 let (h, b) = self.shots_pane(cx);
+                (h, b, None, false)
+            }
+            Scope::Projects => {
+                let (h, b) = self.projects_view(window, cx);
                 (h, b, None, false)
             }
             Scope::Settings | Scope::Phone => {
@@ -717,7 +726,8 @@ impl Panel {
             let on = here == side;
             div()
                 .id(id)
-                .px(px(8.0))
+                // Four of them across the sidebar: Record, Shots, Projects, Settings.
+                .px(px(5.0))
                 .py(px(5.0))
                 .rounded(px(8.0))
                 .cursor_pointer()
@@ -762,9 +772,10 @@ impl Panel {
             .child(
                 h_flex()
                     .px(px(2.0))
-                    .gap(px(2.0))
+                    .gap(px(1.0))
                     .child(foot("side-record", "Record", Side::Record, Scope::Record))
                     .child(foot("side-shots", "Shots", Side::Shots, Scope::Shots))
+                    .child(foot("side-projects", "Projects", Side::Projects, Scope::Projects))
                     .child(foot("side-settings", "Settings", Side::Settings, Scope::Settings)),
             )
             .into_any_element()
@@ -883,7 +894,7 @@ mod tests {
         assert_eq!(scope_key(&Scope::Space("isa".into())), "space-isa");
         assert_ne!(scope_key(&Scope::Space("isa".into())), scope_key(&Scope::Space("anna".into())));
         assert_ne!(scope_key(&session("t1")), scope_key(&session("t2")));
-        let all = [Scope::All, Scope::New, Scope::Record, Scope::Shots, Scope::Settings, Scope::Behaviors, Scope::Phone];
+        let all = [Scope::All, Scope::New, Scope::Record, Scope::Shots, Scope::Projects, Scope::Settings, Scope::Behaviors, Scope::Phone];
         let keys: HashSet<String> = all.iter().map(scope_key).collect();
         assert_eq!(keys.len(), all.len());
     }

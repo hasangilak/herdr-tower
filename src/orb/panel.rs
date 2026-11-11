@@ -101,6 +101,7 @@ mod home;
 mod launch;
 mod phone;
 mod prchip;
+mod projects;
 mod questions;
 mod record;
 mod session;

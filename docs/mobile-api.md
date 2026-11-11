@@ -783,7 +783,7 @@ of them run with `curl` against a tower, with what came back.
 | `POST /v1/spaces/{space}/mute` | `{"on": true}` | `200 {"space", "mute": bool, "mission": Mission or null}`. Its decisions leave (or rejoin) the main queue and the count at once. `400 bad_on`, `404 no_space`. |
 | `POST /v1/spaces/{space}/close` | `{"force": false}` (optional) | Closes the space. `202 {"action": Action}`: see "Actions". `409 busy` while a session there works or waits for the user (unless `force`), `409 closing`, `404 no_space`. |
 | `GET /v1/thread?space=<name>&limit=50&before=h120` | | `{"space", "messages": [Message], "more": bool}`: what the sessions of a space wrote to each other, newest last; pages like the chat. |
-| `GET /v1/setups` | | `{"setups": [{"name", "account", "repos": [folder]}]}`: what a space can be launched with. The first is the default. |
+| `GET /v1/setups` | | `{"setups": [{"name", "account", "about", "repos": [folder], "roles": {folder: role}}]}`: the projects a space can be launched with (`about`: what the project is; `roles`: what each repo is in it, only those that have one). The first is the default. |
 | `POST /v1/launch` | `{"goal": "Fix the login redirect", "setup": "eyzflow", "name": "login", "dry_run": false}` (`goal` required) | With `dry_run`: `200`, the plan. Without: `202 {"action": Action}`, see "Actions". `400 empty`, `400 bad_launch`, `404 no_setup`, `409 no_setups`, `409 launching`. |
 | `GET /v1/actions` | | `{"actions": [Action]}`, newest first: the launches and closes the phones started since the tower started (the last 50). |
 | `GET /v1/actions/{id}` | | `{"action": Action}`. `404 no_action`. |
@@ -1112,10 +1112,11 @@ in has an empty thread. A new message is a `thread` event:
 does nothing:
 
 ```json
-{"space": "fix-login", "goal": "Fix the login redirect", "made": true, "dry_run": true, "agenda": null,
+{"space": "fix-login", "goal": "Fix the login redirect", "done_when": "", "made": true, "dry_run": true, "agenda": null,
  "sessions": [{"name": "fix-login-eyzflow", "repo": "~/Work/eyz/eyzflow", "address": null, "account": "orca",
                "worktree": "/…/.tower-worktrees/fix-login/eyzflow", "branch": "fix-login/eyzflow",
-               "port": null, "task": null, "error": null}],
+               "port": null, "task": null, "error": null, "why": "the web app and its API"}],
+ "repos_from": "setup",
  "assumed": {"setup": "eyzflow + mediaroom on orca", "setup_why": "the first of 2",
              "account": "orca", "account_why": "the setup's",
              "name": "fix-login", "name_why": "the goal's first two words, small ones left out",
@@ -1125,8 +1126,15 @@ does nothing:
 It never asks: the space's name comes from the goal (or is `name`, taken as
 given: a space that has that name already is joined, `made: false`), the
 setup is the one named by `setup` (its whole name, or a part), else the
-first, and `assumed` says what it chose and why. Show the plan before
-launching ("what the tower will do").
+first, and `assumed` says what it chose and why. `goal` is the space's
+goal: the ticket's title (the line after one that only asks for sessions,
+else the first line, at most 120 characters); the whole text still goes to
+the sessions. `done_when` is its "Acceptance criteria" (or "Definition of
+done", "Done when") section's lines, joined, or "". Each session's `why`
+is its repo's role in the project, or how it came in; `repos_from` is
+`first-line`, `setup` or `repos`. Show the plan before launching ("what
+the tower will do"). (Drafting a space from a ticket, `tower launch
+--draft`, is the Mac's own for now: the phone launches as before.)
 
 Launching for real opens a session per repo of the setup, each in a
 worktree of its own: seconds each, sometimes minutes. Closing a space ends

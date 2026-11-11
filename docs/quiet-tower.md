@@ -945,53 +945,111 @@ Mission { "name", "goal": "" when none, "done_when": "" when none,
 
 ## Step 9: one sentence launches a space
 
+The code is `src/launch.rs` (the plan, the launch), `src/ticket.rs` (the
+draft of a ticket), `src/setups.rs` (the projects) and
+`src/orb/panel/launch.rs` / `projects.rs` (New space, Projects).
+
+### Projects
+
+A project is a `[[setups]]` table (the name stays, for the files and the
+phones from before): a name, the account its sessions run on, a line on
+what it is, its repos, and a line on what each repo is in it.
+
 ```toml
 [[setups]]
-name = "eyzflow + mediaroom on orca"
+name = "EYZFlow"
 account = "orca"
+about = "the video platform agencies run their media and customer support on"
 repos = ["~/Work/eyz/eyzflow", "~/Work/eyz/eyz-mediaroom-serverless"]
+roles = { "~/Work/eyz/eyzflow" = "the web app and its API", "~/Work/eyz/eyz-mediaroom-serverless" = "the media backend" }
 ```
 
-- `tower setups [--json]`: `{"setups":[{"name","account","repos":[…]}]}`.
-  The first is the default.
-- `tower setup add "<name>" --account <account> --repo <folder> [--repo
-  <folder>…]`: the same name again (any case) changes that setup in its
-  place. The account is checked against `cca` (none given: the first); a
-  repo that is no folder is taken as a project's name and matched
-  (`projects::best`), and the answer says which folder it took.
-  `tower setup remove "<name>"`. Both edit config.toml's text, so the rest
-  of the file stays as it is, and refuse a change after which the file
-  wouldn't read.
-- `tower launch "<goal>" [--setup <name>] [--name <space>] [--dry-run]
-  [--json]`:
-  - the space's name is the goal's first two words that carry meaning,
-    lower-cased, joined with a dash: `Fix the login redirect` is
-    `fix-login`. The small words `the a an to for of and in on with my our
-    new some` are passed over (`launch::space_name`); a goal made of them
-    only keeps its first two. It gets `-2`, `-3`, …
-    while a space has it (Herdr's, and those the tower remembers, closed
-    ones too). `--name` is taken as given; a space that has that name
-    already is joined, not made;
-  - the setup is the one named (its whole name, or a part), else the only
-    one, else the first. No setup at all is an error that says how to add
-    one. It never asks;
-  - it sets the goal and makes the mission, opens one agenda for the goal
-    (the request; only while the daemon runs), then runs `tower start
-    --space <space> --new-space --account <the setup's> --agenda <id>` once
-    per repo, so each session is named `<space-slug>-<repo-name>` (shown
-    `<space> › <repo-name>`, said "the <repo-name> session in <space>"),
-    works in the space's worktree of its repo with
-    a dev port (step 10), and has the goal as its first task: the goal,
-    that it is the space's goal and which part is this session's, the
-    other sessions' names, then where it works. The introduction between
-    them is the daemon's, as sessions join;
-  - it prints one receipt:
+`about` and `roles` are optional: a table from before reads as one without
+them, and is written back without them. A role is keyed by the repo as
+`repos` writes it (`~` and a trailing `/` aside, `Setup::role_of`).
+
+- `tower setups [--json]`: `{"setups":[{"name","account","about","repos":[…],
+  "roles":{"<repo>":"<role>"}}]}` (only the repos that have a role). The
+  first is the default.
+- `tower setup add "<name>" --account <account> [--about "<line>"] --repo
+  "<folder>=<its role>" [--repo …] [--was "<old name>"]`: a repo is
+  `<folder>=<role>`, or `<folder> — <role>` (an em or en dash or `-`, a
+  space each side), or the folder alone (`setups::repo_and_role`). The
+  same name again (any case) changes that project in its place; `--was`
+  renames one in its place (so the first stays the default), and refuses a
+  name another project has. The account is checked against `cca` (none
+  given: the first); a repo that is no folder is taken as a project
+  folder's name and matched (`projects::best`), and the answer says which
+  folder it took. `tower setup remove "<name>"`. Both edit config.toml's
+  text, so the rest of the file stays as it is, and refuse a change after
+  which the file wouldn't read.
+- The full window's **Projects** (the sidebar's foot, beside Record and
+  Shots; Settings has a card with the way there) lists them, a card each
+  (name, account, about, each repo with its role and folder), with **+ Add
+  project**, **Edit** (one form: name, an account pick from `tower
+  accounts`, about, the repos one per line as `<folder> — <its role>`) and
+  **Remove** (asked once in the card). It saves through `tower setup
+  add|remove` and reads `tower setups --json` again.
+
+### `tower launch`
+
+`tower launch "<goal>" [--setup <name>] [--name <space>] [--repo <folder>…]
+[--title "<goal>"] [--done-when "<…>"] [--account <a>] [--dry-run] [--json]`:
+
+- the repos: those `--repo` gives (each must be a folder; nothing else is
+  opened); else those of the project `--setup` names; else those the
+  goal's first line names (`launch::repos_named`: a word that is a project
+  folder's whole name, or a distinctive part of only one folder's name, at
+  least five letters; the rest of the goal is never read for them). When a
+  saved project has every repo the first line names, its account and roles
+  come with them (only the repos named are opened). With none of these,
+  the only project, else the first. No project at all is an error that
+  says to name the repos in the first line, or how to add one. It never
+  asks. With `--repo` and `--setup`, the project is the one it is for: its
+  name, account and roles, the repos as given;
+- the space's name is the goal's first two words that carry meaning,
+  lower-cased, joined with a dash: `Fix the login redirect` is
+  `fix-login`. The small words `the a an to for of and in on with my our
+  new some` are passed over (`launch::space_name`), and so are the words
+  that only ask for sessions (`open a session at …`) and the repos named;
+  a first line made of those only names it from the ticket's title after
+  it. It gets `-2`, `-3`, … while a space has it (Herdr's, and those the
+  tower remembers, closed ones too). `--name` is taken as given; a space
+  that has that name already is joined, not made;
+- **the space's goal is the ticket's title** (`launch::title_of`): the line
+  after the one that only asks for sessions (what follows that line's
+  colon, else the next line with words), else the first line; heading
+  marks and a `Title:` in front taken off, at most 120 characters.
+  `--title` gives it instead;
+- **what counts as done** (`launch::done_when_of`): the ticket's
+  "Acceptance criteria", "Definition of done" or "Done when" section (a
+  heading, `**…**`, or a line ending in `:`): its bullet lines (`-`, `*`,
+  `•`, `1.`, `- [ ]`; a line under one continues it; a list goes on after
+  an empty line only as a list), or with no bullets its lines up to the
+  next empty one, joined with "; ", at most 400 characters; a heading with
+  words after its colon is those words. `--done-when` gives it instead (""
+  is kept empty);
+- the account: `--account`, else the project's, else the default one;
+- it sets the goal (`agendas`) and the done-when (`missions.<space>.done_when`,
+  as `tower space goal --done-when` sets it) and makes the mission, opens
+  one agenda (the request) whose words are the whole ticket under the
+  title (only while the daemon runs), then runs `tower start --space
+  <space> --new-space --account <a> --agenda <id>` once per repo, so each
+  session is named `<space-slug>-<repo-name>` (shown `<space> ›
+  <repo-name>`, said "the <repo-name> session in <space>"), works in the
+  space's worktree of its repo with a dev port (step 10), and has the whole
+  ticket as its first task (with the title in front when the ticket doesn't
+  have it), that it is the space's goal, when it is done, which part is
+  this session's, the other sessions' names, then where it works. The
+  introduction between them is the daemon's, as sessions join;
+- it prints one receipt:
 
     ```
-    { "space", "goal", "made": bool (false: it joined a space), "dry_run": bool,
-      "agenda": id or null,
+    { "space", "goal": the title, "done_when", "made": bool (false: it joined a space), "dry_run": bool,
+      "agenda": id or null, "repos_from": "first-line" | "setup" | "repos",
       "sessions": [ { "name", "repo", "address", "account", "worktree", "branch",
-                      "port", "task": agenda task or null, "error": text or null } ],
+                      "port", "task": agenda task or null, "error": text or null,
+                      "why": its role in the project, or how it came in } ],
       "assumed": { "setup", "setup_why", "account", "account_why",
                    "name", "name_why", "worktrees": bool, "worktrees_why" },
       "act": the id of the act kept for it (`tower undo <id>`), when the daemon runs }
@@ -1000,6 +1058,93 @@ repos = ["~/Work/eyz/eyzflow", "~/Work/eyz/eyz-mediaroom-serverless"]
     `--dry-run` prints the same plan (no `address`, `port`, `task`) and
     does nothing: no space, no session, no worktree, no file touched. A
     session that didn't open has its `error`; the others still open.
+
+### A ticket's draft
+
+`tower launch "<ticket>" --draft [--setup <project>] [--adjust "<the
+user's words>" --prior '<the draft before, as --draft --json printed it>']
+[--json]`: the tower's brain reads the ticket and drafts the space, for the
+user to confirm or change. Nothing is opened, nothing written.
+
+- **One headless call** (`ticket::argv`): `cca <the default account> -p
+  --output-format json --model <[brains] model> --effort low
+  --no-session-persistence --strict-mcp-config --settings
+  '{"disableAllHooks":true}' --tools ""` (plain `claude -p …` without the
+  accounts mod), the prompt on its stdin, in the system's temporary folder,
+  in an environment without `CLAUDE_CONFIG_DIR`, `CLAUDECODE`,
+  `CCA_ACCOUNT`, `ANTHROPIC_*`, `HC_*` and `CLAUDE_CODE_*`
+  (`ticket::left_out`), so the account is the one asked for. It is stopped
+  after 90 seconds. It takes about 6 seconds.
+- **The prompt** (`ticket::prompt`): the projects (name, account, about,
+  each repo whole with its role; with `--setup`, that project only, and
+  that the user chose it), every project folder under the roots with one
+  line on it (`ticket::describe`: `package.json`'s description, else the
+  first heading, with the sentence after it when the heading is only a
+  name, or the first sentence of `README.md`, else of `CLAUDE.md`; 6 KB of
+  each at most), the ticket, and for a revision the draft before (in the
+  answer's shape, `ticket::prior_brief`) and the user's words. It asks for
+  one JSON object and nothing else: `{"project", "account", "repos":
+  [{"folder", "why"}], "space", "goal", "done_when", "notes"}`.
+- **Its answer** (`ticket::parse_reply`): `claude`'s `result` (an
+  `is_error`, or a `subtype` other than `success`, is an error with its
+  words), the object in it even inside a code fence or words, or a bare
+  object.
+- **Checked** (`ticket::check`): a folder must be one of the project
+  folders under the roots or a saved project's repo, by its path (`~` made
+  whole, compared as the file system has it) or by a name only one has;
+  any other is left out and named in `dropped`; each once. No repo left is
+  an error that says to draft again or name the repos in the first line.
+  The project must be one by that name (else dropped), and the one
+  `--setup` named wins, with its own account; an account the mod doesn't
+  know is dropped (none: the project's, else the default). The goal is its
+  first line as a title (at most 120 characters; none: the ticket's own
+  title), the done-when one line of at most 400 (none: the ticket's
+  acceptance criteria), the notes one line; the name kebab-case, at most
+  32 characters, made unique among the spaces.
+- **The draft** is the dry run's receipt of exactly that
+  (`launch::plan_with` with `--repo`, `--name`, `--title`, `--done-when`,
+  `--account`, `--setup`), with `"draft": true`, `"repos_from": "draft"`,
+  `project` (or null), `notes`, `dropped`, `took_ms`, each session's `why`
+  (the brain's), and `assumed` saying it was the brain's.
+- A model error or a timeout: `the tower's brain couldn't read the ticket
+  (…): try again, or name the repos in the first line instead ("open
+  sessions in eyzflow and mediaroom")`.
+- **Launched as confirmed** (`ticket::confirm_flags`): `tower launch
+  "<ticket>" --repo <each folder> --name <space> --title "<goal>"
+  --done-when "<…>" [--account <a>] [--setup <project>]`. The terminal's
+  draft (`--draft` on a terminal, without `--json`) ends with that command.
+
+### New space
+
+The full window's New space (`src/orb/panel/launch.rs`): a goal (a field
+that grows to 14 lines, so a whole ticket fits), **Project** (the projects
+as pills; none picked: the brain picks; a second click unpicks), and what
+the tower will do.
+
+- **The first line names repos** (the dry run's `repos_from` is
+  `first-line`, asked without `--setup` once the typing pauses): the plan
+  as before, its bullets from the receipt (with "Done when: …"), and
+  **Launch** is the confirm (`tower launch "<goal>" --json`).
+- **Any other goal**: the bullets say what a draft does, and the button is
+  **Draft the space** (`tower launch "<ticket>" --draft --json`, with
+  `--setup` for a picked project). While it runs: "Reading the ticket…",
+  and that it takes a little while.
+- **The draft** shows as a card in its place: Space, Goal, Done when, the
+  sessions (each repo with its why), Project and account, the brain's note,
+  and what was left out. Under it **Adjust it in words…** with **Redraft**
+  (Enter too: `--adjust "<words>" --prior '<the draft>'`; the new draft
+  takes the card's place, and the field empties), then **Launch** (exactly
+  that draft, `ticket::confirm_flags`) and **Start over** (the draft is
+  dropped; the ticket stays). A draft belongs to the ticket as it was:
+  changed, the button is Draft the space again.
+- A tower whose `launch --help` has no `--draft` gets the launcher as it
+  was: the first project, its plan, Launch.
+- Launch's receipt names the space, whose view opens with what was done
+  said at its top; an error stays here.
+- `HERDER_TOWER_ORB_DRAFT=<file>` (with `HERDER_TOWER_ORB_WINDOW=show:new=<ticket>`)
+  shows the draft JSON in the file as the card; `reading` shows the
+  launcher reading; `ready` its button before. `HERDER_TOWER_ORB_PROJECT=new|<name>`
+  (with `show:projects`) opens the Projects form once.
 
 ## Step 10: every mission gets its own worktrees
 
@@ -1347,12 +1492,14 @@ where the full window is, `panel/` the views).
     left out, the row names the sender), and an input that goes to that
     space's tower. Its head says "its own tower" when it has one that runs
     (`missions[].tower`; "is starting", "waits on its own screen" when so).
-  - New space: goal, setup, what the tower will do, Launch.
+  - New space: goal, project, what the tower will do (or the draft of a
+    ticket), Launch (step 9).
+  - Projects: each project with its repos and their roles; add, edit, remove.
   - Record: the history, filtered by space (the old Chat and Activity).
   - Shots, Settings (how much it tells you, the tower's model, voice as a
     three-way choice "Off / Decisions / Replies and decisions" with
     "Always on this Mac" as its own switch, questions policy, Follow and
-    Mute, behaviors, phone, accounts, setups), a session's own view.
+    Mute, behaviors, phone, accounts, projects), a session's own view.
 - Number keys answer the open card. Cards are C1 to C6.
 - One model feeds both sizes: answering or picking a card in one shows in
   the other.
@@ -1410,9 +1557,12 @@ question set's `status: failed`, and offers the session or another try.
   <space> "<goal>" --done-when "<…>"` then `tower space standing <space>
   on|off`; `tower space close <space>` (and `--force` after a refusal),
   whose JSON receipt is said in a sentence; `tower setups --json`; `tower
-  launch "<goal>" --setup "<name>" --dry-run --json` for the preview and
-  the same without `--dry-run` to launch (its receipt names the space,
-  whose view then opens).
+  setup add|remove …` (Projects); `tower launch "<goal>" --dry-run --json`
+  for the preview and the same without `--dry-run` to launch (its receipt
+  names the space, whose view then opens); `tower launch "<ticket>"
+  --draft --json` (and `--adjust … --prior …`) for a draft, and `tower
+  launch "<ticket>" --repo … --name … --title … --done-when … --json` to
+  launch it.
 - The input in a space's view runs `tower ask --space <space> "<text>"`
   (step 7): the daemon hands it to that space's brain, or to the main one
   as `In <space>: <text>` when the space has none that can take it. The
@@ -1472,7 +1622,7 @@ section says what was built and how it hangs together.
 | `POST /v1/spaces/{space}/follow` · `/mute` | `{"on": bool}` | `{"space", "follow"\|"mute", "mission"}` |
 | `POST /v1/spaces/{space}/close` | `{"force": bool}` | `202 {"action": Action}`; `409 busy` (with `sessions`) while a session works or is blocked, unless `force` |
 | `GET /v1/thread?space=<name>&limit=50&before=<id>` | | `{"space", "messages": [{"id","at","from","from_name","to","to_name","text","space","delivered"}], "more"}`, newest last |
-| `GET /v1/setups` | | `{"setups": [{"name","account","repos"}]}` |
+| `GET /v1/setups` | | `{"setups": [{"name","account","about","repos","roles"}]}` |
 | `POST /v1/launch` | `{"goal", "setup", "name", "dry_run"}` (`goal` required) | `dry_run`: `200`, the plan (`tower launch --dry-run --json`). Else `202 {"action": Action}` |
 | `GET /v1/actions` · `/v1/actions/{id}` | | `{"actions": [Action]}` · `{"action": Action}` |
 | `GET /v1/tell` · `POST /v1/tell` | `{"level", "voice"}`, each optional | `{"level", "voice"}` · the same with `"was"` and `"voice_was"` for what was set. `400 bad_level`, `400 bad_voice` |

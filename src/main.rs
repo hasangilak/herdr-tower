@@ -45,6 +45,7 @@ mod spaces;
 mod split;
 mod tell;
 mod text;
+mod ticket;
 mod worktrees;
 
 use std::io::IsTerminal;
@@ -250,14 +251,18 @@ enum Cmd {
         task: Vec<String>,
     },
     /// Open a space for a goal, in one go: `tower launch "Fix the login redirect"`. It names the
-    /// space from the goal, makes it, opens a session per repo of a setup (`tower setups`) on its
-    /// account, each in its own git worktree with a dev port, sets the goal and hands it out as the
-    /// first request. It asks nothing, and prints what it assumed. `--dry-run`: only the plan.
+    /// space from the goal, makes it, opens a session per repo (those the goal's first line names,
+    /// else a project's: `tower setups`) on its account, each in its own git worktree with a dev
+    /// port, sets the goal (the ticket's title) and hands the whole text out as the first request.
+    /// It asks nothing, and prints what it assumed. `--dry-run`: only the plan. `--draft`: the
+    /// tower's brain reads the ticket and drafts the space (repos, name, goal, done-when) for you
+    /// to confirm; `--repo`, `--title` and `--done-when` launch exactly what was confirmed.
     Launch {
-        /// The goal, in a sentence.
+        /// The goal, in a sentence, or a whole ticket.
         #[arg(required = true)]
         goal: Vec<String>,
-        /// The setup to open it with (default: the only one, else the first).
+        /// The project to open it with (default: the only one, else the first). With
+        /// `--draft`: the project its repos come from. With `--repo`: the project it is for.
         #[arg(long)]
         setup: Option<String>,
         /// The space's name (default: the goal's first two words that carry meaning, made unique).
@@ -266,28 +271,59 @@ enum Cmd {
         /// Print the plan and do nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Have the tower's brain read the ticket and draft the space, and print the draft
+        /// (as `--dry-run` does its plan). Nothing is opened.
+        #[arg(long, conflicts_with_all = ["repo", "title", "done_when", "dry_run"])]
+        draft: bool,
+        /// With `--draft`: what to change about the draft `--prior` holds, in words.
+        #[arg(long, requires = "draft")]
+        adjust: Option<String>,
+        /// With `--draft`: the draft before (its JSON, as `--draft --json` printed it).
+        #[arg(long, requires = "draft")]
+        prior: Option<String>,
+        /// Open a session in this folder (once per repo), and in no other.
+        #[arg(long)]
+        repo: Vec<String>,
+        /// The space's goal, in a line (default: the ticket's title).
+        #[arg(long)]
+        title: Option<String>,
+        /// What counts as done (default: the ticket's acceptance criteria, if it has any).
+        #[arg(long)]
+        done_when: Option<String>,
+        /// The Claude account its sessions run on (default: the project's, else the default one).
+        #[arg(long)]
+        account: Option<String>,
         #[arg(long)]
         json: bool,
     },
-    /// The setups `tower launch` opens a space with: a name, a Claude account, and the repos that
-    /// get a session each (`[[setups]]` in config.toml). The first is the default.
+    /// The projects (setups) `tower launch` opens a space with: a name, a Claude account, what it
+    /// is, and the repos that get a session each with what each is in it (`[[setups]]` in
+    /// config.toml). The first is the default.
     Setups {
         #[arg(long)]
         json: bool,
     },
-    /// `tower setup add "<name>" --account <account> --repo <folder> [--repo <folder>…]` (the same
-    /// name again changes it), `tower setup remove "<name>"`.
+    /// `tower setup add "<name>" --account <account> [--about "<what it is>"] --repo
+    /// "<folder>=<its role>" [--repo …]` (the same name again changes it; `--was "<old name>"`
+    /// renames one in its place), `tower setup remove "<name>"`.
     Setup {
         /// add | remove
         action: String,
-        /// The setup's name.
+        /// The project's name.
         name: Vec<String>,
         /// add: the Claude account its sessions run on (`tower accounts`; default: the first).
         #[arg(long)]
         account: Option<String>,
-        /// add: a repo's folder (or a project's name), once per repo.
+        /// add: what the project is, in a line.
+        #[arg(long)]
+        about: Option<String>,
+        /// add: a repo's folder (or a project folder's name), with what it is in the project after
+        /// a `=` (or ` — `): `--repo "~/Work/eyz/eyzflow=the web app"`. Once per repo.
         #[arg(long)]
         repo: Vec<String>,
+        /// add: the project's name before, to rename it in its place.
+        #[arg(long)]
+        was: Option<String>,
     },
     /// Every space as a mission: its goal and state (open, quiet, ready to close), what needs you
     /// there, its sessions (with worktree and port) and its requests. JSON when piped.
@@ -794,10 +830,18 @@ fn run(cli: Cli) -> Result<()> {
             let space = space.map(|s| spaces::Asked { name: s, new: new_space });
             start(account.as_deref(), &name, cwd, on.as_deref(), space.as_ref(), no_watch, tag, &task.join(" "), no_worktree, !no_act)
         }
-        Cmd::Launch { goal, setup, name, dry_run, json } => launch::cmd(&goal.join(" "), setup.as_deref(), name.as_deref(), dry_run, json),
+        Cmd::Launch { goal, setup, name, dry_run, draft, adjust, prior, repo, title, done_when, account, json } => {
+            let goal = goal.join(" ");
+            if draft {
+                ticket::cmd(&goal, setup.as_deref(), adjust.as_deref(), prior.as_deref(), json)
+            } else {
+                let ask = launch::Ask { setup: setup.as_deref(), name: name.as_deref(), repos: &repo, title: title.as_deref(), done_when: done_when.as_deref(), account: account.as_deref() };
+                launch::cmd(&goal, &ask, dry_run, json)
+            }
+        }
         Cmd::Setups { json } => setups::cmd_list(json),
-        Cmd::Setup { action, name, account, repo } => match action.as_str() {
-            "add" => setups::cmd_add(&name.join(" "), account.as_deref(), &repo),
+        Cmd::Setup { action, name, account, about, repo, was } => match action.as_str() {
+            "add" => setups::cmd_add(&name.join(" "), account.as_deref(), about.as_deref(), &repo, was.as_deref()),
             "remove" | "rm" | "delete" => setups::cmd_remove(&name.join(" ")),
             other => bail!("tower setup {other}: use `tower setup add \"<name>\" --account <account> --repo <folder>` or `tower setup remove \"<name>\"` (`tower setups` lists them)"),
         },

@@ -554,7 +554,7 @@ mod tests {
         // As `setups::pick` and `launch::plan` word them.
         let none = crate::setups::pick(&[], None).unwrap_err().to_string();
         assert_eq!(code(&none), (409, "no_setups".into()), "{none}");
-        let one = [crate::config::Setup { name: "eyzflow on orca".into(), account: "orca".into(), repos: vec!["/nowhere/at/all".into()] }];
+        let one = [crate::config::Setup { name: "eyzflow on orca".into(), account: "orca".into(), repos: vec!["/nowhere/at/all".into()], ..Default::default() }];
         let unknown = crate::setups::pick(&one, Some("mediaroom")).unwrap_err().to_string();
         assert_eq!(code(&unknown), (404, "no_setup".into()), "{unknown}");
         let world = World { setups: one.to_vec(), ..Default::default() };
@@ -851,11 +851,12 @@ mod tests {
         }
         let world = World {
             setups: vec![
-                crate::config::Setup { name: "eyzflow + mediaroom on orca".into(), account: "orca".into(), repos },
+                crate::config::Setup { name: "eyzflow + mediaroom on orca".into(), account: "orca".into(), repos, ..Default::default() },
                 crate::config::Setup {
                     name: "notes on default".into(),
                     account: "default".into(),
                     repos: vec![dir.join("work").join("eyzflow").to_string_lossy().into_owned()],
+                    ..Default::default()
                 },
             ],
             spaces: SPACES.iter().map(|s| s.to_string()).collect(),

@@ -266,15 +266,45 @@ impl Default for Queue {
     }
 }
 
-/// One `[[setups]]` entry: the repos a space is launched with, and the
-/// Claude account its sessions run on.
+/// One `[[setups]]` entry: a project. Its name, the Claude account its
+/// sessions run on, what it is (`about`), its repos, and what each repo is
+/// in it (`roles`, keyed by the repo as `repos` writes it). `tower launch`
+/// opens a space with it; a ticket's draft reads `about` and the roles to
+/// pick the repos the ticket needs (`crate::ticket`).
+///
+/// ```toml
+/// [[setups]]
+/// name = "EYZFlow"
+/// account = "default"
+/// about = "the video platform agencies run their media on"
+/// repos = ["~/Work/eyz/eyzflow", "~/Work/eyz/eyz-mediaroom-serverless"]
+/// roles = { "~/Work/eyz/eyzflow" = "the web app and its API", "~/Work/eyz/eyz-mediaroom-serverless" = "the media backend" }
+/// ```
+///
+/// A table from before (no `about`, no `roles`) reads as one without them.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Setup {
     pub name: String,
     pub account: String,
+    /// What the project is, in a line.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub about: String,
     /// Folders (`~` allowed), one session each.
     pub repos: Vec<String>,
+    /// What each repo is in the project, in a line, by the repo as `repos` has it.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub roles: std::collections::BTreeMap<String, String>,
+}
+
+impl Setup {
+    /// What `repo` is in this project (its line in `roles`), matched as
+    /// written or as the same folder (`~` made whole, a trailing `/` aside).
+    pub fn role_of(&self, repo: &str) -> &str {
+        let norm = |r: &str| crate::dispatch::expand(r.trim()).trim_end_matches('/').to_string();
+        let want = norm(repo);
+        self.roles.get(repo).or_else(|| self.roles.iter().find(|(k, _)| norm(k) == want).map(|(_, v)| v)).map(|v| v.trim()).unwrap_or("")
+    }
 }
 
 /// `[tell]` in config.toml.
