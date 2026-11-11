@@ -70,6 +70,8 @@ pub(super) struct FullUi {
     pub space_tower: Option<bool>,
     /// The brains' model and effort as just chosen here, until the state says them too.
     pub model: Option<(Option<String>, Option<String>)>,
+    /// Kept while the window is: its size and spot are saved as the user resizes it.
+    pub _resizing: Option<gpui::Subscription>,
 }
 
 impl FullUi {
@@ -86,6 +88,7 @@ impl FullUi {
             drag: None,
             space_tower: None,
             model: None,
+            _resizing: Some(cx.observe_window_bounds(window, |this, window, _| this.resized(window))),
         }
     }
 }
@@ -137,7 +140,19 @@ impl Panel {
             if (x, y) != (f.x, f.y) {
                 win.set_origin(x, y);
             }
-            crate::orb::save_window_position(x, y);
+            crate::orb::save_window_frame(x, y, f.w, f.h);
+        }
+    }
+
+    /// The user resized it (its edges): that size, and where it is, are
+    /// kept for next time.
+    pub(super) fn resized(&mut self, window: &Window) {
+        if self.full.as_ref().is_some_and(|f| f.drag.is_some()) {
+            return;
+        }
+        if let Some(win) = crate::orb::mac::Win::of(window) {
+            let f = win.frame();
+            crate::orb::save_window_frame(f.x, f.y, f.w, f.h);
         }
     }
 

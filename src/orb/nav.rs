@@ -249,6 +249,26 @@ pub fn place(anchor: Option<Rect>, screen: Rect, w: f64, h: f64) -> (f64, f64) {
     (clamp(x, screen.x, screen.x + screen.w - w), clamp(y, screen.y, screen.y + screen.h - h))
 }
 
+/// Where the full window goes when it takes the floating panel's place
+/// (`was`, which closes): over it, its side toward the orb and its top level
+/// with the panel's, so the orb's corner of the screen stays where it was.
+/// Wholly on the screen. AppKit points.
+pub fn place_over(was: Rect, screen: Rect, w: f64, h: f64) -> (f64, f64) {
+    let clamp = |v: f64, low: f64, high: f64| v.min(high).max(low);
+    // The panel opens on the orb's left when there is room: its right edge is the one toward the orb.
+    let toward_right = was.x + was.w / 2.0 >= screen.x + screen.w / 2.0;
+    let x = if toward_right { was.x + was.w - w } else { was.x };
+    let y = was.y + was.h - h;
+    (clamp(x, screen.x, screen.x + screen.w - w), clamp(y, screen.y, screen.y + screen.h - h))
+}
+
+/// The full window's size: the one the user last gave it (`saved`), else
+/// `default`; never under `least`, never over the screen.
+pub fn full_size(saved: Option<(f64, f64)>, screen: Rect, default: (f64, f64), least: (f64, f64)) -> (f64, f64) {
+    let (w, h) = saved.filter(|(w, h)| w.is_finite() && h.is_finite() && *w > 0.0 && *h > 0.0).unwrap_or(default);
+    (w.min(screen.w).max(least.0), h.min(screen.h).max(least.1))
+}
+
 /// A window of `w` by `h` at `(x, y)`, moved as little as it takes to be
 /// wholly on a screen: the one its middle is on, else the nearest. With no
 /// screens, as it is. AppKit points.
@@ -437,5 +457,25 @@ mod tests {
         // A second screen keeps its own coordinates, and a short one clamps.
         let left = Rect { x: -1920.0, y: 100.0, w: 1920.0, h: 600.0 };
         assert_eq!(place(None, left, w, h), (-1440.0, 100.0));
+    }
+
+    #[test]
+    fn the_full_window_takes_the_floating_panels_place_at_the_size_it_was_given() {
+        let screen = Rect { x: 0.0, y: 0.0, w: 1728.0, h: 1080.0 };
+        // The panel left of an orb at the top right: the window's right edge and top are the panel's.
+        let panel = Rect { x: 1300.0, y: 380.0, w: 380.0, h: 640.0 };
+        assert_eq!(place_over(panel, screen, 960.0, 640.0), (1300.0 + 380.0 - 960.0, 380.0));
+        // Taller than the room above the screen's bottom: kept on the screen.
+        assert_eq!(place_over(panel, screen, 960.0, 1200.0).1, 0.0);
+        // A panel on the left half: its left edge is the one toward the orb.
+        let left = Rect { x: 60.0, y: 380.0, w: 380.0, h: 640.0 };
+        assert_eq!(place_over(left, screen, 960.0, 640.0).0, 60.0);
+        // Its size: the one kept, never under the least, never over the screen; none kept is the default.
+        let (default, least) = ((960.0, 640.0), (820.0, 520.0));
+        assert_eq!(full_size(None, screen, default, least), (960.0, 640.0));
+        assert_eq!(full_size(Some((1400.0, 900.0)), screen, default, least), (1400.0, 900.0));
+        assert_eq!(full_size(Some((300.0, 200.0)), screen, default, least), (820.0, 520.0));
+        assert_eq!(full_size(Some((4000.0, 3000.0)), screen, default, least), (1728.0, 1080.0));
+        assert_eq!(full_size(Some((f64::NAN, 900.0)), screen, default, least), (960.0, 640.0), "a broken file is the default");
     }
 }

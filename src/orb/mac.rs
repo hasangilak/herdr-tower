@@ -96,6 +96,25 @@ impl Win {
         }
     }
 
+    /// Its edges resize it. A window with no title bar isn't resizable
+    /// otherwise; its buttons stay hidden (the title bar is invisible).
+    pub fn resizable(self) {
+        // NSWindowStyleMaskResizable.
+        const RESIZABLE: u64 = 1 << 3;
+        // SAFETY: as above; `standardWindowButton:` answers nil for a button the window lacks.
+        unsafe {
+            let mask: u64 = msg_send![self.0, styleMask];
+            let _: () = msg_send![self.0, setStyleMask: mask | RESIZABLE];
+            // Close, minimise, zoom.
+            for kind in 0u64..3 {
+                let button: id = msg_send![self.0, standardWindowButton: kind];
+                if button != nil {
+                    let _: () = msg_send![button, setHidden: YES];
+                }
+            }
+        }
+    }
+
     /// On screen and taking the keyboard (a panel does without activating the app).
     pub fn make_key(self) {
         // SAFETY: as above.

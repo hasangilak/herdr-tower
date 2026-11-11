@@ -104,6 +104,9 @@ struct Tower {
     /// Where the full window is, and the window while it is open.
     nav: nav::Nav,
     full: Option<AnyWindowHandle>,
+    /// The floating panel while it is open (a peek or pinned): it closes
+    /// when the user opens the full window, which takes its place.
+    floating: Option<AnyWindowHandle>,
     /// The floating panel while it is pinned: the keyboard is its again when
     /// the full window closes.
     pinned: Option<AnyWindowHandle>,
@@ -134,6 +137,7 @@ impl Tower {
             mutes: vec![],
             nav: Default::default(),
             full: None,
+            floating: None,
             pinned: None,
             keyed: None,
             live: vec![],
@@ -657,6 +661,10 @@ impl Orb {
     }
 
     fn close_panel(&mut self, give_back: bool, cx: &mut App) {
+        if let Some(p) = &self.panel {
+            let h = p.handle;
+            self.tower.update(cx, |t, _| t.floating = t.floating.filter(|f| *f != h));
+        }
         if let Some(p) = self.panel.take()
             && p.handle.update(cx, |_, window, _| window.remove_window()).is_ok()
             && give_back
@@ -667,6 +675,10 @@ impl Orb {
 
     /// Hovering: the panel as a peek, unless it is open already.
     fn peek(&mut self, cx: &mut Context<Self>) {
+        // The full window is open: it has taken the floating panel's place.
+        if full_open(&self.tower, cx) {
+            return;
+        }
         if self.press.is_none() && !self.panel_open(cx) {
             self.open_panel(true, cx);
         }
@@ -692,7 +704,12 @@ impl Orb {
     }
 
     /// A click: pins a peek, closes a pinned panel, else opens it pinned.
+    /// While the full window is open, it brings that forward instead.
     fn toggle_panel(&mut self, cx: &mut Context<Self>) {
+        if full_open(&self.tower, cx) {
+            open_full(&self.tower, None, None, None, true, cx);
+            return;
+        }
         if self.peeking(cx) {
             if let Some(p) = &self.panel {
                 let view = p.view.clone();
@@ -743,7 +760,10 @@ impl Orb {
             }
             cx.new(|cx| panel::Panel::new(tower, peek, window, cx))
         }) {
-            Ok((handle, view)) => self.panel = Some(PanelWin { handle, view, frame: mac::Rect { x, y, w, h }, away: None, held: false }),
+            Ok((handle, view)) => {
+                self.tower.update(cx, |t, _| t.floating = Some(handle));
+                self.panel = Some(PanelWin { handle, view, frame: mac::Rect { x, y, w, h }, away: None, held: false });
+            }
             Err(e) => eprintln!("[orb] opening the panel: {e:#}"),
         }
     }
@@ -927,23 +947,31 @@ fn open_full(tower: &Entity<Tower>, to: Option<nav::Scope>, anchor: Option<mac::
         }
         return;
     }
-    let (w, h) = (panel::FULL_W as f64, panel::FULL_H as f64);
     let (at_x, at_y) = anchor.map(|a| (a.x + a.w / 2.0, a.y + a.h / 2.0)).unwrap_or_else(mac::mouse);
     let Some(screen) = mac::screen_at(at_x, at_y) else {
         eprintln!("[orb] no screen to open the full window on");
         return;
     };
-    // Where the user last put it, if that is still on a screen; else beside the panel.
-    let (x, y) = spot.or_else(saved_window_position).unwrap_or_else(|| nav::place(anchor, screen, w, h));
+    // The size the user last gave it, never smaller than its least, never larger than the screen.
+    let saved = saved_window();
+    let (w, h) = nav::full_size(saved.map(|s| (s.2, s.3)), screen, (panel::FULL_W as f64, panel::FULL_H as f64), (panel::FULL_MIN_W as f64, panel::FULL_MIN_H as f64));
+    // Where the user last put it, if that is still on a screen; else in the
+    // floating panel's place when it takes it (the user opened it), or beside it.
+    let (x, y) = spot.or_else(|| saved.map(|s| nav::keep_on(&mac::screens(), s.0, s.1, w, h))).unwrap_or_else(|| match anchor {
+        Some(a) if focus => nav::place_over(a, screen, w, h),
+        _ => nav::place(anchor, screen, w, h),
+    });
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds::new(point(px(0.0), px(0.0)), size(px(panel::FULL_W), px(panel::FULL_H))))),
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(point(px(0.0), px(0.0)), size(px(w as f32), px(h as f32))))),
         titlebar: None,
         focus,
         show: false,
         // As the panel: it takes the keyboard without bringing the app forward.
         kind: WindowKind::PopUp,
         is_movable: false,
-        is_resizable: false,
+        // Its edges resize it (`mac::Win::resizable`: the flag alone does nothing without a title bar).
+        is_resizable: true,
+        window_min_size: Some(size(px(panel::FULL_MIN_W), px(panel::FULL_MIN_H))),
         is_minimizable: false,
         window_background: WindowBackgroundAppearance::Blurred,
         ..Default::default()
@@ -954,6 +982,7 @@ fn open_full(tower: &Entity<Tower>, to: Option<nav::Scope>, anchor: Option<mac::
     let t = tower.clone();
     match gpui_kit::open_window(options, cx, |window, cx| {
         if let Some(w) = mac::Win::of(window) {
+            w.resizable();
             w.set_origin(x, y);
             w.glass(panel::RADIUS as f64);
             if focus { w.make_key() } else { w.order_front() }
@@ -965,10 +994,20 @@ fn open_full(tower: &Entity<Tower>, to: Option<nav::Scope>, anchor: Option<mac::
         cx.new(|cx| panel::Panel::full(t, focus, window, cx))
     }) {
         Ok((handle, view)) => {
-            tower.update(cx, |t, cx| {
+            // Opened by the user: it takes the floating panel's place, which goes.
+            let floating = tower.update(cx, |t, cx| {
                 t.full = Some(handle);
                 cx.notify();
+                let f = if focus { t.floating.take() } else { None };
+                if let Some(f) = f {
+                    t.pinned = t.pinned.filter(|h| *h != f);
+                    t.keyed = Some(handle);
+                }
+                f
             });
+            if let Some(f) = floating {
+                let _ = f.update(cx, |_, window, _| window.remove_window());
+            }
             // `HERDER_TOWER_ORB_ANSWER`: a card is answered as a click would, once, to look at what follows.
             static ANSWERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if let Some((id, choice, rule)) = answer_from_start().filter(|_| !focus && !ANSWERED.swap(true, std::sync::atomic::Ordering::SeqCst)) {
@@ -1015,17 +1054,20 @@ fn window_position_file() -> PathBuf {
     config::state_dir().join("window.json")
 }
 
-/// The full window was moved: it opens there next time.
-pub(crate) fn save_window_position(x: f64, y: f64) {
+/// The full window was moved or resized: it opens there, at that size, next time.
+pub(crate) fn save_window_frame(x: f64, y: f64, w: f64, h: f64) {
     let _ = std::fs::create_dir_all(config::state_dir());
-    let _ = std::fs::write(window_position_file(), serde_json::json!({ "x": x, "y": y }).to_string());
+    let _ = std::fs::write(window_position_file(), serde_json::json!({ "x": x, "y": y, "w": w, "h": h }).to_string());
 }
 
-/// Where the user last put the full window, wholly on a screen that is there now.
-fn saved_window_position() -> Option<(f64, f64)> {
+/// Where the user last put the full window and its size (none kept: the
+/// default size; a file from before sizes were kept has only its spot).
+fn saved_window() -> Option<(f64, f64, f64, f64)> {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(window_position_file()).ok()?).ok()?;
     let (x, y) = (v["x"].as_f64()?, v["y"].as_f64()?);
-    Some(nav::keep_on(&mac::screens(), x, y, panel::FULL_W as f64, panel::FULL_H as f64))
+    let w = v["w"].as_f64().unwrap_or(panel::FULL_W as f64);
+    let h = v["h"].as_f64().unwrap_or(panel::FULL_H as f64);
+    Some((x, y, w, h))
 }
 
 /// Closes the full window from another window (the floating panel's button).
