@@ -363,7 +363,21 @@ pub fn task_from_prompt(prompt: &str) -> Option<String> {
 /// t7h: …", "From Shop › web (t7h): …") nor the session's own notice that
 /// background work finished (`<task-notification>`).
 pub fn users_task(text: &str) -> Option<String> {
-    task_from_prompt(text).filter(|t| crate::peers::sender_in(t).is_none() && !t.starts_with("<task-notification>") && !bare_reply(t))
+    task_from_prompt(text).filter(|t| crate::peers::sender_in(t).is_none() && !signed_by_a_session(t) && !t.starts_with("<task-notification>") && !bare_reply(t))
+}
+
+/// A message that opens by saying which session wrote it, the way sessions
+/// introduce themselves to each other ("Hi, this is sandbox-eyzflow (t7h),
+/// …", "I'm the api session (t2): …"): an older tower kept some as tasks.
+fn signed_by_a_session(text: &str) -> bool {
+    let head: String = text.chars().take(120).collect::<String>().to_lowercase();
+    ["this is ", "i am ", "i'm ", "i’m "].iter().filter_map(|w| head.find(w).map(|i| &head[i + w.len()..])).any(|rest| {
+        let rest: String = rest.chars().take(70).collect();
+        rest.find('(').and_then(|o| rest[o + 1..].find(')').map(|c| &rest[o + 1..o + 1 + c])).is_some_and(|inside| {
+            let mut ch = inside.chars();
+            inside.len() <= 8 && ch.next() == Some('t') && ch.next().is_some_and(|c| c.is_ascii_digit()) && inside.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+    })
 }
 
 /// An answer to a question, not a request: "yeah", "ok", "2", "go on".
@@ -642,6 +656,10 @@ mod tests {
             assert_eq!(users_task(reply), None, "{reply} answers a question");
         }
         assert_eq!(users_task("fix login").as_deref(), Some("fix login"));
+        assert_eq!(users_task("Hi, this is sandbox-eyzflow (t7h), the dashboard session. With sandbox-project"), None);
+        assert_eq!(users_task("I'm the api session (t2): the endpoint is on 3001"), None);
+        assert_eq!(users_task("This is urgent (top priority): fix the login").as_deref(), Some("This is urgent (top priority): fix the login"));
+        assert_eq!(users_task("this is the billing page (t1 in the plan): port it").as_deref(), Some("this is the billing page (t1 in the plan): port it"));
         // A message an older tower kept as a session's task is dropped; the user's stays.
         let mut book = seeded();
         let (a, b) = (m("t1", "B2C"), m("t2", "B2C"));
