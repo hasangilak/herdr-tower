@@ -1007,8 +1007,14 @@ fn open_full(tower: &Entity<Tower>, to: Option<nav::Scope>, anchor: Option<mac::
                 }
                 f
             });
+            // After the click that opened it is handled: that click runs inside
+            // the floating panel's own window, which can't be closed from there.
             if let Some(f) = floating {
-                let _ = f.update(cx, |_, window, _| window.remove_window());
+                cx.defer(move |cx| {
+                    if f.update(cx, |_, window, _| window.remove_window()).is_err() {
+                        eprintln!("[orb] the floating panel was already gone");
+                    }
+                });
             }
             // `HERDER_TOWER_ORB_ANSWER`: a card is answered as a click would, once, to look at what follows.
             static ANSWERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1329,8 +1335,17 @@ pub fn run(ui_dir: Option<PathBuf>) -> Result<()> {
                 t.nav.goal = from_start_goal();
             });
             let beside = orb.borrow().as_ref().and_then(|h| h.update(cx, |orb, _, _| orb.panel.as_ref().map(|p| p.frame)).ok().flatten());
-            // `HERDER_TOWER_ORB_WINDOW_REPLACES`: it takes the floating panel's place, as a click does, without the keyboard.
-            open_full(&tower, None, beside, spot, false, std::env::var_os("HERDER_TOWER_ORB_WINDOW_REPLACES").is_some(), cx);
+            // `HERDER_TOWER_ORB_WINDOW_REPLACES`: it takes the floating panel's place
+            // as a click on "Full window" does, from inside the panel's window
+            // (where that click runs), without taking the keyboard.
+            let floating = tower.read(cx).floating;
+            match floating.filter(|_| std::env::var_os("HERDER_TOWER_ORB_WINDOW_REPLACES").is_some()) {
+                Some(f) => {
+                    let t = tower.clone();
+                    let _ = f.update(cx, move |_, _, cx| open_full(&t, None, beside, spot, false, true, cx));
+                }
+                None => open_full(&tower, None, beside, spot, false, false, cx),
+            }
         }
 
         // The daemon rewrites one file whenever something changes.
