@@ -50,10 +50,11 @@ pub fn radar_note() -> Option<String> {
     RUNNING.get()?.lock().radar_note()
 }
 
-/// What `session` is on, from the agenda ledger: its latest unfinished task's instruction.
-pub fn task_of(session: &str) -> Option<String> {
+/// What the user has `session` on: the instruction of its unfinished task,
+/// unless that is a message from another session (`Task::is_message`).
+pub fn users_task_of(session: &str) -> Option<String> {
     let l = RUNNING.get()?.lock();
-    l.unfinished_on(session).map(|t| t.instruction.clone())
+    l.unfinished_users_on(session).map(|t| t.instruction.clone())
 }
 
 /// What was asked of `session` lately: the instruction of the task it is

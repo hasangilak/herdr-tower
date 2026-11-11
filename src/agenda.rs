@@ -949,6 +949,17 @@ impl Ledger {
             .max_by_key(|t| (t.delivered_ms, t.created_at_ms))
     }
 
+    /// `unfinished_on`, of what the user asked for: a message from another
+    /// session (`Task::is_message`) is no work of the user's.
+    pub fn unfinished_users_on(&self, session: &str) -> Option<&Task> {
+        self.agendas
+            .iter()
+            .filter(|a| a.live())
+            .flat_map(|a| a.tasks.iter())
+            .filter(|t| !session.is_empty() && t.session == session && !t.state.settled() && !t.is_message())
+            .max_by_key(|t| (t.delivered_ms, t.created_at_ms))
+    }
+
     /// `unfinished_on`, of what the tower handed out: the user's own work in
     /// a session's terminal (origin `terminal`) is theirs, and what the
     /// tower sends that session is never more of it.

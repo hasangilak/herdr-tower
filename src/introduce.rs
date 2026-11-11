@@ -132,10 +132,37 @@ pub struct Book {
     /// Each member's last real task (by key): its latest prompt may be a
     /// note, an introduction among them, which is no task.
     pub tasks: BTreeMap<String, String>,
+    /// Who has had an introduction (by key: a terminal), and to which space.
+    /// Each gets one: a session that drops out of view for a while (Herdr
+    /// reads it a moment without its agent, the tower restarts) and comes
+    /// back is not introduced again, nor are those already there when
+    /// another joins: only the newcomer is. Forgotten an hour after its
+    /// terminal is no longer seen.
+    pub introduced: BTreeMap<String, Intro>,
 }
+
+/// A session's introduction: to which space, when, and since when its
+/// terminal has not been seen (None: it is there).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Intro {
+    pub space: String,
+    pub at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gone_ms: Option<u64>,
+}
+
+/// How long a terminal that is no longer seen keeps its introduction.
+pub const INTRODUCED_KEEP_MS: u64 = 60 * 60_000;
 
 impl Book {
     pub fn load_from(path: &Path) -> Book {
+        let mut book = Self::read(path);
+        book.migrate();
+        book
+    }
+
+    fn read(path: &Path) -> Book {
         match std::fs::read_to_string(path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
                 let aside = path.with_extension(format!("bad-{}.json", crate::history::now_ms()));
@@ -159,12 +186,71 @@ impl Book {
         Ok(())
     }
 
-    /// It was introduced to `members` now.
+    /// A book from before `introduced`: those it sent an introduction to have had one.
+    fn migrate(&mut self) {
+        if !self.introduced.is_empty() {
+            return;
+        }
+        for (space, k) in self.spaces.iter().filter(|(_, k)| k.sent_ms > 0) {
+            for key in &k.members {
+                let address = key.split('@').next().unwrap_or(key);
+                if k.sent_to.iter().any(|a| a == address) {
+                    self.introduced.insert(key.clone(), Intro { space: space.clone(), at_ms: k.sent_ms, gone_ms: None });
+                }
+            }
+        }
+    }
+
+    /// It was introduced to `members` now: every one of them got it.
+    #[cfg(test)]
     pub fn sent(&mut self, space: &str, members: &[Member], now: u64) {
+        self.introduced_to(space, members, members, now);
+    }
+
+    /// `space` has `members` now, and `reached` of them got the introduction.
+    pub fn introduced_to(&mut self, space: &str, members: &[Member], reached: &[Member], now: u64) {
         self.spaces.insert(
             space.to_string(),
-            Known { members: members.iter().map(Member::key).collect(), sent_ms: now, sent_to: members.iter().map(|m| m.address.clone()).collect() },
+            Known { members: members.iter().map(Member::key).collect(), sent_ms: now, sent_to: reached.iter().map(|m| m.address.clone()).collect() },
         );
+        for m in reached {
+            self.introduced.insert(m.key(), Intro { space: space.to_string(), at_ms: now, gone_ms: None });
+        }
+    }
+
+    /// `space` has `members` now, and nobody needed an introduction (they all had one).
+    pub fn known_now(&mut self, space: &str, members: &[Member]) {
+        self.spaces.entry(space.to_string()).or_default().members = members.iter().map(Member::key).collect();
+    }
+
+    /// Those of `members` that have had no introduction to `space`.
+    pub fn recipients<'a>(&self, space: &str, members: &'a [Member]) -> Vec<&'a Member> {
+        members.iter().filter(|m| self.introduced.get(&m.key()).is_none_or(|i| i.space != space)).collect()
+    }
+
+    /// The terminals seen now (`present`, by key): an introduction is kept
+    /// while its terminal is seen, and for an hour after. True when the book changed.
+    pub fn keep_introduced(&mut self, present: &BTreeSet<String>, now: u64) -> bool {
+        let mut changed = false;
+        self.introduced.retain(|key, i| {
+            if present.contains(key) {
+                changed |= i.gone_ms.take().is_some();
+                return true;
+            }
+            match i.gone_ms {
+                None => {
+                    i.gone_ms = Some(now);
+                    changed = true;
+                    true
+                }
+                Some(gone) if now.saturating_sub(gone) > INTRODUCED_KEEP_MS => {
+                    changed = true;
+                    false
+                }
+                Some(_) => true,
+            }
+        });
+        changed
     }
 }
 
@@ -270,12 +356,23 @@ pub fn task_from_prompt(prompt: &str) -> Option<String> {
     (!t.is_empty()).then_some(t)
 }
 
+/// What the user asked a session for, from a text it was given: as
+/// `task_from_prompt`, and never a message from another session ("From
+/// t7h: …", "From Shop › web (t7h): …") nor the session's own notice that
+/// background work finished (`<task-notification>`).
+pub fn users_task(text: &str) -> Option<String> {
+    task_from_prompt(text).filter(|t| crate::peers::sender_in(t).is_none() && !t.starts_with("<task-notification>"))
+}
+
 impl Book {
     /// Each member's task: `fresh` (what it is on now) when there is one,
-    /// else the last real task it had. Forgets those no space has any more.
-    /// True when the book changed.
+    /// else the last real task it had. Forgets those no space has any more,
+    /// and a kept one that is no request of the user's (an older tower kept
+    /// messages between sessions as tasks). True when the book changed.
     pub fn tasks_for(&mut self, groups: &mut BTreeMap<String, Vec<Member>>, fresh: impl Fn(&Member) -> Option<String>) -> bool {
-        let mut changed = false;
+        let before_kept = self.tasks.len();
+        self.tasks.retain(|_, t| users_task(t).is_some());
+        let mut changed = self.tasks.len() != before_kept;
         let mut keys = BTreeSet::new();
         for m in groups.values_mut().flatten() {
             let key = m.key();
@@ -424,6 +521,111 @@ mod tests {
         std::fs::write(&path, "garbage").unwrap();
         assert!(!Book::load_from(&path).seeded, "an unreadable book starts over by recording, not by messaging everyone");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The recipients' addresses when `ms` is due in B2C.
+    fn to(book: &Book, ms: &[Member]) -> Vec<String> {
+        book.recipients("B2C", ms).into_iter().map(|m| m.address.clone()).collect()
+    }
+
+    #[test]
+    fn a_session_that_drops_out_of_view_and_comes_back_is_not_introduced_again() {
+        let (mut book, mut s) = (seeded(), BTreeMap::new());
+        let two = [m("t1", "B2C"), m("t2", "B2C")];
+        assert_eq!(look(&mut book, &mut s, &two, 0).len(), 1);
+        book.sent("B2C", &two, 1);
+        // The tower restarts, or Herdr reads t2 a moment without its agent: t2 is not seen.
+        assert!(look(&mut book, &mut s, &two[..1], 100_000).is_empty());
+        assert!(book.keep_introduced(&two[..1].iter().map(Member::key).collect(), 100_000));
+        // Back: a join as the space's set goes, but both have had theirs.
+        assert_eq!(look(&mut book, &mut s, &two, 200_000), vec!["B2C".to_string()]);
+        assert!(to(&book, &two).is_empty(), "nobody is introduced again");
+        book.known_now("B2C", &two);
+        assert!(book.keep_introduced(&two.iter().map(Member::key).collect(), 200_000), "t2 is there again");
+        assert!(look(&mut book, &mut s, &two, 300_000).is_empty(), "and then the set is as it was");
+    }
+
+    #[test]
+    fn a_newcomer_alone_is_introduced_and_hears_of_everyone() {
+        let (mut book, mut s) = (seeded(), BTreeMap::new());
+        let two = [m("t1", "B2C"), m("t2", "B2C")];
+        assert_eq!(look(&mut book, &mut s, &two, 0).len(), 1);
+        book.sent("B2C", &two, 1);
+        let three = [two.to_vec(), vec![m("t3", "B2C")]].concat();
+        assert_eq!(look(&mut book, &mut s, &three, 100_000), vec!["B2C".to_string()]);
+        assert_eq!(to(&book, &three), ["t3"], "only the newcomer");
+        let text = compose("B2C", &three[2], &three);
+        assert!(text.contains("(t1)") && text.contains("(t2)") && text.starts_with("[tower] You are s t3 (t3)"), "{text}");
+        let reached: Vec<Member> = book.recipients("B2C", &three).into_iter().cloned().collect();
+        book.introduced_to("B2C", &three, &reached, 100_000);
+        assert!(to(&book, &three).is_empty());
+        assert_eq!(book.spaces["B2C"].sent_to, ["t3"]);
+        // A new terminal at an old address is a new session: it gets one.
+        let reused = [three[0].clone(), three[1].clone(), Member { created_ms: Some(999), ..m("t3", "B2C") }];
+        assert_eq!(to(&book, &reused), ["t3"]);
+        // The same terminal moved to another space gets that space's.
+        assert_eq!(book.recipients("Support", &[m("t1", "Support")]).len(), 1);
+    }
+
+    #[test]
+    fn who_was_introduced_survives_a_restart_and_an_older_book_counts_those_it_sent_to() {
+        let mut book = seeded();
+        let two = [m("t1", "B2C"), m("t2", "B2C")];
+        book.sent("B2C", &two, 7);
+        let path = std::env::temp_dir().join(format!("tower-introduced-{}.json", std::process::id()));
+        book.save_to(&path).unwrap();
+        let back = Book::load_from(&path);
+        assert_eq!(back, book);
+        assert!(to(&back, &two).is_empty());
+        // A book from before `introduced`: those it sent to have had one; one it only recorded has not.
+        let old = serde_json::json!({
+            "seeded": true,
+            "spaces": {
+                "B2C": { "members": ["t1@100", "t2@100", "t3@100"], "sent_ms": 5, "sent_to": ["t1", "t2"] },
+                "Support": { "members": ["t8@100", "t9@100"], "sent_ms": 0, "sent_to": [] }
+            }
+        });
+        std::fs::write(&path, old.to_string()).unwrap();
+        let migrated = Book::load_from(&path);
+        let three = [two.to_vec(), vec![m("t3", "B2C")]].concat();
+        assert_eq!(to(&migrated, &three), ["t3"]);
+        assert_eq!(migrated.recipients("Support", &[m("t8", "Support"), m("t9", "Support")]).len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_introduction_is_forgotten_an_hour_after_its_terminal_went() {
+        let mut book = seeded();
+        let two = [m("t1", "B2C"), m("t2", "B2C")];
+        book.sent("B2C", &two, 0);
+        let only_t1: BTreeSet<String> = [two[0].key()].into();
+        assert!(book.keep_introduced(&only_t1, 1_000));
+        assert!(!book.keep_introduced(&only_t1, 1_000 + INTRODUCED_KEEP_MS), "an hour: kept, and nothing to save");
+        assert!(book.introduced.contains_key(&two[1].key()));
+        assert!(book.keep_introduced(&only_t1, 2_000 + INTRODUCED_KEEP_MS));
+        assert!(!book.introduced.contains_key(&two[1].key()) && book.introduced.contains_key(&two[0].key()));
+    }
+
+    #[test]
+    fn working_on_is_what_the_user_asked_never_a_message_between_sessions() {
+        assert_eq!(users_task("Fix the login bug in the api").as_deref(), Some("Fix the login bug in the api"));
+        assert_eq!(users_task("<pasted_content id=\"1\">merge it and rebuild and restart the tower</pasted_content>").as_deref(), Some("merge it and rebuild and restart the tower"));
+        assert_eq!(users_task("From M5 Pro › m5pro herder tower (t7p): Heads-up, for your merge"), None);
+        assert_eq!(users_task("From t7h: both corrections are on the page"), None);
+        assert_eq!(users_task("<hc from=\"t7p\">From t7p (Mac tower). Installed now</hc>"), None);
+        assert_eq!(users_task("<task-notification> <summary>done</summary>"), None);
+        assert_eq!(users_task(&compose("B2C", &m("t1", "B2C"), &[m("t1", "B2C"), m("t2", "B2C")])), None);
+        // A message an older tower kept as a session's task is dropped; the user's stays.
+        let mut book = seeded();
+        let (a, b) = (m("t1", "B2C"), m("t2", "B2C"));
+        book.tasks.insert(a.key(), "From M5 Pro › m5pro herder tower (t7p): Retry with 0.43".into());
+        book.tasks.insert(b.key(), "commit everything and push. then give me the release".into());
+        let mut g = groups(&[a.clone(), b.clone()]);
+        assert!(book.tasks_for(&mut g, |_| None));
+        assert_eq!(g["B2C"][0].task, "", "no task reported yet, rather than another session's message");
+        assert_eq!(g["B2C"][1].task, "commit everything and push. then give me the release");
+        assert!(!book.tasks.contains_key(&a.key()));
+        assert!(compose("B2C", &b, &g["B2C"]).contains("(t1), in /w/t1: no task reported yet"));
     }
 
     #[test]
