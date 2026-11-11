@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 use gpui::{AnyElement, App, Context, FontWeight, SharedString, Window, div, prelude::*, px, rgb, rgba};
 use gpui_kit::component::{h_flex, v_flex};
 
-use super::home::{LINE, SOFT, bay_label, cstat, mbtn, sign, tg};
+use super::home::{LINE, SOFT, bay_label, cstat, dismiss_mark, mbtn, sign, tg};
 use super::{CYAN, Panel, cli, glass, launch, record, space};
 use crate::history;
 use crate::orb::model::{self, Decision, Missions};
@@ -683,7 +683,13 @@ impl Panel {
                     .px(px(8.0))
                     .gap(px(3.0))
                     .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _: &gpui::MouseDownEvent, window, _| this.drag_start(window)))
-                    .child(div().text_size(px(19.0)).line_height(px(23.0)).font_weight(FontWeight::SEMIBOLD).child("Tower"))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .child(div().flex_1().text_size(px(19.0)).line_height(px(23.0)).font_weight(FontWeight::SEMIBOLD).child("Tower"))
+                            // Closes the full window (as Esc, or a click on the orb, does).
+                            .child(dismiss_mark("close-full").on_click(cx.listener(|this, _, window, cx| this.close(window, cx)))),
+                    )
                     .child(div().text_size(px(12.5)).text_color(g.muted).child(status)),
             )
             .child(div().id("side-list").flex_1().min_h_0().overflow_y_scroll().child(list))

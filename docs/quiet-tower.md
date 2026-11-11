@@ -1139,13 +1139,18 @@ where the full window is, `panel/` the views).
   spaces as chips with their state, the main tower's last reply, the input.
   Hovering the orb peeks at it and a click pins it. It replaces the chat as
   the panel's home.
-- **Full window** (about 960 × 640; W1 to W20), opened from the floating
-  panel. It is moved by its header strip (the view's title and what is
-  beside it) or by the sidebar's top ("Tower" and the status line): press
-  and drag, as the orb is dragged. Where it is dropped is kept in
-  `window.json` (the state folder, beside `orb.json`), moved wholly onto
-  the screen its middle is on (`nav::keep_on`), and it opens there next
-  time (beside the floating panel until it was ever moved). It has a
+- **Full window** (960 × 640 at first; W1 to W20), opened from the floating
+  panel in its place: the panel closes (after the click is handled: a
+  window can't be closed from inside its own update). It is moved by its
+  top, the header strip or the sidebar's top ("Tower" and the status
+  line): a press becomes a native macOS move once the pointer travels a
+  few points, so a click on a header button stays a click. It resizes by
+  its edges, never under 820 × 520 nor over the screen. Where it is and its
+  size are kept in `window.json` (the state folder, beside `orb.json`),
+  moved wholly onto a screen (`nav::keep_on`), and it opens there next
+  time (in the floating panel's place until it was ever moved). While it
+  is open the orb doesn't peek, and a click on the orb closes it, as Esc
+  and the × beside "Tower" do. It has a
   sidebar (All spaces, each open space, New space, the quiet fold,
   Record, Shots, Settings) and a main pane:
   - All spaces: the queue and the missions list.

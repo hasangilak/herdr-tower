@@ -704,10 +704,12 @@ impl Orb {
     }
 
     /// A click: pins a peek, closes a pinned panel, else opens it pinned.
-    /// While the full window is open, it brings that forward instead.
+    /// While the full window is open, it closes that (the orb opens and
+    /// closes whichever of the two is up).
     fn toggle_panel(&mut self, cx: &mut Context<Self>) {
         if full_open(&self.tower, cx) {
-            open_full(&self.tower, None, None, None, true, true, cx);
+            close_full(&self.tower, cx);
+            mac::give_back_focus();
             return;
         }
         if self.peeking(cx) {

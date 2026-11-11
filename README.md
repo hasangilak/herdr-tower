@@ -159,7 +159,7 @@ you and nothing else:
 - **The status line**: how many decisions are yours, in amber, and how many
   spaces have a session at work; under it, faintly, what the tower last
   heard or said. **Mute** is the tower-wide mute; **Full window** opens the
-  window below, or closes it.
+  window below in this panel's place: the panel closes.
 - **The queue**: one card open, tagged **Next**, the rest as rows under "N
   more waiting"; a click on a row opens it instead (**Picked**). A card says
   its space, why it is yours, how many sessions wait and for how long, and
@@ -213,11 +213,13 @@ keyboard's digits too).
 
 ### The full window
 
-"Full window" opens the tower's window, about 960 × 640, the same glass.
-Drag it by its header strip or by the top of its sidebar; it stays on the
-screen, and opens where you left it.
-Both windows show one model: a card answered or picked in one is so in the
-other. A sidebar on the left: **All spaces** with the count of what is
+"Full window" opens the tower's window in the floating panel's place (the
+panel closes), about 960 × 640 at first, the same glass. Move it by its top
+(the header strip, or "Tower" at the top of its sidebar) and resize it by
+its edges, down to 820 × 520; it opens where you left it, at that size.
+While it is open the orb doesn't peek: a click on the orb closes the full
+window, as do Esc and the × beside "Tower". Both windows show one model: a
+card answered or picked in one is so in the other. A sidebar on the left: **All spaces** with the count of what is
 yours, each open space with its mark and a line (its sessions, "standing",
 "ready to close"), **New space**, the quiet spaces and what closed today
 folded into one line, and **Record**, **Shots** and **Settings** at the
