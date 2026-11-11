@@ -102,6 +102,8 @@ pub(super) struct FullUi {
     /// sidebar, the conversation's column and the pane's padding): views lay
     /// out to it (two columns, or one).
     pub pane_w: f32,
+    /// How wide the conversation's column is (0: none in this view).
+    pub talk_w: f32,
     /// The conversation column: its scroll, and what it last showed (its
     /// view, how many messages, the latest's time), to go to its end on a new one.
     pub chat_scroll: gpui::ScrollHandle,
@@ -136,6 +138,7 @@ impl FullUi {
             to_phone: None,
             thread_open: HashSet::new(),
             pane_w: 900.0,
+            talk_w: 0.0,
             chat_scroll: gpui::ScrollHandle::new(),
             chat_seen: None,
             text_w: 600.0,
@@ -317,6 +320,7 @@ impl Panel {
         }
         match &self.tower.read(cx).nav.scope {
             // The conversation column's head says which tower it is; its input is narrow.
+            Scope::Space(_) if self.full.as_ref().is_some_and(|f| f.talk_w < 360.0) => "Write here…".into(),
             Scope::Space(_) => "Write to the tower…".into(),
             Scope::Behaviors => "Tell the tower what to change…".into(),
             _ => "Tell the tower…".into(),
@@ -512,6 +516,7 @@ impl Panel {
         let pane_w = f32::from(window.viewport_size().width) - SIDE_W - talk_w.unwrap_or(0.0) - 36.0;
         if let Some(f) = self.full.as_mut() {
             f.pane_w = pane_w;
+            f.talk_w = talk_w.unwrap_or(0.0);
             // What a thread message's text gets across: the pane, less the row's padding and its colour bar.
             f.text_w = pane_w - 24.0 - 13.0 - 2.0;
         }
