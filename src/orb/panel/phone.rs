@@ -3,7 +3,8 @@
 //!
 //! - **Where the tower is reachable now**: "This Mac is on Office ·
 //!   10.10.30.116" (a network is told by its address range; "Name this
-//!   network" names it in place, `[lan.networks]` in config.toml), and
+//!   network" names it in place, `[lan.networks]` in config.toml), with "·
+//!   found by name on this network" while Bonjour advertises it there, and
 //!   Tailscale in a line: running (reachable anywhere on the tailnet),
 //!   stopped (this network only; "Open Tailscale"), or not installed.
 //! - **Pair a phone**, inline: the QR, the 8-digit code to type instead,
@@ -171,6 +172,12 @@ pub(super) fn paired_line(outcome: &Outcome, network: Option<&str>) -> Option<St
 pub(super) fn where_line(st: &Status) -> Option<(String, Option<String>)> {
     let net = st.here.label()?;
     Some((net, st.here.lan.as_ref().map(|(h, _)| h.clone())))
+}
+
+/// After the address, while Bonjour advertises the tower there: a paired
+/// phone finds it on this network without pairing again.
+pub(super) fn found_phrase(st: &Status) -> Option<&'static str> {
+    st.bonjour.as_ref().map(|_| "found by name on this network")
 }
 
 /// What Tailscale means for the phone, in a line, with the dot's colour and
@@ -577,7 +584,8 @@ impl Panel {
                     .line_height(px(19.0))
                     .child(div().flex_none().text_color(g.muted).child("This Mac is on"))
                     .child(div().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD).child(net))
-                    .children(host.map(|h| div().flex_none().text_color(g.muted).child(format!("· {h}")))),
+                    .children(host.map(|h| div().flex_none().text_color(g.muted).child(format!("· {h}"))))
+                    .children(found_phrase(st).map(|p| div().flex_none().text_color(g.muted).child(format!("· {p}")))),
             )
             .child(
                 div()
@@ -1037,6 +1045,10 @@ mod tests {
         assert_eq!(where_line(&st(Tailscale::default())), Some(("the network 10.10.30.x".to_string(), Some("10.10.30.116".to_string()))));
         let named = Status { here: network::Here { name: Some("Office".into()), ..here.clone() }, ..st(Tailscale::default()) };
         assert_eq!(where_line(&named).unwrap().0, "Office");
+        // Advertised by Bonjour: said after the address; not advertised: nothing.
+        assert_eq!(found_phrase(&st(Tailscale::default())), None);
+        let found = Status { bonjour: Some("Hassan’s MacBook Pro".into()), ..st(Tailscale::default()) };
+        assert_eq!(found_phrase(&found), Some("found by name on this network"));
         // Running: anywhere on the tailnet, by its name.
         let (dot, line, open) = tailscale_line(&st(ts(true, true, true, "auto", "running")), true);
         assert_eq!((dot, line.as_str(), open), (CYAN, "Tailscale: reachable anywhere on your tailnet as mac.ts.net.", false));

@@ -6,9 +6,12 @@
 //! this Mac's private LAN address, and on its Tailscale address too while
 //! Tailscale runs (`[lan] tailscale = "auto"`, see `tailscale`); never on
 //! every interface. Every call but pairing needs a paired device's token.
+//! While the LAN listener runs, Bonjour finds it by name on that network
+//! (`[lan] bonjour`, see `bonjour`).
 
 pub mod audio;
 pub mod auth;
+pub mod bonjour;
 pub mod http;
 pub mod hub;
 pub mod multipart;
@@ -47,7 +50,9 @@ pub const API: u32 = 1;
 /// calls, a request's `space`, and the events that go with them.
 /// `pairing`: pairing again in place (`install_id`), the networks a phone
 /// knows, `hosts` on the stream (`hello`, the `hosts` event) and `GET /v1/network`.
-pub const FEATURES: &[&str] = &["quiet", "acts", "pairing"];
+/// `bonjour`: found by name on the local network (`_herdr-tower._tcp`, the
+/// fingerprint in its TXT), and `bonjour` where `hosts` is.
+pub const FEATURES: &[&str] = &["quiet", "acts", "pairing", "bonjour"];
 const MAX_CONNECTIONS: usize = 32;
 /// Connections open at once from one address.
 const MAX_PER_IP: usize = 8;
@@ -110,6 +115,16 @@ struct Running {
     tailscale: tailscale::Tailscale,
     /// Why the tailnet address isn't listened on though Tailscale runs (a bind that failed).
     tailscale_error: Option<String>,
+    /// The LAN listener as Bonjour advertises it, while it does (dropped: withdrawn).
+    bonjour: Option<Advertised>,
+    /// Why it isn't advertised though it should be (the last failure, said once).
+    bonjour_error: Option<String>,
+}
+
+/// A Bonjour advert and what it says.
+struct Advertised {
+    ad: bonjour::Ad,
+    advert: bonjour::Advert,
 }
 
 impl Running {
@@ -127,6 +142,13 @@ pub type Detect = Arc<dyn Fn() -> tailscale::Tailscale + Send + Sync>;
 
 /// How it asks this Mac's address on the network it is on now (`lan_ip`; tests give their own).
 pub type LanDetect = Arc<dyn Fn() -> Option<IpAddr> + Send + Sync>;
+
+/// How it advertises the LAN listener by Bonjour (`bonjour::Advert::start`; tests give their own).
+pub type Advertise = Arc<dyn Fn(&bonjour::Ad) -> Result<bonjour::Advert> + Send + Sync>;
+
+/// Which interface of this Mac holds an address, to advertise there
+/// (`bonjour::advert_interface`; tests give their own).
+pub type InterfaceOf = Arc<dyn Fn(IpAddr) -> Option<bonjour::Interface> + Send + Sync>;
 
 /// Tailscale is looked at again this often while the API is on: it starts
 /// (or stops) listening on the tailnet as Tailscale comes and goes.
@@ -162,6 +184,12 @@ pub struct Lan {
     names: Arc<Mutex<std::collections::BTreeMap<String, String>>>,
     /// The `hosts` event as last sent to the streams (sent again only when it changes).
     sent_hosts: Arc<Mutex<Option<Value>>>,
+    /// How the LAN listener is put on Bonjour (none in tests unless they give one).
+    advertise: Option<Advertise>,
+    /// The interface that holds the LAN listener's address, for the advert.
+    interface_of: InterfaceOf,
+    /// mDNSResponder answered (the name taken, a rename): the state and the phones are told within 250 ms.
+    bonjour_news: Arc<AtomicBool>,
 }
 
 /// Which listener an address of this Mac is: the one listening there, else
@@ -458,6 +486,16 @@ fn hosts_value(listeners: &[(Kind, SocketAddr)], ts: &tailscale::Tailscale) -> V
         .collect()
 }
 
+/// `bonjour` in `GET /v1/network`, the `hosts` event and `hello`: how the
+/// phone finds this tower by Bonjour (the type to browse, the name it is
+/// registered under, the TXT's `fp`), or null while it isn't advertised.
+fn bonjour_value(r: &Running) -> Value {
+    match r.bonjour.as_ref().and_then(|b| Some((b.advert.name()?, &b.ad.fp))) {
+        Some((name, fp)) => json!({ "type": bonjour::SERVICE, "name": name, "fp": fp }),
+        None => Value::Null,
+    }
+}
+
 /// What the Mac shows to pair a phone, and the link its QR carries: the
 /// first address as `host`/`port` (what older apps read), every address in
 /// order as `hosts`, and the MagicDNS name while the tailnet is listened on.
@@ -498,6 +536,12 @@ impl Lan {
     }
 
     pub fn with_paths(ctx: Ctx, devices_path: std::path::PathBuf, identity_dir: std::path::PathBuf) -> Lan {
+        let bonjour_news = Arc::new(AtomicBool::new(false));
+        let news = bonjour_news.clone();
+        let advertise: Advertise = Arc::new(move |ad: &bonjour::Ad| {
+            let news = news.clone();
+            bonjour::Advert::start(ad.port, &ad.interface, &ad.name, &ad.txt()?, move || news.store(true, Ordering::SeqCst))
+        });
         Lan {
             devices: Arc::new(auth::Store::new(devices_path)),
             identity_dir,
@@ -514,7 +558,23 @@ impl Lan {
             lan_detect: Arc::new(lan_ip),
             names: Arc::default(),
             sent_hosts: Arc::default(),
+            // Tests never advertise on this Mac's network unless they say so (`with_advertiser`).
+            advertise: (!cfg!(test)).then_some(advertise),
+            interface_of: Arc::new(bonjour::advert_interface),
+            bonjour_news,
         }
+    }
+
+    /// Another way to advertise by Bonjour, and to find an address's interface (tests).
+    #[cfg(test)]
+    pub fn with_advertiser(
+        mut self,
+        advertise: impl Fn(&bonjour::Ad) -> Result<bonjour::Advert> + Send + Sync + 'static,
+        interface_of: impl Fn(IpAddr) -> Option<bonjour::Interface> + Send + Sync + 'static,
+    ) -> Lan {
+        self.advertise = Some(Arc::new(advertise));
+        self.interface_of = Arc::new(interface_of);
+        self
     }
 
     /// Another way to ask this Mac's address on the network (tests: a network change).
@@ -601,7 +661,18 @@ impl Lan {
             }
         }
         let fingerprint = identity.fingerprint();
-        *running = Some(Running { listeners, stop: stop.clone(), fingerprint: fingerprint.clone(), tls, cfg: cfg.clone(), tailscale: ts, tailscale_error });
+        *running = Some(Running {
+            listeners,
+            stop: stop.clone(),
+            fingerprint: fingerprint.clone(),
+            tls,
+            cfg: cfg.clone(),
+            tailscale: ts,
+            tailscale_error,
+            bonjour: None,
+            bonjour_error: None,
+        });
+        self.sync_bonjour(running.as_mut().expect("just set"));
         let r = running.as_ref().expect("just set");
         let addrs: Vec<String> = r.listeners.iter().map(|l| format!("https://{} ({})", l.addr, l.kind.word())).collect();
         let primary = r.primary();
@@ -620,6 +691,10 @@ impl Lan {
                     let until = Instant::now() + TAILSCALE_RECHECK;
                     while Instant::now() < until && !stop.load(Ordering::SeqCst) {
                         thread::sleep(Duration::from_millis(250));
+                        // Bonjour took a name (or another, on a clash): said now, not in 20 s.
+                        if me.bonjour_news.swap(false, Ordering::SeqCst) {
+                            me.refresh();
+                        }
                     }
                     if stop.load(Ordering::SeqCst) {
                         break;
@@ -627,6 +702,8 @@ impl Lan {
                     if auto_bind {
                         me.recheck_lan(&stop);
                     }
+                    // The advert follows the LAN listener's address and its interface (Wi-Fi off and on).
+                    me.recheck_bonjour(&stop);
                     if tailnet {
                         me.recheck_tailscale(&stop);
                     }
@@ -760,6 +837,7 @@ impl Lan {
             "network": self.here(r).view(),
             "magic_dns": r.tailscale.dns_name.clone().filter(|_| on_tailnet),
             "tailscale": r.tailscale.view(),
+            "bonjour": bonjour_value(r),
         })
     }
 
@@ -768,7 +846,7 @@ impl Lan {
         let r = self.running.lock().unwrap_or_else(|e| e.into_inner());
         match r.as_ref() {
             Some(r) => self.network_value(r),
-            None => json!({ "hosts": [], "network": null, "magic_dns": null, "tailscale": null }),
+            None => json!({ "hosts": [], "network": null, "magic_dns": null, "tailscale": null, "bonjour": null }),
         }
     }
 
@@ -840,7 +918,79 @@ impl Lan {
                 Err(e) => eprintln!("[phone] can't listen on the new network yet: {e:#}"),
             }
         }
+        // Bonjour moves with it: withdrawn from the old network, advertised on the new one.
+        self.sync_bonjour(r);
         self.publish(r);
+    }
+
+    /// The Bonjour advert again, as the LAN listener is now: advertised on
+    /// the interface that holds its address, again when that changed (the
+    /// Mac moved, Wi-Fi came back) or mDNSResponder dropped it, withdrawn
+    /// when no interface holds it (Wi-Fi off) or there is no LAN listener.
+    fn recheck_bonjour(&self, api_stop: &Arc<AtomicBool>) {
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(r) = running.as_mut() else { return };
+        if !Arc::ptr_eq(&r.stop, api_stop) {
+            return;
+        }
+        if self.sync_bonjour(r) {
+            self.publish(r);
+        }
+    }
+
+    /// What Bonjour should say of the LAN listener now (`None`: nothing:
+    /// `[lan] bonjour = false`, no LAN listener, or no interface holds its address).
+    fn bonjour_ad(&self, r: &Running) -> Option<bonjour::Ad> {
+        self.advertise.as_ref()?;
+        if !r.cfg.bonjour {
+            return None;
+        }
+        let lan = r.of(Kind::Lan)?.addr;
+        let interface = (self.interface_of)(lan.ip())?;
+        let fp = bonjour::fp_hex(&r.fingerprint)?;
+        let asked = Some(r.cfg.bonjour_name.trim()).filter(|n| !n.is_empty()).map(String::from).or_else(bonjour::computer_name);
+        Some(bonjour::Ad { ip: lan.ip(), port: lan.port(), interface, name: bonjour::instance_name(&asked.unwrap_or_default()), fp })
+    }
+
+    /// The advert made to match `bonjour_ad`: kept when it says the same
+    /// (and is alive), else withdrawn and, when one is wanted, made again.
+    /// True when it changed.
+    fn sync_bonjour(&self, r: &mut Running) -> bool {
+        let want = self.bonjour_ad(r);
+        let keep = match (&r.bonjour, &want) {
+            (Some(have), Some(want)) => have.ad == *want && have.advert.failed().is_none(),
+            (None, None) => true,
+            _ => false,
+        };
+        if keep {
+            return false;
+        }
+        // The old one goes first: the same name twice would clash with itself.
+        if let Some(old) = r.bonjour.take() {
+            eprintln!("[phone] Bonjour: no longer advertised on {} ({})", old.ad.interface.name, old.ad.ip);
+            drop(old);
+        }
+        let Some(ad) = want else {
+            r.bonjour_error = None;
+            return true;
+        };
+        let Some(advertise) = &self.advertise else { return true };
+        match advertise(&ad) {
+            Ok(advert) => {
+                let at = SocketAddr::new(ad.ip, ad.port);
+                eprintln!("[phone] Bonjour: advertising {:?} ({}) on {} for {at}", ad.name, bonjour::SERVICE, ad.interface.name);
+                r.bonjour = Some(Advertised { ad, advert });
+                r.bonjour_error = None;
+            }
+            Err(e) => {
+                let why = format!("{e:#}");
+                if r.bonjour_error.as_ref() != Some(&why) {
+                    eprintln!("[phone] Bonjour: not advertised (tried again every 20 s): {why}");
+                }
+                r.bonjour_error = Some(why);
+            }
+        }
+        true
     }
 
     fn recheck_tailscale(&self, api_stop: &Arc<AtomicBool>) {
@@ -891,8 +1041,10 @@ impl Lan {
     }
 
     pub fn stop(&self) {
-        if let Some(r) = self.running.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(mut r) = self.running.lock().unwrap_or_else(|e| e.into_inner()).take() {
             r.stop.store(true, Ordering::SeqCst);
+            // Withdrawn first: no phone finds a tower that is going.
+            drop(r.bonjour.take());
             for l in r.listeners {
                 Self::unlisten(l);
             }
@@ -947,6 +1099,7 @@ impl Lan {
             "network": here.view(),
             "tailscale": tailscale,
             "fingerprint": r.as_ref().map(|r| r.fingerprint.clone()),
+            "bonjour": r.as_ref().map(bonjour_value).unwrap_or(Value::Null),
             "devices": devices.devices.iter().map(|d| {
                 let via: Vec<&str> = connected.iter().filter(|(id, _)| *id == d.id).map(|(_, v)| v.as_str()).collect();
                 json!({
@@ -1101,6 +1254,7 @@ impl Lan {
                     "phone_is_voice": self.ctx.hub.voice(),
                     "audio_route": device.audio_route,
                     "features": FEATURES,
+                    "bonjour": self.network_now()["bonjour"],
                 }),
             ),
             ("GET", ["state"]) => Response::json(200, &self.state(&device)),
@@ -1549,6 +1703,7 @@ impl Lan {
                     &json!({
                         "token": token, "device": { "id": device.id, "name": device.name }, "fingerprint": fp, "api": API, "features": FEATURES,
                         "repaired": repaired, "hosts": net["hosts"], "network": net["network"], "magic_dns": net["magic_dns"],
+                        "bonjour": net["bonjour"],
                     }),
                 )
             }
@@ -1805,7 +1960,7 @@ impl Lan {
         let net = self.network_now();
         let hello = json!({
             "api": API, "device": device.id, "voice": voice, "features": FEATURES,
-            "hosts": net["hosts"], "network": net["network"], "magic_dns": net["magic_dns"],
+            "hosts": net["hosts"], "network": net["network"], "magic_dns": net["magic_dns"], "bonjour": net["bonjour"],
         });
         let mut ok = send(w, "hello", &hello)
             && send(w, "state", &state)
@@ -2288,7 +2443,7 @@ mod tests {
         for ip in ["8.8.8.8", "172.32.0.1", "100.128.0.1", "2001:db8::1"] {
             assert!(!is_private(ip.parse().unwrap()), "{ip}");
         }
-        let cfg = |bind: &str, allow_public| crate::config::Lan { enabled: true, port: 7843, bind: bind.into(), allow_public, tailscale: "off".into(), networks: Default::default() };
+        let cfg = |bind: &str, allow_public| crate::config::Lan { enabled: true, port: 7843, bind: bind.into(), allow_public, tailscale: "off".into(), ..Default::default() };
         assert!(choose_ip(&cfg("8.8.8.8", false)).is_err(), "a public address needs allow_public");
         assert!(choose_ip(&cfg("0.0.0.0", false)).is_err(), "every interface needs allow_public");
         assert!(choose_ip(&cfg("nonsense", false)).is_err());
@@ -2417,7 +2572,7 @@ mod tests {
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
         let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs: test_prs() };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
-        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into(), networks: Default::default() }).unwrap();
+        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into(), ..Default::default() }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
 
         // Nothing without a token.
@@ -2522,7 +2677,7 @@ mod tests {
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
         let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub: hub.clone(), stt, asks, prs: test_prs() };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
-        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into(), networks: Default::default() }).unwrap();
+        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into(), ..Default::default() }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
         let code = lan.pair().unwrap()["code"].as_str().unwrap().to_string();
         let token =
@@ -2881,7 +3036,7 @@ mod tests {
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
         let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
-        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into(), networks: Default::default() }).unwrap();
+        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into(), ..Default::default() }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
         (lan, dir, addr, fp)
     }
@@ -2898,7 +3053,7 @@ mod tests {
     }
 
     fn lan_cfg(bind: &str, tailscale: &str) -> crate::config::Lan {
-        crate::config::Lan { enabled: true, port: 7843, bind: bind.into(), allow_public: false, tailscale: tailscale.into(), networks: Default::default() }
+        crate::config::Lan { enabled: true, port: 7843, bind: bind.into(), allow_public: false, tailscale: tailscale.into(), ..Default::default() }
     }
 
     #[test]
@@ -3093,6 +3248,126 @@ mod tests {
         let stop = lan.running.lock().unwrap().as_ref().unwrap().stop.clone();
         lan.recheck_lan(&stop);
         assert_eq!(lan.info()["url"], format!("https://{fixed}"));
+        lan.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Bonjour that only notes what it is asked (`+Desk Mac on en0 for 127.0.0.1:port`,
+    /// `-Desk Mac`), on a Mac whose addresses are on `en0` while `wifi` is on.
+    /// At `taken`, another Mac has the name: mDNSResponder registers "<name> (2)".
+    fn fake_bonjour(
+        log: &Arc<Mutex<Vec<String>>>,
+        wifi: &Arc<AtomicBool>,
+        refuse: &Arc<AtomicBool>,
+        taken: Option<IpAddr>,
+    ) -> (
+        impl Fn(&bonjour::Ad) -> Result<bonjour::Advert> + Send + Sync + use<>,
+        impl Fn(IpAddr) -> Option<bonjour::Interface> + Send + Sync + use<>,
+    ) {
+        let (log, wifi, refuse) = (log.clone(), wifi.clone(), refuse.clone());
+        let advertise = move |ad: &bonjour::Ad| {
+            if refuse.load(Ordering::SeqCst) {
+                bail!("mDNSResponder isn't running");
+            }
+            ad.txt()?;
+            log.lock().unwrap().push(format!("+{} on {} for {}", ad.name, ad.interface.name, SocketAddr::new(ad.ip, ad.port)));
+            let name = if Some(ad.ip) == taken { format!("{} (2)", ad.name) } else { ad.name.clone() };
+            let (log, gone) = (log.clone(), name.clone());
+            Ok(bonjour::Advert::fake(&name, move || log.lock().unwrap().push(format!("-{gone}"))))
+        };
+        let interface = move |_: IpAddr| wifi.load(Ordering::SeqCst).then(|| bonjour::Interface { name: "en0".into(), index: 4 });
+        (advertise, interface)
+    }
+
+    #[test]
+    fn bonjour_follows_the_lan_listener_from_home_to_the_office() {
+        let dir = std::env::temp_dir().join(format!("tower-lan-bonjour-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hub = Arc::new(Hub::default());
+        let (stt, rx) = std::sync::mpsc::channel();
+        std::mem::forget(rx);
+        let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
+        let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
+        let phone_hub = hub.clone();
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs: test_prs() };
+        // "Home" and "the office", both over this Mac's Wi-Fi (en0).
+        let (home, office): (IpAddr, IpAddr) = ("127.0.0.1".parse().unwrap(), "::1".parse().unwrap());
+        let now = Arc::new(Mutex::new(Some(home)));
+        let seen = now.clone();
+        let (log, wifi, refuse) = (Arc::new(Mutex::new(vec![])), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
+        let (advertise, interface) = fake_bonjour(&log, &wifi, &refuse, Some(office));
+        let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"))
+            .with_lan_detect(move || *seen.lock().unwrap())
+            .with_advertiser(advertise, interface);
+        let cfg = crate::config::Lan { port: 0, bonjour_name: "Desk Mac".into(), ..lan_cfg("auto", "off") };
+        let addr = lan.start(&cfg).unwrap();
+        let port = addr.port();
+        let stop = lan.running.lock().unwrap().as_ref().unwrap().stop.clone();
+        let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
+        let said = |n: &str| json!({"type": "_herdr-tower._tcp", "name": n, "fp": fp});
+        let took = || std::mem::take(&mut *log.lock().unwrap());
+        // On as the listener starts: on the interface that holds its address, at its port.
+        assert_eq!(took(), [format!("+Desk Mac on en0 for 127.0.0.1:{port}")]);
+        assert_eq!(lan.info()["bonjour"], said("Desk Mac"));
+        assert_eq!(lan.network_now()["bonjour"], said("Desk Mac"));
+        // Nothing changed: it stays as it is (not withdrawn and made again every 20 s).
+        lan.recheck_lan(&stop);
+        lan.recheck_bonjour(&stop);
+        assert_eq!(took(), Vec::<String>::new());
+        // Wi-Fi off: the address is on no interface, so the advert is withdrawn (the listener stays).
+        *now.lock().unwrap() = None;
+        wifi.store(false, Ordering::SeqCst);
+        lan.recheck_lan(&stop);
+        lan.recheck_bonjour(&stop);
+        assert_eq!(took(), ["-Desk Mac"]);
+        assert_eq!(lan.info()["bonjour"], Value::Null);
+        // Back on the same network: advertised again.
+        *now.lock().unwrap() = Some(home);
+        wifi.store(true, Ordering::SeqCst);
+        lan.recheck_lan(&stop);
+        lan.recheck_bonjour(&stop);
+        assert_eq!(took(), [format!("+Desk Mac on en0 for 127.0.0.1:{port}")]);
+        // At the office, with a phone connected: withdrawn at home, then advertised there, and the
+        // phone told the name it is found by (another Mac at the office has "Desk Mac").
+        let (phone, events) = phone_hub.subscribe("d_phone", false, false);
+        *now.lock().unwrap() = Some(office);
+        lan.recheck_lan(&stop);
+        assert_eq!(took(), ["-Desk Mac".to_string(), format!("+Desk Mac on en0 for [::1]:{port}")], "the old one first");
+        let told: Vec<Value> = events.try_iter().filter(|o| o.event == "hosts").map(|o| o.data).collect();
+        assert_eq!(told.len(), 1, "told once: {told:?}");
+        assert_eq!(told[0]["bonjour"], said("Desk Mac (2)"));
+        lan.recheck_bonjour(&stop);
+        assert_eq!(took(), Vec::<String>::new());
+        phone_hub.unsubscribe(phone);
+        // mDNSResponder refuses: not advertised, said once, and tried again on the next beat.
+        wifi.store(false, Ordering::SeqCst);
+        lan.recheck_bonjour(&stop);
+        refuse.store(true, Ordering::SeqCst);
+        wifi.store(true, Ordering::SeqCst);
+        lan.recheck_bonjour(&stop);
+        lan.recheck_bonjour(&stop);
+        assert_eq!(took(), ["-Desk Mac (2)"]);
+        assert_eq!(lan.info()["bonjour"], Value::Null);
+        refuse.store(false, Ordering::SeqCst);
+        lan.recheck_bonjour(&stop);
+        assert_eq!(took(), [format!("+Desk Mac on en0 for [::1]:{port}")]);
+        // Stopped: withdrawn.
+        lan.stop();
+        assert_eq!(took(), ["-Desk Mac (2)"]);
+        assert_eq!(lan.network_now()["bonjour"], Value::Null);
+        // An address set by hand is advertised on its interface too, and never moved.
+        let fixed = lan.start(&crate::config::Lan { bind: "127.0.0.1".into(), ..cfg.clone() }).unwrap();
+        let stop = lan.running.lock().unwrap().as_ref().unwrap().stop.clone();
+        lan.recheck_lan(&stop);
+        lan.recheck_bonjour(&stop);
+        assert_eq!(took(), [format!("+Desk Mac on en0 for {fixed}")]);
+        lan.stop();
+        took();
+        // `[lan] bonjour = false`: never advertised.
+        lan.start(&crate::config::Lan { bonjour: false, ..cfg.clone() }).unwrap();
+        let stop = lan.running.lock().unwrap().as_ref().unwrap().stop.clone();
+        lan.recheck_bonjour(&stop);
+        assert_eq!((took(), &lan.info()["bonjour"]), (vec![], &Value::Null));
         lan.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3436,14 +3711,21 @@ mod tests {
         let (home, office): (IpAddr, IpAddr) = ("127.0.0.1".parse().unwrap(), "::1".parse().unwrap());
         let now = Arc::new(Mutex::new(Some(home)));
         let seen_ip = now.clone();
-        let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan")).with_lan_detect(move || *seen_ip.lock().unwrap());
-        let addr = lan.start(&crate::config::Lan { port: 0, ..lan_cfg("auto", "off") }).unwrap();
+        let (log, wifi, refuse) = (Arc::new(Mutex::new(vec![])), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
+        let (advertise, interface) = fake_bonjour(&log, &wifi, &refuse, None);
+        let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"))
+            .with_lan_detect(move || *seen_ip.lock().unwrap())
+            .with_advertiser(advertise, interface);
+        let addr = lan.start(&crate::config::Lan { port: 0, bonjour_name: "Desk Mac".into(), ..lan_cfg("auto", "off") }).unwrap();
         let stop = lan.running.lock().unwrap().as_ref().unwrap().stop.clone();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
+        let bonjour = json!({"type": "_herdr-tower._tcp", "name": "Desk Mac", "fp": fp});
         lan.set_names(&[("127.0.0", "Home")]);
         assert_eq!(shared.get().network, Some(json!({"range": "127.0.0", "name": "Home", "lan": {"host": "127.0.0.1", "port": addr.port()}})));
         let code = lan.pair().unwrap()["code"].as_str().unwrap().to_string();
-        let token = call(addr, &fp, "POST", "/v1/pair", None, &format!(r#"{{"code":"{code}","name":"OnePlus"}}"#)).unwrap().1["token"].as_str().unwrap().to_string();
+        let paired = call(addr, &fp, "POST", "/v1/pair", None, &format!(r#"{{"code":"{code}","name":"OnePlus"}}"#)).unwrap().1;
+        assert_eq!(paired["bonjour"], bonjour, "how to find the tower by name, from the moment it pairs");
+        let token = paired["token"].as_str().unwrap().to_string();
         let first = lan.devices.load().devices[0].networks[0].last_ms;
 
         // The stream's hello says where the tower is, and connecting is kept as a network the phone knows.
@@ -3454,6 +3736,7 @@ mod tests {
         assert_eq!(hello["hosts"], json!([{"kind": "lan", "host": "127.0.0.1", "port": addr.port()}]));
         assert_eq!(hello["network"]["name"], "Home");
         assert_eq!(hello["magic_dns"], Value::Null);
+        assert_eq!(hello["bonjour"], bonjour);
         let d = &lan.devices.load().devices[0];
         assert_eq!((d.networks.len(), d.networks[0].host.as_str()), (1, "127.0.0.1"));
         assert!(d.networks[0].last_ms >= first);
@@ -3462,7 +3745,8 @@ mod tests {
         assert_eq!(shared.get().phone_hint, None, "the phone knows this network");
         // GET /v1/network: the same, any time.
         let (st, v) = call(addr, &fp, "GET", "/v1/network", Some(&token), "").unwrap();
-        assert_eq!((st, &v["hosts"], &v["network"]), (200, &hello["hosts"], &hello["network"]));
+        assert_eq!((st, &v["hosts"], &v["network"], &v["bonjour"]), (200, &hello["hosts"], &hello["network"], &bonjour));
+        assert_eq!(call(addr, &fp, "GET", "/v1/hello", Some(&token), "").unwrap().1["bonjour"], bonjour);
 
         // The Mac moves to the office: the open stream gets the new address before the phone needs it.
         *now.lock().unwrap() = Some(office);
@@ -3472,6 +3756,9 @@ mod tests {
         let ev = last_event(&seen, "hosts");
         assert_eq!(ev["hosts"], json!([{"kind": "lan", "host": "::1", "port": addr.port()}]));
         assert_eq!(ev["network"], json!({"range": "::1", "name": null, "lan": {"host": "::1", "port": addr.port()}}));
+        assert_eq!(ev["bonjour"], bonjour, "advertised at the office now, by the same name");
+        let advertised = [format!("+Desk Mac on en0 for {addr}"), "-Desk Mac".into(), format!("+Desk Mac on en0 for {moved}")];
+        assert_eq!(*log.lock().unwrap(), advertised);
         // The phone in use knows only home, and Tailscale isn't running: the windows say so, once.
         assert_eq!(shared.get().phone_hint.as_deref(), Some(network::HINT));
         assert_eq!(lan.info()["devices"][0]["reach"], "elsewhere");

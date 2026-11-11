@@ -43,6 +43,8 @@ port = 7843
 bind = "auto"         # this Mac's address on its default-route network, or an IP of this Mac
 allow_public = false  # refuse anything but private/link-local/100.64.0.0/10 (Tailscale) addresses
 tailscale = "auto"    # also listen on this Mac's Tailscale IPv4 while Tailscale runs; "off" not to
+bonjour = true        # be found by name on the local network (`_herdr-tower._tcp`); false not to
+bonjour_name = ""     # the name it is found by; empty: this Mac's name (Sharing's Computer Name)
 
 [lan.networks]        # names for the networks this Mac is on, by range (`tower phone network name`, Settings > Phone)
 "10.10.30" = "Office"
@@ -147,7 +149,9 @@ So:
    with a letter or digit.
 
 What's left, honestly: anyone on the same network can see that a TLS server
-runs on the port, and could try codes during the 5 minutes a code is open
+runs on the port (and, by Bonjour, that it is this Mac's tower, its name and
+its certificate's fingerprint, which every TLS handshake shows anyway; a fake
+advert gets a phone nowhere, as the phone connects only with the pin), and could try codes during the 5 minutes a code is open
 (5 tries from an address, 30 in all: at worst 1 in 3 million), or use up
 the 30 from several addresses so the code has to be made again. A phone that is stolen while paired holds a valid
 token until you revoke it (`tower phone revoke`). The certificate's private
@@ -230,9 +234,10 @@ the same tokens, the same limits (the tailnet's address counts as private).
 
    ```json
    200 {"token": "htk_…", "device": {"id": "d_3fa9c2e1", "name": "Pixel 9"}, "fingerprint": "<hex>", "api": 1,
-        "features": ["quiet", "acts", "pairing"], "repaired": false,
+        "features": ["quiet", "acts", "pairing", "bonjour"], "repaired": false,
         "hosts": [{"kind": "lan", "host": "10.10.30.116", "port": 7843}],
-        "network": {"range": "10.10.30", "name": "Office", "lan": {"host": "10.10.30.116", "port": 7843}}, "magic_dns": null}
+        "network": {"range": "10.10.30", "name": "Office", "lan": {"host": "10.10.30.116", "port": 7843}}, "magic_dns": null,
+        "bonjour": {"type": "_herdr-tower._tcp", "name": "Hassan’s MacBook Pro", "fp": "<hex>"}}
    400 {"error": {"code": "bad_install_id", "message": "…"}}
    403 {"error": {"code": "pairing_closed", "message": "…"}}
    403 {"error": {"code": "wrong_code", "message": "…", "tries_left": 4}}
@@ -247,7 +252,7 @@ the same tokens, the same limits (the tailnet's address counts as private).
    close), and `"repaired": true`. Otherwise it is a new device
    (`"repaired": false`). Without `install_id` (an older app) it is always
    a new device, as before. The answer also says where the tower is now
-   (`hosts`, `network`, `magic_dns`, as `GET /v1/network`): store them.
+   (`hosts`, `network`, `magic_dns`, `bonjour`, as `GET /v1/network`): store them.
 
 4. The app stores every address (`hosts`, else `host`/`port`), the
    MagicDNS name, the fingerprint and the token, and from then on sends the
@@ -262,10 +267,10 @@ the same tokens, the same limits (the tailnet's address counts as private).
 
 ## Pairing on more than one network
 
-A phone knows only the addresses it was given. Paired at home
-(192.168.2.211), it can't find the Mac at the office (10.10.30.116), even
-on the office Wi-Fi, unless both run Tailscale. What the tower does about
-it:
+A phone knows only the addresses it was given. Paired at the office
+(10.10.30.116), it can't reach the Mac at home (192.168.2.211), even on
+the home Wi-Fi, by the addresses it knows, unless both run Tailscale.
+What the tower does about it:
 
 - The LAN listener follows this Mac's network (within 20 s), and every open
   event stream gets the new addresses at once (the `hosts` event): a phone
@@ -290,6 +295,10 @@ it:
   under their status: "Phone: pair again on this network" (`phone_hint` in
   the state), which opens Settings at the Phone card. Never spoken, never a
   decision; gone once a phone pairs or connects here, or Tailscale runs.
+- While the LAN listener runs, the Mac is **found by name** on that
+  network (Bonjour), so a paired phone that knows none of the addresses
+  there can still find it, without pairing again: see "Finding the Mac by
+  Bonjour" below.
 
 **What the Android app must do** (with `pairing` in `features`; an older
 tower ignores `install_id` and sends no `hosts` event, and all of this
@@ -323,7 +332,79 @@ still works there as far as it can):
    both." with a button that opens the scanner (and keep the stored
    pairing: back on a known network, it connects again). A `401
    unauthorized` is another thing: this phone's token was revoked or
-   replaced, pair again.
+   replaced, pair again. Before saying it, look for the Mac by Bonjour
+   (below): only when that finds nothing either is it said.
+
+### Finding the Mac by Bonjour
+
+With `bonjour` in `features`, the Mac advertises the phone API by DNS-SD
+(Bonjour, multicast DNS) while its LAN listener runs:
+
+- **Service type** `_herdr-tower._tcp`, domain `local.`; the **port** is
+  the API's (the SRV record's); the **host** is this Mac's
+  (`<LocalHostName>.local.`), resolved to its addresses on that network.
+- **Instance name**: the Mac's name (Sharing's Computer Name, "Hassan’s
+  MacBook Pro"), or `[lan] bonjour_name`; at most 63 bytes. When another
+  device on the network has that name, mDNSResponder registers another
+  ("Hassan’s MacBook Pro (2)"): never match on the name.
+- **TXT record**, in this order: `v=1` (the TXT's version), `fp=<the
+  certificate's SHA-256, 64 lowercase hex digits, no colons>` (the
+  pairing's `fingerprint`, which the QR's `fp` and `hello` carry), and
+  `name=<the instance name asked for>` (for people: what the app may show,
+  "Found Hassan’s MacBook Pro"). Each string is at most 255 bytes.
+- Only on the interface that holds the LAN listener's address (Wi-Fi,
+  Ethernet), never over the tailnet or a loopback address. When the
+  listener moves (another network) it is withdrawn there and advertised on
+  the new one; with Wi-Fi off it is withdrawn, and advertised again when
+  the address is back (within 20 s each time). `[lan] bonjour = false`
+  turns it off; so does the API going off.
+
+`GET /v1/network`, the `hosts` event, the stream's `hello`, `GET
+/v1/hello` and `POST /v1/pair`'s answer say what is advertised now:
+
+```json
+"bonjour": {"type": "_herdr-tower._tcp", "name": "Hassan’s MacBook Pro", "fp": "<64 hex chars>"}
+```
+
+or `"bonjour": null` while it isn't (Wi-Fi off, `[lan] bonjour = false`,
+the Mac's mDNSResponder refused it).
+
+**What the Android app does** (NsdManager):
+
+1. **When**: no stored address answered (each with the short connect
+   timeout, as above), and the phone is on Wi-Fi or Ethernet (not mobile
+   data alone). Browse for `_herdr-tower._tcp` (`discoverServices(
+   "_herdr-tower._tcp", NsdManager.PROTOCOL_DNS_SD, …)`) for up to 5 s,
+   and stop browsing once a match connects (or the 5 s are up). Also
+   browse when the user taps "Try again" on the "Can't reach the tower"
+   message. Browsing doesn't need `bonjour` in `features` (an older tower
+   just isn't found); a tower that lists it advertises while its LAN
+   listener runs.
+2. **Match by `fp`**: resolve each service found and read its TXT
+   (`NsdServiceInfo.getAttributes()`). Take only one whose `v` is `1` and
+   whose `fp`, lowercased with any `:` removed, equals the fingerprint
+   stored for this tower at pairing. Ignore the others: the name and the
+   TXT are not checked by anyone, and anyone can advertise them. Several
+   towers on one network are told apart the same way.
+3. **IPv4 first**: the API listens on one LAN address, the Mac's IPv4 one
+   (unless `[lan] bind` names another), while the host resolves to its
+   IPv6 addresses too. Of the resolved addresses (`getHostAddresses()` on Android 14, else
+   `getHost()`), connect to an IPv4 one, at the resolved port; an IPv6
+   one only when it is the only one there is. The Mac's host name
+   (`.local.`) needs no lookup of its own: use the address NsdManager
+   gives.
+4. **The pin and the token are the same**: connect exactly as to a stored
+   address, pinning the certificate's SHA-256 stored at pairing and
+   sending the stored token. A certificate that doesn't match is the end
+   of it (someone else, or another Mac with a copied TXT): never pair
+   there, and never send the token to a certificate that isn't the pin. A `401` is a revoked token, as
+   anywhere.
+5. **Keep it**: once connected, merge the address (`kind: "lan"`, the
+   host and port it connected to) into the stored addresses as any other,
+   and take `hosts`, `network` and `bonjour` from the stream's `hello`. On
+   the next try that address is among the stored ones (the latest-used
+   first), so Bonjour is needed only on a network the phone hasn't been
+   on with this Mac.
 
 ## Conventions
 
@@ -354,9 +435,9 @@ still works there as far as it can):
 
 | Call | Returns |
 |---|---|
-| `GET /v1/hello` | `{"api":1,"tower":"0.1.0","device":{"id","name"},"voice":"af_bella","phone_is_voice":bool,"audio_route":"phone"\|"mac","features":["quiet","acts","pairing"]}`. Use it to check a stored token, and to see what this tower has (`features`: see "Versioning"). |
+| `GET /v1/hello` | `{"api":1,"tower":"0.1.0","device":{"id","name"},"voice":"af_bella","phone_is_voice":bool,"audio_route":"phone"\|"mac","features":["quiet","acts","pairing","bonjour"],"bonjour":{…}\|null}` (`bonjour` as `GET /v1/network`). Use it to check a stored token, and to see what this tower has (`features`: see "Versioning"). |
 | `GET /v1/state` | The daemon's state (below). Also pushed on the event stream. |
-| `GET /v1/network` | `{"hosts": [Host], "network": {"range", "name", "lan": {"host", "port"} \| null} \| null, "magic_dns": string \| null, "tailscale": {…}}`: where the tower can be reached now (every address as the pairing lists them, the network, the MagicDNS name while the tailnet is listened on, Tailscale as in the state). The same as the `hosts` event. |
+| `GET /v1/network` | `{"hosts": [Host], "network": {"range", "name", "lan": {"host", "port"} \| null} \| null, "magic_dns": string \| null, "tailscale": {…}, "bonjour": {"type", "name", "fp"} \| null}`: where the tower can be reached now (every address as the pairing lists them, the network, the MagicDNS name while the tailnet is listened on, Tailscale as in the state, and how Bonjour finds it on this network: see "Finding the Mac by Bonjour"). The same as the `hosts` event. |
 | `GET /v1/agents?all=1` | `tower agents --json`: `{"agents":[…],"unreachable":[…]}`; each agent has `address, account, machine, name, spoken, agent, status, doing, title, folder, where`. `all=1` adds plain shells. Slow-ish (asks Herdr, and other machines). |
 | `GET /v1/spaces` | `tower spaces --json`: `{"focus": name or null, "spaces":[{"space","focus","follow","mute","agenda","goal","done_when","standing","state","report","quiet_since_ms","ready_since_ms","closed_ms","archived","unread","unread_asked","unread_needs_you","running_jobs","sessions":[{"address","name","status","account"}],"last_activity_ms"}]}`. `goal` is the same as `agenda`; `state` is the space's as a mission (`open`, `quiet`, `ready`, `closed`: docs/quiet-tower.md, step 5 and 8); a space quiet for a day, or closed, is left out. `unread`: held news not yet read; of it, `unread_asked`: reports on work the user asked for (a watch's or a job's), `unread_needs_you`: someone there blocked on or waiting for the user. Show a space with either above 0 as needing a look (the panel marks it amber). |
 | `GET /v1/jobs?status=open\|finished\|all&session=t3&limit=50` | `{"jobs":[{"job","session","name","space","account","status","asked","summary","started_ms","updated_ms"}]}`, newest first. `status`: `working`, `blocked`, `done`, `failed`, `error`, `exited`. |
@@ -1265,8 +1346,8 @@ line of JSON `data`. A comment line `: ping` comes every 10 s.
 
 | `event` | `data` |
 |---|---|
-| `hello` | `{"api":1,"device":"d_…","voice":bool,"features":["quiet","acts","pairing"],"hosts":[Host],"network":{…}\|null,"magic_dns":…}`, first: `hosts`, `network` and `magic_dns` as `GET /v1/network` |
-| `hosts` | `{"hosts": [Host], "network": {…} \| null, "magic_dns": …, "tailscale": {…}}` (as `GET /v1/network`): the tower's addresses changed (this Mac moved to another network, Tailscale started or stopped, the network was named). Merge `hosts` into the stored addresses. |
+| `hello` | `{"api":1,"device":"d_…","voice":bool,"features":["quiet","acts","pairing","bonjour"],"hosts":[Host],"network":{…}\|null,"magic_dns":…,"bonjour":{…}\|null}`, first: `hosts`, `network`, `magic_dns` and `bonjour` as `GET /v1/network` |
+| `hosts` | `{"hosts": [Host], "network": {…} \| null, "magic_dns": …, "tailscale": {…}, "bonjour": {…} \| null}` (as `GET /v1/network`): the tower's addresses changed (this Mac moved to another network, Tailscale started or stopped, the network was named, Bonjour advertised it under another name or stopped). Merge `hosts` into the stored addresses. |
 | `state` | the whole state, first right after `hello`, then whenever something in it changes (at most 4 a second). A change to the decisions, the missions or a thread alone sends their own event, not this one. |
 | `decisions` | `{"count": n, "decisions": [Decision]}`: every open decision in queue order, each with `muted`; `count` is how many are outside muted spaces (the badge). Right after the first `state`, then whenever the list changes: one opened, closed or changed, or the order moved (the tower orders them again every 30 s). See "Notifying". |
 | `missions` | the answer of `GET /v1/missions`, right after the first `decisions`, then whenever it changes (a session's status or last words, a goal, follow, mute, a request, a space's tower, a space opening, going quiet or closing) |
@@ -1430,6 +1511,7 @@ stream's `hello` event). A tower from before there were features sends no
 | Feature | The tower has |
 |---|---|
 | `pairing` | Pairing on more than one network: `install_id` and `repaired` on `POST /v1/pair` (and `hosts`, `network`, `magic_dns` in its answer), `GET /v1/network`, `hosts`, `network` and `magic_dns` in the stream's `hello`, the `hosts` event, `PATCH /v1/device`, and `network` and `phone_hint` in the state |
+| `bonjour` | Found by name on the local network: the `_herdr-tower._tcp` advert with the certificate's `fp` in its TXT, and `bonjour` in `GET /v1/network`, `GET /v1/hello`, `POST /v1/pair`'s answer, the stream's `hello` and the `hosts` event (see "Finding the Mac by Bonjour") |
 | `acts` | Acts and what came with them: `GET /v1/acts`, `/v1/acts/{id}`, `POST /v1/acts/{id}/undo`, the chat's `kind: "act"` messages and the `act` event; `rule` in a decision's answer and `POST /v1/decisions/{id}/rule`; `voice` in `/v1/tell` and `tell_voice` in the state |
 | `quiet` | Everything under "The Quiet Tower": the `/v1/decisions`, `/v1/missions`, `/v1/spaces/{space}/…`, `/v1/thread`, `/v1/setups`, `/v1/launch`, `/v1/actions`, `/v1/tell` and `/v1/model` calls; `space` on `POST /v1/ask`, on chat messages, and as a filter of `/v1/history` and `/v1/chat`; the `decisions`, `missions`, `thread` and `action` events; `decisions_count`, `tell_level`, `brain_model` and `brains` in the state |
 
