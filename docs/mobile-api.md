@@ -715,8 +715,12 @@ Every PR the tower's sessions open is a chip in the chat (a message of
 `role` `pr`), the same on the Mac and every phone, from when it's found
 (a `github.com/…/pull/N` link in what a session says at the end of a turn,
 or what its `gh pr create` printed) until it's merged or closed. The Mac
-asks GitHub about each open one every 30 s while its checks run, every
-90 s otherwise. A PR:
+asks GitHub about each open one every 30 s while its checks run or while it
+waits for the user's merge (however old: it is often merged on GitHub), every
+90 s otherwise, and again at once when the queue is looked at (`GET
+/v1/decisions`, the Mac's windows opening; at most every 15 s). Merged on
+GitHub, its merge decision closes, and so does an open question of its
+space's sessions that names it ("#786" or its link). A PR:
 
 ```json
 {

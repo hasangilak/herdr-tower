@@ -314,6 +314,15 @@ mod tests {
     const T0: u64 = 1_000_000;
 
     #[test]
+    fn an_agents_own_message_from_another_session_is_never_the_users() {
+        let mut l = Log::default();
+        let m = "<cross-session-message from=\"uds:/tmp/cc-socks/28680.sock\" from-name=\"support-translation-eyzflow\" from-mode=\"prompting\"> E2E on prod: test case EYZ-1032 was created.";
+        assert_eq!(l.whose("t8t", m, None, T0), Whose::Terminal("support-translation-eyzflow".into()));
+        assert!(!l.users("t8t", T0));
+        assert_eq!(crate::introduce::users_task(m), None);
+    }
+
+    #[test]
     fn the_first_task_tower_start_gives_a_session_is_the_towers_start() {
         let mut l = Log::default();
         let task = "This is a throwaway check of the tower's session introductions. Reply with the single word ok.";

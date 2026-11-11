@@ -5,8 +5,9 @@
 //!   prints the link). Tied to the session and its space. Only a PR that is
 //!   open when first looked at becomes a chip.
 //! - **Polled** with `gh pr view --json …` while open (every 30 s while
-//!   checks run, 90 s otherwise, 15 min once it's days old), and once more
-//!   after it closes. Kept in `prs.json` beside `state.json` (the orb watches
+//!   checks run or while it waits for the user's merge, 90 s otherwise, 15
+//!   min once it's days old), again at once when the queue is looked at
+//!   (`look_now`), and once more after it closes. Kept in `prs.json` beside `state.json` (the orb watches
 //!   that folder), across restarts.
 //! - **In the chat**: one history entry (`kind` `pr`, `id` the PR's key) when
 //!   it's found; the chip shows the PR as it is now, so it changes in place
@@ -535,7 +536,10 @@ pub fn next_check(pr: &Pr) -> Option<u64> {
         return Some(pr.closed_ms.unwrap_or(pr.checked_ms) + MIN);
     }
     let age = pr.checked_ms.saturating_sub(pr.found_ms);
-    let every = if age > 3 * 24 * 60 * MIN {
+    // One that waits for the user's merge is often merged on GitHub: looked at every 30 s, however old.
+    let every = if pr.waiting {
+        MIN / 2
+    } else if age > 3 * 24 * 60 * MIN {
         15 * MIN
     } else if pr.checks.state == "pending" || pr.mergeable == "unknown" {
         MIN / 2
@@ -715,6 +719,28 @@ impl Prs {
             open.push(pr);
         }
         open
+    }
+
+    /// The queue is being looked at (a window opened, a phone asked): the
+    /// PRs that wait for a merge are looked at again now, in the background,
+    /// so one merged on GitHub leaves the queue at once. At most every 15 s.
+    pub fn look_now(&self) {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = crate::history::now_ms();
+        if now.saturating_sub(LAST.load(Ordering::Relaxed)) < 15_000 {
+            return;
+        }
+        LAST.store(now, Ordering::Relaxed);
+        let keys: Vec<String> = self.lock().values().filter(|p| p.open() && p.waiting && !p.settled).map(Pr::key).collect();
+        if keys.is_empty() {
+            return;
+        }
+        let me = self.clone();
+        std::thread::spawn(move || {
+            for k in keys {
+                me.poll(&k);
+            }
+        });
     }
 
     /// The PRs due a look now.
@@ -946,6 +972,10 @@ pub(crate) mod tests {
         assert_eq!(next_check(&pr), Some(10 * MIN + 3 * MIN / 2), "settled: every 90 s");
         pr.checked_ms = 5 * 24 * 60 * MIN;
         assert_eq!(next_check(&pr), Some(5 * 24 * 60 * MIN + 15 * MIN), "days old: every 15 min");
+        // Waiting for the user's merge: every 30 s however old (it is often merged on GitHub).
+        pr.waiting = true;
+        assert_eq!(next_check(&pr), Some(5 * 24 * 60 * MIN + MIN / 2), "waiting: every 30 s");
+        pr.waiting = false;
         pr.state = "merged".into();
         pr.closed_ms = Some(100 * MIN);
         assert_eq!(next_check(&pr), Some(101 * MIN), "once more after it closed");

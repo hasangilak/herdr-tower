@@ -254,8 +254,12 @@ pub fn run() -> Result<()> {
     sendq.start();
     {
         // A merge (the user's, or on GitHub one its session waited on): the session and the brain are told.
-        let (sendq, watches) = (sendq.clone(), watches.clone());
-        prs.on_merged(Box::new(move |pr, by| after_merge(&sendq, &watches, pr, by)));
+        let (sendq, watches, asks) = (sendq.clone(), watches.clone(), asks.clone());
+        prs.on_merged(Box::new(move |pr, by| {
+            // Its questions ("merge it, or leave it open?") are settled by the merge.
+            asks.settled_by_merge(pr, by);
+            after_merge(&sendq, &watches, pr, by)
+        }));
         // Open PRs looked at gently.
         let prs = prs.clone();
         thread::Builder::new().name("prs".into()).spawn(move || {
@@ -626,7 +630,8 @@ impl Daemon {
                 return Response { ok: true, error: None, state: Some(serde_json::json!({ "questions": v })) };
             }
             Request::Decisions { space, all } => {
-                // As it stands now: a space may have been muted a moment ago.
+                // As it stands now: a space may have been muted a moment ago, a PR merged on GitHub.
+                self.prs.look_now();
                 self.decisions.refresh();
                 return Response { ok: true, error: None, state: Some(self.decisions.list(space.as_deref(), all)) };
             }

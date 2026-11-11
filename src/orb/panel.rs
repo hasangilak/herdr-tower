@@ -227,6 +227,8 @@ impl Panel {
         // which would hide the glass.
         Theme::change(ThemeMode::Light, Some(window), cx);
         Theme::update(cx, |t| t.tokens.background = gpui::transparent_black().into());
+        // The queue is looked at: the tower looks at the PRs that wait for a merge again (one merged on GitHub goes).
+        cx.background_executor().spawn(async { cli::tower(&["decisions", "--json"]) }).detach();
         let text = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 6).submit_on_enter(true).placeholder("Tell the tower…"));
         let subs = vec![
             cx.subscribe_in(&text, window, |this, _, ev: &InputEvent, window, cx| match ev {
