@@ -112,7 +112,7 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
                     }
                     let _ = deliver(&shared, &mouth, heard.trim(), settings.ack, "voice");
                 }
-                Source::Phone { reply, attachments, markers, send, phone, device } => {
+                Source::Phone { reply, attachments, markers, send, phone, device, space } => {
                     if !send {
                         // Dictation: the text goes back, nothing to the tower.
                         let _ = reply.send(heard.trim().to_string());
@@ -123,7 +123,8 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
                         continue;
                     }
                     let message = crate::history::compose(&super::lan::with_markers(heard.trim(), &markers), &attachments);
-                    if deliver_from(&shared, &mouth, &message, settings.ack, phone, &format!("phone:{device}")).is_ok() {
+                    // Said in a space's view: to that space's tower, as a typed request there goes.
+                    if deliver_to(&shared, &mouth, &message, settings.ack, phone, &format!("phone:{device}"), space.as_deref(), true).is_ok() {
                         let _ = reply.send(heard.trim().to_string());
                     }
                 }
@@ -284,25 +285,34 @@ fn vocabulary(shared: &Shared) -> String {
     format!("Tower, Claude, Codex, Herdr, terminal, agent. {}.", names.join(", "))
 }
 
-/// Hands a request to the brain and acknowledges it out loud.
-/// `source`: `mac` (typed) or `voice` (this Mac's microphone), for the chat.
+/// Hands what was spoken to the brain and acknowledges it out loud.
+/// `source`: `voice` (this Mac's microphone), for the chat.
 pub fn deliver(shared: &Shared, mouth: &Mouth, text: &str, ack: Option<Duration>, source: &str) -> anyhow::Result<()> {
     deliver_from(shared, mouth, text, ack, None, source)
 }
 
-/// `deliver` for a request from a paired phone whose replies are heard on
-/// the phone only (`phone`: its device id; None: heard as usual).
+/// `deliver` for what was spoken into a paired phone whose replies are
+/// heard on the phone only (`phone`: its device id; None: heard as usual).
 pub fn deliver_from(shared: &Shared, mouth: &Mouth, text: &str, ack: Option<Duration>, phone: Option<String>, source: &str) -> anyhow::Result<()> {
+    deliver_to(shared, mouth, text, ack, phone, source, None, true)
+}
+
+/// `deliver_from`, for a request made in a space's view (`space`): it goes
+/// to that space's own brain when it has one that can take it, else to the
+/// main brain with the space named (see `super::brains::ask`). `spoken`:
+/// it was said, not typed: only then is its answer said out loud.
+#[allow(clippy::too_many_arguments)]
+pub fn deliver_to(shared: &Shared, mouth: &Mouth, text: &str, ack: Option<Duration>, phone: Option<String>, source: &str, space: Option<&str>, spoken: bool) -> anyhow::Result<()> {
     shared.update(|s| {
         s.heard = text.to_string();
         s.heard_ms = now_ms();
         s.hearing.clear();
         s.error.clear();
     });
-    match brain::ask(text, &radar(shared), source) {
+    match super::brains::ask(space, text, shared, source) {
         Ok(()) => {
             timing::mark("sent to the brain");
-            mouth.asked(text, phone);
+            mouth.asked(text, phone, spoken);
             if let Some(delay) = ack {
                 mouth.ack(delay);
             }
@@ -321,14 +331,8 @@ pub fn deliver_from(shared: &Shared, mouth: &Mouth, text: &str, ack: Option<Dura
 
 /// One line: every agent the radar sees and its status; then what spaces
 /// out of focus hold that the user would want and hasn't been told.
-fn radar(shared: &Shared) -> String {
-    let agents = shared.with(|s| s.agents.clone());
-    let line = if agents.is_empty() {
-        "[radar] no agents running".to_string()
-    } else {
-        let list: Vec<String> = agents.iter().map(radar_entry).collect();
-        format!("[radar] {}", list.join("; "))
-    };
+pub(super) fn radar(shared: &Shared) -> String {
+    let line = radar_line(&shared.with(|s| s.agents.clone()));
     let hours = crate::config::Config::load().map(|c| c.alerts.focus_hours).unwrap_or(8);
     let focus = crate::spaces::focus_now(hours);
     let spaces = crate::spaces::load();
@@ -341,6 +345,15 @@ fn radar(shared: &Shared) -> String {
         Some(note) => format!("{line} {note}"),
         None => line,
     }
+}
+
+/// `[radar] t5 fix login: working; t6 api: idle` for these agents.
+pub(super) fn radar_line(agents: &[super::state::AgentLine]) -> String {
+    if agents.is_empty() {
+        return "[radar] no agents running".to_string();
+    }
+    let list: Vec<String> = agents.iter().map(radar_entry).collect();
+    format!("[radar] {}", list.join("; "))
 }
 
 /// `t5 fix login [eyzflow]: working, 2 queued`: who, in which project, doing what.
@@ -428,7 +441,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let (reply, heard) = std::sync::mpsc::channel();
         tx.send(utt(Source::Ptt)).unwrap();
-        let phone = Source::Phone { reply, attachments: vec![], markers: vec![], send: true, phone: None, device: "d".into() };
+        let phone = Source::Phone { reply, attachments: vec![], markers: vec![], send: true, phone: None, device: "d".into(), space: None };
         tx.send(utt(phone)).unwrap();
         drop(tx);
         refuse_all(&rx, &shared, &mouth, "speech recognition didn't start: no GPU");

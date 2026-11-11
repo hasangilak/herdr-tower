@@ -315,20 +315,10 @@ pub fn name(t: &Value) -> Option<&str> {
     t["name"].as_str().filter(|n| !n.is_empty()).or_else(|| t["labels"]["tower.name"].as_str().filter(|n| !n.is_empty()))
 }
 
-/// What to call a terminal out loud: its name, else its folder.
+/// What a terminal's session is called within its space: its own name, else
+/// its project (see `crate::names`, which also says it with its space).
 pub fn spoken_name(t: &Value) -> String {
-    if let Some(n) = name(t) {
-        return n.replace(['-', '_'], " ");
-    }
-    let cwd = t["foreground"]["cwd"].as_str().or_else(|| t["cwd"].as_str()).unwrap_or("");
-    let folder = cwd.rsplit('/').find(|s| !s.is_empty()).unwrap_or("a terminal");
-    let app = match agent_app(t).as_deref() {
-        Some("claude-code") => "Claude",
-        Some("codex") => "Codex",
-        Some(other) if !other.is_empty() => return format!("{} in {}", other, folder.replace(['-', '_'], " ")),
-        _ => "the agent",
-    };
-    format!("{app} in {}", folder.replace(['-', '_'], " "))
+    crate::names::short_of(t)
 }
 
 /// The machines added with `hc machine add`.
@@ -363,11 +353,25 @@ pub fn list_on(machine: Option<&str>) -> Result<Vec<Value>> {
 }
 
 /// Pastes text into a terminal and presses Enter (one writer at a time; text
-/// that starts with `-` is text, not an option).
+/// that starts with `-` is text, not an option). hc refuses a terminal that
+/// is blocked on a dialog. Enter is all it presses (no Esc, no interrupt):
+/// a Claude Code session that is working keeps what is typed and sends it
+/// as its next message when its turn ends.
 pub fn send(terminal: &str, text: &str) -> Result<()> {
+    send_if(terminal, text, None)
+}
+
+/// `send`, only while the terminal's status is exactly `status` (`idle`,
+/// `working`): hc looks again as it types, and refuses otherwise.
+pub fn send_if(terminal: &str, text: &str, status: Option<&str>) -> Result<()> {
     let text = clean(text);
     let _typing = typing(terminal);
-    let out = run(&["send", "--json", "--", terminal, &text])?;
+    let mut args = vec!["send", "--json"];
+    if let Some(s) = status {
+        args.extend(["--if", s]);
+    }
+    args.extend(["--", terminal, &text]);
+    let out = run(&args)?;
     if out.code != 0 {
         let msg = if out.stderr.trim().is_empty() { out.stdout.trim() } else { out.stderr.trim() };
         bail!("{msg}");

@@ -7,6 +7,11 @@
 //! What it has to say goes to the brain through the radar's outbox, like a
 //! watch's report: it waits for a brain that's away (said out loud once
 //! meanwhile), and a space out of focus marks it, as work the user asked for.
+//!
+//! A task that failed: at a quiet level (`tell`) the tower sends it once
+//! more by itself (unless `[agenda] retry_failed = false` in config.toml);
+//! one that failed again after a retry is the user's to decide
+//! (`decisions`, kind `failed`).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -16,7 +21,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::agenda::{self, Action, Facts, Heard, HookFact, Ledger, Live, Probe, Reg, TaskEv};
+use crate::agenda::{self, Action, Facts, FailedTask, Heard, HookFact, Ledger, Live, Probe, Reg, TaskEv};
 use crate::hc;
 use crate::protocol::Response;
 
@@ -27,6 +32,7 @@ pub struct Ctx {
     pub watches: super::watch::Watches,
     pub asks: super::asks::Asks,
     pub shared: super::state::Shared,
+    pub decisions: super::decisions::Decisions,
 }
 
 #[derive(Clone)]
@@ -48,6 +54,13 @@ pub fn radar_note() -> Option<String> {
 pub fn task_of(session: &str) -> Option<String> {
     let l = RUNNING.get()?.lock();
     l.unfinished_on(session).map(|t| t.instruction.clone())
+}
+
+/// What was asked of `session` lately: the instruction of the task it is
+/// on, or was until a minute ago (None: nothing, or no daemon here).
+pub fn working_on(session: &str) -> Option<String> {
+    let l = RUNNING.get()?.lock();
+    l.at_work_on(session, now_ms(), 60_000).map(|t| t.instruction.clone())
 }
 
 fn now_ms() -> u64 {
@@ -76,6 +89,11 @@ impl Agendas {
         if let Err(e) = l.save_to(&self.path) {
             eprintln!("[agenda] {e:#}");
         }
+    }
+
+    /// The ledger as it stands (for the missions: each space's requests).
+    pub fn ledger(&self) -> Ledger {
+        self.lock().clone()
     }
 
     /// The reconciler, from now on.
@@ -134,7 +152,8 @@ impl Agendas {
         if !reg.session.is_empty() && hc::get(&reg.session).is_some_and(|t| super::watch::left_alone(&t)) {
             return None;
         }
-        if reg.session == crate::brain::name() {
+        // What goes to a brain (the main one, a space's own) is no task of anyone's.
+        if reg.session == crate::brain::name() || super::brains::is_brain_address(&reg.session) {
             return None;
         }
         let heard = self.heard();
@@ -147,6 +166,21 @@ impl Agendas {
         eprintln!("[agenda] #{} is {} in {} ({})", reg.queue_id, r.task, r.agenda, r.how);
         self.kick();
         Some(r)
+    }
+
+    /// The user typed a request in a session's own terminal: an agenda of
+    /// its own (origin `terminal`), or more of the one typed there before.
+    /// Kept, never told to a brain.
+    pub fn typed(&self, t: agenda::Typed) -> agenda::Registered {
+        let r = {
+            let mut l = self.lock();
+            let r = l.typed(&t, now_ms());
+            self.save(&l);
+            r
+        };
+        eprintln!("[agenda] {}: typed in its terminal: {} in {} ({})", t.session, r.task, r.agenda, r.how);
+        self.kick();
+        r
     }
 
     /// One round: facts for every open task, moves, re-prompts, news.
@@ -164,11 +198,16 @@ impl Agendas {
             vec![]
         };
         let facts = if probes.is_empty() { BTreeMap::new() } else { gather(ctx, &probes) };
-        let (actions, notes) = {
+        let quiet = crate::tell::level().quiet();
+        // `[agenda] retry_failed`, read each round: switching it needs no restart.
+        let retry = retries(quiet, &crate::config::Config::live().agenda);
+        let (actions, failures, notes) = {
             let mut l = self.lock();
             let before = l.clone();
             let actions = l.step(&facts, now);
             l.attach_jobs(&jobs);
+            // Before the news: a failure the tower handles itself isn't told as one.
+            let failures = l.failures(retry, now);
             let notes = l.news(now);
             let pruned = l.prune(now);
             if pruned > 0 {
@@ -177,14 +216,113 @@ impl Agendas {
             if *l != before {
                 self.save(&l);
             }
-            (actions, notes)
+            (actions, failures, notes)
         };
         for a in actions {
             self.reprompt(ctx, a);
         }
+        for f in failures {
+            self.failed(ctx, f, quiet);
+        }
         for n in notes {
             eprintln!("[agenda] telling the brain: {}", agenda::clip(&n.msg, 200));
             ctx.watches.tell_agenda(n);
+        }
+        // A failure's decision is over once its task is sent again, verified or dropped.
+        let still = self.lock().failed_twice();
+        ctx.decisions.sync_failed(&still);
+    }
+
+    /// A task failed. The first time, the tower sends it once more by itself
+    /// (a quiet level only); again after a retry, it is the user's to decide.
+    fn failed(&self, ctx: &Ctx, f: FailedTask, quiet: bool) {
+        let now = now_ms();
+        match f {
+            FailedTask::Retry { task, session, text, why } => {
+                // Settled meanwhile (the brain said it's done, or dropped it): nothing to send.
+                if self.lock().task(&task).is_none_or(|t| t.state != agenda::TaskState::Failed) {
+                    return;
+                }
+                // Its address has another terminal now: the tower sends nothing of this task in there by itself.
+                let given = self.lock().task(&task).and_then(|t| t.created_ms);
+                let there = match look(&session) {
+                    Live::Here { created_ms, .. } => created_ms,
+                    _ => None,
+                };
+                if let Some(stranger) = agenda::another_terminal(&session, given, there) {
+                    eprintln!("[agenda] {task} failed, and isn't sent again: {stranger}");
+                    let mut l = self.lock();
+                    l.retry_unsent(&task, &stranger);
+                    self.save(&l);
+                    return;
+                }
+                // Other words than the first time: the queue takes the same instruction again for a retry of its own.
+                let again = format!("That didn't work ({}). Try it once more: {text}", agenda::clip(why.trim_end_matches('.'), 200));
+                match ctx.sendq.add(&session, &again, &[]) {
+                    Ok((added, address, name)) => {
+                        let id = match added {
+                            super::sendq::Added::Sent { id } | super::sendq::Added::Queued { id, .. } => id,
+                        };
+                        let note = {
+                            let mut l = self.lock();
+                            l.requeue(&task, id, &again, now);
+                            self.save(&l);
+                            let t = l.task(&task).cloned().unwrap_or_default();
+                            agenda::Note {
+                                session: address.clone(),
+                                name: name.clone(),
+                                space: t.space.clone(),
+                                msg: format!(
+                                    "[agenda] {task} \"{}\" on {address} ({name}) failed ({}), so the tower sent it once more by itself (#{id}). Nothing to do: if it fails again, the tower puts it to the user as a decision.",
+                                    t.title,
+                                    agenda::clip(&why, 200)
+                                ),
+                                speech: String::new(),
+                            }
+                        };
+                        eprintln!("[agenda] {task} failed: sent once more to {address} as #{id}");
+                        ctx.watches.tell_agenda(note);
+                    }
+                    Err(e) => {
+                        eprintln!("[agenda] {task} failed, and couldn't be sent again: {e:#}");
+                        let mut l = self.lock();
+                        l.retry_unsent(&task, &format!("{e:#}"));
+                        self.save(&l);
+                        drop(l);
+                        self.kick();
+                    }
+                }
+            }
+            FailedTask::Decide { task, title, session, name, space, why } => {
+                // A session that has ended is still what it is about, but nobody waits there.
+                let live = !session.is_empty() && hc::get(&session).is_some_and(|t| t["state"] == "live");
+                let who = live.then(|| crate::decisions::Who::new(&session, &name));
+                let (raised, d, told) =
+                    ctx.decisions.failed(crate::decisions::Failure { task: task.clone(), title: title.clone(), space: space.clone(), who, why: why.clone() });
+                {
+                    let mut l = self.lock();
+                    l.decided(&task, quiet, now);
+                    self.save(&l);
+                }
+                eprintln!("[agenda] {task} failed again after a retry: the user's to decide ({})", raised.id);
+                if told {
+                    let line = crate::decisions::said(&name, &format!("{}. Try it again, or drop it?", d.title), None);
+                    ctx.watches.raise(&session, &line);
+                }
+                if quiet {
+                    ctx.watches.tell_agenda(agenda::Note {
+                        session: session.clone(),
+                        name: name.clone(),
+                        space,
+                        msg: format!(
+                            "[agenda] {task} \"{title}\" on {session} ({name}) failed again after a retry: {}. The tower has put it to the user as a decision ({}): try it again, or drop it. Don't raise it again, and don't requeue it yourself.",
+                            agenda::clip(&why, 300),
+                            raised.id
+                        ),
+                        speech: String::new(),
+                    });
+                }
+            }
         }
     }
 
@@ -285,6 +423,16 @@ impl Agendas {
                 anyhow::bail!("{id} never had a session: give one (`tower agenda requeue {id} <session>`)");
             }
             let text = if c.text.trim().is_empty() { t.followups.last().cloned().unwrap_or(t.instruction.clone()) } else { c.text.trim().to_string() };
+            // No session named: the one it had, and only while that address is still that terminal.
+            if c.session.trim().is_empty() {
+                let there = match look(&session) {
+                    Live::Here { created_ms, .. } => created_ms,
+                    _ => None,
+                };
+                if let Some(stranger) = agenda::another_terminal(&session, t.created_ms, there) {
+                    anyhow::bail!("{id} isn't sent again: {stranger}. Name the session it should go to (`tower agenda requeue {id} <session>`), or drop it");
+                }
+            }
             (id, session, text)
         };
         let (added, address, name) = ctx.sendq.add(&session, &text, &[])?;
@@ -300,6 +448,14 @@ impl Agendas {
         self.kick();
         Ok(json!({ "task": task, "queue_id": id, "session": address, "name": name, "sent": sent }))
     }
+}
+
+/// Whether a task that just failed is sent to its session once more by the
+/// tower itself: at a quiet level (`tell`), unless `[agenda] retry_failed`
+/// is off. Then nothing is sent again unasked: the brain hears of the
+/// failure in the ledger's note and raises it, or requeues it itself.
+fn retries(quiet: bool, cfg: &crate::config::Agenda) -> bool {
+    quiet && cfg.retry_failed
 }
 
 /// What Herdr says about a session now.
@@ -355,4 +511,41 @@ fn gather(ctx: &Ctx, probes: &[Probe]) -> BTreeMap<String, Facts> {
         out.insert(p.task.clone(), Facts { queue, live: Some(live), hook, question, screen });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retries;
+    use crate::agenda::{FailedTask, Ledger, Reg, Tag, TaskEv};
+
+    /// `[agenda] retry_failed = false`: a failed task is not sent again by
+    /// the tower; the brain hears of it from the ledger's note instead.
+    #[test]
+    fn the_retry_of_a_failed_task_can_be_turned_off() {
+        let on = crate::config::Config::default();
+        assert!(on.agenda.retry_failed, "on unless the user says otherwise");
+        let off: crate::config::Config = toml::from_str("[agenda]\nretry_failed = false\n").unwrap();
+        assert!(!off.agenda.retry_failed);
+        assert!(retries(true, &on.agenda) && !retries(false, &on.agenda), "never while the tower tells everything");
+        assert!(!retries(true, &off.agenda) && !retries(false, &off.agenda));
+        // A task that just failed.
+        let now = 1_000_000;
+        let mut l = Ledger::default();
+        let a = l.open("fix the login", "", "user", 0, &[], now);
+        let reg = Reg { queue_id: 1, session: "t5".into(), name: "api".into(), text: "fix the login".into(), tag: Tag { agenda: Some(a), ..Default::default() } };
+        let task = l.register(&reg, &Default::default(), now).unwrap().task;
+        l.apply(&task, TaskEv::Fail { why: "the tests fail".into() }, now).unwrap();
+        // On: the tower sends it once more.
+        assert!(matches!(l.failures(retries(true, &on.agenda), now + 1_000).as_slice(), [FailedTask::Retry { task: t, .. }] if *t == task));
+        // Off: nothing is sent again, and it is no decision either (it wasn't retried)...
+        assert!(l.failures(retries(true, &off.agenda), now + 1_000).is_empty());
+        // ... so the ledger's note tells the brain, once its grace has passed.
+        let notes = l.news(now + crate::agenda::GRACE_TROUBLE_MS);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].msg.starts_with("[agenda] ") && notes[0].msg.contains("failed"), "{}", notes[0].msg);
+        // Tried again by hand and failed again: the user's to decide, as always.
+        l.requeue(&task, 2, "", now + 60_000);
+        l.apply(&task, TaskEv::Fail { why: "still failing".into() }, now + 120_000).unwrap();
+        assert!(matches!(l.failures(retries(true, &off.agenda), now + 121_000).as_slice(), [FailedTask::Decide { task: t, .. }] if *t == task));
+    }
 }

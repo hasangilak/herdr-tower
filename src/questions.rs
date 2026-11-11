@@ -49,8 +49,14 @@ pub struct Tab {
     pub multi: bool,
     /// A typed answer is possible (Claude's "Type something").
     pub allows_other: bool,
-    /// Already answered in the dialog.
+    /// Already answered in the dialog (its tab is ticked in the tab bar):
+    /// the user answered it there, or the tower's keys did.
     pub answered: bool,
+    /// What it was answered with in the dialog, when the screen shows it
+    /// (the review tab lists the answers; a multi-choice tab shows its
+    /// ticks). Empty: not known, or not answered.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub answer: String,
 }
 
 /// One recommended answer for a tab.
@@ -117,6 +123,10 @@ pub struct QuestionSet {
     /// (an address can come back for another one).
     #[serde(skip)]
     pub created_ms: Option<u64>,
+    /// The Herdr space its session is in: what it asks is one decision per
+    /// space (`decisions`).
+    #[serde(skip)]
+    pub space: Option<String>,
 }
 
 /// The same question on both: its title, wording, kind and options (a
@@ -131,9 +141,14 @@ pub fn same_tab(a: &Tab, b: &Tab) -> bool {
 }
 
 /// `new` is `old`'s dialog read again: the same session, kind and tabs (by
-/// title), whatever more is known of their questions now.
+/// title), whatever more is known of their questions now. A menu (a
+/// permission, a plan, Codex's approval) is about one command or plan: the
+/// next one, after the user answered this one in the terminal, is another.
 pub fn redrawn(old: &QuestionSet, new: &QuestionSet) -> bool {
-    old.session == new.session && old.kind == new.kind && old.tabs.iter().map(|t| &t.title).eq(new.tabs.iter().map(|t| &t.title))
+    old.session == new.session
+        && old.kind == new.kind
+        && old.tabs.iter().map(|t| &t.title).eq(new.tabs.iter().map(|t| &t.title))
+        && (old.kind == "claude-ask" || old.detail.trim() == new.detail.trim())
 }
 
 /// Answers given to `old` are good for `new`: it is the same dialog and every
@@ -141,6 +156,22 @@ pub fn redrawn(old: &QuestionSet, new: &QuestionSet) -> bool {
 /// they didn't see).
 pub fn answers_still_fit(old: &QuestionSet, new: &QuestionSet, answers: &[Answer]) -> bool {
     redrawn(old, new) && answers.iter().all(|a| matches!((old.tabs.get(a.tab), new.tabs.get(a.tab)), (Some(o), Some(n)) if same_tab(o, n)))
+}
+
+/// Answers put together on the card of `shown` mean the same in `other`
+/// (another session that asks the same): every tab they answer offers there
+/// the options the card showed, in that order. An option is chosen by its
+/// place, so the same place under other options is another answer; words
+/// that are only typed mean the same anywhere.
+pub fn answers_mean_the_same(shown: &QuestionSet, other: &QuestionSet, answers: &[Answer]) -> bool {
+    answers.iter().all(|a| {
+        let typed = a.choice.as_object().is_some_and(|o| o.get("other").is_some_and(Value::is_string) && !o.contains_key("option") && !o.contains_key("options") && !o.contains_key("spoken"));
+        match (shown.tabs.get(a.tab), other.tabs.get(a.tab)) {
+            (Some(x), Some(y)) if typed => x.allows_other == y.allows_other,
+            (Some(x), Some(y)) => x.multi == y.multi && x.options.iter().map(|o| o.label.trim()).eq(y.options.iter().map(|o| o.label.trim())),
+            _ => false,
+        }
+    })
 }
 
 // ---- reading the screen ----
@@ -402,7 +433,7 @@ pub fn transcript_questions(jsonl: &str) -> Option<Vec<Tab>> {
                 .collect(),
             multi: q["multiSelect"].as_bool().unwrap_or(false),
             allows_other: true,
-            answered: false,
+            ..Default::default()
         })
         .collect();
     (!tabs.is_empty()).then_some(tabs)
@@ -526,6 +557,7 @@ pub fn build(session: &str, name: &str, codex: bool, screen: &Screen, transcript
                         .collect();
                 }
             }
+            answers_shown(&mut q, screen);
             q.title = q.tabs.first().map(|t| t.question.clone()).unwrap_or_default();
             if q.tabs.len() > 1 {
                 q.title = format!("{} questions: {}", q.tabs.len(), q.tabs.iter().map(|t| t.title.as_str()).collect::<Vec<_>>().join(", "));
@@ -555,6 +587,120 @@ pub fn build(session: &str, name: &str, codex: bool, screen: &Screen, transcript
     }
     q.id = id_of(session, &q.kind, &q.tabs, &q.title, &q.detail);
     q
+}
+
+/// What the dialog shows of the answers given already: its review lists
+/// each answered question with its answer; a multi-choice tab on screen
+/// shows its ticks (a single choice shows nothing of it).
+fn answers_shown(q: &mut QuestionSet, screen: &Screen) {
+    if screen.kind == "review" {
+        for (asked, answer) in review_answers(&screen.review) {
+            if let Some(t) = q.tabs.iter_mut().find(|t| t.answered && same_question(&asked, &t.question)) {
+                t.answer = answer;
+            }
+        }
+        return;
+    }
+    let Some(t) = q.tabs.get_mut(q.current_tab).filter(|t| t.answered && t.multi) else { return };
+    let ticked: Vec<String> = screen
+        .options
+        .iter()
+        .filter(|o| o.checked == Some(true))
+        .filter_map(|o| match t.options.get(o.n.wrapping_sub(1)) {
+            Some(known) => Some(known.label.clone()),
+            // The typed answer's row, with what was typed in it.
+            None if !o.label.trim().is_empty() && !o.label.starts_with("Type something") => Some(o.label.trim().to_string()),
+            None => None,
+        })
+        .collect();
+    if !ticked.is_empty() {
+        t.answer = ticked.join(", ");
+    }
+}
+
+/// The review tab's questions and answers: `● <question>` then `→ <answer>`,
+/// either of them wrapped onto more lines.
+fn review_answers(review: &[String]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String, bool)> = vec![];
+    for l in review {
+        let t = l.trim();
+        if let Some(asked) = t.strip_prefix('●') {
+            out.push((asked.trim().to_string(), String::new(), false));
+        } else if let Some(answer) = t.strip_prefix('→') {
+            if let Some(last) = out.last_mut() {
+                last.1 = answer.trim().to_string();
+                last.2 = true;
+            }
+        } else if let Some(last) = out.last_mut() {
+            let part = if last.2 { &mut last.1 } else { &mut last.0 };
+            part.push(' ');
+            part.push_str(t);
+        }
+    }
+    out.into_iter()
+        .filter(|(_, _, has)| *has)
+        .map(|(asked, answer, _)| (asked, crate::introduce::task_from_prompt(&answer).unwrap_or(answer)))
+        .collect()
+}
+
+/// The screen shows a set's dialog somewhere else than the set says: on
+/// another tab, or with other tabs answered (the user answering it in the
+/// terminal, tab by tab: Herdr's status doesn't change for that). Only
+/// Claude's tabbed questions move in place.
+pub fn dialog_moved(set: &QuestionSet, s: &Screen) -> bool {
+    if set.kind != "claude-ask" || !matches!(s.kind.as_str(), "ask" | "review") {
+        return false;
+    }
+    let ticked: Vec<bool> = s.tabs.iter().map(|(_, a)| *a).collect();
+    let known: Vec<bool> = set.tabs.iter().map(|t| t.answered).collect();
+    (!ticked.is_empty() && ticked != known) || tab_index(s, set) != Some(set.current_tab)
+}
+
+/// The tabs of a set answered in the dialog already (the user did it in the terminal).
+pub fn answered_there(set: &QuestionSet) -> Vec<usize> {
+    if set.kind != "claude-ask" || set.tabs.len() < 2 {
+        return vec![];
+    }
+    set.tabs.iter().enumerate().filter(|(_, t)| t.answered).map(|(i, _)| i).collect()
+}
+
+/// Answers for a dialog as it is now (`now`, just read): what the user
+/// answered in the terminal stands, so the answers for those tabs are left
+/// out. The answers left, and the tabs left out.
+pub fn answers_left(now: &QuestionSet, answers: &[Answer]) -> (Vec<Answer>, Vec<usize>) {
+    let there = answered_there(now);
+    let (left, out): (Vec<Answer>, Vec<Answer>) = answers.iter().cloned().partition(|a| !there.contains(&a.tab));
+    (left, out.iter().map(|a| a.tab).collect())
+}
+
+/// Why nothing is typed into a tabbed dialog for these answers (what
+/// `answers_left` left of them), if so: every tab they were for was
+/// answered in the terminal already; or there were none, and the dialog
+/// isn't ready to submit (a question is still open). None: something goes
+/// in, or it is only submitted (every tab answered, `submit`).
+pub fn nothing_to_type(now: &QuestionSet, left: &[Answer], skipped: &[usize], submit: bool) -> Option<String> {
+    if !left.is_empty() || now.kind != "claude-ask" || now.tabs.len() < 2 {
+        return None;
+    }
+    let names = |tabs: Vec<usize>| -> String {
+        let t: Vec<String> = tabs.iter().filter_map(|i| now.tabs.get(*i)).map(|t| if t.title.trim().is_empty() { t.question.clone() } else { t.title.clone() }).collect();
+        match t.as_slice() {
+            [] => String::new(),
+            [one] => one.clone(),
+            [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        }
+    };
+    let all = now.tabs.iter().all(|t| t.answered);
+    let open: Vec<usize> = (0..now.tabs.len()).filter(|i| !now.tabs[*i].answered).collect();
+    if !skipped.is_empty() {
+        let were = if skipped.len() == 1 { "was" } else { "were" };
+        let then = if all { "; only Submit is left".to_string() } else { format!("; still open: {}", names(open)) };
+        return Some(format!("Nothing was typed: {} {were} answered in its terminal already{then}", names(skipped.to_vec())));
+    }
+    if submit && all {
+        return None;
+    }
+    Some(if submit { format!("Not every question is answered yet: {} still open", names(open)) } else { "No answer to type".to_string() })
 }
 
 // ---- answers ----
@@ -1126,6 +1272,70 @@ pub fn message_from_screen(screen: &str) -> Option<String> {
     (!t.is_empty()).then_some(t)
 }
 
+/// What the user chose in a dialog they answered in the session's own
+/// terminal, as its screen shows it once the dialog is gone: Claude Code's
+/// "User answered Claude's questions" (each question by its tab's title when
+/// there are several), its plan approved or rejected, a permission turned
+/// down, Codex's "You approved codex to run …". None when the screen doesn't
+/// say (a permission granted only shows its command running), or still
+/// shows the dialog.
+pub fn chosen_on_screen(set: &QuestionSet, screen: &str) -> Option<String> {
+    if parse_screen(screen).is_some_and(|s| set.tabs.iter().any(|t| same_question(&s.question, &t.question)) && s.detail.trim() == set.detail.trim()) {
+        return None;
+    }
+    let lines: Vec<&str> = screen.lines().map(|l| l.trim_end()).filter(|l| !is_rule(l)).collect();
+    let plain = |s: &str| crate::introduce::task_from_prompt(s).unwrap_or_else(|| s.split_whitespace().collect::<Vec<_>>().join(" "));
+    let last = |f: &dyn Fn(&str) -> bool| lines.iter().rev().take(80).map(|l| l.trim()).find(|l| f(&l.to_lowercase())).map(str::to_string);
+    match set.kind.as_str() {
+        "claude-ask" => {
+            let at = lines.iter().rposition(|l| l.contains("User answered Claude's questions"))?;
+            let mut pairs: Vec<(String, String)> = vec![];
+            for l in &lines[at + 1..] {
+                let t = l.trim().trim_start_matches('⎿').trim();
+                match t.strip_prefix("· ").and_then(|r| r.split_once(" → ")) {
+                    Some((q, a)) => pairs.push((q.trim().to_string(), a.trim().to_string())),
+                    // An answer wrapped onto the next line.
+                    None if !t.is_empty() && l.starts_with(' ') && !t.starts_with(['⏺', '✻', '❯', '•']) => match pairs.last_mut() {
+                        Some((_, a)) => {
+                            a.push(' ');
+                            a.push_str(t);
+                        }
+                        None => break,
+                    },
+                    None => break,
+                }
+            }
+            let pairs: Vec<(String, String)> = pairs.into_iter().map(|(q, a)| (q, plain(&a))).filter(|(_, a)| !a.is_empty()).collect();
+            match pairs.as_slice() {
+                [] => None,
+                [(_, a)] => Some(a.clone()),
+                _ => Some(
+                    pairs
+                        .iter()
+                        .map(|(q, a)| {
+                            let title = set.tabs.iter().find(|t| same_question(q, &t.question)).map(|t| t.title.trim()).filter(|t| !t.is_empty());
+                            format!("{}: {a}", title.unwrap_or(q))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ),
+            }
+        }
+        "claude-plan" => {
+            let said = last(&|l| l.contains("approved claude's plan") || l.contains("rejected claude's plan"))?;
+            Some(if said.to_lowercase().contains("approved") { "approved the plan".into() } else { "rejected the plan".into() })
+        }
+        "claude-permission" => {
+            last(&|l| l.contains("user rejected") || l.contains("interrupted by user") || l.contains("doesn't want to proceed")).map(|_| "No".to_string())
+        }
+        "codex-menu" => {
+            let said = last(&|l| l.contains("you approved codex") || l.contains("you canceled") || l.contains("you did not approve") || l.contains("you denied"))?;
+            Some(said.trim_start_matches(['✔', '✓', '✗', '✘', '×', ' ']).trim().to_string())
+        }
+        _ => None,
+    }
+}
+
 /// Worth asking the brain: the message's end asks the user something.
 /// Cheap and generous; the brain decides.
 pub fn looks_like_question(message: &str) -> bool {
@@ -1189,6 +1399,68 @@ pub fn waits_for_user(message: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// A turn's end that only says the session is ready: it waits for
+/// instructions, has no task yet, stands by. Nothing in it is for the user
+/// to do or decide, so on its own it is no wait (`waits_for_user` takes
+/// "waiting for your instructions" for one). True when, among the last few
+/// sentences, one says so and none hands the user anything else (a merge, a
+/// review, a question) or says something is wrong (it is blocked, it failed).
+pub fn ready_only(message: &str) -> bool {
+    let plain = plain_words(message);
+    let chars: Vec<char> = plain.chars().collect();
+    let tail: String = chars[chars.len().saturating_sub(700)..].iter().collect();
+    let trouble = [
+        "blocked", "stuck", "error", "failed", "fails", "failing", "can't", "cannot", "couldn't", "could not", "unable", "missing", "denied", "not allowed",
+        "i need", "requires your", "fehlgeschlagen", "fehler",
+        // Something didn't go as it should, in other words: the user is told, not left with "is ready".
+        "n't", " not ", "rejected", "refused", "timed out", "conflict", "broke", "crash", "wrong", "problem", "abgelehnt", " nicht ",
+    ];
+    let mut ready = false;
+    for s in split_sentences(&tail).iter().rev().take(4) {
+        if says_ready(s) {
+            ready = true;
+            continue;
+        }
+        let l = s.to_lowercase().replace(['’', '‘'], "'");
+        if asks_the_user(s) || s.contains('?') || trouble.iter().any(|w| l.contains(w)) {
+            return false;
+        }
+    }
+    ready
+}
+
+/// One sentence says the session is ready for instructions, and names
+/// nothing for the user to do.
+fn says_ready(sentence: &str) -> bool {
+    let l = format!(" {} ", sentence.to_lowercase().replace(['’', '‘'], "'").replace([',', ';', ':', '(', ')', '"', '.', '!', '?'], " "));
+    let l = l.split_whitespace().collect::<Vec<_>>().join(" ");
+    let l = format!(" {l} ");
+    // It waits (or is ready) for instructions or a task, in so many words.
+    let verbs = ["waiting for", "wait for", "waits for", "waiting on", "wait on", "await", "awaiting", "ready for", "standing by for"];
+    let objects = [
+        "your instruction", "instruction", "my instruction", "further instruction", "your next instruction", "the next instruction", "more instruction",
+        "new instruction", "your next task", "a task", "your task", "the next task", "my next task", "the first task", "your first task", "a new task",
+    ];
+    let outright = [
+        "no task yet", "have no task", "no tasks yet", "don't have a task", "do not have a task", "no instructions yet", "ready when you are", "standing by",
+        "tell me what to do", "what would you like me to do", "what would you like me to work on", "what should i work on", "how can i help",
+        "auf deine anweisung", "auf anweisungen", "auf weitere anweisungen", "noch keine aufgabe",
+    ];
+    let ready = outright.iter().any(|p| l.contains(p)) || verbs.iter().any(|v| objects.iter().any(|o| l.contains(&format!(" {v} {o}"))));
+    if !ready {
+        return false;
+    }
+    // Something concrete beside it: not only ready.
+    let concrete = [
+        "merg", " pr ", "pull request", "approv", "review", "test", "deploy", "releas", "decid", "decision", "confirm", "sign off", "sign-off", "log in",
+        "login", "sign in", "click", "verify", "check", "look at", "restart", "install", "permission", "access", "credential", "token", "password", "secret",
+        "blocked", "stuck", "error", "fail", "can't", "cannot", "unable", "conflict", " which ", "whether", "before i ", " how to ", "freigeb", "freigabe",
+        "prüf", "entscheid", "bestätig",
+    ];
+    let numbered = sentence.split('#').skip(1).any(|r| r.starts_with(|c: char| c.is_ascii_digit()));
+    !numbered && !concrete.iter().any(|w| l.contains(w))
 }
 
 /// A sentence that names what it is about only by "it", "this", "them":
@@ -1304,6 +1576,10 @@ pub fn wait_set(session: &str, name: &str, message: &str, request: &str, context
 
 /// A wait set's `reason`: what the card says about why it's the user's.
 pub const WAITS: &str = "it waits for you to do this";
+
+/// The `reason` of a question asked at the end of a turn the user typed in
+/// the session's own terminal: theirs, as it is, with no note to the brain.
+pub const TYPED_THERE: &str = "asked at the end of a turn you typed in its terminal";
 
 /// What is said of a turn that waits on the user.
 pub fn wait_line(name: &str, request: &str) -> String {
@@ -2126,7 +2402,7 @@ mod tests {
                 options: t.opts.iter().enumerate().map(|(i, o)| Opt { label: o.to_string(), description: String::new(), key: (i + 1).to_string() }).collect(),
                 multi: t.multi,
                 allows_other: true,
-                answered: false,
+                ..Default::default()
             })
             .collect();
         let s = parse_screen(&sim.render()).unwrap();
@@ -2553,5 +2829,197 @@ mod tests {
         ] {
             assert_eq!(waits_for_user(msg), None, "{msg}");
         }
+    }
+
+    /// Idle is not blocked: a session that only says it is ready waits for
+    /// nothing the user has to do. (The first four are from the tower's own
+    /// log, where each became a "waits for you" alert.)
+    #[test]
+    fn a_turn_that_only_says_it_is_ready_is_not_a_wait() {
+        for msg in [
+            "I'm waiting for your instructions",
+            "I have no task yet and I'm waiting for your instructions",
+            "I'm on dev and waiting for your instructions",
+            "First task: read CLAUDE.md and README.md, then wait for your instructions",
+            "I've read CLAUDE.md and README.md.\n\nI'm on `dev`, the tree is clean. Waiting for your instructions.",
+            "Understood: the web session is t5 and the api session is t7. I have no task yet.",
+            "Ready when you are.",
+            "Standing by for your next task.",
+            "Got it. Awaiting further instructions.",
+            "I know who the others are now. What would you like me to work on?",
+            "Alles klar. Ich warte auf deine Anweisungen.",
+        ] {
+            assert!(ready_only(msg), "{msg}");
+        }
+        // Real waits are never swallowed: something there is the user's to do.
+        for msg in [
+            "waits for you to merge PR #1250",
+            "Still waiting on you: merging #1273 into dev",
+            "PR #1250 (dev to main) is open and its checks passed. The merge command is blocked for me, so you need to merge it. I'll wait.",
+            "Plan is ready. Waiting for your approval.",
+            "I'm waiting for your instructions on whether to merge #1273 into dev.",
+            "I'm blocked on the migration and waiting for your instructions.",
+            "Waiting for your instructions before I deploy.",
+            "I'm waiting for your instructions. Also, please review PR #77.",
+            "Should I open the PR now? I'm waiting for your instructions.",
+            "The new APK is at /tmp/app.apk. You need to install it on the phone and test the header.",
+            "Waiting for your review.",
+            "Ready for you to test.",
+            "Blocked: the AWS credentials are missing. Waiting for your instructions.",
+            "The build failed on the lint step. I'm waiting for your instructions.",
+            "The staging deploy was rejected with a 403. What would you like me to do?",
+            "The migration didn't apply. I'm waiting for your instructions.",
+            "The push was refused by the remote. Standing by.",
+            "Two files are in conflict after the rebase. Ready when you are.",
+            "The request timed out twice. Awaiting further instructions.",
+        ] {
+            assert!(!ready_only(msg), "{msg}");
+        }
+        // What merely happened is neither.
+        for msg in ["I merged PR #1248 and verified dev; prod is healthy.", "Done. All tests pass.", "I created a branch for the task and pushed it.", ""] {
+            assert!(!ready_only(msg), "{msg}");
+        }
+    }
+
+    /// What the user chose in a dialog they answered in the terminal, as the screen shows it after.
+    #[test]
+    fn what_was_chosen_in_the_terminal_reads_off_the_screen() {
+        let tabs = transcript_questions(&fixture("claude-ask-transcript.jsonl")).unwrap();
+        let screen = parse_screen(&fixture("claude-ask-tab1.txt")).unwrap();
+        let ask = build("t1", "qfix ask", false, &screen, Some(tabs), "", "");
+        assert_eq!(
+            chosen_on_screen(&ask, &fixture("claude-ask-answered.txt")).as_deref(),
+            Some("Features: Search (full text), Auth (sign in); Deploy: Railway, with a staging app and preview deploys per PR; Database: SQLite (single file)")
+        );
+        assert_eq!(chosen_on_screen(&ask, &fixture("claude-ask-tab1.txt")), None, "the dialog is still up: nothing chosen yet");
+        let one = "⏺ User answered Claude's questions:\n  ⎿  · Which database should the app use? → Postgres (managed, scales)\n\n✻ Working…\n";
+        assert_eq!(chosen_on_screen(&ask, one).as_deref(), Some("Postgres (managed, scales)"), "one question: just the answer");
+
+        let perm = build("t37", "qfix perm", false, &parse_screen(&fixture("claude-permission.txt")).unwrap(), None, "approve Bash: touch /tmp/x", "");
+        assert_eq!(chosen_on_screen(&perm, "⏺ Bash(touch /tmp/x)\n  ⎿  User rejected tool use\n").as_deref(), Some("No"));
+        assert_eq!(chosen_on_screen(&perm, "⏺ Bash(touch /tmp/x)\n  ⎿  (No content)\n"), None, "granted: the screen doesn't say how (once, or always)");
+        assert_eq!(chosen_on_screen(&perm, &fixture("claude-permission.txt")), None);
+
+        let codex = build("t9", "qfix codex", true, &parse_screen(&fixture("codex-approval.txt")).unwrap(), None, "", "");
+        let after = "• Running npm test\n✔ You approved codex to run npm test this time\n\n› ";
+        assert_eq!(chosen_on_screen(&codex, after).as_deref(), Some("You approved codex to run npm test this time"));
+        assert_eq!(chosen_on_screen(&codex, "✗ You canceled the request to run rm -rf build\n").as_deref(), Some("You canceled the request to run rm -rf build"));
+    }
+
+    // ---- a dialog answered in the terminal, tab by tab ----
+
+    fn four_tabs() -> Vec<Tab> {
+        let mut tabs = transcript_questions(&fixture("claude-ask-transcript.jsonl")).unwrap();
+        tabs.push(Tab {
+            title: "Region".into(),
+            question: "Which region should it run in?".into(),
+            options: ["Frankfurt (eu-central)", "Virginia (us-east)"].iter().enumerate().map(|(i, l)| Opt { label: l.to_string(), description: String::new(), key: (i + 1).to_string() }).collect(),
+            allows_other: true,
+            ..Default::default()
+        });
+        tabs
+    }
+
+    /// Four questions; the user answered three in the terminal and is on the
+    /// fourth: the set says where the dialog is and what is answered there,
+    /// and a set read before reads as moved.
+    #[test]
+    fn a_dialog_answered_in_the_terminal_reads_as_it_stands() {
+        let screen = parse_screen(&fixture("claude-ask-4tabs-3answered.txt")).unwrap();
+        assert_eq!(screen.tabs.iter().map(|(_, a)| *a).collect::<Vec<_>>(), [true, true, true, false]);
+        let now = build("t1", "web", false, &screen, Some(four_tabs()), "", "");
+        assert_eq!((now.current_tab, now.submit_state.as_str()), (3, "answering"));
+        assert_eq!(answered_there(&now), [0, 1, 2]);
+        // The set as it was read when the dialog opened (on its first tab, nothing answered).
+        let mut was = now.clone();
+        was.current_tab = 0;
+        was.tabs.iter_mut().for_each(|t| t.answered = false);
+        assert_eq!(was.id, now.id, "the same questions: the same set");
+        assert!(dialog_moved(&was, &screen), "the card is behind the dialog");
+        assert!(!dialog_moved(&now, &screen), "read again: in step");
+        let mut back = now.clone();
+        back.current_tab = 2;
+        assert!(dialog_moved(&back, &screen), "on another tab");
+        let perm = build("t9", "p", false, &parse_screen(&fixture("claude-permission.txt")).unwrap(), None, "approve Bash: x", "");
+        assert!(!dialog_moved(&perm, &screen), "only tabbed questions move in place");
+        // The card's answers for every tab: only the fourth's goes in; the terminal's three stand.
+        let ans = |tab: usize| Answer { tab, choice: json!(0), attachments: vec![] };
+        let (left, out) = answers_left(&now, &[ans(0), ans(1), ans(2), ans(3)]);
+        assert_eq!((left.iter().map(|a| a.tab).collect::<Vec<_>>(), out.clone()), (vec![3], vec![0, 1, 2]));
+        assert_eq!(nothing_to_type(&now, &left, &out, true), None);
+        let (left, out) = answers_left(&now, &[ans(1)]);
+        assert_eq!(
+            nothing_to_type(&now, &left, &out, true).as_deref(),
+            Some("Nothing was typed: Features was answered in its terminal already; still open: Region")
+        );
+        assert_eq!(nothing_to_type(&now, &[], &[], true).as_deref(), Some("Not every question is answered yet: Region still open"), "nothing to submit yet");
+        let mut all = now.clone();
+        all.tabs[3].answered = true;
+        let (left, out) = answers_left(&all, &[ans(0), ans(3)]);
+        assert_eq!(nothing_to_type(&all, &left, &out, true).as_deref(), Some("Nothing was typed: Database and Region were answered in its terminal already; only Submit is left"));
+        assert_eq!(nothing_to_type(&all, &[], &[], true), None, "Submit only");
+    }
+
+    /// What the screen shows of the answers given in the terminal: the review lists them, a multi-choice tab its ticks.
+    #[test]
+    fn answers_given_in_the_terminal_read_off_the_dialog() {
+        let tabs = transcript_questions(&fixture("claude-ask-transcript.jsonl")).unwrap();
+        let review = build("t1", "web", false, &parse_screen(&fixture("claude-ask-review-tagged.txt")).unwrap(), Some(tabs.clone()), "", "");
+        let got: Vec<(bool, &str)> = review.tabs.iter().map(|t| (t.answered, t.answer.as_str())).collect();
+        assert_eq!(got, [(false, ""), (true, "Search (full text)"), (true, "Railway, with a staging app and preview deploys per PR")]);
+        assert_eq!(review.current_tab, 3, "on the review");
+        let ticks = build("t1", "web", false, &parse_screen(&fixture("claude-ask-tab2-checked.txt")).unwrap(), Some(tabs.clone()), "", "");
+        assert_eq!((ticks.current_tab, ticks.tabs[1].answered, ticks.tabs[1].answer.as_str()), (1, true, "Search (full text)"));
+        // A single choice on screen shows nothing of its answer.
+        let three = build("t1", "web", false, &parse_screen(&fixture("claude-ask-tab3.txt")).unwrap(), Some(tabs), "", "");
+        assert!(three.tabs.iter().all(|t| t.answer.is_empty()));
+        // On the wire: `answer` only when there is one.
+        let v = serde_json::to_value(&ticks).unwrap();
+        assert_eq!((v["current_tab"].as_u64(), v["tabs"][1]["answered"].as_bool(), v["tabs"][1]["answer"].as_str()), (Some(1), Some(true), Some("Search (full text)")));
+        assert!(v["tabs"][0].get("answer").is_none());
+    }
+
+    /// The user answered the first two questions in the terminal and is on
+    /// the third; the card sends answers for all three: only the third goes
+    /// in, from where the dialog is, and the terminal's two stand. Then all
+    /// answered there and not submitted: only Submit goes in.
+    #[test]
+    fn nothing_is_typed_for_a_tab_answered_in_the_terminal() {
+        let mut sim = Sim::new();
+        // In the terminal: Database is SQLite, Features is Auth; the dialog moved on to Deploy.
+        sim.tabs[0].picked = Some(1);
+        sim.tabs[1].checked[0] = true;
+        sim.cur = 2;
+        let now = sim_set(&mut sim);
+        assert_eq!((now.current_tab, answered_there(&now)), (2, vec![0, 1]));
+        let card = vec![
+            Answer { tab: 0, choice: json!(0), attachments: vec![] },
+            Answer { tab: 1, choice: json!({"options": [1, 2]}), attachments: vec![] },
+            Answer { tab: 2, choice: json!(1), attachments: vec![] },
+        ];
+        let (left, out) = answers_left(&now, &card);
+        assert_eq!(out, [0, 1]);
+        drive(&mut sim, &now, &left, true).unwrap();
+        assert!(sim.submitted);
+        assert_eq!((sim.tabs[0].picked, sim.tabs[1].checked.clone(), sim.tabs[2].picked), (Some(1), vec![true, false, false], Some(1)), "the terminal's answers stand");
+        assert!(!sim.log.iter().any(|k| k == "left"), "never back to a tab answered there: {:?}", sim.log);
+        assert_eq!(sim.log.first().map(String::as_str), Some("2"), "the first key is the third question's answer: {:?}", sim.log);
+
+        // All three answered there, the dialog on its review, not submitted: Submit only.
+        let mut sim = Sim::new();
+        sim.tabs[0].picked = Some(0);
+        sim.tabs[1].checked[2] = true;
+        sim.tabs[2].picked = Some(0);
+        sim.cur = 3;
+        let now = sim_set(&mut sim);
+        assert_eq!((now.current_tab, answered_there(&now)), (3, vec![0, 1, 2]));
+        assert_eq!(now.tabs[1].answer, "Billing", "the review shows what was chosen");
+        let (left, out) = answers_left(&now, &card);
+        assert!(nothing_to_type(&now, &left, &out, true).is_some_and(|w| w.ends_with("only Submit is left")), "answers for them type nothing");
+        assert!(sim.log.is_empty());
+        assert_eq!(nothing_to_type(&now, &[], &[], true), None);
+        drive(&mut sim, &now, &[], true).unwrap();
+        assert!(sim.submitted);
+        assert_eq!(sim.log, ["enter"], "Submit, nothing else: {:?}", sim.log);
     }
 }

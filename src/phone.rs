@@ -9,6 +9,7 @@ use serde_json::Value;
 use crate::config;
 use crate::daemon::lan::{
     auth::{self, Device, Devices},
+    network::{self, Here, Reach},
     tls,
 };
 use crate::protocol::{self, Request};
@@ -29,6 +30,49 @@ pub struct Status {
     /// Seconds left on the open pairing code (none open: `None`).
     pub pairing_expires_in_s: Option<u64>,
     pub devices: Vec<Device>,
+    /// Where the tower can be reached now: the network (named or not), the
+    /// LAN address, the tailnet's while listened on.
+    pub here: Here,
+    /// The devices with a stream open, and how each came in (`lan`, `tailscale`).
+    pub connected: Vec<(String, String)>,
+    /// The windows say `network::HINT` (the phones in use can't reach the tower here).
+    pub hint: bool,
+    /// The name Bonjour finds the tower by on this network, while it is advertised.
+    pub bonjour: Option<String>,
+}
+
+impl Status {
+    /// How a device came in, while it has a stream open: `lan`, `tailscale`.
+    pub fn via(&self, id: &str) -> Vec<&str> {
+        self.connected.iter().filter(|(d, _)| d == id).map(|(_, v)| v.as_str()).collect()
+    }
+
+    /// Whether a paired phone can reach the tower where the Mac is now.
+    pub fn reach(&self, d: &Device) -> Reach {
+        // Connected now: it reaches the tower, whatever it knew before.
+        match self.via(&d.id).first() {
+            Some(&"tailscale") => Reach::Tailnet,
+            Some(_) => Reach::Lan,
+            None => network::reach(&d.networks, &self.here),
+        }
+    }
+
+    /// How it is connected now, or when it was last seen and where:
+    /// `Connected now, on this network`, `Last seen 3 h ago, on Home`.
+    pub fn seen_line(&self, d: &Device) -> String {
+        let via = self.via(&d.id);
+        if via.contains(&"lan") {
+            return "Connected now, on this network".into();
+        }
+        if via.contains(&"tailscale") {
+            return "Connected now, over Tailscale".into();
+        }
+        if !via.is_empty() {
+            return "Connected now".into();
+        }
+        let on = network::last_on(&d.networks).map(|n| format!(", on {n}")).unwrap_or_default();
+        if d.last_seen_ms == 0 { format!("Never seen{on}") } else { format!("Last seen {}{on}", ago(d.last_seen_ms)) }
+    }
 }
 
 /// One address the API listens on.
@@ -56,8 +100,13 @@ impl Host {
     pub fn line(&self) -> String {
         let kind = if self.kind == "tailscale" { "Tailscale" } else { "Local network" };
         let dns = self.dns_name.as_ref().map(|n| format!(" ({n})")).unwrap_or_default();
-        format!("{kind} {}:{}{dns}", self.host, self.port)
+        format!("{kind} {}{dns}", addr(&self.host, self.port))
     }
+}
+
+/// `10.10.30.116:7843`, `[fd00::1]:7843`.
+pub fn addr(host: &str, port: impl std::fmt::Display) -> String {
+    if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") }
 }
 
 /// Tailscale as the phone API sees it.
@@ -118,6 +167,14 @@ impl Tailscale {
 
 pub fn status() -> Status {
     let info = daemon("status", "").ok();
+    // A network reads by the name it has now, if the user named it since the phone was there.
+    let names = config::Config::load().map(|c| c.lan.networks).unwrap_or_default();
+    let mut devices = Devices::load_from(&Devices::path()).unwrap_or_default().devices;
+    for k in devices.iter_mut().flat_map(|d| d.networks.iter_mut()) {
+        if let Some(n) = names.get(&k.range).filter(|n| !n.trim().is_empty()) {
+            k.name = Some(n.clone());
+        }
+    }
     Status {
         enabled: config::Config::load().map(|c| c.lan.enabled).unwrap_or(false),
         voice: info.is_some(),
@@ -128,7 +185,92 @@ pub fn status() -> Status {
             None => Tailscale::here(),
         },
         pairing_expires_in_s: info.as_ref().and_then(|v| v["pairing_expires_in_s"].as_u64()),
-        devices: Devices::load_from(&Devices::path()).unwrap_or_default().devices,
+        devices,
+        here: match &info {
+            Some(v) => Here::of(&v["network"], &v["hosts"]),
+            None => here_off(),
+        },
+        connected: info
+            .as_ref()
+            .and_then(|v| v["connected"].as_array().map(|a| a.iter().filter_map(|c| Some((c["device"].as_str()?.to_string(), c["via"].as_str()?.to_string()))).collect()))
+            .unwrap_or_default(),
+        hint: info.as_ref().is_some_and(|v| v["phone_hint"].is_string()),
+        bonjour: info.as_ref().and_then(|v| v["bonjour"]["name"].as_str().map(String::from)),
+    }
+}
+
+/// The network this Mac is on while the voice (and so the API) isn't running: nothing listens there.
+fn here_off() -> Here {
+    let cfg = config::Config::load().map(|c| c.lan).unwrap_or_default();
+    let auto = cfg.bind.is_empty() || cfg.bind == "auto";
+    let ip = if auto { crate::daemon::lan::lan_ip() } else { cfg.bind.parse().ok() };
+    let range = ip.map(network::range_of);
+    let name = range.as_ref().and_then(|r| cfg.networks.get(r).cloned()).filter(|n| !n.trim().is_empty());
+    Here { range, name, ..Default::default() }
+}
+
+/// The network this Mac is on now (`tower phone network`).
+pub fn here() -> Here {
+    match daemon("status", "") {
+        Ok(v) if v["network"].is_object() => Here::of(&v["network"], &v["hosts"]),
+        _ => here_off(),
+    }
+}
+
+/// Names the network this Mac is on now (`[lan.networks]` in config.toml;
+/// an empty name forgets it), and tells the daemon. Returns its range.
+pub fn name_network(name: &str) -> Result<String> {
+    let Some(range) = here().range else { bail!("this Mac has no network address now (is Wi-Fi on?)") };
+    let name = network::clean_name(name);
+    config::Config::write_default_if_missing()?;
+    let path = config::config_file();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let new = with_network_name(&text, &range, Some(name.as_str()).filter(|n| !n.is_empty()));
+    // Never written broken: what is written must read back.
+    if let Err(e) = config::Config::from_text(&new) {
+        bail!("config.toml wouldn't read after naming the network: {e:#}");
+    }
+    std::fs::write(&path, new)?;
+    let _ = daemon("renamed", "");
+    Ok(range)
+}
+
+/// Renames a paired phone (devices.json, under the lock the daemon takes too).
+pub fn rename(id: &str, name: &str) -> Result<String> {
+    let name = auth::clean_name(name);
+    if name.is_empty() {
+        bail!("a phone's name can't be empty");
+    }
+    if !auth::update(&Devices::path(), |d| d.rename(id, &name))? {
+        bail!("no paired device {id}");
+    }
+    let _ = daemon("renamed", "");
+    Ok(name)
+}
+
+/// Sets (or, with `None`, removes) a network's name under `[lan.networks]`,
+/// keeping the rest of the file as it is.
+pub fn with_network_name(text: &str, range: &str, name: Option<&str>) -> String {
+    const TABLE: &str = "[lan.networks]";
+    let unquoted = |k: &str| k.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+    // The entries for this range go (however the key was quoted)...
+    let mut inside = false;
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            if t.starts_with('[') {
+                inside = t.split('#').next().unwrap_or("").trim() == TABLE;
+                return true;
+            }
+            !(inside && !t.starts_with('#') && t.contains('=') && unquoted(t.split('=').next().unwrap_or("")) == range)
+        })
+        .collect();
+    let text = kept.join("\n") + "\n";
+    // ...and the new one is written in its table.
+    match name {
+        Some(n) => config::with_table_key(&text, "lan.networks", &toml::Value::String(range.to_string()).to_string(), &toml::Value::String(n.to_string()).to_string()),
+        None => text,
     }
 }
 
@@ -224,11 +366,56 @@ pub fn cmd(action: &str, id: Option<&str>, value: Option<&str>, json: bool) -> R
                     println!("  {:<12} {}", if i == 0 { "address" } else { "or" }, h.line());
                 }
             } else {
-                println!("  address      {}:{}", v["host"].as_str().unwrap_or(""), v["port"]);
+                println!("  address      {}", addr(v["host"].as_str().unwrap_or(""), &v["port"]));
             }
             println!("  code         {} {}", &code[..4.min(code.len())], &code[4.min(code.len())..]);
             println!("  certificate  {}", tls::grouped(v["fingerprint"].as_str().unwrap_or("")));
+            let here = Here::of(&v["network"], &v["hosts"]);
+            if let Some(net) = here.label() {
+                println!("  network      {net}{}", here.name.as_ref().map(|_| String::new()).unwrap_or_else(|| "  (name it: tower phone network name \"Office\")".into()));
+                println!("{}", network::requirement(&net));
+            }
             println!("The code works once, for {} minutes.", v["expires_in_s"].as_u64().unwrap_or(300) / 60);
+            Ok(())
+        }
+        "network" | "net" => {
+            match (id, value) {
+                (Some("name"), Some(name)) => {
+                    let range = name_network(name)?;
+                    let clean = network::clean_name(name);
+                    if clean.is_empty() {
+                        println!("{} has no name now.", network::label(&range, None));
+                    } else {
+                        println!("{} is called {clean} now ([lan.networks] in config.toml).", network::label(&range, None));
+                    }
+                }
+                (Some("name"), None) => bail!("tower phone network name \"<name>\" (\"\" to forget it)"),
+                (Some(other), _) => bail!("tower phone network [name \"<name>\"], not {other:?}"),
+                (None, _) => {
+                    let here = here();
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&here.view())?);
+                        return Ok(());
+                    }
+                    match (here.label(), &here.lan) {
+                        (None, _) => println!("This Mac has no network address now (is Wi-Fi on?)."),
+                        (Some(net), Some((host, port))) => println!("This Mac is on {net} · {host} (the phone API listens on {}).", addr(host, port)),
+                        (Some(net), None) => println!("This Mac is on {net}. The phone API isn't listening (tower phone enable)."),
+                    }
+                    if let (Some(range), None) = (&here.range, &here.name) {
+                        println!("Name it: tower phone network name \"Office\" (kept as \"{range}\" under [lan.networks]).");
+                    }
+                    if let Some(net) = here.label() {
+                        println!("{}", network::requirement(&net));
+                    }
+                }
+            }
+            Ok(())
+        }
+        "rename" => {
+            let (Some(id), Some(name)) = (id, value) else { bail!("tower phone rename <device id> \"<name>\"") };
+            let name = rename(id, name)?;
+            println!("{id} is called {name} now.");
             Ok(())
         }
         "devices" | "status" | "ls" => {
@@ -267,13 +454,27 @@ pub fn cmd(action: &str, id: Option<&str>, value: Option<&str>, json: bool) -> R
                     }
                 ),
             }
+            if let Some(net) = st.here.label() {
+                let at = st.here.lan.as_ref().map(|(h, _)| format!(" · {h}")).unwrap_or_default();
+                let found = st.bonjour.as_ref().map(|n| format!(", found by name on this network (Bonjour: {n:?})")).unwrap_or_default();
+                println!("This Mac is on {net}{at}{found}.");
+            }
             println!("{}", st.tailscale.line(st.url.is_some()));
-            let d = Devices::load_from(&Devices::path())?;
-            if d.devices.is_empty() {
+            // (Read again, so a damaged file is said, not shown as no phones.)
+            Devices::load_from(&Devices::path())?;
+            if st.devices.is_empty() {
                 println!("No paired phones.");
             }
-            for x in &d.devices {
-                println!("  {:<12} {:<24} replies on the {:<5}  last seen {}", x.id, x.name, x.audio_route, ago(x.last_seen_ms));
+            for x in &st.devices {
+                println!("  {:<12} {:<24} replies on the {:<5}  {}", x.id, x.name, x.audio_route, st.seen_line(x));
+                let knows = network::knows_line(&x.networks);
+                println!("  {:<12} {}", "", if knows.is_empty() { "Knows no network yet".to_string() } else { format!("Knows {knows}") });
+                if st.url.is_some() {
+                    println!("  {:<12} {}.", "", st.reach(x).line());
+                }
+            }
+            if st.hint {
+                println!("{}: no phone used today knows this network, and Tailscale isn't running.", network::HINT);
             }
             Ok(())
         }
@@ -289,7 +490,7 @@ pub fn cmd(action: &str, id: Option<&str>, value: Option<&str>, json: bool) -> R
             println!("Revoked {n} device(s): their tokens no longer work, and their open streams are closed.");
             Ok(())
         }
-        other => bail!("tower phone {other}: use enable, disable, pair, devices, route or revoke"),
+        other => bail!("tower phone {other}: use enable, disable, pair, devices, network, rename, route or revoke"),
     }
 }
 
@@ -420,6 +621,65 @@ mod tests {
         let t = with_top_level("", "question_policy", "\"normal\"");
         let v: toml::Value = toml::from_str(&t).unwrap();
         assert_eq!(v["question_policy"].as_str(), Some("normal"));
+    }
+
+    #[test]
+    fn naming_a_network_keeps_the_rest_of_config_toml() {
+        use super::with_network_name;
+        let text = "# my settings\nvoice = \"af_bella\"\n\n[lan]\nenabled = true # on\nport = 7843\n\n[[setups]]\nname = \"web\"\nrepos = [\"~/w\"]\n";
+        let named = with_network_name(text, "10.10.30", Some("Office"));
+        let cfg = crate::config::Config::from_text(&named).unwrap();
+        assert_eq!(cfg.lan.networks.get("10.10.30").map(String::as_str), Some("Office"));
+        assert!(cfg.lan.enabled && cfg.lan.port == 7843);
+        assert_eq!(cfg.setups.len(), 1, "the setups are kept");
+        assert!(named.starts_with("# my settings\nvoice = \"af_bella\"\n") && named.contains("enabled = true # on"), "comments and order kept: {named}");
+        // A second network, then the first renamed: one line each, the other kept.
+        let two = with_network_name(&with_network_name(&named, "192.168.2", Some("Home")), "10.10.30", Some("Head \"office\""));
+        let cfg = crate::config::Config::from_text(&two).unwrap();
+        assert_eq!(cfg.lan.networks.len(), 2);
+        assert_eq!(cfg.lan.networks["10.10.30"], "Head \"office\"", "quotes in a name are escaped");
+        assert_eq!(cfg.lan.networks["192.168.2"], "Home");
+        assert_eq!(two.matches("[lan.networks]").count(), 1);
+        // However the key was written by hand, it is replaced, not doubled.
+        let hand = "[lan.networks]\n'10.10.30' = \"Old\"\n";
+        let cfg = crate::config::Config::from_text(&with_network_name(hand, "10.10.30", Some("New"))).unwrap();
+        assert_eq!(cfg.lan.networks["10.10.30"], "New");
+        // An IPv6 network's range is its address: quoted as a key.
+        let v6 = with_network_name("", "fd00::1", Some("Lab"));
+        assert_eq!(crate::config::Config::from_text(&v6).unwrap().lan.networks["fd00::1"], "Lab");
+        // Forgotten: the line goes, the rest stays.
+        let gone = with_network_name(&two, "10.10.30", None);
+        let cfg = crate::config::Config::from_text(&gone).unwrap();
+        assert_eq!((cfg.lan.networks.len(), cfg.lan.networks.get("192.168.2").map(String::as_str)), (1, Some("Home")));
+        assert_eq!(cfg.setups.len(), 1);
+        // A config with no names writes none (the default's file has no empty table).
+        assert!(!toml::to_string(&crate::config::Config::default()).unwrap().contains("networks"));
+    }
+
+    #[test]
+    fn a_phone_reads_as_where_it_is_and_what_it_knows() {
+        use crate::daemon::lan::network::{Here, Known, Reach};
+        let known = |range: &str, name: Option<&str>, host: &str, last: u64| Known { range: range.into(), name: name.map(String::from), host: host.into(), port: 7843, first_ms: 1, last_ms: last };
+        let dev = super::Device {
+            id: "d_1".into(),
+            name: "OnePlus".into(),
+            token_sha256: String::new(),
+            created_ms: 1,
+            last_seen_ms: crate::history::now_ms() - 3 * 3_600_000,
+            audio_route: "phone".into(),
+            install_id: None,
+            networks: vec![known("192.168.2", Some("Home"), "192.168.2.211", 5), known("10.10.30", None, "10.10.30.9", 2)],
+        };
+        let here = Here { range: Some("10.10.30".into()), name: Some("Office".into()), lan: Some(("10.10.30.116".into(), 7843)), tailnet: None };
+        let st = |connected: Vec<(String, String)>| super::Status { here: here.clone(), connected, ..Default::default() };
+        let away = st(vec![]);
+        assert_eq!(away.seen_line(&dev), "Last seen 3 h ago, on Home");
+        assert_eq!(away.reach(&dev), Reach::Elsewhere);
+        assert_eq!(crate::daemon::lan::network::knows_line(&dev.networks), "Home and the network 10.10.30.x");
+        let on = st(vec![("d_1".into(), "lan".into())]);
+        assert_eq!((on.seen_line(&dev).as_str(), on.reach(&dev)), ("Connected now, on this network", Reach::Lan));
+        let tail = st(vec![("d_1".into(), "tailscale".into())]);
+        assert_eq!((tail.seen_line(&dev).as_str(), tail.reach(&dev)), ("Connected now, over Tailscale", Reach::Tailnet));
     }
 
     #[test]

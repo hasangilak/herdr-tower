@@ -10,6 +10,9 @@
 //! (`questions::safe_auto`: only a plain one-time yes) and the user's policy
 //! override the brain; both are checked again on the screen right before an
 //! answer is typed for the user.
+//!
+//! A set that is the user's is a decision (`decisions`): the same thing
+//! asked by several sessions of a space is one, told once.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -26,6 +29,10 @@ use crate::questions::{self, Answer, QuestionSet};
 
 type Notify = Box<dyn Fn(&str, &str) + Send + Sync>;
 type Note = Arc<dyn Fn(&str) + Send + Sync>;
+/// A session's screen as it is now (None: it couldn't be read).
+type Screen = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+/// Writes a line in the history.
+type Record = Arc<dyn Fn(crate::history::Entry) + Send + Sync>;
 
 /// A queued reply drops after this long (its question is stale by then).
 const REPLY_TTL_MS: u64 = 30 * 60 * 1000;
@@ -85,6 +92,20 @@ impl std::fmt::Display for Held {
 
 impl std::error::Error for Held {}
 
+/// The user is answering the dialog in its terminal (a tab is answered
+/// there, or it is on another tab than it opened on): the tower types
+/// nothing of its own into it, and it is the user's card, quietly.
+#[derive(Debug)]
+struct Busy(String);
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Busy {}
+
 /// An answer that comes too late: the question was answered (or closed, or
 /// read again) meanwhile. Nothing was typed; the tower doesn't take it to
 /// the user as a failure.
@@ -101,6 +122,60 @@ impl std::error::Error for Late {}
 
 /// Closed sets remembered, so a late action on one hears how it ended.
 const KEEP_PAST: usize = 100;
+
+/// Sets answered in their session's own terminal are remembered this long:
+/// a prompt hook that comes after the radar finds its set, and a screen read
+/// before the answer can't bring the card back.
+const THERE_KEEP_MS: u64 = 60_000;
+
+/// A set its session stopped showing without the tower answering it: the
+/// user answered it in the session's own terminal (for a text question, the
+/// prompt hook says whether it was the user who went on, and with what
+/// words). Its card and its decision went at once; its line in the record
+/// waits a moment for what was chosen.
+#[derive(Debug, Clone)]
+struct There {
+    set: QuestionSet,
+    /// The decision it stood in, when it was the user's.
+    decision: Option<String>,
+    /// That decision closed with it (nobody else asks the same).
+    over: bool,
+    closed_ms: u64,
+    /// What the user typed there: a text question's answer.
+    words: Option<String>,
+    /// The next prompt was the tower's (or another terminal's), not the user's.
+    not_users: bool,
+    /// Its line is in the record.
+    recorded: bool,
+}
+
+/// How long the record line of a set answered in its terminal waits: for
+/// its screen to show what was chosen, and for a text question's words to
+/// come with the prompt hook.
+#[derive(Debug, Clone, Copy)]
+struct Waits {
+    screen_ms: u64,
+    words_ms: u64,
+}
+
+impl Default for Waits {
+    fn default() -> Waits {
+        Waits { screen_ms: 700, words_ms: 6_000 }
+    }
+}
+
+/// A prompt this soon after the tower typed into a session is taken to be
+/// the tower's, for a question it asked at the end of its turn.
+const TYPED_MS: u64 = 20_000;
+
+/// A session working again while its question at the end of a turn is open.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WentOn {
+    /// On a prompt that isn't the user's: the question stays open.
+    Kept,
+    /// Whose prompt it is, its hook is still to say (since when it was seen working).
+    Waiting(u64),
+}
 
 /// Why a session's set is over when the session stops showing it.
 fn over_why(s: &QuestionSet, gone: bool) -> CloseWhy {
@@ -135,6 +210,18 @@ struct Inner {
     /// Sessions whose dialog is being read (the status line it was read
     /// for): one reader per screen.
     reading: HashMap<String, String>,
+    /// Sets answered in their terminal lately (`There`).
+    there: Vec<There>,
+    /// What the user typed in a session's terminal while its text question
+    /// was open, by session (and when): that question's answer.
+    typed_words: HashMap<String, (String, u64)>,
+    /// Sessions working again with a question at the end of a turn open, by
+    /// session, until they stop: on a prompt that isn't the user's, or one
+    /// whose hook is still to say whose it is (`Asks::went_on`).
+    went_on: HashMap<String, WentOn>,
+    /// The latest prompt each session's hook said was not the user's: when,
+    /// and at which turn count.
+    not_users: HashMap<String, (u64, Option<u64>)>,
 }
 
 impl Inner {
@@ -158,6 +245,9 @@ struct Saved {
     dismissed: Vec<(String, String)>,
     replies: HashMap<String, Reply>,
     noted: Vec<String>,
+    /// Kept by a tower that makes no card of a turn that only says its
+    /// session is ready (false: an older one's file, looked through once).
+    ready_checked: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -166,6 +256,8 @@ struct SavedSet {
     set: QuestionSet,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     created_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    space: Option<String>,
 }
 
 impl Saved {
@@ -232,16 +324,41 @@ pub struct Asks {
     notify: Arc<std::sync::OnceLock<Notify>>,
     /// Tells the brain (`[question] …`); tests keep what it would have been told.
     brain: Note,
+    /// What needs the user, one decision per key: the sets that are theirs
+    /// go there (none: tests that keep no decisions).
+    decisions: Arc<std::sync::OnceLock<super::decisions::Decisions>>,
+    /// A session's screen as it is now (`hc read`); tests give their own.
+    screen: Screen,
+    /// Writes a line in the history (tests keep what it would have been).
+    record: Record,
+    waits: Waits,
 }
 
 impl Asks {
     pub fn new(shared: Shared, hub: Arc<Hub>, policy: &str) -> Asks {
+        // To the brain of the asking session's space, when it has one (the note names the session).
         let brain: Note = Arc::new(|text: &str| {
-            if let Err(e) = crate::brain::note(text) {
+            if let Err(e) = super::brains::note_about(text, false) {
                 eprintln!("[questions] the brain can't take it: {e:#}");
             }
         });
-        let me = Asks { inner: Arc::new(Mutex::new(Inner::default())), store: None, shared, hub, notify: Arc::new(std::sync::OnceLock::new()), brain };
+        let me = Asks {
+            inner: Arc::new(Mutex::new(Inner::default())),
+            store: None,
+            shared,
+            hub,
+            notify: Arc::new(std::sync::OnceLock::new()),
+            brain,
+            decisions: Arc::default(),
+            screen: Arc::new(|address: &str| hc::run(&["read", address, "--lines", "60"]).ok().filter(|o| o.code == 0).map(|o| o.stdout)),
+            record: Arc::new(|e: crate::history::Entry| {
+                // Tests never write the history.
+                if !cfg!(test) {
+                    crate::history::later(move || crate::history::append(e));
+                }
+            }),
+            waits: Waits::default(),
+        };
         me.set_policy(policy);
         me
     }
@@ -256,6 +373,30 @@ impl Asks {
         crate::config::state_dir().join("questions.json")
     }
 
+    /// Tells no brain anything (tests outside this file: nothing reaches a real session).
+    #[cfg(test)]
+    pub fn telling_no_brain(mut self) -> Asks {
+        self.brain = Arc::new(|_: &str| ());
+        self
+    }
+
+    /// The sets that are the user's become decisions there, from now on.
+    pub fn with_decisions(self, decisions: super::decisions::Decisions) -> Asks {
+        let _ = self.decisions.set(decisions);
+        self
+    }
+
+    /// Whether the user is told of a set that is theirs now. It is one
+    /// decision per key: told when the decision first appears, and the same
+    /// thing asked again says nothing; unless the tower tells everything,
+    /// when it is told as it was before (`loud`). Never from a muted space.
+    fn tells(&self, set: &str, loud: bool) -> bool {
+        match self.decisions.get() {
+            Some(d) => d.tells(&d.for_question(set), loud),
+            None => loud,
+        }
+    }
+
     /// Writes what a restart needs (every change to the cards ends here).
     fn save(&self) {
         let Some(store) = &self.store else { return };
@@ -263,10 +404,11 @@ impl Asks {
         let saved = {
             let i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             Saved {
-                sets: i.sets.iter().map(|s| SavedSet { set: s.clone(), created_ms: s.created_ms }).collect(),
+                sets: i.sets.iter().map(|s| SavedSet { set: s.clone(), created_ms: s.created_ms, space: s.space.clone() }).collect(),
                 dismissed: i.dismissed.clone(),
                 replies: i.replies.clone(),
                 noted: i.noted.clone(),
+                ready_checked: true,
             }
         };
         if let Err(e) = saved.write(&store.0) {
@@ -285,24 +427,41 @@ impl Asks {
         let Some(store) = &self.store else { return };
         let saved = Saved::load(&store.0);
         if saved.sets.is_empty() && saved.replies.is_empty() && saved.dismissed.is_empty() {
+            // No card is left: a decision that stood for one is over.
+            self.publish();
             return;
         }
         let mut looked: HashMap<String, Terminal> = HashMap::new();
         let mut look = |a: &str| looked.entry(a.to_string()).or_insert_with(|| Terminal::of(a)).clone();
-        self.restore_from(saved, &mut look, crate::history::now_ms());
+        // What was asked of a session, as the ledger's file says (the queue and the ledger start after this).
+        let now = crate::history::now_ms();
+        let ledger = crate::agenda::Ledger::load_from(&crate::agenda::path());
+        let asked = |a: &str| ledger.at_work_on(a, now, 60_000).is_some_and(|t| !questions::ready_only(&t.instruction));
+        self.restore_from(saved, &mut look, &asked, now);
     }
 
-    fn restore_from(&self, saved: Saved, look: &mut dyn FnMut(&str) -> Terminal, now_ms: u64) {
+    /// `asked`: something was asked of that session (`has_work`, as far as the files say).
+    fn restore_from(&self, saved: Saved, look: &mut dyn FnMut(&str) -> Terminal, asked: &dyn Fn(&str) -> bool, now_ms: u64) {
         let mut kept: Vec<QuestionSet> = vec![];
         let mut over: Vec<QuestionSet> = vec![];
+        // An older tower made a "waits for you" card of a turn that only said its session was ready.
+        // This one never does, so its own cards are never looked through for that.
+        let older = !saved.ready_checked;
         for s in saved.sets {
             let mut set = s.set;
             set.created_ms = s.created_ms;
+            set.space = s.space;
             set.state = card::SetState::from_wire(&set.status, set.decision.as_deref(), set.error.as_deref());
             card::sync(&mut set);
             let t = look(&set.session);
             let why = match &t {
                 _ if !t.same(set.created_ms) => Some(CloseWhy::SessionGone),
+                // Idle is not blocked: a card that only said its session was ready (an older tower made those).
+                // By the whole message it kept, not the one sentence in its title: "The build failed.
+                // I'm waiting for your instructions." is a real wait.
+                _ if older && set.reason == questions::WAITS && questions::ready_only(if set.detail.trim().is_empty() { &set.title } else { &set.detail }) && !asked(&set.session) => {
+                    Some(CloseWhy::NothingAsked)
+                }
                 Terminal::Live { status, .. } if set.kind != "text" && *status != SessionStatus::Blocked => Some(over_why(&set, false)),
                 Terminal::Live { status, .. } if set.kind == "text" && matches!(status, SessionStatus::Working | SessionStatus::Starting) => {
                     Some(over_why(&set, false))
@@ -417,7 +576,11 @@ impl Asks {
 
     fn publish(&self) {
         self.save();
-        let sets = self.list();
+        let (sets, past) = {
+            let i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let past: Vec<(String, crate::decisions::State)> = i.past.iter().map(|p| (p.id.clone(), ended_as(p))).collect();
+            (i.sets.clone(), past)
+        };
         let by_session: HashMap<String, String> = sets.iter().map(|s| (s.session.clone(), s.id.clone())).collect();
         self.shared.update(|st| {
             st.questions = sets.iter().map(|s| serde_json::to_value(s).unwrap_or_default()).collect();
@@ -425,6 +588,10 @@ impl Asks {
                 a.question = by_session.get(&a.address).cloned();
             }
         });
+        // The sets that are the user's, as decisions: one per key.
+        if let Some(d) = self.decisions.get() {
+            d.sync_questions(&sets, &|id| past.iter().rev().find(|(p, _)| p == id).map(|(_, s)| *s).unwrap_or(crate::decisions::State::Stopped));
+        }
     }
 
     fn event(&self, op: &str, set: Option<&QuestionSet>, id: &str) {
@@ -460,8 +627,14 @@ impl Asks {
         if !blocked {
             let gone = status.ended();
             self.close_where(address, |s| s.kind != "text", |s| over_why(s, gone), true);
-            if *status == SessionStatus::Working || gone {
+            if gone {
+                self.inner.lock().unwrap_or_else(|e| e.into_inner()).went_on.remove(address);
                 self.close_where(address, |s| s.kind == "text", |s| over_why(s, gone), true);
+            } else if *status == SessionStatus::Working {
+                self.went_on(address, turn_of(t));
+            } else {
+                // It stopped: when it works again, that is looked at anew.
+                self.inner.lock().unwrap_or_else(|e| e.into_inner()).went_on.remove(address);
             }
             if let Some(r) = self.due_reply(address, status, turn_of(t), hc::created_ms(t), crate::history::now_ms()) {
                 match type_into(address, &r.text) {
@@ -506,6 +679,109 @@ impl Asks {
                 i.reading.remove(&address);
             }
         });
+    }
+
+    /// The session works again while a question it asked at the end of its
+    /// turn is open. One answered here (its reply is what went in) is over.
+    /// Any other stays the user's unless the prompt it works on is theirs:
+    /// one the tower typed (an instruction, a message from another session,
+    /// an introduction, also one typed in while it worked and sent as it
+    /// stopped), another terminal's, or the session's own (its background
+    /// work reporting back) leaves it open, and its decision with it; the
+    /// user's words close it, with them (`typed_there`). The prompt hook says
+    /// whose it is, and the radar can be first: it is waited for a moment,
+    /// and with no word from it the question was answered in the terminal,
+    /// as before.
+    fn went_on(&self, address: &str, turn: Option<u64>) {
+        self.close_where(address, |s| s.kind == "text" && s.state.answered_here(), |s| over_why(s, false), true);
+        if !self.list().iter().any(|s| s.session == address && s.kind == "text") {
+            return;
+        }
+        let seen_ms = crate::history::now_ms();
+        {
+            let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if i.went_on.contains_key(address) {
+                return;
+            }
+            if not_the_users(&i, address, turn, seen_ms) {
+                i.went_on.insert(address.to_string(), WentOn::Kept);
+                eprintln!("[questions] {address} works on a prompt that isn't the user's: its question stays open");
+                return;
+            }
+            i.went_on.insert(address.to_string(), WentOn::Waiting(seen_ms));
+        }
+        let (me, address) = (self.clone(), address.to_string());
+        std::thread::spawn(move || {
+            let until = seen_ms + me.waits.words_ms;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let open = me.list().iter().any(|s| s.session == address && s.kind == "text" && s.at_ms <= seen_ms);
+                let mut i = me.inner.lock().unwrap_or_else(|e| e.into_inner());
+                let mine = i.went_on.get(&address) == Some(&WentOn::Waiting(seen_ms));
+                if i.went_on.get(&address) == Some(&WentOn::Kept) || (!mine && i.went_on.contains_key(&address)) {
+                    return;
+                }
+                if !open {
+                    if mine {
+                        i.went_on.remove(&address);
+                    }
+                    return;
+                }
+                let now = crate::history::now_ms();
+                if not_the_users(&i, &address, turn, now) {
+                    i.went_on.insert(address.clone(), WentOn::Kept);
+                    eprintln!("[questions] {address} works on a prompt that isn't the user's: its question stays open");
+                    return;
+                }
+                if now >= until {
+                    if mine {
+                        i.went_on.remove(&address);
+                    }
+                    drop(i);
+                    // No word whose prompt it was: the session went on, so it was answered there.
+                    me.close_where(&address, |s| s.kind == "text" && s.at_ms <= seen_ms, |s| over_why(s, false), true);
+                    return;
+                }
+            }
+        });
+    }
+
+    /// From now on (the daemon's): every open tabbed dialog is looked at
+    /// again about every 1.5 seconds while its session shows it. The user
+    /// may be answering it in the terminal, tab by tab, which changes nothing
+    /// in Herdr's status: when its screen shows another tab, or other tabs
+    /// answered, it is read again whole, and its card (the Mac's, the
+    /// phone's, its decision's) follows.
+    pub fn follow(&self) {
+        let me = self.clone();
+        let _ = std::thread::Builder::new().name("questions-follow".into()).spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(1_500));
+                me.look_again();
+            }
+        });
+    }
+
+    /// One look at every open tabbed dialog (one `hc read` each).
+    fn look_again(&self) {
+        let open: Vec<QuestionSet> = {
+            let i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            i.sets
+                .iter()
+                // Being typed into (the driver reads it itself), or being read: not now.
+                .filter(|s| s.kind == "claude-ask" && !s.session.contains('/') && matches!(s.state.phase, Phase::Open | Phase::Failed { .. }))
+                .filter(|s| !i.reading.contains_key(&s.session))
+                .cloned()
+                .collect()
+        };
+        for set in open {
+            let Ok(out) = hc::run(&["read", &set.session]) else { continue };
+            let Some(screen) = questions::parse_screen(&out.stdout) else { continue };
+            if questions::dialog_moved(&set, &screen) {
+                eprintln!("[questions] {} ({}): its dialog moved on in the terminal; reading it again", set.id, set.session);
+                self.refresh(&set.session);
+            }
+        }
     }
 
     /// A waiting reply's session has `status` now: stopping for a dialog
@@ -557,13 +833,28 @@ impl Asks {
             Some(set) => Some(self.upsert(set)),
             None => {
                 let had = self.list().iter().any(|s| s.session == address && s.kind != "text");
-                self.close_where(address, |s| s.kind != "text", |s| over_why(s, false), true);
-                // Blocked on something it can't read: the plain notice, as before.
+                let blocked = hc::get(address).filter(|t| hc::status(t) == SessionStatus::Blocked);
+                // Still blocked, on a screen it can't read now: not answered, only out of sight.
+                let still = blocked.is_some();
+                self.close_where(address, |s| s.kind != "text", |s| if still && !s.state.answered_here() { CloseWhy::Unread } else { over_why(s, false) }, true);
+                // Blocked on something it can't read: a decision of its own (on
+                // the orb's count, in the queue, with Herdr one tap away), told
+                // as the plain notice was: once at a quiet level.
                 if !had
-                    && let Some(t) = hc::get(address).filter(|t| hc::status(t) == SessionStatus::Blocked)
+                    && let Some(t) = blocked
                     && !super::watch::left_alone(&t)
                 {
-                    self.tell(address, &blocked_notice(&hc::spoken_name(&t), &t["status"]));
+                    let notice = blocked_notice(&hc::spoken_name(&t), &t["status"]);
+                    let told = match self.decisions.get() {
+                        Some(d) => {
+                            let who = crate::decisions::Who::new(address, &hc::spoken_name(&t));
+                            d.blocked(crate::spaces::space_of(&t), who, &blocked_title(&t["status"]))
+                        }
+                        None => true,
+                    };
+                    if told {
+                        self.tell(address, &notice);
+                    }
                 }
                 None
             }
@@ -584,49 +875,90 @@ impl Asks {
         let ended_ms = crate::history::now_ms();
         std::thread::spawn(move || {
             let Some(message) = turn_message(&address, &t, ended_ms) else { return };
+            // A turn the user started in its own terminal: the user is in that conversation.
+            let own = super::typed::users_turn(&address);
             let context = crate::history::jobs(&crate::history::load()).into_iter().find(|j| j.session == address).map(|j| j.title).unwrap_or_default();
             let waits = questions::waits_for_user(&message);
             let watched = reported.lock().unwrap_or_else(|e| e.into_inner()).contains(&address);
+            let (name, space) = (hc::spoken_name(&t), crate::spaces::space_of(&t));
+            // It only says it is ready: that hands the user nothing.
+            let ready = questions::ready_only(&message);
             // PRs it opened (or ends on): chips in the chat, waiting for the user's merge.
             let found = crate::prs::links(&format!("{message}\n{}", turn_transcript(&address, &t)));
             if !found.is_empty()
                 && let Some(store) = crate::prs::daemon()
             {
-                let name = hc::spoken_name(&t);
-                let open = store.found(&found, &address, &name, crate::spaces::space_of(&t).as_deref(), true);
+                let open = store.found(&found, &address, &name, space.as_deref(), true);
                 // Its wait is the merge (or it just ended on the PR): the chip is what the user acts on.
-                let on_merge = waits.as_deref().is_none_or(|r| r.to_lowercase().contains("merg"));
+                let on_merge = waits.as_deref().filter(|_| !ready).is_none_or(|r| r.to_lowercase().contains("merg"));
                 if !open.is_empty() && on_merge {
-                    if !watched {
+                    // One merge decision per repo and space: said when it first appears.
+                    let tells = match me.decisions.get() {
+                        Some(d) => d.tells_merge(&open, !watched),
+                        None => !watched,
+                    };
+                    if tells {
                         me.tell(&address, &pr_line(&name, &open));
                     }
                     return;
                 }
             }
+            // Idle is not blocked: no card, no alert, no decision.
+            if idle_ready(&address, &message) {
+                eprintln!("[questions] {address} ({name}) is ready: it only says it waits for instructions, and nothing was asked of it");
+                me.shared.record(&address, &format!("{name} is ready"), "ready");
+                return;
+            }
             if let Some(request) = waits {
-                me.waiting(&address, &hc::spoken_name(&t), hc::created_ms(&t), &message, &request, &context, watched);
+                me.waiting_in(space, &address, &name, hc::created_ms(&t), &message, &request, &context, watched, own);
                 return;
             }
             if !questions::looks_like_question(&message) {
                 return;
             }
-            let mut set = questions::text_set(&address, &hc::spoken_name(&t), &message, &context);
+            let mut set = questions::text_set(&address, &name, &message, &context);
             set.at_ms = crate::history::now_ms();
             set.created_ms = hc::created_ms(&t);
-            me.upsert(set);
+            set.space = space;
+            me.asked_after(set, own);
         });
+    }
+
+    /// A question a session's message asks at the end of its turn: a card,
+    /// for the brain to read (it recommends replies, and decides). `own`: the
+    /// user typed that turn in the session's own terminal, so the question is
+    /// theirs as it is: their card at once, no note to the brain, nothing said.
+    fn asked_after(&self, mut set: QuestionSet, own: bool) -> QuestionSet {
+        if own {
+            let _ = card::apply(&mut set, &Ev::Decide { auto: false });
+            set.reason = questions::TYPED_THERE.into();
+            eprintln!("[questions] {} ({}) asks, at the end of a turn the user typed in its terminal: {}", set.session, set.name, set.title);
+        }
+        self.upsert(set)
     }
 
     /// A turn that ended waiting for the user to act: a card that goes
     /// straight to them (the brain can't merge or test for them, so it isn't
     /// asked to answer it), the session's open job blocked on it, and the
     /// request said in plain words: by the tower, unless a watch reports
-    /// this turn to the brain (it says it then, naming the space).
+    /// this turn to the brain (it says it then, naming the space). At a
+    /// quiet level the tower says it itself either way, and once per
+    /// decision: the same wait from another session of the space adds its
+    /// session to the card and says nothing.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn waiting(&self, address: &str, name: &str, created_ms: Option<u64>, message: &str, request: &str, context: &str, watched: bool) -> Option<QuestionSet> {
+        self.waiting_in(None, address, name, created_ms, message, request, context, watched, false)
+    }
+
+    /// `waiting`, for a session in `space`. `own`: the turn was the user's,
+    /// typed in the session's terminal: its card is there, and nothing is said.
+    #[allow(clippy::too_many_arguments)]
+    fn waiting_in(&self, space: Option<String>, address: &str, name: &str, created_ms: Option<u64>, message: &str, request: &str, context: &str, watched: bool, own: bool) -> Option<QuestionSet> {
         let mut set = questions::wait_set(address, name, message, request, context);
         set.at_ms = crate::history::now_ms();
         set.created_ms = created_ms;
+        set.space = space;
         let known = self.get(&set.id).is_some();
         let set = self.upsert(set);
         if known {
@@ -635,7 +967,9 @@ impl Asks {
         eprintln!("[questions] {address} ({name}) waits for the user: {request}");
         let (a, r) = (address.to_string(), request.to_string());
         crate::history::later(move || crate::history::job_follow(&a, crate::history::JobState::Blocked, &r));
-        if !watched {
+        if own {
+            eprintln!("[questions] {address} ({name}): the user typed that turn in its terminal; its wait isn't said");
+        } else if self.tells(&set.id, !watched) {
             self.tell(address, &questions::wait_line(name, request));
         }
         Some(set)
@@ -650,6 +984,12 @@ impl Asks {
             let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             // Dismissed while the session still shows it: it stays away.
             if i.dismissed.iter().any(|(a, id)| *a == set.session && *id == set.id) {
+                return set;
+            }
+            // Read before the user answered it in the terminal (a reader a step behind the
+            // radar): that screen is gone, and its card doesn't come back.
+            if set.kind != "text" && set.at_ms > 0 && i.there.iter().any(|x| x.set.session == set.session && x.set.id == set.id && set.at_ms <= x.closed_ms) {
+                eprintln!("[questions] {} ({}): read before it was answered in its terminal; not shown again", set.id, set.session);
                 return set;
             }
             let mut old = i.sets.iter().position(|s| s.session == set.session && (s.kind == "text") == (set.kind == "text"));
@@ -674,7 +1014,14 @@ impl Asks {
                     set.answered_with = o.answered_with.clone();
                     set.replaces = set.replaces.take().or_else(|| o.replaces.clone());
                     set.created_ms = set.created_ms.or(o.created_ms);
+                    set.space = set.space.take().or_else(|| o.space.clone());
                     set.state = o.state.clone();
+                    // What a tab was answered with stays known after the screen stops showing it.
+                    for (t, was) in set.tabs.iter_mut().zip(&o.tabs) {
+                        if t.answered && t.answer.is_empty() && was.answered {
+                            t.answer = was.answer.clone();
+                        }
+                    }
                     card::sync(&mut set);
                     i.sets[k] = set.clone();
                     false
@@ -693,6 +1040,7 @@ impl Asks {
                         // decides it still), with what was recommended for the
                         // questions that didn't change.
                         set.replaces = Some(old.id.clone());
+                        set.space = set.space.take().or_else(|| old.space.clone());
                         if old.state.decision == Decision::Escalated {
                             set.state.decision = Decision::Escalated;
                             set.reason = old.reason.clone();
@@ -724,6 +1072,10 @@ impl Asks {
             }
             (new, note, closed)
         };
+        // Another dialog in place of one the tower didn't answer: that one was answered in its terminal.
+        if let Some(c) = closed.as_ref().filter(|c| c.kind != "text" && c.state.phase == Phase::Closed { why: CloseWhy::Unblocked }) {
+            self.answered_there(vec![c.clone()]);
+        }
         self.publish();
         self.event(if new { "open" } else { "update" }, Some(&set), &set.id);
         if let Some(c) = &closed {
@@ -757,6 +1109,7 @@ impl Asks {
     /// the brain again); without it (the user dismissed a dialog still up)
     /// they stay known.
     fn close_where(&self, address: &str, which: impl Fn(&QuestionSet) -> bool, why: impl Fn(&QuestionSet) -> CloseWhy, over: bool) {
+        let mut there: Vec<QuestionSet> = vec![];
         let gone: Vec<String> = {
             let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let ids: Vec<String> = i.sets.iter().filter(|s| s.session == address && which(s)).map(|s| s.id.clone()).collect();
@@ -769,8 +1122,13 @@ impl Asks {
             i.sets = keep;
             for mut s in closing {
                 let w = why(&s);
+                // The session went on without the tower: the user answered it in its own terminal.
+                let answered_there = matches!(w, CloseWhy::Unblocked | CloseWhy::AnsweredElsewhere);
                 // Closing never fails but for a re-read while typing, which isn't closed here.
                 let _ = card::apply(&mut s, &Ev::Close(w));
+                if answered_there {
+                    there.push(s.clone());
+                }
                 i.remember(s);
             }
             if over {
@@ -787,11 +1145,194 @@ impl Asks {
             }
             ids
         };
+        // Their decisions close first, as answered there (the queue published next leaves them out).
+        self.answered_there(there);
         if !gone.is_empty() {
             self.publish();
             for id in gone {
                 self.event("closed", None, &id);
             }
+        }
+    }
+
+    /// Sets the session stopped showing without the tower answering them:
+    /// the user answered them in the session's own terminal. The decision
+    /// each stood in closes now, as answered (the Mac's windows and the phone
+    /// lose its card with the next state), nothing is said, and a line in the
+    /// record follows in a moment with what was chosen: what the screen shows
+    /// for a dialog, the words the user typed for a text question.
+    fn answered_there(&self, sets: Vec<QuestionSet>) {
+        let now = crate::history::now_ms();
+        for set in sets {
+            let decided = self.decisions.get().map(|d| d.answered_in_terminal(&set.id)).unwrap_or_default();
+            let (decision, over) = match decided.first() {
+                Some((id, over)) => (Some(id.clone()), *over),
+                None => (None, false),
+            };
+            {
+                let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                i.there.retain(|x| now.saturating_sub(x.closed_ms) < THERE_KEEP_MS && x.set.id != set.id);
+                i.typed_words.retain(|_, (_, at)| now.saturating_sub(*at) < THERE_KEEP_MS);
+                let words = if set.kind == "text" { i.typed_words.remove(&set.session).map(|(w, _)| w) } else { None };
+                i.there.push(There { set: set.clone(), decision, over, closed_ms: now, words, not_users: false, recorded: false });
+            }
+            eprintln!("[questions] {} ({}): its session went on without the tower: answered in its terminal", set.id, set.session);
+            self.record_there_later(&set.id);
+        }
+    }
+
+    fn there(&self, id: &str) -> Option<There> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).there.iter().rev().find(|x| x.set.id == id).cloned()
+    }
+
+    /// The record line of a set answered in its terminal, once what was
+    /// chosen is known (or waited for long enough).
+    fn record_there_later(&self, id: &str) {
+        let (me, id) = (self.clone(), id.to_string());
+        std::thread::spawn(move || {
+            let Some(x) = me.there(&id) else { return };
+            let chosen = if x.set.kind == "text" {
+                // The words come with the prompt hook, which may be a moment behind the radar.
+                let until = crate::history::now_ms() + me.waits.words_ms;
+                loop {
+                    match me.there(&id) {
+                        Some(x) if x.words.is_some() || x.not_users => break x.words,
+                        None => return,
+                        Some(_) if crate::history::now_ms() >= until => break None,
+                        Some(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+                    }
+                }
+            } else {
+                // What was chosen, once the screen has moved on.
+                std::thread::sleep(std::time::Duration::from_millis(me.waits.screen_ms));
+                (me.screen)(&x.set.session).and_then(|s| questions::chosen_on_screen(&x.set, &s))
+            };
+            me.record_there(&id, chosen);
+        });
+    }
+
+    /// Writes the line of a set answered in its terminal (once): "Answered
+    /// in <space › session>: <what was chosen>", or "Answered in its
+    /// terminal" when nothing shows what. A text question whose session the
+    /// tower (or another terminal) gave its next prompt wasn't answered by
+    /// the user: its decision gets the plain line any other gets.
+    fn record_there(&self, id: &str, chosen: Option<String>) {
+        let x = {
+            let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(x) = i.there.iter_mut().rev().find(|x| x.set.id == id) else { return };
+            if x.recorded {
+                return;
+            }
+            x.recorded = true;
+            x.clone()
+        };
+        let set = &x.set;
+        let decisions = self.decisions.get();
+        let towers = x.not_users || (set.kind == "text" && x.words.is_none() && super::typed::typed_lately(&set.session, 20_000));
+        if towers {
+            eprintln!("[questions] {id}: its session was given its next prompt by the tower, not answered by the user");
+            if let (Some(d), true, Some(ds)) = (&x.decision, x.over, decisions) {
+                ds.record_closed(d);
+            }
+            return;
+        }
+        let name = if set.name.is_empty() { set.session.clone() } else { set.name.clone() };
+        let place = crate::names::shown(set.space.as_deref(), &name);
+        let chosen = chosen.map(|c| c.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|c| !c.is_empty()).map(|c| clip(&c, 300));
+        let how = match &chosen {
+            Some(c) => format!("Answered in {place}: {c}"),
+            None => "Answered in its terminal".to_string(),
+        };
+        if let (Some(d), Some(ds)) = (&x.decision, decisions) {
+            ds.note_answer(d, &match &chosen {
+                Some(c) => format!("in its terminal: {c}"),
+                None => "in its terminal".to_string(),
+            });
+        }
+        let asked = if set.title.trim().is_empty() { set.tabs.first().map(|t| t.question.clone()).unwrap_or_default() } else { set.title.clone() };
+        eprintln!("[questions] {id}: {how}");
+        (self.record)(crate::history::Entry {
+            kind: "decision".into(),
+            id: Some(x.decision.clone().unwrap_or_else(|| set.id.clone())),
+            session: Some(set.session.clone()),
+            name: Some(set.name.clone()).filter(|n| !n.is_empty()),
+            space: set.space.clone(),
+            status: Some("answered".into()),
+            why: Some(set.reason.clone()).filter(|w| !w.is_empty()),
+            source: Some(format!("terminal:{}", set.session)),
+            text: if asked.trim().is_empty() { how } else { format!("{} -> {how}", clip(asked.trim(), 200)) },
+            record: true,
+            ..Default::default()
+        });
+    }
+
+    /// The user typed `words` into the session's own terminal (its prompt
+    /// hook said so, and nothing the tower typed): a question the session
+    /// asked at the end of its turn is answered with them, and a reply the
+    /// tower held for it is never typed (written down, not said). True when
+    /// it was an answer, not new work.
+    pub fn typed_there(&self, address: &str, words: &str, at_ms: u64) -> bool {
+        let words = words.trim().to_string();
+        let mut answered = false;
+        {
+            // The user's prompt is the one it works on now.
+            let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            i.went_on.remove(address);
+            i.not_users.remove(address);
+        }
+        // The reply the tower held is moot now.
+        let held = self.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.remove(address);
+        if let Some(r) = held {
+            self.save();
+            eprintln!("[questions] {address}: the waiting reply to {} is not sent: the user answered in the terminal", r.set);
+            (self.record)(crate::history::Entry {
+                kind: "queue".into(),
+                session: Some(address.to_string()),
+                name: Some(r.name.clone()).filter(|n| !n.is_empty()),
+                space: self.past(&r.set).or_else(|| self.get(&r.set)).and_then(|s| s.space),
+                status: Some("not-sent".into()),
+                text: format!("Not sent: you answered it in the terminal (the reply was \"{}\")", clip(r.text.trim(), 200)),
+                record: true,
+                ..Default::default()
+            });
+            answered = true;
+        }
+        // Its question, still open: these words answer it.
+        if self.list().iter().any(|s| s.session == address && s.kind == "text") {
+            self.inner.lock().unwrap_or_else(|e| e.into_inner()).typed_words.insert(address.to_string(), (words.clone(), at_ms));
+            self.close_where(address, |s| s.kind == "text", |_| CloseWhy::Unblocked, true);
+            return true;
+        }
+        // Or the one the radar closed a moment ago, as the session started on them.
+        let now = crate::history::now_ms();
+        let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(x) = i
+            .there
+            .iter_mut()
+            .rev()
+            .find(|x| x.set.session == address && x.set.kind == "text" && !x.recorded && x.words.is_none() && now.saturating_sub(x.closed_ms) < THERE_KEEP_MS)
+        {
+            x.words = Some(words);
+            x.not_users = false;
+            answered = true;
+        }
+        answered
+    }
+
+    /// The session's next prompt was the tower's (or another terminal's, or
+    /// its own), at turn count `turn`: a question it asked at the end of its
+    /// turn stays open while it works on it (`went_on`), and one the radar
+    /// closed a moment ago was not the user's to have answered there.
+    pub fn typed_by_tower(&self, address: &str, turn: Option<u64>) {
+        let now = crate::history::now_ms();
+        let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        i.not_users.insert(address.to_string(), (now, turn));
+        if matches!(i.went_on.get(address), Some(WentOn::Waiting(_))) {
+            i.went_on.insert(address.to_string(), WentOn::Kept);
+            eprintln!("[questions] {address} works on a prompt that isn't the user's: its question stays open");
+        }
+        for x in i.there.iter_mut().filter(|x| x.set.session == address && x.set.kind == "text" && !x.recorded && x.words.is_none() && now.saturating_sub(x.closed_ms) < THERE_KEEP_MS) {
+            x.not_users = true;
         }
     }
 
@@ -911,7 +1452,9 @@ impl Asks {
                     format!("answered for you: {picked}, because {}", if set.reason.is_empty() { "it's routine" } else { &set.reason });
                 eprintln!("[questions] {}: {line}", set.session);
                 let (a, l) = (set.session.clone(), line.clone());
-                crate::history::later(move || crate::history::record_session("answered", &a, &l, Some("auto")));
+                // A routine answer is written down, not told, unless the tower tells everything.
+                let record = crate::tell::for_record(crate::tell::level(), "auto");
+                crate::history::later(move || crate::history::record_session_as("answered", &a, &l, Some("auto"), record));
                 if let Some(s) = self.inner.lock().unwrap_or_else(|e| e.into_inner()).sets.iter_mut().find(|s| s.id == now.id) {
                     s.answered_with = picked;
                 }
@@ -920,6 +1463,9 @@ impl Asks {
             Err(e) => {
                 if let Some(held) = e.downcast_ref::<Held>() {
                     self.escalate(&set.id, &held.0);
+                } else if let Some(busy) = e.downcast_ref::<Busy>() {
+                    eprintln!("[questions] {}: not answering {id}: {busy}", set.session);
+                    self.escalate_quietly(&set.id, &busy.0);
                 } else if e.downcast_ref::<Late>().is_some() || e.downcast_ref::<Refused>().is_some() {
                     // Answered (or closed) meanwhile: nothing for the user to do.
                     eprintln!("[questions] {}: not answering {id} for the user: {e:#}", set.session);
@@ -948,6 +1494,23 @@ impl Asks {
         self.tell_escalated(&set);
     }
 
+    /// The user's card after all, said to nobody: they are in its dialog already.
+    fn escalate_quietly(&self, id: &str, why: &str) {
+        let set = {
+            let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(s) = i.sets.iter_mut().find(|s| s.id == id) else { return };
+            if card::apply(s, &Ev::Escalate).is_err() {
+                return;
+            }
+            s.reason = why.to_string();
+            s.clone()
+        };
+        self.publish();
+        // Told, as far as the decision goes: nothing says it later either.
+        let _ = self.tells(&set.id, false);
+        self.event("update", Some(&set), id);
+    }
+
     /// One sentence: what is asked, and what the tower would pick.
     fn tell_escalated(&self, set: &QuestionSet) {
         let what = match set.kind.as_str() {
@@ -964,6 +1527,11 @@ impl Asks {
             .map(|o| format!(" I'd say: {}.", o.label.trim_end_matches('.')))
             .unwrap_or_default();
         let line = format!("{} asks: {}{more}.{pick}", set.name, what.trim_end_matches(['.', '?']));
+        // One decision per key: the same thing asked again by another session says nothing.
+        if !self.tells(&set.id, true) {
+            eprintln!("[questions] {} ({}): in front of the user already, not said again", set.id, set.session);
+            return;
+        }
         self.tell(&set.session, &line);
     }
 
@@ -1022,9 +1590,11 @@ impl Asks {
         let Some(mut now) = detect(&address) else {
             if let Some(k) = &known {
                 // Answered in the session (or it moved on): its card goes (the one
-                // it was read again as too), nothing is typed.
-                self.close_where(&address, |s| s.kind != "text", |_| CloseWhy::AnsweredElsewhere, true);
-                bail!(Late(CloseWhy::AnsweredElsewhere.late(&k.id, if k.name.is_empty() { &k.session } else { &k.name })));
+                // it was read again as too), nothing is typed. Still blocked on a
+                // screen the tower can't read: not answered, and said so.
+                let why = if hc::get(&address).is_some_and(|t| hc::status(&t) == SessionStatus::Blocked) { CloseWhy::Unread } else { CloseWhy::AnsweredElsewhere };
+                self.close_where(&address, |s| s.kind != "text", |_| why.clone(), true);
+                bail!(Late(why.late(&k.id, if k.name.is_empty() { &k.session } else { &k.name })));
             }
             if is_set_id(target) {
                 // A card's id, no longer open: its dialog was answered (or closed) meanwhile.
@@ -1050,7 +1620,21 @@ impl Asks {
                 bail!("the questions changed since they were shown (now {}); the card shows them now: check it and submit again", shown.id);
             }
         }
-        let answers = if auto { self.recheck(&now, answers).map_err(Held)? } else { answers.to_vec() };
+        // The user is in the dialog, answering it in the terminal: the tower's own answer stays out.
+        let there = questions::answered_there(&now);
+        if auto && now.kind == "claude-ask" && now.tabs.len() > 1 && (!there.is_empty() || now.current_tab != 0) {
+            bail!(Busy(format!("the user is answering it in its terminal ({} of {} answered there)", there.len(), now.tabs.len())));
+        }
+        // What the user answered in the terminal stands: those tabs get nothing typed, and the
+        // keys start where the dialog is now (its tab: `now.current_tab`).
+        let (answers, skipped) = questions::answers_left(&now, answers);
+        if !skipped.is_empty() {
+            eprintln!("[questions] {}: tab(s) {skipped:?} answered in its terminal already; their answers are left out", now.id);
+        }
+        if let Some(why) = questions::nothing_to_type(&now, &answers, &skipped, submit) {
+            bail!("{why}");
+        }
+        let answers = if auto { self.recheck(&now, &answers).map_err(Held)? } else { answers };
         // Checked and marked at once: a second answer (the phone, the panel, the tower) waits its turn.
         let tracked = match self.start_answering(&now.id, by) {
             Ok(t) => t,
@@ -1059,7 +1643,11 @@ impl Asks {
         };
         let result = {
             let _typing = hc::typing(&address);
-            let mut term = questions::Hc { address: address.clone() };
+            // Once its dialog is gone (the user answered it in the terminal as the keys went
+            // in), nothing more goes in: not a key, not a word.
+            let id = now.id.clone();
+            let open = || !tracked || self.get(&id).is_some();
+            let mut term = Guarded { term: questions::Hc { address: address.clone() }, open: &open };
             questions::drive(&mut term, &now, &answers, submit)
         };
         match result {
@@ -1089,6 +1677,46 @@ impl Asks {
             }
         }
     }
+}
+
+/// A session's terminal for the keys that answer one set: while the set is
+/// open. Once the radar closed it (its dialog went: answered in the terminal)
+/// no key and no word goes in, whatever the driver was about to press.
+struct Guarded<'a, T: questions::Term> {
+    term: T,
+    open: &'a dyn Fn() -> bool,
+}
+
+impl<T: questions::Term> Guarded<'_, T> {
+    fn still(&self) -> Result<()> {
+        if !(self.open)() {
+            bail!("its dialog is gone (answered in its terminal): nothing more is typed");
+        }
+        Ok(())
+    }
+}
+
+impl<T: questions::Term> questions::Term for Guarded<'_, T> {
+    fn read(&mut self) -> String {
+        self.term.read()
+    }
+    fn keys(&mut self, keys: &[&str]) -> Result<()> {
+        self.still()?;
+        self.term.keys(keys)
+    }
+    fn paste(&mut self, text: &str) -> Result<()> {
+        self.still()?;
+        self.term.paste(text)
+    }
+    fn settle(&mut self) {
+        self.term.settle()
+    }
+}
+
+/// `s` on one line, cut to `n` characters.
+fn clip(s: &str, n: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= n { flat } else { format!("{}…", flat.chars().take(n).collect::<String>().trim_end()) }
 }
 
 /// What a late action on a set that is over is told.
@@ -1173,12 +1801,17 @@ fn type_into(address: &str, text: &str) -> Result<()> {
     let _typing = hc::typing(address);
     let status = hc::get(address).map(|t| hc::status_live(&t)).unwrap_or(SessionStatus::Gone);
     let args = send_args(address, &questions::clean_text(text), &status)?;
+    // Written down before it is typed: the prompt its hook reports is the tower's reply, not the user's.
+    let id = super::typed::note(address, text, "reply");
     let out = std::process::Command::new(crate::config::hc_bin())
         .args(&args)
         .env_remove("HC_TERMINAL_ID")
         .env_remove("HC_SCOPE")
         .stdin(std::process::Stdio::null())
-        .output()?;
+        .output();
+    let ok = out.as_ref().is_ok_and(|o| o.status.success());
+    super::typed::done(id, ok);
+    let out = out?;
     if !out.status.success() {
         bail!("hc send: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -1199,6 +1832,20 @@ fn send_args(address: &str, text: &str, status: &SessionStatus) -> Result<Vec<St
     }
     args.extend(["--".to_string(), address.to_string(), text.to_string()]);
     Ok(args)
+}
+
+/// Whether the prompt `address` works on now (at turn count `turn`) is not
+/// the user's: the tower is typing into it or just was, the send queue typed
+/// a message in while it worked that it hasn't taken yet, or its hook said
+/// so about this stretch of work.
+fn not_the_users(i: &Inner, address: &str, turn: Option<u64>, now: u64) -> bool {
+    if super::typed::typed_lately(address, TYPED_MS) || super::sendq::typed_in_while_working(address) {
+        return true;
+    }
+    i.not_users.get(address).is_some_and(|(at, was)| match (*was, turn) {
+        (Some(a), Some(b)) => a == b,
+        _ => now.saturating_sub(*at) <= TYPED_MS,
+    })
 }
 
 /// The last message a session wrote: its transcript (Claude Code here), else its screen.
@@ -1269,6 +1916,8 @@ fn is_set_id(s: &str) -> bool {
 }
 
 pub fn detect(address: &str) -> Option<QuestionSet> {
+    // When the screen was read: a set read before its dialog was answered in the terminal is stale.
+    let read_ms = crate::history::now_ms();
     let t = hc::get(address)?;
     if hc::status(&t) != SessionStatus::Blocked {
         return None;
@@ -1285,9 +1934,37 @@ pub fn detect(address: &str) -> Option<QuestionSet> {
     let context = crate::history::jobs(&crate::history::load()).into_iter().find(|j| j.session == addr && j.open()).map(|j| j.title).unwrap_or_default();
     let msg = t["status"]["msg"].as_str().unwrap_or("");
     let mut set = questions::build(&addr, &hc::spoken_name(&t), app == "codex", &screen, transcript, msg, &context);
-    set.at_ms = crate::history::now_ms();
+    set.at_ms = read_ms;
     set.created_ms = hc::created_ms(&t);
+    set.space = crate::spaces::space_of(&t);
     Some(set)
+}
+
+/// How a set that is over ended, for the decision it stood in.
+fn ended_as(p: &QuestionSet) -> crate::decisions::State {
+    use crate::decisions::State;
+    match &p.state.phase {
+        Phase::Dismissed | Phase::Closed { why: CloseWhy::Dismissed } => State::Dismissed,
+        Phase::Closed { why: CloseWhy::AnsweredHere | CloseWhy::AnsweredElsewhere | CloseWhy::Unblocked } => State::Answered,
+        _ => State::Stopped,
+    }
+}
+
+/// Something was asked of the session: an instruction waits for it in the
+/// queue, or it is on an agenda task (other than one that itself told it to
+/// wait for instructions).
+pub(super) fn has_work(address: &str) -> bool {
+    if super::sendq::waiting_counts().get(address).copied().unwrap_or(0) > 0 {
+        return true;
+    }
+    super::agendas::working_on(address).is_some_and(|asked| !questions::ready_only(&asked))
+}
+
+/// Idle is not blocked: a turn's end that only says the session is ready
+/// (`questions::ready_only`), from a session nothing was asked of. It is no
+/// wait for the user: no card, no alert, no decision.
+pub fn idle_ready(address: &str, message: &str) -> bool {
+    questions::ready_only(message) && !has_work(address)
 }
 
 /// The one-line notice for a blocked session, from herdr-core's status
@@ -1322,6 +1999,16 @@ pub fn blocked_notice(name: &str, status: &Value) -> String {
     format!("{name} needs you")
 }
 
+/// The same as a decision's title, which names no session (its card shows
+/// who): "Asks to run npm test", "Has a plan ready for you to approve".
+pub fn blocked_title(status: &Value) -> String {
+    let line = blocked_notice("\u{1}", status);
+    let rest = line.strip_prefix("\u{1} ").unwrap_or(&line);
+    let rest = if rest == "needs you" { "Needs you: it shows something the tower can't read" } else { rest };
+    let mut c = rest.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1344,7 +2031,34 @@ mod tests {
         let told = Arc::new(Mutex::new(vec![]));
         let t = told.clone();
         a.brain = Arc::new(move |text: &str| t.lock().unwrap_or_else(|e| e.into_inner()).push(text.to_string()));
+        // No screen is read (no hc), nothing is written, nobody waits long.
+        a.screen = Arc::new(|_: &str| None);
+        a.record = Arc::new(|_: crate::history::Entry| ());
+        a.waits = Waits { screen_ms: 0, words_ms: 1_500 };
         (a, told)
+    }
+
+    /// `deciding`, keeping what the record would get, with `screen` for every session's screen.
+    #[allow(clippy::type_complexity)]
+    fn recording(screen: Option<String>) -> (Asks, super::super::decisions::Decisions, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<crate::history::Entry>>>) {
+        let (mut a, d, user) = deciding(|| crate::tell::Level::Decisions);
+        let lines = Arc::new(Mutex::new(vec![]));
+        let l = lines.clone();
+        a.record = Arc::new(move |e: crate::history::Entry| l.lock().unwrap_or_else(|e| e.into_inner()).push(e));
+        a.screen = Arc::new(move |_: &str| screen.clone());
+        (a, d, user, lines)
+    }
+
+    /// The record's lines, once its thread has written `n`.
+    fn lines(l: &Arc<Mutex<Vec<crate::history::Entry>>>, n: usize) -> Vec<crate::history::Entry> {
+        for _ in 0..300 {
+            if l.lock().unwrap_or_else(|e| e.into_inner()).len() >= n {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        l.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// What the brain was told, once its thread has run.
@@ -1405,6 +2119,102 @@ mod tests {
         assert_eq!(said().len(), 1);
         // Its job stays blocked while the card is open (the radar asks).
         assert!(a.waits_on("tw-wait-1") && a.waits_on("tw-wait-2") && !a.waits_on("tw-other"));
+    }
+
+    /// Asks whose sets that are the user's become decisions, in a tower that
+    /// tells `level`; and what the user is told.
+    fn deciding(level: fn() -> crate::tell::Level) -> (Asks, super::super::decisions::Decisions, Arc<Mutex<Vec<String>>>) {
+        let (a, _) = asks();
+        let d = super::super::decisions::Decisions::telling(a.shared.clone(), level);
+        let a = a.with_decisions(d.clone());
+        let user = Arc::new(Mutex::new(Vec::<String>::new()));
+        let u = user.clone();
+        a.set_notify(move |addr, text| u.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{addr}: {text}")));
+        (a, d, user)
+    }
+
+    /// Three sessions end their turns waiting for the same thing: one
+    /// decision with three waiting, one alert, one sentence. It closes when
+    /// they are answered, dismissed, or gone.
+    #[test]
+    fn the_same_wait_from_three_sessions_is_one_decision_said_once() {
+        let (a, d, user) = deciding(|| crate::tell::Level::Decisions);
+        let said = || user.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let msg = "PR #1273 is ready. Still waiting on you: merging #1273 into dev.";
+        let req = questions::waits_for_user(msg).unwrap();
+        // The first is watched: at a quiet level the brain's words are for the record, so the tower says it itself.
+        let first = a.waiting("tw-d1", "web", None, msg, &req, "", true).unwrap();
+        a.waiting("tw-d2", "api", None, msg, &req, "", false).unwrap();
+        a.waiting("tw-d3", "sdk", None, msg, &req, "", false).unwrap();
+        assert_eq!(said(), vec![format!("tw-d1: web waits for you: {}", req.trim_end_matches('.'))], "said once, for the first");
+        let st = a.shared.get();
+        assert_eq!(st.questions.len(), 3, "each session keeps its card");
+        assert_eq!((st.decisions.len(), st.decisions_count), (1, 1), "one decision");
+        let v = &st.decisions[0];
+        assert_eq!((v["kind"].as_str(), v["waiting"].as_u64(), v["count"].as_u64(), v["state"].as_str()), (Some("question"), Some(3), Some(3), Some("open")));
+        assert_eq!((v["title"].as_str(), v["why"].as_str(), v["question_id"].as_str()), (Some(req.as_str()), Some(questions::WAITS), Some(first.id.as_str())));
+        let id = v["id"].as_str().unwrap().to_string();
+        assert_eq!(d.for_question(&first.id), vec![id.clone()]);
+        // One of them works again, on what the user typed there (its hook says so): two wait.
+        a.seen("tw-d1", &json!({}), &SessionStatus::Working);
+        a.typed_there("tw-d1", "merged it, go on", crate::history::now_ms());
+        let st = a.shared.get();
+        assert_eq!((st.decisions.len(), st.decisions[0]["waiting"].as_u64(), st.decisions[0]["id"].as_str()), (1, Some(2), Some(id.as_str())));
+        // One is dismissed, the last one's session ends: the decision is over, as answered (one of them was).
+        let second = a.list().into_iter().find(|s| s.session == "tw-d2").unwrap();
+        a.dismiss(&second.id).unwrap();
+        assert_eq!(a.shared.get().decisions_count, 1);
+        a.seen("tw-d3", &Value::Null, &SessionStatus::Gone);
+        assert_eq!((a.shared.get().decisions.len(), a.shared.get().decisions_count), (0, 0));
+        assert_eq!(d.get(&id).map(|d| d.state), Some(crate::decisions::State::Answered));
+        // The same wait later is a new decision, said again.
+        a.waiting("tw-d4", "docs", None, msg, &req, "", false).unwrap();
+        assert_eq!(said().len(), 2);
+        assert_ne!(a.shared.get().decisions[0]["id"].as_str(), Some(id.as_str()));
+        // Dismissed, it is over as dismissed.
+        let fourth = a.list().into_iter().find(|s| s.session == "tw-d4").unwrap();
+        a.dismiss(&fourth.id).unwrap();
+        assert_eq!(d.list(None, true)["closed"][0]["state"], "dismissed");
+    }
+
+    /// The same permission asked in two sessions: one decision with the
+    /// tower's pick, said once. While the tower tells everything, each is
+    /// said, as before; the decision is still one.
+    #[test]
+    fn a_repeat_is_not_said_at_decisions_but_still_is_at_everything() {
+        let ask = |a: &Asks, n: u64, session: &str, name: &str| {
+            let mut p = perm("approve Bash: git push origin main");
+            (p.id, p.session, p.name) = (format!("q{n:012x}"), session.into(), name.into());
+            a.upsert(p.clone());
+            let recs = json!([{"tab": 0, "options": [{"label": "Yes", "why": "the tests pass", "choice": 0}, {"label": "No", "why": "", "choice": 2}]}]);
+            a.recommend(&p.id, &recs, Some("auto"), "routine", false).unwrap()
+        };
+        for (level, alerts) in [(|| crate::tell::Level::Decisions, 1), (|| crate::tell::Level::Results, 1), (|| crate::tell::Level::Everything, 2)] as [(fn() -> crate::tell::Level, usize); 3] {
+            let (a, _, user) = deciding(level);
+            ask(&a, 1, "tw-p1", "web");
+            ask(&a, 2, "tw-p2", "api");
+            let said = user.lock().unwrap().clone();
+            assert_eq!(said.len(), alerts, "{said:?}");
+            assert!(said[0].starts_with("tw-p1: web asks: Allow Bash: git push origin main") && said[0].ends_with("I'd say: Yes."), "{said:?}");
+            let st = a.shared.get();
+            assert_eq!((st.decisions.len(), st.questions.len()), (1, 2));
+            let v = &st.decisions[0];
+            assert_eq!((v["kind"].as_str(), v["waiting"].as_u64(), v["pick"].as_str(), v["why"].as_str()), (Some("permission"), Some(2), Some("Yes"), Some("it pushes or merges to a shared branch")), "why: the rule that made it the user's");
+            assert_eq!(v["options"][0], json!({ "label": "Yes", "why": "the tests pass", "pick": true }));
+        }
+    }
+
+    /// Idle is not blocked: a session that only says it is ready, with
+    /// nothing asked of it, waits for nothing the user must do.
+    #[test]
+    fn a_session_that_only_says_it_is_ready_is_not_waiting_for_the_user() {
+        for msg in ["I'm waiting for your instructions", "I have no task yet and I'm waiting for your instructions", "I'm on dev and waiting for your instructions"] {
+            assert!(questions::waits_for_user(msg).is_some(), "what made it a wait before: {msg}");
+            assert!(idle_ready("tw-idle", msg), "{msg}");
+        }
+        for msg in ["Still waiting on you: merging #1273 into dev", "PR #1250 is open, so you need to merge it. I'll wait."] {
+            assert!(!idle_ready("tw-idle", msg), "a real wait: {msg}");
+        }
     }
 
     /// t41's two-tab dialog: read from the screen only (tab 1 has no question
@@ -1749,7 +2559,7 @@ mod tests {
             "t41" => live(1, "idle"),
             _ => Terminal::Gone,
         };
-        b.restore_from(Saved::load(&path), &mut look, now);
+        b.restore_from(Saved::load(&path), &mut look, &|_| false, now);
         let cards: Vec<(String, String, Option<String>)> = b.list().iter().map(|s| (s.session.clone(), s.status.clone(), s.decision.clone())).collect();
         assert_eq!(
             cards,
@@ -1781,17 +2591,48 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_keeps_every_card_that_waits_for_the_user() {
+        let dir = tmp("restart-waits");
+        let path = dir.0.join("questions.json");
+        let idle = |_: &str| Terminal::Live { created_ms: Some(1), status: SessionStatus::Idle };
+        {
+            let (a, _) = stored(&path);
+            // A real wait whose asking sentence, alone, reads as "ready".
+            a.waiting("t9", "api", Some(1), "The build failed on the lint step. I'm waiting for your instructions.", "I'm waiting for your instructions.", "", false).unwrap();
+            // A session that was asked something and ends "waiting for your instructions": its card too.
+            a.waiting("t8", "web", Some(1), "I'm waiting for your instructions.", "I'm waiting for your instructions.", "", false).unwrap();
+            assert_eq!(a.list().len(), 2);
+        }
+        // The tower restarts (an install, `tower restart`): both are still the user's.
+        let (b, _) = stored(&path);
+        b.restore_from(Saved::load(&path), &mut { idle }, &|_| false, 2);
+        assert_eq!(b.list().iter().map(|s| s.session.as_str()).collect::<Vec<_>>(), ["t9", "t8"], "no card is dropped by a restart");
+        // An older tower's file (it has no mark): its card for a turn that only said "ready" goes, once,
+        // judged by the whole message; a real wait and one of a session that was asked something stay.
+        let mut older: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        older.as_object_mut().unwrap().remove("ready_checked");
+        std::fs::write(&path, older.to_string()).unwrap();
+        let (c, _) = stored(&path);
+        c.restore_from(Saved::load(&path), &mut { idle }, &|_| false, 3);
+        assert_eq!(c.list().iter().map(|s| s.session.as_str()).collect::<Vec<_>>(), ["t9"]);
+        std::fs::write(&path, older.to_string()).unwrap();
+        let (d, _) = stored(&path);
+        d.restore_from(Saved::load(&path), &mut { idle }, &|a| a == "t8", 3);
+        assert_eq!(d.list().len(), 2);
+    }
+
+    #[test]
     fn a_broken_or_old_file_never_stops_the_start() {
         let dir = tmp("broken");
         let path = dir.0.join("questions.json");
         std::fs::write(&path, "{ not json").unwrap();
         let (a, _) = stored(&path);
-        a.restore_from(Saved::load(&path), &mut |_| Terminal::Unknown, 1);
+        a.restore_from(Saved::load(&path), &mut |_| Terminal::Unknown, &|_| false, 1);
         assert!(a.list().is_empty());
         assert!(std::fs::read_dir(&dir.0).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().contains("bad-")), "kept aside");
         // Words this tower doesn't know, and fields it doesn't have: loaded as open, undecided.
         std::fs::write(&path, r#"{"sets": [{"id": "q1", "session": "t9", "kind": "claude-permission", "status": "pondering", "decision": "later", "future": 1}], "extra": true}"#).unwrap();
-        a.restore_from(Saved::load(&path), &mut |_| Terminal::Live { created_ms: None, status: SessionStatus::Blocked }, 1);
+        a.restore_from(Saved::load(&path), &mut |_| Terminal::Live { created_ms: None, status: SessionStatus::Blocked }, &|_| false, 1);
         let s = a.get("q1").unwrap();
         assert_eq!((s.status.as_str(), s.decision.as_deref()), ("open", None));
     }
@@ -1864,5 +2705,362 @@ mod tests {
         assert_eq!(n("", ""), "The orb session needs you", "nothing to say: the bare notice");
         let long = format!("approve Bash: {}", "x".repeat(200));
         assert!(n("permission", &long).chars().count() < 120);
+    }
+
+    // ---- answered in the session's own terminal ----
+
+    const PERM: &str = "approve Bash: touch /tmp/qfix-perm-test";
+
+    /// The tower's three picks for the permission prompt, and the user's to decide.
+    fn escalate_perm(a: &Asks, set: &QuestionSet) {
+        let recs = json!([{"tab": 0, "options": [{"label": "Yes", "why": "it only touches a file in /tmp", "choice": 0}]}]);
+        a.recommend(&set.id, &recs, Some("escalate"), "the user decides", false).unwrap();
+    }
+
+    fn open_decisions(a: &Asks) -> usize {
+        a.shared.get().decisions.len()
+    }
+
+    /// The user answers a permission prompt in the session's terminal instead
+    /// of on its card: the card and its decision go at once, as answered; the
+    /// record says so with what the screen shows was chosen; nothing is said;
+    /// a late card answer, a late recommendation, a screen read before the
+    /// answer: none brings anything back or types anything.
+    #[test]
+    fn a_dialog_answered_in_its_terminal_closes_its_decision_at_once() {
+        let screen = "⏺ Bash(touch /tmp/qfix-perm-test)\n  ⎿  User rejected tool use\n\n❯ \n";
+        let (a, d, user, record) = recording(Some(screen.into()));
+        let mut set = perm(PERM);
+        set.at_ms = crate::history::now_ms();
+        a.upsert(set.clone());
+        escalate_perm(&a, &set);
+        assert_eq!(open_decisions(&a), 1);
+        let id = d.for_question(&set.id)[0].clone();
+        assert_eq!(user.lock().unwrap().len(), 1, "said once, as it appeared");
+
+        // The radar: the session works again, and nothing of the tower's went in.
+        let before = crate::history::now_ms();
+        a.seen("t37", &Value::Null, &SessionStatus::parse("working"));
+        assert!(a.list().is_empty());
+        assert_eq!(open_decisions(&a), 0, "off the Mac's windows and the phone with this state");
+        let closed = d.get(&id).unwrap();
+        assert_eq!(closed.state, crate::decisions::State::Answered);
+        let line = lines(&record, 1);
+        assert_eq!(line.len(), 1);
+        let e = &line[0];
+        assert_eq!((e.kind.as_str(), e.status.as_deref(), e.source.as_deref(), e.id.as_deref()), ("decision", Some("answered"), Some("terminal:t37"), Some(id.as_str())));
+        assert_eq!(e.text, "Allow Bash: touch /tmp/qfix-perm-test? -> Answered in qfix perm: No");
+        assert!(e.record, "for the record, never a chat message");
+        assert_eq!(d.get(&id).unwrap().answer, "in its terminal: No");
+        assert_eq!(user.lock().unwrap().len(), 1, "nothing more is said");
+
+        // The phone's card a moment late: already answered, nothing typed.
+        let e = a.answer(&set.id, &ans0(), true).unwrap_err();
+        assert!(format!("{e:#}").starts_with("already answered"), "{e:#}");
+        assert!(a.recommend(&set.id, &json!([]), Some("auto"), "", false).is_err(), "a recommendation still coming finds it over");
+        a.escalate(&set.id, "no recommendation came in time");
+        a.auto_answer(&set.id);
+        assert_eq!(user.lock().unwrap().len(), 1, "no late escalation is said");
+
+        // A reader a step behind: the screen it read had the dialog, before the answer. It stays away.
+        let mut stale = set.clone();
+        stale.at_ms = before;
+        a.upsert(stale);
+        assert!(a.list().is_empty() && open_decisions(&a) == 0, "no card comes back");
+        assert_eq!(lines(&record, 2).len(), 1, "one line");
+        // The same prompt asked again later is a new question.
+        let mut again = perm(PERM);
+        again.at_ms = crate::history::now_ms() + 5;
+        a.upsert(again);
+        assert_eq!(a.list().len(), 1);
+    }
+
+    /// Three sessions ask the same; the user answers one in its terminal: that
+    /// session leaves the decision (its line is in the record), the others
+    /// still wait on theirs, and the decision ends with the last of them.
+    #[test]
+    fn one_session_answered_in_its_terminal_leaves_a_decision_others_still_wait_on() {
+        let (a, d, _user, record) = recording(None);
+        let other = |session: &str| {
+            let screen = questions::parse_screen(&fixture("claude-permission.txt")).unwrap();
+            let mut s = questions::build(session, "qfix two", false, &screen, None, PERM, "");
+            s.at_ms = crate::history::now_ms();
+            s
+        };
+        let (one, two) = (other("t37"), other("t38"));
+        for s in [&one, &two] {
+            a.upsert(s.clone());
+            escalate_perm(&a, s);
+        }
+        let id = d.for_question(&one.id)[0].clone();
+        assert_eq!(d.get(&id).unwrap().sessions.len(), 2, "one decision");
+        a.seen("t37", &Value::Null, &SessionStatus::parse("idle"));
+        let open = d.get(&id).unwrap();
+        assert!(open.closed_ms.is_none() && open.sessions.len() == 1 && open.sessions[0].address == "t38");
+        assert_eq!(open_decisions(&a), 1);
+        assert_eq!(lines(&record, 1)[0].text, "Allow Bash: touch /tmp/qfix-perm-test? -> Answered in its terminal", "nothing on the screen says what");
+        a.seen("t38", &Value::Null, &SessionStatus::parse("working"));
+        assert_eq!(d.get(&id).unwrap().state, crate::decisions::State::Answered);
+        assert_eq!(open_decisions(&a), 0);
+        assert_eq!(lines(&record, 2).len(), 2);
+    }
+
+    fn text_q(session: &str, name: &str) -> QuestionSet {
+        let mut q = questions::text_set(session, name, "I made the change in src/api.rs. Want me to open the PR, or wait?", "");
+        q.at_ms = crate::history::now_ms();
+        q
+    }
+
+    /// The user replies in the terminal to the question a session asked at
+    /// the end of its turn: the card and its decision close as answered, with
+    /// the user's words, whether the hook or the radar is first; a reply the
+    /// tower held is not sent; and when the tower gave the session its next
+    /// prompt, nobody answered it there.
+    #[test]
+    fn a_question_answered_by_a_prompt_in_the_terminal_closes_with_the_users_words() {
+        let (a, d, user, record) = recording(None);
+        // The hook first: the card is still up.
+        let q1 = a.asked_after(text_q("tw-q1", "web"), true);
+        assert_eq!(open_decisions(&a), 1, "a turn the user typed there: their card at once");
+        let id1 = d.for_question(&q1.id)[0].clone();
+        assert!(a.typed_there("tw-q1", "Wait, I'll review it first", crate::history::now_ms()));
+        assert!(a.list().is_empty() && open_decisions(&a) == 0);
+        assert_eq!(d.get(&id1).unwrap().state, crate::decisions::State::Answered);
+        let line = lines(&record, 1);
+        assert!(line[0].text.ends_with("-> Answered in web: Wait, I'll review it first"), "{}", line[0].text);
+        assert_eq!(d.get(&id1).unwrap().answer, "in its terminal: Wait, I'll review it first");
+
+        // The radar first (the session works): the card waits for the hook to
+        // say whose prompt that was; the user's words, a moment after, close it.
+        let q2 = a.asked_after(text_q("tw-q2", "api"), false);
+        a.escalate(&q2.id, "the user decides");
+        assert_eq!(user.lock().unwrap().len(), 1);
+        a.seen("tw-q2", &Value::Null, &SessionStatus::parse("working"));
+        assert_eq!(open_decisions(&a), 1, "not answered until the hook says whose prompt it was");
+        assert!(a.typed_there("tw-q2", "yes, open it", crate::history::now_ms()));
+        assert_eq!(open_decisions(&a), 0, "the user's words: answered");
+        let line = lines(&record, 2);
+        assert!(line[1].text.ends_with("-> Answered in api: yes, open it"), "{}", line[1].text);
+
+        // The tower typed the next prompt (the queue): not the user's answer. The
+        // question stays theirs, and so does its decision; no line says it was answered.
+        let q3 = a.asked_after(text_q("tw-q3", "docs"), false);
+        a.escalate(&q3.id, "the user decides");
+        a.seen("tw-q3", &Value::Null, &SessionStatus::parse("working"));
+        a.typed_by_tower("tw-q3", None);
+        std::thread::sleep(std::time::Duration::from_millis(1_800));
+        assert!(a.get(&q3.id).is_some() && open_decisions(&a) == 1, "still open");
+        assert_eq!(lines(&record, 3).len(), 2, "nothing says the user answered it");
+        assert_eq!(user.lock().unwrap().len(), 2, "two said as they appeared, nothing since");
+        assert!(!a.typed_there("tw-q9", "build the docs site", crate::history::now_ms()), "no question open: new work, not an answer");
+
+        // The session works again and no hook ever says on whose prompt (an
+        // agent with none): a moment later it was answered in its terminal, as before.
+        let q4 = a.asked_after(text_q("tw-q4", "sdk"), false);
+        a.escalate(&q4.id, "the user decides");
+        a.seen("tw-q4", &Value::Null, &SessionStatus::parse("working"));
+        assert!(a.get(&q4.id).is_some());
+        std::thread::sleep(std::time::Duration::from_millis(1_800));
+        assert!(a.get(&q4.id).is_none(), "over once no word came");
+        let line = lines(&record, 3);
+        assert!(line[2].text.ends_with("-> Answered in its terminal"), "{}", line[2].text);
+    }
+
+    /// A message from another session (or anything the tower typed) that
+    /// arrives after a question at the end of a turn leaves that question,
+    /// and its decision, open: the session works on it, but nobody answered.
+    /// Only the user's own words (on the card, or typed in its terminal)
+    /// answer it.
+    #[test]
+    fn a_message_from_another_session_leaves_the_users_question_open() {
+        let (a, d, user, record) = recording(None);
+        let q = a.asked_after(text_q("tw-pm1", "web"), false);
+        a.escalate(&q.id, "the user decides");
+        let id = d.for_question(&q.id)[0].clone();
+        assert_eq!(open_decisions(&a), 1);
+        // The send queue types a peer message in (written down first, as `Herdr::send` does).
+        let typed = super::super::typed::note("tw-pm1", "From Shop › api (t6): the schema changed, see api/CHANGES.md", "queue");
+        super::super::typed::done(typed, true);
+        // 0.3 s later the radar sees the session working; its hook comes after.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        a.seen("tw-pm1", &json!({ "turn": 4 }), &SessionStatus::Working);
+        assert!(a.get(&q.id).is_some(), "the question stays the user's");
+        assert_eq!(d.get(&id).map(|x| x.state), Some(crate::decisions::State::Open), "and so does its decision");
+        a.typed_by_tower("tw-pm1", Some(4));
+        for _ in 0..3 {
+            a.seen("tw-pm1", &json!({ "turn": 4 }), &SessionStatus::Working);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1_800));
+        assert!(a.get(&q.id).is_some() && open_decisions(&a) == 1, "still open once the moment for the hook is over");
+        // Its turn on the message ends without asking again: the question still waits for the user.
+        a.seen("tw-pm1", &json!({ "turn": 5 }), &SessionStatus::Done);
+        assert!(a.get(&q.id).is_some());
+        assert!(lines(&record, 1).is_empty(), "nothing says it was answered");
+        // The user answers it in the terminal: now it is answered, with their words.
+        a.seen("tw-pm1", &json!({ "turn": 5 }), &SessionStatus::Working);
+        assert!(a.typed_there("tw-pm1", "open the PR", crate::history::now_ms()));
+        assert_eq!(d.get(&id).map(|x| x.state), Some(crate::decisions::State::Answered));
+        let line = lines(&record, 1);
+        assert!(line[0].text.ends_with("-> Answered in web: open the PR"), "{}", line[0].text);
+
+        // Hook first: a session's message that came in some other way (another
+        // terminal's `hc send`), then the radar: open as well.
+        let q2 = a.asked_after(text_q("tw-pm2", "api"), false);
+        a.escalate(&q2.id, "the user decides");
+        a.typed_by_tower("tw-pm2", Some(9));
+        a.seen("tw-pm2", &json!({ "turn": 9 }), &SessionStatus::Working);
+        std::thread::sleep(std::time::Duration::from_millis(1_800));
+        assert!(a.get(&q2.id).is_some(), "another terminal's prompt is no answer either");
+        // A word about an earlier stretch of work says nothing about this one.
+        let q3 = a.asked_after(text_q("tw-pm3", "docs"), false);
+        a.escalate(&q3.id, "the user decides");
+        a.typed_by_tower("tw-pm3", Some(2));
+        a.seen("tw-pm3", &json!({ "turn": 3 }), &SessionStatus::Working);
+        std::thread::sleep(std::time::Duration::from_millis(1_800));
+        assert!(a.get(&q3.id).is_none(), "the turn it worked on before isn't this one: answered in its terminal");
+        // An answer the user gave on the card goes in as the session's next prompt: over, as before.
+        let q4 = a.asked_after(text_q("tw-pm4", "sdk"), false);
+        a.escalate(&q4.id, "the user decides");
+        {
+            let mut i = a.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let s = i.sets.iter_mut().find(|s| s.id == q4.id).unwrap();
+            card::apply(s, &Ev::Reply { queued: false }).unwrap();
+        }
+        a.seen("tw-pm4", &json!({ "turn": 1 }), &SessionStatus::Working);
+        assert!(a.get(&q4.id).is_none(), "its own reply: over at once");
+        assert!(!user.lock().unwrap().is_empty(), "the question was put to the user, once");
+    }
+
+    /// The user answered on the card while the session was busy (the reply
+    /// waits for its turn to end), then typed their answer in the terminal:
+    /// the held reply is never typed, and the record says so.
+    #[test]
+    fn a_reply_the_tower_held_is_not_sent_once_the_user_answers_in_the_terminal() {
+        let (a, _d, user, record) = recording(None);
+        let r = Reply { set: "q1".into(), text: "Yes, open the PR.".into(), at_ms: 1_000, turn: Some(4), last: SessionStatus::Blocked, created_ms: None, name: "web".into() };
+        a.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.insert("tw-r1".into(), r);
+        assert!(a.typed_there("tw-r1", "no, wait", crate::history::now_ms()));
+        assert!(a.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.is_empty());
+        assert_eq!(a.due_reply("tw-r1", &SessionStatus::parse("idle"), Some(5), None, 2_000), None, "nothing left to type");
+        let line = lines(&record, 1);
+        assert_eq!((line[0].kind.as_str(), line[0].status.as_deref()), ("queue", Some("not-sent")));
+        assert!(line[0].text.starts_with("Not sent: you answered it in the terminal") && line[0].text.contains("Yes, open the PR."), "{}", line[0].text);
+        assert!(user.lock().unwrap().is_empty(), "never said");
+    }
+
+    /// The question at the end of a turn the user typed in its terminal is
+    /// theirs as it is: a card, no note to the brain, nothing said.
+    #[test]
+    fn a_question_after_a_turn_the_user_typed_goes_to_them_quietly() {
+        let (a, brain) = asks();
+        let d = super::super::decisions::Decisions::telling(a.shared.clone(), || crate::tell::Level::Decisions);
+        let a = a.with_decisions(d.clone());
+        let user = Arc::new(Mutex::new(Vec::<String>::new()));
+        let u = user.clone();
+        a.set_notify(move |addr, text| u.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{addr}: {text}")));
+        let q = a.asked_after(text_q("tw-o1", "web"), true);
+        assert_eq!((q.decision.as_deref(), q.reason.as_str()), (Some("escalate"), questions::TYPED_THERE));
+        assert_eq!(open_decisions(&a), 1);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(brain.lock().unwrap().is_empty(), "the brain is not asked to answer it");
+        assert!(user.lock().unwrap().is_empty(), "nothing said");
+        // A wait at the end of such a turn: its card, not said either.
+        let msg = "PR #12 is open. You need to merge it; I'll wait.";
+        a.waiting_in(None, "tw-o2", "api", None, msg, &questions::waits_for_user(msg).unwrap(), "", false, true).unwrap();
+        assert_eq!(open_decisions(&a), 2);
+        assert!(user.lock().unwrap().is_empty());
+        // Another session's own question still goes through the brain.
+        a.asked_after(text_q("tw-o3", "docs"), false);
+        assert_eq!(told(&brain, 1).len(), 1);
+    }
+
+    /// The driver presses nothing once the set it answers is over (the
+    /// user answered the dialog in its terminal as the keys went in).
+    #[test]
+    fn nothing_is_typed_into_a_dialog_that_is_gone() {
+        struct Fake {
+            screen: String,
+            keys: Vec<String>,
+        }
+        impl questions::Term for Fake {
+            fn read(&mut self) -> String {
+                if self.keys.is_empty() { self.screen.clone() } else { String::new() }
+            }
+            fn keys(&mut self, keys: &[&str]) -> Result<()> {
+                self.keys.extend(keys.iter().map(|k| k.to_string()));
+                Ok(())
+            }
+            fn paste(&mut self, text: &str) -> Result<()> {
+                self.keys.push(text.to_string());
+                Ok(())
+            }
+        }
+        let set = perm(PERM);
+        let closed = || false;
+        let mut term = Guarded { term: Fake { screen: fixture("claude-permission.txt"), keys: vec![] }, open: &closed };
+        let stop = questions::drive(&mut term, &set, &ans0(), true).unwrap_err();
+        assert!(stop.message.contains("answered in its terminal"), "{stop}");
+        assert!(term.term.keys.is_empty(), "not a key");
+        let open = || true;
+        let mut term = Guarded { term: Fake { screen: fixture("claude-permission.txt"), keys: vec![] }, open: &open };
+        questions::drive(&mut term, &set, &ans0(), true).unwrap();
+        assert_eq!(term.term.keys, ["1"], "while it is open, its answer goes in");
+
+        // The next permission prompt (another command) is no redraw of this one: what was
+        // decided for the first never goes into it.
+        let mut next = questions::parse_screen(&fixture("claude-permission.txt")).unwrap();
+        next.detail = next.detail.replace("touch /tmp/qfix-perm-test", "rm -rf /tmp/qfix");
+        let next = questions::build("t37", "qfix perm", false, &next, None, "approve Bash: rm -rf /tmp/qfix", "");
+        assert!(!questions::redrawn(&set, &next) && !questions::answers_still_fit(&set, &next, &ans0()));
+        assert!(questions::redrawn(&set, &perm("approve Bash: touch it")), "the same command read under another status line still is");
+    }
+
+    /// A dialog the session still shows but the tower can't read any more is
+    /// not answered: its card goes, nothing says the user answered it.
+    #[test]
+    fn a_dialog_out_of_sight_is_not_answered() {
+        let (a, d, _user, record) = recording(None);
+        let set = perm(PERM);
+        a.upsert(set.clone());
+        escalate_perm(&a, &set);
+        let id = d.for_question(&set.id)[0].clone();
+        a.close_where("t37", |s| s.kind != "text", |_| CloseWhy::Unread, true);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(lines(&record, 1).is_empty());
+        assert_eq!(d.get(&id).unwrap().state, crate::decisions::State::Stopped);
+    }
+
+    /// The dialog read again as the user answers it in the terminal: the
+    /// same set moves on (its tab, what is answered), keeps its decision, and
+    /// what the review showed of an answer stays known once it doesn't show.
+    #[test]
+    fn a_dialog_read_again_tab_by_tab_follows_and_keeps_its_answers() {
+        let (a, d, user) = deciding(|| crate::tell::Level::Decisions);
+        let tabs = questions::transcript_questions(&fixture("claude-ask-transcript.jsonl")).unwrap();
+        let read = |name: &str| {
+            let mut s = questions::build("t21", "web", false, &questions::parse_screen(&fixture(name)).unwrap(), Some(tabs.clone()), "", "");
+            s.at_ms = crate::history::now_ms();
+            s
+        };
+        let first = read("claude-ask-tab1.txt");
+        a.upsert(first.clone());
+        a.escalate(&first.id, "the user decides");
+        let id = d.for_question(&first.id)[0].clone();
+        assert_eq!(user.lock().unwrap().len(), 1);
+        // The user ticks Features in the terminal, then goes to the review.
+        let review = read("claude-ask-review-tagged.txt");
+        assert_eq!(review.id, first.id);
+        a.upsert(review);
+        let now = a.get(&first.id).unwrap();
+        assert_eq!((now.current_tab, now.tabs[1].answered, now.tabs[1].answer.as_str(), now.decision.as_deref()), (3, true, "Search (full text)", Some("escalate")));
+        assert!(d.get(&id).unwrap().title.contains("2 answered in the terminal"), "{}", d.get(&id).unwrap().title);
+        // Back on a question tab: the review's answer isn't on screen any more, and is still known.
+        let mut back = read("claude-ask-tab3.txt");
+        back.tabs[1].answered = true;
+        a.upsert(back);
+        let now = a.get(&first.id).unwrap();
+        assert_eq!((now.current_tab, now.tabs[1].answer.as_str()), (2, "Search (full text)"));
+        assert_eq!(user.lock().unwrap().len(), 1, "nothing said again");
+        assert_eq!(d.get(&id).unwrap().state, crate::decisions::State::Open);
     }
 }

@@ -1,0 +1,1474 @@
+<title>Quiet Tower</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: one reading column for the argument; the mockups sit on a dark "desk" band, the way the orb and its panel float over a desktop. */
+:root{
+  --bg:#f1f3f7; --surface:#ffffff; --surface-2:#e6eaf1; --line:#d2d9e5; --grid:#e4e8f0;
+  --ink:#16233a; --ink-2:#45526a; --ink-3:#6b7890;
+  --accent:#2a5fd0;
+  --yours:#8f5800; --yours-bg:#fdefc8;
+  --bad:#b3364a;
+  --series:#2a78d6; --series-hi:#b87400; --series-mute:#8794aa;
+  --f-display:"Barlow Condensed","Arial Narrow","Helvetica Neue",sans-serif;
+  --f-body:"IBM Plex Sans",-apple-system,"Segoe UI",sans-serif;
+  --f-mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace;
+  --f-mac:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Arial,sans-serif;
+  /* The mock is the product: its own glass and orb colours, the same in both page themes. */
+  --m-desk-a:#141d31; --m-desk-b:#2c3954;
+  --m-glass-a:#435070; --m-glass-b:#384563; --m-card:#4a5777; --m-card-2:#56638a;
+  --m-line:rgba(255,255,255,.18); --m-soft:rgba(255,255,255,.08); --m-shadow:rgba(4,10,24,.45);
+  --m-ink:#ffffff; --m-ink-2:#cdd6e6; --m-ink-3:#9eaac0;
+  --m-pale:#cce0ff; --m-cyan:#59d9ff; --m-amber:#ffcf70; --m-rose:#ff8f8f; --m-navy:#16233a;
+  --m-orb-a:#7fa3ea; --m-orb-b:#2f4a86;
+  --m-pill:#f3f5f9; --m-pill-ink:#1d2330; --m-pill-mute:#8a93a3; --m-shot:#dfe6f2; --m-shot-2:#b3c1d9; --m-phone:#0d1424;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0c1320; --surface:#151e30; --surface-2:#1d2840; --line:#2b3852; --grid:#222d44;
+    --ink:#e6ecf7; --ink-2:#aeb9cd; --ink-3:#8290a8;
+    --accent:#8ec5ff; --yours:#ffcf70; --yours-bg:#3b3013; --bad:#ff8f8f;
+    --series:#3987e5; --series-hi:#c98500; --series-mute:#5f6d86;
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0c1320; --surface:#151e30; --surface-2:#1d2840; --line:#2b3852; --grid:#222d44;
+  --ink:#e6ecf7; --ink-2:#aeb9cd; --ink-3:#8290a8;
+  --accent:#8ec5ff; --yours:#ffcf70; --yours-bg:#3b3013; --bad:#ff8f8f;
+  --series:#3987e5; --series-hi:#c98500; --series-mute:#5f6d86;
+  color-scheme:dark;
+}
+
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:400 16px/1.55 var(--f-body);-webkit-font-smoothing:antialiased}
+.wrap{width:100%;max-width:1080px;margin-inline:auto;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+main{display:grid;gap:clamp(56px,8vw,96px);padding-block:clamp(44px,6vw,72px)}
+h1,h2,h3,h4,p,ul,ol,figure{margin:0}
+h1{font:600 clamp(60px,12vw,136px)/.86 var(--f-display);text-transform:uppercase;letter-spacing:-.005em;text-wrap:balance}
+h2{font:600 clamp(30px,4.2vw,42px)/1 var(--f-display);text-transform:uppercase;letter-spacing:.01em;text-wrap:balance}
+h3{font:600 16px/1.35 var(--f-body)}
+code{font:500 .88em var(--f-mono);background:var(--surface-2);padding:.1em .35em;border-radius:5px;overflow-wrap:anywhere}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.eyebrow{font:500 12px/1.5 var(--f-mono);letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3)}
+.top{display:grid;gap:22px;padding-top:clamp(40px,7vw,88px)}
+.lede{font-size:clamp(18px,2.1vw,22px);line-height:1.45;max-width:60ch;color:var(--ink-2)}
+.sec{display:grid;gap:28px}
+.sechead{display:grid;gap:12px}
+.intro{max-width:65ch;color:var(--ink-2)}
+.small{font-size:14px;color:var(--ink-3);max-width:70ch}
+
+/* measured */
+.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.stat{padding:20px 20px 22px 0;display:grid;gap:8px;align-content:start}
+.stat + .stat{border-left:1px solid var(--line);padding-left:20px}
+.stat b{font:600 clamp(34px,5vw,52px)/1 var(--f-body);letter-spacing:-.02em}
+.stat span{font-size:14px;line-height:1.4;color:var(--ink-2)}
+@media (max-width:720px){
+  .stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .stat:nth-child(3){border-left:0;padding-left:0}
+  .stat:nth-child(n+3){border-top:1px solid var(--line)}
+}
+.charts{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:20px}
+@media (max-width:860px){.charts{grid-template-columns:minmax(0,1fr)}}
+.fig{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:20px;display:grid;gap:18px;align-content:start;min-width:0}
+.fig figcaption{display:grid;gap:4px}
+.fig figcaption b{font-weight:600}
+.fig figcaption span{font-size:13px;color:var(--ink-3)}
+.legend{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:13px;color:var(--ink-2)}
+.legend span{display:inline-flex;align-items:center;gap:7px}
+.k-bar{width:10px;height:10px;border-radius:2px;background:var(--series)}
+.k-dot{width:8px;height:8px;border-radius:50%;background:var(--ink)}
+.bars{position:relative;height:178px;margin-left:30px;display:grid;grid-template-columns:repeat(14,minmax(0,1fr))}
+.gl{position:absolute;left:0;right:0;height:1px;background:var(--grid)}
+.yt{position:absolute;left:-30px;width:24px;text-align:right;font:400 11px/1 var(--f-mono);color:var(--ink-3);transform:translateY(50%);font-variant-numeric:tabular-nums}
+.col{position:relative;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:4px;border-radius:4px}
+.col .bar{width:min(20px,62%);background:var(--series);border-radius:4px 4px 0 0}
+.col:hover .bar,.col:focus-visible .bar{filter:brightness(1.15)}
+.col .cap{font:500 11px/1 var(--f-mono);color:var(--ink)}
+.xrow{margin:7px 0 0 30px;display:grid;grid-template-columns:repeat(14,minmax(0,1fr))}
+.xc{display:grid;justify-items:center;gap:7px}
+.xl{font:400 11px/1 var(--f-mono);color:var(--ink-3);font-variant-numeric:tabular-nums}
+.dots{height:8px;display:flex;gap:3px}
+.dots i{width:8px;height:8px;border-radius:50%;background:var(--ink)}
+.tip{position:fixed;z-index:20;transform:translate(-50%,-100%);background:var(--ink);color:var(--bg);font:500 12px/1.3 var(--f-mono);padding:7px 9px;border-radius:7px;pointer-events:none;white-space:nowrap}
+details.tv summary{font-size:13px;color:var(--ink-3);cursor:pointer;width:max-content}
+details.tv table{min-width:0;margin-top:10px;font:400 12px/1.3 var(--f-mono);font-variant-numeric:tabular-nums}
+details.tv th,details.tv td{padding:5px 12px 5px 0;border-bottom:1px solid var(--grid)}
+.rank{display:grid;gap:14px}
+.rr{display:grid;gap:6px}
+.rr .lab{font-size:14px}
+.rr .track{display:flex;align-items:center;gap:8px}
+.rr .b{height:14px;width:calc((100% - 40px) * var(--r));min-width:3px;border-radius:0 4px 4px 0;background:var(--series-mute)}
+.rr.hi .b{background:var(--series-hi)}
+.rr.hi .lab{font-weight:600}
+.rr .v{font:500 13px/1 var(--f-mono);font-variant-numeric:tabular-nums}
+.log{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:4px 20px}
+.log .row{display:grid;grid-template-columns:72px minmax(0,1fr);gap:14px;padding:13px 0;border-top:1px solid var(--grid);font:400 13px/1.6 var(--f-mono)}
+.log .row:first-child{border-top:0}
+.log time{color:var(--ink-3);font-variant-numeric:tabular-nums}
+.log mark{background:transparent;color:var(--bad)}
+@media (max-width:520px){.log .row{grid-template-columns:minmax(0,1fr);gap:2px}}
+
+/* causes */
+.causes{display:grid;border-top:1px solid var(--line)}
+.cause{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);gap:8px 36px;padding:22px 0;border-bottom:1px solid var(--line)}
+.cause h3{grid-column:1;font-size:17px}
+.cause .ev{grid-column:1;color:var(--ink-2);font-size:15px}
+.cause .fix{grid-column:2;grid-row:1 / span 2;display:grid;gap:6px;align-content:start;font-size:15px}
+.cause .fix b{font:500 11px/1.4 var(--f-mono);letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}
+@media (max-width:760px){.cause{grid-template-columns:minmax(0,1fr)} .cause .fix{grid-column:1;grid-row:auto;margin-top:6px}}
+
+/* rule */
+.rule{font:500 clamp(21px,2.8vw,28px)/1.3 var(--f-body);max-width:32ch;text-wrap:balance}
+.lanes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.lane{padding:22px 24px 24px 0;display:grid;gap:10px;align-content:start;font-size:15px}
+.lane + .lane{border-left:1px solid var(--line);padding-left:24px}
+.lane p{color:var(--ink-2)}
+@media (max-width:760px){.lanes{grid-template-columns:minmax(0,1fr)} .lane + .lane{border-left:0;padding-left:0;border-top:1px solid var(--line)}}
+.chip{display:inline-flex;align-items:center;width:max-content;font:500 11px/1 var(--f-mono);letter-spacing:.08em;text-transform:uppercase;padding:6px 9px;border-radius:999px;border:1px solid var(--line);color:var(--ink-2);white-space:nowrap}
+.chip.yours{background:var(--yours-bg);color:var(--yours);border-color:transparent}
+.chip.asked{color:var(--accent);border-color:currentColor}
+.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:14px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;min-width:640px;font-size:14.5px}
+th,td{text-align:left;padding:12px 16px;border-bottom:1px solid var(--grid);vertical-align:top}
+th{font:500 11px/1.4 var(--f-mono);letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3)}
+tbody tr:last-child td{border-bottom:0}
+td.was{color:var(--ink-2)}
+td .chip{margin-right:8px}
+
+/* the desk band and the mock */
+.band{background:linear-gradient(160deg,var(--m-desk-a),var(--m-desk-b));color:var(--m-ink);padding-block:clamp(44px,6vw,76px)}
+.band :focus-visible{outline-color:var(--m-cyan)}
+.band .intro{color:var(--m-ink-2)}
+.stagehead{display:flex;flex-wrap:wrap;gap:24px;align-items:end;justify-content:space-between}
+.stagehead .sechead{flex:1 1 420px}
+.seg{display:inline-flex;gap:2px;padding:4px;border-radius:999px;border:1px solid var(--m-line);background:var(--m-soft)}
+.seg button{font:600 14px/1 var(--f-body);padding:10px 18px;border-radius:999px;border:0;background:transparent;color:var(--m-ink-2);cursor:pointer}
+.seg button[aria-pressed="true"]{background:var(--m-pale);color:var(--m-navy)}
+.scene{display:grid;gap:32px;margin-top:36px;align-items:start}
+.scene.next{grid-template-columns:minmax(0,1fr)}
+.scene.today{grid-template-columns:minmax(0,400px) minmax(0,1fr)}
+@media (max-width:820px){.scene.today{grid-template-columns:minmax(0,1fr)} .scene.today > *{max-width:420px}}
+.surf{display:grid;gap:12px;align-content:start;min-width:0}
+.capt{font:500 11px/1.4 var(--f-mono);letter-spacing:.08em;text-transform:uppercase;color:var(--m-ink-3)}
+.notes{display:grid;gap:20px;align-content:start;font-size:15px}
+.note{display:grid;gap:4px;align-content:start}
+.note p{color:var(--m-ink-2)}
+.try{display:grid;gap:10px;padding-top:18px;border-top:1px solid var(--m-line)}
+.try .row{display:flex;flex-wrap:wrap;gap:8px}
+.tbtn{font:500 13px/1.3 var(--f-mono);text-align:left;padding:9px 12px;border-radius:10px;border:1px solid var(--m-line);background:var(--m-soft);color:var(--m-ink);cursor:pointer}
+.tbtn:hover{background:var(--m-line)}
+.orbrow{display:flex;align-items:center;gap:18px}
+.orb{position:relative;flex:none;width:88px;height:88px;border-radius:50%;border:0;padding:0;cursor:pointer;
+  background:radial-gradient(circle at 42% 40%,var(--m-navy) 0 22%,var(--m-orb-b) 33%,transparent 46%),radial-gradient(circle at 50% 50%,var(--m-orb-a) 0 52%,var(--m-pale) 60% 64%,var(--m-orb-a) 71% 100%);
+  box-shadow:0 14px 30px var(--m-shadow),inset 0 0 0 1px var(--m-line);animation:breathe 5s ease-in-out infinite}
+.orb .badge{position:absolute;top:-5px;right:-5px;min-width:30px;height:30px;padding:0 8px;border-radius:15px;background:var(--m-amber);color:var(--m-navy);font:700 16px/30px var(--f-mac);text-align:center;box-shadow:0 0 0 3px var(--m-desk-a)}
+.orbsay{font-size:14px;color:var(--m-ink-2)}
+@keyframes breathe{50%{transform:scale(1.035)}}
+@keyframes pulse{50%{opacity:.3}}
+.panel{background:linear-gradient(180deg,var(--m-glass-a),var(--m-glass-b));border:1px solid var(--m-line);border-radius:28px;padding:20px 16px 16px;display:grid;gap:16px;font:14px/1.4 var(--f-mac);color:var(--m-ink);box-shadow:0 30px 60px var(--m-shadow);min-width:0}
+.phead{display:grid;gap:3px;padding:0 4px}
+.phead .t{display:flex;justify-content:space-between;align-items:baseline;gap:12px}
+.phead .t b{font-size:20px;font-weight:600}
+.phead .t span{font-size:12px;color:var(--m-ink-3)}
+.pstatus{color:var(--m-ink-2);font-size:14px}
+.pstatus b{color:var(--m-amber);font-weight:600}
+.bay{display:grid;gap:10px}
+.bayh{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--m-ink-3);padding:0 4px}
+.dcard{background:var(--m-card);border:1px solid var(--m-line);border-radius:18px;padding:14px;display:grid;gap:10px}
+.dcard .meta{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center;font-size:12px;color:var(--m-ink-2)}
+.dcard .sp{font-weight:600;color:var(--m-ink)}
+.dcard .why{border:1px solid var(--m-amber);color:var(--m-amber);border-radius:999px;padding:1px 8px;font-size:11px}
+.dcard h4{font-size:16px;font-weight:600;line-height:1.3}
+.prs{list-style:none;padding:0;display:grid;gap:6px}
+.prs li{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline;background:var(--m-soft);border-radius:10px;padding:7px 10px;font-size:13px}
+.prs b{font-weight:600}
+.prs span{color:var(--m-ink-2)}
+.prs em{font-style:normal;color:var(--m-cyan);margin-left:auto}
+.acts{display:flex;flex-wrap:wrap;gap:8px}
+.mbtn{font:600 13px/1.2 var(--f-mac);padding:9px 14px;border-radius:999px;border:1px solid var(--m-line);background:transparent;color:var(--m-ink);cursor:pointer;display:inline-flex;gap:8px;align-items:baseline}
+.mbtn:hover{background:var(--m-soft)}
+.mbtn.primary{background:var(--m-amber);border-color:transparent;color:var(--m-navy)}
+.mbtn.primary:hover{filter:brightness(1.06);background:var(--m-amber)}
+.mbtn small{font-weight:500;font-size:11px;opacity:.75}
+.dcard.done{grid-template-columns:auto minmax(0,1fr);align-items:baseline;background:var(--m-soft);color:var(--m-ink-2);font-size:13px}
+.dcard.done .tick{color:var(--m-cyan);font-weight:700}
+.empty{padding:14px;border:1px dashed var(--m-line);border-radius:18px;color:var(--m-ink-2);font-size:14px}
+.rows{display:grid;gap:2px}
+.sg{flex:none;width:22px;height:22px;border-radius:50%;display:grid;place-items:center;font-size:12px;font-weight:700;color:var(--m-ink-3)}
+[data-state="yours"] > .sg{background:var(--m-amber);color:var(--m-navy)}
+[data-state="muted"] > .sg{box-shadow:inset 0 0 0 1.5px var(--m-amber);color:var(--m-amber)}
+[data-state="working"] > .sg::before{content:"";width:9px;height:9px;border-radius:50%;background:var(--m-cyan);animation:pulse 1.8s ease-in-out infinite}
+[data-state="done"] > .sg{color:var(--m-cyan)}
+[data-state="ready"] > .sg::before{content:"";width:9px;height:9px;border-radius:50%;box-shadow:inset 0 0 0 1.5px var(--m-ink-3)}
+.lrow{display:grid;grid-template-columns:22px minmax(0,1fr) auto;gap:1px 10px;align-items:center;padding:8px;border-radius:12px;text-align:left}
+button.lrow{width:100%;border:0;background:transparent;color:var(--m-ink);font:inherit;cursor:pointer}
+button.lrow:hover{background:var(--m-soft)}
+.lrow > .sg{grid-row:1 / span 2;align-self:start}
+.nm{font-weight:600;overflow-wrap:anywhere}
+.pg{font-size:12px;color:var(--m-ink-3);font-variant-numeric:tabular-nums}
+.rq{grid-column:2 / -1;font-size:13px;color:var(--m-ink-2)}
+.thread{display:grid;gap:7px;background:var(--m-soft);border-radius:14px;padding:11px 12px;font-size:13px}
+.thread div{display:grid;grid-template-columns:minmax(0,150px) minmax(0,1fr);gap:2px 12px}
+.thread b{font-weight:600}
+.thread span{color:var(--m-ink-2)}
+@media (max-width:520px){.thread div{grid-template-columns:minmax(0,1fr)}}
+.entry{display:grid;grid-template-columns:minmax(0,220px) minmax(0,380px) minmax(0,1fr);gap:24px 44px;align-items:start}
+@media (max-width:1000px){.entry{grid-template-columns:minmax(0,1fr)} .entry > *{max-width:420px}}
+.entry .orbrow{flex-direction:column;align-items:flex-start}
+.fl:focus{outline:none;border-color:var(--m-pale)}
+.fsp{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.fchip{display:inline-flex;align-items:center;gap:6px;padding:4px 11px 4px 5px;border-radius:999px;border:1px solid var(--m-line);background:transparent;color:var(--m-ink);font:inherit;font-size:12.5px;cursor:pointer}
+.fchip:hover{background:var(--m-soft)}
+.fchip > .sg{width:18px;height:18px;font-size:11px}
+.fq{font-size:12.5px;color:var(--m-ink-3);padding-left:4px}
+.win{display:grid;grid-template-columns:236px minmax(0,1fr);min-height:640px;overflow:hidden;background:linear-gradient(180deg,var(--m-glass-a),var(--m-glass-b));border:1px solid var(--m-line);border-radius:26px;box-shadow:0 30px 60px var(--m-shadow);font:14px/1.4 var(--f-mac);color:var(--m-ink)}
+.wside{display:flex;flex-direction:column;gap:12px;padding:18px 10px 14px;border-right:1px solid var(--m-line);background:var(--m-soft);min-width:0}
+.brand{display:grid;gap:3px;padding:0 8px}
+.brand > b{font-size:19px;font-weight:600}
+.wside .pstatus{font-size:12.5px}
+.slist{display:grid;gap:2px}
+.slabel{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--m-ink-3);padding:10px 8px 3px}
+.sitem{display:grid;grid-template-columns:22px minmax(0,1fr);gap:9px;align-items:center;width:100%;text-align:left;padding:8px;border:0;border-radius:12px;background:transparent;color:var(--m-ink);font:inherit;cursor:pointer}
+.sitem:hover{background:var(--m-soft)}
+.sitem[aria-current="true"]{background:var(--m-card-2);box-shadow:inset 0 0 0 1px var(--m-line)}
+.sitem small{display:block;font-size:12px;font-weight:400;color:var(--m-ink-3)}
+.wfoot{margin-top:auto;padding:10px 2px 0;display:flex;flex-wrap:wrap;gap:2px}
+.flink{font:inherit;font-size:12px;padding:6px 8px;border-radius:8px;border:0;background:transparent;color:var(--m-ink-3);cursor:pointer}
+.flink:hover{color:var(--m-ink)}
+.flink[aria-current="true"]{background:var(--m-card-2);color:var(--m-ink)}
+.wmain{display:flex;flex-direction:column;gap:16px;padding:20px 18px 16px;min-width:0}
+.whead{display:flex;flex-wrap:wrap;gap:10px 16px;justify-content:space-between;align-items:flex-start}
+.whead h3{font:600 20px/1.2 var(--f-mac)}
+.whead p{font-size:13px;color:var(--m-ink-2)}
+.toggles{display:flex;gap:6px}
+.tg{font:600 12px/1 var(--f-mac);padding:8px 12px;border-radius:999px;border:1px solid var(--m-line);background:transparent;color:var(--m-ink-2);cursor:pointer}
+.tg[aria-pressed="true"]{background:var(--m-pale);color:var(--m-navy);border-color:transparent}
+.wbody{flex:1 1 auto;display:grid;gap:16px;align-content:start}
+.eff{font-size:13px;color:var(--m-ink-2);background:var(--m-soft);border-radius:10px;padding:8px 12px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,210px),1fr));gap:10px;align-items:start}
+.win:focus{outline:none}
+.mbtn kbd{align-self:center;font:700 10px/1 var(--f-mac);padding:3px 5px;border-radius:5px;background:var(--m-navy);color:var(--m-pale)}
+.keys{font-size:12px;color:var(--m-ink-3);padding:0 4px}
+.goal{font-size:13px;color:var(--m-ink-2)}
+.goal b{font-weight:600;color:var(--m-ink);margin-right:4px}
+.wt{grid-column:2 / -1;font:400 11.5px/1.5 var(--f-mono);color:var(--m-ink-3);overflow-wrap:anywhere}
+.report{background:var(--m-card);border:1px solid var(--m-line);border-radius:18px;padding:14px;display:grid;gap:10px}
+.report h4{font-size:15px;font-weight:600}
+.report p{font-size:13px;color:var(--m-ink-2)}
+.sitem.new .sg{box-shadow:inset 0 0 0 1.5px var(--m-line);color:var(--m-ink-2);font-size:15px}
+.launch{display:grid;gap:16px;max-width:560px}
+.field{display:grid;gap:7px}
+.launch label,.launch .lab{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--m-ink-3)}
+.launch input{width:100%;font:15px/1.3 var(--f-mac);padding:12px 14px;border-radius:14px;border:1px solid var(--m-line);background:var(--m-pill);color:var(--m-pill-ink)}
+.tpls{display:flex;flex-wrap:wrap;gap:6px}
+.plan{margin:0;padding:12px 14px 12px 30px;display:grid;gap:4px;background:var(--m-soft);border-radius:14px;font-size:13px;color:var(--m-ink-2)}
+.plan b{color:var(--m-ink)}
+.wmain{container-type:inline-size}
+.cols{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:22px;align-items:start}
+@container (max-width:640px){.cols{grid-template-columns:minmax(0,1fr)}}
+.now{background:var(--m-pale);color:var(--m-navy);border-radius:999px;padding:1px 8px;font-size:11px;font-weight:700}
+.dcard.open{border-color:var(--m-pale)}
+.after{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--m-ink-3);padding:6px 4px 0}
+.qrow{display:grid;gap:2px;width:100%;text-align:left;padding:10px 14px;border-radius:14px;border:1px solid var(--m-line);background:var(--m-soft);color:var(--m-ink);font:inherit;cursor:pointer}
+.qrow:hover{background:var(--m-card)}
+.qrow .rq{grid-column:auto}
+.mt{grid-column:2 / -1;font-size:12px;color:var(--m-ink-3)}
+.tagm{font-style:normal;font-weight:500;font-size:11px;color:var(--m-ink-3);border:1px solid var(--m-line);border-radius:999px;padding:0 7px;margin-left:7px;white-space:nowrap}
+.pg.ok{color:var(--m-cyan)}
+.gallery{display:grid;gap:44px;margin-top:80px;padding-top:56px;border-top:1px solid var(--m-line)}
+.gindex{display:flex;flex-wrap:wrap;gap:6px}
+.gindex a{font:500 12px/1.2 var(--f-mono);padding:7px 10px;border-radius:9px;border:1px solid var(--m-line);color:var(--m-ink-2);text-decoration:none}
+.gindex a:hover{background:var(--m-soft);color:var(--m-ink)}
+.ggroup{display:grid;gap:24px}
+.ggroup > h3{font:600 24px/1 var(--f-display);text-transform:uppercase;letter-spacing:.02em}
+.gframe{display:grid;gap:12px;align-content:start;min-width:0;scroll-margin-top:16px}
+.gframe figcaption{display:grid;grid-template-columns:auto minmax(0,1fr);gap:3px 10px;align-items:baseline;font-size:14px}
+.gframe figcaption b{font-weight:600}
+.gframe figcaption span:last-child{grid-column:2;color:var(--m-ink-2);font-size:13px}
+.gcode{font:500 12px/1 var(--f-mono);padding:4px 6px;border-radius:6px;background:var(--m-pale);color:var(--m-navy)}
+.gframe [inert]{pointer-events:none}
+.gorbs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:28px 24px}
+.gfloat{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:40px 24px;align-items:start}
+.gwin{display:grid;gap:52px}
+.gwin .win{min-height:0}
+@media (max-width:1000px){.gfloat{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:700px){.gfloat,.gorbs{grid-template-columns:minmax(0,1fr)}}
+.reclist{display:grid}
+.rec{display:grid;grid-template-columns:44px 124px minmax(0,190px) minmax(0,1fr);gap:3px 12px;padding:9px 4px;border-top:1px solid var(--m-line);font-size:13px;align-items:baseline}
+.rec time{color:var(--m-ink-3);font-variant-numeric:tabular-nums}
+.rec .rw{color:var(--m-ink-2)}
+.rk{font-size:11px;border-radius:999px;padding:1px 8px;border:1px solid var(--m-line);color:var(--m-ink-2);width:max-content}
+.k-auto{border-color:var(--m-cyan);color:var(--m-cyan)}
+.k-you{background:var(--m-pale);color:var(--m-navy);border-color:transparent}
+@container (max-width:640px){.rec{grid-template-columns:44px minmax(0,1fr)} .rec .rw,.rec .rt{grid-column:2}}
+.shots{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,190px),1fr));gap:14px}
+.shot{display:grid;gap:5px;text-align:left;border:0;background:transparent;color:var(--m-ink);font:inherit;font-size:13px;padding:0;cursor:pointer}
+.shot small{color:var(--m-ink-3);font-size:12px}
+.thumb{display:block;aspect-ratio:16 / 10;border-radius:10px;background:linear-gradient(var(--m-shot-2),var(--m-shot-2)) 8% 12% / 34% 9% no-repeat,linear-gradient(var(--m-shot-2),var(--m-shot-2)) 8% 46% / 84% 30% no-repeat,linear-gradient(var(--m-shot-2),var(--m-shot-2)) 8% 86% / 52% 8% no-repeat,var(--m-shot)}
+.thumb.big{border-radius:14px;aspect-ratio:2 / 1}
+.sets{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+@container (max-width:640px){.sets{grid-template-columns:minmax(0,1fr)}}
+.set{background:var(--m-soft);border-radius:16px;padding:14px;display:grid;gap:9px;align-content:start}
+.set h4{font-size:14px;font-weight:600}
+.set p,.set li{font-size:13px;color:var(--m-ink-2)}
+.set ul{margin:0;padding-left:16px;display:grid;gap:2px}
+.brow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:1px 12px;padding:9px 4px;border-top:1px solid var(--m-line);font-size:13px}
+.brow b{font-weight:600}
+.brow span{grid-column:1;color:var(--m-ink-2)}
+.brow .sw{grid-row:1 / span 2;grid-column:2;align-self:center;font-size:11px;font-weight:700;border-radius:999px;padding:3px 10px;background:var(--m-pale);color:var(--m-navy)}
+.qrwrap{display:flex;flex-wrap:wrap;gap:20px;align-items:center}
+.qr{width:132px;height:132px;border-radius:10px;border:8px solid var(--m-pill);background:conic-gradient(var(--m-navy) 25%,var(--m-pill) 0 50%,var(--m-navy) 0 75%,var(--m-pill) 0) 0 0 / 22px 22px}
+.scr{margin:0;font:11.5px/1.55 var(--f-mono);background:var(--m-navy);color:var(--m-pale);border-radius:12px;padding:10px 12px;white-space:pre-wrap;overflow-wrap:anywhere}
+.opts{display:grid;gap:6px}
+.opt{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:1px 8px;padding:9px 12px;border-radius:12px;border:1px solid var(--m-line);font-size:13px}
+.opt.pick{background:var(--m-amber);color:var(--m-navy);border-color:transparent}
+.opt b{font-weight:600}
+.opt span{grid-column:1 / -1;font-size:12px;opacity:.82}
+.opt em{font-style:normal;font-size:11px;font-weight:700}
+.own{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:12px;color:var(--m-ink-2)}
+.own span{border:1px solid var(--m-line);border-radius:999px;padding:2px 9px}
+.other{font-size:13px;color:var(--m-pill-mute);background:var(--m-pill);border-radius:12px;padding:9px 12px}
+.skel{height:40px;border-radius:12px;background:var(--m-soft)}
+.cstat{font-size:13px;color:var(--m-ink-2)}
+.bad,.prs em.bad{color:var(--m-rose)}
+.rev{list-style:none;padding:0;display:grid;gap:6px;font-size:13px}
+.rev li{display:grid;gap:1px;background:var(--m-soft);border-radius:10px;padding:7px 10px}
+.rev span{color:var(--m-amber)}
+.att{display:flex;gap:10px;align-items:center;font-size:12px;color:var(--m-ink-2)}
+.att .thumb{width:64px}
+.send.live{background:var(--m-cyan);color:var(--m-navy)}
+.gfloat.g4{grid-template-columns:repeat(4,minmax(0,1fr))}
+@media (max-width:1000px){.gfloat.g4{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:700px){.gfloat.g4{grid-template-columns:minmax(0,1fr)}}
+.gframe .panel.fl{gap:12px}
+.phone{max-width:330px;border-radius:36px;border:1px solid var(--m-line);background:var(--m-phone);padding:9px;box-shadow:0 30px 60px var(--m-shadow);font:14px/1.4 Roboto,"Noto Sans",var(--f-mac);color:var(--m-ink)}
+.pscreen{border-radius:28px;min-height:590px;display:flex;flex-direction:column;overflow:hidden;background:linear-gradient(180deg,var(--m-glass-b),var(--m-desk-b))}
+.pbar{display:flex;justify-content:space-between;padding:10px 18px 2px;font-size:11px;color:var(--m-ink-3)}
+.ptop{padding:8px 16px 12px;display:grid;gap:2px}
+.ptop > b{font-size:21px;font-weight:600}
+.ptop span{font-size:13px;color:var(--m-ink-2)}
+.pbody{flex:1;padding:0 12px 12px;display:grid;gap:11px;align-content:start}
+.ptalkrow{display:flex;justify-content:flex-end;padding:0 12px 10px}
+.ptalk{background:var(--m-pale);color:var(--m-navy);font-weight:700;font-size:13px;border-radius:999px;padding:12px 18px}
+.ptalk.live{background:var(--m-cyan)}
+.pnav{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border-top:1px solid var(--m-line);font-size:11.5px;text-align:center}
+.pnav span{padding:10px 2px 12px;color:var(--m-ink-3)}
+.pnav .on{color:var(--m-ink);font-weight:700}
+.pclock{font:300 58px/1 var(--f-mac);text-align:center;padding:40px 0 30px}
+.pnote{margin:0 12px;background:var(--m-card);border:1px solid var(--m-line);border-radius:22px;padding:13px 14px;display:grid;gap:6px}
+.pn-h{display:flex;justify-content:space-between;font-size:12px;color:var(--m-ink-3)}
+.pn-h b{color:var(--m-ink)}
+.pn-t{font-weight:600;font-size:15px}
+.pn-s{font-size:13px;color:var(--m-ink-2)}
+.heard{font-size:21px;line-height:1.3;padding:26px 4px}
+.pill .send{flex:none}
+.phone .rec{grid-template-columns:44px minmax(0,1fr)}
+.phone .rec .rw,.phone .rec .rt{grid-column:2}
+.phone .shots{grid-template-columns:repeat(2,minmax(0,1fr))}
+.phone .sets{grid-template-columns:minmax(0,1fr)}
+.try.flat{border-top:0;padding-top:6px}
+.notes.n3{grid-template-columns:repeat(3,minmax(0,1fr));gap:24px 40px}
+@media (max-width:860px){.notes.n3{grid-template-columns:minmax(0,1fr)}}
+@media (max-width:760px){
+  .entry{grid-template-columns:minmax(0,1fr)}
+  .win{grid-template-columns:minmax(0,1fr);min-height:0}
+  .wside{border-right:0;border-bottom:1px solid var(--m-line)}
+  .slist{display:flex;overflow-x:auto;gap:6px;padding-bottom:4px}
+  .slabel{display:none}
+  .sitem{flex:none;width:auto}
+  .sitem small{display:none}
+  .wfoot{margin-top:0}
+}
+.fold{width:100%;display:flex;justify-content:space-between;gap:10px;padding:9px 8px 9px 40px;border:0;border-radius:12px;background:transparent;color:var(--m-ink-3);font:inherit;font-size:13px;cursor:pointer;text-align:left}
+.fold:hover{background:var(--m-soft)}
+.quiet{margin:0 8px 0 40px;font-size:13px;color:var(--m-ink-3);display:grid;gap:3px;padding-bottom:6px}
+.answer{background:var(--m-card-2);border:1px solid var(--m-line);border-radius:16px;padding:12px 14px;display:grid;gap:9px;font-size:14px}
+.answer .q{font-size:12px;color:var(--m-ink-3)}
+.answer ul{padding-left:16px;display:grid;gap:3px;color:var(--m-ink-2);font-size:13px}
+.assume{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.assume span{font-size:12px;padding:3px 9px;border-radius:999px;border:1px solid var(--m-line);color:var(--m-ink-2)}
+.assume .mbtn{padding:5px 12px;font-size:12px}
+.pill{display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--m-pill);color:var(--m-pill-mute);border-radius:999px;padding:12px 16px 12px 18px;font-size:15px}
+.pill .send{width:30px;height:30px;border-radius:50%;background:var(--m-pill-mute);color:var(--m-pill);display:grid;place-items:center;font-weight:700}
+.pill.has{color:var(--m-pill-ink)}
+
+/* today's panel */
+.tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));padding:4px;border-radius:999px;border:1px solid var(--m-line);font-size:14px;text-align:center}
+.tabs span{padding:8px 4px;border-radius:999px;color:var(--m-ink-2)}
+.tabs .on{background:var(--m-pale);color:var(--m-navy);font-weight:600}
+.nowstrip{display:flex;gap:6px;overflow-x:auto;padding-bottom:2px}
+.nowstrip span{flex:none;font-size:12px;padding:5px 10px;border-radius:999px;border:1px solid var(--m-line);color:var(--m-ink-2)}
+.nowstrip .need{border-color:var(--m-amber);color:var(--m-amber)}
+.chat{display:grid;gap:8px;max-height:430px;overflow-y:auto;padding-right:4px}
+.bub{background:var(--m-card);border:1px solid var(--m-line);border-radius:18px;padding:11px 13px;font-size:13.5px;line-height:1.45;display:grid;gap:5px;margin-right:22px}
+.bub time{font-size:11px;color:var(--m-ink-3)}
+.evt{font-size:12px;color:var(--m-ink-2);background:var(--m-soft);border-radius:10px;padding:6px 10px;margin:0 10px}
+
+/* spaces scale */
+.scalectl{display:flex;flex-wrap:wrap;gap:14px;align-items:center}
+.scalectl label{font-weight:600}
+.scalectl output{font:600 22px/1 var(--f-body);min-width:2ch;font-variant-numeric:tabular-nums}
+input[type="range"]{flex:1 1 220px;max-width:420px;accent-color:var(--accent)}
+.scale{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px;align-items:start}
+@media (max-width:820px){.scale{grid-template-columns:minmax(0,1fr)}}
+.side{display:grid;gap:10px;min-width:0}
+.side h3 span{font-weight:400;color:var(--ink-3)}
+.mini{background:linear-gradient(180deg,var(--m-glass-a),var(--m-glass-b));border-radius:20px;padding:14px;color:var(--m-ink);font:13px/1.4 var(--f-mac);display:grid;gap:8px;min-width:0}
+.strip{display:flex;gap:6px;overflow-x:auto;padding-bottom:6px}
+.mc{flex:none;padding:5px 10px;border-radius:999px;background:var(--m-soft);color:var(--m-ink-2);white-space:nowrap}
+.mc.on{background:var(--m-pale);color:var(--m-navy);font-weight:600}
+.mc.sp{background:var(--m-card-2);color:var(--m-ink)}
+.mrow{display:grid;grid-template-columns:18px minmax(0,1fr) auto;gap:8px;align-items:center;padding:5px 4px}
+.mrow i{width:18px;height:18px;border-radius:50%;display:grid;place-items:center;font-style:normal;font-size:11px;font-weight:700}
+.mrow.y i{background:var(--m-amber);color:var(--m-navy)}
+.mrow.w i::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--m-cyan)}
+.mrow em{font-style:normal;font-size:12px;color:var(--m-ink-3)}
+.mrow.q{color:var(--m-ink-3)}
+.sidenote{font-size:14px;color:var(--ink-2)}
+
+/* dial */
+.pseg{display:inline-flex;flex-wrap:wrap;gap:2px;padding:4px;border-radius:16px;border:1px solid var(--line);background:var(--surface);width:max-content;max-width:100%}
+.pseg button{font:600 14px/1.2 var(--f-body);padding:10px 16px;border-radius:12px;border:0;background:transparent;color:var(--ink-2);cursor:pointer}
+.pseg button[aria-pressed="true"]{background:var(--ink);color:var(--bg)}
+.dialout{display:grid;grid-template-columns:auto minmax(0,1fr);gap:8px 28px;align-items:center;border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:22px 0}
+.dialout b{font:600 clamp(36px,6vw,56px)/1 var(--f-body);letter-spacing:-.02em}
+.dialout p{color:var(--ink-2);max-width:60ch}
+@media (max-width:620px){.dialout{grid-template-columns:minmax(0,1fr)}}
+.two{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px 40px}
+@media (max-width:720px){.two{grid-template-columns:minmax(0,1fr)}}
+.two > div{display:grid;gap:10px;align-content:start}
+.two ul,.two ol{padding-left:20px;display:grid;gap:6px;color:var(--ink-2);font-size:15px}
+.two p{color:var(--ink-2);font-size:15px}
+
+/* more + build */
+.more{display:grid;border-top:1px solid var(--line)}
+.more > div{display:grid;grid-template-columns:minmax(0,260px) minmax(0,1fr);gap:6px 36px;padding:18px 0;border-bottom:1px solid var(--line)}
+.more p{color:var(--ink-2);font-size:15px;max-width:68ch}
+@media (max-width:720px){.more > div{grid-template-columns:minmax(0,1fr)}}
+.steps{list-style:none;padding:0;display:grid;border-top:1px solid var(--line);counter-reset:s}
+.steps li{counter-increment:s;display:grid;grid-template-columns:44px minmax(0,1fr);gap:6px 12px;padding:20px 0;border-bottom:1px solid var(--line)}
+.steps li::before{content:counter(s);font:600 30px/1 var(--f-display);color:var(--ink-3)}
+.steps .body{display:grid;gap:6px}
+.steps p{color:var(--ink-2);font-size:15px;max-width:72ch}
+.steps .files{font:400 12.5px/1.6 var(--f-mono);color:var(--ink-3);overflow-wrap:anywhere}
+footer{padding-bottom:56px}
+footer p{font-size:13px;color:var(--ink-3);max-width:80ch}
+@media (prefers-reduced-motion: reduce){*{animation:none !important;transition:none !important}}
+</style>
+
+<header class="wrap top">
+  <p class="eyebrow">herdr-tower · Mac orb and panel · proposal · 10 Nov 2026</p>
+  <h1>Quiet Tower</h1>
+  <p class="lede">You built the tower to do 90 percent of the work out of sight. On 10 November it did the work and then reported every step of it: 277 messages back for 8 requests. This is a proposal for a tower that stays silent unless you asked or the decision is yours, and a Mac panel built around that.</p>
+</header>
+
+<main>
+
+<section class="wrap sec" id="measured">
+  <div class="sechead">
+    <h2>One day, measured</h2>
+    <p class="intro">Counted from <code>history.jsonl</code> for 10 Nov 2026, midnight to 23:10.</p>
+  </div>
+  <div class="stats">
+    <div class="stat"><b>8</b><span>requests from you</span></div>
+    <div class="stat"><b>277</b><span>messages the tower wrote back</span></div>
+    <div class="stat"><b>15,700</b><span>words in those messages, about an hour and a half read aloud</span></div>
+    <div class="stat"><b>112</b><span>“waits for you” alerts, 28 of them from sessions that had no task</span></div>
+  </div>
+  <p class="intro">The tower is muted as this is written. Muting stops the voice. The same messages still land in the chat and on the phone.</p>
+
+  <div class="charts">
+    <figure class="fig">
+      <figcaption><b>Messages from the tower, by hour</b><span>10 Nov, 10:00 to 23:10</span></figcaption>
+      <div class="legend"><span><i class="k-bar"></i>Messages the tower wrote</span><span><i class="k-dot"></i>One request from you</span></div>
+      <div>
+        <div class="bars" id="bars"></div>
+        <div class="xrow" id="xrow"></div>
+      </div>
+      <details class="tv"><summary>Show as a table</summary><table id="hourTable"></table></details>
+    </figure>
+    <figure class="fig">
+      <figcaption><b>What the 277 messages were</b><span>Each message counted once, sorted by its wording</span></figcaption>
+      <div class="rank">
+        <div class="rr"><span class="lab">Says nothing is needed from you</span><div class="track"><div class="b" style="--r:1"></div><span class="v">111</span></div></div>
+        <div class="rr"><span class="lab">Reports progress, no action</span><div class="track"><div class="b" style="--r:.721"></div><span class="v">80</span></div></div>
+        <div class="rr hi"><span class="lab">Asks or offers you something</span><div class="track"><div class="b" style="--r:.595"></div><span class="v">66</span></div></div>
+        <div class="rr"><span class="lab">Narrates one session writing to another</span><div class="track"><div class="b" style="--r:.153"></div><span class="v">17</span></div></div>
+        <div class="rr"><span class="lab">Says it is repeating itself</span><div class="track"><div class="b" style="--r:.027"></div><span class="v">3</span></div></div>
+      </div>
+    </figure>
+  </div>
+
+  <div class="sechead">
+    <h3>22:52 tonight: four messages in 18 seconds</h3>
+    <div class="log">
+      <div class="row"><time>22:52:24</time><span>The dashboard session finished taking in the MediaRoom answers and wrote them into the plan. That's the document I linked a moment ago. <mark>Nothing new needs you;</mark> the decisions in the plan are yours when you read it.</span></div>
+      <div class="row"><time>22:52:31</time><span>The sandbox mediaroom session read the plan summary and had no corrections to its part. <mark>Nothing is needed from you.</mark></span></div>
+      <div class="row"><time>22:52:36</time><span>The sandbox project session finished reading the plan summary and sent its four changes to the dashboard session, which I told you about. <mark>Nothing new needs you.</mark></span></div>
+      <div class="row"><time>22:52:42</time><span>The dashboard session has asked the sandbox mediaroom session three follow-ups from the sandbox project session. […]</span></div>
+    </div>
+    <p class="small">In red: sentences that tell you there is nothing to tell.</p>
+  </div>
+</section>
+
+<section class="wrap sec" id="causes">
+  <div class="sechead">
+    <h2>Where the noise comes from</h2>
+    <p class="intro">Wording will not fix this. You already have behaviors named <code>be-brief-on-simple-tasks</code> and <code>open-sessions-without-asking</code>, and the day above happened with both switched on. The structure asks for a message per event, so messages come. Seven causes, each with its change.</p>
+  </div>
+  <div class="causes">
+    <div class="cause">
+      <h3>Every event becomes a brain turn, and the brain is told to speak</h3>
+      <p class="ev">The core prompt says of <code>[watch]</code>, <code>[queue]</code> and <code>[agenda]</code> notes: “Tell the user what happened” and “Never answer one with silence.” More than 260 of the 277 messages followed a note, with no request from you in front of them. 111 said nothing was needed.</p>
+      <div class="fix"><b>Change</b><p>A note turn is silent. The brain either raises a decision or writes nothing.</p></div>
+    </div>
+    <div class="cause">
+      <h3>The tower treats a session's message as work it handed out</h3>
+      <p class="ev">Sessions write to each other with <code>tower queue</code>, as their introduction tells them. 50 of the day's 126 queued instructions were such messages. Each one was filed as a task, watched, reported to the brain and told to you. The next section follows one through.</p>
+      <div class="fix"><b>Change</b><p>A message between sessions is delivered and kept as a thread. Nothing else happens to it.</p></div>
+    </div>
+    <div class="cause">
+      <h3>One decision is announced by everyone who touches it</h3>
+      <p class="ev">Between 23:03 and 23:05 the same production read was announced 5 times by 3 sessions.</p>
+      <div class="fix"><b>Change</b><p>One card per decision. It lists who waits on it and how long.</p></div>
+    </div>
+    <div class="cause">
+      <h3>Idle counts as blocked</h3>
+      <p class="ev">28 of the 112 “waits for you” alerts were a freshly opened session saying “I'm waiting for your instructions.”</p>
+      <div class="fix"><b>Change</b><p>A session with no open task is ready. It shows as ready and alerts nobody.</p></div>
+    </div>
+    <div class="cause">
+      <h3>A command gets a question back</h3>
+      <p class="ev">At 12:29 you asked for three sessions. At 12:33 the tower answered “Want me to switch them to Opus 5.5?” At 22:37 you wrote to it: “once i ask tower to open up sessions it asks me questions!”</p>
+      <div class="fix"><b>Change</b><p>It assumes the default, acts, and shows what it assumed as chips you can change.</p></div>
+    </div>
+    <div class="cause">
+      <h3>Everything lands in one thread at one weight</h3>
+      <p class="ev">Between 15:00 and 16:00 the chat took 150 items. Decisions, deliveries, screenshots and PR chips scroll past together.</p>
+      <div class="fix"><b>Change</b><p>Three lanes with different weight. Only one of them interrupts.</p></div>
+    </div>
+    <div class="cause">
+      <h3>Spaces only accumulate</h3>
+      <p class="ev">The tower lists 12 spaces. 10 have no live session. One of the empty ones still shows 12 items as needing you. The Activity filter adds a chip for every space and every session.</p>
+      <div class="fix"><b>Change</b><p>A space with no sessions folds away. A need closes when its session is gone.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="wrap sec" id="between">
+  <div class="sechead">
+    <h2>The tower between sessions</h2>
+    <p class="intro">You introduced the sessions so they could settle things among themselves, and they do. The brain does not carry their messages: on 10 Nov it sent 3 instructions of its own all day, and none passed one session's words to another. The tower is still in the middle of every message. The introduction tells sessions to write to each other with <code>tower queue</code>, and that command does not record who called it, so the tower handles a session's message exactly like work it handed out itself.</p>
+  </div>
+  <div class="stats">
+    <div class="stat"><b>50</b><span>messages sessions sent each other, of 126 instructions queued that day</span></div>
+    <div class="stat"><b>48</b><span>of them filed as tasks under your requests, of 99 tasks in all</span></div>
+    <div class="stat"><b>40</b><span>times the brain was told “You had asked it” about a message a session sent</span></div>
+    <div class="stat"><b>33 of 38</b><span>tasks under your 22:37 complaint that were sandbox sessions writing to each other</span></div>
+  </div>
+  <div class="sechead">
+    <div class="log">
+      <div class="row"><time>23:01:53</time><span>[watch] t7j (sandbox mediaroom) is now done. <mark>You had asked it:</mark> From t7h, from t7k, one request and one finding. Planning only. […]</span></div>
+      <div class="row"><time>23:07:44</time><span>All 38 tasks from that request are verified, so it's finished.</span></div>
+    </div>
+    <p class="small">First line: a note the brain received. A session asked, and the brain is told that it did. Second line: what the tower then told you about your 22:37 complaint, after checking off 33 messages that had nothing to do with it.</p>
+  </div>
+  <div class="two">
+    <div>
+      <h3>One message today</h3>
+      <ol>
+        <li>A session runs <code>tower queue t7k "From t7h: …"</code>.</li>
+        <li>The tower files it as a task under whatever you asked last.</li>
+        <li>It delivers the message and starts watching the receiver.</li>
+        <li>The receiver finishes. The brain gets a <code>[watch]</code> note.</li>
+        <li>The brain reads the receiver's screen and marks the task verified.</li>
+        <li>It writes you that the answer “has now gone to” the other session.</li>
+      </ol>
+      <p>The reply starts the same six steps again. This is why it looks as if the tower moved the message.</p>
+    </div>
+    <div>
+      <h3>One message, proposed</h3>
+      <ol>
+        <li>A session runs the same command. The tower records who sent it.</li>
+        <li>It delivers the message when the receiver is free, with the sender's name on it.</li>
+        <li>The message joins that space's thread on the board.</li>
+      </ol>
+      <p>The brain is not woken and you are told nothing. Two things still surface: a message that cannot be delivered, and a decision that is yours.</p>
+    </div>
+  </div>
+  <p class="intro">This is where the brain's day went: 74 screen reads and 73 task verifications, against 3 instructions sent. A behavior telling it not to relay would change nothing, because it is not relaying. The change belongs in the daemon.</p>
+</section>
+
+<section class="wrap sec" id="rule">
+  <div class="sechead">
+    <h2>One rule</h2>
+    <p class="rule">The tower speaks in two cases: you asked, or the decision is yours. Everything else it writes down.</p>
+  </div>
+  <div class="lanes">
+    <div class="lane"><span class="chip yours">Yours</span><h3>A decision only you can make</h3><p>Interrupts once. The orb shows a count and one card appears. Merges, deploys, deletes, production data, secrets, money, design choices.</p></div>
+    <div class="lane"><span class="chip asked">Asked</span><h3>The answer to something you said</h3><p>One reply, in the place you asked. A command gets a receipt. It never gets a question.</p></div>
+    <div class="lane"><span class="chip">Record</span><h3>Everything else</h3><p>Starts, deliveries, finishes, session-to-session messages, routine answers, retries. Written to the board. Never spoken, never pushed.</p></div>
+  </div>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>What happens</th><th>Today</th><th>Proposed</th></tr></thead>
+      <tbody>
+        <tr><td>A session finishes a task</td><td class="was">A message and an “is done” alert</td><td><span class="chip">Record</span>The task ticks on its row</td></tr>
+        <tr><td>A whole request finishes</td><td class="was">A message per task, then one more</td><td><span class="chip asked">Asked</span>One receipt line</td></tr>
+        <tr><td>An instruction is queued or delivered</td><td class="was">A note and often a message</td><td><span class="chip">Record</span></td></tr>
+        <tr><td>One session writes to another</td><td class="was">A task, a watch, a note to the brain and a message to you</td><td><span class="chip">Record</span>Delivered, kept as a thread</td></tr>
+        <tr><td>A session has no task</td><td class="was">A “waits for you” alert</td><td><span class="chip">Record</span>Shown as ready</td></tr>
+        <tr><td>A routine question</td><td class="was">Answered, plus a line in the chat</td><td><span class="chip">Record</span>“Answered for you”</td></tr>
+        <tr><td>Pull requests wait for a merge</td><td class="was">A chip, an alert and a message each, repeated</td><td><span class="chip yours">Yours</span>One card per repo, merged in order</td></tr>
+        <tr><td>Deploy, delete, production, secret, money</td><td class="was">A card, an alert and a message</td><td><span class="chip yours">Yours</span>One card</td></tr>
+        <tr><td>Three sessions wait on one decision</td><td class="was">An alert from each, repeated</td><td><span class="chip yours">Yours</span>One card: “3 sessions wait”</td></tr>
+        <tr><td>A task stalls or fails</td><td class="was">An <code>[agenda]</code> note and a message</td><td><span class="chip">Record</span>if the tower's retry works, <span class="chip yours">Yours</span>if it does not</td></tr>
+        <tr><td>A session says it is still waiting</td><td class="was">Another alert</td><td>Nothing new. The card shows its age.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="band" id="board">
+  <div class="wrap">
+    <div class="stagehead">
+      <div class="sechead">
+        <h2>The Mac tower, rebuilt</h2>
+        <p class="intro">The chat stops being the home screen. The same tower takes its place at two sizes: a floating panel for what to do now, and a full window with a sidebar, one tower for everything and one for each open space. Every control below works.</p>
+      </div>
+      <div class="seg" role="group" aria-label="Which tower to show">
+        <button type="button" data-scene="today" aria-pressed="false">Today</button>
+        <button type="button" data-scene="next" aria-pressed="true">Proposed</button>
+      </div>
+    </div>
+
+    <div class="scene next" data-scene="next">
+      <div class="entry">
+        <div class="surf">
+          <span class="capt">The orb</span>
+          <div class="orbrow">
+            <button type="button" class="orb" id="orb" aria-label="The orb"><span class="badge" id="orbBadge">3</span></button>
+            <p class="orbsay" id="orbSay"></p>
+          </div>
+        </div>
+        <div class="surf">
+          <span class="capt">Floating panel · hover the orb to peek, click to pin · 380 wide, like the panel now</span>
+          <div class="panel fl" id="float" tabindex="-1"></div>
+        </div>
+        <div class="notes">
+          <div class="note"><h3>Floating panel: what do I do now?</h3><p>It holds the open card from your queue, what waits behind it, the state of each space and the input. You answer here without opening anything larger.</p></div>
+          <div class="note"><h3>Full window: what is going on in there?</h3><p>The Full window button opens it: the sidebar, missions, each space's tower, the launcher and the record. A space in the floating panel opens that space's tower in the window.</p></div>
+          <div class="note"><h3>One tower at two sizes</h3><p>Both show the same queue. Answer or pick a card in one and the other follows, so there is one thing to learn and one thing to build.</p></div>
+        </div>
+      </div>
+
+      <div class="surf">
+        <span class="capt">Full window · opened from the floating panel · about 960 × 640</span>
+        <div class="win" id="win" tabindex="-1"></div>
+        <div class="try flat">
+          <span class="capt">Try a request in whichever tower is open</span>
+          <div class="row">
+            <button type="button" class="tbtn" data-try="open" id="tryOpen">open a session in M5 Pro on my second account</button>
+            <button type="button" class="tbtn" data-try="left">what's left?</button>
+            <button type="button" class="tbtn" data-try="reset">Reset the demo</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="notes n3">
+        <div class="note"><h3>One tower for everything</h3><p>All spaces is the tower you have now. It opens spaces, moves work between them and answers what is left across all of them.</p></div>
+        <div class="note"><h3>One tower for each space</h3><p>Every open space gets its own tower with only that space in its head: its sessions, its requests, its thread. Type in a space and you never name the space. Today one brain serves them all in turn. On 10 Nov it took 337 prompts and filed 15 messages from sandbox sessions under your request to open a session in M5 Pro.</p></div>
+        <div class="note"><h3>The sidebar is your focus</h3><p>Click a space to work in it. The others keep running and stay quiet. Their rows change state and nothing else moves. Follow and Mute sit at the top of each space. New space, at the foot of the list, launches one from a sentence.</p></div>
+        <div class="note"><h3>Your queue</h3><p>Every decision from every space, in the order that frees the most waiting work. One card is open at a time and a number key answers it. Three sessions waiting on the same thing make one card, and a repeat changes its age, never the count.</p></div>
+        <div class="note"><h3>Missions</h3><p>Each space is a mission with a goal. The list shows how far each one is and which are ready to close. Their sessions work in their own worktrees and write to each other without the tower in between. New space starts one from a sentence.</p></div>
+        <div class="note"><h3>Answers without a conversation</h3><p>The tower's first recommendation is the main button on a card. A reply to something you type appears above the input and then joins that tower's record.</p></div>
+      </div>
+      <p class="capt">Example state. The items are real ones from the day's log, shown together, names trimmed.</p>
+    </div>
+
+    <div class="scene today" data-scene="today" hidden>
+      <div class="surf">
+        <span class="capt">The panel now · Chat</span>
+        <div class="panel">
+          <div class="phead">
+            <div class="t"><b>Tower</b><span>Phone · Settings</span></div>
+            <div class="pstatus">Ready · 1 of 6 busy</div>
+          </div>
+          <div class="tabs"><span class="on">Chat</span><span>Activity · 3</span><span>Spaces · 4</span></div>
+          <div class="nowstrip"><span class="need">sandbox eyzflow · needs you</span><span class="need">herder tower · needs you</span><span>sandbox mediaroom · 3m</span></div>
+          <div class="chat" tabindex="0" aria-label="The chat between 22:52 and 22:59">
+            <div class="bub">The dashboard session finished taking in the MediaRoom answers and wrote them into the plan. That's the document I linked a moment ago. Nothing new needs you; the decisions in the plan are yours when you read it.<time>22:52:24</time></div>
+            <div class="bub">The sandbox mediaroom session read the plan summary and had no corrections to its part. Nothing is needed from you.<time>22:52:31</time></div>
+            <div class="evt">sandbox mediaroom is done</div>
+            <div class="bub">The sandbox project session finished reading the plan summary and sent its four changes to the dashboard session, which I told you about. Nothing new needs you.<time>22:52:36</time></div>
+            <div class="bub">The dashboard session has asked the sandbox mediaroom session three follow-ups from the sandbox project session. They cover whether one block or promo can be shared across pages and storefronts […]<time>22:52:42</time></div>
+            <div class="evt">sandbox eyzflow is done</div>
+            <div class="bub">The dashboard session has put all five additions into the plan, with Editor publishing and the 15-minute token as decisions for you. Its note says the three follow-up answers are still open […]<time>22:54:14</time></div>
+            <div class="bub">The dashboard session finished fixing the estimate and sent the sandbox project session the plan's text to check. Nothing is needed from you now. The Mac tower fix is still waiting on your yes to merge and install.<time>22:57:34</time></div>
+            <div class="bub">The sandbox project session finished reading the dashboard session's update and sent the four consequences I just described. Nothing new needs you. The one decision waiting is whether I queue the sign-in fix […]<time>22:59:06</time></div>
+          </div>
+          <div class="pill"><span>Message the tower…</span><span class="send" aria-hidden="true">↑</span></div>
+        </div>
+      </div>
+      <div class="notes">
+        <div class="note"><h3>Seven messages in seven minutes</h3><p>This is the chat between 22:52 and 22:59, as the tower wrote it. Five of the seven say nothing is needed.</p></div>
+        <div class="note"><h3>What was yours is in the closing clauses</h3><p>Two decisions in the plan, a merge for the tower fix, and whether to queue a sign-in fix. Each sits at the end of a progress report.</p></div>
+        <div class="note"><h3>State is written as prose</h3><p>To learn where the sandbox work stands you read the thread. The ledger behind it is no clearer: its agenda holds 38 tasks, and 33 of them are messages the sessions sent each other.</p></div>
+        <div class="note"><h3>Three tabs hold the same work</h3><p>Chat tells it, Activity lists it as jobs, Spaces counts it as unread. None of them answers “what do I have to do now?”</p></div>
+      </div>
+    </div>
+    <div class="gallery" id="states">
+      <div class="sechead">
+        <h2>Every state</h2>
+        <p class="intro">The mockup above, frozen in each state it can be in. Every frame has a code, so you can say which one to change. The frames are pictures drawn by the same code as the mockup, and the working controls are in the mockup above. Window frames are cut to their content; the real window keeps its height. The words in the frames are examples built from the day's log.</p>
+      </div>
+      <nav class="gindex" id="gindex" aria-label="States"></nav>
+      <div class="ggroup"><h3>The orb</h3><div class="gorbs" id="gorbs"></div></div>
+      <div class="ggroup"><h3>Floating panel</h3><div class="gfloat" id="gfloat"></div></div>
+      <div class="ggroup"><h3>Decision cards</h3><div class="gfloat" id="gcards"></div></div>
+      <div class="ggroup"><h3>Input and tower states</h3><div class="gfloat g4" id="ginputs"></div></div>
+      <div class="ggroup"><h3>Full window</h3><div class="gwin" id="gwin"></div></div>
+      <div class="ggroup"><h3>Android app</h3><p class="intro">The phone gets the same tower: your queue first, spaces as missions, and one talk button. It notifies for a decision and for nothing else. Drawn from the app's README and the phone API, since the app's code is not on this Mac.</p><div class="gfloat" id="gphones"></div></div>
+    </div>
+  </div>
+</section>
+
+<section class="wrap sec" id="spaces">
+  <div class="sechead">
+    <h2>Twelve spaces now, thirty later</h2>
+    <p class="intro">Today every space adds chips to the filter line, a card to the Spaces tab and its own stream of messages. In the sidebar a space takes one row while it is open and folds away when it is quiet.</p>
+  </div>
+  <div class="scalectl">
+    <label for="nspaces">Spaces</label>
+    <input type="range" id="nspaces" min="3" max="30" value="12">
+    <output id="nval" for="nspaces">12</output>
+  </div>
+  <div class="scale">
+    <div class="side">
+      <h3>Today <span>the Activity filter line</span></h3>
+      <div class="mini"><div class="strip" id="strip" tabindex="0" aria-label="Filter chips, scrolls sideways"></div></div>
+      <p class="sidenote" id="stripNote"></p>
+    </div>
+    <div class="side">
+      <h3>Proposed <span>the sidebar</span></h3>
+      <div class="mini" id="miniBoard"></div>
+      <p class="sidenote" id="boardNote"></p>
+    </div>
+  </div>
+  <p class="small">The sketch assumes two live sessions per space, a quarter of the spaces working and about one in eight holding a decision.</p>
+</section>
+
+<section class="wrap sec" id="many">
+  <div class="sechead">
+    <h2>When there are too many spaces</h2>
+    <p class="intro">Past about ten spaces you can no longer look after them one by one. Five changes take that job away from you. Each one is in the mockup above.</p>
+  </div>
+  <div class="causes">
+    <div class="cause">
+      <h3>Work one queue, not thirty spaces</h3>
+      <p class="ev">You will not visit thirty spaces. The main tower puts every decision in one queue, ordered by how much work each answer frees: sessions waiting, times the minutes they have waited. You clear it from the keyboard or the phone, and open a space only when you are curious.</p>
+      <div class="fix"><b>In the mockup</b><p>The floating panel and All spaces both open on your queue. One card is open: press a number to answer it, or click another to pick it instead.</p></div>
+    </div>
+    <div class="cause">
+      <h3>A space is a mission with an end</h3>
+      <p class="ev">A space starts with a goal and what counts as done. Today all 12 spaces read “No agenda yet”, and 10 of them have no session left. When the goal is met, the space's tower writes a closing report, stops its sessions and archives the space. A space with no end, like M5 Pro, is marked as standing.</p>
+      <div class="fix"><b>In the mockup</b><p>Missions lists every space with its goal. Anna is ready to close: open it for the closing report.</p></div>
+    </div>
+    <div class="cause">
+      <h3>One sentence launches a mission</h3>
+      <p class="ev">Six of your eight requests on 10 Nov set up sessions, and three of them asked for the same pair: eyzflow and mediaroom on your second account. You say the goal and pick a saved setup. The tower opens the sessions, introduces them and hands out the goal, and asks nothing.</p>
+      <div class="fix"><b>In the mockup</b><p>Press New space, at the top of All spaces or the foot of the sidebar, then Launch.</p></div>
+    </div>
+    <div class="cause">
+      <h3>Every space gets its own worktree</h3>
+      <p class="ev">Anna, isa and sandbox all worked in the same <code>~/Work/eyz/eyzflow</code> checkout that day, and in the same mediaroom one. More spaces means more collisions. Each space gets its own worktree, branch and dev port for every repo it touches, and they go when the space closes.</p>
+      <div class="fix"><b>In the mockup</b><p>Missions says which spaces work in their own worktrees. Inside a space, each session row names its worktree and port.</p></div>
+    </div>
+    <div class="cause">
+      <h3>The phone works the same queue</h3>
+      <p class="ev">The Android app mirrors today's panel, so it carries the same chat and the same stream of news. It should open on your queue, show spaces as missions, and notify for a decision and for nothing else. Then the phone is enough to keep thirty spaces moving while you are away from the Mac.</p>
+      <div class="fix"><b>In the mockup</b><p>Frames A1 to A12 under Every state.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="wrap sec" id="dial">
+  <div class="sechead">
+    <h2>How much it tells you</h2>
+    <p class="intro">One setting. Today quiet comes from focus: you silence the spaces you are not in, and that runs out after eight hours. Here every space is quiet until you follow it, and working in one space is a click in the sidebar.</p>
+  </div>
+  <div class="pseg" role="group" aria-label="How much the tower tells you">
+    <button type="button" data-level="decisions" aria-pressed="true">Decisions</button>
+    <button type="button" data-level="results" aria-pressed="false">Decisions and results</button>
+    <button type="button" data-level="all" aria-pressed="false">Everything</button>
+  </div>
+  <div class="dialout"><b id="dialN"></b><p id="dialD"></p></div>
+  <div class="two">
+    <div>
+      <h3>It speaks when</h3>
+      <ul>
+        <li>You said something out loud. It answers once.</li>
+        <li>A decision of yours arrives. One sentence, once.</li>
+        <li>You say “catch me up”. Three sentences at most, decisions first.</li>
+      </ul>
+    </div>
+    <div>
+      <h3>It never speaks for</h3>
+      <ul>
+        <li>Deliveries, starts and finishes.</li>
+        <li>One session writing to another.</li>
+        <li>A check that passed, a task verified, a retry that worked.</li>
+        <li>Anything that ends in “nothing for you”.</li>
+      </ul>
+    </div>
+  </div>
+  <p class="intro">Per space there are two switches. Follow sends you that space's results as they land. Mute keeps its decisions in its own tower and off the orb. Both are in the mockup above, at the top of each space.</p>
+</section>
+
+<section class="wrap sec" id="more">
+  <div class="sechead"><h2>Smaller changes that add up</h2></div>
+  <div class="more">
+    <div><h3>Make it a rule</h3><p>After you answer a card, one tap turns the answer into a behavior, such as “on the landing page, take the tower's pick for drawing choices”. Your 10 percent shrinks as you use it.</p></div>
+    <div><h3>Merge in order</h3><p>A repo's pull requests stack in one card, dev before main, with one button. 29 merge prompts in a day become a handful.</p></div>
+    <div><h3>Names you can read</h3><p>A session is its space and its project: “sandbox › mediaroom”. Today the same session can appear as “Claude in eyz mediaroom serverless”.</p></div>
+    <div><h3>Colour means state</h3><p>Amber is yours, cyan is working, grey is quiet, rose failed. Account badges become plain text and show only when the account is not the default.</p></div>
+    <div><h3>The record keeps everything</h3><p>Chat and Activity merge into one searchable log, filtered by space. All 277 of the day's messages would still be there to read.</p></div>
+    
+  </div>
+</section>
+
+<section class="wrap sec" id="build">
+  <div class="sechead">
+    <h2>Build order</h2>
+    <p class="intro">The first three steps need no new interface. By the day's own numbers they take 277 messages down to roughly 70.</p>
+  </div>
+  <ol class="steps">
+    <li><div class="body"><h3>Silence the note turns</h3><p><code>is_news_prompt</code> already tells a <code>[watch]</code> or <code>[queue]</code> turn from a request. On those turns, write nothing to the chat and speak nothing. Replace “Tell the user what happened” and “Never answer one with silence” with one command the brain uses to raise a decision.</p><p class="files">assets/tower-core.md · src/brain.rs · src/daemon/narrate.rs</p></div></li>
+    <li><div class="body"><h3>Take the tower out of the path between sessions</h3><p><code>tower queue</code> records who called it, from <code>HC_TERMINAL_ID</code>, the way <code>tower screenshot</code> already does. A message from a session is delivered with the same guarantees and kept as a thread. It makes no agenda task, starts no watch, and sends the brain no <code>[queue]</code>, <code>[watch]</code> or <code>[agenda]</code> note. The tower adds the sender's name, so sessions stop writing “From t7h” by hand.</p><p class="files">src/main.rs · src/protocol.rs · src/daemon/sendq.rs · src/daemon/watch.rs · src/agenda.rs · src/introduce.rs</p></div></li>
+    <li><div class="body"><h3>Fix what counts as needing you</h3><p>A session with no open task that says it is ready is ready. Give each decision one key (the PR, or the normalised question) so repeats and several askers update one card.</p><p class="files">src/questions.rs · src/daemon/asks.rs · src/prs.rs</p></div></li>
+    <li><div class="body"><h3>Widen the window and make the board its home</h3><p>The panel is 380 × 640 (<code>panel::W</code>, <code>panel::H</code>). Keep that size for the floating panel, and add a full window of about 960 × 640 with a sidebar: All spaces, then each open space. <code>View</code> has Chat, Activity, Spaces, Phone, Behaviors, Shots and Session; add Board as the default, showing what the sidebar selects. A request typed in a space reaches the brain tagged with that space. Chat and Activity become Record. Order the cards by sessions waiting times minutes waited, and let the number keys answer the first one. This gives you the sidebar and the view per space while one brain still does the work.</p><p class="files">src/orb/panel.rs · src/orb/mod.rs · src/orb/panel/questions.rs · src/orb/panel/prchip.rs</p></div></li>
+    <li><div class="body"><h3>Let spaces fold</h3><p>A space with no live session folds into the quiet line and archives after a day. Its needs close when its sessions are gone.</p><p class="files">src/spaces.rs</p></div></li>
+    <li><div class="body"><h3>Give the orb its count and the floating panel</h3><p>The red dot becomes an amber number of open decisions. Hovering the orb peeks at the floating panel and a click pins it. The floating panel is the queue column of the full window, reused, so both stay in step.</p><p class="files">src/orb/mod.rs · src/orb/render.rs · src/orb/panel.rs</p></div></li>
+    <li><div class="body"><h3>Give each open space its own tower</h3><p>Start one brain per open space, such as <code>tower-sandbox</code>, holding only that space's sessions, agenda and thread. The daemon already knows each session's space, so notes and requests route by space, and a space's messages can no longer land under another space's request. The main tower keeps what crosses spaces. A space tower starts with the space's first session and stops with its last. Each one is another Claude session running, so do this after steps 1 to 3 have cut the load.</p><p class="files">src/brain.rs · src/daemon/mod.rs · src/spaces.rs · src/agenda.rs · assets/tower-core.md</p></div></li>
+    <li><div class="body"><h3>Make a space a mission</h3><p><code>tower space agenda</code> already stores a goal per space, and no space has one. Ask for the goal when a space is made, add what counts as done, and let the space's tower close it with a report and archive it. A standing space is marked as one and never closes.</p><p class="files">src/spaces.rs · assets/behaviors/spaces-and-focus.md</p></div></li>
+    <li><div class="body"><h3>Launch a space from one sentence</h3><p>A saved setup names the repos and the account. <code>tower dispatch</code> already takes a plan with a task per project, so a launch is a setup plus your goal, with no questions back.</p><p class="files">src/dispatch.rs · src/config.rs · src/orb/panel.rs</p></div></li>
+    <li><div class="body"><h3>Give every space its own worktrees</h3><p><code>isolate</code> already puts one task's session in a git worktree. Make that the default for every session a space opens, give each a dev port of its own, and remove both when the space closes.</p><p class="files">src/dispatch.rs · src/main.rs</p></div></li>
+    <li><div class="body"><h3>Bring the phone in line</h3><p>The phone API already serves questions, pull requests, spaces, screenshots and voice. Add the ordered queue, each space's goal and state, launch and close, and Follow and Mute. In the app, make the queue the first screen and notify for decisions only.</p><p class="files">docs/mobile-api.md · src/daemon/lan/mod.rs · the herdr-tower-android repo</p></div></li>
+  </ol>
+</section>
+
+</main>
+
+<footer class="wrap">
+  <p>Method. Counts come from ~/.local/share/herder-tower/history.jsonl, <code>tower spaces</code>, the agenda ledger and the brain's own transcripts, read between 23:10 and 23:30 on 10 Nov 2026. The message groups come from matching phrases, a message going to the first group it matches, so they are approximate. “About 65 decisions” and “roughly 70” are estimates made by removing repeats from the day's alerts. Customer names and incident details are left out of the examples.</p>
+</footer>
+
+<div class="tip" id="tip" hidden></div>
+
+<script>
+(() => {
+  const $ = (s, r = document) => r.querySelector(s);
+  const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  /* ---- messages by hour ---- */
+  const HOURS = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23];
+  const SAID = [6, 22, 10, 42, 24, 58, 0, 0, 13, 0, 0, 0, 66, 36];
+  const ASKED = [0, 0, 2, 2, 0, 0, 0, 0, 1, 0, 0, 0, 2, 1];
+  const MAXV = 70, PLOT = 160;
+  const bars = $('#bars'), xrow = $('#xrow'), tip = $('#tip');
+  [0, 20, 40, 60].forEach(v => {
+    const y = v / MAXV * PLOT;
+    bars.insertAdjacentHTML('beforeend', `<span class="gl" style="bottom:${y}px"></span><span class="yt" style="bottom:${y}px">${v}</span>`);
+  });
+  const peak = Math.max(...SAID);
+  HOURS.forEach((h, i) => {
+    const v = SAID[i], a = ASKED[i];
+    const label = `${h}:00 to ${h}:59. The tower wrote ${v}. You asked ${a}.`;
+    bars.insertAdjacentHTML('beforeend',
+      `<div class="col" tabindex="0" role="img" aria-label="${label}" data-tip="${h}:00 · tower wrote ${v} · you asked ${a}">` +
+      (v === peak ? `<span class="cap">${v}</span>` : '') +
+      `<div class="bar" style="height:${v / MAXV * PLOT}px"></div></div>`);
+    xrow.insertAdjacentHTML('beforeend', `<div class="xc"><span class="xl">${h}</span><span class="dots">${'<i></i>'.repeat(a)}</span></div>`);
+  });
+  $('#hourTable').innerHTML = '<thead><tr><th>Hour</th><th>Tower wrote</th><th>You asked</th></tr></thead><tbody>' +
+    HOURS.map((h, i) => `<tr><td>${h}:00</td><td>${SAID[i]}</td><td>${ASKED[i]}</td></tr>`).join('') + '</tbody>';
+  const showTip = el => {
+    const r = (el.querySelector('.bar') || el).getBoundingClientRect();
+    tip.textContent = el.dataset.tip;
+    tip.hidden = false;
+    const half = tip.offsetWidth / 2 + 8;
+    tip.style.left = Math.min(Math.max(r.left + r.width / 2, half), window.innerWidth - half) + 'px';
+    tip.style.top = (r.top - 8) + 'px';
+  };
+  const hideTip = () => { tip.hidden = true; };
+  $$('.col', bars).forEach(el => {
+    el.addEventListener('pointerenter', () => showTip(el));
+    el.addEventListener('pointerleave', hideTip);
+    el.addEventListener('focus', () => showTip(el));
+    el.addEventListener('blur', hideTip);
+  });
+  window.addEventListener('scroll', hideTip, { passive: true });
+
+  /* ---- the tower window ---- */
+  const DECISIONS = [
+    { id: 'db', space: 'sandbox', wait: 3, mins: 2, why: 'Production data',
+      title: 'Allow one read of the production database',
+      acts: [{ t: 'Allow once', r: 'Allowed once. Three sessions carry on.', p: 1 }, { t: 'No', r: 'Refused. The three sessions were told.' }] },
+    { id: 'pr', space: 'isa', wait: 0, mins: 31, why: 'Merge',
+      title: '2 pull requests ready to merge', prs: [['#1273', 'dev'], ['#1277', 'main']],
+      acts: [{ t: 'Merge both, dev first', r: 'Merged #1273 into dev, then #1277 into main. isa carries on.', p: 1 }] },
+    { id: 'pick', space: 'industrial-landing-page', wait: 1, mins: 4, why: 'Design choice',
+      title: 'Which microscope drawing?',
+      acts: [{ t: 'B, magnified view', r: 'Answered: B, magnified view.', p: 1, rec: 1 }, { t: 'A', r: 'Answered: A.' }, { t: 'C', r: 'Answered: C.' }] }
+  ];
+  const SPACES0 = [
+    { id: 'sandbox', base: 'done', sub: '3 sessions on orca', goal: 'A plan for the storefront live editor', when: 'the plan is written and all three sessions agree on it',
+      req: [['Plan the storefront live editor', 'done']],
+      sess: [['eyzflow', 'done', 'Wrote the plan', 'eyzflow@sandbox · port 3010'], ['mediaroom', 'done', 'Answered the planning questions', 'mediaroom@sandbox · port 3011'], ['project', 'done', 'Checked the estimate', 'sandbox-project@sandbox · port 3012']],
+      thread: ['33 messages', [['mediaroom → eyzflow', 'Answers on stale writes and publish events.'], ['project → eyzflow', 'Four changes to the plan summary.']]] },
+    { id: 'isa', base: 'working', sub: '2 sessions on orca', goal: 'Voice clips for the Ingest tour, live', when: 'the release is out and the tour plays on production',
+      req: [['Voice clips for the Ingest tour', '5 of 6']],
+      sess: [['eyzflow', 'done', 'Uploaded 12 clips to dev and production', 'eyzflow@isa · port 3013'], ['mediaroom', 'working', 'Runs the last step after the two merges', 'mediaroom@isa · port 3014']],
+      thread: ['', [['mediaroom → eyzflow', 'The clips are ready and release #1277 is open.']]] },
+    { id: 'industrial-landing-page', base: 'working', sub: '1 session on orca', goal: 'New product drawings on the landing page', when: 'every section has its drawing and the page is live',
+      req: [['Rework the product drawings', 'working']],
+      sess: [['landing', 'working', 'Reworking the product drawings', 'industrial-landing-page@landing · port 3015']], thread: null },
+    { id: 'M5 Pro', base: 'working', sub: '2 sessions', standing: true,
+      req: [['Rethink the Mac tower’s UX', 'working']],
+      sess: [['herder-tower · default', 'done', 'Merged the fix and restarted the tower', 'herder-tower@m5-pro-1'], ['herder-tower · orca', 'working', 'Rethinking the Mac tower’s UX', 'herder-tower@m5-pro-2']], thread: null },
+    { id: 'Anna', base: 'done', sub: '2 sessions on orca', goal: 'Support pictures on cases, in production', when: 'the release is live and the case shows its pictures',
+      report: 'Support pictures are live on production. Released at 14:55 UTC, health check passing. Both sessions have finished.',
+      req: [['Support pictures, released', 'done 15:44']],
+      sess: [['eyzflow', 'done', 'Checked the case on production', 'eyzflow@anna · port 3016'], ['mediaroom', 'done', 'Release live since 14:55 UTC', 'mediaroom@anna · port 3017']],
+      thread: ['', [['eyzflow → mediaroom', 'Production check of the case passed.']]] }
+  ];
+  const TEMPLATES = [
+    { id: 'pair', label: 'eyzflow + mediaroom on orca', acct: 'orca', repos: ['eyzflow', 'mediaroom'] },
+    { id: 'landing', label: 'landing page on orca', acct: 'orca', repos: ['industrial-landing-page'] },
+    { id: 'tower', label: 'herder-tower on default', acct: 'default', repos: ['herder-tower'] }
+  ];
+  const QUIET = 7;
+  const QUIET_NAMES = ['B2C support', 'eyz-mediaroom-serverless', 'b2c', 'b2c-tickets', 'B2B ticketing', 'eyzflow', 'uiux'];
+
+  const model = over => Object.assign({
+    decisions: DECISIONS.map(d => ({ ...d })), spaces: SPACES0.map(x => ({ ...x })), closed: [], scope: 'all', focusId: null,
+    muted: new Set(), followed: new Set(), notice: null, draft: { goal: 'Case exports as PDF', tpl: 'pair' }, reply: null, quietOpen: false, live: false, recFilter: 'all', level: 'decisions', speak: 'decisions', policy: 'normal'
+  }, over);
+  const needs = n => `${n} need${n === 1 ? 's' : ''} you`;
+  const stake = d => d.wait ? `${d.wait} session${d.wait === 1 ? ' waits' : 's wait'}` : 'Nothing is blocked';
+  const ordered = list => list.slice().sort((a, b) => b.wait * b.mins - a.wait * a.mins || b.mins - a.mins);
+  const spaceOf = m => m.spaces.find(x => x.id === m.scope);
+  const mainQueue = m => ordered(m.decisions.filter(d => !m.muted.has(d.space)));
+  const viewList = m => { const sp = spaceOf(m); return sp ? ordered(m.decisions.filter(d => d.space === sp.id)) : mainQueue(m); };
+  const focusIn = (m, list) => { const o = list.filter(d => !d.done); return o.find(d => d.id === m.focusId) || o[0]; };
+  const yours = m => mainQueue(m).filter(d => !d.done).length;
+  const working = m => m.spaces.filter(x => x.base === 'working').length;
+  function slug(m, goal) {
+    const base = goal.toLowerCase().replace(/[^a-z0-9 ]/g, '').trim().split(/\s+/).filter(Boolean).slice(0, 2).join('-') || 'new-space';
+    let id = base, n = 2;
+    while (m.spaces.some(x => x.id === id)) id = `${base}-${n++}`;
+    return id;
+  }
+  function spaceState(m, sp) {
+    const mine = m.decisions.filter(d => !d.done && d.space === sp.id).length;
+    if (mine) return [m.muted.has(sp.id) ? 'muted' : 'yours', mine];
+    return [sp.base, sp.base === 'done' ? '✓' : ''];
+  }
+  const statusHTML = m => (yours(m) ? `<b>${needs(yours(m))}</b>` : 'Nothing needs you') + ` · ${working(m)} working`;
+
+  /* what you can do to the model */
+  const answerCard = (m, id, i) => { const d = m.decisions.find(x => x.id === id); if (d && d.acts[i]) d.done = d.acts[i].r; };
+  function launch(m) {
+    const t = TEMPLATES.find(x => x.id === m.draft.tpl), id = slug(m, m.draft.goal), goal = m.draft.goal.trim() || 'No goal yet', n = t.repos.length;
+    m.spaces.push({ id, base: 'working', sub: `${n} session${n === 1 ? '' : 's'} on ${t.acct}`, goal, when: 'the change is live and checked', req: [[goal, 'working']],
+      sess: t.repos.map((r, i) => [r, 'working', 'Reading the goal', `${r}@${id} · port ${3018 + i}`]), thread: null });
+    m.notice = { scope: id, text: `Launched ${id}. Nothing was asked. Change the goal or the setup from here.` };
+    m.scope = id;
+  }
+  function closeSpace(m) {
+    const sp = spaceOf(m);
+    if (!sp) return;
+    m.closed.push(sp.id);
+    m.spaces = m.spaces.filter(x => x !== sp);
+    m.notice = { scope: 'all', text: `${sp.id} is closed. Its sessions are stopped, its worktrees are removed and its report is in Record.` };
+    m.scope = 'all';
+  }
+
+  /* drawing */
+  function cardHTML(d, open, tag) {
+    if (d.done) return `<div class="dcard done"><span class="tick" aria-hidden="true">✓</span><span>${esc(d.done)}</span></div>`;
+    const prs = d.prs ? `<ul class="prs">${d.prs.map(([n, b]) => `<li><b>${n}</b><span>into ${b}</span><em>checks pass</em></li>`).join('')}</ul>` : '';
+    const acts = d.acts.map((a, i) =>
+      `<button type="button" class="mbtn${a.p ? ' primary' : ''}" data-id="${d.id}" data-act="${i}">${open ? `<kbd>${i + 1}</kbd>` : ''}${esc(a.t)}${a.rec ? '<small>tower’s pick</small>' : ''}</button>`).join('');
+    return `<article class="dcard${open ? ' open' : ''}"><div class="meta">${tag ? `<span class="now">${tag}</span>` : ''}<span class="sp">${esc(d.space)}</span><span class="why">${esc(d.why)}</span><span>${esc(stake(d))} · ${d.mins} min</span></div><h4>${esc(d.title)}</h4>${prs}<div class="acts">${acts}</div></article>`;
+  }
+  const rowHTML = d => `<button type="button" class="qrow" data-focus="${d.id}"><span class="nm">${esc(d.title)}</span><span class="rq">${esc(d.space)} · ${esc(stake(d).toLowerCase())} · ${d.mins} min</span></button>`;
+  function queueHTML(m, list, restLabel, empty) {
+    if (!list.length) return `<div class="empty">${empty}</div>`;
+    const o = list.filter(d => !d.done), f = focusIn(m, list), rest = o.filter(d => d !== f);
+    return list.filter(d => d.done || d === f).map(d => cardHTML(d, d === f, d === f ? (d === o[0] ? 'Next' : 'Picked') : '')).join('') +
+      (rest.length ? `<div class="after">${restLabel(rest.length)}</div>` + rest.map(rowHTML).join('') : '');
+  }
+  function replyHTML(m, scope) {
+    const r = m.reply;
+    if (!r || r.to !== scope) return '';
+    const sp = m.spaces.find(x => x.id === r.to);
+    let q, html;
+    if (r.kind === 'undo') {
+      q = 'undo';
+      html = '<div><b>Closed it.</b> Nothing else changed.</div>';
+    } else if (r.kind === 'open') {
+      q = sp ? 'open one more session here on my second account' : 'open a session in M5 Pro on my second account';
+      html = `<div><b>Opened in ${esc(sp ? sp.id : 'M5 Pro')}.</b> One session in its own worktree${sp ? ', introduced to the others' : ''}.</div>` +
+        `<div class="assume"><span>orca</span><span>Fable 5.2</span>${sp ? '' : '<span>herder-tower</span>'}<button type="button" class="mbtn" data-undo>Undo</button></div>`;
+    } else {
+      q = 'what’s left?';
+      const o = (sp ? ordered(m.decisions.filter(d => d.space === sp.id)) : mainQueue(m)).filter(d => !d.done);
+      const busy = sp ? sp.sess.filter(x => x[1] === 'working').map(x => x[0]) : m.spaces.filter(x => x.base === 'working').map(x => x.id);
+      html = `<div><b>${o.length ? needs(o.length) : 'Nothing needs you'}${sp ? ' here' : ''}${busy.length ? `, ${busy.length} working` : ''}.</b></div><ul>` +
+        o.map(d => `<li>${sp ? '' : esc(d.space) + ': '}${esc(d.title)}</li>`).join('') +
+        (busy.length ? `<li>Working: ${busy.map(esc).join(', ')}</li>` : '') + '</ul>';
+    }
+    return `<div class="answer"><div class="q">You, to ${sp ? 'the ' + esc(sp.id) + ' tower' : 'the main tower'}: ${esc(q)}</div>${html}</div>`;
+  }
+  function floatInner(m) {
+    return `<div class="phead"><div class="t"><b>Tower</b><button type="button" class="tg" data-expand>Full window</button></div><div class="pstatus">${statusHTML(m)}</div></div>` +
+      `<div class="bay">${queueHTML(m, mainQueue(m), n => `${n} more waiting`, 'Nothing needs you.')}</div>` +
+      '<div class="bay"><div class="bayh">Spaces</div><div class="fsp">' + m.spaces.map(sp => {
+        const [st, g] = spaceState(m, sp);
+        return `<button type="button" class="fchip" data-scope="${esc(sp.id)}" data-state="${st}"><span class="sg">${g}</span>${esc(sp.id)}</button>`;
+      }).join('') + `<span class="fq">+ ${QUIET} quiet</span></div></div>` +
+      replyHTML(m, 'all') +
+      '<div class="pill"><span>Tell the tower…</span><span class="send" aria-hidden="true">↑</span></div>';
+  }
+  function sideInner(m) {
+    const n = yours(m);
+    return `<div class="brand"><b>Tower</b><span class="pstatus">${statusHTML(m)}</span></div><div class="slist">` +
+      `<button type="button" class="sitem" data-scope="all" data-state="${n ? 'yours' : 'ready'}" aria-current="${m.scope === 'all'}"><span class="sg">${n || ''}</span><span class="nm">All spaces<small>the main tower</small></span></button>` +
+      '<div class="slabel">Open spaces</div>' +
+      m.spaces.map(sp => {
+        const [st, g] = spaceState(m, sp);
+        return `<button type="button" class="sitem" data-scope="${esc(sp.id)}" data-state="${st}" aria-current="${m.scope === sp.id || m.scope.startsWith('session:' + sp.id + '/')}"><span class="sg">${g}</span><span class="nm">${esc(sp.id)}<small>${esc(sp.report ? 'ready to close' : sp.standing ? 'standing · ' + sp.sub : sp.sub)}</small></span></button>`;
+      }).join('') +
+      `<button type="button" class="sitem new" data-scope="new" aria-current="${m.scope === 'new'}"><span class="sg">+</span><span class="nm">New space<small>from one sentence</small></span></button></div>` +
+      `<button type="button" class="fold" data-fold aria-expanded="${m.quietOpen}"><span>${QUIET} quiet spaces${m.closed.length ? ` · ${m.closed.length} closed today` : ''}</span><span>${m.quietOpen ? 'Hide' : 'Show'}</span></button>` +
+      (m.quietOpen ? '<div class="quiet">' + (m.closed.length ? `<span>Closed today: ${esc(m.closed.join(', '))}. The closing report is in Record.</span>` : '') +
+        QUIET_NAMES.map(x => `<span>${esc(x)}</span>`).join('') + '<span>No sessions in any of them, so no tower runs for them. They archive after a day.</span></div>' : '') +
+      '<div class="wfoot">' + [['record', 'Record'], ['shots', 'Shots'], ['settings', 'Settings']].map(([k, l]) =>
+        `<button type="button" class="flink" data-scope="${k}" aria-current="${m.scope.split(':')[0] === k || (k === 'shots' && m.scope.startsWith('shot:')) || (k === 'settings' && (m.scope === 'behaviors' || m.scope === 'pair'))}">${l}</button>`).join('') + '</div>';
+  }
+  function mainInner(m) {
+    const view = VIEWS[m.scope.split(':')[0]];
+    if (view) {
+      const [vh, vb] = view(m);
+      return `<div class="whead">${vh}</div><div class="wbody">${m.notice && m.notice.scope === m.scope ? `<p class="eff">${esc(m.notice.text)}</p>` : ''}${vb}</div>`;
+    }
+    const sp = spaceOf(m);
+    let head, html = '';
+    if (m.notice && m.notice.scope === m.scope) html += `<p class="eff">${esc(m.notice.text)}</p>`;
+    if (m.scope === 'new') {
+      const t = TEMPLATES.find(x => x.id === m.draft.tpl), n = t.repos.length;
+      head = '<div><h3>New space</h3><p>Say what it should get done. The tower does the rest and asks nothing.</p></div>';
+      html += `<div class="launch">
+        <div class="field"><label${m.live ? ' for="newGoal"' : ''}>Goal</label><input type="text"${m.live ? ' id="newGoal"' : ''} data-goal value="${esc(m.draft.goal)}" autocomplete="off"></div>
+        <div class="field"><span class="lab">Setup</span><div class="tpls">${TEMPLATES.map(x => `<button type="button" class="tg" data-tpl="${x.id}" aria-pressed="${x.id === m.draft.tpl}">${esc(x.label)}</button>`).join('')}</div></div>
+        <div class="field"><span class="lab">What the tower will do</span><ul class="plan"><li>Name the space <b data-newname>${esc(slug(m, m.draft.goal))}</b></li><li>Open ${n} session${n === 1 ? '' : 's'} on ${esc(t.acct)}: ${esc(t.repos.join(', '))}</li><li>Give each its own worktree, branch and dev port</li><li>${n > 1 ? 'Introduce them to each other and hand' : 'Hand'} out the goal</li></ul></div>
+        <div class="acts"><button type="button" class="mbtn primary" data-launch>Launch</button></div></div>`;
+    } else {
+      head = sp
+        ? `<div><h3>${esc(sp.id)}</h3><p>${esc(sp.sub)} · its own tower</p>` +
+          (sp.standing ? '<p class="goal">A standing space. It has no end and is never archived.</p>'
+            : `<p class="goal"><b>Goal</b>${esc(sp.goal)}</p><p class="goal"><b>Done when</b>${esc(sp.when)}</p>`) +
+          `</div><div class="toggles"><button type="button" class="tg" data-tg="follow" aria-pressed="${m.followed.has(sp.id)}">Follow</button><button type="button" class="tg" data-tg="mute" aria-pressed="${m.muted.has(sp.id)}">Mute</button></div>`
+        : `<div><h3>All spaces</h3><p>${m.spaces.length} open · ${QUIET} quiet · the main tower</p></div><div class="toggles"><button type="button" class="mbtn primary" data-scope="new">+ New space</button></div>`;
+      const list = viewList(m), f = focusIn(m, list);
+      if (sp && m.followed.has(sp.id)) html += '<p class="eff">Following. This space’s results reach you as they land.</p>';
+      if (sp && m.muted.has(sp.id)) html += '<p class="eff">Muted. Its decisions stay here and leave the orb’s count and the main queue.</p>';
+      if (sp && sp.report) html += `<div class="report"><h4>Closing report</h4><p>${esc(sp.report)}</p><p>Closing stops its two sessions and removes their worktrees. Left alone, it closes by itself tomorrow.</p><div class="acts"><button type="button" class="mbtn primary" data-close>Close this space</button></div></div>`;
+      if (!sp) {
+        html += '<div class="cols"><div class="bay"><div class="bayh">Your queue · most waiting work first</div>' +
+          queueHTML(m, list, () => 'After that', 'Your queue is empty.') +
+          (f ? '<p class="keys">Click in the window, then press a number to answer the open card.</p>' : '') + '</div>' +
+          '<div class="bay"><div class="bayh">Missions</div><div class="rows">' + m.spaces.map(x => {
+            const [st, g] = spaceState(m, x), n = x.sess.length;
+            const meta = `${n} session${n === 1 ? '' : 's'} · own worktrees` + (x.thread && x.thread[0] ? ` · ${x.thread[0]} between them` : '');
+            return `<button type="button" class="lrow" data-scope="${esc(x.id)}" data-state="${st}"><span class="sg">${g}</span><span class="nm">${esc(x.id)}${x.standing ? '<em class="tagm">standing</em>' : ''}</span><span class="pg${x.report ? ' ok' : ''}">${esc(x.report ? 'ready to close' : x.req[0][1])}</span><span class="rq">${esc(x.standing ? x.req[0][0] : x.goal)}</span><span class="mt">${esc(meta)}</span></button>`;
+          }).join('') + '</div></div></div>';
+      } else {
+        html += '<div class="bay"><div class="bayh">Needs you</div>' +
+          (list.length ? `<div class="cards">${list.map(d => cardHTML(d, d === f)).join('')}</div>` : '<div class="empty">Nothing needs you here.</div>') + '</div>';
+        html += '<div class="bay"><div class="bayh">Requests</div><div class="rows">' + sp.req.map(([t, pg]) =>
+          `<div class="lrow" data-state="${pg.startsWith('done') ? 'done' : 'working'}"><span class="sg">${pg.startsWith('done') ? '✓' : ''}</span><span class="nm">${esc(t)}</span><span class="pg">${esc(pg)}</span></div>`).join('') + '</div></div>';
+        html += '<div class="bay"><div class="bayh">Sessions</div><div class="rows">' + sp.sess.map(([nm, st, txt, wt]) =>
+          `<button type="button" class="lrow" data-scope="session:${esc(sp.id)}/${esc(nm)}" data-state="${st}"><span class="sg">${st === 'done' ? '✓' : ''}</span><span class="nm">${esc(nm)}</span><span class="pg">${esc(st)}</span><span class="rq">${esc(txt)}</span><span class="wt">worktree ${esc(wt)}</span></button>`).join('') + '</div></div>';
+        if (sp.thread) {
+          html += `<div class="bay"><div class="bayh">Between sessions${sp.thread[0] ? ' · ' + esc(sp.thread[0]) : ''}</div><div class="thread">` +
+            sp.thread[1].map(([who, txt]) => `<div><b>${esc(who)}</b><span>${esc(txt)}</span></div>`).join('') + '</div></div>';
+        }
+      }
+    }
+    return `<div class="whead">${head}</div><div class="wbody">${html}</div>` + replyHTML(m, sp ? sp.id : 'all') +
+      (m.scope === 'new' ? '' : `<div class="pill"><span>${sp ? `Tell the ${esc(sp.id)} tower…` : 'Tell the tower…'}</span><span class="send" aria-hidden="true">↑</span></div>`);
+  }
+  const winInner = m => `<nav class="wside" aria-label="Towers">${sideInner(m)}</nav><div class="wmain">${mainInner(m)}</div>`;
+
+  /* the views behind Record, Shots and Settings, and a session's own view */
+  const RECORD = [
+    ['23:07', 'sandbox', 'tower', 'done', 'The plan for the storefront live editor is finished and checked.'],
+    ['23:04', 'sandbox', 'mediaroom → eyzflow', 'msg', 'Answer on the read-only key question.'],
+    ['23:01', 'sandbox', 'mediaroom → eyzflow', 'msg', 'Answers on stale writes and publish events.'],
+    ['22:54', 'sandbox', 'eyzflow', 'done', 'Put all five additions into the plan.'],
+    ['22:52', 'sandbox', 'project → eyzflow', 'msg', 'Four changes to the plan summary.'],
+    ['22:15', 'sandbox', 'you', 'you', 'Open a space named sandbox with three sessions on orca.'],
+    ['18:01', 'industrial-landing-page', 'landing', 'done', 'PR #40 is merged.'],
+    ['15:44', 'Anna', 'mediaroom', 'done', 'The support pictures work is complete.'],
+    ['14:55', 'Anna', 'mediaroom', 'done', 'Release live, health check passing.'],
+    ['13:57', 'isa', 'eyzflow', 'shot', '3 screenshots of the Ingest walk on dev.'],
+    ['13:45', 'isa', 'eyzflow', 'done', 'Uploaded 12 clips to production and to dev.'],
+    ['13:40', 'isa', 'mediaroom', 'auto', 'Start with the small fix to the analysis description.']
+  ];
+  const KIND = { done: 'Finished', msg: 'Between sessions', you: 'You asked', auto: 'Answered for you', shot: 'Screenshots' };
+  const SHOTS = [
+    ['M5 Pro', 'herder-tower · orca', 'Quiet Tower: every state of the orb, the floating panel and the full window'],
+    ['M5 Pro', 'herder-tower · orca', 'Quiet Tower: the floating panel above the full window it opens'],
+    ['industrial-landing-page', 'landing', 'The film-frames drawing, variant D2'],
+    ['industrial-landing-page', 'landing', 'The microscope drawing, variant B'],
+    ['Anna', 'eyzflow', 'A case showing its support pictures on production'],
+    ['isa', 'eyzflow', 'The Ingest walk on dev with the highlight fixed']
+  ];
+  const BEHAVIORS = [
+    ['Talking', [['You are heard, not read', 'built in'], ['Be brief on simple tasks', 'learned'], ['Say what blocked needs', 'learned']]],
+    ['Sessions', [['Leave sessions running', 'built in'], ['Look before you act, then hand off', 'built in'], ['Never defer: queue it', 'learned'], ['Open sessions without asking', 'learned']]],
+    ['Questions 90/10', [['Questions: the tower answers 90%, you decide 10%', 'built in'], ['Autonomy for space sessions', 'learned']]],
+    ['Releases and safety', [['Blocked sessions and approvals', 'built in'], ['Validate everything', 'learned']]]
+  ];
+  const recRows = list => list.map(([t, sp, who, kind, txt]) => `<div class="rec"><time>${t}</time><span class="rk k-${kind}">${KIND[kind]}</span><span class="rw">${esc(sp)} › ${esc(who)}</span><span class="rt">${esc(txt)}</span></div>`).join('');
+  const VIEWS = {
+    record(m) {
+      const names = [...new Set(RECORD.map(r => r[1]))];
+      const rows = RECORD.filter(r => m.recFilter === 'all' || r[1] === m.recFilter);
+      return [`<div><h3>Record</h3><p>Everything the tower did and heard, kept for when you want it. ${rows.length} of ${RECORD.length} entries.</p></div>`,
+        `<div class="tpls">${[['all', 'All spaces'], ...names.map(x => [x, x])].map(([k, l]) => `<button type="button" class="tg" data-rec="${esc(k)}" aria-pressed="${m.recFilter === k}">${esc(l)}</button>`).join('')}</div>` +
+        (rows.length ? `<div class="reclist">${recRows(rows)}</div>` : '<div class="empty">Nothing is recorded for this space yet.</div>')];
+    },
+    shots(m) {
+      return [`<div><h3>Shots</h3><p>What sessions sent to show their work, newest first. ${SHOTS.length} today.</p></div>`,
+        `<div class="shots">${SHOTS.map(([sp, who, capt], i) => `<button type="button" class="shot" data-scope="shot:${i}"><span class="thumb"></span><b>${esc(capt)}</b><small>${esc(sp)} › ${esc(who)}</small></button>`).join('')}</div>`];
+    },
+    shot(m) {
+      const i = Math.min(SHOTS.length - 1, Math.max(0, +m.scope.split(':')[1] || 0)), [sp, who, capt] = SHOTS[i];
+      return [`<div><h3>${esc(capt)}</h3><p>${esc(sp)} › ${esc(who)} · ${i + 1} of ${SHOTS.length}</p></div><div class="toggles"><button type="button" class="tg" data-scope="shot:${(i + SHOTS.length - 1) % SHOTS.length}" aria-label="Previous">←</button><button type="button" class="tg" data-scope="shot:${(i + 1) % SHOTS.length}" aria-label="Next">→</button><button type="button" class="tg" data-scope="shots">Close</button></div>`,
+        '<span class="thumb big"></span><p class="cstat">In the app this covers the whole screen. A click shows it at 100%, the arrow keys step through the others and Esc closes it, as today.</p>'];
+    },
+    settings(m) {
+      const seg = (key, opts) => `<div class="tpls">${opts.map(([v, l]) => `<button type="button" class="tg" data-set="${key}:${v}" aria-pressed="${m[key] === v}">${l}</button>`).join('')}</div>`;
+      const tells = { decisions: 'Only what is yours reaches you. Everything else goes to the record.', results: 'Also one receipt when something you asked for is finished.', all: 'Every event as it happens, as today.' };
+      const says = { off: 'It never speaks. Cards and replies still appear.', decisions: 'It speaks a decision once, in one sentence.', replies: 'It also answers out loud when you spoke to it.' };
+      const marks = m.spaces.map(x => `<li>${esc(x.id)}: ${m.followed.has(x.id) ? 'followed' : 'not followed'}, ${m.muted.has(x.id) ? 'muted' : 'not muted'}</li>`).join('');
+      return ['<div><h3>Settings</h3><p>How the tower behaves, in one place.</p></div>',
+        `<div class="sets">
+          <section class="set"><h4>How much it tells you</h4>${seg('level', [['decisions', 'Decisions'], ['results', 'Decisions and results'], ['all', 'Everything']])}<p>${tells[m.level]}</p></section>
+          <section class="set"><h4>Voice</h4>${seg('speak', [['off', 'Off'], ['decisions', 'Decisions'], ['replies', 'Replies and decisions']])}<p>${says[m.speak]} Talk key: Control.</p></section>
+          <section class="set"><h4>Questions it answers for you</h4>${seg('policy', [['normal', 'Normal'], ['keep-moving', 'Keep moving'], ['ask-everything', 'Ask me everything']])}<p>Deploys, deletes, production data, secrets and money always come to you.</p></section>
+          <section class="set"><h4>Follow and Mute</h4><ul>${marks}</ul><p>Change them at the top of each space.</p></section>
+          <section class="set"><h4>Behaviors</h4><p>The rules that say how the tower works. Read, switch or rewrite any of them.</p><div class="acts"><button type="button" class="mbtn" data-scope="behaviors">Open behaviors</button></div></section>
+          <section class="set"><h4>Phone</h4><p>Pair the Android app and choose where its replies are heard.</p><div class="acts"><button type="button" class="mbtn" data-scope="pair">Pair a phone</button></div></section>
+          <section class="set"><h4>Accounts</h4><p>default and orca, read from the accounts mod. A session uses default unless a setup or your request names another.</p></section>
+          <section class="set"><h4>Saved setups</h4><ul>${TEMPLATES.map(x => `<li>${esc(x.label)}</li>`).join('')}</ul><p>New space offers these.</p></section>
+        </div>`];
+    },
+    behaviors() {
+      return ['<div><h3>Behaviors</h3><p>14 of your 24 rules, grouped as today. The talking rules shrink once the tower speaks only when asked or when the decision is yours.</p></div><div class="toggles"><button type="button" class="tg" data-scope="settings">Back to Settings</button></div>',
+        BEHAVIORS.map(([group, list]) => `<div class="bay"><div class="bayh">${group}</div><div>${list.map(([title, src]) => `<div class="brow"><b>${esc(title)}</b><span>${src}</span><span class="sw">on</span></div>`).join('')}</div></div>`).join('') +
+        '<div class="other">Tell the tower what to change…</div>'];
+    },
+    pair() {
+      return ['<div><h3>Pair a phone</h3><p>Scan this in the Android app. The code works once, for 5 minutes.</p></div><div class="toggles"><button type="button" class="tg" data-scope="settings">Back to Settings</button></div>',
+        '<div class="qrwrap"><div class="qr" role="img" aria-label="A pairing code (placeholder)"></div><div><p class="goal"><b>Code</b>4827 1930</p><p class="goal"><b>Expires in</b>4:52</p><p class="cstat">It listens on this Mac’s private network address, and on Tailscale while that runs.</p></div></div>' +
+        '<div class="bay"><div class="bayh">Paired phones</div><div><div class="brow"><b>Pixel</b><span>Replies heard on the phone</span><span class="sw">Revoke</span></div></div></div>'];
+    },
+    session(m) {
+      const [sid, nm] = m.scope.slice(8).split('/'), sp = m.spaces.find(x => x.id === sid), se = sp && sp.sess.find(x => x[0] === nm);
+      if (!se) return ['<div><h3>Session</h3></div>', '<div class="empty">This session is gone.</div>'];
+      return [`<div><h3>${esc(sid)} › ${esc(nm)}</h3><p>${esc(se[1])} · worktree ${esc(se[3])}</p></div><div class="toggles"><button type="button" class="tg" data-scope="${esc(sid)}">Back to ${esc(sid)}</button></div>`,
+        `<div class="bay"><div class="bayh">Asked</div><p class="goal">${esc(sp.req[0][0])}</p></div>` +
+        `<div class="bay"><div class="bayh">Last said</div><p class="goal">${esc(se[2])}.</p></div>` +
+        `<div class="bay"><div class="bayh">Its screen now</div><pre class="scr">● ${esc(se[2])}.\n\n> </pre></div>` +
+        '<div class="acts"><button type="button" class="mbtn primary" data-flash="Shown in Herdr.">Show in Herdr</button></div>'];
+    }
+  };
+
+  /* the live mockup */
+  let live, gen = 0;
+  const float = $('#float'), win = $('#win');
+  function paint() {
+    const n = yours(live), sp = spaceOf(live);
+    const badge = $('#orbBadge');
+    badge.hidden = n === 0;
+    badge.textContent = n;
+    $('#orb').setAttribute('aria-label', n ? `The orb: ${n} decision${n === 1 ? '' : 's'} waiting` : 'The orb: nothing needs you');
+    $('#orbSay').textContent = n
+      ? 'An amber number: decisions waiting for you, across every space. Nothing else adds a badge.'
+      : 'No number. Spaces are still working, and the orb stays calm.';
+    float.innerHTML = floatInner(live);
+    win.innerHTML = winInner(live);
+    $('#tryOpen').textContent = sp ? 'open one more session here on my second account' : 'open a session in M5 Pro on my second account';
+  }
+  const toWindow = () => win.scrollIntoView({ block: 'nearest', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+  function setScope(id) {
+    live.scope = id;
+    if (live.notice && live.notice.scope !== id) live.notice = null;
+    paint();
+    const cur = $('[aria-current="true"]', win);
+    if (cur) cur.focus({ preventScroll: true });
+  }
+  function resolve(id, i, host) {
+    const d = live.decisions.find(x => x.id === id);
+    if (!d || d.done || !d.acts[i]) return;
+    answerCard(live, id, i);
+    live.focusId = null;
+    paint();
+    host.focus({ preventScroll: true });
+    const mine = gen;
+    setTimeout(() => {
+      if (mine !== gen) return;
+      live.decisions = live.decisions.filter(x => x !== d);
+      paint();
+    }, 2400);
+  }
+  function onClick(e, host) {
+    const t = e.target;
+    let el;
+    if (t.closest('[data-expand]')) { toWindow(); return win.focus({ preventScroll: true }); }
+    if ((el = t.closest('[data-scope]'))) {
+      if (el.dataset.scope === 'record') live.recFilter = spaceOf(live) ? live.scope : 'all';
+      setScope(el.dataset.scope);
+      if (host === float) toWindow();
+      return;
+    }
+    if ((el = t.closest('[data-focus]'))) { live.focusId = el.dataset.focus; paint(); return host.focus({ preventScroll: true }); }
+    if ((el = t.closest('[data-tg]'))) {
+      const sp = spaceOf(live), set = el.dataset.tg === 'mute' ? live.muted : live.followed;
+      if (!sp) return;
+      if (set.has(sp.id)) set.delete(sp.id); else set.add(sp.id);
+      paint();
+      const again = $(`[data-tg="${el.dataset.tg}"]`, win);
+      if (again) again.focus({ preventScroll: true });
+      return;
+    }
+    if ((el = t.closest('[data-tpl]'))) { live.draft.tpl = el.dataset.tpl; return paint(); }
+    if (t.closest('[data-launch]')) { launch(live); return setScope(live.scope); }
+    if (t.closest('[data-close]')) { closeSpace(live); return setScope('all'); }
+    if (t.closest('[data-undo]')) { live.reply = { to: live.reply.to, kind: 'undo' }; return paint(); }
+    if (t.closest('[data-fold]')) {
+      live.quietOpen = !live.quietOpen;
+      paint();
+      const f = $('[data-fold]', win);
+      if (f) f.focus({ preventScroll: true });
+      return;
+    }
+    if ((el = t.closest('[data-rec]'))) { live.recFilter = el.dataset.rec; return paint(); }
+    if ((el = t.closest('[data-set]'))) { const [key, v] = el.dataset.set.split(':'); live[key] = v; return paint(); }
+    if ((el = t.closest('[data-flash]'))) { live.notice = { scope: live.scope, text: el.dataset.flash }; return paint(); }
+    if ((el = t.closest('.mbtn[data-act]'))) resolve(el.dataset.id, +el.dataset.act, host);
+  }
+  function onKey(e, host) {
+    if (e.target.matches('input') || e.metaKey || e.ctrlKey || e.altKey || !/^[1-9]$/.test(e.key)) return;
+    if (host === win && !(live.scope === 'all' || spaceOf(live))) return;
+    const d = focusIn(live, host === float ? mainQueue(live) : viewList(live));
+    if (!d || !d.acts[+e.key - 1]) return;
+    e.preventDefault();
+    resolve(d.id, +e.key - 1, host);
+  }
+  [float, win].forEach(host => {
+    host.addEventListener('click', e => onClick(e, host));
+    host.addEventListener('keydown', e => onKey(e, host));
+  });
+  win.addEventListener('input', e => {
+    if (!e.target.matches('[data-goal]')) return;
+    live.draft.goal = e.target.value;
+    const name = $('[data-newname]', win);
+    if (name) name.textContent = slug(live, live.draft.goal);
+  });
+  $('#orb').addEventListener('click', () => float.focus({ preventScroll: true }));
+  $$('[data-try]').forEach(b => b.addEventListener('click', () => {
+    if (b.dataset.try === 'reset') { gen++; live = model({ live: true }); return paint(); }
+    live.reply = { to: spaceOf(live) ? live.scope : 'all', kind: b.dataset.try };
+    paint();
+  }));
+  $$('.seg [data-scene]').forEach(b => b.addEventListener('click', () => {
+    $$('.seg [data-scene]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+    $$('.scene').forEach(x => { x.hidden = x.dataset.scene !== b.dataset.scene; });
+  }));
+  live = model({ live: true });
+  paint();
+
+  /* every state, frozen */
+  const ORBS = [
+    ['O1', 'Decisions waiting', 'An amber number: how many decisions are yours, across every space.', 3],
+    ['O2', 'Nothing needs you', 'No number, however much is running.', 0],
+    ['O3', 'A space muted', 'A muted space’s decision is not counted. Here sandbox is muted.', 2]
+  ];
+  const FLOATS = [
+    ['F1', 'Queue, one card open', 'Decisions are waiting. This is what a click on the orb shows.', m => {}],
+    ['F2', 'Another card picked', 'You click a card that waits behind the open one. It opens and the first one steps back.', m => { m.focusId = 'pr'; }],
+    ['F3', 'Just answered', 'For about two seconds after an answer. Then the line joins the record.', m => answerCard(m, 'db', 0)],
+    ['F4', 'Queue empty', 'Every decision is answered. Spaces keep working and the orb shows no number.', m => { m.decisions = []; }],
+    ['F5', 'Reply to a command', 'You asked the main tower to open a session. It acted and shows what it assumed.', m => { m.reply = { to: 'all', kind: 'open' }; }],
+    ['F6', 'After Undo', 'You pressed Undo on that reply.', m => { m.reply = { to: 'all', kind: 'undo' }; }],
+    ['F7', 'Reply to a question', 'You asked what is left. The answer comes as a short list.', m => { m.reply = { to: 'all', kind: 'left' }; }],
+    ['F8', 'A space muted', 'sandbox is muted. Its decision leaves this queue and the orb, and its chip turns to an outline.', m => { m.muted.add('sandbox'); }],
+    ['F9', 'A space launched', 'A new space was started from one sentence. It joins the chips as working.', m => { launch(m); m.scope = 'all'; m.notice = null; }]
+  ];
+  const WINS = [
+    ['W1', 'All spaces: queue and missions', 'The full window opens here.', m => {}],
+    ['W2', 'All spaces: just answered', 'For about two seconds after an answer. The next card is already open.', m => answerCard(m, 'db', 0)],
+    ['W3', 'All spaces: queue empty', 'Nothing is yours. Missions carry on.', m => { m.decisions = []; }],
+    ['W4', 'All spaces: a space closed', 'Anna was closed from its closing report. The quiet list is shown open.', m => { m.scope = 'Anna'; closeSpace(m); m.quietOpen = true; }],
+    ['W5', 'A space that needs you', 'sandbox, opened from the sidebar: its own tower, its goal, its sessions and the thread between them.', m => { m.scope = 'sandbox'; }],
+    ['W6', 'A space ready to close', 'Anna has met its goal. Its tower wrote the closing report.', m => { m.scope = 'Anna'; }],
+    ['W7', 'A standing space', 'M5 Pro has no end and is never archived.', m => { m.scope = 'M5 Pro'; }],
+    ['W8', 'Follow and Mute on', 'isa with both switches on. Its decision is off the orb and out of the main queue.', m => { m.scope = 'isa'; m.followed.add('isa'); m.muted.add('isa'); }],
+    ['W9', 'New space', 'From + New space: a goal, a saved setup, and what the tower will do.', m => { m.scope = 'new'; }],
+    ['W10', 'A space just launched', 'Right after Launch. Nothing was asked.', m => launch(m)],
+    ['W11', 'The main tower replies to a command', 'A receipt above the input, with what it assumed as chips.', m => { m.reply = { to: 'all', kind: 'open' }; }],
+    ['W12', 'A space’s tower replies to a question', 'Asked in isa, answered about isa only.', m => { m.scope = 'isa'; m.reply = { to: 'isa', kind: 'left' }; }]
+  ];
+  const cap = (code, name, when) => `<figcaption><span class="gcode">${code}</span><b>${esc(name)}</b><span>${esc(when)}</span></figcaption>`;
+  const frozen = (list, cls, draw) => list.map(([code, name, when, change]) => {
+    const m = model();
+    change(m);
+    return `<figure class="gframe" id="state-${code.toLowerCase()}">${cap(code, name, when)}<div class="${cls}" inert>${draw(m)}</div></figure>`;
+  }).join('');
+  $('#gorbs').innerHTML = ORBS.map(([code, name, when, n]) =>
+    `<figure class="gframe" id="state-${code.toLowerCase()}">${cap(code, name, when)}<div class="orb" role="img" aria-label="${esc(name)}">${n ? `<span class="badge">${n}</span>` : ''}</div></figure>`).join('');
+  $('#gfloat').innerHTML = frozen(FLOATS, 'panel fl', floatInner);
+  const still = (list, cls) => list.map(([code, name, when, html]) => `<figure class="gframe" id="state-${code.toLowerCase()}">${cap(code, name, when)}<div class="${cls}" inert>${html}</div></figure>`).join('');
+  const opt = (label, why, pick) => `<div class="opt${pick ? ' pick' : ''}"><b>${label}</b>${pick ? '<em>tower’s pick</em>' : ''}<span>${why}</span></div>`;
+  const rich = (step, space, why, stk, title, body) => `<article class="dcard open"><div class="meta">${step ? `<span class="now">${step}</span>` : ''}<span class="sp">${space}</span><span class="why">${why}</span><span>${stk}</span></div><h4>${title}</h4>${body}</article>`;
+  const ownOpts = '<div class="own">The session’s own options <span>Hero</span><span>Workflow factory</span><span>Pricing and contact</span><span>Phones</span></div>';
+  const otherBox = '<div class="other">Other… type it, hold Control and say it, or add files</div>';
+  const CARDS = [
+    ['C1', 'A question with the tower’s three answers', 'A session asks something only you can settle. The first answer is the tower’s pick, with why.',
+      rich('', 'industrial-landing-page', 'Design choice', '1 session waits · 2 min', 'Which section should be reworked next?',
+        `<div class="opts">${opt('Hero', 'It has no plain statement of what the product is.', 1)}${opt('Pricing and contact', 'The shortest section to finish.')}${opt('The workflow factory', 'The largest change, best done last.')}</div>${ownOpts}${otherBox}`)],
+    ['C2', 'Answers still coming', 'The card appears at once. You can answer before the tower’s answers arrive.',
+      rich('', 'industrial-landing-page', 'Design choice', '1 session waits · just now', 'Which section should be reworked next?',
+        `<div class="opts"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div><p class="cstat">The tower is working out its three answers.</p>${ownOpts}${otherBox}`)],
+    ['C3', 'Several questions, then a review', 'One question at a time, like the session’s own dialog. The last step shows every answer before it is sent.',
+      rich('2 of 3', 'isa', 'Release', '1 session waits · 6 min', 'Release mediaroom dev to production now?',
+        `<div class="opts">${opt('Not yet', 'One pull request into dev is still open.', 1)}${opt('Yes, release now', 'Carries everything on dev today.')}${opt('After #1277', 'Waits for the open merge.')}</div>`) +
+      rich('3 of 3', 'isa', 'Release', 'review', 'Review your answers',
+        '<ul class="rev"><li><b>Upload the 12 clips to production</b><span>Yes, with the release</span></li><li><b>Release mediaroom dev now</b><span>Not yet</span></li><li><b>Remove the unused dev upload</b><span>Keep them</span></li></ul><div class="acts"><button type="button" class="mbtn primary">Submit</button><button type="button" class="mbtn">Change</button></div>')],
+    ['C4', 'The tower types your answer in', 'After Submit. It checks the session’s screen after every step and stops on any surprise.',
+      rich('', 'isa', 'Release', 'answering', 'Sending your three answers', '<p class="cstat">Typing answer 2 of 3 into isa › mediaroom…</p>') +
+      rich('', 'isa', 'Release', 'stopped', 'It stopped at answer 2', '<p class="cstat bad">The session’s screen changed before the answer went in. Nothing more was typed.</p><div class="acts"><button type="button" class="mbtn primary">Open the session</button><button type="button" class="mbtn">Try again</button></div>')],
+    ['C5', 'A merge asks once more', 'Merging takes two steps: the second says what the merge will do. A failing check holds its pull request back.',
+      rich('', 'isa', 'Merge', 'Nothing is blocked · 31 min', '2 pull requests ready to merge',
+        '<ul class="prs"><li><b>#1273</b><span>into dev</span><em>checks pass</em></li><li><b>#1277</b><span>into main</span><em class="bad">1 check fails</em></li></ul><p class="cstat">Merging #1273 squashes its commits into dev. #1277 waits for its check.</p><div class="acts"><button type="button" class="mbtn primary">Confirm: merge #1273</button><button type="button" class="mbtn">Cancel</button></div>')],
+    ['C6', 'A task that failed', 'The tower sends it again by itself first. It comes to you only when the second try fails too.',
+      rich('', 'isa', 'Failed twice', '1 session stopped · 12 min', 'The dev check of the Ingest tour did not finish',
+        '<p class="cstat">The tower sent it again once. Both tries stopped at the same step.</p><div class="acts"><button type="button" class="mbtn primary">Open the session</button><button type="button" class="mbtn">Send it again</button><button type="button" class="mbtn">Drop the task</button></div>')]
+  ];
+  const fhead = status => `<div class="phead"><div class="t"><b>Tower</b><span>Full window</span></div><div class="pstatus">${status}</div></div>`;
+  const idle = statusHTML(model());
+  const INPUTS = [
+    ['I1', 'Dictating', 'You tap or hold Control and talk. Your words appear in the input as you say them.',
+      fhead('Listening…') + '<div class="pill has"><span>open a session in M5 Pro on my second acc</span><span class="send live" aria-hidden="true">●</span></div>'],
+    ['I2', 'With attachments', 'Paste, drop or pick a picture or a file. Each becomes a token where you were typing.',
+      fhead(idle) + '<div class="att"><span class="thumb"></span><span>design.png</span></div><div class="pill has"><span>[Image #1] can the landing session match this?</span><span class="send" aria-hidden="true">↑</span></div>'],
+    ['I3', 'Working on your command', 'One line while the tower works. It takes the place of the running commentary.',
+      fhead(idle) + '<p class="cstat">Opening 3 sessions in sandbox · 15 s</p><div class="pill"><span>Tell the tower…</span><span class="send" aria-hidden="true">↑</span></div>'],
+    ['I4', 'The tower is off', 'The orb is faded and sessions keep running. What happened meanwhile is in the record when it starts again.',
+      fhead('Off') + '<div class="empty">The tower is off. Your sessions keep running.</div><div class="acts"><button type="button" class="mbtn primary">Start the tower</button></div>']
+  ];
+  const MORE_WINS = [
+    ['W13', 'Record', 'From Record at the foot of the sidebar. The whole day, every space.', m => { m.scope = 'record'; }],
+    ['W14', 'Record for one space', 'Opened from inside sandbox, or picked from the chips.', m => { m.scope = 'record'; m.recFilter = 'sandbox'; }],
+    ['W15', 'Shots', 'The pictures sessions sent to show their work.', m => { m.scope = 'shots'; }],
+    ['W16', 'A screenshot open', 'Click a picture. It opens full size with its caption and where it came from.', m => { m.scope = 'shot:3'; }],
+    ['W17', 'Settings', 'Eight settings. The first three are choices you make once.', m => { m.scope = 'settings'; }],
+    ['W18', 'Behaviors', 'From Settings. The rules the tower follows, each with a switch.', m => { m.scope = 'behaviors'; }],
+    ['W19', 'Pair a phone', 'From Settings. A code for the Android app, and the phones already paired.', m => { m.scope = 'pair'; }],
+    ['W20', 'A session', 'Click a session inside a space: what it was asked, what it last said, its screen.', m => { m.scope = 'session:sandbox/mediaroom'; }]
+  ];
+  const pnav = on => `<div class="pnav">${['Queue', 'Spaces', 'Record', 'Shots'].map(x => `<span class="${x === on ? 'on' : ''}">${x}</span>`).join('')}</div>`;
+  const pscreen = (title, sub, body, on, talk) => `<div class="pscreen"><div class="pbar"><span>9:41</span><span>Mac in reach</span></div><div class="ptop"><b>${title}</b><span>${sub}</span></div><div class="pbody">${body}</div><div class="ptalkrow"><span class="ptalk${talk ? ' live' : ''}">${talk || 'Hold to talk'}</span></div>${pnav(on)}</div>`;
+  const pm = model(), pq = mainQueue(pm), psand = pm.spaces[0];
+  const pempty = model({ decisions: [] });
+  const prow = (st, g, name, right, sub) => `<div class="lrow" data-state="${st}"><span class="sg">${g}</span><span class="nm">${esc(name)}</span><span class="pg">${esc(right)}</span><span class="rq">${esc(sub)}</span></div>`;
+  const PHONES = [
+    ['A1', 'A notification, for a decision only', 'Nothing else notifies. You can answer from the lock screen.',
+      '<div class="pscreen"><div class="pbar"><span>9:41</span><span></span></div><div class="pclock">9:41</div><div class="pnote"><div class="pn-h"><b>Tower</b><span>sandbox · now</span></div><div class="pn-t">Allow one read of the production database?</div><div class="pn-s">3 sessions wait</div><div class="acts"><button type="button" class="mbtn primary">Allow once</button><button type="button" class="mbtn">No</button><button type="button" class="mbtn">Open</button></div></div></div>'],
+    ['A2', 'Queue', 'The app opens here: one card with large buttons, the rest waiting behind it.',
+      pscreen('Your queue', statusHTML(pm), queueHTML(pm, pq, n => `${n} more waiting`, ''), 'Queue')],
+    ['A3', 'Queue empty', 'Nothing is yours. The phone stays silent while spaces work.',
+      pscreen('Your queue', statusHTML(pempty), '<div class="empty">Nothing needs you.</div>', 'Queue')],
+    ['A4', 'Spaces', 'Every space as a mission: its goal, how far it is, and which are ready to close.',
+      pscreen('Spaces', `${pm.spaces.length} open · ${QUIET} quiet`, '<div class="rows">' + pm.spaces.map(x => { const [st, g] = spaceState(pm, x); return prow(st, g, x.id, x.report ? 'ready to close' : x.req[0][1], x.standing ? x.req[0][0] : x.goal); }).join('') + '</div><div class="acts"><button type="button" class="mbtn primary">+ New space</button></div>', 'Spaces')],
+    ['A5', 'A space’s tower', 'Tap a space. What you say or type here goes to that space.',
+      pscreen('sandbox', '3 sessions on orca · its own tower', '<p class="goal"><b>Goal</b>A plan for the storefront live editor</p>' + cardHTML(pq[0], false) + '<div class="bayh">Sessions</div><div class="rows">' + psand.sess.map(([nm, st, txt]) => prow(st, st === 'done' ? '✓' : '', nm, st, txt)).join('') + '</div><div class="bayh">Between sessions · 33 messages</div>', 'Spaces')],
+    ['A6', 'A session', 'Its last words and its screen. Show on Mac brings it up in Herdr.',
+      pscreen('sandbox › mediaroom', 'done · worktree mediaroom@sandbox', '<div class="bayh">Last said</div><p class="goal">Answered the planning questions.</p><pre class="scr">● Answered the planning questions.\n\n> </pre><div class="acts"><button type="button" class="mbtn primary">Show on Mac</button></div>', 'Spaces')],
+    ['A7', 'Talking', 'Hold the button and talk. The Mac writes it down, and the reply plays on the phone.',
+      pscreen('Listening…', 'Let go to send', '<p class="heard">open a session in M5 Pro on my second account</p>', 'Queue', 'Let go to send')],
+    ['A8', 'Reply to a command', 'A receipt with what it assumed. It is spoken on the phone because you spoke.',
+      pscreen('Your queue', statusHTML(pm), replyHTML(model({ reply: { to: 'all', kind: 'open' } }), 'all') + queueHTML(pm, pq.slice(0, 1), () => '', ''), 'Queue')],
+    ['A9', 'New space', 'Say or type the goal, pick a setup, launch. Nothing is asked.',
+      pscreen('New space', 'From one sentence', `<div class="launch"><div class="field"><span class="lab">Goal</span><div class="other">Case exports as PDF</div></div><div class="field"><span class="lab">Setup</span><div class="tpls">${TEMPLATES.map((x, i) => `<span class="tg" aria-pressed="${i === 0}">${esc(x.label)}</span>`).join('')}</div></div><ul class="plan"><li>Name the space <b>case-exports</b></li><li>Open 2 sessions on orca</li><li>Own worktrees, introduced</li></ul><div class="acts"><button type="button" class="mbtn primary">Launch</button></div></div>`, 'Spaces')],
+    ['A10', 'Record', 'Everything the tower did, by space. Read when you want it.',
+      pscreen('Record', 'All spaces', `<div class="reclist">${recRows(RECORD.slice(0, 6))}</div>`, 'Record')],
+    ['A11', 'Shots', 'What sessions sent, newest first. Tap one for full size.',
+      pscreen('Shots', `${SHOTS.length} today`, `<div class="shots">${SHOTS.slice(0, 4).map(([sp, who, capt]) => `<div class="shot"><span class="thumb"></span><b>${esc(capt)}</b><small>${esc(sp)}</small></div>`).join('')}</div>`, 'Shots')],
+    ['A12', 'Settings', 'This phone’s own choices. The rest is set on the Mac and shown here.',
+      pscreen('Settings', 'This phone', '<div class="sets"><section class="set"><h4>Replies are heard on</h4><div class="tpls"><span class="tg" aria-pressed="true">Phone</span><span class="tg" aria-pressed="false">Mac</span></div></section><section class="set"><h4>Notify me for</h4><div class="tpls"><span class="tg" aria-pressed="true">Decisions</span><span class="tg" aria-pressed="false">Decisions and results</span></div></section><section class="set"><h4>Paired with</h4><p>This Mac, over the local network or Tailscale.</p><div class="acts"><button type="button" class="mbtn">Unpair</button></div></section></div>', 'Queue')]
+  ];
+  $('#gcards').innerHTML = still(CARDS, 'panel fl');
+  $('#ginputs').innerHTML = still(INPUTS, 'panel fl');
+  $('#gphones').innerHTML = still(PHONES, 'phone');
+  $('#gwin').innerHTML = frozen([...WINS, ...MORE_WINS], 'win', winInner);
+  $('#gindex').innerHTML = [...ORBS, ...FLOATS, ...CARDS, ...INPUTS, ...WINS, ...MORE_WINS, ...PHONES].map(([code, name]) => `<a href="#state-${code.toLowerCase()}">${code} ${esc(name)}</a>`).join('');
+
+  /* ---- spaces scale ---- */
+  const NAMES = ['M5 Pro', 'sandbox', 'isa', 'Anna', 'industrial-landing-page', 'eyzflow', 'eyz-mediaroom-serverless', 'b2c-tickets', 'b2c', 'B2C support', 'B2B ticketing', 'uiux'];
+  const range = $('#nspaces');
+  function renderScale() {
+    const n = +range.value;
+    $('#nval').textContent = n;
+    const names = Array.from({ length: n }, (_, i) => NAMES[i] || `space ${i + 1}`);
+    const strip = $('#strip');
+    strip.innerHTML = '<span class="mc on">All sessions</span>' +
+      names.map(s => `<span class="mc sp">${esc(s)}</span><span class="mc">eyzflow</span><span class="mc">mediaroom</span>`).join('');
+    const wide = strip.clientWidth ? strip.scrollWidth / strip.clientWidth : 0;
+    $('#stripNote').textContent = `${1 + 3 * n} chips on one line${wide ? `, ${wide.toFixed(1)} panel widths long` : ''}. The Spaces tab holds ${n} cards and shows about 3 at a time.`;
+    const y = Math.max(1, Math.round(n * 0.12)), w = Math.max(1, Math.round(n * 0.25)), q = n - y - w;
+    $('#miniBoard').innerHTML =
+      names.slice(0, y).map(s => `<div class="mrow y"><i>1</i><span>${esc(s)}</span><em>needs you</em></div>`).join('') +
+      names.slice(y, y + w).map(s => `<div class="mrow w"><i></i><span>${esc(s)}</span><em>working</em></div>`).join('') +
+      (q > 0 ? `<div class="mrow q"><i></i><span>${q} quiet space${q === 1 ? '' : 's'}</span><em>folded</em></div>` : '');
+    $('#boardNote').textContent = `${y + w} rows${q > 0 ? ' and one fold' : ''}. The ${q > 0 ? q : 'quiet'} spaces with nothing running take one line together.`;
+  }
+  range.addEventListener('input', renderScale);
+  window.addEventListener('resize', renderScale);
+
+  /* ---- how much it tells you ---- */
+  const LEVELS = {
+    decisions: ['About 65', 'cards on 10 Nov: 29 pull requests to merge, 6 permission prompts and about 30 questions. A repo’s merges stack into one card, so you would see fewer.'],
+    results: ['About 73', 'items on 10 Nov: the same decisions, plus one receipt for each of your 8 requests when it finished.'],
+    all: ['About 760', 'items on 10 Nov, which is what the chat held: 277 messages, 223 alerts, 154 watch notes, 59 screenshots, 29 PR chips, 11 job reports and your 8 requests.']
+  };
+  function setLevel(k) {
+    $$('.pseg [data-level]').forEach(x => x.setAttribute('aria-pressed', String(x.dataset.level === k)));
+    $('#dialN').textContent = LEVELS[k][0];
+    $('#dialD').textContent = LEVELS[k][1];
+  }
+  $$('.pseg [data-level]').forEach(b => b.addEventListener('click', () => setLevel(b.dataset.level)));
+
+  reset();
+  renderScale();
+  setLevel('decisions');
+})();
+</script>

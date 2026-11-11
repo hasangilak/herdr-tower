@@ -51,11 +51,6 @@ impl Shot {
         })
     }
 
-    /// A history entry of kind `screenshot`.
-    pub fn from_entry(e: &crate::history::Entry) -> Option<Shot> {
-        Shot::of(&serde_json::to_value(e).ok()?)
-    }
-
     /// Who sent it: its name, else its address.
     pub fn who(&self) -> &str {
         if self.name.is_empty() { &self.session } else { &self.name }

@@ -34,6 +34,8 @@ struct Sub {
     voice: bool,
     /// Its device hears replies on the phone (route `phone`).
     on_phone: bool,
+    /// Which of the tower's addresses it came in on: `lan` or `tailscale` ("" unknown).
+    via: String,
     tx: Sender<Out>,
 }
 
@@ -67,7 +69,7 @@ impl Hub {
         i.next_sub += 1;
         let id = i.next_sub;
         let was = i.subs.iter().any(|s| s.voice && s.on_phone);
-        i.subs.push(Sub { id, device: device.to_string(), voice, on_phone, tx });
+        i.subs.push(Sub { id, device: device.to_string(), voice, on_phone, via: String::new(), tx });
         if voice && on_phone && !was {
             eprintln!("[phone] {device} is the tower's voice now");
         }
@@ -81,6 +83,25 @@ impl Hub {
         if was && !i.subs.iter().any(|s| s.voice && s.on_phone) {
             eprintln!("[phone] no phone is the voice: back to the Mac");
         }
+    }
+
+    /// Which of the tower's addresses a stream came in on (`lan`, `tailscale`).
+    pub fn set_via(&self, id: u64, via: &str) {
+        if let Some(s) = self.inner.lock().unwrap_or_else(|e| e.into_inner()).subs.iter_mut().find(|s| s.id == id) {
+            s.via = via.to_string();
+        }
+    }
+
+    /// The devices with a stream open now, each with how it came in (`lan`,
+    /// `tailscale`), in the order they connected, without repeats.
+    pub fn connections(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = vec![];
+        for s in &self.inner.lock().unwrap_or_else(|e| e.into_inner()).subs {
+            if !out.iter().any(|(d, v)| *d == s.device && *v == s.via) {
+                out.push((s.device.clone(), s.via.clone()));
+            }
+        }
+        out
     }
 
     /// A device's route changed (`PUT /v1/device/audio`, the panel).

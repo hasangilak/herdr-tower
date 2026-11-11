@@ -6,14 +6,20 @@
 //! this Mac's private LAN address, and on its Tailscale address too while
 //! Tailscale runs (`[lan] tailscale = "auto"`, see `tailscale`); never on
 //! every interface. Every call but pairing needs a paired device's token.
+//! While the LAN listener runs, Bonjour finds it by name on that network
+//! (`[lan] bonjour`, see `bonjour`).
 
 pub mod audio;
 pub mod auth;
+pub mod bonjour;
 pub mod http;
 pub mod hub;
 pub mod multipart;
+pub mod network;
+mod quiet;
 pub mod tailscale;
 pub mod tls;
+pub mod tower;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -38,6 +44,15 @@ use tls::Identity;
 
 /// The API version in every path (`/v1/...`).
 pub const API: u32 = 1;
+/// What this tower's API has beyond the first `/v1` (`GET /v1/hello`'s
+/// `features`): an app checks a name here before it uses that part.
+/// `quiet`: the decisions, missions, threads, launch, tell level and model
+/// calls, a request's `space`, and the events that go with them.
+/// `pairing`: pairing again in place (`install_id`), the networks a phone
+/// knows, `hosts` on the stream (`hello`, the `hosts` event) and `GET /v1/network`.
+/// `bonjour`: found by name on the local network (`_herdr-tower._tcp`, the
+/// fingerprint in its TXT), and `bonjour` where `hosts` is.
+pub const FEATURES: &[&str] = &["quiet", "acts", "pairing", "bonjour"];
 const MAX_CONNECTIONS: usize = 32;
 /// Connections open at once from one address.
 const MAX_PER_IP: usize = 8;
@@ -56,7 +71,6 @@ pub struct Ctx {
     pub shared: Shared,
     pub mouth: Mouth,
     pub hub: Arc<Hub>,
-    pub ack: Option<Duration>,
     pub stt: Sender<Utterance>,
     /// The open question sets (blocked sessions' dialogs).
     pub asks: super::asks::Asks,
@@ -101,6 +115,16 @@ struct Running {
     tailscale: tailscale::Tailscale,
     /// Why the tailnet address isn't listened on though Tailscale runs (a bind that failed).
     tailscale_error: Option<String>,
+    /// The LAN listener as Bonjour advertises it, while it does (dropped: withdrawn).
+    bonjour: Option<Advertised>,
+    /// Why it isn't advertised though it should be (the last failure, said once).
+    bonjour_error: Option<String>,
+}
+
+/// A Bonjour advert and what it says.
+struct Advertised {
+    ad: bonjour::Ad,
+    advert: bonjour::Advert,
 }
 
 impl Running {
@@ -115,6 +139,16 @@ impl Running {
 
 /// How the phone API asks about Tailscale (tests give their own).
 pub type Detect = Arc<dyn Fn() -> tailscale::Tailscale + Send + Sync>;
+
+/// How it asks this Mac's address on the network it is on now (`lan_ip`; tests give their own).
+pub type LanDetect = Arc<dyn Fn() -> Option<IpAddr> + Send + Sync>;
+
+/// How it advertises the LAN listener by Bonjour (`bonjour::Advert::start`; tests give their own).
+pub type Advertise = Arc<dyn Fn(&bonjour::Ad) -> Result<bonjour::Advert> + Send + Sync>;
+
+/// Which interface of this Mac holds an address, to advertise there
+/// (`bonjour::advert_interface`; tests give their own).
+pub type InterfaceOf = Arc<dyn Fn(IpAddr) -> Option<bonjour::Interface> + Send + Sync>;
 
 /// Tailscale is looked at again this often while the API is on: it starts
 /// (or stops) listening on the tailnet as Tailscale comes and goes.
@@ -138,6 +172,34 @@ pub struct Lan {
     /// The certificate's folder (elsewhere in tests).
     identity_dir: std::path::PathBuf,
     detect: Detect,
+    /// This Mac's address on the network it is on now, for `bind = "auto"`.
+    lan_detect: LanDetect,
+    /// The rest of the tower (`tower::Tower`): the daemon, once it is whole.
+    tower: Arc<std::sync::OnceLock<Arc<dyn tower::Tower>>>,
+    /// `history.jsonl` (elsewhere in tests).
+    history: std::path::PathBuf,
+    /// The launches and closes the phones started.
+    actions: tower::Actions,
+    /// The names the user gave networks (`[lan.networks]`), by range.
+    names: Arc<Mutex<std::collections::BTreeMap<String, String>>>,
+    /// The `hosts` event as last sent to the streams (sent again only when it changes).
+    sent_hosts: Arc<Mutex<Option<Value>>>,
+    /// How the LAN listener is put on Bonjour (none in tests unless they give one).
+    advertise: Option<Advertise>,
+    /// The interface that holds the LAN listener's address, for the advert.
+    interface_of: InterfaceOf,
+    /// mDNSResponder answered (the name taken, a rename): the state and the phones are told within 250 ms.
+    bonjour_news: Arc<AtomicBool>,
+}
+
+/// Which listener an address of this Mac is: the one listening there, else
+/// the tailnet's for a 100.64/10 address, the LAN's otherwise.
+fn kind_of(listeners: &[Listener], local: SocketAddr) -> Kind {
+    match listeners.iter().find(|l| l.addr == local) {
+        Some(l) => l.kind,
+        None if matches!(local.ip(), IpAddr::V4(v) if tailscale::is_tailnet(v)) => Kind::Tailscale,
+        None => Kind::Lan,
+    }
 }
 
 /// The connections open now, in all and by address.
@@ -294,16 +356,23 @@ fn body_limit(req: &Request, seg: &[&str]) -> usize {
     let multipart = req.header("content-type").and_then(multipart::boundary).is_some();
     match (req.method.as_str(), seg.get(1..).unwrap_or(&[])) {
         ("POST", ["pair"]) => http::MAX_PAIR_BODY,
-        ("POST", ["voice"] | ["transcribe"] | ["questions", _, "voice"]) if !multipart => http::MAX_VOICE_BODY,
-        ("POST", ["ask"] | ["voice"] | ["transcribe"] | ["questions", _, "voice"] | ["questions", _, "answer"]) if multipart => {
+        ("POST", ["voice"] | ["transcribe"] | ["questions" | "decisions", _, "voice"]) if !multipart => http::MAX_VOICE_BODY,
+        ("POST", ["ask"] | ["voice"] | ["transcribe"] | ["questions" | "decisions", _, "voice"] | ["questions" | "decisions", _, "answer"])
+            if multipart =>
+        {
             http::MAX_BODY
         }
         _ => http::MAX_JSON_BODY,
     }
 }
 
-/// This Mac's address on the network its default route uses (no packet is sent).
+/// This Mac's address on the network its default route uses (no packet is
+/// sent). `HERDER_TOWER_LAN_IP_FILE` names a file whose one line stands in
+/// for it, read each time (a sandbox moving "networks"; empty: none).
 pub fn lan_ip() -> Option<IpAddr> {
+    if let Some(f) = std::env::var_os("HERDER_TOWER_LAN_IP_FILE") {
+        return std::fs::read_to_string(f).ok()?.trim().parse().ok();
+    }
     let s = UdpSocket::bind("0.0.0.0:0").ok()?;
     s.connect("192.0.2.1:9").or_else(|_| s.connect("8.8.8.8:53")).ok()?;
     let ip = s.local_addr().ok()?.ip();
@@ -417,6 +486,16 @@ fn hosts_value(listeners: &[(Kind, SocketAddr)], ts: &tailscale::Tailscale) -> V
         .collect()
 }
 
+/// `bonjour` in `GET /v1/network`, the `hosts` event and `hello`: how the
+/// phone finds this tower by Bonjour (the type to browse, the name it is
+/// registered under, the TXT's `fp`), or null while it isn't advertised.
+fn bonjour_value(r: &Running) -> Value {
+    match r.bonjour.as_ref().and_then(|b| Some((b.advert.name()?, &b.ad.fp))) {
+        Some((name, fp)) => json!({ "type": bonjour::SERVICE, "name": name, "fp": fp }),
+        None => Value::Null,
+    }
+}
+
 /// What the Mac shows to pair a phone, and the link its QR carries: the
 /// first address as `host`/`port` (what older apps read), every address in
 /// order as `hosts`, and the MagicDNS name while the tailnet is listened on.
@@ -457,9 +536,18 @@ impl Lan {
     }
 
     pub fn with_paths(ctx: Ctx, devices_path: std::path::PathBuf, identity_dir: std::path::PathBuf) -> Lan {
+        let bonjour_news = Arc::new(AtomicBool::new(false));
+        let news = bonjour_news.clone();
+        let advertise: Advertise = Arc::new(move |ad: &bonjour::Ad| {
+            let news = news.clone();
+            bonjour::Advert::start(ad.port, &ad.interface, &ad.name, &ad.txt()?, move || news.store(true, Ordering::SeqCst))
+        });
         Lan {
             devices: Arc::new(auth::Store::new(devices_path)),
             identity_dir,
+            tower: Arc::default(),
+            history: crate::history::path(),
+            actions: tower::Actions::new(ctx.hub.clone()),
             ctx,
             running: Arc::new(Mutex::new(None)),
             pairing: Arc::new(Mutex::new(Pairing::default())),
@@ -467,7 +555,33 @@ impl Lan {
             conns: Arc::new(Mutex::new(Conns::default())),
             // Tests never ask this Mac's Tailscale unless they say so (`with_detect`).
             detect: Arc::new(if cfg!(test) { tailscale::Tailscale::default } else { tailscale::detect as fn() -> tailscale::Tailscale }),
+            lan_detect: Arc::new(lan_ip),
+            names: Arc::default(),
+            sent_hosts: Arc::default(),
+            // Tests never advertise on this Mac's network unless they say so (`with_advertiser`).
+            advertise: (!cfg!(test)).then_some(advertise),
+            interface_of: Arc::new(bonjour::advert_interface),
+            bonjour_news,
         }
+    }
+
+    /// Another way to advertise by Bonjour, and to find an address's interface (tests).
+    #[cfg(test)]
+    pub fn with_advertiser(
+        mut self,
+        advertise: impl Fn(&bonjour::Ad) -> Result<bonjour::Advert> + Send + Sync + 'static,
+        interface_of: impl Fn(IpAddr) -> Option<bonjour::Interface> + Send + Sync + 'static,
+    ) -> Lan {
+        self.advertise = Some(Arc::new(advertise));
+        self.interface_of = Arc::new(interface_of);
+        self
+    }
+
+    /// Another way to ask this Mac's address on the network (tests: a network change).
+    #[cfg(test)]
+    pub fn with_lan_detect(mut self, detect: impl Fn() -> Option<IpAddr> + Send + Sync + 'static) -> Lan {
+        self.lan_detect = Arc::new(detect);
+        self
     }
 
     /// Another way to ask about Tailscale (tests).
@@ -475,6 +589,40 @@ impl Lan {
     pub fn with_detect(mut self, detect: impl Fn() -> tailscale::Tailscale + Send + Sync + 'static) -> Lan {
         self.detect = Arc::new(detect);
         self
+    }
+
+    /// Another history file (tests).
+    #[cfg(test)]
+    pub fn with_history(mut self, path: std::path::PathBuf) -> Lan {
+        self.history = path;
+        self
+    }
+
+    /// The rest of the tower, for what a phone does as the Mac's windows
+    /// do: given once, when the daemon is whole (it holds this API itself).
+    pub fn attach(&self, tower: Arc<dyn tower::Tower>) {
+        let _ = self.tower.set(tower);
+    }
+
+    fn tower(&self) -> Option<Arc<dyn tower::Tower>> {
+        self.tower.get().cloned()
+    }
+
+    /// Every history entry, oldest first.
+    fn entries(&self) -> Vec<crate::history::Entry> {
+        crate::history::load_from(&self.history)
+    }
+
+    /// The history with each entry's line number (a chat message's id).
+    fn lines(&self) -> Vec<(usize, crate::history::Entry)> {
+        std::fs::read_to_string(&self.history).map(|t| crate::chat::parse(&t)).unwrap_or_default()
+    }
+
+    /// The chat thread as it is now, oldest first.
+    fn chat(&self) -> Vec<Value> {
+        let spaces = self.tower().map(|t| t.remembered()).unwrap_or_default();
+        let acts = self.ctx.shared.with(|s| s.acts.clone());
+        crate::chat::thread_of(&self.lines(), &crate::history::attachments_dir(), &self.ctx.prs.map(), &spaces, &acts)
     }
 
     /// Starts listening: on the LAN address, and the tailnet's while Tailscale
@@ -487,8 +635,10 @@ impl Lan {
         }
         let identity = Identity::load_or_create(&self.identity_dir)?;
         let tls = identity.server_config()?;
+        *self.names.lock().unwrap_or_else(|e| e.into_inner()) = cfg.networks.clone();
         let ts = if tailscale_wanted(cfg)? { (self.detect)() } else { tailscale::Tailscale::default() };
-        let auto = if cfg.bind.is_empty() || cfg.bind == "auto" { lan_ip() } else { None };
+        let auto_bind = cfg.bind.is_empty() || cfg.bind == "auto";
+        let auto = if auto_bind { (self.lan_detect)() } else { None };
         let stop = Arc::new(AtomicBool::new(false));
         let mut listeners = vec![];
         let mut tailscale_error = None;
@@ -511,30 +661,56 @@ impl Lan {
             }
         }
         let fingerprint = identity.fingerprint();
-        *running = Some(Running { listeners, stop: stop.clone(), fingerprint: fingerprint.clone(), tls, cfg: cfg.clone(), tailscale: ts, tailscale_error });
+        *running = Some(Running {
+            listeners,
+            stop: stop.clone(),
+            fingerprint: fingerprint.clone(),
+            tls,
+            cfg: cfg.clone(),
+            tailscale: ts,
+            tailscale_error,
+            bonjour: None,
+            bonjour_error: None,
+        });
+        self.sync_bonjour(running.as_mut().expect("just set"));
         let r = running.as_ref().expect("just set");
         let addrs: Vec<String> = r.listeners.iter().map(|l| format!("https://{} ({})", l.addr, l.kind.word())).collect();
         let primary = r.primary();
         self.publish(r);
         drop(running);
         eprintln!("[phone] API on {} (certificate {})", addrs.join(", "), tls::grouped(&fingerprint[..16]));
-        if tailscale_wanted(cfg).unwrap_or(false) {
-            let me = self.clone();
-            thread::Builder::new()
-                .name("lan-tailscale".into())
-                .spawn(move || {
-                    while !stop.load(Ordering::SeqCst) {
-                        let until = Instant::now() + TAILSCALE_RECHECK;
-                        while Instant::now() < until && !stop.load(Ordering::SeqCst) {
-                            thread::sleep(Duration::from_millis(250));
-                        }
-                        if !stop.load(Ordering::SeqCst) {
-                            me.recheck_tailscale(&stop);
+        // Every 20 s: the network this Mac is on (home, the office: the LAN
+        // listener follows it) and Tailscale (the tailnet's follows that),
+        // and the phones in use against both (the hint, `network::hint`).
+        let tailnet = tailscale_wanted(cfg).unwrap_or(false);
+        let me = self.clone();
+        thread::Builder::new()
+            .name("lan-follow".into())
+            .spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let until = Instant::now() + TAILSCALE_RECHECK;
+                    while Instant::now() < until && !stop.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(250));
+                        // Bonjour took a name (or another, on a clash): said now, not in 20 s.
+                        if me.bonjour_news.swap(false, Ordering::SeqCst) {
+                            me.refresh();
                         }
                     }
-                })
-                .ok();
-        }
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if auto_bind {
+                        me.recheck_lan(&stop);
+                    }
+                    // The advert follows the LAN listener's address and its interface (Wi-Fi off and on).
+                    me.recheck_bonjour(&stop);
+                    if tailnet {
+                        me.recheck_tailscale(&stop);
+                    }
+                    me.refresh();
+                }
+            })
+            .ok();
         Ok(primary)
     }
 
@@ -599,20 +775,224 @@ impl Lan {
         }
     }
 
-    /// Where it listens, into the state (the panel, `state.json`, `GET /v1/state`).
+    /// Where it listens, into the state (the panel, `state.json`, `GET
+    /// /v1/state`): the addresses, the network and whether to say the hint.
+    /// When the addresses or the network changed, every open stream gets a
+    /// `hosts` event, so a phone learns the new address while it can.
     fn publish(&self, r: &Running) {
         let url = format!("https://{}", r.primary());
         let hosts = hosts_value(&r.listeners.iter().map(|l| (l.kind, l.addr)).collect::<Vec<_>>(), &r.tailscale);
         let ts = r.tailscale.view();
+        let here = self.here(r);
+        let hint = network::hint(&self.devices.load().devices, &here, r.tailscale.running, now_ms()).then(|| network::HINT.to_string());
+        let net = here.view();
         self.ctx.shared.update(|s| {
             s.lan = url;
             s.lan_hosts = hosts;
             s.tailscale = Some(ts);
+            s.network = Some(net).filter(|n| !n.is_null());
+            s.phone_hint = hint;
         });
+        let payload = self.network_value(r);
+        let mut sent = self.sent_hosts.lock().unwrap_or_else(|e| e.into_inner());
+        if sent.as_ref() != Some(&payload) {
+            // (Not when it is first published: no stream is open yet, and each gets it in its `hello`.)
+            if sent.is_some() {
+                self.ctx.hub.broadcast("hosts", payload.clone());
+            }
+            *sent = Some(payload);
+        }
+    }
+
+    /// The state and the hint again, as things are now (a phone paired or
+    /// connected, one was revoked, a network was named, time passed).
+    pub fn refresh(&self) {
+        let running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = running.as_ref() {
+            self.publish(r);
+        }
+    }
+
+    /// Where the tower can be reached now (`network::Here`).
+    fn here(&self, r: &Running) -> network::Here {
+        let lan = r.of(Kind::Lan).map(|l| l.addr);
+        let range = lan.map(|a| network::range_of(a.ip()));
+        let name = range.as_ref().and_then(|g| self.names.lock().unwrap_or_else(|e| e.into_inner()).get(g).cloned()).filter(|n| !n.trim().is_empty());
+        network::Here {
+            range,
+            name,
+            lan: lan.map(|a| (a.ip().to_string(), a.port())),
+            tailnet: r.of(Kind::Tailscale).map(|l| (l.addr.ip().to_string(), l.addr.port())),
+        }
+    }
+
+    /// `GET /v1/network`, the `hosts` event, and what `hello` adds: every
+    /// address (as the pairing lists them), the network, the MagicDNS name
+    /// while the tailnet is listened on, and Tailscale.
+    fn network_value(&self, r: &Running) -> Value {
+        let listeners: Vec<(Kind, SocketAddr)> = r.listeners.iter().map(|l| (l.kind, l.addr)).collect();
+        let on_tailnet = r.of(Kind::Tailscale).is_some();
+        json!({
+            "hosts": hosts_value(&listeners, &r.tailscale),
+            "network": self.here(r).view(),
+            "magic_dns": r.tailscale.dns_name.clone().filter(|_| on_tailnet),
+            "tailscale": r.tailscale.view(),
+            "bonjour": bonjour_value(r),
+        })
+    }
+
+    /// `network_value` now (no addresses while the API is off).
+    fn network_now(&self) -> Value {
+        let r = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        match r.as_ref() {
+            Some(r) => self.network_value(r),
+            None => json!({ "hosts": [], "network": null, "magic_dns": null, "tailscale": null, "bonjour": null }),
+        }
+    }
+
+    /// What a phone knows of the tower at this listener: the network's range
+    /// (`tailnet` for the tailnet's), its name now, the host and port.
+    fn known_of(&self, kind: Kind, addr: SocketAddr) -> (String, Option<String>, String, u16) {
+        let (host, port) = (addr.ip().to_string(), addr.port());
+        match kind {
+            Kind::Tailscale => (network::TAILNET.to_string(), None, host, port),
+            Kind::Lan => {
+                let range = network::range_of(addr.ip());
+                let name = self.names.lock().unwrap_or_else(|e| e.into_inner()).get(&range).cloned().filter(|n| !n.trim().is_empty());
+                (range, name, host, port)
+            }
+        }
+    }
+
+    /// The user named the network (config.toml was written): the names
+    /// again, and the state and the phones told.
+    pub fn renamed(&self) {
+        if let Ok(c) = crate::config::Config::load() {
+            *self.names.lock().unwrap_or_else(|e| e.into_inner()) = c.lan.networks;
+        }
+        self.refresh();
+    }
+
+    /// Names a network (tests: no config.toml).
+    #[cfg(test)]
+    pub fn set_names(&self, names: &[(&str, &str)]) {
+        *self.names.lock().unwrap_or_else(|e| e.into_inner()) = names.iter().map(|(r, n)| (r.to_string(), n.to_string())).collect();
+        self.refresh();
     }
 
     /// Tailscale again: listens on the tailnet once it runs, stops when it
     /// stops or its address changes. The LAN listener is never touched.
+    /// The network this Mac is on now, for `bind = "auto"`: when its address
+    /// changed (another network), the LAN listener moves to the new one on
+    /// the same port, and the pairing and the state show it. With no network
+    /// (Wi-Fi off), the old one stays unless the tailnet's is there instead.
+    fn recheck_lan(&self, api_stop: &Arc<AtomicBool>) {
+        let now = (self.lan_detect)();
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(r) = running.as_mut() else { return };
+        // Another start since (this watcher's API was stopped), or an address set by hand.
+        if !Arc::ptr_eq(&r.stop, api_stop) || !(r.cfg.bind.is_empty() || r.cfg.bind == "auto") {
+            return;
+        }
+        let tail = r.of(Kind::Tailscale).map(|l| l.addr.ip());
+        // As `plan` takes it: a private address (unless allow_public), and not the tailnet's own.
+        let want = choose_ip_from(&r.cfg, now).ok().filter(|ip| Some(*ip) != tail);
+        let have = r.of(Kind::Lan).map(|l| l.addr.ip());
+        if want == have || r.listeners.is_empty() {
+            return;
+        }
+        let port = r.primary().port();
+        if let Some(pos) = r.listeners.iter().position(|l| l.kind == Kind::Lan)
+            && (r.listeners.len() > 1 || want.is_some())
+        {
+            let l = r.listeners.remove(pos);
+            eprintln!("[phone] no longer on {}: this Mac is on another network", l.addr);
+            Self::unlisten(l);
+        }
+        if let Some(ip) = want {
+            match self.listen(Kind::Lan, ip, port, &r.tls, &r.stop) {
+                Ok(l) => {
+                    eprintln!("[phone] API on https://{} (lan): this Mac's network changed", l.addr);
+                    r.listeners.insert(0, l);
+                }
+                Err(e) => eprintln!("[phone] can't listen on the new network yet: {e:#}"),
+            }
+        }
+        // Bonjour moves with it: withdrawn from the old network, advertised on the new one.
+        self.sync_bonjour(r);
+        self.publish(r);
+    }
+
+    /// The Bonjour advert again, as the LAN listener is now: advertised on
+    /// the interface that holds its address, again when that changed (the
+    /// Mac moved, Wi-Fi came back) or mDNSResponder dropped it, withdrawn
+    /// when no interface holds it (Wi-Fi off) or there is no LAN listener.
+    fn recheck_bonjour(&self, api_stop: &Arc<AtomicBool>) {
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(r) = running.as_mut() else { return };
+        if !Arc::ptr_eq(&r.stop, api_stop) {
+            return;
+        }
+        if self.sync_bonjour(r) {
+            self.publish(r);
+        }
+    }
+
+    /// What Bonjour should say of the LAN listener now (`None`: nothing:
+    /// `[lan] bonjour = false`, no LAN listener, or no interface holds its address).
+    fn bonjour_ad(&self, r: &Running) -> Option<bonjour::Ad> {
+        self.advertise.as_ref()?;
+        if !r.cfg.bonjour {
+            return None;
+        }
+        let lan = r.of(Kind::Lan)?.addr;
+        let interface = (self.interface_of)(lan.ip())?;
+        let fp = bonjour::fp_hex(&r.fingerprint)?;
+        let asked = Some(r.cfg.bonjour_name.trim()).filter(|n| !n.is_empty()).map(String::from).or_else(bonjour::computer_name);
+        Some(bonjour::Ad { ip: lan.ip(), port: lan.port(), interface, name: bonjour::instance_name(&asked.unwrap_or_default()), fp })
+    }
+
+    /// The advert made to match `bonjour_ad`: kept when it says the same
+    /// (and is alive), else withdrawn and, when one is wanted, made again.
+    /// True when it changed.
+    fn sync_bonjour(&self, r: &mut Running) -> bool {
+        let want = self.bonjour_ad(r);
+        let keep = match (&r.bonjour, &want) {
+            (Some(have), Some(want)) => have.ad == *want && have.advert.failed().is_none(),
+            (None, None) => true,
+            _ => false,
+        };
+        if keep {
+            return false;
+        }
+        // The old one goes first: the same name twice would clash with itself.
+        if let Some(old) = r.bonjour.take() {
+            eprintln!("[phone] Bonjour: no longer advertised on {} ({})", old.ad.interface.name, old.ad.ip);
+            drop(old);
+        }
+        let Some(ad) = want else {
+            r.bonjour_error = None;
+            return true;
+        };
+        let Some(advertise) = &self.advertise else { return true };
+        match advertise(&ad) {
+            Ok(advert) => {
+                let at = SocketAddr::new(ad.ip, ad.port);
+                eprintln!("[phone] Bonjour: advertising {:?} ({}) on {} for {at}", ad.name, bonjour::SERVICE, ad.interface.name);
+                r.bonjour = Some(Advertised { ad, advert });
+                r.bonjour_error = None;
+            }
+            Err(e) => {
+                let why = format!("{e:#}");
+                if r.bonjour_error.as_ref() != Some(&why) {
+                    eprintln!("[phone] Bonjour: not advertised (tried again every 20 s): {why}");
+                }
+                r.bonjour_error = Some(why);
+            }
+        }
+        true
+    }
+
     fn recheck_tailscale(&self, api_stop: &Arc<AtomicBool>) {
         let ts = (self.detect)();
         let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
@@ -661,8 +1041,10 @@ impl Lan {
     }
 
     pub fn stop(&self) {
-        if let Some(r) = self.running.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(mut r) = self.running.lock().unwrap_or_else(|e| e.into_inner()).take() {
             r.stop.store(true, Ordering::SeqCst);
+            // Withdrawn first: no phone finds a tower that is going.
+            drop(r.bonjour.take());
             for l in r.listeners {
                 Self::unlisten(l);
             }
@@ -673,7 +1055,10 @@ impl Lan {
                 s.lan.clear();
                 s.lan_hosts.clear();
                 s.phone = None;
+                s.network = None;
+                s.phone_hint = None;
             });
+            *self.sent_hosts.lock().unwrap_or_else(|e| e.into_inner()) = None;
             eprintln!("[phone] API off");
         }
     }
@@ -696,13 +1081,34 @@ impl Lan {
         tailscale["mode"] = json!(if mode.trim() == "off" { "off" } else { "auto" });
         tailscale["listening"] = json!(listeners.iter().any(|(k, _)| *k == Kind::Tailscale));
         tailscale["error"] = json!(r.as_ref().and_then(|r| r.tailscale_error.clone()));
+        // The network: the LAN listener's; while off, the one this Mac is on (nothing listens there).
+        let here = match r.as_ref() {
+            Some(r) => self.here(r),
+            None => {
+                let range = (self.lan_detect)().map(network::range_of);
+                let name = range.as_ref().and_then(|g| crate::config::Config::load().ok()?.lan.networks.get(g).cloned());
+                network::Here { range, name, ..Default::default() }
+            }
+        };
+        let connected = self.ctx.hub.connections();
+        let now = now_ms();
         json!({
             "on": r.is_some(),
             "url": r.as_ref().map(|r| format!("https://{}", r.primary())),
             "hosts": hosts_value(&listeners, &ts),
+            "network": here.view(),
             "tailscale": tailscale,
             "fingerprint": r.as_ref().map(|r| r.fingerprint.clone()),
-            "devices": devices.devices.iter().map(|d| json!({ "id": d.id, "name": d.name, "created_ms": d.created_ms, "last_seen_ms": d.last_seen_ms })).collect::<Vec<_>>(),
+            "bonjour": r.as_ref().map(bonjour_value).unwrap_or(Value::Null),
+            "devices": devices.devices.iter().map(|d| {
+                let via: Vec<&str> = connected.iter().filter(|(id, _)| *id == d.id).map(|(_, v)| v.as_str()).collect();
+                json!({
+                    "id": d.id, "name": d.name, "created_ms": d.created_ms, "last_seen_ms": d.last_seen_ms, "audio_route": d.audio_route,
+                    "networks": d.networks, "reach": network::reach(&d.networks, &here).word(), "connected": via,
+                })
+            }).collect::<Vec<_>>(),
+            "connected": connected.iter().map(|(id, via)| json!({ "device": id, "via": via })).collect::<Vec<_>>(),
+            "phone_hint": network::hint(&devices.devices, &here, ts.running, now).then_some(network::HINT),
             "streams": streams,
             "voice_streams": voice,
             "pairing_expires_in_s": self.pairing.lock().unwrap_or_else(|e| e.into_inner()).expires_in().map(|d| d.as_secs()),
@@ -716,12 +1122,16 @@ impl Lan {
         let code = self.pairing.lock().unwrap_or_else(|e| e.into_inner()).open();
         let listeners: Vec<(Kind, SocketAddr)> = r.listeners.iter().map(|l| (l.kind, l.addr)).collect();
         eprintln!("[phone] pairing open for {} s", auth::CODE_TTL.as_secs());
-        Ok(pairing_payload(&code, &listeners, &r.fingerprint, &r.tailscale, auth::CODE_TTL.as_secs()))
+        let mut v = pairing_payload(&code, &listeners, &r.fingerprint, &r.tailscale, auth::CODE_TTL.as_secs());
+        // The network the phone must be on (or both on Tailscale), for the Mac to say so.
+        v["network"] = self.here(r).view();
+        Ok(v)
     }
 
     /// A device was revoked (`tower phone revoke`): its open streams end.
     pub fn revoked(&self, device: &str) {
         self.ctx.hub.drop_device(device);
+        self.refresh();
     }
 
     fn connection(&self, tcp: TcpStream, tls: Arc<rustls::ServerConfig>, stop: &AtomicBool) {
@@ -732,6 +1142,7 @@ impl Lan {
         let fd = tcp.as_raw_fd();
         let Ok(conn) = rustls::ServerConnection::new(tls) else { return };
         let mut stream = rustls::StreamOwned::new(conn, Sock { tcp, deadline: Some(Instant::now() + HEAD_DEADLINE) });
+        let local = stream.sock.tcp.local_addr().ok();
         let (mut req, rest) = match http::read_head(&mut stream) {
             Ok(r) => r,
             Err(e) => {
@@ -747,6 +1158,7 @@ impl Lan {
             let _ = http::write_response(&mut stream, &Response::error(429, "too_many_failures", "too many failed logins; wait a minute"));
             return;
         }
+        req.local = local;
         let resp = self.handle(&mut req, rest, peer, &mut stream, fd, stop);
         if let Some(resp) = resp {
             let _ = http::write_response(&mut stream, &resp);
@@ -841,9 +1253,25 @@ impl Lan {
                     "voice": self.ctx.shared.get().voice,
                     "phone_is_voice": self.ctx.hub.voice(),
                     "audio_route": device.audio_route,
+                    "features": FEATURES,
+                    "bonjour": self.network_now()["bonjour"],
                 }),
             ),
             ("GET", ["state"]) => Response::json(200, &self.state(&device)),
+            // Where the tower can be reached now: every address, the network, the MagicDNS name.
+            ("GET", ["network"]) => Response::json(200, &self.network_now()),
+            // The phone renames itself (as Settings > Phone and `tower phone rename` do).
+            ("PATCH", ["device"]) | ("PUT", ["device"]) => {
+                let name = req.json().unwrap_or_default()["name"].as_str().map(auth::clean_name).unwrap_or_default();
+                if name.is_empty() {
+                    return Some(Response::error(400, "bad_name", "send {\"name\": \"...\"}, not empty"));
+                }
+                match self.devices.update(|d| d.rename(&device.id, &name)) {
+                    Ok(true) => Response::json(200, &json!({ "device": { "id": device.id, "name": name } })),
+                    Ok(false) => Response::error(401, "unauthorized", "this device isn't paired any more"),
+                    Err(e) => Response::error(503, "save", &format!("{e:#}")),
+                }
+            }
             // Where this phone's replies are heard: `phone` (only there) or `mac`.
             ("GET", ["device", "audio"]) => Response::json(200, &json!({ "route": device.audio_route })),
             ("PUT", ["device", "audio"]) | ("POST", ["device", "audio"]) => {
@@ -938,7 +1366,7 @@ impl Lan {
                 };
                 let tab = q("tab").and_then(|t| t.parse::<usize>().ok()).unwrap_or(0);
                 let Some(t) = set.tabs.get(tab).cloned() else { return Some(Response::error(400, "bad_tab", "no such tab")) };
-                let heard = self.voice(req, false, &device);
+                let heard = self.voice(req, false, &device, None);
                 if heard.status != 200 {
                     return Some(heard);
                 }
@@ -948,8 +1376,15 @@ impl Lan {
                 Response::json(200, &json!({ "tab": tab, "heard": text, "choice": { "options": p.options, "other": p.other } }))
             }
             // The main chat thread, as the panel shows it: newest last, in pages.
+            // With `space`: the conversation with that space's own tower; with `main=1`:
+            // the main one without those; neither: every message, as before.
             ("GET", ["chat"]) => {
-                let all = crate::chat::thread_with(&crate::chat::load(), &crate::history::attachments_dir(), &self.ctx.prs.map());
+                let mut all = self.chat();
+                match (q("space").map(str::trim).filter(|s| !s.is_empty()), q("main") == Some("1")) {
+                    (Some(space), _) => all.retain(|m| crate::chat::in_conversation(m, Some(space))),
+                    (None, true) => all.retain(|m| crate::chat::in_conversation(m, None)),
+                    (None, false) => {}
+                }
                 let (messages, more) = crate::chat::page(&all, q("before"), limit(50).min(200));
                 Response::json(200, &json!({ "messages": messages, "more": more }))
             }
@@ -1016,7 +1451,7 @@ impl Lan {
             ("GET", ["jobs"]) => {
                 let want = q("status").unwrap_or("all");
                 let session = q("session");
-                let rows: Vec<Value> = crate::history::jobs(&crate::history::load())
+                let rows: Vec<Value> = crate::history::jobs(&self.entries())
                     .into_iter()
                     .filter(|j| match want {
                         "open" => j.open(),
@@ -1031,13 +1466,17 @@ impl Lan {
             }
             ("GET", ["history"]) => {
                 let (session, kind) = (q("session"), q("kind"));
+                // A space by its whole name, any case (the Record of one space).
+                let space = q("space").map(str::trim).filter(|s| !s.is_empty());
                 let before = q("before_ms").and_then(|b| b.parse::<u64>().ok()).unwrap_or(u64::MAX);
-                let mut list: Vec<_> = crate::history::load()
+                let mut list: Vec<_> = self
+                    .entries()
                     .into_iter()
                     .rev()
                     .filter(|e| e.at < before)
                     .filter(|e| session.is_none_or(|s| e.session.as_deref() == Some(s)))
                     .filter(|e| kind.is_none_or(|k| k.split(',').any(|k| k == e.kind)))
+                    .filter(|e| space.is_none_or(|s| e.space.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(s))))
                     .take(limit(100))
                     .collect();
                 list.reverse();
@@ -1073,7 +1512,7 @@ impl Lan {
             }
             ("GET", ["screenshots"]) => {
                 let session = q("session");
-                let entries = crate::history::load();
+                let entries = self.entries();
                 let rows: Vec<Value> = crate::screenshots::recent(&entries, usize::MAX)
                     .into_iter()
                     .filter(|e| session.is_none_or(|s| e.session.as_deref() == Some(s)))
@@ -1097,17 +1536,23 @@ impl Lan {
                 None => Response::error(404, "no_clip", "that clip is gone (they are kept for 15 minutes)"),
             },
             ("GET", ["events"]) => {
-                self.events(&device, q("voice") == Some("1"), stream, fd, stop);
+                self.events(&device, q("voice") == Some("1"), req.local, stream, fd, stop);
                 return None;
             }
             ("POST", ["ask"]) => {
-                let (text, files) = match ask_body(req) {
+                let (text, space, files) = match ask_body(req) {
                     Ok(x) => x,
                     Err(r) => return Some(r),
                 };
                 if text.is_empty() && files.is_empty() {
                     return Some(Response::error(400, "empty", "send {\"text\": \"...\"}, or multipart text and files"));
                 }
+                // Asked in a space's view: a space the tower knows, by its whole name (before any file is saved).
+                let space = match space.map(|want| self.space_named(&want)) {
+                    Some(Ok(name)) => Some(name),
+                    Some(Err(r)) => return Some(r),
+                    None => None,
+                };
                 let saved = match save_files(&files, &crate::history::attachments_dir(), now_ms()) {
                     Ok(p) => p,
                     Err(r) => return Some(r),
@@ -1115,9 +1560,13 @@ impl Lan {
                 let paths: Vec<String> = saved.iter().map(|f| f.path.clone()).collect();
                 let markers: Vec<String> = saved.iter().map(|f| f.marker.clone()).collect();
                 let text = with_markers(&text, &markers);
-                let mut resp = self.ask(&device, &crate::history::compose(&text, &paths));
+                let mut resp = self.ask(&device, &crate::history::compose(&text, &paths), space.as_deref());
                 if resp.status == 202 {
-                    resp = Response::json(202, &json!({ "sent": text, "attachments": paths }));
+                    let mut sent = json!({ "sent": text, "attachments": paths });
+                    if let Some(space) = &space {
+                        sent["space"] = json!(space);
+                    }
+                    resp = Response::json(202, &sent);
                 }
                 resp
             }
@@ -1138,7 +1587,7 @@ impl Lan {
                     .filter(|n| !n.is_empty())
                     .map(|n| format!(" {n}"))
                     .unwrap_or_default();
-                self.ask(&device, &format!("{verb} what {address} is asking for.{note}"))
+                self.ask(&device, &format!("{verb} what {address} is asking for.{note}"), None)
             }
             ("POST", ["focus"]) => {
                 let body = req.json().unwrap_or_default();
@@ -1166,6 +1615,13 @@ impl Lan {
                         if on {
                             self.ctx.hub.drop_clips();
                         }
+                        // The mute is the voice setting `off`: config.toml says what the mouth does.
+                        // (Tests never write the user's config.)
+                        if !cfg!(test)
+                            && let Err(e) = crate::tell::set_voice(self.ctx.mouth.voice())
+                        {
+                            eprintln!("[phone] keeping the voice setting in config.toml: {e:#}");
+                        }
                         Response::json(200, &json!({ "muted": on }))
                     }
                     Err(e) => Response::error(503, "save", &format!("{e:#}")),
@@ -1184,8 +1640,8 @@ impl Lan {
                 }
             }
             // Transcribe only: the text comes back, nothing goes to the tower.
-            ("POST", ["voice"]) => self.voice(req, q("send") != Some("0"), &device),
-            ("POST", ["transcribe"]) => self.voice(req, false, &device),
+            ("POST", ["voice"]) => self.voice(req, q("send") != Some("0"), &device, q("space")),
+            ("POST", ["transcribe"]) => self.voice(req, false, &device, None),
             ("DELETE", ["device"]) => {
                 if let Err(e) = self.devices.update(|d| d.revoke(&device.id)) {
                     return Some(Response::error(503, "save", &format!("{e:#}")));
@@ -1193,26 +1649,62 @@ impl Lan {
                 self.ctx.hub.drop_device(&device.id);
                 Response::json(200, &json!({ "revoked": device.id }))
             }
-            _ => Response::error(404, "not_found", &format!("no {m} {}", req.path)),
+            // The queue, the missions, their threads, launching, the tell level, the model.
+            _ => match self.quiet(req, device, &seg[1..]) {
+                Some(resp) => resp,
+                None => Response::error(404, "not_found", &format!("no {m} {}", req.path)),
+            },
         };
         Some(resp)
     }
 
+    /// `POST /v1/pair`: the code, the phone's name, and (a newer app) the
+    /// id of its install: the same install pairs again in place.
     fn pair_device(&self, req: &Request, peer: IpAddr) -> Response {
         let body = req.json().unwrap_or_default();
         let code = body["code"].as_str().unwrap_or("");
+        // Checked before the code is taken: a bad id doesn't use it up.
+        let install_id = match body.get("install_id") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) if auth::valid_install_id(id) => Some(id.clone()),
+            Some(_) => return Response::error(400, "bad_install_id", "install_id is 8 to 64 letters, digits, - and _"),
+        };
         let taken = self.pairing.lock().unwrap_or_else(|e| e.into_inner()).take(code, peer);
         match taken {
             Ok(()) => {
-                let (device, token) = match self.devices.update(|d| d.add(body["name"].as_str().unwrap_or("phone"), now_ms())) {
+                // Where it can reach the tower: every address listened on now (the answer lists them too).
+                let (fp, knows, net) = {
+                    let r = self.running.lock().unwrap_or_else(|e| e.into_inner());
+                    match r.as_ref() {
+                        Some(r) => (Some(r.fingerprint.clone()), r.listeners.iter().map(|l| self.known_of(l.kind, l.addr)).collect::<Vec<_>>(), self.network_value(r)),
+                        None => (None, vec![], json!({})),
+                    }
+                };
+                let now = now_ms();
+                let paired = self.devices.update(|d| {
+                    let (dev, token, again) = d.pair(body["name"].as_str(), install_id.as_deref(), now);
+                    for (range, name, host, port) in &knows {
+                        d.saw(&dev.id, range, name.as_deref(), host, *port, now);
+                    }
+                    (dev, token, again)
+                });
+                let (device, token, repaired) = match paired {
                     Ok(x) => x,
                     Err(e) => return Response::error(503, "save", &format!("{e:#}")),
                 };
-                eprintln!("[phone] paired {} ({}) from {peer}", device.name, device.id);
-                let fp = self.running.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|r| r.fingerprint.clone());
+                // Its old token's streams end (the token itself stopped with the new one).
+                if repaired {
+                    self.ctx.hub.drop_device(&device.id);
+                }
+                eprintln!("[phone] {} {} ({}) from {peer}", if repaired { "paired again" } else { "paired" }, device.name, device.id);
+                self.refresh();
                 Response::json(
                     200,
-                    &json!({ "token": token, "device": { "id": device.id, "name": device.name }, "fingerprint": fp, "api": API }),
+                    &json!({
+                        "token": token, "device": { "id": device.id, "name": device.name }, "fingerprint": fp, "api": API, "features": FEATURES,
+                        "repaired": repaired, "hosts": net["hosts"], "network": net["network"], "magic_dns": net["magic_dns"],
+                        "bonjour": net["bonjour"],
+                    }),
                 )
             }
             Err(PairError::NoCode) => {
@@ -1230,6 +1722,25 @@ impl Lan {
         }
     }
 
+    /// A stream came in on `local`: how (the LAN or the tailnet), and the
+    /// network that is, kept with the device; the hint looks again.
+    fn connected_on(&self, device: &auth::Device, sid: u64, local: SocketAddr) {
+        let found = {
+            let r = self.running.lock().unwrap_or_else(|e| e.into_inner());
+            r.as_ref().map(|r| {
+                let kind = kind_of(&r.listeners, local);
+                (kind, self.known_of(kind, local))
+            })
+        };
+        let Some((kind, (range, name, host, port))) = found else { return };
+        self.ctx.hub.set_via(sid, kind.word());
+        let now = now_ms();
+        if let Err(e) = self.devices.update(|d| d.saw(&device.id, &range, name.as_deref(), &host, port, now)) {
+            eprintln!("[phone] keeping where {} connected: {e:#}", device.name);
+        }
+        self.refresh();
+    }
+
     /// Remembers when a device was last heard from (written at most once a minute).
     fn seen(&self, device: &auth::Device) {
         let now = now_ms();
@@ -1244,18 +1755,42 @@ impl Lan {
         });
     }
 
-    fn ask(&self, device: &auth::Device, text: &str) -> Response {
-        crate::daemon::timing::start("asked");
+    /// Hands what the phone's user asked to the tower (`space`: asked in
+    /// that space's view, so its own tower gets it when it has one).
+    fn ask(&self, device: &auth::Device, text: &str, space: Option<&str>) -> Response {
+        let Some(tower) = self.tower() else { return starting() };
         let source = format!("phone:{}", device.id);
-        match super::stt::deliver_from(&self.ctx.shared, &self.ctx.mouth, text, self.ctx.ack, heard_on_phone(device), &source) {
+        match tower.ask(text, heard_on_phone(device), &source, space) {
             Ok(()) => Response::json(202, &json!({ "sent": text })),
             Err(e) => Response::error(503, "brain", &crate::brain::spoken_error(&format!("{e:#}"))),
         }
     }
 
+    /// The space a call names, as the tower knows it: its whole name, in
+    /// any case. A name no space has is a 404.
+    fn space_named(&self, want: &str) -> Result<String, Response> {
+        let Some(tower) = self.tower() else { return Err(starting()) };
+        let want = want.trim();
+        tower
+            .spaces()
+            .into_iter()
+            .find(|s| !want.is_empty() && s.trim().eq_ignore_ascii_case(want))
+            .ok_or_else(|| Response::error(404, "no_space", &format!("no space called {want:?}")))
+    }
+
     /// The state with what the brain is doing now (`work`, the panel's working line).
     fn state(&self, device: &auth::Device) -> Value {
         let mut s = self.ctx.shared.json();
+        // The big lists are too much to send with every change, and each has
+        // its own call and event: the decisions (`decisions_count` stays),
+        // the missions, the spaces' threads.
+        if let Some(o) = s.as_object_mut() {
+            o.remove("threads");
+            o.remove("missions");
+            o.remove("decisions");
+            // What the tower opened lately: each is a chat message and an `act` event.
+            o.remove("acts");
+        }
         s["work"] = work_value();
         s["audio_route"] = json!(device.audio_route);
         s
@@ -1291,39 +1826,15 @@ impl Lan {
         if answers.iter().any(|a| a.tab >= set.tabs.len()) {
             return Response::error(400, "bad_tab", "no such tab");
         }
-        // Files for tab N: every tab's checked before any is saved, then attached to that tab's typed answer.
-        let by_tab: Vec<(usize, Vec<multipart::Part>)> = answers
-            .iter()
-            .enumerate()
-            .map(|(i, a)| (i, files.iter().filter(|p| p.name == format!("tab{}", a.tab)).cloned().collect::<Vec<_>>()))
-            .filter(|(_, mine)| !mine.is_empty())
-            .collect();
-        for (_, mine) in &by_tab {
-            if let Err(r) = check_files(mine) {
-                return r;
-            }
-        }
-        for (i, mine) in by_tab {
-            match save_files(&mine, &crate::history::attachments_dir(), now_ms()) {
-                Ok(saved) => answers[i].attachments.extend(saved.into_iter().map(|s| s.path)),
-                Err(r) => return r,
-            }
+        if let Err(r) = attach_tab_files(&mut answers, &files) {
+            return r;
         }
         let submit = body["submit"].as_bool().unwrap_or(true);
         match self.ctx.asks.answer(id, &answers, submit) {
             Ok(set) => Response::json(200, &json!({ "ok": true, "id": set.id, "submitted": submit })),
             Err(e) => {
                 let msg = format!("{e:#}");
-                let code = if msg.starts_with("stopped at") {
-                    "stopped"
-                } else if msg.starts_with("already answered") {
-                    "answered"
-                } else if msg.contains("changed") {
-                    "changed"
-                } else {
-                    "cannot_answer"
-                };
-                Response::error(409, code, &msg)
+                Response::error(409, question_code(&msg), &msg)
             }
         }
     }
@@ -1347,8 +1858,16 @@ impl Lan {
 
     /// A recording from the phone: transcribed by the tower's Whisper, then
     /// handed to the brain like a press-to-talk take (`send`), or only
-    /// transcribed. Everything is checked before a file is saved.
-    fn voice(&self, req: &Request, send: bool, device: &auth::Device) -> Response {
+    /// transcribed. Everything is checked before a file is saved. `space`
+    /// (`?space=`): said in that space's view, so it goes to that space's
+    /// tower, as `/v1/ask` with `space` (a name no space has: `404 no_space`,
+    /// before anything is transcribed or saved).
+    fn voice(&self, req: &Request, send: bool, device: &auth::Device, space: Option<&str>) -> Response {
+        let space = match space.map(str::trim).filter(|s| send && !s.is_empty()).map(|want| self.space_named(want)) {
+            Some(Ok(name)) => Some(name),
+            Some(Err(r)) => return r,
+            None => None,
+        };
         // A WAV body, or multipart: the WAV as `audio`, files beside it.
         let (wav, files): (&[u8], Vec<multipart::Part>) = match req.header("content-type").and_then(multipart::boundary) {
             Some(b) => match multipart::parse(&req.body, &b) {
@@ -1392,12 +1911,19 @@ impl Lan {
             send,
             phone: heard_on_phone(device),
             device: device.id.clone(),
+            space: space.clone(),
         };
         if self.ctx.stt.send(Utterance { samples, source }).is_err() {
             return Response::error(503, "stt", "the transcriber isn't running");
         }
         match rx.recv_timeout(Duration::from_secs(90)) {
-            Ok(heard) if send => Response::json(200, &json!({ "heard": heard, "sent": true, "attachments": attachments })),
+            Ok(heard) if send => {
+                let mut v = json!({ "heard": heard, "sent": true, "attachments": attachments });
+                if let Some(space) = &space {
+                    v["space"] = json!(space);
+                }
+                Response::json(200, &v)
+            }
             Ok(heard) => Response::json(200, &json!({ "heard": heard, "sent": false })),
             // Nothing worth sending (silence, noise, a stop word).
             Err(_) => Response::json(200, &json!({ "heard": "", "sent": false })),
@@ -1407,11 +1933,15 @@ impl Lan {
     /// `GET /v1/events`: the panel's live feed, and with `voice=1` the tower's voice.
     /// It ends when the phone goes (a write fails, or what was sent isn't
     /// taken for `STREAM_STUCK`), the device is revoked, or the API is turned off.
-    fn events(&self, device: &auth::Device, voice: bool, w: &mut impl Write, fd: Option<RawFd>, stop: &AtomicBool) {
+    fn events(&self, device: &auth::Device, voice: bool, local: Option<SocketAddr>, w: &mut impl Write, fd: Option<RawFd>, stop: &AtomicBool) {
         if http::write_sse_head(w).is_err() {
             return;
         }
         let (sid, rx) = self.ctx.hub.subscribe(&device.id, voice, device.audio_route == "phone");
+        // The address it came in on: the phone knows the tower on that network.
+        if let Some(local) = local {
+            self.connected_on(device, sid, local);
+        }
         if voice {
             self.ctx.shared.update(|s| s.phone = Some(device.name.clone()));
         }
@@ -1423,14 +1953,27 @@ impl Lan {
         let state = self.state(device);
         let mut version = state["version"].as_u64().unwrap_or(0);
         let mut work = state["work"].clone();
-        let mut ok = send(w, "hello", &json!({ "api": API, "device": device.id, "voice": voice })) && send(w, "state", &state);
-        let history = crate::history::path();
-        let mut offset = std::fs::metadata(&history).map(|m| m.len()).unwrap_or(0);
+        // What the state says besides its counter: only a change there is a `state` event.
+        let mut said = stateless(&state);
+        // The queue and the missions as last sent: each has its own event, sent when it changes.
+        let (mut decisions, mut count, mut missions) = self.ctx.shared.with(|s| (s.decisions.clone(), s.decisions_count, s.missions.clone()));
+        let net = self.network_now();
+        let hello = json!({
+            "api": API, "device": device.id, "voice": voice, "features": FEATURES,
+            "hosts": net["hosts"], "network": net["network"], "magic_dns": net["magic_dns"], "bonjour": net["bonjour"],
+        });
+        let mut ok = send(w, "hello", &hello)
+            && send(w, "state", &state)
+            && send(w, "decisions", &decisions_event(&decisions, count))
+            && send(w, "missions", &missions);
+        let history = self.history.clone();
+        let mut tail = Tail::end(&history);
         // The chat's latest messages as last sent: a new or changed one is a `chat` event.
         let mut chat = ChatTail::default();
-        chat.diff(&crate::chat::thread_with(&crate::chat::load(), &crate::history::attachments_dir(), &self.ctx.prs.map()));
+        chat.diff(&self.chat());
         // A PR's chip changes without the history growing.
         let mut prs_version = self.ctx.prs.version();
+        let mut acts_sent = self.ctx.shared.with(|s| s.acts.clone());
         let (mut last_ping, mut last_check, mut last_history) = (Instant::now(), Instant::now(), Instant::now());
         let (mut drained, mut last_unsent) = (Instant::now(), Instant::now());
         while ok && !stop.load(Ordering::SeqCst) {
@@ -1445,23 +1988,45 @@ impl Lan {
             if ok && (v != version || now_work != work) {
                 version = v;
                 work = now_work;
-                ok = send(w, "state", &self.state(device));
+                let state = self.state(device);
+                let now = stateless(&state);
+                if now != said {
+                    said = now;
+                    ok = send(w, "state", &state);
+                }
+                let (d, c, m) = self.ctx.shared.with(|s| (s.decisions.clone(), s.decisions_count, s.missions.clone()));
+                if ok && (d != decisions || c != count) {
+                    (decisions, count) = (d, c);
+                    ok = send(w, "decisions", &decisions_event(&decisions, count));
+                }
+                if ok && m != missions {
+                    missions = m;
+                    ok = send(w, "missions", &missions);
+                }
             }
             if ok && last_history.elapsed() > Duration::from_secs(1) {
                 last_history = Instant::now();
-                let (entries, end) = new_history(&history, offset);
-                offset = end;
+                let (entries, end) = new_history(&history, tail);
+                tail = end;
                 let grew = !entries.is_empty();
-                for e in entries {
+                for (line, e) in entries {
                     if !ok {
                         break;
                     }
                     ok = send(w, "history", &e);
+                    // A message between sessions: its space's thread got it.
+                    if let Some(t) = thread_event(line, &e).filter(|_| ok) {
+                        ok = send(w, "thread", &t);
+                    }
                 }
                 let prs_changed = self.ctx.prs.version() != prs_version;
                 prs_version = self.ctx.prs.version();
-                if grew || prs_changed {
-                    for (op, m) in chat.diff(&crate::chat::thread_with(&crate::chat::load(), &crate::history::attachments_dir(), &self.ctx.prs.map())) {
+                // An act changes without the history growing too (its session was given more work).
+                let acts_now = self.ctx.shared.with(|s| s.acts.clone());
+                let acts_changed = acts_now != acts_sent;
+                acts_sent = acts_now;
+                if grew || prs_changed || acts_changed {
+                    for (op, m) in chat.diff(&self.chat()) {
                         if !ok {
                             break;
                         }
@@ -1485,10 +2050,10 @@ impl Lan {
                     Some(_) => {}
                 }
             }
-            // Revoked from the terminal meanwhile.
+            // Revoked from the terminal meanwhile, or paired again (its token replaced).
             if last_check.elapsed() > Duration::from_secs(5) {
                 last_check = Instant::now();
-                if !self.devices.load().devices.iter().any(|d| d.id == device.id) {
+                if !self.devices.load().devices.iter().any(|d| d.id == device.id && d.token_sha256 == device.token_sha256) {
                     break;
                 }
             }
@@ -1498,6 +2063,57 @@ impl Lan {
             self.ctx.shared.update(|s| s.phone = None);
         }
     }
+}
+
+/// The state without what moves with every change (`version`,
+/// `updated_ms`): two that are equal here say the same to a phone.
+fn stateless(state: &Value) -> Value {
+    let mut s = state.clone();
+    if let Some(o) = s.as_object_mut() {
+        o.remove("version");
+        o.remove("updated_ms");
+    }
+    s
+}
+
+/// The tower isn't whole yet (the daemon is starting): nothing can be asked of it.
+fn starting() -> Response {
+    Response::error(503, "starting", "the tower is still starting: try again in a moment")
+}
+
+/// Why a question set didn't take its answers, as a code: `stopped`
+/// (typing stopped half way), `answered` (answered meanwhile, in the
+/// session or from the tower), `changed` (the dialog asks something else
+/// now), else `cannot_answer`.
+fn question_code(msg: &str) -> &'static str {
+    if msg.starts_with("stopped at") {
+        "stopped"
+    } else if msg.starts_with("already answered") {
+        "answered"
+    } else if msg.contains("changed") {
+        "changed"
+    } else {
+        "cannot_answer"
+    }
+}
+
+/// Files for tab N's typed answer (parts named `tab<N>`): every tab's are
+/// checked before any is saved, then attached to that tab's answer.
+fn attach_tab_files(answers: &mut [crate::questions::Answer], files: &[multipart::Part]) -> Result<(), Response> {
+    let by_tab: Vec<(usize, Vec<multipart::Part>)> = answers
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (i, files.iter().filter(|p| p.name == format!("tab{}", a.tab)).cloned().collect::<Vec<_>>()))
+        .filter(|(_, mine)| !mine.is_empty())
+        .collect();
+    for (_, mine) in &by_tab {
+        check_files(mine)?;
+    }
+    for (i, mine) in by_tab {
+        let saved = save_files(&mine, &crate::history::attachments_dir(), now_ms())?;
+        answers[i].attachments.extend(saved.into_iter().map(|s| s.path));
+    }
+    Ok(())
 }
 
 /// The chat messages a stream has seen (the latest ones), to send only what is new or changed.
@@ -1534,7 +2150,7 @@ fn behavior_change(op: crate::behaviors::Op) -> Response {
     match crate::behaviors::apply(op, "user") {
         Ok((b, c)) => {
             let view = c.view();
-            let _ = crate::protocol::send(&crate::protocol::Request::BehaviorsChanged { by: "user".into(), change: view.clone() });
+            let _ = crate::protocol::send(&crate::protocol::Request::BehaviorsChanged { by: "user".into(), change: view.clone(), from: None });
             Response::json(if adding { 201 } else { 200 }, &json!({ "behavior": b, "change": view }))
         }
         Err(e) => {
@@ -1570,21 +2186,25 @@ fn is_file_part(p: &multipart::Part) -> bool {
     p.filename.is_some() || p.name.starts_with("image") || p.name.starts_with("file")
 }
 
-/// The text and files of `POST /v1/ask`: JSON `{"text"}`, or multipart with
-/// a `text` field and file parts.
-fn ask_body(req: &Request) -> Result<(String, Vec<multipart::Part<'_>>), Response> {
+/// What `POST /v1/ask` carries.
+type Asked<'a> = (String, Option<String>, Vec<multipart::Part<'a>>);
+
+/// The text, the space it was asked in (when one is named) and the files
+/// of `POST /v1/ask`: JSON `{"text", "space"}`, or multipart with a `text`
+/// field, a `space` field and file parts.
+fn ask_body(req: &Request) -> Result<Asked<'_>, Response> {
+    let named = |s: String| Some(s.trim().to_string()).filter(|s| !s.is_empty());
     match req.header("content-type").and_then(multipart::boundary) {
         Some(b) => {
             let parts = multipart::parse(&req.body, &b).map_err(|e| Response::error(400, "bad_multipart", &format!("{e:#}")))?;
-            let text = parts
-                .iter()
-                .find(|p| p.name == "text" && p.filename.is_none())
-                .map(|p| clean_text(&String::from_utf8_lossy(p.data)).trim().to_string());
-            Ok((text.unwrap_or_default(), parts.into_iter().filter(|p| p.name != "text" && is_file_part(p)).collect()))
+            let field = |name: &str| parts.iter().find(|p| p.name == name && p.filename.is_none()).map(|p| clean_text(&String::from_utf8_lossy(p.data)).trim().to_string());
+            let (text, space) = (field("text"), field("space").and_then(named));
+            Ok((text.unwrap_or_default(), space, parts.into_iter().filter(|p| !matches!(p.name.as_str(), "text" | "space") && is_file_part(p)).collect()))
         }
         None => {
             let body = req.json().map_err(|_| Response::error(400, "bad_json", "send {\"text\": \"...\"}"))?;
-            Ok((clean_text(body["text"].as_str().unwrap_or("")).trim().to_string(), vec![]))
+            let space = body["space"].as_str().map(clean_text).and_then(named);
+            Ok((clean_text(body["text"].as_str().unwrap_or("")).trim().to_string(), space, vec![]))
         }
     }
 }
@@ -1745,22 +2365,56 @@ pub fn attachment(root: &std::path::Path, folder: &str, name: &str) -> Response 
     }
 }
 
-/// History lines added since `offset` (whole lines only), and the new offset.
-fn new_history(path: &std::path::Path, offset: u64) -> (Vec<Value>, u64) {
-    use std::io::{Read, Seek, SeekFrom};
-    let Ok(mut f) = std::fs::File::open(path) else { return (vec![], offset) };
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    if len < offset {
-        return (vec![], len);
+/// Where a stream is in the history: the bytes it has read, and how many
+/// lines they were (a line's number is its entry's id, `h<line>`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Tail {
+    offset: u64,
+    lines: usize,
+}
+
+impl Tail {
+    /// The end of the history as it is now.
+    fn end(path: &std::path::Path) -> Tail {
+        let bytes = std::fs::read(path).unwrap_or_default();
+        let end = bytes.iter().rposition(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0);
+        Tail { offset: end as u64, lines: bytes[..end].iter().filter(|b| **b == b'\n').count() }
     }
-    if len == offset || f.seek(SeekFrom::Start(offset)).is_err() {
-        return (vec![], offset);
+}
+
+/// History lines added since `tail` (whole lines only), each with its line
+/// number, and where the stream is then.
+fn new_history(path: &std::path::Path, tail: Tail) -> (Vec<(usize, Value)>, Tail) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else { return (vec![], tail) };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    // Shorter than it was (compacted): from its end as it is now.
+    if len < tail.offset {
+        return (vec![], Tail::end(path));
+    }
+    if len == tail.offset || f.seek(SeekFrom::Start(tail.offset)).is_err() {
+        return (vec![], tail);
     }
     let mut buf = Vec::new();
     let _ = f.take(4 * 1024 * 1024).read_to_end(&mut buf);
-    let Some(last_nl) = buf.iter().rposition(|b| *b == b'\n') else { return (vec![], offset) };
+    let Some(last_nl) = buf.iter().rposition(|b| *b == b'\n') else { return (vec![], tail) };
     let text = String::from_utf8_lossy(&buf[..=last_nl]);
-    (text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect(), offset + last_nl as u64 + 1)
+    let read = text.lines().count();
+    let entries = text.lines().enumerate().filter_map(|(i, l)| serde_json::from_str(l).ok().map(|v| (tail.lines + i + 1, v))).collect();
+    (entries, Tail { offset: tail.offset + last_nl as u64 + 1, lines: tail.lines + read })
+}
+
+/// A message between sessions as the `thread` event carries it: its space,
+/// and the message as `GET /v1/thread` lists it.
+fn thread_event(line: usize, entry: &Value) -> Option<Value> {
+    let e: crate::history::Entry = serde_json::from_value(entry.clone()).ok().filter(|e: &crate::history::Entry| e.kind == "peer")?;
+    Some(json!({ "space": e.space, "message": crate::peers::message(line, &e) }))
+}
+
+/// The `decisions` event: every open decision in queue order, each saying
+/// whether its space is muted, and how many are in the main queue.
+fn decisions_event(list: &[Value], count: usize) -> Value {
+    json!({ "count": count, "decisions": list })
 }
 
 /// `t3`, `vps/t3`, a name: letters, digits, `-`, `_`, one `/`, starting
@@ -1789,7 +2443,7 @@ mod tests {
         for ip in ["8.8.8.8", "172.32.0.1", "100.128.0.1", "2001:db8::1"] {
             assert!(!is_private(ip.parse().unwrap()), "{ip}");
         }
-        let cfg = |bind: &str, allow_public| crate::config::Lan { enabled: true, port: 7843, bind: bind.into(), allow_public, tailscale: "off".into() };
+        let cfg = |bind: &str, allow_public| crate::config::Lan { enabled: true, port: 7843, bind: bind.into(), allow_public, tailscale: "off".into(), ..Default::default() };
         assert!(choose_ip(&cfg("8.8.8.8", false)).is_err(), "a public address needs allow_public");
         assert!(choose_ip(&cfg("0.0.0.0", false)).is_err(), "every interface needs allow_public");
         assert!(choose_ip(&cfg("nonsense", false)).is_err());
@@ -1798,7 +2452,7 @@ mod tests {
 
     /// A phone that pins the tower's certificate by its fingerprint, as the app does.
     #[derive(Debug)]
-    struct Pin(String);
+    pub(super) struct Pin(String);
 
     impl rustls::client::danger::ServerCertVerifier for Pin {
         fn verify_server_cert(
@@ -1837,7 +2491,7 @@ mod tests {
     }
 
     /// One HTTPS call: (status, JSON body), or Err when TLS refused.
-    fn call(addr: SocketAddr, pin: &str, method: &str, path: &str, token: Option<&str>, body: &str) -> Result<(u16, Value)> {
+    pub(super) fn call(addr: SocketAddr, pin: &str, method: &str, path: &str, token: Option<&str>, body: &str) -> Result<(u16, Value)> {
         use std::io::Read;
         let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()?
@@ -1864,8 +2518,26 @@ mod tests {
         Ok((status, serde_json::from_str(body).unwrap_or(Value::Null)))
     }
 
+    /// An open connection to the tower, pinned, with `head` sent (an event stream).
+    pub(super) fn open(addr: SocketAddr, pin: &str, head: &str) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Pin(pin.to_string())))
+            .with_no_client_auth();
+        let conn =
+            rustls::ClientConnection::new(Arc::new(cfg), rustls::pki_types::ServerName::try_from("herder-tower").unwrap().to_owned()).unwrap();
+        let tcp = TcpStream::connect(addr).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut s = rustls::StreamOwned::new(conn, tcp);
+        s.write_all(head.as_bytes()).unwrap();
+        s.flush().unwrap();
+        s
+    }
+
     /// One HTTPS call with a binary body and a content type.
-    fn call_raw(addr: SocketAddr, pin: &str, method: &str, path: &str, token: &str, ctype: &str, body: &[u8]) -> Result<(u16, Value)> {
+    pub(super) fn call_raw(addr: SocketAddr, pin: &str, method: &str, path: &str, token: &str, ctype: &str, body: &[u8]) -> Result<(u16, Value)> {
         use std::io::Read;
         let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()?
@@ -1898,9 +2570,9 @@ mod tests {
         let (stt, _rx) = std::sync::mpsc::channel();
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
-        let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs: test_prs() };
+        let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs: test_prs() };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
-        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into() }).unwrap();
+        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into(), ..Default::default() }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
 
         // Nothing without a token.
@@ -2003,9 +2675,9 @@ mod tests {
         let (stt, _rx) = std::sync::mpsc::channel();
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
-        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub: hub.clone(), ack: None, stt, asks, prs: test_prs() };
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub: hub.clone(), stt, asks, prs: test_prs() };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
-        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into() }).unwrap();
+        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into(), ..Default::default() }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
         let code = lan.pair().unwrap()["code"].as_str().unwrap().to_string();
         let token =
@@ -2163,8 +2835,8 @@ mod tests {
     #[test]
     fn reads_ask_bodies_both_ways() {
         let json_req = Request { body: br#"{"text":" hi "}"#.to_vec(), ..Default::default() };
-        let (t, imgs) = ask_body(&json_req).ok().unwrap();
-        assert_eq!((t.as_str(), imgs.len()), ("hi", 0));
+        let (t, space, imgs) = ask_body(&json_req).ok().unwrap();
+        assert_eq!((t.as_str(), space, imgs.len()), ("hi", None, 0));
         let body = multipart::build(
             "BB",
             &[("text", "what's this?")],
@@ -2172,10 +2844,20 @@ mod tests {
         );
         let mut req = Request { body, ..Default::default() };
         req.headers.insert("content-type".into(), "multipart/form-data; boundary=BB".into());
-        let (t, files) = ask_body(&req).ok().unwrap();
-        assert_eq!((t.as_str(), files.len()), ("what's this?", 2));
+        let (t, space, files) = ask_body(&req).ok().unwrap();
+        assert_eq!((t.as_str(), space, files.len()), ("what's this?", None, 2));
         let bad = Request { body: b"nope".to_vec(), ..Default::default() };
         assert_eq!(ask_body(&bad).err().unwrap().status, 400);
+        // Asked in a space's view: the space comes with it, both ways; an empty one is none.
+        let there = Request { body: br#"{"text":"what's left?","space":" B2C support\u001b "}"#.to_vec(), ..Default::default() };
+        assert_eq!(ask_body(&there).ok().unwrap().1.as_deref(), Some("B2C support"));
+        let nowhere = Request { body: br#"{"text":"what's left?","space":"  "}"#.to_vec(), ..Default::default() };
+        assert_eq!(ask_body(&nowhere).ok().unwrap().1, None);
+        let body = multipart::build("BB", &[("text", "and this?"), ("space", "B2C support")], &[("image", "a.png", "image/png", b"\x89PNG\r\n\x1a\n")]);
+        let mut req = Request { body, ..Default::default() };
+        req.headers.insert("content-type".into(), "multipart/form-data; boundary=BB".into());
+        let (t, space, files) = ask_body(&req).ok().unwrap();
+        assert_eq!((t.as_str(), space.as_deref(), files.len()), ("and this?", Some("B2C support"), 1), "the space is a field, never a file");
     }
 
     #[test]
@@ -2204,15 +2886,26 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("history.jsonl");
         std::fs::write(&p, "{\"kind\":\"a\"}\n").unwrap();
-        let (_, off) = new_history(&p, 0);
+        let (first, off) = new_history(&p, Tail::default());
+        assert_eq!((first.len(), first[0].0, off), (1, 1, Tail::end(&p)));
         let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
-        f.write_all(b"{\"kind\":\"b\"}\n{\"kind\":\"c\"").unwrap();
+        f.write_all(b"not json\n{\"kind\":\"b\"}\n{\"kind\":\"c\"").unwrap();
         let (e, off2) = new_history(&p, off);
         assert_eq!(e.len(), 1, "the half-written line waits");
-        assert_eq!(e[0]["kind"], "b");
+        assert_eq!((e[0].0, &e[0].1["kind"]), (3, &json!("b")), "a line that doesn't read keeps its number");
+        assert_eq!(Tail::end(&p), off2, "a stream that starts now starts after the last whole line");
         f.write_all(b"}\n").unwrap();
-        let (e, _) = new_history(&p, off2);
-        assert_eq!(e[0]["kind"], "c");
+        let (e, off3) = new_history(&p, off2);
+        assert_eq!((e[0].0, &e[0].1["kind"]), (4, &json!("c")));
+        // Compacted (shorter than it was): from its end as it is now, nothing sent twice.
+        std::fs::write(&p, "{\"kind\":\"c\"}\n").unwrap();
+        let (e, off4) = new_history(&p, off3);
+        assert_eq!((e.len(), off4), (0, Tail { offset: 13, lines: 1 }));
+        // A message between sessions is a `thread` event too; nothing else is.
+        let peer = json!({ "at": 5, "kind": "peer", "session": "t6", "name": "api", "from": "t5", "from_name": "web", "space": "Shop", "text": "which port?", "status": "delivered", "record": true });
+        let ev = thread_event(7, &peer).unwrap();
+        assert_eq!((ev["space"].as_str(), ev["message"]["id"].as_str(), ev["message"]["from_name"].as_str(), ev["message"]["delivered"].as_bool()), (Some("Shop"), Some("h7"), Some("web"), Some(true)));
+        assert!(thread_event(8, &json!({ "at": 6, "kind": "note", "text": "x" })).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2244,6 +2937,11 @@ mod tests {
         assert_eq!(body_limit(&req("POST", mp), &["v1", "voice"]), http::MAX_BODY);
         assert_eq!(body_limit(&req("POST", mp), &["v1", "ask"]), http::MAX_BODY);
         assert_eq!(body_limit(&req("POST", mp), &["v1", "questions", "q1", "answer"]), http::MAX_BODY);
+        // A decision's answer and its spoken answer take what a question's do.
+        assert_eq!(body_limit(&req("POST", mp), &["v1", "decisions", "d0123456789ab", "answer"]), http::MAX_BODY);
+        assert_eq!(body_limit(&req("POST", None), &["v1", "decisions", "d0123456789ab", "answer"]), http::MAX_JSON_BODY);
+        assert_eq!(body_limit(&req("POST", Some("audio/wav")), &["v1", "decisions", "d0123456789ab", "voice"]), http::MAX_VOICE_BODY);
+        assert_eq!(body_limit(&req("POST", mp), &["v1", "launch"]), http::MAX_JSON_BODY);
         assert_eq!(body_limit(&req("POST", None), &["v1", "ask"]), http::MAX_JSON_BODY);
         assert_eq!(body_limit(&req("PUT", mp), &["v1", "behaviors", "b1"]), http::MAX_JSON_BODY);
     }
@@ -2317,7 +3015,7 @@ mod tests {
     }
 
     /// A PR store of its own for a test (no gh: nothing is looked up).
-    fn test_prs() -> crate::prs::Prs {
+    pub(super) fn test_prs() -> crate::prs::Prs {
         let dir = std::env::temp_dir().join(format!("tower-lan-prs-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
         crate::prs::Prs::at(dir.join("prs.json"), std::path::PathBuf::from("/nonexistent/gh"))
     }
@@ -2336,9 +3034,9 @@ mod tests {
         std::mem::forget(rx);
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
-        let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs };
+        let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
-        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into() }).unwrap();
+        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into(), ..Default::default() }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
         (lan, dir, addr, fp)
     }
@@ -2355,7 +3053,7 @@ mod tests {
     }
 
     fn lan_cfg(bind: &str, tailscale: &str) -> crate::config::Lan {
-        crate::config::Lan { enabled: true, port: 7843, bind: bind.into(), allow_public: false, tailscale: tailscale.into() }
+        crate::config::Lan { enabled: true, port: 7843, bind: bind.into(), allow_public: false, tailscale: tailscale.into(), ..Default::default() }
     }
 
     #[test]
@@ -2432,7 +3130,7 @@ mod tests {
         std::mem::forget(rx);
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
-        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs: test_prs() };
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs: test_prs() };
         // "Running", with an address no interface here has (as just after Tailscale stops).
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan")).with_detect(|| ts(true, "100.100.100.100"));
         let addr = lan.start(&crate::config::Lan { port: 0, ..lan_cfg("127.0.0.1", "auto") }).unwrap();
@@ -2467,7 +3165,7 @@ mod tests {
         std::mem::forget(rx);
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
-        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs: test_prs() };
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs: test_prs() };
         let now = Arc::new(Mutex::new(ts(false, "100.100.100.100")));
         let seen = now.clone();
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan")).with_detect(move || seen.lock().unwrap().clone());
@@ -2496,6 +3194,180 @@ mod tests {
         lan.recheck_tailscale(&stop);
         assert_eq!(lan.info()["tailscale"]["error"], Value::Null, "the old watcher's look isn't this API's");
         assert_eq!(lan.info()["url"], format!("https://{addr2}"));
+        lan.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_lan_listener_follows_this_macs_network_from_home_to_the_office() {
+        let dir = std::env::temp_dir().join(format!("tower-lan-follow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hub = Arc::new(Hub::default());
+        let (stt, rx) = std::sync::mpsc::channel();
+        std::mem::forget(rx);
+        let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
+        let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
+        let phone_hub = hub.clone();
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs: test_prs() };
+        // "Home" and "the office": two addresses this Mac can listen on in a test.
+        let home: IpAddr = "127.0.0.1".parse().unwrap();
+        let office: IpAddr = "::1".parse().unwrap();
+        let now = Arc::new(Mutex::new(Some(home)));
+        let seen = now.clone();
+        let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan")).with_lan_detect(move || *seen.lock().unwrap());
+        let addr = lan.start(&crate::config::Lan { port: 0, ..lan_cfg("auto", "off") }).unwrap();
+        assert_eq!(addr.ip(), home);
+        let stop = lan.running.lock().unwrap().as_ref().unwrap().stop.clone();
+        let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
+        // Nothing changed: nothing moves.
+        lan.recheck_lan(&stop);
+        assert_eq!(lan.info()["url"], format!("https://{addr}"));
+        // Wi-Fi off: no address now, and the only listener stays (it answers again when the network is back).
+        *now.lock().unwrap() = None;
+        lan.recheck_lan(&stop);
+        assert_eq!(call(addr, &fp, "GET", "/v1/hello", None, "").unwrap().0, 401);
+        // A phone connected through the move.
+        let (phone, events) = phone_hub.subscribe("d_phone", false, false);
+        // At the office: it listens there on the same port, the pairing offers that address, and the old one is let go.
+        *now.lock().unwrap() = Some(office);
+        lan.recheck_lan(&stop);
+        let told: Vec<Value> = events.try_iter().filter(|o| o.event == "hosts").map(|o| o.data).collect();
+        assert_eq!(told.len(), 1, "the open stream is told once: {told:?}");
+        assert_eq!(told[0]["hosts"], json!([{"kind": "lan", "host": "::1", "port": addr.port()}]), "with the office address");
+        lan.recheck_lan(&stop);
+        assert!(events.try_iter().all(|o| o.event != "hosts"), "and not again while nothing changes");
+        phone_hub.unsubscribe(phone);
+        let moved = SocketAddr::new(office, addr.port());
+        assert_eq!(lan.info()["url"], format!("https://{moved}"));
+        assert_eq!(shared.get().lan_hosts, vec![json!({"kind": "lan", "host": "::1", "port": addr.port()})]);
+        assert_eq!(call(moved, &fp, "GET", "/v1/hello", None, "").unwrap().0, 401, "answers at the new address, same certificate");
+        assert!(call(addr, &fp, "GET", "/v1/hello", None, "").is_err(), "the home address is let go");
+        // An address set by hand is never moved.
+        lan.stop();
+        let fixed = lan.start(&crate::config::Lan { port: 0, ..lan_cfg("127.0.0.1", "off") }).unwrap();
+        let stop = lan.running.lock().unwrap().as_ref().unwrap().stop.clone();
+        lan.recheck_lan(&stop);
+        assert_eq!(lan.info()["url"], format!("https://{fixed}"));
+        lan.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Bonjour that only notes what it is asked (`+Desk Mac on en0 for 127.0.0.1:port`,
+    /// `-Desk Mac`), on a Mac whose addresses are on `en0` while `wifi` is on.
+    /// At `taken`, another Mac has the name: mDNSResponder registers "<name> (2)".
+    fn fake_bonjour(
+        log: &Arc<Mutex<Vec<String>>>,
+        wifi: &Arc<AtomicBool>,
+        refuse: &Arc<AtomicBool>,
+        taken: Option<IpAddr>,
+    ) -> (
+        impl Fn(&bonjour::Ad) -> Result<bonjour::Advert> + Send + Sync + use<>,
+        impl Fn(IpAddr) -> Option<bonjour::Interface> + Send + Sync + use<>,
+    ) {
+        let (log, wifi, refuse) = (log.clone(), wifi.clone(), refuse.clone());
+        let advertise = move |ad: &bonjour::Ad| {
+            if refuse.load(Ordering::SeqCst) {
+                bail!("mDNSResponder isn't running");
+            }
+            ad.txt()?;
+            log.lock().unwrap().push(format!("+{} on {} for {}", ad.name, ad.interface.name, SocketAddr::new(ad.ip, ad.port)));
+            let name = if Some(ad.ip) == taken { format!("{} (2)", ad.name) } else { ad.name.clone() };
+            let (log, gone) = (log.clone(), name.clone());
+            Ok(bonjour::Advert::fake(&name, move || log.lock().unwrap().push(format!("-{gone}"))))
+        };
+        let interface = move |_: IpAddr| wifi.load(Ordering::SeqCst).then(|| bonjour::Interface { name: "en0".into(), index: 4 });
+        (advertise, interface)
+    }
+
+    #[test]
+    fn bonjour_follows_the_lan_listener_from_home_to_the_office() {
+        let dir = std::env::temp_dir().join(format!("tower-lan-bonjour-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hub = Arc::new(Hub::default());
+        let (stt, rx) = std::sync::mpsc::channel();
+        std::mem::forget(rx);
+        let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
+        let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
+        let phone_hub = hub.clone();
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs: test_prs() };
+        // "Home" and "the office", both over this Mac's Wi-Fi (en0).
+        let (home, office): (IpAddr, IpAddr) = ("127.0.0.1".parse().unwrap(), "::1".parse().unwrap());
+        let now = Arc::new(Mutex::new(Some(home)));
+        let seen = now.clone();
+        let (log, wifi, refuse) = (Arc::new(Mutex::new(vec![])), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
+        let (advertise, interface) = fake_bonjour(&log, &wifi, &refuse, Some(office));
+        let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"))
+            .with_lan_detect(move || *seen.lock().unwrap())
+            .with_advertiser(advertise, interface);
+        let cfg = crate::config::Lan { port: 0, bonjour_name: "Desk Mac".into(), ..lan_cfg("auto", "off") };
+        let addr = lan.start(&cfg).unwrap();
+        let port = addr.port();
+        let stop = lan.running.lock().unwrap().as_ref().unwrap().stop.clone();
+        let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
+        let said = |n: &str| json!({"type": "_herdr-tower._tcp", "name": n, "fp": fp});
+        let took = || std::mem::take(&mut *log.lock().unwrap());
+        // On as the listener starts: on the interface that holds its address, at its port.
+        assert_eq!(took(), [format!("+Desk Mac on en0 for 127.0.0.1:{port}")]);
+        assert_eq!(lan.info()["bonjour"], said("Desk Mac"));
+        assert_eq!(lan.network_now()["bonjour"], said("Desk Mac"));
+        // Nothing changed: it stays as it is (not withdrawn and made again every 20 s).
+        lan.recheck_lan(&stop);
+        lan.recheck_bonjour(&stop);
+        assert_eq!(took(), Vec::<String>::new());
+        // Wi-Fi off: the address is on no interface, so the advert is withdrawn (the listener stays).
+        *now.lock().unwrap() = None;
+        wifi.store(false, Ordering::SeqCst);
+        lan.recheck_lan(&stop);
+        lan.recheck_bonjour(&stop);
+        assert_eq!(took(), ["-Desk Mac"]);
+        assert_eq!(lan.info()["bonjour"], Value::Null);
+        // Back on the same network: advertised again.
+        *now.lock().unwrap() = Some(home);
+        wifi.store(true, Ordering::SeqCst);
+        lan.recheck_lan(&stop);
+        lan.recheck_bonjour(&stop);
+        assert_eq!(took(), [format!("+Desk Mac on en0 for 127.0.0.1:{port}")]);
+        // At the office, with a phone connected: withdrawn at home, then advertised there, and the
+        // phone told the name it is found by (another Mac at the office has "Desk Mac").
+        let (phone, events) = phone_hub.subscribe("d_phone", false, false);
+        *now.lock().unwrap() = Some(office);
+        lan.recheck_lan(&stop);
+        assert_eq!(took(), ["-Desk Mac".to_string(), format!("+Desk Mac on en0 for [::1]:{port}")], "the old one first");
+        let told: Vec<Value> = events.try_iter().filter(|o| o.event == "hosts").map(|o| o.data).collect();
+        assert_eq!(told.len(), 1, "told once: {told:?}");
+        assert_eq!(told[0]["bonjour"], said("Desk Mac (2)"));
+        lan.recheck_bonjour(&stop);
+        assert_eq!(took(), Vec::<String>::new());
+        phone_hub.unsubscribe(phone);
+        // mDNSResponder refuses: not advertised, said once, and tried again on the next beat.
+        wifi.store(false, Ordering::SeqCst);
+        lan.recheck_bonjour(&stop);
+        refuse.store(true, Ordering::SeqCst);
+        wifi.store(true, Ordering::SeqCst);
+        lan.recheck_bonjour(&stop);
+        lan.recheck_bonjour(&stop);
+        assert_eq!(took(), ["-Desk Mac (2)"]);
+        assert_eq!(lan.info()["bonjour"], Value::Null);
+        refuse.store(false, Ordering::SeqCst);
+        lan.recheck_bonjour(&stop);
+        assert_eq!(took(), [format!("+Desk Mac on en0 for [::1]:{port}")]);
+        // Stopped: withdrawn.
+        lan.stop();
+        assert_eq!(took(), ["-Desk Mac (2)"]);
+        assert_eq!(lan.network_now()["bonjour"], Value::Null);
+        // An address set by hand is advertised on its interface too, and never moved.
+        let fixed = lan.start(&crate::config::Lan { bind: "127.0.0.1".into(), ..cfg.clone() }).unwrap();
+        let stop = lan.running.lock().unwrap().as_ref().unwrap().stop.clone();
+        lan.recheck_lan(&stop);
+        lan.recheck_bonjour(&stop);
+        assert_eq!(took(), [format!("+Desk Mac on en0 for {fixed}")]);
+        lan.stop();
+        took();
+        // `[lan] bonjour = false`: never advertised.
+        lan.start(&crate::config::Lan { bonjour: false, ..cfg.clone() }).unwrap();
+        let stop = lan.running.lock().unwrap().as_ref().unwrap().stop.clone();
+        lan.recheck_bonjour(&stop);
+        assert_eq!((took(), &lan.info()["bonjour"]), (vec![], &Value::Null));
         lan.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2560,7 +3432,7 @@ mod tests {
         std::mem::forget(rx);
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
-        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs: test_prs() };
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs: test_prs() };
         // 127.0.0.1 is the tailnet here; the LAN is ::1.
         let now = Arc::new(Mutex::new(ts(false, "127.0.0.1")));
         let seen = now.clone();
@@ -2744,6 +3616,169 @@ mod tests {
             }
         }
         assert!(t.elapsed() < Duration::from_secs(3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reads a stream until `want` has come (or fails the test).
+    fn read_until(s: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>, seen: &mut String, want: &str) {
+        use std::io::Read;
+        let mut buf = [0u8; 4096];
+        while !seen.contains(want) {
+            let n = s.read(&mut buf).unwrap_or_else(|e| panic!("waiting for {want:?}: {e}; got {seen}"));
+            assert!(n > 0, "stream ended before {want:?}: {seen}");
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    }
+
+    /// The data of the last `event: <name>` a stream sent.
+    fn last_event(seen: &str, name: &str) -> Value {
+        let at = seen.rfind(&format!("event: {name}\n")).unwrap_or_else(|| panic!("no {name} event in {seen}"));
+        let line = seen[at..].lines().find(|l| l.starts_with("data: ")).unwrap();
+        serde_json::from_str(&line["data: ".len()..]).unwrap()
+    }
+
+    #[test]
+    fn the_same_phone_pairs_again_in_place() {
+        let (lan, dir, addr, fp) = test_lan("repair");
+        lan.set_names(&[("127.0.0", "Desk")]);
+        let pair = |body: &str| {
+            let code = lan.pair().unwrap()["code"].as_str().unwrap().to_string();
+            call(addr, &fp, "POST", "/v1/pair", None, &body.replace("CODE", &code)).unwrap()
+        };
+        // A bad install id is refused before the code is used: the right call still pairs with it.
+        let code = lan.pair().unwrap()["code"].as_str().unwrap().to_string();
+        let (st, v) = call(addr, &fp, "POST", "/v1/pair", None, &format!(r#"{{"code":"{code}","install_id":"no"}}"#)).unwrap();
+        assert_eq!((st, v["error"]["code"].as_str()), (400, Some("bad_install_id")));
+        let (st, v) = call(addr, &fp, "POST", "/v1/pair", None, &format!(r#"{{"code":"{code}","name":"OnePlus","install_id":"app-1234-abcd"}}"#)).unwrap();
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["repaired"], false);
+        let (id, old) = (v["device"]["id"].as_str().unwrap().to_string(), v["token"].as_str().unwrap().to_string());
+        // The answer says where the tower is, as the stream does.
+        assert_eq!(v["hosts"], json!([{"kind": "lan", "host": "127.0.0.1", "port": addr.port()}]));
+        assert_eq!(v["network"], json!({"range": "127.0.0", "name": "Desk", "lan": {"host": "127.0.0.1", "port": addr.port()}}));
+        assert!(v["features"].as_array().unwrap().contains(&json!("pairing")));
+        assert_eq!(call(addr, &fp, "PUT", "/v1/device/audio", Some(&old), r#"{"route":"mac"}"#).unwrap().0, 200);
+        // Its stream, on the old token.
+        let mut stream = open(addr, &fp, &format!("GET /v1/events HTTP/1.1\r\nAuthorization: Bearer {old}\r\n\r\n"));
+        let mut seen = String::new();
+        read_until(&mut stream, &mut seen, "event: state");
+
+        // Paired again, by the same install: the same device, a new token, the old one refused at once.
+        let (st, v) = pair(r#"{"code":"CODE","name":"OnePlus 12","install_id":"app-1234-abcd"}"#);
+        assert_eq!((st, v["repaired"].as_bool(), v["device"]["id"].as_str()), (200, Some(true), Some(id.as_str())), "{v}");
+        assert_eq!(v["device"]["name"], "OnePlus 12");
+        let new = v["token"].as_str().unwrap().to_string();
+        assert_eq!(call(addr, &fp, "GET", "/v1/hello", Some(&old), "").unwrap().0, 401, "the old token stops at once");
+        let (st, v) = call(addr, &fp, "GET", "/v1/hello", Some(&new), "").unwrap();
+        assert_eq!((st, v["device"]["id"].as_str(), v["audio_route"].as_str()), (200, Some(id.as_str()), Some("mac")), "the same device, its route kept");
+        let d = lan.devices.load();
+        assert_eq!(d.devices.len(), 1, "no second entry");
+        assert_eq!(d.devices[0].networks.len(), 1);
+        assert_eq!((d.devices[0].networks[0].range.as_str(), d.devices[0].networks[0].name.as_deref()), ("127.0.0", Some("Desk")), "the network it was paired on");
+        // The old token's stream ends.
+        let t = Instant::now();
+        let mut buf = [0u8; 4096];
+        loop {
+            use std::io::Read;
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => assert!(t.elapsed() < Duration::from_secs(8), "the old token's stream goes on"),
+            }
+        }
+        // Another install: another device. No install id (an older app): another one too, as before.
+        assert_eq!(pair(r#"{"code":"CODE","name":"Pixel","install_id":"app-9999-zzzz"}"#).1["repaired"], false);
+        assert_eq!(pair(r#"{"code":"CODE","name":"Old app"}"#).1["repaired"], false);
+        assert_eq!(lan.devices.load().devices.len(), 3);
+        // The phone renames itself.
+        let (st, v) = call(addr, &fp, "PATCH", "/v1/device", Some(&new), r#"{"name":"Work phone"}"#).unwrap();
+        assert_eq!((st, v["device"]["name"].as_str()), (200, Some("Work phone")));
+        assert_eq!(call(addr, &fp, "PATCH", "/v1/device", Some(&new), r#"{"name":"  "}"#).unwrap().0, 400);
+        assert_eq!(lan.info()["devices"][0]["name"], "Work phone");
+        lan.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_phone_learns_where_the_tower_moved_while_it_is_connected() {
+        let dir = std::env::temp_dir().join(format!("tower-lan-hosts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hub = Arc::new(Hub::default());
+        let (stt, rx) = std::sync::mpsc::channel();
+        std::mem::forget(rx);
+        let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
+        let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs: test_prs() };
+        let (home, office): (IpAddr, IpAddr) = ("127.0.0.1".parse().unwrap(), "::1".parse().unwrap());
+        let now = Arc::new(Mutex::new(Some(home)));
+        let seen_ip = now.clone();
+        let (log, wifi, refuse) = (Arc::new(Mutex::new(vec![])), Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
+        let (advertise, interface) = fake_bonjour(&log, &wifi, &refuse, None);
+        let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"))
+            .with_lan_detect(move || *seen_ip.lock().unwrap())
+            .with_advertiser(advertise, interface);
+        let addr = lan.start(&crate::config::Lan { port: 0, bonjour_name: "Desk Mac".into(), ..lan_cfg("auto", "off") }).unwrap();
+        let stop = lan.running.lock().unwrap().as_ref().unwrap().stop.clone();
+        let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
+        let bonjour = json!({"type": "_herdr-tower._tcp", "name": "Desk Mac", "fp": fp});
+        lan.set_names(&[("127.0.0", "Home")]);
+        assert_eq!(shared.get().network, Some(json!({"range": "127.0.0", "name": "Home", "lan": {"host": "127.0.0.1", "port": addr.port()}})));
+        let code = lan.pair().unwrap()["code"].as_str().unwrap().to_string();
+        let paired = call(addr, &fp, "POST", "/v1/pair", None, &format!(r#"{{"code":"{code}","name":"OnePlus"}}"#)).unwrap().1;
+        assert_eq!(paired["bonjour"], bonjour, "how to find the tower by name, from the moment it pairs");
+        let token = paired["token"].as_str().unwrap().to_string();
+        let first = lan.devices.load().devices[0].networks[0].last_ms;
+
+        // The stream's hello says where the tower is, and connecting is kept as a network the phone knows.
+        let mut s = open(addr, &fp, &format!("GET /v1/events HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"));
+        let mut seen = String::new();
+        read_until(&mut s, &mut seen, "event: state");
+        let hello = last_event(&seen, "hello");
+        assert_eq!(hello["hosts"], json!([{"kind": "lan", "host": "127.0.0.1", "port": addr.port()}]));
+        assert_eq!(hello["network"]["name"], "Home");
+        assert_eq!(hello["magic_dns"], Value::Null);
+        assert_eq!(hello["bonjour"], bonjour);
+        let d = &lan.devices.load().devices[0];
+        assert_eq!((d.networks.len(), d.networks[0].host.as_str()), (1, "127.0.0.1"));
+        assert!(d.networks[0].last_ms >= first);
+        assert_eq!(lan.info()["connected"], json!([{"device": d.id, "via": "lan"}]));
+        assert_eq!(lan.info()["devices"][0]["reach"], "here");
+        assert_eq!(shared.get().phone_hint, None, "the phone knows this network");
+        // GET /v1/network: the same, any time.
+        let (st, v) = call(addr, &fp, "GET", "/v1/network", Some(&token), "").unwrap();
+        assert_eq!((st, &v["hosts"], &v["network"], &v["bonjour"]), (200, &hello["hosts"], &hello["network"], &bonjour));
+        assert_eq!(call(addr, &fp, "GET", "/v1/hello", Some(&token), "").unwrap().1["bonjour"], bonjour);
+
+        // The Mac moves to the office: the open stream gets the new address before the phone needs it.
+        *now.lock().unwrap() = Some(office);
+        lan.recheck_lan(&stop);
+        read_until(&mut s, &mut seen, "event: hosts");
+        let moved = SocketAddr::new(office, addr.port());
+        let ev = last_event(&seen, "hosts");
+        assert_eq!(ev["hosts"], json!([{"kind": "lan", "host": "::1", "port": addr.port()}]));
+        assert_eq!(ev["network"], json!({"range": "::1", "name": null, "lan": {"host": "::1", "port": addr.port()}}));
+        assert_eq!(ev["bonjour"], bonjour, "advertised at the office now, by the same name");
+        let advertised = [format!("+Desk Mac on en0 for {addr}"), "-Desk Mac".into(), format!("+Desk Mac on en0 for {moved}")];
+        assert_eq!(*log.lock().unwrap(), advertised);
+        // The phone in use knows only home, and Tailscale isn't running: the windows say so, once.
+        assert_eq!(shared.get().phone_hint.as_deref(), Some(network::HINT));
+        assert_eq!(lan.info()["devices"][0]["reach"], "elsewhere");
+        // Named: the streams hear it too.
+        lan.set_names(&[("127.0.0", "Home"), ("::1", "Office")]);
+        read_until(&mut s, &mut seen, "\"name\":\"Office\"");
+        assert_eq!(last_event(&seen, "hosts")["network"]["name"], "Office");
+        assert_eq!(call(moved, &fp, "GET", "/v1/network", Some(&token), "").unwrap().1["network"]["name"], "Office");
+        // It connects at the office: the hint goes, and the office is one of its networks.
+        drop(s);
+        let mut s2 = open(moved, &fp, &format!("GET /v1/events HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"));
+        let mut seen2 = String::new();
+        read_until(&mut s2, &mut seen2, "event: state");
+        assert_eq!(shared.get().phone_hint, None);
+        let ranges: Vec<String> = lan.devices.load().devices[0].networks.iter().map(|k| k.range.clone()).collect();
+        assert_eq!(ranges, vec!["127.0.0".to_string(), "::1".to_string()]);
+        assert_eq!(network::knows_line(&lan.devices.load().devices[0].networks), "Office and Home");
+        drop(s2);
+        lan.stop();
+        assert_eq!((shared.get().network, shared.get().phone_hint), (None, None));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

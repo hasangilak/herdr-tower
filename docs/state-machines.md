@@ -118,6 +118,15 @@ missed event is caught by the sequence gap, which triggers a resync. All of
 this exists already; the enum only makes the comparisons
 (`was == "working" && status != "working"`) typed.
 
+**A resync reads rows.** `hc ls` gives one row per terminal, which says less
+than an event: its status is a word (not `{app, state}`), and it has no
+labels, no pids and no dates. So a row is only compared with what the radar
+knows (`row_news`: status, turn, liveness); a terminal that moved, or that the
+radar doesn't know, is read whole (`hc get`) and observed as after an event.
+`Seen::of` builds a terminal's facts from either shape and keeps what a look
+can't say (its app, space, account, name, when it was made) as it was known,
+so a resync never blanks the agents in `state.json`.
+
 ---
 
 ## 2. Question sets (fix first)
@@ -261,7 +270,8 @@ pub enum DeliveryState { Sent, Taken, Finished }   // Delivered{taken, finished}
 
 **Stale and external cases are handled:**
 - Unreachable machines keep waiting; the brain hears after 10 min.
-- A session in `error` keeps its instructions, and the brain hears it once (`stuck`).
+- A session in `error` keeps its instructions, and the brain hears it once (`stuck`); a Claude Code or Codex session in `error` sits at its prompt and takes them at once (`Session::ready`).
+- A message from another session to a Claude Code session working longer than `[queue] busy_deliver_minutes` is typed in while it works (claimed with the turn count that turn ends on, so a restart never types it twice), one at a time (`Book::busy_pick`).
 - A retry within 10 min is the same item.
 - A session gone or replaced parks its items.
 
@@ -364,6 +374,8 @@ broke today. Steps 3–5 are independent of each other.
 | Queued instruction | `sendq.rs`: `Item::state() -> ItemState`, `Item::apply(ItemEv)`, `ParkWhy`, `Delivered::state/take/finish` | `queue.json` as before; new optional `parked_ms`, `expired` |
 | Job | `history.rs`: `JobState`, `JobState::next(&JobEv)`, `follow`/`job_follow` | `history.jsonl` as before (job words) |
 | Session status | `hc.rs`: `SessionStatus`, `status`, `status_live`, `block_kind` | its word everywhere (`watches.json`, `sessions.json`, `questions.json`, the state's agents) |
+| Decision | `decisions.rs`: `Book` (`sync_questions`, `sync_merges`, `raise`, `failed`, `session_gone`, `space_over`, `answered`, `dismiss`), `State` | `decisions.json` (new): the open ones, the last 50 closed, `settled_prs` |
+| Mission (a space) | `missions.rs`: `State` (open, quiet, ready, closed), `step` (one look at every space: its sessions, requests and decisions in, `Effect`s out), `close` | `spaces.json`: `missions`, by space name |
 
 Where it differs from the design above:
 
@@ -380,6 +392,15 @@ Where it differs from the design above:
   answer to a *replaced* card follows it to the screen and goes in when its
   tabs didn't change; a late answer to a *dismissed* dialog still up goes in.
   After a restart only the sets that closed at the restore are remembered.
+- **Answered in the terminal** is `Closed{Unblocked}` (the radar saw the
+  session go on) or `Closed{AnsweredElsewhere}` (an answer found the dialog
+  gone), and it is acted on: the set's decision closes in the same step
+  (`Book::answered_in_terminal`), the record gets its line once what was
+  chosen is known, a screen read before it can't bring the card back, and
+  the driver's keys stop once the set is closed (`Guarded`). A dialog still
+  up that the tower can't read any more is `Closed{Unread}`: not answered
+  (its decision `stopped`). docs/quiet-tower.md, "Answered in the
+  session's own terminal".
 - **Restart**: a restored set the brain never decided gets its 40 s wait
   again; one decided `auto` but not typed goes to the user (the tower doesn't
   type after a restart without a fresh look); one being typed comes back
@@ -413,7 +434,11 @@ follow-up adds an id to the same task). `dispatch`, `queue` (`add`,
 the instruction; what goes out while the user's request is under half an
 hour old joins its agenda, more for a session whose task waits on a
 question is that task again, and work the brain starts on its own gets an
-agenda with `origin: tower`.
+agenda with `origin: tower`. What the user types in a session's own
+terminal (its prompt hook, and nothing the tower typed: `daemon::typed`)
+is an agenda with `origin: terminal` (`Ledger::typed`): one task, running
+from the start, with no queue id; more typed there while it is unfinished
+is a follow-up of it, and nothing the tower hands that session joins it.
 
 ```rust
 pub enum TaskState { Queued, Running, Blocked, DoneClaimed, Verified, Failed, Stalled, Abandoned }
@@ -432,7 +457,16 @@ pub enum AgendaState { Open, Done, Closed, Abandoned }
 | any but verified, abandoned | it says it couldn't, StopFailure, `tower job failed`, `tower agenda fail` | failed |
 | any open | parked / expired in the queue, the session exited, vanished or is another terminal, error, never took it after a re-send, no progress 25 min, an id the queue has no trace of | stalled |
 | any | `tower agenda requeue`, the reconciler's re-send, a follow-up, a parked id retargeted | queued |
+| failed, never retried (`retries` 0), at `tower tell decisions|results`, unless `[agenda] retry_failed = false` | the daemon sends it once more by itself | queued (`retries` 1) |
+| failed after a retry | it becomes a `failed` decision for the user (`raised`), once | failed |
 | any but verified | the queue id cancelled, `tower agenda abandon`, `close --force` | abandoned |
+| done-claimed, of an agenda of origin `terminal` | (the user saw its turn end there) | verified |
+| any, of origin `terminal` | more typed in its terminal while it is unfinished | running |
+
+An agenda of origin `terminal` is never news for a brain (`Ledger::news`
+skips it), is never sent again or made a decision when it fails
+(`failures`), owes no receipt, and doesn't count as work asked of its
+session (`at_work_on`, the idle check).
 
 Refused moves are values (`Refused::Same`, `Settled`, `NotNow`): once a
 task is failed, verified or abandoned, what its session does next is the
@@ -460,3 +494,27 @@ temporary file, then a rename); an unreadable file is kept aside. At start
 the reconciler waits for the radar's and the queue's own reconcile, then
 looks at every open task again: what ended or finished while the voice was
 down moves then.
+
+## 6. Missions: a space with an end (`src/missions.rs`, `src/daemon/missions.rs`)
+
+One state per space, moved by `missions::step` every 20 seconds (and at
+once when a session starts, stops or ends), from what the daemon sees: the
+space's live agent sessions, its requests (agendas) and its open
+decisions. Kept in `spaces.json` (`missions`). docs/quiet-tower.md, step 5
+and 8, has the commands and the JSON.
+
+| From | Event | To |
+|---|---|---|
+| (none) | a session is seen in the space, a goal is set, `tower launch` | open |
+| open, ready | no live session (and it was seen with one, or is older than 10 min) | quiet: held news read, its decisions close but its merges |
+| quiet | a live session there | open |
+| quiet | 24 h without one | quiet, archived: out of the listings, its merges close |
+| open | a goal, not standing, a finished request, none unfinished, no open decision | ready: the brain is asked for a closing report (once) |
+| ready | a new request, a new decision, `standing on`, the goal cleared | open (its report dropped) |
+| ready | every session idle or done for `[spaces] auto_close_hours`; or quiet for a day after being ready | closed (as below, without `--force`) |
+| any | `tower space close` (refused while a session works or is blocked, unless `--force`) | closed, archived: sessions ended, clean worktrees removed, the report in the record |
+| closed | `tower space goal` with a goal, a session opened there by the tower | open (it starts over) |
+
+- Closed stays closed whatever is seen there.
+- A standing space never becomes ready and is never closed by the tower.
+- When Herdr can't be asked about its sessions, nothing moves that round.

@@ -51,7 +51,14 @@ A screen it can't read gives no question set: the user answers as before,
 through the tower ("approve it", "say no").
 
 Every change of herdr-core's status line (a new tab, a new question) reads
-the screen again; the set's `id` (a hash of the session, kind, title, detail
+the screen again, and so does the user answering the dialog in the terminal
+tab by tab (which changes nothing in herdr-core's status): while a dialog of
+several questions is open, its screen is looked at again about every 1.5
+seconds, and read again whole when it shows another tab or other tabs
+answered (`Asks::follow`, `questions::dialog_moved`). `current_tab` and each
+tab's `answered` (and `answer`: the review tab lists the answers given, a
+multi-choice tab shows its ticks) follow the dialog, and so do the cards on
+the Mac and the phone, and the decision's title; the set's `id` (a hash of the session, kind, title, detail
 and questions: another command or plan is another set) stays the same while
 the questions do, so recommendations stay with it. When the session stops
 being blocked, its set closes, and the same dialog asked again later (the
@@ -71,7 +78,9 @@ the session still shows it.
   "tabs": [
     {"title": "Database", "question": "Which database should the app use?",
      "options": [{"label": "Postgres", "description": "…", "key": "1"}, …],
-     "multi": false, "allows_other": true, "answered": false},
+     "multi": false, "allows_other": true,
+     "answered": false,             // ticked in the dialog's tab bar (answered there)
+     "answer": "SQLite"},           // what it was answered with, when the screen shows it (left out otherwise)
     …
   ],
   "current_tab": 0,                // tabs.len(): the review tab
@@ -114,6 +123,16 @@ turn count; a dialog on the way doesn't count). It is typed only while the
 session is idle or done (read again just before; `hc send --if idle` when
 idle), never into a dialog.
 
+When the user replies in the session's own terminal instead (its
+`UserPromptSubmit` hook brings the words, and the tower didn't type them),
+the set closes as answered with those words, and a reply the tower held for
+it is dropped, never typed (the record says "Not sent: you answered it in
+the terminal"). A question at the end of a turn the user typed there goes
+to them as it is: escalated at once (`reason`: "asked at the end of a turn
+you typed in its terminal"), with no `[question-text]` note to the brain,
+and not said. docs/quiet-tower.md, "Answered in the session's own
+terminal", has the whole of it.
+
 ## Waiting for you
 
 A turn can also end handing something to the user without asking a
@@ -137,6 +156,24 @@ It needs the user as a blocked session does:
   out of focus, as "In <space>: …". When the brain watches that session, the
   watch's report says it instead (`[watch] … It is waiting for the user to
   act: "…"`), marked blocked, and the job is blocked rather than done.
+  (At the quiet levels of `tower tell` the tower says it itself either way,
+  once per decision: see "Decisions" below.)
+
+Idle is not blocked: a turn that ends saying only that the session is
+ready ("I'm waiting for your instructions", "I have no task yet":
+`questions::ready_only`), from a session nothing was asked of (no
+instruction queued for it, no agenda task it is on, or one that itself told
+it to wait for instructions), makes no card, no alert and no decision.
+
+## Decisions
+
+A set that is the user's (`decision: escalate`, a wait card too) is a
+**decision** (`src/decisions.rs`, docs/quiet-tower.md step 3): one per
+space and what is asked. The same thing asked by another session of the
+space joins that decision (`waiting` counts them) instead of making a
+second one; each session keeps its own set here. The decision's options are
+the recommendations (the first is the pick), and `tower answer <decision
+id> --choice <n>` answers every set in it. It closes with its sets.
 
 ## Recommendations
 
@@ -241,8 +278,22 @@ key:
 5. Menus (permission, plan, Codex): the option's number, and Enter if the
    number only moved the cursor; done when the prompt is gone.
 
+What was answered in the dialog already stands: answers for tabs it shows
+answered are left out, and the keys start from the tab it is on. When every
+answer given was for such a tab, nothing is typed and the answer says so
+("Nothing was typed: … answered in its terminal already"); with every tab
+answered there, `"answers": []` with `submit` only submits. The tower never
+answers a dialog itself (`auto`) once the user is in it (a tab answered
+there, or the dialog on another tab than it opened on): it becomes the
+user's card, without a word.
+
 On any surprise it stops and says where (`status: failed`, `error`), and
-the user can finish in the terminal. Text is typed with `hc send` without
+the user can finish in the terminal. When they do (or answer it there in
+the first place), the radar sees the session go on: the set closes, its
+decision closes as answered, the record says "Answered in <space ›
+session>: <what the screen shows was chosen>", and no key the tower was
+about to press goes in (the driver's keys stop once the set is closed).
+Text is typed with `hc send` without
 the tower's terminal identity, so it goes in as it is (from a terminal hc
 would wrap it in a note saying who sent it), with `--` before the terminal
 and the text (a reply like "- yes" isn't a flag), and without control
@@ -268,7 +319,9 @@ itself).
 ## Notices
 
 Questions go through the brain: the user hears only escalated ones, in one
-sentence with the tower's pick. Other blocked sessions (and dialogs the tower
+sentence with the tower's pick, once per decision: at `tower tell
+decisions|results` the same thing asked by another session of the space
+says nothing (at `everything` each set is said, as before). Other blocked sessions (and dialogs the tower
 can't read) get the notice from herdr-core's status line, in a sentence: "The orb session asks: Which
 database should the app use?", "… asks to run touch /tmp/x", "… has a plan
 ready for you to approve", "… asks to edit login.rs"; just "… needs you"

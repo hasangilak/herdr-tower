@@ -9,7 +9,10 @@
 //! - else, or with `isolate` (work beside another task in the same
 //!   project), a new named session in that folder (with `isolate`, in a git
 //!   worktree of its own, so two sessions never edit one checkout), started
-//!   now, or once what it waits for is done;
+//!   now, or once what it waits for is done. A new session for a space that
+//!   isn't standing works in that space's worktree of the project
+//!   (`tower start` makes it: see `worktrees`), and a session already there
+//!   counts as the one in the project's folder;
 //! - `after`: the other tasks (by their ids in the plan) that must be done
 //!   first. The send queue holds it until they are.
 //!
@@ -122,12 +125,13 @@ pub fn run(json_text: &str, dry_run: bool) -> Result<()> {
             project: t.project.clone(),
             space: t.space.clone(),
             skip: false,
+            from: None,
         };
         let (line, id, task) = match &routes[&t.id] {
             Route::Queue { session } => queue(session, &t.instruction, &after, tag)?,
             Route::Start { name, cwd, worktree } => {
                 let cwd = if *worktree { make_worktree(cwd, name)? } else { cwd.clone() };
-                start(t, name, &cwd, &after, tag)?
+                start(t, name, &cwd, *worktree, &after, tag)?
             }
         };
         ids.insert(t.id.clone(), id);
@@ -242,7 +246,21 @@ pub fn route(plan: &Plan, order: &[usize], live: &[Live]) -> Result<BTreeMap<Str
             "working" => 1,
             _ => 2,
         };
-        let here = live.iter().filter(|l| same_folder(&l.cwd, &cwd)).min_by_key(|l| rank(l));
+        // A session in one of the tower's worktrees of the project
+        // (`worktrees`) is in the project too: any of them when the task
+        // names no space, its space's own when it does. A task for a space
+        // goes to that space's worktree before the project's own checkout.
+        let slug = t.space.as_deref().map(crate::worktrees::slug);
+        let in_worktree = |l: &Live| {
+            crate::worktrees::repo_of(Path::new(&l.cwd)).is_some_and(|(repo, top)| {
+                same_folder(&repo.to_string_lossy(), &cwd)
+                    && slug.as_ref().is_none_or(|s| top.parent().and_then(|p| p.file_name()).is_some_and(|d| d.to_string_lossy() == s.as_str()))
+            })
+        };
+        let here = live
+            .iter()
+            .filter(|l| same_folder(&l.cwd, &cwd) || in_worktree(l))
+            .min_by_key(|l| (in_worktree(l) != slug.is_some(), rank(l)));
         match here {
             Some(l) if !t.isolate => {
                 out.insert(t.id.clone(), Route::Queue { session: l.address.clone() });
@@ -275,6 +293,7 @@ fn queue(session: &str, text: &str, after: &[u64], tag: crate::agenda::Tag) -> R
         after: after.to_vec(),
         start: vec![],
         tag: Some(tag),
+        from: None,
     })?;
     if !r.ok {
         bail!("queueing for {session}: {}", r.error.unwrap_or_default());
@@ -292,8 +311,12 @@ fn queue(session: &str, text: &str, after: &[u64], tag: crate::agenda::Tag) -> R
     Ok((line, id, v["task"].clone()))
 }
 
-fn start(t: &Task, name: &str, cwd: &str, after: &[u64], tag: crate::agenda::Tag) -> Result<(String, u64, Value)> {
+fn start(t: &Task, name: &str, cwd: &str, own_worktree: bool, after: &[u64], tag: crate::agenda::Tag) -> Result<(String, u64, Value)> {
     let mut args: Vec<String> = vec!["--name".into(), name.into(), "--cwd".into(), cwd.into()];
+    // It has a worktree of its own already: not the space's as well.
+    if own_worktree {
+        args.push("--no-worktree".into());
+    }
     for (flag, v) in [("--space", &t.space), ("--account", &t.account), ("--on", &t.on)] {
         if let Some(v) = v {
             args.extend([flag.to_string(), v.clone()]);
@@ -316,6 +339,7 @@ fn start(t: &Task, name: &str, cwd: &str, after: &[u64], tag: crate::agenda::Tag
             after: after.to_vec(),
             start: held,
             tag: Some(tag),
+            from: None,
         })?;
         if !r.ok {
             bail!("queueing the start of {name}: {}", r.error.unwrap_or_default());
@@ -353,6 +377,7 @@ fn start(t: &Task, name: &str, cwd: &str, after: &[u64], tag: crate::agenda::Tag
                 after: vec![],
                 start: vec![],
                 tag: Some(tag),
+                from: None,
             })?;
             let s = r.state.unwrap_or_default();
             (s["id"].as_u64().unwrap_or(0), s["task"].clone())
@@ -369,13 +394,8 @@ fn make_worktree(project: &str, name: &str) -> Result<String> {
     if Path::new(&dir).exists() {
         return Ok(dir);
     }
-    let branch = format!("tower/{name}");
-    let mut cmd = Command::new("git");
-    cmd.args(["-C", project, "worktree", "add", "-b", &branch, &dir]);
-    let out = hc::output_within(cmd, "git worktree add", Duration::from_secs(60))?;
-    if out.code != 0 {
-        bail!("git worktree add in {project}: {}", out.stderr.trim());
-    }
+    let place = crate::worktrees::Place { repo: project.to_string(), path: dir.clone(), branch: format!("tower/{name}") };
+    crate::worktrees::add(Path::new(project), &place)?;
     Ok(dir)
 }
 
@@ -413,7 +433,8 @@ pub fn live_sessions() -> Vec<Live> {
         .unwrap_or_default()
         .iter()
         .filter(|t| t["state"].as_str().is_none_or(|s| s == "live") && hc::status_word(t).is_some())
-        .filter(|t| hc::name(t) != Some(crate::brain::NAME))
+        // (A brain, the main one or a space's own, takes no task.)
+        .filter(|t| crate::brain::brain_of(t).is_none())
         .map(|t| Live {
             address: t["address"].as_str().unwrap_or("").to_string(),
             name: hc::name(t).unwrap_or("").to_string(),
@@ -519,6 +540,34 @@ mod tests {
         assert!(matches!(&r["c"], Route::Start { name, worktree: true, .. } if name == "api-rewrite-auth"));
         let missing = Plan { request: String::new(), agenda: None, tasks: vec![task("a", "/no/such/folder", &[])] };
         assert!(route(&missing, &[0], &live).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_session_in_a_spaces_worktree_is_in_its_project() {
+        let base = std::env::temp_dir().join(format!("tower-dispatch-wt-{}", std::process::id()));
+        let api = base.join("api");
+        let (shop, docs) = (base.join(".tower-worktrees/shop/api"), base.join(".tower-worktrees/docs/api"));
+        for d in [&api, &shop, &docs] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let s = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let l = |address: &str, cwd: &std::path::Path, status: &str| Live { address: address.into(), name: address.into(), cwd: s(cwd), status: status.into() };
+        let live = vec![l("t1", &api, "working"), l("t2", &shop, "working"), l("t3", &docs, "idle")];
+        let plan = |space: Option<&str>| {
+            let mut t = task("a", &s(&api), &[]);
+            t.space = space.map(String::from);
+            Plan { request: String::new(), agenda: None, tasks: vec![t] }
+        };
+        // A task for a space goes to that space's session, though another is free.
+        assert_eq!(route(&plan(Some("Shop")), &[0], &live).unwrap()["a"], Route::Queue { session: "t2".into() });
+        assert_eq!(route(&plan(Some("docs")), &[0], &live).unwrap()["a"], Route::Queue { session: "t3".into() });
+        // No space named: the project's own checkout first, then a worktree of it.
+        assert_eq!(route(&plan(None), &[0], &live).unwrap()["a"], Route::Queue { session: "t1".into() });
+        assert_eq!(route(&plan(None), &[0], &live[1..]).unwrap()["a"], Route::Queue { session: "t3".into() }, "the free one of the two worktrees");
+        // A space with no session in the project yet: the project's own session if there is one, else a new one.
+        assert_eq!(route(&plan(Some("Billing")), &[0], &live).unwrap()["a"], Route::Queue { session: "t1".into() });
+        assert!(matches!(route(&plan(Some("Billing")), &[0], &live[1..]).unwrap()["a"], Route::Start { worktree: false, .. }));
         let _ = std::fs::remove_dir_all(&base);
     }
 

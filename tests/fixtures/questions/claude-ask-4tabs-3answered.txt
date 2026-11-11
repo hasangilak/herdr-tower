@@ -1,0 +1,118 @@
+
+ ▐▛███▛█   Claude Code v2.1.319
+▝▜██████▀  Haiku 5.5 · Claude Ultra
+ ▝▝   ▝▝   ~/Work/herder-tower-cca
+
+
+❯ Use the AskUserQuestion tool right now, once, with four questions in one call: Database, Features, Deploy and Region. Do nothing else before asking.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Database  ☒ Features  ☒ Deploy  ☐ Region  ✔ Submit  →
+
+Which region should it run in?
+
+❯ 1. Frankfurt (eu-central)
+     Close to most of the users.
+  2. Virginia (us-east)
+     The default region.
+  3. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── qfix-ask ─

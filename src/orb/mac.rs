@@ -53,6 +53,13 @@ impl Win {
         Rect { x: f.origin.x, y: f.origin.y, w: f.size.width, h: f.size.height }
     }
 
+    /// Ordered in (on a screen or not).
+    pub fn is_visible(self) -> bool {
+        // SAFETY: -isVisible on a live NSWindow.
+        let v: cocoa::base::BOOL = unsafe { msg_send![self.0, isVisible] };
+        v != NO
+    }
+
     pub fn set_origin(self, x: f64, y: f64) {
         // SAFETY: -setFrameOrigin: on a live NSWindow, on the main thread.
         unsafe {
@@ -89,11 +96,38 @@ impl Win {
         }
     }
 
+    /// Its edges resize it. A window with no title bar isn't resizable
+    /// otherwise; its buttons stay hidden (the title bar is invisible).
+    pub fn resizable(self) {
+        // NSWindowStyleMaskResizable.
+        const RESIZABLE: u64 = 1 << 3;
+        // SAFETY: as above; `standardWindowButton:` answers nil for a button the window lacks.
+        unsafe {
+            let mask: u64 = msg_send![self.0, styleMask];
+            let _: () = msg_send![self.0, setStyleMask: mask | RESIZABLE];
+            // Close, minimise, zoom.
+            for kind in 0u64..3 {
+                let button: id = msg_send![self.0, standardWindowButton: kind];
+                if button != nil {
+                    let _: () = msg_send![button, setHidden: YES];
+                }
+            }
+        }
+    }
+
     /// On screen and taking the keyboard (a panel does without activating the app).
     pub fn make_key(self) {
         // SAFETY: as above.
         unsafe {
             let _: () = msg_send![self.0, makeKeyAndOrderFront: nil];
+        }
+    }
+
+    /// Out of sight, kept as it is (`make_key` or `order_front` brings it back).
+    pub fn order_out(self) {
+        // SAFETY: as above.
+        unsafe {
+            let _: () = msg_send![self.0, orderOut: nil];
         }
     }
 
@@ -116,6 +150,11 @@ pub struct Rect {
 impl Rect {
     pub fn contains(&self, x: f64, y: f64) -> bool {
         x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
+    }
+
+    /// The same, `by` points larger on every side.
+    pub fn grown(&self, by: f64) -> Rect {
+        Rect { x: self.x - by, y: self.y - by, w: self.w + 2.0 * by, h: self.h + 2.0 * by }
     }
 }
 
