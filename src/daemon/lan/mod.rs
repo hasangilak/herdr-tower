@@ -3052,6 +3052,7 @@ mod tests {
         std::mem::forget(rx);
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
+        let phone_hub = hub.clone();
         let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs: test_prs() };
         // "Home" and "the office": two addresses this Mac can listen on in a test.
         let home: IpAddr = "127.0.0.1".parse().unwrap();
@@ -3070,9 +3071,17 @@ mod tests {
         *now.lock().unwrap() = None;
         lan.recheck_lan(&stop);
         assert_eq!(call(addr, &fp, "GET", "/v1/hello", None, "").unwrap().0, 401);
+        // A phone connected through the move.
+        let (phone, events) = phone_hub.subscribe("d_phone", false, false);
         // At the office: it listens there on the same port, the pairing offers that address, and the old one is let go.
         *now.lock().unwrap() = Some(office);
         lan.recheck_lan(&stop);
+        let told: Vec<Value> = events.try_iter().filter(|o| o.event == "hosts").map(|o| o.data).collect();
+        assert_eq!(told.len(), 1, "the open stream is told once: {told:?}");
+        assert_eq!(told[0]["hosts"], json!([{"kind": "lan", "host": "::1", "port": addr.port()}]), "with the office address");
+        lan.recheck_lan(&stop);
+        assert!(events.try_iter().all(|o| o.event != "hosts"), "and not again while nothing changes");
+        phone_hub.unsubscribe(phone);
         let moved = SocketAddr::new(office, addr.port());
         assert_eq!(lan.info()["url"], format!("https://{moved}"));
         assert_eq!(shared.get().lan_hosts, vec![json!({"kind": "lan", "host": "::1", "port": addr.port()})]);
