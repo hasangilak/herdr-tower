@@ -77,6 +77,11 @@ pub(super) struct FullUi {
     /// drawn, and again until this moment (the cards above it grow as what
     /// they show arrives).
     pub to_phone: Option<std::time::Instant>,
+    /// The thread's messages shown whole (by `space::thread_key`), the
+    /// spaces whose earlier messages show too, and the one just copied.
+    pub thread_open: HashSet<String>,
+    pub thread_earlier: HashSet<String>,
+    pub copied: Option<String>,
     /// Kept while the window is: its size and spot are saved as the user resizes it.
     pub _resizing: Option<gpui::Subscription>,
 }
@@ -99,6 +104,9 @@ impl FullUi {
             settings_scroll: scroll.clone(),
             phone_anchor: gpui::ScrollAnchor::for_handle(scroll),
             to_phone: None,
+            thread_open: HashSet::new(),
+            thread_earlier: HashSet::new(),
+            copied: None,
             _resizing: Some(cx.observe_window_bounds(window, |this, window, _| this.resized(window))),
         }
     }

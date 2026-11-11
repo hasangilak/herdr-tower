@@ -1340,7 +1340,11 @@ where the full window is, `panel/` the views).
   - All spaces: the queue and the missions list.
   - A space: its goal and done-when, Follow and Mute, its closing report,
     what needs you there, its requests, its sessions (with worktree and
-    port), the thread between its sessions, and an input that goes to that
+    port), the thread between its sessions (the latest five, "N earlier"
+    for the rest the state holds: each with who wrote to whom and when,
+    its colour by sender, its first four lines, and the whole of it with
+    Copy on a click or "Show all"; the "From t7r (…)." it opens with is
+    left out, the row names the sender), and an input that goes to that
     space's tower. Its head says "its own tower" when it has one that runs
     (`missions[].tower`; "is starting", "waits on its own screen" when so).
   - New space: goal, setup, what the tower will do, Launch.

@@ -405,49 +405,222 @@ impl Panel {
             items.push(bay("Sessions", vec![v_flex().gap(px(2.0)).children(rows).into_any_element()]));
         }
 
-        // What its sessions wrote to each other: the latest of it.
+        // What its sessions wrote to each other: the latest of it, each message whole a click away.
         let thread = model::thread(self.tower.read(cx).state.as_ref().unwrap_or(&serde_json::Value::Null), name);
         if !thread.is_empty() {
             let count = thread.len().max(m.thread_count);
-            let label = if count == 1 { "Between sessions · 1 message".to_string() } else { format!("Between sessions · {count} messages") };
-            let from = thread.len().saturating_sub(THREAD_ROWS);
-            let rows = thread[from..].iter().map(|msg| {
-                h_flex()
-                    .gap(px(12.0))
-                    .items_start()
-                    .text_size(px(13.0))
-                    .line_height(px(18.0))
-                    .child(div().w(px(190.0)).flex_none().font_weight(FontWeight::SEMIBOLD).truncate().child(msg.who_in(name)))
-                    .child(div().flex_1().min_w_0().line_clamp(3).text_color(if msg.delivered { g.muted } else { g.faint }).child(if msg.delivered { msg.text.clone() } else { format!("{} (not delivered)", msg.text) }))
-            });
-            items.push(
-                v_flex()
-                    .w_full()
-                    .gap(px(10.0))
-                    .child(
-                        h_flex().items_center().child(bay_label(&label).flex_1()).child(
-                            div()
-                                .id("thread-record")
-                                .px(px(4.0))
-                                .text_size(px(12.0))
-                                .text_color(g.faint)
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(rgb(CYAN)))
-                                .child("All of it in Record ›")
-                                .on_click(cx.listener(|this, _, _, cx| this.nav_to(Scope::Record, cx))),
-                        ),
-                    )
-                    .child(v_flex().w_full().px(px(12.0)).py(px(11.0)).gap(px(7.0)).rounded(px(14.0)).bg(rgba(SOFT)).children(rows))
-                    .into_any_element(),
-            );
+            items.push(self.thread_view(name, &thread, count, cx));
         }
         (head, items)
     }
 }
 
+impl Panel {
+    /// "Between sessions": the latest messages, newest last, each with who
+    /// wrote it to whom and when. A long one shows its first lines; a click
+    /// (or "Show all") shows it whole, with a way to copy it. "Earlier"
+    /// shows the rest the state holds; Record has all of it.
+    fn thread_view(&mut self, space: &str, thread: &[model::Message], count: usize, cx: &mut Context<Self>) -> AnyElement {
+        let g = glass();
+        let (earlier, open, copied) = match self.full.as_ref() {
+            Some(f) => (f.thread_earlier.contains(space), f.thread_open.clone(), f.copied.clone()),
+            None => (false, Default::default(), None),
+        };
+        let from = if earlier { 0 } else { thread.len().saturating_sub(THREAD_ROWS) };
+        let label = if count == 1 { "Between sessions · 1 message".to_string() } else { format!("Between sessions · {count} messages") };
+        let link = |id: SharedString, text: String| {
+            div().id(id).px(px(4.0)).text_size(px(12.0)).text_color(g.faint).cursor_pointer().hover(|s| s.text_color(rgb(CYAN))).child(text)
+        };
+        let sp = space.to_string();
+        let head = h_flex()
+            .w_full()
+            .items_center()
+            .gap(px(10.0))
+            .child(bay_label(&label).flex_1())
+            .when(from > 0, |el| {
+                el.child(link("thread-earlier".into(), format!("{from} earlier")).on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(f) = this.full.as_mut() {
+                        f.thread_earlier.insert(sp.clone());
+                    }
+                    cx.notify();
+                })))
+            })
+            .child(link("thread-record".into(), "All of it in Record ›".into()).on_click(cx.listener(|this, _, _, cx| this.nav_to(Scope::Record, cx))));
+        let rows = thread[from..].iter().map(|msg| {
+            let key = thread_key(msg);
+            let long = msg_is_long(&said_text(&msg.text));
+            // `HERDER_TOWER_ORB_THREAD=open`: every message whole, to look at it with test data.
+            let whole = !long || open.contains(&key) || std::env::var("HERDER_TOWER_ORB_THREAD").is_ok_and(|v| v == "open");
+            let (who_from, who_to) = msg.names_in(space);
+            let k_open = key.clone();
+            let toggle = cx.listener(move |this, _, _, cx| {
+                if let Some(f) = this.full.as_mut()
+                    && !f.thread_open.remove(&k_open)
+                {
+                    f.thread_open.insert(k_open.clone());
+                }
+                cx.notify();
+            });
+            let body = div()
+                .id(SharedString::from(format!("thread-body-{key}")))
+                .w_full()
+                .text_size(px(13.0))
+                .line_height(px(19.0))
+                .text_color(if msg.delivered { g.text } else { g.muted })
+                .when(!whole, |el| el.line_clamp(4).text_ellipsis())
+                .when(long, |el| el.cursor_pointer())
+                .child(said_text(&msg.text));
+            let body = if long { body.on_click(toggle).into_any_element() } else { body.into_any_element() };
+            let (k_copy, text) = (key.clone(), said_text(&msg.text));
+            let k_more = key.clone();
+            h_flex()
+                .w_full()
+                .items_start()
+                .gap(px(10.0))
+                .p(px(12.0))
+                .rounded(px(14.0))
+                .bg(rgba(SOFT))
+                .border_1()
+                .border_color(rgba(if whole && long { LINE } else { 0xffffff0d }))
+                // Who wrote it, in that session's colour (the same in every message).
+                .child(div().w(px(3.0)).flex_none().self_stretch().rounded_full().bg(rgb(sender_colour(&msg.from))))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(px(6.0))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_start()
+                                .gap(px(10.0))
+                                .child(
+                                    h_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex_wrap()
+                                        .items_center()
+                                        .gap_x(px(6.0))
+                                        .text_size(px(13.0))
+                                        .line_height(px(18.0))
+                                        .child(div().font_weight(FontWeight::SEMIBOLD).child(who_from))
+                                        .child(div().text_color(g.faint).child("→"))
+                                        .child(div().font_weight(FontWeight::SEMIBOLD).text_color(g.muted).child(who_to)),
+                                )
+                                .when(!msg.delivered, |el| {
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .px(px(8.0))
+                                            .py(px(1.0))
+                                            .rounded_full()
+                                            .border_1()
+                                            .border_color(rgb(AMBER))
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(AMBER))
+                                            .child("Not delivered"),
+                                    )
+                                })
+                                .child(div().flex_none().text_size(px(12.0)).line_height(px(18.0)).text_color(g.faint).child(when_said(msg.at))),
+                        )
+                        .child(body)
+                        .when(long, |el| {
+                            el.child(
+                                h_flex()
+                                    .gap(px(4.0))
+                                    .ml(px(-4.0))
+                                    .child(link(SharedString::from(format!("thread-more-{k_more}")), if whole { "Show less".into() } else { "Show all".into() }).on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            if let Some(f) = this.full.as_mut()
+                                                && !f.thread_open.remove(&k_more)
+                                            {
+                                                f.thread_open.insert(k_more.clone());
+                                            }
+                                            cx.notify();
+                                        },
+                                    )))
+                                    .when(whole, |el| {
+                                        let said = copied.as_deref() == Some(k_copy.as_str());
+                                        el.child(link(SharedString::from(format!("thread-copy-{k_copy}")), if said { "Copied".into() } else { "Copy".into() }).on_click(cx.listener(
+                                            move |this, _, _, cx| {
+                                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+                                                if let Some(f) = this.full.as_mut() {
+                                                    f.copied = Some(k_copy.clone());
+                                                }
+                                                cx.notify();
+                                            },
+                                        )))
+                                    }),
+                            )
+                        }),
+                )
+                .into_any_element()
+        });
+        v_flex().w_full().gap(px(10.0)).child(head).child(v_flex().w_full().gap(px(8.0)).children(rows)).into_any_element()
+    }
+}
+
+/// A message's own key in the view (what is open, what was copied).
+fn thread_key(m: &model::Message) -> String {
+    format!("{}-{}-{}", m.at, m.from, m.to)
+}
+
+/// What a message says, without the "From t7r (Android). " it opens with:
+/// the row names who wrote it already.
+fn said_text(text: &str) -> String {
+    let t = text.trim();
+    let Some(rest) = t.strip_prefix("From ") else { return t.to_string() };
+    let Some((who, after)) = rest.split_once(' ') else { return t.to_string() };
+    if who.is_empty() || who.len() > 24 || who.contains(|c: char| c == '.' || c == ',') {
+        return t.to_string();
+    }
+    // "(Android). " or "(Mac tower): " after the address, or a bare ". " / ": ".
+    let after = match after.strip_prefix('(').and_then(|a| a.split_once(')')) {
+        Some((desc, more)) if desc.len() <= 40 => more,
+        _ => after,
+    };
+    match after.strip_prefix(". ").or_else(|| after.strip_prefix(": ")).or_else(|| after.strip_prefix("). ")) {
+        Some(body) if !body.trim().is_empty() => body.trim().to_string(),
+        _ => t.to_string(),
+    }
+}
+
+/// Longer than its first lines show.
+fn msg_is_long(text: &str) -> bool {
+    let t = text.trim();
+    t.chars().count() > 320 || t.lines().count() > 4
+}
+
+/// "7:50 PM · 12m ago" today, else the day and the time.
+fn when_said(at: u64) -> String {
+    if at == 0 {
+        return String::new();
+    }
+    let day = super::day_label(at);
+    if day == "Today" { format!("{} · {}", super::clock(at), super::ago(at)) } else { format!("{day}, {}", super::clock(at)) }
+}
+
+/// A session's colour in the thread, the same for it in every message.
+fn sender_colour(address: &str) -> u32 {
+    const COLOURS: [u32; 5] = [CYAN, AMBER, 0xb9a7ff, 0x8fe3b0, 0xff9fb2];
+    let n = address.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
+    COLOURS[n as usize % COLOURS.len()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_says_what_it_says_without_who_wrote_it() {
+        assert_eq!(said_text("From t7r (Android). Checked against the real tower."), "Checked against the real tower.");
+        assert_eq!(said_text("From t7p (Mac tower): installed."), "installed.");
+        assert_eq!(said_text("From t2. The build is green"), "The build is green");
+        // Not an opening of that shape: as it is.
+        assert_eq!(said_text("From now on, run the tests first."), "From now on, run the tests first.");
+        assert_eq!(said_text("From t7r (Android)."), "From t7r (Android).");
+        assert_eq!(said_text("  The api is on 3001 "), "The api is on 3001");
+    }
 
     #[test]
     fn a_session_row_says_how_it_stands() {

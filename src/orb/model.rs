@@ -1039,7 +1039,14 @@ impl Message {
     /// `mediaroom → eyzflow`, by name where it is known. Inside `space`'s
     /// own view a session `tower launch` named after its space (`fix login
     /// eyzflow` in `fix-login`) goes by the rest of its name (`eyzflow`).
+    #[cfg(test)]
     pub fn who_in(&self, space: &str) -> String {
+        let (from, to) = self.names_in(space);
+        format!("{from} → {to}")
+    }
+
+    /// The two sides of `who_in`, apart.
+    pub fn names_in(&self, space: &str) -> (String, String) {
         let lead: Vec<String> = space.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect();
         let short = |name: &str| -> String {
             let words: Vec<&str> = name.split_whitespace().collect();
@@ -1047,7 +1054,7 @@ impl Message {
             if named { words[lead.len()..].join(" ") } else { name.to_string() }
         };
         let pick = |name: &str, addr: &str| if name.is_empty() { addr.to_string() } else { short(name) };
-        format!("{} → {}", pick(&self.from_name, &self.from), pick(&self.to_name, &self.to))
+        (pick(&self.from_name, &self.from), pick(&self.to_name, &self.to))
     }
 }
 

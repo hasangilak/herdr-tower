@@ -243,7 +243,9 @@ foot. The pane beside it shows:
   closing report with **Close this space** once it is ready (and when it
   would close by itself), what needs you there (a muted space's decisions
   show only here), its requests, its sessions (status, last words, worktree
-  and branch, dev port), and the latest of the thread between its sessions.
+  and branch, dev port), and the latest of the thread between its sessions:
+  who wrote to whom and when, each message's first lines, and the whole of
+  it (with Copy) on a click.
   Its head says when it has a tower of its own; what you type under it
   goes to that tower, and its reply shows there (with none running: to the
   main tower, with the space named).
