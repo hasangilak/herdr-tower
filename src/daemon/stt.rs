@@ -112,7 +112,7 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
                     }
                     let _ = deliver(&shared, &mouth, heard.trim(), settings.ack, "voice");
                 }
-                Source::Phone { reply, attachments, markers, send, phone, device } => {
+                Source::Phone { reply, attachments, markers, send, phone, device, space } => {
                     if !send {
                         // Dictation: the text goes back, nothing to the tower.
                         let _ = reply.send(heard.trim().to_string());
@@ -123,7 +123,8 @@ pub fn start(settings: Settings, rx: Receiver<Utterance>, shared: Shared, mouth:
                         continue;
                     }
                     let message = crate::history::compose(&super::lan::with_markers(heard.trim(), &markers), &attachments);
-                    if deliver_from(&shared, &mouth, &message, settings.ack, phone, &format!("phone:{device}")).is_ok() {
+                    // Said in a space's view: to that space's tower, as a typed request there goes.
+                    if deliver_to(&shared, &mouth, &message, settings.ack, phone, &format!("phone:{device}"), space.as_deref(), true).is_ok() {
                         let _ = reply.send(heard.trim().to_string());
                     }
                 }
@@ -440,7 +441,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let (reply, heard) = std::sync::mpsc::channel();
         tx.send(utt(Source::Ptt)).unwrap();
-        let phone = Source::Phone { reply, attachments: vec![], markers: vec![], send: true, phone: None, device: "d".into() };
+        let phone = Source::Phone { reply, attachments: vec![], markers: vec![], send: true, phone: None, device: "d".into(), space: None };
         tx.send(utt(phone)).unwrap();
         drop(tx);
         refuse_all(&rx, &shared, &mouth, "speech recognition didn't start: no GPU");

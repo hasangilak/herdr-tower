@@ -112,6 +112,12 @@ pub(super) fn meta_row(tag: Option<&str>, space: &str, why: &str, rest: String) 
 }
 
 /// A card's question or headline.
+/// More to read on a card: the command, the plan, the message that asks,
+/// in the small monospace block, `lines` at most.
+pub(super) fn detail_block(text: &str, lines: usize) -> AnyElement {
+    div().px_2().py_1().rounded(px(8.0)).bg(rgba(0x0000002e)).font_family("Menlo").text_xs().line_clamp(lines).child(text.trim().to_string()).into_any_element()
+}
+
 pub(super) fn card_title(text: &str) -> AnyElement {
     div().text_size(px(16.0)).line_height(px(21.0)).font_weight(FontWeight::SEMIBOLD).child(text.to_string()).into_any_element()
 }
@@ -1158,6 +1164,8 @@ impl Panel {
             .child(card_title(&d.title))
             .when(!who.is_empty(), |el| el.child(div().text_size(px(12.0)).text_color(g.faint).truncate().child(who.join(", "))))
             .children(d.reason().map(|why| cstat(why, false)))
+            // What it is about (the command, the plan), as a question's card shows its dialog's.
+            .when(!d.detail.trim().is_empty(), |el| el.child(detail_block(&d.detail, 6)))
             .children(d.options.iter().find(|o| o.pick && !o.why.is_empty()).map(|o| cstat(format!("The tower would pick {}: {}", o.label, o.why), false)))
             .when(!d.options.is_empty(), |el| el.child(acts))
             .child(other)

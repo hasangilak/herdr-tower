@@ -297,10 +297,25 @@ pub struct Task {
     pub told: String,
     pub told_ms: u64,
     pub history: Vec<Step>,
+    /// The session that sent it, when it is a message from one session to
+    /// another (while the tower tells everything, such a message is a task):
+    /// its address. Never a request of the user's (`is_message`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 }
 
 fn is_zero(n: &u32) -> bool {
     *n == 0
+}
+
+impl Task {
+    /// A message one session sent another, not work the user asked for: by
+    /// its recorded sender, or, on what an older tower kept (when such
+    /// messages were tasks, and those it took for the user's typing), by how
+    /// it opens ("From t7h: …", "From web (t7h): …": `peers::sender_in`).
+    pub fn is_message(&self) -> bool {
+        self.from.is_some() || crate::peers::sender_in(&self.instruction).is_some()
+    }
 }
 
 fn is_zero_ms(n: &u64) -> bool {
@@ -538,6 +553,10 @@ pub struct Tag {
     /// Not for the ledger (a start whose queue item already stands for it).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub skip: bool,
+    /// The session that sent it (the daemon's word, by who ran `tower
+    /// queue`): a message from one session to another.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 }
 
 /// A registration: a queue id, its session (empty: one still to start) and text.
@@ -1076,6 +1095,7 @@ impl Ledger {
             space: reg.tag.space.clone(),
             queue_ids: vec![reg.queue_id],
             after,
+            from: reg.tag.from.clone(),
             state: TaskState::Queued,
             since_ms: now,
             created_at_ms: now,
@@ -1357,27 +1377,24 @@ impl Ledger {
     /// The requests about one space, for its mission: those still open and
     /// those finished since `since_ms`, each with its tasks settled out of
     /// all of them; and how many of each.
+    ///
+    /// What is shown is each agenda as a request of the user's
+    /// (`Agenda::request`): messages between sessions are no part of one,
+    /// and a request is listed in its own space only (`Request::space`).
+    /// A view: the ledger as it is kept is not changed.
     pub fn requests_of(&self, space: &str, since_ms: u64) -> Requests {
-        let about = |a: &Agenda| {
-            a.spaces.iter().chain(a.tasks.iter().filter_map(|t| t.space.as_ref())).any(|s| s.eq_ignore_ascii_case(space.trim()))
-        };
+        let here = |r: &Request| r.space.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(space.trim()));
+        let mine: Vec<Request> = self.agendas.iter().filter_map(Agenda::request).filter(here).collect();
         let mut out = Requests::default();
-        let row = |a: &Agenda| {
-            serde_json::json!({
-                "id": a.id,
-                "title": clip(&a.title_or_words(), 80),
-                "state": a.state.word(),
-                "done": a.tasks.iter().filter(|t| t.state.settled()).count(),
-                "total": a.tasks.len(),
-            })
-        };
-        for a in self.agendas.iter().filter(|a| about(a) && a.live()) {
+        for r in mine.iter().filter(|r| r.state == AgendaState::Open) {
             out.open += 1;
-            out.rows.push(row(a));
+            out.rows.push(r.row());
         }
-        for a in self.agendas.iter().rev().filter(|a| about(a) && !a.live() && a.closed_ms.is_some_and(|c| c >= since_ms)) {
+        let mut done: Vec<&Request> = mine.iter().filter(|r| r.state != AgendaState::Open && r.closed_ms.is_some_and(|c| c >= since_ms)).collect();
+        done.sort_by_key(|r| std::cmp::Reverse(r.closed_ms));
+        for r in done {
             out.finished += 1;
-            out.rows.push(row(a));
+            out.rows.push(r.row());
         }
         out
     }
@@ -1422,6 +1439,76 @@ impl Ledger {
 impl Agenda {
     fn title_or_words(&self) -> String {
         if self.title.is_empty() { self.words.clone() } else { self.title.clone() }
+    }
+
+    /// This agenda as a request of the user's, for its space's mission; None
+    /// when none of it is one. Its tasks that are messages between sessions
+    /// (`Task::is_message`) are left out, and an agenda of nothing else is no
+    /// request; nor is what an older tower took for the user's typing that
+    /// was a message from another session or the session's own notice of
+    /// background work (`<task-notification>`). Done once the tasks that are
+    /// its own are; it belongs to one space (`home`).
+    pub fn request(&self) -> Option<Request> {
+        if self.words.trim_start().starts_with("<task-notification>") {
+            return None;
+        }
+        let own: Vec<&Task> = self.tasks.iter().filter(|t| !t.is_message()).collect();
+        if own.is_empty() && !self.tasks.is_empty() {
+            return None;
+        }
+        let (state, closed_ms) = match self.state {
+            AgendaState::Open if !own.is_empty() && own.iter().all(|t| t.state.settled()) => {
+                (AgendaState::Done, own.iter().map(|t| t.since_ms).max())
+            }
+            s => (s, self.closed_ms),
+        };
+        // Its title is the user's words; one the tower made of a message gives way to its own first task's.
+        let title = match own.first() {
+            Some(t) if crate::peers::sender_in(&self.title_or_words()).is_some() => t.title.clone(),
+            _ => self.title_or_words(),
+        };
+        let space = self.home(&own);
+        Some(Request { id: self.id.clone(), title, state, closed_ms, done: own.iter().filter(|t| t.state.settled()).count(), total: own.len(), space })
+    }
+
+    /// The one space a request belongs to: the one the user asked it in (the
+    /// space it was opened with), else that of its first task of its own.
+    /// `spaces` holds the ones it was opened with first, then those its
+    /// tasks took it to: one only a message between sessions took it to is
+    /// not its own.
+    fn home(&self, own: &[&Task]) -> Option<String> {
+        let of = |list: &mut dyn Iterator<Item = &Task>| list.filter_map(|t| t.space.clone()).collect::<Vec<String>>();
+        let mine = of(&mut own.iter().copied());
+        let theirs = of(&mut self.tasks.iter().filter(|t| t.is_message()));
+        let has = |list: &[String], s: &str| list.iter().any(|x| x.eq_ignore_ascii_case(s));
+        self.spaces
+            .iter()
+            .find(|s| has(&mine, s) || !has(&theirs, s))
+            .cloned()
+            .or_else(|| mine.first().cloned())
+            .or_else(|| self.spaces.first().cloned())
+    }
+}
+
+/// An agenda as a request of the user's (`Agenda::request`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Request {
+    pub id: String,
+    pub title: String,
+    /// Open, or done once its own tasks are (the agenda's own word when it was closed or dropped).
+    pub state: AgendaState,
+    pub closed_ms: Option<u64>,
+    /// Its own tasks settled, of all its own.
+    pub done: usize,
+    pub total: usize,
+    /// The space it belongs to.
+    pub space: Option<String>,
+}
+
+impl Request {
+    /// `{id, title, state, done, total}`, as a mission lists it.
+    fn row(&self) -> serde_json::Value {
+        serde_json::json!({ "id": self.id, "title": clip(&self.title, 80), "state": self.state.word(), "done": self.done, "total": self.total })
     }
 }
 
@@ -2697,5 +2784,76 @@ mod tests {
         assert!(notes.iter().all(|n| !n.msg.contains("rate limiting") && !n.msg.contains("deploy it")), "{notes:?}");
         // The tower's own task there is still followed as before.
         assert!(l.unfinished_handed("t5").is_some_and(|t| t.id == theirs.task));
+    }
+
+    /// Agendas shaped like those an older tower kept (when a session's
+    /// message to another was a task): a request of the user's whose tasks
+    /// are mostly such messages, in two spaces; agendas made of messages
+    /// only; a message and a background-task notice taken for the user's
+    /// typing. A request lists in its own space only, with its own tasks;
+    /// the rest are no requests. The ledger itself is left as it was.
+    #[test]
+    fn messages_between_sessions_are_no_request_and_a_request_has_one_space() {
+        let day = 1_000_000_000u64;
+        let task = |id: &str, state: &str, session: &str, space: Option<&str>, instruction: &str, since: u64| {
+            serde_json::json!({ "id": id, "title": clip(instruction, 40), "instruction": instruction, "session": session, "name": session,
+                                "space": space, "queue_ids": [], "state": state, "since_ms": since, "created_at_ms": since })
+        };
+        let ledger = serde_json::json!({ "next_id": 6, "agendas": [
+            { "id": "a1", "words": "open a session for the phone app in Studio on my second account", "origin": "user", "request_ms": day,
+              "spaces": ["Studio", "Garden"], "created_ms": day, "state": "open", "tasks": [
+                task("a1.1", "verified", "t7j", Some("Garden"), "From t7j: yes, the session token can live in memory only.", day + 1),
+                task("a1.2", "verified", "t7r", Some("Studio"), "Wait for instructions from the user. Do nothing until told.", day + 2),
+                task("a1.3", "verified", "t7k", Some("Garden"), "From t7h: t7j answered; four things for your layer.", day + 3),
+                task("a1.4", "verified", "t7r", Some("Studio"), "From t7p (Claude in ~/w/tower, Studio space), at the user's request. I am building the API.", day + 4),
+                task("a1.5", "queued", "t7p", None, "From t7r (Phone). Status and what I need from your side.", day + 5),
+                task("a1.6", "queued", "t7p", None, "About \"Phone check: did this card reach you?\": the user decided: It arrived", day + 6),
+              ] },
+            { "id": "a2", "words": "From t7h: thanks, all of it is worked into the plan.", "title": "From t7h: thanks, all of it…", "origin": "tower",
+              "spaces": ["Garden"], "created_ms": day + 10, "state": "done", "closed_ms": day + 20, "tasks": [
+                task("a2.1", "verified", "t7j", Some("Garden"), "From t7h: thanks, all of it is worked into the plan.", day + 20),
+              ] },
+            { "id": "a3", "words": "From t7p (studio tower). Sorry for the silence: your messages reached me late.", "origin": "terminal",
+              "request_ms": day + 30, "spaces": ["Studio"], "created_ms": day + 30, "state": "open", "tasks": [
+                task("a3.1", "running", "t7r", Some("Studio"), "From t7p (studio tower). Sorry for the silence: your messages reached me late.", day + 30),
+              ] },
+            { "id": "a4", "words": "<task-notification> <summary>Goal check-in: background work still running</summary> </task-notification>",
+              "origin": "terminal", "spaces": ["Studio"], "created_ms": day + 40, "state": "done", "closed_ms": day + 41, "tasks": [
+                task("a4.1", "verified", "t7p", Some("Studio"), "<task-notification> <summary>Goal check-in…</summary>", day + 41),
+              ] },
+            { "id": "a5", "words": "rename the settings tabs", "origin": "user", "spaces": [], "created_ms": day + 50, "state": "open", "tasks": [
+                task("a5.1", "queued", "t9", Some("Garden"), "From t9: which tabs?", day + 50),
+                task("a5.2", "running", "t5", Some("Studio"), "rename the settings tabs to General and Billing", day + 51),
+              ] },
+        ] });
+        let mut l: Ledger = serde_json::from_value(ledger).unwrap();
+        // One recorded by its sender (a session's instruction while the tower tells everything).
+        l.agendas[4].tasks.push(Task { id: "a5.3".into(), instruction: "please look at the tabs too".into(), from: Some("t9".into()), space: Some("Garden".into()), ..Default::default() });
+        let kept = l.clone();
+        let ids = |r: &Requests| r.rows.iter().map(|x| x["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+
+        let studio = l.requests_of("studio", 0);
+        assert_eq!(ids(&studio), ["a1", "a5"], "the user's requests, in the space they asked in");
+        assert_eq!((studio.open, studio.finished), (2, 0));
+        let a1 = &studio.rows[0];
+        assert_eq!((a1["state"].as_str(), a1["done"].as_u64(), a1["total"].as_u64()), (Some("open"), Some(1), Some(2)), "its own tasks only: {a1}");
+        assert_eq!(a1["title"].as_str(), Some("open a session for the phone app in Studio on my second account"));
+        assert_eq!((studio.rows[1]["done"].as_u64(), studio.rows[1]["total"].as_u64()), (Some(0), Some(1)));
+        // Nothing of it in the other space its messages went to; and messages alone are no request.
+        let garden = l.requests_of("Garden", 0);
+        assert!(garden.rows.is_empty() && garden.open == 0 && garden.finished == 0, "{:?}", garden.rows);
+        assert!(l.agendas[1].request().is_none() && l.agendas[2].request().is_none() && l.agendas[3].request().is_none());
+        assert_eq!(l.agendas[4].request().unwrap().space.as_deref(), Some("Studio"), "opened with no space: its first task of its own's");
+
+        // Its own last task is done: the request is done (the messages left queued don't hold it open).
+        l.agendas[0].tasks[5].state = TaskState::Verified;
+        l.agendas[0].tasks[5].since_ms = day + 99;
+        let studio = l.requests_of("Studio", day + 90);
+        assert_eq!(ids(&studio), ["a5", "a1"]);
+        assert_eq!((studio.open, studio.finished, studio.rows[1]["state"].as_str()), (1, 1, Some("done")));
+        assert!(l.requests_of("Studio", day + 100).rows.iter().all(|r| r["id"] != "a1"), "finished before the day began: not listed");
+        // A view: what is kept is as it was.
+        assert_eq!(l.agendas[1..], kept.agendas[1..]);
+        assert_eq!(l.agendas[0].state, AgendaState::Open);
     }
 }

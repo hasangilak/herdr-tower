@@ -179,6 +179,10 @@ pub struct Decision {
     /// How many sessions can't go on until it is answered.
     pub waiting: usize,
     pub title: String,
+    /// What it is about, to read before deciding (the command, the plan, the
+    /// message that asks; `tower raise --detail`), "" when it has none.
+    #[serde(deserialize_with = "or_default")]
+    pub detail: String,
     /// Why it is the user's: the reason a question went to them, `merge`,
     /// the category `tower raise` gave, `failed` (see `badge`).
     #[serde(deserialize_with = "or_default")]
@@ -380,6 +384,7 @@ pub fn adapt(sets: &[QuestionSet], prs: &BTreeMap<String, Pr>, agents: &Value, s
             sessions: vec![SessionRef { question_id: Some(set.id.clone()), ..SessionRef::new(&set.session, &set.name) }],
             waiting: 1,
             title,
+            detail: crate::decisions::detail_of(set),
             why: why_of(&set.kind, set.tabs.len()).into(),
             pick: options.first().map(|o: &Opt| o.label.clone()),
             options,
@@ -437,6 +442,7 @@ pub fn adapt(sets: &[QuestionSet], prs: &BTreeMap<String, Pr>, agents: &Value, s
             waiting: sessions.iter().filter(|s| s.waiting).count(),
             sessions,
             title: merge_title(refs.len()),
+            detail: String::new(),
             why: "Merge".into(),
             pick: Some(merge_label(&refs)),
             options: vec![Opt { label: merge_label(&refs), why: String::new(), pick: true }],

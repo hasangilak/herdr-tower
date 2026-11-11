@@ -300,7 +300,7 @@ mod tests {
         spaces::update_in(&ui, |s| {
             s.read_ms.insert("Shop".into(), 5);
         });
-        let raised = m.decisions.raise(Raise { space: Some("Shop".into()), who: None, why: "design".into(), text: "Tabs or a sidebar?".into(), options: vec![] }).0.id;
+        let raised = m.decisions.raise(Raise { detail: String::new(), space: Some("Shop".into()), who: None, why: "design".into(), text: "Tabs or a sidebar?".into(), options: vec![] }).0.id;
         m.decisions.sync_prs(&[pr(88, "t1", "Shop")]);
         let v = m.settle(Some(vec![seen("Shop", "t1", "working"), seen("Docs", "t7", "idle")]), &ui, now, 24);
         // First sight: both are missions, open; the one that needs the user first.
@@ -363,7 +363,7 @@ mod tests {
         let v = m.settle(Some(vec![seen("Shop", "t1", "idle")]), &ui, now + 240_000, 24);
         assert_eq!(v["spaces"][0]["report"], "The checkout is live.");
         // A decision there: open again, the report dropped; settled again: ready, and asked again.
-        let d = m.decisions.raise(Raise { space: Some("Shop".into()), who: None, why: "deploy".into(), text: "Deploy it?".into(), options: vec![] }).0.id;
+        let d = m.decisions.raise(Raise { detail: String::new(), space: Some("Shop".into()), who: None, why: "deploy".into(), text: "Deploy it?".into(), options: vec![] }).0.id;
         let v = m.settle(Some(vec![seen("Shop", "t1", "idle")]), &ui, now + 300_000, 24);
         assert_eq!((v["spaces"][0]["state"].as_str(), v["spaces"][0]["report"].as_str(), v["spaces"][0]["needs"].as_u64()), (Some("open"), Some(""), Some(1)));
         m.decisions.answered(&d, "yes");

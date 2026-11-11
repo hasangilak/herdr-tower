@@ -116,10 +116,13 @@ At level `decisions` or `results`:
   and space of the session the note names (the first address in it; a note
   about no one session has none), so the record has it.
 - The brain puts something in front of the user only by a command:
-  - `tower raise <session> --why "<category>" "<the decision, one line>" [--options '<json>']`
+  - `tower raise <session> --why "<category>" "<the decision, one line>" [--options '<json>'] [--detail "<text>"]`
     makes a decision (step 3). `--why` is required; `--options` is a JSON
     list of `{"label","why","text"}` (or plain words), the recommended one
-    first. It writes a history entry of kind `raised` (`id` = the
+    first; `--detail` is what the line can't say (the command it would run,
+    the plan, the change), the decision's `detail`, cut to about 600
+    characters with an ellipsis (raised again with one, the card shows the
+    newer). It writes a history entry of kind `raised` (`id` = the
     decision's, `session`, `name`, `space`, `why`, `text`, `options`;
     `record: true` when it was raised before) and, the first time, the
     alert a session that needs the user makes ("<name> needs you: <text>.
@@ -181,9 +184,12 @@ At level `decisions` or `results`:
   a session `<repo>-<space>` where `<space>-<repo>` would be such a name.
   This holds at `decisions` and `results`. At `everything` a session's
   instruction is handled as it was (a task, watched, told to the brain);
-  it only gains the sender's name. A peer message is:
+  it only gains the sender's name, and its task records who sent it
+  (`from`), so it is never shown as a request of the user's. A peer
+  message is:
   - delivered with the same queue guarantees (waits for a busy receiver, in
-    order, once, kept across restarts);
+    order, once, kept across restarts), but for a receiver busy a long
+    while (below);
   - the daemon puts the sender's name on it ("From <space> › <name>
     (<address>): …") unless the text already starts with "From ";
   - no agenda task, no job, no watch for the brain, and no `[queue]`,
@@ -192,6 +198,57 @@ At level `decisions` or `results`:
     `name` = receiver, `from` and `from_name` = sender, `space` = the
     receiver's, else the sender's, `status` = `delivered`, `text` as the
     sender wrote it, `record: true`).
+- **A receiver that works for hours.** A Claude Code session that runs
+  background agents stays `working` for hours, and messages to it from
+  other sessions used to wait all that while. A peer message whose
+  receiver is a Claude Code session (not a brain) that has been working
+  longer than `[queue] busy_deliver_minutes` is typed in anyway:
+
+  ```toml
+  [queue]
+  busy_deliver_minutes = 10   # 0: never; a peer message waits for the turn to end
+  ```
+
+  How long it has worked is Herdr's `status_ms` (when it set the status),
+  or the queue's own first sight of it working at its turn count, whichever
+  is longer; the setting is read live. The tower types into a session with
+  `hc send`, which pastes the text and presses Enter, nothing else (no Esc,
+  no interrupt), here with `--if working`, so hc looks again as it types
+  and refuses a session that stopped or is blocked on a dialog meanwhile
+  (it refuses a dialog anyway). Claude Code keeps what is typed while it
+  works and sends it as its next message when its turn ends: nothing is
+  interrupted. The bookkeeping says it went in once:
+  - One at a time: the next message waits until the session took the last
+    one (its turn count moved past the turn that was under way) or has been
+    free for 90 seconds without starting on it (then it went into that
+    turn). Peer messages keep their order among themselves; one typed in
+    this way goes ahead of instructions that wait for the session, which
+    go in as before once the session is free (after the turn on the
+    message, too). The user's own instructions, a brain's, an answer from a
+    decision, an introduction: never typed into a working session.
+  - It is claimed on disk before it is typed, with the turn count that
+    turn will end on. A restart that finds it claimed reads the count: the
+    session took a turn past that one, so it went in and is not typed
+    again; else it is not typed in again while that turn lasts (it may be
+    in the session's input already), only once the session is free, and
+    then only if the count still says it wasn't taken.
+  - What is typed in this way is the tower's for a day (`daemon::typed`),
+    so its prompt, when it comes hours later, is no request of the user's
+    and answers no question of theirs; the turn it was typed into stays
+    whoever's it was. Its delivery is no "next hand-over" for the task the
+    session was working on (the agenda's `next_ms` leaves it out), so that
+    task's turn isn't taken as over.
+  - It is in the thread as delivered when it is typed in; `tower queue`
+    says `while_working: true`.
+  - Codex sessions keep waiting: nothing here says Codex keeps typed input
+    for its next turn, so a message to one waits for its turn to end, as
+    before.
+- **A turn that ended on an error.** A Claude Code or Codex session whose
+  turn ended on an API error has status `error` (the radar says it "hit an
+  error", "stuck on an error"), but it sits at its prompt: it takes what
+  waits for it at once, as idle or done would (`sendq::Session::ready`),
+  with no "is error" note to the brain. A terminal of another program in
+  `error` still waits, and the brain hears it once, as before.
 - A peer message that cannot be delivered (receiver gone, parked): the
   sender is told with one queued message, and it is recorded (`status` =
   `undelivered`). The user is not told. It is taken out of the queue, not
@@ -224,7 +281,7 @@ model is `src/decisions.rs`; the daemon holds it in `src/daemon/decisions.rs`
 and keeps it in `decisions.json` (the state folder) across restarts.
 
 ```
-Decision { id, key, kind, space, sessions[], title, why, options[], pick,
+Decision { id, key, kind, space, sessions[], title, detail, why, options[], pick,
            prs[], question_id, task, first_ms, last_ms, count, state }
 kind  = permission | question | merge | choice | failed | raised | blocked
 state = open | answering | answered | stopped | dismissed
@@ -233,6 +290,17 @@ state = open | answering | answered | stopped | dismissed
 `id` is `d` and 12 hex digits (a question set's is `q…`). It belongs to
 this decision from when it opened: the same thing needing the user again,
 after it closed, is a new decision with a new id.
+
+`detail` is what the title can't say, to read before deciding, cut to about
+600 characters with an ellipsis (`decisions::DETAIL`): for a question or a
+permission its question set's `detail` (the command a permission or a Codex
+approval would run, the plan to approve; for a question at the end of a
+turn the message that asks, its end kept, since it asks last); for `tower
+raise` its `--detail`; for a merge none (its PRs say it); "" when there is
+none. It is in `state.json`, `tower decisions --json`, `GET /v1/decisions`
+and the `decisions` event. The Mac's cards show it in the small monospace
+block a question's card uses for its dialog's detail: a card with no
+question set behind it (a raise) has that block now too.
 
 ### Where they come from
 
@@ -355,7 +423,28 @@ stays in step:
   user's reply typed there comes with the session's `UserPromptSubmit`
   hook. The set and its decision close as answered, with the user's words
   ("… -> Answered in Shop › api: Wait, I'll review it first"), whether the
-  hook or the radar (the session working again) is first. A reply the
+  hook or the radar (the session working again) is first.
+- **A prompt that isn't the user's leaves it open.** The session working
+  again closes such a question only when what it works on is the user's.
+  A prompt the tower typed (an instruction, a message from another
+  session, an introduction; one typed in while it worked and sent when that
+  turn ended), another terminal's, or the session's own (Claude Code's
+  `<task-notification>` that its background work finished) leaves the
+  question open, and its decision with it (`Asks::went_on`). The tower
+  knows its own typing as it types (`typed_lately`, the send queue's
+  `typed_in_while_working`); for the rest the hook says, and when the radar
+  is first the question waits up to six seconds for it: the user's words
+  close it with them, any other prompt keeps it, and no word at all (an
+  agent with no hook) closes it as answered in the terminal, as before. A
+  question answered on its card closes when its reply goes in, as before.
+  What then: the session works on that prompt and the question stays the
+  user's (on the Mac, the phone, `waiting`). If that turn ends asking
+  something again, the new question takes the old one's place (one
+  question at the end of a turn per session: the old card and its decision
+  close, as before). If it ends asking nothing, the question stays open
+  until the user answers it (on its card, the reply going in as the
+  session's next prompt; or in the terminal), dismisses it, or the session
+  ends: the session's own next turn is not taken for an answer. A reply the
   tower held for that session (answered on the card while it was busy) is
   not typed: the record has a `queue` entry with `status: not-sent`, "Not
   sent: you answered it in the terminal (the reply was "…")". Never said.
@@ -829,7 +918,22 @@ Mission { "name", "goal": "" when none, "done_when": "" when none,
   comes from the session's hooks, so it is null until its first turn ends.
 - `requests`: the space's open agendas (oldest first), then those finished
   since local midnight (newest first). `done` counts tasks that are
-  verified or dropped; `title` is cut to 80 characters.
+  verified or dropped; `title` is cut to 80 characters. Only what the user
+  asked for (`Agenda::request`, a view: the ledger is kept as it is):
+  - A task that is a message one session sent another is no part of a
+    request: by its recorded sender (`from` on the task, while the tower
+    tells everything), or, in what an older tower kept, by how it opens
+    ("From t7h: …", "From web (t7h): …", "From Shop › web (t7h): …":
+    `peers::sender_in`). An agenda of nothing else is no request at all,
+    and neither is what an older tower took for the user's typing that was
+    such a message or a session's `<task-notification>` (the prompt hook now
+    tells both apart: `daemon::typed`). `done` and `total` count the
+    request's own tasks, and it is done once they are (finished at the last
+    of them), whatever messages were left queued in it.
+  - A request belongs to one space and is listed there only: the one the
+    user asked it in (the space it was opened with), else that of its first
+    task of its own. A space only a message between sessions took it to is
+    not its own. The same counts make a space `ready`.
 - `thread_count`: the messages in the space's thread as the state carries
   it (at most 50).
 - `auto_close_ms`: when a ready space closes by itself (null: not ready,
@@ -1369,7 +1473,8 @@ section says what was built and how it hangs together.
 | `POST /v1/decisions/{id}/rule` | `{"answer": text}`, optional | `202 {"sent": the request, "space"}`: asked of that space's tower as `/v1/ask` asks. `409 not_answered`, `409 no_rule`, `404 no_decision` |
 | `GET /v1/model` · `POST /v1/model` | `{"model", "effort", "restart"}`, each optional | The report under "The brains' model", with `restarted` |
 | `POST /v1/ask` | gains `"space": name` (a `space` field in the form) | `202 {"sent", "attachments", "space"}`; `404 no_space` |
-| `GET /v1/chat` | gains `?space=<name>` and `?main=1` | Every message has `space` |
+| `POST /v1/voice` | gains `?space=<name>` | Said in that space's view, a take goes to that space's tower, as `/v1/ask` with `space`: `200 {"heard", "sent", "attachments", "space"}`; `404 no_space` before anything is transcribed or saved. Dictation (`send=0`) takes no space |
+| `GET /v1/chat` | gains `?space=<name>` and `?main=1` | Every message has `space`; a space's conversation pages back with `before` as the main chat does, its acts in it |
 | `GET /v1/history` | gains `?space=<name>` | A space's Record |
 
 `GET /v1/hello` (and the pairing answer, and the stream's `hello`) has
@@ -1385,7 +1490,7 @@ network"). `api` stays 1: nothing that was there changed.
 Decision { "id", "key", "kind": "permission"|"question"|"merge"|"choice"|"failed"|"raised"|"blocked",
            "space": name or null,
            "sessions":[{"address","name","waiting":bool,"question_id"?}], "waiting": n,
-           "title", "why", "options":[{"label","why","pick":bool}], "pick": label or null,
+           "title", "detail", "why", "options":[{"label","why","pick":bool}], "pick": label or null,
            "prs":[{"key","repo","number","base","title","url",
                    "checks":"pass"|"pending"|"fail"|"none","note","session",
                    "merge":{"can","blocked","needs_override","warnings"}}],
@@ -1516,8 +1621,11 @@ named in front, `In <space>: …`, when the main tower took it for a space it
 keeps); an answer's is its request's (the main tower's answers are matched
 to its requests in order); for anything else it is where it comes from.
 `chat::in_conversation` is the one rule for both filters: a space's own
-conversation is its requests, answers and receipts; the main one is
-everything but the requests and answers that have a space.
+conversation is its requests, answers, receipts and acts; the main one is
+everything but the requests, answers and acts that have a space. An act's
+`space` is its request's conversation: the space whose own tower took the
+request, or, for one the main tower took as `In <space>: …`, that space (by
+the request it answers, `request_at`).
 
 ### Tests
 

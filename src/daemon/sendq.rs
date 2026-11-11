@@ -32,6 +32,15 @@
 //! A message one session queues for another (`peers`) rides the same queue
 //! and is no task: not watched, not told to any brain, kept in the history
 //! as `peer`. One that can't be delivered is taken out and its sender told.
+//! A Claude Code session that has been working longer than `[queue]
+//! busy_deliver_minutes` (background agents keep one "working" for hours)
+//! gets such a message typed in anyway, one at a time: Claude Code keeps
+//! what is typed while it works and sends it as its next message when its
+//! turn ends (`hc send` pastes and presses Enter, nothing that interrupts).
+//! The user's and the brains' instructions always wait for the turn to end.
+//!
+//! A Claude Code or Codex session in `error` (its turn ended on an API
+//! error) sits at its prompt: it takes an instruction as idle or done would.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -132,8 +141,9 @@ pub enum ItemState {
 /// What happens to a queued instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ItemEv {
-    /// About to be typed (or started): on disk first.
-    Claim { now_ms: u64, turn: Option<u64> },
+    /// About to be typed (or started): on disk first. `busy`: typed in while
+    /// its session works (its turn count then is that of the turn under way).
+    Claim { now_ms: u64, turn: Option<u64>, busy: bool },
     /// The hand-over failed: it waits again, one try more.
     Failed,
     /// The claim is let go without a try (it couldn't be saved; a restart found it didn't go in).
@@ -214,6 +224,14 @@ pub struct Item {
     /// out (not parked) and its sender is told.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<crate::peers::Sender>,
+    /// Claimed to be typed in while its session works (a message from
+    /// another session, see `Book::busy_pick`): `turn_before` is then the
+    /// count that session's turn under way ends on, so the turn its message
+    /// starts is the one after. Still set after a restart let the claim go:
+    /// it may be in that session's input already, so it is not typed in
+    /// again while the session works, only once it is free.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub busy: bool,
 }
 
 impl Item {
@@ -237,16 +255,19 @@ impl Item {
         match (ev, self.state()) {
             (ItemEv::Claim { .. }, ItemState::Claimed { .. }) => Err(ItemRefused::GoingIn),
             (ItemEv::Claim { .. }, ItemState::Parked(why)) => Err(ItemRefused::Parked(why)),
-            (ItemEv::Claim { now_ms, turn }, _) => {
+            (ItemEv::Claim { now_ms, turn, busy }, _) => {
                 self.sending_ms = Some(now_ms);
                 if self.start.is_empty() {
-                    self.turn_before = turn;
+                    // Typed in while it works: the turn under way ends on one more.
+                    self.turn_before = if busy { turn.map(|n| n + 1) } else { turn };
                 }
+                self.busy = busy;
                 Ok(())
             }
             (ItemEv::Failed, ItemState::Claimed { .. }) => {
                 self.sending_ms = None;
                 self.tries += 1;
+                self.busy = false;
                 Ok(())
             }
             (ItemEv::Release, ItemState::Claimed { .. }) => {
@@ -289,7 +310,7 @@ pub enum DeliveryState {
 }
 
 /// An instruction that went in.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Delivered {
     pub id: u64,
     pub session: String,
@@ -304,6 +325,14 @@ pub struct Delivered {
     /// ... and finished that turn.
     #[serde(default)]
     pub finished: bool,
+    /// Typed in while its session worked (`Book::busy_pick`): its session
+    /// sends it when that turn ends. `turn_before` is the count that turn
+    /// ended on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub busy: bool,
+    /// When its session was first seen free after the turn it was typed into.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_ms: Option<u64>,
 }
 
 impl Delivered {
@@ -351,6 +380,10 @@ struct Book {
     /// the way, not deleted (newest last).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     expired: Vec<Item>,
+    /// Sessions seen working, by address: at which turn count, and since when
+    /// the queue first saw it so (Herdr's `status_ms` may say longer).
+    #[serde(skip)]
+    working: BTreeMap<String, (Option<u64>, u64)>,
 }
 
 impl Book {
@@ -426,16 +459,69 @@ impl Book {
 
     /// The session may take its next instruction now.
     fn may_send(&self, s: &Session, now: u64) -> bool {
-        if !s.status.ready() {
+        if !s.ready() {
             return false;
         }
         match self.last_delivery(&s.address) {
             None => true,
+            // Typed in while it worked: its session starts on it when that turn
+            // ends, so the next waits for that one, or for a while free without it.
+            Some(d) if d.busy && !d.finished => d.taken || d.free_ms.is_some_and(|f| now.saturating_sub(f) >= TAKE_MS),
             Some(d) => {
                 let since = now.saturating_sub(d.at_ms);
                 since >= GAP_MS && (d.taken || since >= TAKE_MS)
             }
         }
+    }
+
+    /// Since when `s` has been working, at its turn count now: the queue's
+    /// own first sight of it so, or Herdr's word (`status_ms`) when that is
+    /// longer. None: it isn't working.
+    fn working_since(&mut self, s: &Session, now: u64) -> Option<u64> {
+        if s.status != SessionStatus::Working {
+            self.working.remove(&s.address);
+            return None;
+        }
+        let seen = match self.working.get(&s.address) {
+            Some((turn, since)) if *turn == s.turn => *since,
+            _ => {
+                self.working.insert(s.address.clone(), (s.turn, now));
+                now
+            }
+        };
+        Some(s.status_ms.filter(|t| *t > 0 && *t <= now).map_or(seen, |t| t.min(seen)))
+    }
+
+    /// A message from another session that may be typed into `s` while it
+    /// works (its place in `items`): `s` is a Claude Code session (not a
+    /// brain) that has been working `minutes` or more (0: never), nothing of
+    /// its own is being typed, and nothing typed in that way is still to be
+    /// taken; the first such message waiting for it, in order, that wasn't
+    /// let go half way before (`Item::busy`). The user's and the brains'
+    /// instructions wait for the turn to end; a dialog takes nothing.
+    fn busy_pick(&mut self, s: &Session, now: u64, minutes: u64) -> Option<usize> {
+        if minutes == 0 || !s.claude() || s.brain || s.status != SessionStatus::Working {
+            return None;
+        }
+        let since = self.working_since(s, now)?;
+        if now.saturating_sub(since) < minutes.saturating_mul(60_000) {
+            return None;
+        }
+        if self.last_delivery(&s.address).is_some_and(|d| d.busy && !d.finished) {
+            return None;
+        }
+        if self.items.iter().any(|i| i.session == s.address && matches!(i.state(), ItemState::Claimed { .. })) {
+            return None;
+        }
+        let pos = self.items.iter().position(|i| {
+            i.session == s.address
+                && i.from.is_some()
+                && !i.busy
+                && i.start.is_empty()
+                && matches!(i.state(), ItemState::Waiting | ItemState::WaitingFor(_))
+                && self.after_done(i) == Some(true)
+        })?;
+        Some(pos)
     }
 
     /// Whether the ids an item waits for are all done (None: one was cancelled).
@@ -464,18 +550,41 @@ impl Book {
         }
     }
 
-    /// What the session's facts say about the last delivery: taken (its turn
-    /// count moved), finished (and it stopped since).
-    fn follow(&mut self, s: &Session) -> bool {
-        let Some(d) = self.delivered.iter_mut().rev().find(|d| d.session == s.address) else { return false };
-        let moved = matches!((s.turn, d.turn_before), (Some(now), Some(before)) if now > before);
-        let mut changed = moved && d.take();
-        // Taken and ready again; or, with no turn count to go by, ready again.
-        if (moved || d.turn_before.is_none()) && s.status.ready() {
-            changed |= d.finish();
+    /// What the session's facts say about the last delivery (and, when that
+    /// one was typed in while the session worked, the one it worked on):
+    /// taken (its turn count moved), finished (and it stopped since).
+    fn follow(&mut self, s: &Session, now: u64) -> bool {
+        let mine: Vec<usize> = self.delivered.iter().enumerate().rev().filter(|(_, d)| d.session == s.address).map(|(i, _)| i).take(2).collect();
+        let Some(&last) = mine.first() else { return false };
+        let mut changed = follow_one(&mut self.delivered[last], s, now);
+        if self.delivered[last].busy
+            && let Some(&before) = mine.get(1)
+            && !self.delivered[before].finished
+        {
+            changed |= follow_one(&mut self.delivered[before], s, now);
         }
         changed
     }
+}
+
+/// `Book::follow` for one delivery.
+fn follow_one(d: &mut Delivered, s: &Session, now: u64) -> bool {
+    let moved = matches!((s.turn, d.turn_before), (Some(n), Some(before)) if n > before);
+    let mut changed = moved && d.take();
+    // Typed in while it worked: the turn under way is over, and it is free.
+    if d.busy && !moved && d.free_ms.is_none() && s.ready() && matches!((s.turn, d.turn_before), (Some(n), Some(b)) if n >= b) {
+        d.free_ms = Some(now);
+        changed = true;
+    }
+    // Taken and ready again; or, with no turn count to go by, ready again.
+    if (moved || d.turn_before.is_none()) && s.ready() {
+        changed |= d.finish();
+    }
+    // Free a while since, with no turn of its own: it went into the turn it was typed into.
+    if d.busy && s.ready() && d.free_ms.is_some_and(|f| now.saturating_sub(f) >= TAKE_MS) {
+        changed |= d.finish();
+    }
+    changed
 }
 
 
@@ -685,8 +794,7 @@ impl SendQueue {
             text: text.into(),
             at_ms: now,
             turn_before: Some(0),
-            taken: false,
-            finished: false,
+            ..Default::default()
         });
         self.save(&b)?;
         Ok(id)
@@ -731,7 +839,7 @@ impl SendQueue {
                 let item = b.items[pos].clone();
                 match b.after_done(&item) {
                     Some(true) => {
-                        if b.items[pos].apply(ItemEv::Claim { now_ms: now, turn: None }).is_ok() {
+                        if b.items[pos].apply(ItemEv::Claim { now_ms: now, turn: None, busy: false }).is_ok() {
                             ready.push(b.items[pos].clone());
                         }
                     }
@@ -772,8 +880,7 @@ impl SendQueue {
                         text: item.text.clone(),
                         at_ms: now,
                         turn_before: Some(0),
-                        taken: false,
-                        finished: false,
+                        ..Default::default()
                     });
                     h.record(&address, &format!("Started {} for: {}", item.name, item.text), "delivered");
                     // A start is for the record unless the tower tells everything.
@@ -827,8 +934,9 @@ impl SendQueue {
             };
         }
         if let Some(d) = b.delivered.iter().find(|d| d.id == id) {
-            // The session's next hand-over after this one: its turn was over by then.
-            let next_ms = b.delivered.iter().filter(|o| o.session == d.session && o.id != d.id && o.at_ms > d.at_ms).map(|o| o.at_ms).min();
+            // The session's next hand-over after this one: its turn was over by
+            // then (not one typed in while it still worked on this one).
+            let next_ms = b.delivered.iter().filter(|o| o.session == d.session && o.id != d.id && o.at_ms > d.at_ms && !o.busy).map(|o| o.at_ms).min();
             return QueueFact::Delivered {
                 session: d.session.clone(),
                 at_ms: d.at_ms,
@@ -850,6 +958,11 @@ impl SendQueue {
     /// Everything waiting, oldest first.
     pub fn items(&self) -> Vec<Item> {
         self.lock().items.clone()
+    }
+
+    /// The delivery `id` was typed in while its session worked (it reads it when that turn ends).
+    pub fn typed_while_working(&self, id: u64) -> bool {
+        self.lock().delivered.iter().any(|d| d.id == id && d.busy)
     }
 
     /// Takes one out by hand (the only way one leaves undelivered).
@@ -937,8 +1050,7 @@ impl SendQueue {
                             text: item.text.clone(),
                             at_ms: crate::history::now_ms(),
                             turn_before: Some(0),
-                            taken: false,
-                            finished: false,
+                            ..Default::default()
                         });
                     }
                     None => {
@@ -1047,7 +1159,8 @@ impl SendQueue {
                 {
                     let mut b = self.lock();
                     b.unreachable.remove(session);
-                    let mut changed = b.follow(&s);
+                    let mut changed = b.follow(&s, now);
+                    b.working_since(&s, now);
                     // A different terminal at this address: what waited for the old one stays.
                     let replaced: Vec<u64> = b
                         .items
@@ -1066,7 +1179,7 @@ impl SendQueue {
                         changed = true;
                     }
                     // Nothing goes into this status; the brain hears it once.
-                    if s.status != SessionStatus::Starting && !s.status.ready() && !s.status.passing() && b.waiting_for(session) > 0 {
+                    if s.status != SessionStatus::Starting && !s.ready() && !s.status.passing() && b.waiting_for(session) > 0 {
                         if b.stuck.get(session).map(String::as_str) != Some(s.status.word()) {
                             b.stuck.insert(session.to_string(), s.status.word().to_string());
                             let n = b.waiting_for(session);
@@ -1093,8 +1206,9 @@ impl SendQueue {
             Look::Finished | Look::Gone => {
                 let mut b = self.lock();
                 let name = b.items.iter().find(|i| i.session == session).map(|i| i.name.clone()).unwrap_or_else(|| session.to_string());
-                // Its last delivery is over, one way or another.
-                if let Some(d) = b.delivered.iter_mut().rev().find(|d| d.session == session) {
+                // What went in to it is over, one way or another.
+                b.working.remove(session);
+                for d in b.delivered.iter_mut().filter(|d| d.session == session && !d.finished) {
                     d.finish();
                 }
                 self.park(h, &mut b, session, ParkWhy::Gone, &name);
@@ -1120,15 +1234,28 @@ impl SendQueue {
         }
     }
 
-    /// The session's next instruction, if it may take one now.
+    /// The session's next instruction, if it may take one now; or, while it
+    /// works, a message from another session that may be typed in anyway
+    /// (`Book::busy_pick`).
     fn deliver(&self, h: &dyn Sessions, s: &Session) {
         let now = crate::history::now_ms();
-        let item = {
+        let (item, busy) = {
             let mut b = self.lock();
-            if !b.may_send(s, now) {
-                return;
-            }
-            let Some(pos) = b.items.iter().position(|i| i.session == s.address && !matches!(i.state(), ItemState::Parked(_))) else { return };
+            let (pos, busy) = if b.may_send(s, now) {
+                let Some(pos) = b.items.iter().position(|i| i.session == s.address && !matches!(i.state(), ItemState::Parked(_))) else { return };
+                (pos, false)
+            } else {
+                // Only a Claude Code session, working, is worth the setting's read.
+                let minutes = if s.claude() && s.status == SessionStatus::Working && b.items.iter().any(|i| i.session == s.address && i.from.is_some()) {
+                    h.busy_minutes()
+                } else {
+                    0
+                };
+                match b.busy_pick(s, now, minutes) {
+                    Some(pos) => (pos, true),
+                    None => return,
+                }
+            };
             let item = b.items[pos].clone();
             match b.after_done(&item) {
                 Some(true) => {}
@@ -1168,23 +1295,30 @@ impl SendQueue {
                 return;
             }
             // Claimed, on disk, before it's typed.
-            if let Err(e) = b.items[pos].apply(ItemEv::Claim { now_ms: now, turn: s.turn }) {
+            if let Err(e) = b.items[pos].apply(ItemEv::Claim { now_ms: now, turn: s.turn, busy }) {
                 eprintln!("[queue] not sending #{}: {e}", item.id);
                 return;
             }
             if let Err(e) = self.save(&b) {
                 let _ = b.items[pos].apply(ItemEv::Release);
+                // Not typed: it may be typed in while it works another time.
+                b.items[pos].busy = false;
                 eprintln!("[queue] not sending #{}: {e:#}", item.id);
                 return;
             }
-            b.items[pos].clone()
+            (b.items[pos].clone(), busy)
         };
-        let result = h.send(&s.address, &item.text);
+        let result = h.send(&s.address, &item.text, busy);
         let mut b = self.lock();
         match result {
             Ok(()) => {
                 self.went_in(h, &mut b, &item, s, now);
-                eprintln!("[queue] delivered #{} to {}", item.id, s.address);
+                if busy {
+                    let mins = s.status_ms.map(|t| now.saturating_sub(t) / 60_000).unwrap_or(0);
+                    eprintln!("[queue] typed #{} into {} while it works ({mins} min so far): it reads it when that turn ends", item.id, s.address);
+                } else {
+                    eprintln!("[queue] delivered #{} to {}", item.id, s.address);
+                }
             }
             Err(e) => {
                 if let Some(i) = b.items.iter_mut().find(|i| i.id == item.id) {
@@ -1210,8 +1344,8 @@ impl SendQueue {
             text: item.text.clone(),
             at_ms: now,
             turn_before: item.turn_before,
-            taken: false,
-            finished: false,
+            busy: item.busy,
+            ..Default::default()
         });
         if item.quiet {
             // A note, not work: nothing to watch or tell.
@@ -1352,6 +1486,26 @@ pub struct Session {
     pub status: SessionStatus,
     pub created_ms: Option<u64>,
     pub turn: Option<u64>,
+    /// The agent program Herdr reports for it (`claude-code`, `codex`).
+    pub app: Option<String>,
+    /// When Herdr set its status.
+    pub status_ms: Option<u64>,
+    /// It is a brain (the main one, a space's own).
+    pub brain: bool,
+}
+
+impl Session {
+    /// It takes an instruction now: idle or done; or, a Claude Code or
+    /// Codex session, `error` (its turn ended on an API error, and it sits
+    /// at its prompt; the radar says it "hit an error").
+    pub fn ready(&self) -> bool {
+        self.status.ready() || (self.status == SessionStatus::Error && matches!(self.app.as_deref(), Some("claude-code" | "codex")))
+    }
+
+    /// A Claude Code session: what is typed while it works, it keeps for its next message.
+    pub fn claude(&self) -> bool {
+        self.app.as_deref() == Some("claude-code")
+    }
 }
 
 /// What Herdr says about a session.
@@ -1367,7 +1521,8 @@ pub enum Look {
 /// Herdr, the brain and the radar, behind a seam the tests replace.
 trait Sessions: Sync {
     fn look(&self, session: &str) -> Look;
-    fn send(&self, session: &str, text: &str) -> Result<()>;
+    /// Types `text` in. `busy`: while the session works (only if it still does).
+    fn send(&self, session: &str, text: &str, busy: bool) -> Result<()>;
     /// A note for the brain, through the radar's outbox.
     fn tell(&self, note: Note);
     /// Watch the session: the brain hears when it stops.
@@ -1379,6 +1534,8 @@ trait Sessions: Sync {
     fn peer(&self, msg: crate::peers::Message);
     /// How much the tower tells the user now (see `tell`).
     fn level(&self) -> crate::tell::Level;
+    /// `[queue] busy_deliver_minutes`, as config.toml says now (0: never).
+    fn busy_minutes(&self) -> u64;
 }
 
 /// How the daemon hears what the queue does: set once at its start.
@@ -1397,6 +1554,12 @@ static RUNNING: OnceLock<SendQueue> = OnceLock::new();
 /// Everything waiting in the daemon's queue (for the phone API).
 pub fn current_items() -> Vec<Item> {
     RUNNING.get().map(|q| q.items()).unwrap_or_default()
+}
+
+/// The daemon's queue typed a message into `session` while it worked, and
+/// it hasn't taken it yet: its next prompt (when that turn ends) is that one.
+pub fn typed_in_while_working(session: &str) -> bool {
+    RUNNING.get().is_some_and(|q| q.lock().last_delivery(session).is_some_and(|d| d.busy && !d.finished))
 }
 
 /// How many instructions wait for each session (not parked).
@@ -1425,10 +1588,12 @@ impl Sessions for Herdr {
             hc::Lookup::Unreachable(e) => Look::Unreachable(e),
         }
     }
-    fn send(&self, session: &str, text: &str) -> Result<()> {
-        // Written down before it is typed: the prompt its hook reports is the tower's, not the user's.
-        let id = super::typed::note(session, text, "queue");
-        let sent = hc::send(session, text);
+    fn send(&self, session: &str, text: &str, busy: bool) -> Result<()> {
+        // Written down before it is typed: the prompt its hook reports is the
+        // tower's, not the user's (typed in while it works: when that turn ends).
+        let id = super::typed::note_as(session, text, "queue", busy);
+        // While it works: only if it still does as hc types (never into a dialog: hc refuses one).
+        let sent = hc::send_if(session, text, busy.then_some("working"));
         super::typed::done(id, sent.is_ok());
         sent
     }
@@ -1483,6 +1648,9 @@ impl Sessions for Herdr {
     fn level(&self) -> crate::tell::Level {
         crate::tell::level()
     }
+    fn busy_minutes(&self) -> u64 {
+        config::Config::live().queue.busy_deliver_minutes
+    }
 }
 
 fn session_of(t: &Value, asked: &str) -> Session {
@@ -1492,6 +1660,9 @@ fn session_of(t: &Value, asked: &str) -> Session {
         status: hc::status(t),
         created_ms: hc::created_ms(t),
         turn: hc::turn(t),
+        app: hc::agent_app(t),
+        status_ms: t["status_ms"].as_u64(),
+        brain: crate::brain::brain_of(t).is_some(),
     }
 }
 
@@ -1534,6 +1705,14 @@ mod tests {
         recorded: Mutex<Vec<(String, String, String)>>,
         peers: Mutex<Vec<crate::peers::Message>>,
         level: Mutex<crate::tell::Level>,
+        /// Each session's agent program (none: a session of no program the queue tells apart).
+        apps: Mutex<BTreeMap<String, String>>,
+        /// Herdr's `status_ms` for each session.
+        since: Mutex<BTreeMap<String, u64>>,
+        /// `[queue] busy_deliver_minutes`.
+        minutes: Mutex<u64>,
+        /// What was typed in while its session worked.
+        busy_sent: Mutex<Vec<String>>,
     }
     /// A tower that tells everything, as it always did: what these tests
     /// were written for. The quiet levels are set by the tests about them.
@@ -1554,7 +1733,16 @@ mod tests {
                 recorded: Default::default(),
                 peers: Default::default(),
                 level: Mutex::new(level),
+                apps: Default::default(),
+                since: Default::default(),
+                minutes: Mutex::new(10),
+                busy_sent: Default::default(),
             }
+        }
+        /// `s` runs `app` (`claude-code`, `codex`), its status set at `since_ms`.
+        fn runs(&self, s: &str, app: &str, since_ms: u64) {
+            self.apps.lock().unwrap().insert(s.into(), app.into());
+            self.since.lock().unwrap().insert(s.into(), since_ms);
         }
         fn recorded(&self, kind: &str) -> Vec<String> {
             self.recorded.lock().unwrap().iter().filter(|(_, _, k)| k == kind).map(|(_, t, _)| t.clone()).collect()
@@ -1590,17 +1778,27 @@ mod tests {
                 return Look::Unreachable("ssh: timed out".into());
             }
             match self.sessions.lock().unwrap().get(session).cloned() {
-                Some((st, created, turn)) => {
-                    Look::Live(Session { address: session.into(), name: format!("{session}-name"), status: SessionStatus::parse(&st), created_ms: created, turn })
-                }
+                Some((st, created, turn)) => Look::Live(Session {
+                    address: session.into(),
+                    name: format!("{session}-name"),
+                    status: SessionStatus::parse(&st),
+                    created_ms: created,
+                    turn,
+                    app: self.apps.lock().unwrap().get(session).cloned(),
+                    status_ms: self.since.lock().unwrap().get(session).copied(),
+                    brain: false,
+                }),
                 None => Look::Gone,
             }
         }
-        fn send(&self, session: &str, text: &str) -> Result<()> {
+        fn send(&self, session: &str, text: &str, busy: bool) -> Result<()> {
             if *self.send_fails.lock().unwrap() {
                 bail!("herdr is down");
             }
             self.sent.lock().unwrap().push((session.into(), text.into()));
+            if busy {
+                self.busy_sent.lock().unwrap().push(text.into());
+            }
             Ok(())
         }
         fn tell(&self, note: Note) {
@@ -1623,6 +1821,9 @@ mod tests {
         }
         fn level(&self) -> crate::tell::Level {
             *self.level.lock().unwrap()
+        }
+        fn busy_minutes(&self) -> u64 {
+            *self.minutes.lock().unwrap()
         }
     }
 
@@ -1797,16 +1998,16 @@ mod tests {
         assert_eq!(i.state(), ItemState::Waiting);
         assert_eq!(i.apply(ItemEv::Failed), Err(ItemRefused::NotClaimed));
         assert_eq!(i.apply(ItemEv::Release), Err(ItemRefused::NotClaimed));
-        i.apply(ItemEv::Claim { now_ms: 5, turn: Some(3) }).unwrap();
+        i.apply(ItemEv::Claim { now_ms: 5, turn: Some(3), busy: false }).unwrap();
         assert_eq!(i.state(), ItemState::Claimed { since_ms: 5, turn_before: Some(3) });
-        assert_eq!(i.apply(ItemEv::Claim { now_ms: 6, turn: Some(3) }), Err(ItemRefused::GoingIn), "claimed once");
+        assert_eq!(i.apply(ItemEv::Claim { now_ms: 6, turn: Some(3), busy: false }), Err(ItemRefused::GoingIn), "claimed once");
         assert_eq!(i.apply(ItemEv::Park { why: ParkWhy::Gone, now_ms: 6 }), Err(ItemRefused::GoingIn), "never parked while typed");
         assert_eq!(i.apply(ItemEv::Retarget { session: "t6".into(), name: "n".into(), created_ms: None }), Err(ItemRefused::GoingIn));
         i.apply(ItemEv::Failed).unwrap();
         assert_eq!((i.state(), i.tries), (ItemState::Waiting, 1), "the hand-over failed: waits again, one try more");
         i.apply(ItemEv::Park { why: ParkWhy::Gone, now_ms: 7 }).unwrap();
         assert_eq!((i.state(), i.parked_ms), (ItemState::Parked(ParkWhy::Gone), Some(7)));
-        assert_eq!(i.apply(ItemEv::Claim { now_ms: 8, turn: None }), Err(ItemRefused::Parked(ParkWhy::Gone)), "parked goes nowhere");
+        assert_eq!(i.apply(ItemEv::Claim { now_ms: 8, turn: None, busy: false }), Err(ItemRefused::Parked(ParkWhy::Gone)), "parked goes nowhere");
         i.apply(ItemEv::Park { why: ParkWhy::Gone, now_ms: 99 }).unwrap();
         assert_eq!(i.parked_ms, Some(7), "parked again for the same reason: since when it first was");
         i.apply(ItemEv::Retarget { session: "t6".into(), name: "t6-name".into(), created_ms: Some(4) }).unwrap();
@@ -1815,7 +2016,7 @@ mod tests {
         assert_eq!(start.state(), ItemState::WaitingFor(vec![1]));
         assert_eq!(Item { after: vec![], ..start }.state(), ItemState::ToStart);
 
-        let mut d = Delivered { id: 1, session: "t5".into(), text: "x".into(), at_ms: 0, turn_before: Some(1), taken: false, finished: false };
+        let mut d = Delivered { id: 1, session: "t5".into(), text: "x".into(), at_ms: 0, turn_before: Some(1), ..Default::default() };
         assert_eq!(d.state(), DeliveryState::Sent);
         assert!(d.take() && !d.take(), "taken once");
         assert_eq!(d.state(), DeliveryState::Taken);
@@ -2088,8 +2289,8 @@ mod tests {
                 }
                 self.0.look(s)
             }
-            fn send(&self, s: &str, t: &str) -> Result<()> {
-                self.0.send(s, t)
+            fn send(&self, s: &str, t: &str, busy: bool) -> Result<()> {
+                self.0.send(s, t, busy)
             }
             fn tell(&self, n: Note) {
                 self.0.tell(n)
@@ -2106,6 +2307,9 @@ mod tests {
             }
             fn level(&self) -> crate::tell::Level {
                 self.0.level()
+            }
+            fn busy_minutes(&self) -> u64 {
+                self.0.busy_minutes()
             }
         }
         let (q, _d) = queue();
@@ -2303,6 +2507,211 @@ mod tests {
             assert_eq!(h.notes().len(), 2);
             assert!(h.notes()[1].starts_with("[queue] t9 (z) is gone"));
         }
+    }
+
+    /// A Claude Code or Codex session whose turn ended on an API error sits
+    /// at its prompt: it gets what waits for it at once. A program the
+    /// queue can't tell is at its prompt still waits, and the brain hears once.
+    #[test]
+    fn an_agent_in_error_takes_its_instruction_at_once() {
+        let (q, _d) = queue();
+        let h = Fake::at(crate::tell::Level::Decisions);
+        let now = crate::history::now_ms();
+        for (s, app) in [("t5", "claude-code"), ("t6", "codex")] {
+            h.set(s, "error");
+            h.runs(s, app, now);
+            let (added, ..) = q.add_with(&h, s, &format!("try again in {s}"), &[], None).unwrap();
+            assert!(matches!(added, Added::Sent { .. }), "{s} ({app}) is at its prompt");
+        }
+        // A peer message too, as to a session that is done.
+        let (added, ..) = q.add_with(&h, "t5", "the api is back up", &[], Some(&orb())).unwrap();
+        assert!(matches!(added, Added::Queued { .. }), "one per turn: the instruction before it isn't taken yet");
+        h.turn("t5");
+        settle(&q);
+        q.session_round(&h, "t5");
+        assert_eq!(h.sent(), ["try again in t5", "try again in t6", "From Shop › orb rust (t1): the api is back up"]);
+        assert!(h.busy_sent.lock().unwrap().is_empty(), "nothing typed into a working session");
+        // An error from a program the queue can't tell: it waits, told once.
+        h.set("t7", "working");
+        q.add_with(&h, "t7", "rerun it", &[], None).unwrap();
+        h.set("t7", "error");
+        q.tick(&h);
+        q.tick(&h);
+        assert_eq!(h.notes().iter().filter(|n| n.contains("t7") && n.contains("is error")).count(), 1);
+        assert!(!h.sent().contains(&"rerun it".to_string()));
+    }
+
+    /// A Claude Code session that has worked longer than `busy_deliver_minutes`
+    /// (background agents keep it "working" for hours) gets a message from
+    /// another session typed in: it keeps it and reads it when its turn ends.
+    /// One at a time, each exactly once; the user's and the brains'
+    /// instructions wait for the turn's end; a session that worked a short
+    /// while, a Codex session, a brain or a setting of 0 get nothing typed in.
+    #[test]
+    fn a_message_to_a_session_busy_for_long_goes_in_once_and_is_read_when_its_turn_ends() {
+        let (q, _d) = queue();
+        let h = Fake::at(crate::tell::Level::Decisions);
+        let now = crate::history::now_ms();
+        h.set("t2", "working");
+        h.runs("t2", "claude-code", now - 11 * 60_000);
+        h.sessions.lock().unwrap().get_mut("t2").unwrap().2 = Some(7);
+        let sent_ = |n: usize| h.sent().len() == n;
+        // The message goes in at once, while it works.
+        let (Added::Sent { id: first }, ..) = q.add_with(&h, "t2", "which port does the api use?", &[], Some(&orb())).unwrap() else {
+            panic!("typed in while it works")
+        };
+        assert_eq!(*h.busy_sent.lock().unwrap(), ["From Shop › orb rust (t1): which port does the api use?"]);
+        assert!(q.typed_while_working(first));
+        assert_eq!(h.peers().len(), 1, "in the thread, as delivered");
+        {
+            let b = q.lock();
+            let d = b.delivered.iter().find(|d| d.id == first).unwrap();
+            assert_eq!((d.busy, d.turn_before, d.taken, d.finished), (true, Some(8), false, false), "its turn is the one after this");
+        }
+        // The user's (or a brain's) instruction waits for the turn to end; so does the next message.
+        let (Added::Queued { id: work, .. }, ..) = q.add_with(&h, "t2", "fix the login", &[], None).unwrap() else { panic!("waits") };
+        let (Added::Queued { id: second, .. }, ..) = q.add_with(&h, "t2", "and which branch?", &[], Some(&orb())).unwrap() else { panic!("one at a time") };
+        for _ in 0..3 {
+            q.tick(&h);
+        }
+        assert!(sent_(1), "{:?}", h.sent());
+        // The long turn ends: Claude Code sends the message it kept as its next one. Nothing else goes in meanwhile.
+        h.turn("t2");
+        h.set("t2", "done");
+        settle(&q);
+        q.tick(&h);
+        assert!(sent_(1), "free a moment, but it starts on the message: {:?}", h.sent());
+        h.set("t2", "working");
+        q.tick(&h);
+        // It worked on the message and stopped: then the instruction, then the second message, one per turn.
+        h.turn("t2");
+        h.set("t2", "done");
+        q.tick(&h);
+        assert_eq!(h.sent().last().map(String::as_str), Some("fix the login"));
+        assert!(q.lock().delivered.iter().any(|d| d.id == first && d.finished), "the first is taken and done");
+        h.turn("t2");
+        settle(&q);
+        q.tick(&h);
+        assert_eq!(h.sent().last().map(String::as_str), Some("From Shop › orb rust (t1): and which branch?"));
+        for text in ["From Shop › orb rust (t1): which port does the api use?", "fix the login", "From Shop › orb rust (t1): and which branch?"] {
+            assert_eq!(h.sent().iter().filter(|s| *s == text).count(), 1, "{text} went in once");
+        }
+        assert!(q.items().is_empty() && !q.typed_while_working(work) && !q.typed_while_working(second));
+
+        // Working only five minutes: it waits.
+        h.set("t3", "working");
+        h.runs("t3", "claude-code", now - 5 * 60_000);
+        assert!(matches!(q.add_with(&h, "t3", "ping", &[], Some(&orb())).unwrap().0, Added::Queued { .. }));
+        // Codex keeps no typed input for later: it waits however long it works.
+        h.set("t4", "working");
+        h.runs("t4", "codex", now - 60 * 60_000);
+        assert!(matches!(q.add_with(&h, "t4", "ping", &[], Some(&orb())).unwrap().0, Added::Queued { .. }));
+        // 0 is never.
+        *h.minutes.lock().unwrap() = 0;
+        h.set("t8", "working");
+        h.runs("t8", "claude-code", now - 60 * 60_000);
+        assert!(matches!(q.add_with(&h, "t8", "ping", &[], Some(&orb())).unwrap().0, Added::Queued { .. }));
+        q.tick(&h);
+        let typed_in = || h.busy_sent.lock().unwrap().clone();
+        assert_eq!(typed_in().len(), 1, "only the first message was typed in while working: {:?}", typed_in());
+        // Blocked on a dialog: never.
+        *h.minutes.lock().unwrap() = 10;
+        h.set("t8", "blocked");
+        q.tick(&h);
+        assert_eq!(typed_in().len(), 1, "{:?}", typed_in());
+        // The setting back, working again: it goes in.
+        h.set("t8", "working");
+        q.tick(&h);
+        assert_eq!(typed_in().len(), 2, "{:?}", typed_in());
+        assert_eq!(typed_in()[1], "From Shop › orb rust (t1): ping");
+    }
+
+    /// A message claimed to be typed in while its session works, and the
+    /// tower stops before it writes down that it went in: after the restart
+    /// it is never typed in again while that turn lasts (it may be in the
+    /// session's input already). It goes in when the session is free, unless
+    /// the turn count says the session took it.
+    #[test]
+    fn a_restart_around_a_busy_hand_over_types_it_once() {
+        let (q, d) = queue();
+        let h = Fake::at(crate::tell::Level::Decisions);
+        let now = crate::history::now_ms();
+        h.set("t2", "working");
+        h.runs("t2", "claude-code", now - 30 * 60_000);
+        h.sessions.lock().unwrap().get_mut("t2").unwrap().2 = Some(3);
+        *h.minutes.lock().unwrap() = 0;
+        q.add_with(&h, "t2", "the docs moved", &[], Some(&orb())).unwrap();
+        // Claimed (as a busy hand-over at turn 3), typed, and the tower stopped.
+        {
+            let mut b = q.lock();
+            assert!(b.items[0].apply(ItemEv::Claim { now_ms: now, turn: Some(3), busy: true }).is_ok());
+            assert_eq!((b.items[0].turn_before, b.items[0].busy), (Some(4), true));
+            q.save(&b).unwrap();
+        }
+        *h.minutes.lock().unwrap() = 10;
+        let q2 = SendQueue::at(d.0.join("queue.json"));
+        q2.recover(&h);
+        for _ in 0..3 {
+            q2.tick(&h);
+        }
+        assert!(h.sent().is_empty(), "not typed in again while it works");
+        // That turn ends and the session works on the message it kept, then stops: it went in.
+        h.turn("t2");
+        h.set("t2", "working");
+        q2.tick(&h);
+        h.turn("t2");
+        h.set("t2", "done");
+        q2.tick(&h);
+        assert!(h.sent().is_empty(), "the turn count says it took it: never typed twice");
+        assert!(q2.items().is_empty());
+
+        // Claimed, never typed (the session's turn ended with nothing more): typed once it is free.
+        let (q, d) = queue();
+        h.set("t9", "working");
+        h.runs("t9", "claude-code", now - 30 * 60_000);
+        h.sessions.lock().unwrap().get_mut("t9").unwrap().2 = Some(1);
+        *h.minutes.lock().unwrap() = 0;
+        q.add_with(&h, "t9", "the build is green", &[], Some(&orb())).unwrap();
+        {
+            let mut b = q.lock();
+            assert!(b.items[0].apply(ItemEv::Claim { now_ms: now, turn: Some(1), busy: true }).is_ok());
+            q.save(&b).unwrap();
+        }
+        *h.minutes.lock().unwrap() = 10;
+        let q2 = SendQueue::at(d.0.join("queue.json"));
+        q2.recover(&h);
+        q2.tick(&h);
+        assert!(h.sent().is_empty());
+        h.turn("t9");
+        h.set("t9", "idle");
+        q2.tick(&h);
+        assert_eq!(h.sent(), ["From Shop › orb rust (t1): the build is green"]);
+        q2.tick(&h);
+        assert_eq!(h.sent().len(), 1, "once");
+    }
+
+    /// A message typed in while its session still works on a task is not
+    /// "the next hand-over" that says the task's turn was over.
+    #[test]
+    fn a_busy_hand_over_says_nothing_about_the_turn_under_way() {
+        use crate::agenda::QueueFact;
+        let (q, _d) = queue();
+        let h = Fake::at(crate::tell::Level::Decisions);
+        let now = crate::history::now_ms();
+        h.set("t2", "idle");
+        h.runs("t2", "claude-code", now - 30 * 60_000);
+        let (Added::Sent { id: task }, ..) = q.add_with(&h, "t2", "port the billing page", &[], None).unwrap() else { panic!() };
+        h.set("t2", "working");
+        q.session_round(&h, "t2");
+        settle(&q);
+        let (Added::Sent { id: msg }, ..) = q.add_with(&h, "t2", "the api is on 3001", &[], Some(&orb())).unwrap() else { panic!("typed in") };
+        assert!(q.typed_while_working(msg));
+        assert!(matches!(q.fact(task), QueueFact::Delivered { next_ms: None, taken: false, finished: false, .. }), "{:?}", q.fact(task));
+        // The turn ends: the task's turn is over (and the message's is next).
+        h.turn("t2");
+        h.set("t2", "done");
+        q.session_round(&h, "t2");
+        assert!(matches!(q.fact(task), QueueFact::Delivered { taken: true, finished: true, .. }), "{:?}", q.fact(task));
     }
 
     #[test]

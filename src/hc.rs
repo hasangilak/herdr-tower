@@ -353,11 +353,25 @@ pub fn list_on(machine: Option<&str>) -> Result<Vec<Value>> {
 }
 
 /// Pastes text into a terminal and presses Enter (one writer at a time; text
-/// that starts with `-` is text, not an option).
+/// that starts with `-` is text, not an option). hc refuses a terminal that
+/// is blocked on a dialog. Enter is all it presses (no Esc, no interrupt):
+/// a Claude Code session that is working keeps what is typed and sends it
+/// as its next message when its turn ends.
 pub fn send(terminal: &str, text: &str) -> Result<()> {
+    send_if(terminal, text, None)
+}
+
+/// `send`, only while the terminal's status is exactly `status` (`idle`,
+/// `working`): hc looks again as it types, and refuses otherwise.
+pub fn send_if(terminal: &str, text: &str, status: Option<&str>) -> Result<()> {
     let text = clean(text);
     let _typing = typing(terminal);
-    let out = run(&["send", "--json", "--", terminal, &text])?;
+    let mut args = vec!["send", "--json"];
+    if let Some(s) = status {
+        args.extend(["--if", s]);
+    }
+    args.extend(["--", terminal, &text]);
+    let out = run(&args)?;
     if out.code != 0 {
         let msg = if out.stderr.trim().is_empty() { out.stdout.trim() } else { out.stderr.trim() };
         bail!("{msg}");

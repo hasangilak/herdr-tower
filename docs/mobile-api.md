@@ -590,13 +590,17 @@ Every message has `space` (a space's name, or `null`).
 
 So the app shows two kinds of conversation from one thread:
 
-- **A space's own**: the messages of kind `request`, `answer` or `receipt`
-  whose `space` is that space. `GET /v1/chat?space=<name>` returns exactly
-  these.
+- **A space's own**: the messages of kind `request`, `answer`, `receipt` or
+  `act` whose `space` is that space. `GET /v1/chat?space=<name>` returns
+  exactly these, and pages back with `before` (the first message's `id`)
+  and `limit` as the main chat does, `more` saying older ones remain. An
+  `act` (what the tower opened in answer to a request) is the conversation
+  of the request it answers: asked of the space's own tower, or of the main
+  tower as `In <space>: …`.
 - **The main one**: everything else, that is every message except the
-  requests and answers that have a `space`. `GET /v1/chat?main=1` returns
-  exactly these. (A receipt that names a space is in both: it is the reply
-  to a request that may have been asked in either place.)
+  requests, answers and acts that have a `space`. `GET /v1/chat?main=1`
+  returns exactly these. (A receipt that names a space is in both: it is
+  the reply to a request that may have been asked in either place.)
 
 `GET /v1/chat` with neither returns every message, as it always did, and a
 `chat` event carries each message with its `space`: put it where the rule
@@ -729,6 +733,7 @@ of one repo waiting for a merge in one space are one decision.
   ],
   "waiting": 2,                      // how many of them are blocked on it now
   "title": "Tabs or a sidebar for the settings?",
+  "detail": "",                      // more to read before deciding: the command, the plan; "" when none
   "why": "design",
   "options": [
     {"label": "Tabs", "why": "matches the mock", "pick": true},
@@ -770,6 +775,16 @@ of one repo waiting for a merge in one space are one decision.
   set to show as the card's steps (`GET /v1/questions/{id}`, or
   `questions` in the state) when it has several questions, more than its
   options say, or a dialog to follow.
+- `detail`: what the `title` can't say, to show under it (monospace keeps
+  a command readable; it can have line breaks), cut to about 600
+  characters with an ellipsis. For a `permission`, the command it would run
+  (a Codex approval's command, the plan to approve for a plan); for a
+  `question`, its question set's detail (the message that asks, its end
+  kept, so it starts with "…" when cut); for `choice` and `raised`, what the
+  tower gave with it (`tower raise --detail`; raised again with another, it
+  changes in place, the same id); `""` for a `merge` (its `prs` say it) and
+  whenever there is nothing more. A tower from before this has no `detail`:
+  read a missing one as `""`.
 - `why`: the reason a question went to the user (the tower's words), the
   category a raise gave (`merge`, `deploy`, `delete`, `data`, `secrets`,
   `money`, `design`, `failed`, `waiting`, …), `merge`, or `failed`.
@@ -960,7 +975,12 @@ user, and where it stands.
   (its last words, cut to 240 characters) are null when not known.
 - `requests`: what the user asked for there (the open ones, oldest first,
   then those finished today): `state` `open`, `done`, `closed` or
-  `abandoned`; `done` of `total` tasks are finished.
+  `abandoned`; `done` of `total` tasks are finished. Only the user's: a
+  message one session sent another is never a request nor a task of one
+  (so a request made only of them isn't listed), and `done`/`total` count
+  the request's own tasks. A request is listed in one space only, the one
+  it was asked in (else that of its first task): the same request is never
+  the current one of two spaces.
 - `thread_count`: how many messages its thread holds in the tower's memory
   (at most 50): whether there is a thread to show.
 - `tower`: the space's own tower (its own brain), or null when it has none
@@ -1306,6 +1326,15 @@ Content-Length: 160044
 415 {"error": {"code": "bad_audio", …}}
 400 {"error": {"code": "bad_length", …}}   // under 0.2 s or over 120 s
 ```
+
+**In a space's view**: `POST /v1/voice?space=<name>` (the name in any case,
+URL-encoded). What was heard goes to that space's own tower, as `POST
+/v1/ask` with `space` does (to the main tower, with the space named in
+front, while the space has none that can take it), and the answer adds
+`"space": name` (its whole name). A name no space has is `404 no_space`,
+before anything is transcribed or saved. Its reply is in that space's
+conversation (see "Whose conversation"). `space` means nothing to
+dictation (`send=0`, `/v1/transcribe`).
 
 **With files**: send `multipart/form-data` instead, the WAV as a part named
 `audio`, and up to 6 file parts as for `/v1/ask`. The transcript gets

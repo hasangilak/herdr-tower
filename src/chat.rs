@@ -196,6 +196,8 @@ pub fn thread_of(
     // What was asked of the main tower and has no answer yet, oldest first:
     // when, and the space it named in front.
     let mut waiting: std::collections::VecDeque<(u64, Option<String>)> = Default::default();
+    // Each request's conversation, by when it was asked: an act answers one.
+    let mut asked_at: std::collections::HashMap<u64, Option<String>> = Default::default();
     for (n, e) in lines.iter().filter(|(_, e)| shown(e)) {
         let own = e.space.clone().filter(|s| !s.is_empty());
         if e.kind == "screenshot" {
@@ -225,8 +227,11 @@ pub fn thread_of(
         if e.kind == "act" {
             let id = e.id.clone().unwrap_or_default();
             let now = acts.iter().find(|a| a["id"].as_str() == Some(id.as_str())).cloned();
-            // Whose conversation: the request it answered was asked there.
-            let asked_in = e.act.as_ref().and_then(|a| a["request_space"].as_str()).map(String::from);
+            // Whose conversation: the request it answered was asked there (of
+            // that space's own tower, or of the main one with the space named in front).
+            let asked_in = e.act.as_ref().and_then(|a| a["request_space"].as_str()).filter(|s| !s.is_empty()).map(String::from).or_else(|| {
+                e.act.as_ref().and_then(|a| a["request_at"].as_u64()).and_then(|at| asked_at.get(&at).cloned().flatten())
+            });
             let act = now.unwrap_or_else(|| act_of_entry(e));
             let text = match act["state"].as_str() {
                 Some("undone") => act["closing"].as_str().or(act["line"].as_str()).unwrap_or(&e.text).to_string(),
@@ -285,6 +290,9 @@ pub fn thread_of(
             ("answer", None) => waiting.pop_front().and_then(|(_, about)| about),
             (_, own) => own,
         };
+        if e.kind == "request" {
+            asked_at.insert(e.at, space.clone());
+        }
         let shots: Vec<Value> = e.shots.iter().filter_map(|id| by_id(id)).map(shot).collect();
         let mut m = json!({
             "id": format!("h{n}"), "at": e.at, "updated_at": e.at, "role": role, "kind": e.kind, "text": text, "source": source,

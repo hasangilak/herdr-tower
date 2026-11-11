@@ -12,7 +12,15 @@
 //! made into `[Image #1]`). The same words again later, or a prompt nothing
 //! was typed for, are the user's. A prompt `hc send` brought from another
 //! terminal (`<hc from="…">`) is that terminal's: a brain's, another
-//! session's.
+//! session's; and so is one that opens the way a message between sessions
+//! does ("From t7h: …", `peers::sender_in`), whoever typed it in. A Claude
+//! Code session's own notice that background work of its own finished
+//! (`<task-notification>`) is that session's, not the user's.
+//!
+//! A message the send queue types into a session that is working (see
+//! `sendq`, `busy_deliver_minutes`) comes back as a prompt only when that
+//! turn ends, maybe hours later: its words are kept (`held`) until a prompt
+//! takes them, for up to a day.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -27,6 +35,9 @@ const JUST_MS: u64 = 5_000;
 const SENDING_MS: u64 = 90_000;
 /// Texts kept, all terminals together.
 const KEEP: usize = 200;
+/// What the tower typed into a session while it worked is matched by its
+/// words this long: its prompt comes when that turn ends.
+const HELD_MS: u64 = 24 * 3_600_000;
 
 /// One text the tower typed (or is typing) into a terminal.
 #[derive(Debug, Clone, PartialEq)]
@@ -42,6 +53,16 @@ pub struct Typed {
     pub done_ms: Option<u64>,
     /// A prompt took it already: the same words again are someone else's.
     pub taken: bool,
+    /// Typed in while its session worked: its prompt comes when that turn
+    /// ends (its words are the tower's until then, up to `HELD_MS`).
+    pub held: bool,
+}
+
+impl Typed {
+    /// How long a prompt with its words is the tower's.
+    fn window(&self) -> u64 {
+        if self.held { HELD_MS } else { WORDS_MS }
+    }
 }
 
 /// Whose a prompt is.
@@ -49,8 +70,12 @@ pub struct Typed {
 pub enum Whose {
     /// The tower typed it (`by`: what of the tower).
     Tower(String),
-    /// Another terminal handed it over with `hc send` (its address): a brain, another session.
+    /// Another terminal handed it over with `hc send` (its address): a brain,
+    /// another session; or it opens the way a message from another session does.
     Terminal(String),
+    /// The session's own program: Claude Code telling it that background
+    /// work of its own finished (`<task-notification>`).
+    Session,
     /// Nothing the tower typed: the user, in the session's own terminal.
     User,
 }
@@ -66,14 +91,25 @@ pub struct Log {
 impl Log {
     /// The tower is about to type `text` into `terminal`: its id, for `done`.
     pub fn note(&mut self, terminal: &str, text: &str, by: &str, now: u64) -> u64 {
+        self.note_as(terminal, text, by, false, now)
+    }
+
+    /// `note`; `held`: typed in while the session works (its prompt comes
+    /// when that turn ends). The turn it works on stays whoever's it was.
+    pub fn note_as(&mut self, terminal: &str, text: &str, by: &str, held: bool, now: u64) -> u64 {
         self.next += 1;
-        self.typed.retain(|t| now.saturating_sub(t.at_ms) < WORDS_MS + SENDING_MS);
+        self.typed.retain(|t| now.saturating_sub(t.at_ms) < t.window() + SENDING_MS);
         if self.typed.len() >= KEEP {
-            self.typed.remove(0);
+            // The oldest goes; one still held for its turn's end only when nothing else can.
+            let i = self.typed.iter().position(|t| !t.held || t.taken).unwrap_or(0);
+            self.typed.remove(i);
         }
-        self.typed.push(Typed { id: self.next, terminal: terminal.into(), words: words(text), by: by.into(), at_ms: now, done_ms: None, taken: false });
-        // What the tower types next is no turn of the user's.
-        self.user.remove(terminal);
+        self.typed.push(Typed { id: self.next, terminal: terminal.into(), words: words(text), by: by.into(), at_ms: now, done_ms: None, taken: false, held });
+        // What the tower types next is no turn of the user's (typed in while it
+        // works, it comes after the turn under way, which stays theirs).
+        if !held {
+            self.user.remove(terminal);
+        }
         self.next
     }
 
@@ -124,11 +160,19 @@ impl Log {
         if let Some(t) = self
             .typed
             .iter_mut()
-            .filter(|t| t.terminal == terminal && !t.taken && at_ms.saturating_sub(t.at_ms) < WORDS_MS && t.at_ms <= at_ms + 2_000)
+            .filter(|t| t.terminal == terminal && !t.taken && at_ms.saturating_sub(t.at_ms) < t.window() && t.at_ms <= at_ms + 2_000)
             .find(|t| same_words(&said, &t.words))
         {
             t.taken = true;
             return Whose::Tower(t.by.clone());
+        }
+        // Claude Code's own word that background work of its session finished.
+        if said.starts_with("<task-notification>") {
+            return Whose::Session;
+        }
+        // It opens as a message from another session does, whoever typed it in.
+        if let Some(from) = crate::peers::sender_in(&said) {
+            return Whose::Terminal(from);
         }
         // Other words, but the tower is typing into it this moment, or just was: the
         // tower's (said differently). Not taken: its own prompt may still come.
@@ -215,6 +259,11 @@ fn log() -> std::sync::MutexGuard<'static, Log> {
 /// The daemon's: the tower is about to type `text` into `terminal`.
 pub fn note(terminal: &str, text: &str, by: &str) -> u64 {
     log().note(terminal, text, by, crate::history::now_ms())
+}
+
+/// `note`; `held`: into a session that works (its prompt comes when that turn ends).
+pub fn note_as(terminal: &str, text: &str, by: &str, held: bool) -> u64 {
+    log().note_as(terminal, text, by, held, crate::history::now_ms())
 }
 
 /// The daemon's: the typing of `id` is over.
@@ -336,6 +385,42 @@ mod tests {
         l.note("t5", "From Shop › api (t6): the schema changed", "queue", T0 + 5_000);
         assert!(!l.users("t5", T0));
         assert!(l.typed_lately("t5", T0 + 6_000, 20_000) && !l.typed_lately("t5", T0 + 60_000, 20_000) && !l.typed_lately("t6", T0 + 6_000, 20_000));
+    }
+
+    /// What the send queue typed in while the session worked comes back as
+    /// a prompt when that turn ends, hours later maybe: still the tower's.
+    /// The turn under way stays the user's meanwhile.
+    #[test]
+    fn what_was_typed_in_while_it_worked_is_the_towers_when_its_turn_ends() {
+        let mut l = Log::default();
+        assert_eq!(l.whose("t5", "refactor the billing module", None, T0), Whose::User);
+        let id = l.note_as("t5", "From Shop › api (t6): the schema changed", "queue", true, T0 + 60_000);
+        l.done(id, true, T0 + 61_000);
+        assert!(l.users("t5", T0), "the turn it works on is still the user's");
+        let three_hours = T0 + 3 * 3_600_000;
+        assert_eq!(l.whose("t5", "From Shop › api (t6): the schema changed", None, three_hours), Whose::Tower("queue".into()));
+        // Once: the same words later are someone else's (they open as a message from t6: that session's).
+        assert_eq!(l.whose("t5", "From Shop › api (t6): the schema changed", None, three_hours + 1_000), Whose::Terminal("t6".into()));
+        // Not held: after ten minutes its words are no longer the tower's.
+        let id = l.note("t8", "run the migrations check please", "queue", T0);
+        l.done(id, true, T0 + 100);
+        assert_eq!(l.whose("t8", "run the migrations check please", None, T0 + WORDS_MS + 1), Whose::User);
+    }
+
+    /// A message from another session is no prompt of the user's, however it
+    /// came in (another terminal's paste, not the queue); nor is Claude Code's
+    /// notice that background work of the session's own finished.
+    #[test]
+    fn a_message_or_a_notice_is_not_the_users_prompt() {
+        let mut l = Log::default();
+        let from = "<pasted_content id=\"2248\">\nFrom t7p (m5pro herder tower). Sorry for the silence: your messages reached me late.\n</pasted_content id=\"2248\">";
+        assert_eq!(l.whose("t7r", from, None, T0), Whose::Terminal("t7p".into()));
+        assert_eq!(l.whose("t7r", "From Sandbox › eyzflow (t7h): the plan is on the page", None, T0), Whose::Terminal("t7h".into()));
+        assert_eq!(l.whose("t7p", "<task-notification> <summary>Goal check-in: background work still running</summary> </task-notification>", None, T0), Whose::Session);
+        assert!(!l.users("t7p", T0) && !l.users("t7r", T0));
+        // The user's own words, even about a session.
+        assert_eq!(l.whose("t7r", "From now on, run the tests before every commit", None, T0), Whose::User);
+        assert_eq!(l.whose("t7r", "from t7p's branch, cherry-pick the fix", None, T0), Whose::User);
     }
 
     #[test]

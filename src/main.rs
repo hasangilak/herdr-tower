@@ -464,6 +464,10 @@ enum Cmd {
         /// The choices to offer, the recommended one first: `[{"label":"…","why":"…"}]`.
         #[arg(long)]
         options: Option<String>,
+        /// What it is about, more than the line says: the command it would run, the plan, the
+        /// change (shown with it, cut to about 600 characters).
+        #[arg(long)]
+        detail: Option<String>,
         /// The decision, in one line.
         #[arg(required = true)]
         text: Vec<String>,
@@ -910,7 +914,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Tell { level, voice } => tell_cmd(level.as_deref(), voice.as_deref()),
         Cmd::Undo { id, force, json } => undo_cmd(id.as_deref(), force, json),
         Cmd::Acts { json } => acts_cmd(json),
-        Cmd::Raise { session, why, options, text } => {
+        Cmd::Raise { session, why, options, detail, text } => {
             let options: Option<Value> = match options.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
                 Some(o) => match serde_json::from_str::<Value>(o) {
                     Ok(v) if v.is_array() => Some(v),
@@ -919,7 +923,8 @@ fn run(cli: Cli) -> Result<()> {
                 },
                 None => None,
             };
-            let r = protocol::send(&Request::Raise { session, why, text: text.join(" "), options, from: peers::caller() })?;
+            let detail = detail.map(|d| d.trim().to_string()).unwrap_or_default();
+            let r = protocol::send(&Request::Raise { session, why, text: text.join(" "), options, detail, from: peers::caller() })?;
             if !r.ok {
                 bail!("{}", r.error.unwrap_or_default());
             }
@@ -1289,7 +1294,13 @@ fn queue_cmd(args: &[String]) -> Result<()> {
             if v["sent"] == true { "Message sent to" } else { "Message queued for" },
             v["session"].as_str().unwrap_or(""),
             v["name"].as_str().unwrap_or(""),
-            if v["sent"] == true { "" } else { " It goes in when that session stops working; you are told only if it can't be delivered." }
+            if v["while_working"] == true {
+                " It was typed in while that session works: it reads it when its turn ends."
+            } else if v["sent"] == true {
+                ""
+            } else {
+                " It goes in when that session stops working (or, once a Claude Code session has worked a long while, is typed in to be read when its turn ends); you are told only if it can't be delivered."
+            }
         ),
         "add" if v["sent"] == true => println!(
             "Sent #{} to {} ({}): it was free. Watching it: you'll get a [watch] message when it stops working.{}",

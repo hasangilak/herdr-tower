@@ -66,8 +66,10 @@ pub enum Source {
     /// `attachments`: images sent with it (saved paths), passed on as the panel does.
     /// `markers`: their tokens (`[Image #1]`, ...). `send`: false only transcribes.
     /// `phone`: the device whose replies are heard on it only (route `phone`).
-    /// `device`: the phone that sent it (for the chat).
-    Phone { reply: std::sync::mpsc::Sender<String>, attachments: Vec<String>, markers: Vec<String>, send: bool, phone: Option<String>, device: String },
+    /// `device`: the phone that sent it (for the chat). `space`: said in
+    /// that space's view, so it goes to that space's tower (as `/v1/ask`
+    /// with `space`).
+    Phone { reply: std::sync::mpsc::Sender<String>, attachments: Vec<String>, markers: Vec<String>, send: bool, phone: Option<String>, device: String, space: Option<String> },
 }
 
 pub struct Utterance {

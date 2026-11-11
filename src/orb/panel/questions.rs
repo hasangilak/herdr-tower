@@ -671,6 +671,9 @@ impl Panel {
                 out.push(
                     div().px_2().py_1().rounded(px(8.0)).bg(rgba(0x0000002e)).font_family("Menlo").text_xs().line_clamp(if short { 4 } else { 8 }).child(set.detail.clone()).into_any_element(),
                 );
+            } else if !d.detail.trim().is_empty() {
+                // The set says nothing more (read before its detail came): the decision's.
+                out.push(super::home::detail_block(&d.detail, if short { 4 } else { 8 }));
             }
         }
         // The dialog's own options a short card's buttons don't already stand

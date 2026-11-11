@@ -125,6 +125,7 @@ pub fn run(json_text: &str, dry_run: bool) -> Result<()> {
             project: t.project.clone(),
             space: t.space.clone(),
             skip: false,
+            from: None,
         };
         let (line, id, task) = match &routes[&t.id] {
             Route::Queue { session } => queue(session, &t.instruction, &after, tag)?,

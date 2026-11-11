@@ -48,7 +48,7 @@ impl Lan {
             ("POST", ["decisions", id, "voice"]) => t().and_then(|t| {
                 let tab = q("tab").and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
                 let (tab_of, question) = self.decision_tab(t, id, tab)?;
-                let heard = self.voice(req, false, device);
+                let heard = self.voice(req, false, device, None);
                 if heard.status != 200 {
                     return Err(heard);
                 }
@@ -821,6 +821,8 @@ mod tests {
         tower: Arc<Fake>,
         history: PathBuf,
         go: Sender<()>,
+        /// What the phone's takes are handed to (the transcriber's end).
+        stt: Mutex<Receiver<crate::daemon::mic::Utterance>>,
     }
 
     const SPACES: [&str; 4] = ["Shop", "B2C support", "Docs", "Q&A / ünï"];
@@ -837,8 +839,7 @@ mod tests {
             }
         });
         let hub = Arc::new(Hub::default());
-        let (stt, rx) = channel();
-        std::mem::forget(rx);
+        let (stt, takes) = channel();
         let shared = Shared::new(State::new("ptt", "af_bella", "test"));
         let muted = ui.clone();
         let decisions = Decisions::new(shared.clone()).muted_by(move || spaces::load_from(&muted).mute.into_iter().collect());
@@ -895,7 +896,7 @@ mod tests {
         let paired = call(addr, &fp, "POST", "/v1/pair", None, &format!(r#"{{"code":"{code}","name":"Pixel 9"}}"#)).unwrap().1;
         assert_eq!(paired["features"], json!(FEATURES), "a phone knows what this tower has from the moment it pairs");
         let (token, device) = (paired["token"].as_str().unwrap().to_string(), paired["device"]["id"].as_str().unwrap().to_string());
-        Rig { lan, dir, addr, fp, token, device, tower, history, go }
+        Rig { lan, dir, addr, fp, token, device, tower, history, go, stt: Mutex::new(takes) }
     }
 
     impl Rig {
@@ -920,7 +921,7 @@ mod tests {
                 .collect();
             self.tower
                 .decisions
-                .raise(Raise { space: Some(space.into()), who: None, why: "design".into(), text: text.into(), options })
+                .raise(Raise { detail: String::new(), space: Some(space.into()), who: None, why: "design".into(), text: text.into(), options })
                 .0
                 .id
         }
@@ -1207,7 +1208,7 @@ mod tests {
         let d = &r.tower.decisions;
         let choice = r.raise("Shop", "Tabs or a sidebar for settings?", &["Tabs", "A sidebar"]);
         let risky = r.raise("Shop", "Deploy the cart change to production?", &["Yes", "No"]);
-        let plain = d.raise(Raise { space: Some("Shop".into()), who: None, why: "waiting".into(), text: "The APK needs testing".into(), options: vec![] }).0.id;
+        let plain = d.raise(Raise { detail: String::new(), space: Some("Shop".into()), who: None, why: "waiting".into(), text: "The APK needs testing".into(), options: vec![] }).0.id;
         assert_eq!(r.stranger("POST", &format!("/v1/decisions/{choice}/rule")), 401);
         // Not answered yet: nothing to make a rule of.
         let (st, v) = r.post(&format!("/v1/decisions/{choice}/rule"), "{}");
@@ -1247,6 +1248,7 @@ mod tests {
         let d = &r.tower.decisions;
         let id = d
             .raise(Raise {
+                detail: String::new(),
                 space: Some("Shop".into()),
                 who: who("tw-q-a"),
                 why: "design".into(),
@@ -1256,6 +1258,7 @@ mod tests {
             .0
             .id;
         d.raise(Raise {
+            detail: String::new(),
             space: Some("Shop".into()),
             who: who("tw-q-b"),
             why: "design".into(),
@@ -1332,6 +1335,7 @@ mod tests {
         let d = &r.tower.decisions;
         let again = d
             .raise(Raise {
+                detail: String::new(),
                 space: Some("B2C support".into()),
                 who: Some(crate::decisions::Who::new("tw-q-c", "api")),
                 why: "deploy".into(),
@@ -1883,6 +1887,116 @@ mod tests {
         assert_eq!(ids("/v1/chat?space=b2c%20support"), ["h11", "h12"]);
         assert_eq!(ids("/v1/chat?main=1"), ["h1", "h2", "h13"], "the main one: clean of the spaces' own, with the receipt");
         assert_eq!(ids("/v1/chat?space=Shop&limit=1&before=h13"), ["h10"]);
+        r.end();
+    }
+
+    /// A take spoken in a space's view goes to that space's tower, as a
+    /// typed request there does (`/v1/ask` with `space`); a name no space
+    /// has is refused before anything is transcribed.
+    #[test]
+    fn a_spoken_request_in_a_space_goes_to_its_tower() {
+        let r = rig("voice-space");
+        let wav = super::super::audio::wav_encode(&vec![0.0f32; 8_000], 16_000);
+        let post = |path: &str| call_raw(r.addr, &r.fp, "POST", path, &r.token, "audio/wav", &wav).unwrap();
+        // Heard as the transcriber would: what comes in, with where it was said.
+        let hear = |said: &'static str| {
+            let rx = r.stt.lock().unwrap();
+            let u = rx.recv_timeout(Duration::from_secs(10)).expect("a take for the transcriber");
+            match u.source {
+                crate::daemon::mic::Source::Phone { reply, send, space, device, .. } => {
+                    reply.send(said.to_string()).unwrap();
+                    (space, send, device)
+                }
+                _ => panic!("not the phone's"),
+            }
+        };
+        let (st, v) = post("/v1/voice?space=Nowhere");
+        assert_eq!((st, code(&v)), (404, Some("no_space")), "{v}");
+        assert!(r.stt.lock().unwrap().try_recv().is_err(), "nothing was handed on");
+        let (got, answer) = thread::scope(|s| {
+            let call = s.spawn(|| post("/v1/voice?space=b2c%20support"));
+            let got = hear("what's left here");
+            (got, call.join().unwrap())
+        });
+        assert_eq!(got, (Some("B2C support".to_string()), true, r.device.clone()), "by its whole name, in any case");
+        assert_eq!(answer.0, 200);
+        assert_eq!((answer.1["heard"].as_str(), answer.1["sent"].as_bool(), answer.1["space"].as_str()), (Some("what's left here"), Some(true), Some("B2C support")));
+        // Said to the tower itself: no space, as before.
+        let (got, answer) = thread::scope(|s| {
+            let call = s.spawn(|| post("/v1/voice"));
+            (hear("what's everyone doing"), call.join().unwrap())
+        });
+        assert_eq!((got.0, answer.0, answer.1.get("space")), (None, 200, None));
+        // Dictation takes no space: only the words come back.
+        let (got, answer) = thread::scope(|s| {
+            let call = s.spawn(|| post("/v1/voice?send=0&space=Nowhere"));
+            (hear("a draft"), call.join().unwrap())
+        });
+        assert_eq!((got.0, got.1, answer.0, answer.1["sent"].as_bool()), (None, false, 200, Some(false)));
+        r.end();
+    }
+
+    /// A space's own conversation pages back like the main chat, and what the
+    /// tower opened in answer to a request asked there (an act) is in it, and
+    /// not in the main one: asked of its own tower, or of the main tower with
+    /// the space named in front.
+    #[test]
+    fn a_spaces_conversation_pages_back_and_holds_its_acts() {
+        let r = rig("space-chat");
+        let act = |id: &str, at: u64, asked_at: u64, asked_in: Option<&str>| {
+            let a = crate::acts::Act {
+                id: id.into(),
+                kind: "start".into(),
+                at_ms: at,
+                by: "tower".into(),
+                space: Some("Shop".into()),
+                sessions: vec![crate::acts::Opened { address: "t9".into(), name: "cart fix".into(), ..Default::default() }],
+                request: Some(crate::acts::Asked { at: asked_at, text: "open a session".into(), space: asked_in.map(String::from) }),
+                state: "done".into(),
+                ..Default::default()
+            };
+            let mut e = a.entry();
+            e.at = at;
+            serde_json::to_value(e).unwrap()
+        };
+        let mut lines = vec![
+            json!({ "at": 100, "kind": "request", "text": "what's everyone doing?", "source": "mac" }),
+            json!({ "at": 110, "kind": "answer", "text": "Nothing is blocked." }),
+            json!({ "at": 120, "kind": "request", "text": "open a session for the cart fix", "source": "phone:d_1", "space": "Shop" }),
+            act("r000000000001", 125, 120, Some("Shop")),
+            json!({ "at": 130, "kind": "answer", "text": "Opened cart fix in Shop.", "space": "Shop" }),
+            json!({ "at": 140, "kind": "request", "text": "In B2C support: open a session for the refunds", "source": "mac" }),
+            act("r000000000002", 145, 140, None),
+            json!({ "at": 150, "kind": "answer", "text": "Opened refunds." }),
+        ];
+        for i in 0..6u64 {
+            lines.push(json!({ "at": 200 + 10 * i, "kind": if i % 2 == 0 { "request" } else { "answer" }, "text": format!("shop {i}"), "space": "Shop", "source": "mac" }));
+        }
+        std::fs::write(&r.history, lines.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
+        let page = |path: &str| {
+            let (st, v) = r.get(path);
+            assert_eq!(st, 200, "{path}: {v}");
+            let ids = v["messages"].as_array().unwrap().iter().map(|m| format!("{}:{}", m["id"].as_str().unwrap(), m["kind"].as_str().unwrap())).collect::<Vec<_>>();
+            (ids, v["more"].as_bool().unwrap())
+        };
+        let (shop, more) = page("/v1/chat?space=shop");
+        assert_eq!(shop, ["h3:request", "h4:act", "h5:answer", "h9:request", "h10:answer", "h11:request", "h12:answer", "h13:request", "h14:answer"]);
+        assert!(!more);
+        // Back, a page at a time, as the main chat pages.
+        let (p1, more1) = page("/v1/chat?space=Shop&limit=4");
+        assert_eq!((p1, more1), (vec!["h11:request".to_string(), "h12:answer".into(), "h13:request".into(), "h14:answer".into()], true));
+        let (p2, more2) = page("/v1/chat?space=Shop&limit=4&before=h11");
+        assert_eq!((p2, more2), (vec!["h4:act".to_string(), "h5:answer".into(), "h9:request".into(), "h10:answer".into()], true));
+        let (p3, more3) = page("/v1/chat?space=Shop&limit=4&before=h4");
+        assert_eq!((p3, more3), (vec!["h3:request".to_string()], false));
+        // The act of the request asked of the main tower for B2C support is that conversation's.
+        let (b2c, _) = page("/v1/chat?space=B2C%20support");
+        assert_eq!(b2c, ["h6:request", "h7:act", "h8:answer"]);
+        // And the main one has neither act.
+        let (main, _) = page("/v1/chat?main=1");
+        assert_eq!(main, ["h1:request", "h2:answer"]);
+        let (_, v) = r.get("/v1/chat?space=Shop&limit=1&before=h5");
+        assert_eq!((v["messages"][0]["act"]["id"].as_str(), v["messages"][0]["space"].as_str()), (Some("r000000000001"), Some("Shop")));
         r.end();
     }
 

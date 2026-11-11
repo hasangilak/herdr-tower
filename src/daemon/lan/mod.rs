@@ -1212,7 +1212,7 @@ impl Lan {
                 };
                 let tab = q("tab").and_then(|t| t.parse::<usize>().ok()).unwrap_or(0);
                 let Some(t) = set.tabs.get(tab).cloned() else { return Some(Response::error(400, "bad_tab", "no such tab")) };
-                let heard = self.voice(req, false, &device);
+                let heard = self.voice(req, false, &device, None);
                 if heard.status != 200 {
                     return Some(heard);
                 }
@@ -1486,8 +1486,8 @@ impl Lan {
                 }
             }
             // Transcribe only: the text comes back, nothing goes to the tower.
-            ("POST", ["voice"]) => self.voice(req, q("send") != Some("0"), &device),
-            ("POST", ["transcribe"]) => self.voice(req, false, &device),
+            ("POST", ["voice"]) => self.voice(req, q("send") != Some("0"), &device, q("space")),
+            ("POST", ["transcribe"]) => self.voice(req, false, &device, None),
             ("DELETE", ["device"]) => {
                 if let Err(e) = self.devices.update(|d| d.revoke(&device.id)) {
                     return Some(Response::error(503, "save", &format!("{e:#}")));
@@ -1703,8 +1703,16 @@ impl Lan {
 
     /// A recording from the phone: transcribed by the tower's Whisper, then
     /// handed to the brain like a press-to-talk take (`send`), or only
-    /// transcribed. Everything is checked before a file is saved.
-    fn voice(&self, req: &Request, send: bool, device: &auth::Device) -> Response {
+    /// transcribed. Everything is checked before a file is saved. `space`
+    /// (`?space=`): said in that space's view, so it goes to that space's
+    /// tower, as `/v1/ask` with `space` (a name no space has: `404 no_space`,
+    /// before anything is transcribed or saved).
+    fn voice(&self, req: &Request, send: bool, device: &auth::Device, space: Option<&str>) -> Response {
+        let space = match space.map(str::trim).filter(|s| send && !s.is_empty()).map(|want| self.space_named(want)) {
+            Some(Ok(name)) => Some(name),
+            Some(Err(r)) => return r,
+            None => None,
+        };
         // A WAV body, or multipart: the WAV as `audio`, files beside it.
         let (wav, files): (&[u8], Vec<multipart::Part>) = match req.header("content-type").and_then(multipart::boundary) {
             Some(b) => match multipart::parse(&req.body, &b) {
@@ -1748,12 +1756,19 @@ impl Lan {
             send,
             phone: heard_on_phone(device),
             device: device.id.clone(),
+            space: space.clone(),
         };
         if self.ctx.stt.send(Utterance { samples, source }).is_err() {
             return Response::error(503, "stt", "the transcriber isn't running");
         }
         match rx.recv_timeout(Duration::from_secs(90)) {
-            Ok(heard) if send => Response::json(200, &json!({ "heard": heard, "sent": true, "attachments": attachments })),
+            Ok(heard) if send => {
+                let mut v = json!({ "heard": heard, "sent": true, "attachments": attachments });
+                if let Some(space) = &space {
+                    v["space"] = json!(space);
+                }
+                Response::json(200, &v)
+            }
             Ok(heard) => Response::json(200, &json!({ "heard": heard, "sent": false })),
             // Nothing worth sending (silence, noise, a stop word).
             Err(_) => Response::json(200, &json!({ "heard": "", "sent": false })),

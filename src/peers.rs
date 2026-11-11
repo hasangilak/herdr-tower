@@ -134,6 +134,58 @@ pub fn signed(from: &Sender, text: &str) -> String {
 /// something the user said.
 pub const TO_BRAIN: &str = "[session] ";
 
+/// The session a text says it comes from, by the way a message between
+/// sessions opens: the tower's own signature (`header`: "From Shop › web
+/// (t7h): …", "From web (t7h): …"), or as sessions sign their own ("From
+/// t7h: …", "From t7h (web). …", "From t7p, at the user's request: …"). An
+/// address is `t`, a digit, then letters or digits (`t7`, `t7h`, `t58`),
+/// maybe after its machine (`vps/t2`). Any case; a `<pasted_content …>` (or
+/// `[session] `) in front is passed over. None: it opens no such way (the
+/// user's own words, a brain's instruction, "From the orb session: …").
+pub fn sender_in(text: &str) -> Option<String> {
+    let mut t = text.trim_start();
+    t = t.strip_prefix(TO_BRAIN).unwrap_or(t).trim_start();
+    if t.starts_with("<pasted_content")
+        && let Some(end) = t.find('>')
+    {
+        t = t[end + 1..].trim_start();
+    }
+    if !t.get(..5).is_some_and(|h| h.eq_ignore_ascii_case("from ")) {
+        return None;
+    }
+    let rest = &t[5..];
+    if let Some(a) = address_at(rest) {
+        return Some(a);
+    }
+    // "From <name> (t7h)": the address in brackets, on the first line.
+    let line: String = rest.lines().next().unwrap_or("").chars().take(160).collect();
+    let open = line.find('(')?;
+    let close = open + line[open..].find(')')?;
+    let inside = line[open + 1..close].trim();
+    address_at(inside).filter(|a| a.len() == inside.len())
+}
+
+/// A session's address at the start of `s` (`t7h`, `vps/t2`), as a whole
+/// word: "t7p's" is no address, nor is "the".
+fn address_at(s: &str) -> Option<String> {
+    let token: String = s.chars().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.')).collect();
+    let token = token.trim_end_matches('.');
+    let next = s[token.len()..].chars().next();
+    if next.is_some_and(|c| c == '\'' || c == '’' || c.is_alphanumeric()) {
+        return None;
+    }
+    let (machine, address) = match token.rsplit_once('/') {
+        Some((m, a)) => (Some(m), a),
+        None => (None, token),
+    };
+    if machine.is_some_and(|m| m.is_empty() || m.contains('/')) {
+        return None;
+    }
+    let mut c = address.chars();
+    let ok = matches!(c.next(), Some('t' | 'T')) && c.next().is_some_and(|d| d.is_ascii_digit()) && c.all(|x| x.is_ascii_alphanumeric());
+    ok.then(|| token.to_lowercase())
+}
+
 /// Ends a session's message to a brain: what a turn on it is, and how it is answered.
 pub const BRAIN_TAIL: &str = " (A note from that session, not from the user: nothing you write on this turn is shown or spoken. If it needs an answer, `tower queue` it to that session; `tower raise` what only the user can decide.)";
 
@@ -410,6 +462,42 @@ mod tests {
         let note = for_brain(&from_own, "open a session for billing");
         assert!(note.starts_with("[session] From Sandbox › tower sandbox (t12): open a session for billing"), "{note}");
         assert!(crate::brain::is_note_prompt(&note) && crate::brain::session_in(&note).as_deref() == Some("t12"));
+    }
+
+    /// How a message between sessions opens says who sent it, as the tower
+    /// signs it and as sessions sign their own; the user's words don't.
+    #[test]
+    fn a_message_says_who_it_is_from_by_how_it_opens() {
+        for (text, from) in [
+            ("From Shop › orb rust (t7h): which port?", "t7h"),
+            ("From orb rust (t7h): which port?", "t7h"),
+            ("From t7h: thanks, all of it is in", "t7h"),
+            ("From t7h, from t7k, one small addition", "t7h"),
+            ("From t7h (sandbox-eyzflow). New steer from the user", "t7h"),
+            ("From t7h. Thanks, all four objections", "t7h"),
+            ("From t7p (Claude in ~/Work/herder-tower, M5 Pro space). The Mac side", "t7p"),
+            ("from t58 the build is green", "t58"),
+            ("From vps/t2: the migration ran", "vps/t2"),
+            ("[session] From Docs › guide (t9): renamed", "t9"),
+            ("<pasted_content id=\"1\">\nFrom t7r (Android). Status", "t7r"),
+        ] {
+            assert_eq!(sender_in(text).as_deref(), Some(from), "{text}");
+        }
+        for text in [
+            "From the orb session: ready when you are",
+            "From now on, ask me first",
+            "From t7p's branch, cherry-pick the fix",
+            "From the user (t5 asked): x",
+            "fix the login",
+            "Wait for instructions from the user. Do nothing until told.",
+            "About \"Phone check\": the user decided: It arrived",
+            "From tower-sandbox: x",
+        ] {
+            assert_eq!(sender_in(text), None, "{text}");
+        }
+        // What the tower signs, it reads back.
+        let s = Sender { address: "t12".into(), name: "tower sandbox".into(), space: Some("Sandbox".into()) };
+        assert_eq!(sender_in(&signed(&s, "hello")).as_deref(), Some("t12"));
     }
 
     #[test]

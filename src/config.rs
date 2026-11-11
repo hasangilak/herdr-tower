@@ -169,6 +169,8 @@ pub struct Config {
     pub spaces: Spaces,
     /// The agenda ledger (`[agenda]`).
     pub agenda: Agenda,
+    /// The send queue (`[queue]`).
+    pub queue: Queue,
     /// The tower's brains (`[brains]`): one per open space, and the model they run on.
     pub brains: Brains,
     /// What `tower launch` opens (`[[setups]]`, `tower setups`).
@@ -243,6 +245,24 @@ pub struct Agenda {
 impl Default for Agenda {
     fn default() -> Self {
         Self { retry_failed: true }
+    }
+}
+
+/// `[queue]` in config.toml: the send queue (`tower queue`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Queue {
+    /// A message one session queues for another waits while its receiver
+    /// works; when the receiver is a Claude Code session that has been
+    /// working longer than this (minutes), it is typed in anyway: Claude
+    /// Code keeps what is typed while it works and sends it as its next
+    /// message when its turn ends. 0: never (it waits for the turn to end).
+    pub busy_deliver_minutes: u64,
+}
+
+impl Default for Queue {
+    fn default() -> Self {
+        Self { busy_deliver_minutes: 10 }
     }
 }
 
@@ -349,6 +369,7 @@ impl Default for Config {
             tell: Tell::default(),
             spaces: Spaces::default(),
             agenda: Agenda::default(),
+            queue: Queue::default(),
             brains: Brains::default(),
             setups: vec![],
         }
@@ -552,6 +573,14 @@ mod tests {
         // Fixed, with other words: those hold from then on.
         let now = Config::kept(Config::from_text("[spaces]\nauto_close_hours = 48\n"), &mut last);
         assert_eq!((now.spaces.auto_close_hours, last.as_ref().map(|c| c.spaces.auto_close_hours)), (48, Some(48)));
+    }
+
+    #[test]
+    fn a_message_goes_into_a_busy_session_after_ten_minutes_unless_set_otherwise() {
+        assert_eq!(Config::default().queue.busy_deliver_minutes, 10);
+        assert_eq!(Config::from_text("[queue]\nbusy_deliver_minutes = 0\n").unwrap().queue.busy_deliver_minutes, 0, "0: never");
+        assert_eq!(Config::from_text("[queue]\nbusy_deliver_minutes = 30\n").unwrap().queue.busy_deliver_minutes, 30);
+        assert_eq!(Config::from_text("voice = \"af_bella\"\n").unwrap().queue.busy_deliver_minutes, 10, "a file from before has the default");
     }
 
     /// A config.toml as an install from before the brains' own table has it.

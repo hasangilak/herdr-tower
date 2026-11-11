@@ -315,7 +315,7 @@ impl Daemon {
         let whose = typed::whose(&ev.terminal, &ev.text, given.as_deref(), ev.at_ms);
         if whose != typed::Whose::User {
             eprintln!("[terminal] {}: a prompt from {whose:?}, not the user's", ev.terminal);
-            self.asks.typed_by_tower(&ev.terminal);
+            self.asks.typed_by_tower(&ev.terminal, crate::hc::turn(t));
             return;
         }
         let (d, ev, t) = (self.clone(), ev.clone(), t.clone());
@@ -526,7 +526,7 @@ impl Daemon {
                 };
             }
             Request::Missions => return Response { ok: true, error: None, state: Some(self.missions.now()) },
-            Request::Raise { session, why, text, options, from } => return self.raise(&session, &why, &text, options, from.as_deref()),
+            Request::Raise { session, why, text, options, detail, from } => return self.raise(&session, &why, &text, &detail, options, from.as_deref()),
             Request::Receipt { text, agenda, from } => return self.receipt(&text, agenda.as_deref(), from.as_deref()),
             Request::Model { model, effort, restart } => return self.model(model.as_deref(), effort.as_deref(), restart),
             Request::Brains { action, space } => {
@@ -798,7 +798,11 @@ impl Daemon {
                 };
                 let (id, address, name, mut v) = match added {
                     Ok((sendq::Added::Sent { id }, address, name)) => {
-                        let v = serde_json::json!({ "sent": true, "id": id, "session": address, "name": name });
+                        let mut v = serde_json::json!({ "sent": true, "id": id, "session": address, "name": name });
+                        // Typed in while it works (a message between sessions): it reads it when that turn ends.
+                        if self.sendq.typed_while_working(id) {
+                            v["while_working"] = true.into();
+                        }
                         (id, address, name, v)
                     }
                     Ok((sendq::Added::Queued { id, position, status }, address, name)) => {
@@ -818,7 +822,10 @@ impl Daemon {
                     crate::peers::Route::Instruction { text } => {
                         // More work for a session the tower just opened: its act is no longer undone lightly.
                         acts::given(&address, &text);
-                        let r = self.ledger(id, &address, &name, &text, tag);
+                        // A session's own (while the tower tells everything, a task): who sent it, so it is no request of the user's.
+                        let mut tag = tag.unwrap_or_default();
+                        tag.from = caller.as_ref().and_then(crate::peers::sender_of).map(|s| s.address);
+                        let r = self.ledger(id, &address, &name, &text, Some(tag));
                         ok(with_agenda(v, r))
                     }
                 }
@@ -930,7 +937,7 @@ impl Daemon {
     /// the same thing raised again (or one the tower already shows: a merge,
     /// a session's own wait) joins that decision and says nothing, unless
     /// the tower tells everything.
-    fn raise(&self, session: &str, why: &str, text: &str, options: Option<serde_json::Value>, from: Option<&str>) -> Response {
+    fn raise(&self, session: &str, why: &str, text: &str, detail: &str, options: Option<serde_json::Value>, from: Option<&str>) -> Response {
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
         if text.is_empty() {
             return Response::err("tower raise <session> --why \"<category>\" \"<the decision, one line>\"");
@@ -952,7 +959,7 @@ impl Daemon {
         let waiting = t.as_ref().is_none_or(|t| crate::hc::status(t) != crate::hc::SessionStatus::Working);
         let who = live.then(|| crate::decisions::Who { waiting, ..crate::decisions::Who::new(&address, &name) });
         let (raised, d, told) =
-            self.decisions.raise(crate::decisions::Raise { space: space.clone(), who, why: why.trim().to_string(), text: text.clone(), options: choices });
+            self.decisions.raise(crate::decisions::Raise { space: space.clone(), who, why: why.trim().to_string(), text: text.clone(), detail: crate::hc::clean(detail), options: choices });
         let entry = crate::history::Entry {
             kind: "raised".into(),
             id: Some(raised.id.clone()),
@@ -980,7 +987,7 @@ impl Daemon {
             ok: true,
             error: None,
             state: Some(serde_json::json!({
-                "raised": true, "id": raised.id, "new": raised.fresh, "folded": raised.folded, "kind": d.kind.word(), "title": d.title,
+                "raised": true, "id": raised.id, "new": raised.fresh, "folded": raised.folded, "kind": d.kind.word(), "title": d.title, "detail": d.detail,
                 "count": raised.count, "waiting": raised.waiting, "session": address, "name": name, "space": space, "why": why, "told": told,
             })),
         }

@@ -129,6 +129,10 @@ pub enum Request {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         options: Option<serde_json::Value>,
+        /// What it is about, more than the line says (`--detail`): the
+        /// command, the plan. Shown with it, cut to about 600 characters.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        detail: String,
         /// The terminal that ran `tower raise`: what a space's own brain
         /// raises is that space's, whatever session it names.
         #[serde(default, skip_serializing_if = "Option::is_none")]

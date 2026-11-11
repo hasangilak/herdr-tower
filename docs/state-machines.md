@@ -270,7 +270,8 @@ pub enum DeliveryState { Sent, Taken, Finished }   // Delivered{taken, finished}
 
 **Stale and external cases are handled:**
 - Unreachable machines keep waiting; the brain hears after 10 min.
-- A session in `error` keeps its instructions, and the brain hears it once (`stuck`).
+- A session in `error` keeps its instructions, and the brain hears it once (`stuck`); a Claude Code or Codex session in `error` sits at its prompt and takes them at once (`Session::ready`).
+- A message from another session to a Claude Code session working longer than `[queue] busy_deliver_minutes` is typed in while it works (claimed with the turn count that turn ends on, so a restart never types it twice), one at a time (`Book::busy_pick`).
 - A retry within 10 min is the same item.
 - A session gone or replaced parks its items.
 

@@ -689,6 +689,7 @@ mod tests {
 
     fn raise(space: &str, session: &str, text: &str) -> Raise {
         Raise {
+            detail: String::new(),
             space: Some(space.into()),
             who: Some(Who::new(session, &format!("s-{session}"))),
             why: "design".into(),
@@ -878,7 +879,7 @@ mod tests {
         d.session_gone("t2");
         assert_eq!(s.get().decisions.len(), 2, "told again that it is gone: nothing more");
         // The space is quiet: nothing else was open there, and the merge still is.
-        let (late, ..) = d.raise(Raise { who: None, ..raise("shop", "t1", "Delete the old staging database?") });
+        let (late, ..) = d.raise(Raise { detail: String::new(), who: None, ..raise("shop", "t1", "Delete the old staging database?") });
         assert_eq!(d.space_over("Shop", false), 1);
         assert_eq!(d.get(&late.id).map(|d| d.state), Some(State::Stopped));
         assert!(s.get().decisions.iter().any(|v| v["id"] == merge.as_str()) && s.get().decisions_count == 2);

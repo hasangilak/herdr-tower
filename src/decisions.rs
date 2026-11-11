@@ -42,6 +42,8 @@ use crate::questions::QuestionSet;
 const KEEP_CLOSED: usize = 50;
 /// A key's text is cut to this many characters.
 const KEY_TEXT: usize = 300;
+/// A decision's `detail` is cut to about this many characters.
+pub const DETAIL: usize = 600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -225,6 +227,12 @@ pub struct Decision {
     pub sessions: Vec<Who>,
     /// What is asked, in one line.
     pub title: String,
+    /// What it is about, to read before deciding (cut to about `DETAIL`
+    /// characters): a question's set's detail (the command a permission
+    /// would run, the plan, the message that asks), `tower raise --detail`.
+    /// None for a merge (its PRs say it).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub detail: String,
     /// Why it is the user's: the rule or reason that sent a question to
     /// them, `merge`, the category `tower raise` gave, how a task failed.
     pub why: String,
@@ -300,6 +308,7 @@ impl Decision {
             "sessions": sessions,
             "waiting": self.waiting(),
             "title": self.title,
+            "detail": self.detail,
             "why": self.why,
             "options": options,
             "pick": self.pick().map(|o| o.label.clone()),
@@ -404,6 +413,29 @@ fn clip(s: &str, n: usize) -> String {
     }
 }
 
+/// A decision's `detail`: `text` trimmed and cut to about `DETAIL`
+/// characters with an ellipsis. `end`: keep its end (a message that asks
+/// something asks it last).
+pub fn detail_cut(text: &str, end: bool) -> String {
+    let t = text.trim();
+    if t.chars().count() <= DETAIL {
+        return t.to_string();
+    }
+    if end {
+        let n = t.chars().count();
+        format!("…{}", t.chars().skip(n - (DETAIL - 1)).collect::<String>().trim_start())
+    } else {
+        clip(t, DETAIL)
+    }
+}
+
+/// What a question set's decision shows as its detail: the command a
+/// permission or an approval would run, the plan to approve, the message
+/// that asks (its end).
+pub fn detail_of(set: &QuestionSet) -> String {
+    detail_cut(&set.detail, set.kind == "text")
+}
+
 /// A decision's id (`d` and 12 hex digits), not a question set's or a session's address.
 pub fn is_id(s: &str) -> bool {
     s.len() == 13 && s.starts_with('d') && s[1..].chars().all(|c| c.is_ascii_hexdigit())
@@ -466,6 +498,8 @@ pub struct Asked {
     /// Its session, with the set's id.
     pub who: Who,
     pub title: String,
+    /// The set's detail, as the decision shows it (`detail_of`).
+    pub detail: String,
     pub why: String,
     pub options: Vec<Opt>,
     pub tabs: usize,
@@ -573,6 +607,7 @@ pub fn asked(set: &QuestionSet) -> Option<Asked> {
         space: set.space.clone(),
         who: Who { address: set.session.clone(), name: set.name.clone(), waiting: true, question_id: Some(set.id.clone()) },
         title,
+        detail: detail_of(set),
         why: set.reason.clone(),
         options: options_of(set),
         tabs: set.tabs.len(),
@@ -594,6 +629,9 @@ pub struct Raise {
     pub why: String,
     /// The decision, in one line.
     pub text: String,
+    /// What it is about, more than the line says (`--detail`): the command,
+    /// the plan, the change. Cut to about `DETAIL` characters.
+    pub detail: String,
     pub options: Vec<Opt>,
 }
 
@@ -845,6 +883,7 @@ impl Book {
             if let Some(lead) = d.sessions.first().and_then(|w| mine.iter().find(|a| a.who.address == w.address)) {
                 d.kind = lead.kind;
                 d.title = lead.title.clone();
+                d.detail = lead.detail.clone();
                 d.why = lead.why.clone();
                 d.options = lead.options.clone();
                 d.tabs = lead.tabs;
@@ -968,6 +1007,10 @@ impl Book {
                 d.options = r.options;
                 d.kind = Kind::Choice;
             }
+            // Raised again with more to read: the card shows it (a question's or a merge's own stays).
+            if matches!(d.kind, Kind::Raised | Kind::Choice) && !r.detail.trim().is_empty() {
+                d.detail = detail_cut(&r.detail, false);
+            }
             return Raised { id: d.id.clone(), fresh: false, folded: by_key.is_none(), count: d.count, waiting: d.waiting() };
         }
         let d = Decision {
@@ -976,6 +1019,7 @@ impl Book {
             space: r.space,
             sessions: r.who.into_iter().collect(),
             title: r.text.trim().to_string(),
+            detail: detail_cut(&r.detail, false),
             why: r.why.trim().to_string(),
             options: r.options,
             ..Default::default()
@@ -1596,6 +1640,59 @@ mod tests {
         assert_ne!(a.key, asked(&menu("t2", "git push --force origin main")).unwrap().key, "another command");
     }
 
+    /// A decision carries what it is about to read before deciding: the
+    /// command a permission would run, the plan, the message that asks (its
+    /// end), `tower raise --detail`; cut to about 600 characters. A merge has none.
+    #[test]
+    fn a_decision_carries_its_detail_cut_short() {
+        let mut perm = QuestionSet {
+            id: "qperm1".into(),
+            session: "t1".into(),
+            name: "web".into(),
+            kind: "claude-permission".into(),
+            title: "Allow Bash?".into(),
+            detail: "  $ rm -rf build && npm run deploy -- --prod  ".into(),
+            tabs: vec![questions::Tab { title: "Permission".into(), question: "Do you want to proceed?".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        perm.state.decision = crate::daemon::card::Decision::Escalated;
+        let mut b = Book::default();
+        b.sync_questions(&asked_all(&[perm.clone()]), &|_| State::Stopped, MIN);
+        let d = &b.open[0];
+        assert_eq!(d.detail, "$ rm -rf build && npm run deploy -- --prod", "the command it would run");
+        assert_eq!(d.view(false)["detail"], "$ rm -rf build && npm run deploy -- --prod");
+        // A plan longer than a card holds: its start, cut with an ellipsis.
+        let plan = format!("Plan: {}", "move the billing page to the new router. ".repeat(40));
+        let mut p = QuestionSet { id: "qplan1".into(), session: "t2".into(), kind: "claude-plan".into(), title: "Approve the plan?".into(), detail: plan.clone(), ..perm.clone() };
+        p.tabs[0].title = "Plan".into();
+        let a = asked(&p).unwrap();
+        assert!(a.detail.starts_with("Plan: move the billing page") && a.detail.ends_with('…'), "{}", a.detail);
+        assert!(a.detail.chars().count() <= DETAIL, "{}", a.detail.chars().count());
+        // A message that asks at its end: its end is kept.
+        let long = format!("{} Want me to open the PR, or wait?", "I changed the login form and its tests. ".repeat(60));
+        let text = crate::questions::text_set("t3", "api", &long, "");
+        let a = Asked { ..asked(&QuestionSet { state: perm.state.clone(), ..text }).unwrap() };
+        assert!(a.detail.starts_with('…') && a.detail.ends_with("Want me to open the PR, or wait?"), "{}", a.detail);
+        assert!(a.detail.chars().count() <= DETAIL);
+        // Raised with a detail; raised again with another: the card shows the latest.
+        let mut b = Book::default();
+        let r = Raise { space: Some("Shop".into()), who: None, why: "deploy".into(), text: "Deploy the tickets change?".into(), detail: "x".repeat(900), options: vec![] };
+        let id = b.raise(r.clone(), MIN).id;
+        let d = b.find(&id).unwrap();
+        assert_eq!((d.detail.chars().count(), d.detail.ends_with('…')), (DETAIL, true));
+        b.raise(Raise { detail: "kubectl rollout restart deploy/tickets".into(), ..r.clone() }, 2 * MIN);
+        assert_eq!(b.find(&id).unwrap().detail, "kubectl rollout restart deploy/tickets");
+        b.raise(Raise { detail: String::new(), ..r }, 3 * MIN);
+        assert_eq!(b.find(&id).unwrap().detail, "kubectl rollout restart deploy/tickets", "raised again with none: it keeps it");
+        // A merge says it with its PRs.
+        let ch = b.sync_merges(&[pr(12, "dev", "t1", "Shop", "passing")], 4 * MIN);
+        let m = b.find(&ch.fresh[0]).unwrap();
+        assert_eq!((m.kind, m.view(false)["detail"].as_str()), (Kind::Merge, Some("")));
+        // Kept across a restart.
+        let back: Book = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+        assert_eq!(back.find(&id).unwrap().detail, "kubectl rollout restart deploy/tickets");
+    }
+
     #[test]
     fn the_same_dialog_read_again_keeps_its_decision() {
         let mut old = waits("t1", "web", "Shop", "Please review the plan.");
@@ -1620,6 +1717,7 @@ mod tests {
     fn the_same_line_raised_three_times_is_one_decision() {
         let mut b = Book::default();
         let raise = |a: &str, text: &str| Raise {
+            detail: String::new(),
             space: Some("Shop".into()),
             who: who(a),
             why: "deploy".into(),
@@ -1639,7 +1737,7 @@ mod tests {
         assert_eq!(b.raise(raise("t1", "Deploy the tickets change to production?"), 4 * MIN).waiting, 3);
         // Another line is another decision; with options it is a choice, the first one the pick.
         let options = options_from(&json!([{ "label": "Keep the old schema", "why": "no migration" }, "Migrate now"])).unwrap();
-        let c = b.raise(Raise { options, ..raise("t1", "Which schema for tickets") }, 5 * MIN);
+        let c = b.raise(Raise { detail: String::new(), options, ..raise("t1", "Which schema for tickets") }, 5 * MIN);
         assert!(c.fresh);
         let d = b.find(&c.id).unwrap();
         assert_eq!((d.kind, d.pick().map(|o| o.label.as_str())), (Kind::Choice, Some("Keep the old schema")));
@@ -1658,9 +1756,9 @@ mod tests {
             options_from(&json!([{ "label": "Wait for Monday." }, { "label": "Deploy now", "text": "Deploy the tickets change now." }]))
                 .unwrap();
         let r =
-            b.raise(Raise { space: None, who: who("t1"), why: "deploy".into(), text: "Deploy the tickets change?".into(), options }, MIN);
+            b.raise(Raise { detail: String::new(), space: None, who: who("t1"), why: "deploy".into(), text: "Deploy the tickets change?".into(), options }, MIN);
         b.raise(
-            Raise { space: None, who: who("t2"), why: "deploy".into(), text: "Deploy the tickets change?".into(), options: vec![] },
+            Raise { detail: String::new(), space: None, who: who("t2"), why: "deploy".into(), text: "Deploy the tickets change?".into(), options: vec![] },
             MIN,
         );
         // One of them works on something else meanwhile: the other is who waits.
@@ -1771,6 +1869,7 @@ mod tests {
             )
             .id;
         let raise = |a: &str, why: &str, text: &str| Raise {
+            detail: String::new(),
             space: Some("Shop".into()),
             who: who(a),
             why: why.into(),
@@ -1854,6 +1953,7 @@ mod tests {
     fn a_decision_goes_when_its_sessions_are_gone() {
         let mut b = Book::default();
         let raise = |a: &str| Raise {
+            detail: String::new(),
             space: Some("Shop".into()),
             who: who(a),
             why: "design".into(),
@@ -1875,7 +1975,7 @@ mod tests {
         // A decision about a session that had ended when it was raised stays until it is answered.
         let orphan = b
             .raise(
-                Raise { who: None, text: "Delete the old staging database?".into(), why: "delete".into(), ..Default::default() },
+                Raise { detail: String::new(), who: None, text: "Delete the old staging database?".into(), why: "delete".into(), ..Default::default() },
                 7 * MIN,
             )
             .id;
@@ -1914,8 +2014,8 @@ mod tests {
         // A space with no session left: what was raised there is over, its merge stays.
         let mut b = Book::default();
         let merge = b.sync_merges(&prs, MIN).fresh[0].clone();
-        let raised = b.raise(Raise { space: Some("Shop".into()), who: None, why: "design".into(), text: "Tabs?".into(), options: vec![] }, MIN).id;
-        let other = b.raise(Raise { space: Some("Docs".into()), who: None, why: "design".into(), text: "Tabs?".into(), options: vec![] }, MIN).id;
+        let raised = b.raise(Raise { detail: String::new(), space: Some("Shop".into()), who: None, why: "design".into(), text: "Tabs?".into(), options: vec![] }, MIN).id;
+        let other = b.raise(Raise { detail: String::new(), space: Some("Docs".into()), who: None, why: "design".into(), text: "Tabs?".into(), options: vec![] }, MIN).id;
         let ch = b.space_over("shop", false, 2 * MIN);
         assert_eq!(ch.closed.iter().map(|d| (d.id.as_str(), d.state)).collect::<Vec<_>>(), [(raised.as_str(), State::Stopped)]);
         assert!(b.find(&merge).unwrap().closed_ms.is_none() && b.find(&other).unwrap().closed_ms.is_none());
@@ -1954,13 +2054,13 @@ mod tests {
         let options = options_from(&json!([{ "label": "Tabs", "why": "less to build" }, { "label": "A sidebar" }])).unwrap();
         let id = b
             .raise(
-                Raise { space: Some("Shop".into()), who: who("t1"), why: "design".into(), text: "Tabs or a sidebar?".into(), options },
+                Raise { detail: String::new(), space: Some("Shop".into()), who: who("t1"), why: "design".into(), text: "Tabs or a sidebar?".into(), options },
                 MIN,
             )
             .id;
         b.claim_told(&id);
         b.sync_merges(&[pr(88, "dev", "t2", "Shop", "passing")], 2 * MIN);
-        let gone = b.raise(Raise { who: who("t3"), text: "Something else".into(), ..Default::default() }, 3 * MIN).id;
+        let gone = b.raise(Raise { detail: String::new(), who: who("t3"), text: "Something else".into(), ..Default::default() }, 3 * MIN).id;
         b.dismiss(&gone, 4 * MIN).unwrap();
         b.settled_prs.insert("o/app#7".into(), State::Dismissed);
         b.save(&path).unwrap();
@@ -1978,7 +2078,7 @@ mod tests {
     #[test]
     fn the_user_is_told_once_per_decision() {
         let mut b = Book::default();
-        let id = b.raise(Raise { who: who("t1"), text: "Deploy?".into(), ..Default::default() }, MIN).id;
+        let id = b.raise(Raise { detail: String::new(), who: who("t1"), text: "Deploy?".into(), ..Default::default() }, MIN).id;
         assert_eq!(b.claim_told(&id), Some(true));
         assert_eq!(b.claim_told(&id), Some(false));
         assert_eq!(b.claim_told("d000000000000"), None);
@@ -2001,7 +2101,7 @@ mod tests {
         let other = b.blocked(Some("Shop".into()), Who::new("t5", "web"), "Asks to use Frobnicate: step 2", 2 * MIN);
         assert!(other.fresh && other.id != first.id);
         // `tower raise` about it joins it.
-        let r = b.raise(Raise { space: Some("Shop".into()), who: Some(who()), why: "blocked".into(), text: "api is blocked on a dialog".into(), options: vec![] }, 3 * MIN);
+        let r = b.raise(Raise { detail: String::new(), space: Some("Shop".into()), who: Some(who()), why: "blocked".into(), text: "api is blocked on a dialog".into(), options: vec![] }, 3 * MIN);
         assert_eq!((r.id.as_str(), r.fresh), (first.id.as_str(), false));
         // Nothing typed reaches it; no rule is made of it.
         assert!(act(&d, &json!({ "other": "yes" }), true).unwrap_err().to_string().contains("answered in the session itself"));

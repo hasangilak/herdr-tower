@@ -164,6 +164,19 @@ impl Default for Waits {
     }
 }
 
+/// A prompt this soon after the tower typed into a session is taken to be
+/// the tower's, for a question it asked at the end of its turn.
+const TYPED_MS: u64 = 20_000;
+
+/// A session working again while its question at the end of a turn is open.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WentOn {
+    /// On a prompt that isn't the user's: the question stays open.
+    Kept,
+    /// Whose prompt it is, its hook is still to say (since when it was seen working).
+    Waiting(u64),
+}
+
 /// Why a session's set is over when the session stops showing it.
 fn over_why(s: &QuestionSet, gone: bool) -> CloseWhy {
     if gone {
@@ -202,6 +215,13 @@ struct Inner {
     /// What the user typed in a session's terminal while its text question
     /// was open, by session (and when): that question's answer.
     typed_words: HashMap<String, (String, u64)>,
+    /// Sessions working again with a question at the end of a turn open, by
+    /// session, until they stop: on a prompt that isn't the user's, or one
+    /// whose hook is still to say whose it is (`Asks::went_on`).
+    went_on: HashMap<String, WentOn>,
+    /// The latest prompt each session's hook said was not the user's: when,
+    /// and at which turn count.
+    not_users: HashMap<String, (u64, Option<u64>)>,
 }
 
 impl Inner {
@@ -607,8 +627,14 @@ impl Asks {
         if !blocked {
             let gone = status.ended();
             self.close_where(address, |s| s.kind != "text", |s| over_why(s, gone), true);
-            if *status == SessionStatus::Working || gone {
+            if gone {
+                self.inner.lock().unwrap_or_else(|e| e.into_inner()).went_on.remove(address);
                 self.close_where(address, |s| s.kind == "text", |s| over_why(s, gone), true);
+            } else if *status == SessionStatus::Working {
+                self.went_on(address, turn_of(t));
+            } else {
+                // It stopped: when it works again, that is looked at anew.
+                self.inner.lock().unwrap_or_else(|e| e.into_inner()).went_on.remove(address);
             }
             if let Some(r) = self.due_reply(address, status, turn_of(t), hc::created_ms(t), crate::history::now_ms()) {
                 match type_into(address, &r.text) {
@@ -651,6 +677,71 @@ impl Asks {
             let mut i = me.inner.lock().unwrap_or_else(|e| e.into_inner());
             if i.reading.get(&address) == Some(&msg) {
                 i.reading.remove(&address);
+            }
+        });
+    }
+
+    /// The session works again while a question it asked at the end of its
+    /// turn is open. One answered here (its reply is what went in) is over.
+    /// Any other stays the user's unless the prompt it works on is theirs:
+    /// one the tower typed (an instruction, a message from another session,
+    /// an introduction, also one typed in while it worked and sent as it
+    /// stopped), another terminal's, or the session's own (its background
+    /// work reporting back) leaves it open, and its decision with it; the
+    /// user's words close it, with them (`typed_there`). The prompt hook says
+    /// whose it is, and the radar can be first: it is waited for a moment,
+    /// and with no word from it the question was answered in the terminal,
+    /// as before.
+    fn went_on(&self, address: &str, turn: Option<u64>) {
+        self.close_where(address, |s| s.kind == "text" && s.state.answered_here(), |s| over_why(s, false), true);
+        if !self.list().iter().any(|s| s.session == address && s.kind == "text") {
+            return;
+        }
+        let seen_ms = crate::history::now_ms();
+        {
+            let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if i.went_on.contains_key(address) {
+                return;
+            }
+            if not_the_users(&i, address, turn, seen_ms) {
+                i.went_on.insert(address.to_string(), WentOn::Kept);
+                eprintln!("[questions] {address} works on a prompt that isn't the user's: its question stays open");
+                return;
+            }
+            i.went_on.insert(address.to_string(), WentOn::Waiting(seen_ms));
+        }
+        let (me, address) = (self.clone(), address.to_string());
+        std::thread::spawn(move || {
+            let until = seen_ms + me.waits.words_ms;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let open = me.list().iter().any(|s| s.session == address && s.kind == "text" && s.at_ms <= seen_ms);
+                let mut i = me.inner.lock().unwrap_or_else(|e| e.into_inner());
+                let mine = i.went_on.get(&address) == Some(&WentOn::Waiting(seen_ms));
+                if i.went_on.get(&address) == Some(&WentOn::Kept) || (!mine && i.went_on.contains_key(&address)) {
+                    return;
+                }
+                if !open {
+                    if mine {
+                        i.went_on.remove(&address);
+                    }
+                    return;
+                }
+                let now = crate::history::now_ms();
+                if not_the_users(&i, &address, turn, now) {
+                    i.went_on.insert(address.clone(), WentOn::Kept);
+                    eprintln!("[questions] {address} works on a prompt that isn't the user's: its question stays open");
+                    return;
+                }
+                if now >= until {
+                    if mine {
+                        i.went_on.remove(&address);
+                    }
+                    drop(i);
+                    // No word whose prompt it was: the session went on, so it was answered there.
+                    me.close_where(&address, |s| s.kind == "text" && s.at_ms <= seen_ms, |s| over_why(s, false), true);
+                    return;
+                }
             }
         });
     }
@@ -1183,6 +1274,12 @@ impl Asks {
     pub fn typed_there(&self, address: &str, words: &str, at_ms: u64) -> bool {
         let words = words.trim().to_string();
         let mut answered = false;
+        {
+            // The user's prompt is the one it works on now.
+            let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            i.went_on.remove(address);
+            i.not_users.remove(address);
+        }
         // The reply the tower held is moot now.
         let held = self.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.remove(address);
         if let Some(r) = held {
@@ -1222,11 +1319,18 @@ impl Asks {
         answered
     }
 
-    /// The session's next prompt was the tower's (or another terminal's): a
-    /// text question it closed was not the user's to have answered there.
-    pub fn typed_by_tower(&self, address: &str) {
+    /// The session's next prompt was the tower's (or another terminal's, or
+    /// its own), at turn count `turn`: a question it asked at the end of its
+    /// turn stays open while it works on it (`went_on`), and one the radar
+    /// closed a moment ago was not the user's to have answered there.
+    pub fn typed_by_tower(&self, address: &str, turn: Option<u64>) {
         let now = crate::history::now_ms();
         let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        i.not_users.insert(address.to_string(), (now, turn));
+        if matches!(i.went_on.get(address), Some(WentOn::Waiting(_))) {
+            i.went_on.insert(address.to_string(), WentOn::Kept);
+            eprintln!("[questions] {address} works on a prompt that isn't the user's: its question stays open");
+        }
         for x in i.there.iter_mut().filter(|x| x.set.session == address && x.set.kind == "text" && !x.recorded && x.words.is_none() && now.saturating_sub(x.closed_ms) < THERE_KEEP_MS) {
             x.not_users = true;
         }
@@ -1730,6 +1834,20 @@ fn send_args(address: &str, text: &str, status: &SessionStatus) -> Result<Vec<St
     Ok(args)
 }
 
+/// Whether the prompt `address` works on now (at turn count `turn`) is not
+/// the user's: the tower is typing into it or just was, the send queue typed
+/// a message in while it worked that it hasn't taken yet, or its hook said
+/// so about this stretch of work.
+fn not_the_users(i: &Inner, address: &str, turn: Option<u64>, now: u64) -> bool {
+    if super::typed::typed_lately(address, TYPED_MS) || super::sendq::typed_in_while_working(address) {
+        return true;
+    }
+    i.not_users.get(address).is_some_and(|(at, was)| match (*was, turn) {
+        (Some(a), Some(b)) => a == b,
+        _ => now.saturating_sub(*at) <= TYPED_MS,
+    })
+}
+
 /// The last message a session wrote: its transcript (Claude Code here), else its screen.
 /// What a session said at the end of the turn that ended at `ended_ms`:
 /// its Stop hook's message (exactly that turn's), waited for a moment since
@@ -2037,8 +2155,9 @@ mod tests {
         assert_eq!((v["title"].as_str(), v["why"].as_str(), v["question_id"].as_str()), (Some(req.as_str()), Some(questions::WAITS), Some(first.id.as_str())));
         let id = v["id"].as_str().unwrap().to_string();
         assert_eq!(d.for_question(&first.id), vec![id.clone()]);
-        // One of them works again (it was answered in its terminal): two wait.
+        // One of them works again, on what the user typed there (its hook says so): two wait.
         a.seen("tw-d1", &json!({}), &SessionStatus::Working);
+        a.typed_there("tw-d1", "merged it, go on", crate::history::now_ms());
         let st = a.shared.get();
         assert_eq!((st.decisions.len(), st.decisions[0]["waiting"].as_u64(), st.decisions[0]["id"].as_str()), (1, Some(2), Some(id.as_str())));
         // One is dismissed, the last one's session ends: the decision is over, as answered (one of them was).
@@ -2711,25 +2830,105 @@ mod tests {
         assert!(line[0].text.ends_with("-> Answered in web: Wait, I'll review it first"), "{}", line[0].text);
         assert_eq!(d.get(&id1).unwrap().answer, "in its terminal: Wait, I'll review it first");
 
-        // The radar first (the session works), the hook's words a moment after.
+        // The radar first (the session works): the card waits for the hook to
+        // say whose prompt that was; the user's words, a moment after, close it.
         let q2 = a.asked_after(text_q("tw-q2", "api"), false);
         a.escalate(&q2.id, "the user decides");
         assert_eq!(user.lock().unwrap().len(), 1);
         a.seen("tw-q2", &Value::Null, &SessionStatus::parse("working"));
-        assert_eq!(open_decisions(&a), 0, "the card goes at once");
+        assert_eq!(open_decisions(&a), 1, "not answered until the hook says whose prompt it was");
         assert!(a.typed_there("tw-q2", "yes, open it", crate::history::now_ms()));
+        assert_eq!(open_decisions(&a), 0, "the user's words: answered");
         let line = lines(&record, 2);
         assert!(line[1].text.ends_with("-> Answered in api: yes, open it"), "{}", line[1].text);
 
-        // The tower typed the next prompt (the queue): not the user's answer, no such line.
+        // The tower typed the next prompt (the queue): not the user's answer. The
+        // question stays theirs, and so does its decision; no line says it was answered.
         let q3 = a.asked_after(text_q("tw-q3", "docs"), false);
         a.escalate(&q3.id, "the user decides");
         a.seen("tw-q3", &Value::Null, &SessionStatus::parse("working"));
-        a.typed_by_tower("tw-q3");
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        a.typed_by_tower("tw-q3", None);
+        std::thread::sleep(std::time::Duration::from_millis(1_800));
+        assert!(a.get(&q3.id).is_some() && open_decisions(&a) == 1, "still open");
         assert_eq!(lines(&record, 3).len(), 2, "nothing says the user answered it");
         assert_eq!(user.lock().unwrap().len(), 2, "two said as they appeared, nothing since");
         assert!(!a.typed_there("tw-q9", "build the docs site", crate::history::now_ms()), "no question open: new work, not an answer");
+
+        // The session works again and no hook ever says on whose prompt (an
+        // agent with none): a moment later it was answered in its terminal, as before.
+        let q4 = a.asked_after(text_q("tw-q4", "sdk"), false);
+        a.escalate(&q4.id, "the user decides");
+        a.seen("tw-q4", &Value::Null, &SessionStatus::parse("working"));
+        assert!(a.get(&q4.id).is_some());
+        std::thread::sleep(std::time::Duration::from_millis(1_800));
+        assert!(a.get(&q4.id).is_none(), "over once no word came");
+        let line = lines(&record, 3);
+        assert!(line[2].text.ends_with("-> Answered in its terminal"), "{}", line[2].text);
+    }
+
+    /// A message from another session (or anything the tower typed) that
+    /// arrives after a question at the end of a turn leaves that question,
+    /// and its decision, open: the session works on it, but nobody answered.
+    /// Only the user's own words (on the card, or typed in its terminal)
+    /// answer it.
+    #[test]
+    fn a_message_from_another_session_leaves_the_users_question_open() {
+        let (a, d, user, record) = recording(None);
+        let q = a.asked_after(text_q("tw-pm1", "web"), false);
+        a.escalate(&q.id, "the user decides");
+        let id = d.for_question(&q.id)[0].clone();
+        assert_eq!(open_decisions(&a), 1);
+        // The send queue types a peer message in (written down first, as `Herdr::send` does).
+        let typed = super::super::typed::note("tw-pm1", "From Shop › api (t6): the schema changed, see api/CHANGES.md", "queue");
+        super::super::typed::done(typed, true);
+        // 0.3 s later the radar sees the session working; its hook comes after.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        a.seen("tw-pm1", &json!({ "turn": 4 }), &SessionStatus::Working);
+        assert!(a.get(&q.id).is_some(), "the question stays the user's");
+        assert_eq!(d.get(&id).map(|x| x.state), Some(crate::decisions::State::Open), "and so does its decision");
+        a.typed_by_tower("tw-pm1", Some(4));
+        for _ in 0..3 {
+            a.seen("tw-pm1", &json!({ "turn": 4 }), &SessionStatus::Working);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1_800));
+        assert!(a.get(&q.id).is_some() && open_decisions(&a) == 1, "still open once the moment for the hook is over");
+        // Its turn on the message ends without asking again: the question still waits for the user.
+        a.seen("tw-pm1", &json!({ "turn": 5 }), &SessionStatus::Done);
+        assert!(a.get(&q.id).is_some());
+        assert!(lines(&record, 1).is_empty(), "nothing says it was answered");
+        // The user answers it in the terminal: now it is answered, with their words.
+        a.seen("tw-pm1", &json!({ "turn": 5 }), &SessionStatus::Working);
+        assert!(a.typed_there("tw-pm1", "open the PR", crate::history::now_ms()));
+        assert_eq!(d.get(&id).map(|x| x.state), Some(crate::decisions::State::Answered));
+        let line = lines(&record, 1);
+        assert!(line[0].text.ends_with("-> Answered in web: open the PR"), "{}", line[0].text);
+
+        // Hook first: a session's message that came in some other way (another
+        // terminal's `hc send`), then the radar: open as well.
+        let q2 = a.asked_after(text_q("tw-pm2", "api"), false);
+        a.escalate(&q2.id, "the user decides");
+        a.typed_by_tower("tw-pm2", Some(9));
+        a.seen("tw-pm2", &json!({ "turn": 9 }), &SessionStatus::Working);
+        std::thread::sleep(std::time::Duration::from_millis(1_800));
+        assert!(a.get(&q2.id).is_some(), "another terminal's prompt is no answer either");
+        // A word about an earlier stretch of work says nothing about this one.
+        let q3 = a.asked_after(text_q("tw-pm3", "docs"), false);
+        a.escalate(&q3.id, "the user decides");
+        a.typed_by_tower("tw-pm3", Some(2));
+        a.seen("tw-pm3", &json!({ "turn": 3 }), &SessionStatus::Working);
+        std::thread::sleep(std::time::Duration::from_millis(1_800));
+        assert!(a.get(&q3.id).is_none(), "the turn it worked on before isn't this one: answered in its terminal");
+        // An answer the user gave on the card goes in as the session's next prompt: over, as before.
+        let q4 = a.asked_after(text_q("tw-pm4", "sdk"), false);
+        a.escalate(&q4.id, "the user decides");
+        {
+            let mut i = a.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let s = i.sets.iter_mut().find(|s| s.id == q4.id).unwrap();
+            card::apply(s, &Ev::Reply { queued: false }).unwrap();
+        }
+        a.seen("tw-pm4", &json!({ "turn": 1 }), &SessionStatus::Working);
+        assert!(a.get(&q4.id).is_none(), "its own reply: over at once");
+        assert!(!user.lock().unwrap().is_empty(), "the question was put to the user, once");
     }
 
     /// The user answered on the card while the session was busy (the reply

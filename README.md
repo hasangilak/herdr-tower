@@ -816,6 +816,11 @@ for **Herdr Core**, because the voice runs in a Herdr terminal.
 - A task that failed is sent once more by the tower itself at the quiet
   levels; `[agenda] retry_failed = false` in config.toml turns that off
   (the brain then hears of the failure and puts it to you).
+- A message one session queues for another waits while its receiver
+  works; a Claude Code session that has been working longer than `[queue]
+  busy_deliver_minutes` (10; 0 is never) gets it typed in anyway, and reads
+  it when its turn ends. Your own instructions and a brain's always wait.
+  A Claude Code or Codex session in `error` takes what waits for it at once.
 - Codex as the brain: `tower up --brain codex` (it uses Codex's `notify`
   instead of a hook, and runs with `--sandbox danger-full-access
   --ask-for-approval on-request` because `hc` talks to herdr-core over a Unix
