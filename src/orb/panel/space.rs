@@ -422,9 +422,9 @@ impl Panel {
     /// shows the rest the state holds; Record has all of it.
     fn thread_view(&mut self, space: &str, thread: &[model::Message], count: usize, cx: &mut Context<Self>) -> AnyElement {
         let g = glass();
-        let (earlier, open, copied) = match self.full.as_ref() {
-            Some(f) => (f.thread_earlier.contains(space), f.thread_open.clone(), f.copied.clone()),
-            None => (false, Default::default(), None),
+        let (earlier, open, copied, text_w) = match self.full.as_ref() {
+            Some(f) => (f.thread_earlier.contains(space), f.thread_open.clone(), f.copied.clone(), f.text_w),
+            None => (false, Default::default(), None, 600.0),
         };
         let from = if earlier { 0 } else { thread.len().saturating_sub(THREAD_ROWS) };
         let label = if count == 1 { "Between sessions · 1 message".to_string() } else { format!("Between sessions · {count} messages") };
@@ -448,7 +448,7 @@ impl Panel {
             .child(link("thread-record".into(), "All of it in Record ›".into()).on_click(cx.listener(|this, _, _, cx| this.nav_to(Scope::Record, cx))));
         let rows = thread[from..].iter().map(|msg| {
             let key = thread_key(msg);
-            let long = msg_is_long(&said_text(&msg.text));
+            let long = msg_is_long(&said_text(&msg.text), text_w);
             // `HERDER_TOWER_ORB_THREAD=open`: every message whole, to look at it with test data.
             let whole = !long || open.contains(&key) || std::env::var("HERDER_TOWER_ORB_THREAD").is_ok_and(|v| v == "open");
             let (who_from, who_to) = msg.names_in(space);
@@ -588,10 +588,13 @@ fn said_text(text: &str) -> String {
     if rest.is_empty() { t.to_string() } else { rest.to_string() }
 }
 
-/// Longer than its first lines show.
-fn msg_is_long(text: &str) -> bool {
-    let t = text.trim();
-    t.chars().count() > 320 || t.lines().count() > 4
+/// Longer than the four lines a message shows, at `width` points across:
+/// its lines as they wrap, at a little more than the 13-point text's
+/// average letter, so a message that might be cut is always offered whole.
+fn msg_is_long(text: &str, width: f32) -> bool {
+    let per_line = ((width / 7.0) as usize).max(30);
+    let lines: usize = text.trim().lines().map(|l| l.chars().count().div_ceil(per_line).max(1)).sum();
+    lines > 4
 }
 
 /// "7:50 PM · 12m ago" today, else the day and the time.
@@ -613,6 +616,15 @@ fn sender_colour(address: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_is_long_when_it_wraps_past_four_lines_at_the_window_width() {
+        let text = "word ".repeat(74); // 370 letters
+        assert!(!msg_is_long(&text, 800.0), "about 3 lines in a wide window");
+        assert!(msg_is_long(&text, 500.0), "about 6 lines in a narrow one");
+        assert!(msg_is_long("a\nb\nc\nd\ne", 800.0), "five short lines");
+        assert!(!msg_is_long("a\nb\nc\nd", 800.0));
+    }
 
     #[test]
     fn a_message_says_what_it_says_without_who_wrote_it() {

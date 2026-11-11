@@ -19,9 +19,34 @@ on every machine added with `hc machine add`. It answers out loud.
   </tr>
 </table>
 
-The other pictures in `docs/screenshots/` show the panel before the Quiet
-Tower (its Chat, Activity and Spaces tabs, which are gone); what replaced
-them is drawn in [docs/quiet-tower.html](docs/quiet-tower.html).
+### The Quiet Tower
+
+It speaks only when you asked or the decision is yours. Everything else
+goes to the record. (Pictured with made-up spaces and sessions.)
+
+<p align="center">
+  <img src="docs/screenshots/full-window.png" width="760" alt="The full window: the sidebar with every open space and its count, the queue with the next decision as a card (a permission with the command it would run, answered by 1 or 2), and the missions"><br><sub>The full window: one queue for every space, most waiting work first; the next card answers with a number key</sub>
+</p>
+
+<table>
+  <tr>
+    <td align="center" width="34%"><img src="docs/screenshots/floating.png" width="260" alt="The floating panel beside the orb: the next decision and what waits after it"><br><sub>The floating panel beside the orb: the same queue at a glance</sub></td>
+    <td align="center"><img src="docs/screenshots/space.png" width="480" alt="A space: what needs you there, its sessions and the thread between them, each message with who wrote to whom and when"><br><sub>A space as a mission: what needs you there, its sessions, and what they wrote to each other (a click opens a message whole)</sub></td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2"><img src="docs/screenshots/new-space.png" width="620" alt="New space: one sentence of goal, and what the tower will do"><br><sub>A new space from one sentence: the tower names it, opens its sessions and worktrees, and asks nothing</sub></td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2"><img src="docs/screenshots/record.png" width="620" alt="The record: every request, delivery, message between sessions and answer, by space"><br><sub>The record: everything it did and heard, by space, for when you want it</sub></td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2"><img src="docs/screenshots/settings.png" width="620" alt="Settings: how much it tells you, the brain's model and effort, voice, questions it answers, follow and mute"><br><sub>Settings: how much it tells you, the model its brains run on, what it says out loud</sub></td>
+  </tr>
+</table>
+
+The design and every state of both windows is drawn in
+[docs/quiet-tower.html](docs/quiet-tower.html); the contract is
+[docs/quiet-tower.md](docs/quiet-tower.md).
 
 Everything that listens and speaks runs locally, in one Rust binary:
 

@@ -80,6 +80,8 @@ pub(super) struct FullUi {
     /// The thread's messages shown whole (by `space::thread_key`), the
     /// spaces whose earlier messages show too, and the one just copied.
     pub thread_open: HashSet<String>,
+    /// How wide a thread message's text is, in points, as last drawn.
+    pub text_w: f32,
     pub thread_earlier: HashSet<String>,
     pub copied: Option<String>,
     /// Kept while the window is: its size and spot are saved as the user resizes it.
@@ -105,6 +107,7 @@ impl FullUi {
             phone_anchor: gpui::ScrollAnchor::for_handle(scroll),
             to_phone: None,
             thread_open: HashSet::new(),
+            text_w: 600.0,
             thread_earlier: HashSet::new(),
             copied: None,
             _resizing: Some(cx.observe_window_bounds(window, |this, window, _| this.resized(window))),
@@ -460,6 +463,10 @@ fn scope_key(scope: &Scope) -> String {
 impl Panel {
     /// The whole window: the sidebar, and the pane for the view showing.
     pub(super) fn full_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(f) = self.full.as_mut() {
+            // What a thread message's text gets across: the window, less the sidebar, the pane's and the row's padding and its colour bar.
+            f.text_w = f32::from(window.viewport_size().width) - SIDE_W - 36.0 - 24.0 - 13.0 - 2.0;
+        }
         let all = self.decisions(cx);
         let missions = self.missions(&all, cx);
         let (scope, notice, act) = {
