@@ -122,6 +122,9 @@ impl Running {
 /// How the phone API asks about Tailscale (tests give their own).
 pub type Detect = Arc<dyn Fn() -> tailscale::Tailscale + Send + Sync>;
 
+/// How it asks this Mac's address on the network it is on now (`lan_ip`; tests give their own).
+pub type LanDetect = Arc<dyn Fn() -> Option<IpAddr> + Send + Sync>;
+
 /// Tailscale is looked at again this often while the API is on: it starts
 /// (or stops) listening on the tailnet as Tailscale comes and goes.
 const TAILSCALE_RECHECK: Duration = Duration::from_secs(20);
@@ -144,6 +147,8 @@ pub struct Lan {
     /// The certificate's folder (elsewhere in tests).
     identity_dir: std::path::PathBuf,
     detect: Detect,
+    /// This Mac's address on the network it is on now, for `bind = "auto"`.
+    lan_detect: LanDetect,
     /// The rest of the tower (`tower::Tower`): the daemon, once it is whole.
     tower: Arc<std::sync::OnceLock<Arc<dyn tower::Tower>>>,
     /// `history.jsonl` (elsewhere in tests).
@@ -484,7 +489,15 @@ impl Lan {
             conns: Arc::new(Mutex::new(Conns::default())),
             // Tests never ask this Mac's Tailscale unless they say so (`with_detect`).
             detect: Arc::new(if cfg!(test) { tailscale::Tailscale::default } else { tailscale::detect as fn() -> tailscale::Tailscale }),
+            lan_detect: Arc::new(lan_ip),
         }
+    }
+
+    /// Another way to ask this Mac's address on the network (tests: a network change).
+    #[cfg(test)]
+    pub fn with_lan_detect(mut self, detect: impl Fn() -> Option<IpAddr> + Send + Sync + 'static) -> Lan {
+        self.lan_detect = Arc::new(detect);
+        self
     }
 
     /// Another way to ask about Tailscale (tests).
@@ -539,7 +552,8 @@ impl Lan {
         let identity = Identity::load_or_create(&self.identity_dir)?;
         let tls = identity.server_config()?;
         let ts = if tailscale_wanted(cfg)? { (self.detect)() } else { tailscale::Tailscale::default() };
-        let auto = if cfg.bind.is_empty() || cfg.bind == "auto" { lan_ip() } else { None };
+        let auto_bind = cfg.bind.is_empty() || cfg.bind == "auto";
+        let auto = if auto_bind { (self.lan_detect)() } else { None };
         let stop = Arc::new(AtomicBool::new(false));
         let mut listeners = vec![];
         let mut tailscale_error = None;
@@ -569,17 +583,26 @@ impl Lan {
         self.publish(r);
         drop(running);
         eprintln!("[phone] API on {} (certificate {})", addrs.join(", "), tls::grouped(&fingerprint[..16]));
-        if tailscale_wanted(cfg).unwrap_or(false) {
+        // Every 20 s: the network this Mac is on (home, the office: the LAN
+        // listener follows it) and Tailscale (the tailnet's follows that).
+        let tailnet = tailscale_wanted(cfg).unwrap_or(false);
+        if tailnet || auto_bind {
             let me = self.clone();
             thread::Builder::new()
-                .name("lan-tailscale".into())
+                .name("lan-follow".into())
                 .spawn(move || {
                     while !stop.load(Ordering::SeqCst) {
                         let until = Instant::now() + TAILSCALE_RECHECK;
                         while Instant::now() < until && !stop.load(Ordering::SeqCst) {
                             thread::sleep(Duration::from_millis(250));
                         }
-                        if !stop.load(Ordering::SeqCst) {
+                        if stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if auto_bind {
+                            me.recheck_lan(&stop);
+                        }
+                        if tailnet {
                             me.recheck_tailscale(&stop);
                         }
                     }
@@ -664,6 +687,45 @@ impl Lan {
 
     /// Tailscale again: listens on the tailnet once it runs, stops when it
     /// stops or its address changes. The LAN listener is never touched.
+    /// The network this Mac is on now, for `bind = "auto"`: when its address
+    /// changed (another network), the LAN listener moves to the new one on
+    /// the same port, and the pairing and the state show it. With no network
+    /// (Wi-Fi off), the old one stays unless the tailnet's is there instead.
+    fn recheck_lan(&self, api_stop: &Arc<AtomicBool>) {
+        let now = (self.lan_detect)();
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(r) = running.as_mut() else { return };
+        // Another start since (this watcher's API was stopped), or an address set by hand.
+        if !Arc::ptr_eq(&r.stop, api_stop) || !(r.cfg.bind.is_empty() || r.cfg.bind == "auto") {
+            return;
+        }
+        let tail = r.of(Kind::Tailscale).map(|l| l.addr.ip());
+        // As `plan` takes it: a private address (unless allow_public), and not the tailnet's own.
+        let want = choose_ip_from(&r.cfg, now).ok().filter(|ip| Some(*ip) != tail);
+        let have = r.of(Kind::Lan).map(|l| l.addr.ip());
+        if want == have || r.listeners.is_empty() {
+            return;
+        }
+        let port = r.primary().port();
+        if let Some(pos) = r.listeners.iter().position(|l| l.kind == Kind::Lan)
+            && (r.listeners.len() > 1 || want.is_some())
+        {
+            let l = r.listeners.remove(pos);
+            eprintln!("[phone] no longer on {}: this Mac is on another network", l.addr);
+            Self::unlisten(l);
+        }
+        if let Some(ip) = want {
+            match self.listen(Kind::Lan, ip, port, &r.tls, &r.stop) {
+                Ok(l) => {
+                    eprintln!("[phone] API on https://{} (lan): this Mac's network changed", l.addr);
+                    r.listeners.insert(0, l);
+                }
+                Err(e) => eprintln!("[phone] can't listen on the new network yet: {e:#}"),
+            }
+        }
+        self.publish(r);
+    }
+
     fn recheck_tailscale(&self, api_stop: &Arc<AtomicBool>) {
         let ts = (self.detect)();
         let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
@@ -2743,6 +2805,51 @@ mod tests {
         lan.recheck_tailscale(&stop);
         assert_eq!(lan.info()["tailscale"]["error"], Value::Null, "the old watcher's look isn't this API's");
         assert_eq!(lan.info()["url"], format!("https://{addr2}"));
+        lan.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_lan_listener_follows_this_macs_network_from_home_to_the_office() {
+        let dir = std::env::temp_dir().join(format!("tower-lan-follow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hub = Arc::new(Hub::default());
+        let (stt, rx) = std::sync::mpsc::channel();
+        std::mem::forget(rx);
+        let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
+        let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs: test_prs() };
+        // "Home" and "the office": two addresses this Mac can listen on in a test.
+        let home: IpAddr = "127.0.0.1".parse().unwrap();
+        let office: IpAddr = "::1".parse().unwrap();
+        let now = Arc::new(Mutex::new(Some(home)));
+        let seen = now.clone();
+        let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan")).with_lan_detect(move || *seen.lock().unwrap());
+        let addr = lan.start(&crate::config::Lan { port: 0, ..lan_cfg("auto", "off") }).unwrap();
+        assert_eq!(addr.ip(), home);
+        let stop = lan.running.lock().unwrap().as_ref().unwrap().stop.clone();
+        let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
+        // Nothing changed: nothing moves.
+        lan.recheck_lan(&stop);
+        assert_eq!(lan.info()["url"], format!("https://{addr}"));
+        // Wi-Fi off: no address now, and the only listener stays (it answers again when the network is back).
+        *now.lock().unwrap() = None;
+        lan.recheck_lan(&stop);
+        assert_eq!(call(addr, &fp, "GET", "/v1/hello", None, "").unwrap().0, 401);
+        // At the office: it listens there on the same port, the pairing offers that address, and the old one is let go.
+        *now.lock().unwrap() = Some(office);
+        lan.recheck_lan(&stop);
+        let moved = SocketAddr::new(office, addr.port());
+        assert_eq!(lan.info()["url"], format!("https://{moved}"));
+        assert_eq!(shared.get().lan_hosts, vec![json!({"kind": "lan", "host": "::1", "port": addr.port()})]);
+        assert_eq!(call(moved, &fp, "GET", "/v1/hello", None, "").unwrap().0, 401, "answers at the new address, same certificate");
+        assert!(call(addr, &fp, "GET", "/v1/hello", None, "").is_err(), "the home address is let go");
+        // An address set by hand is never moved.
+        lan.stop();
+        let fixed = lan.start(&crate::config::Lan { port: 0, ..lan_cfg("127.0.0.1", "off") }).unwrap();
+        let stop = lan.running.lock().unwrap().as_ref().unwrap().stop.clone();
+        lan.recheck_lan(&stop);
+        assert_eq!(lan.info()["url"], format!("https://{fixed}"));
         lan.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }

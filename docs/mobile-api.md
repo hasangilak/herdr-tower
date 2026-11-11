@@ -53,7 +53,12 @@ tower finds Tailscale through its CLI (`tailscale` on the PATH, the
 `tailscale ip -4` when the status has no address. It looks again every 20 s
 while the API is on: when Tailscale starts, the tailnet address is listened
 on within 20 s; when it stops, that listener closes (the LAN one never
-does). Stopped, logged out or not installed: the LAN only, and `tower phone
+does). The LAN address (`bind = "auto"`) is looked at on the same beat:
+when the Mac is on another network, the LAN listener moves to the new
+address on the same port within 20 s, and the pairing offers it; with no
+network at all (Wi-Fi off) the old listener stays until there is one. A
+phone paired on another network needs that address: pair it again, or use
+Tailscale. Stopped, logged out or not installed: the LAN only, and `tower phone
 devices` and the panel say so. With no LAN address (Wi-Fi off) but
 Tailscale up, the tailnet address alone. A default route over the tailnet
 (an exit node) is one address, the tailnet's (`kind: "tailscale"`). It never

@@ -552,7 +552,9 @@ the Mac keeps only as a hash. The QR carries every address (the LAN's
 first, then the tailnet's, with the Mac's MagicDNS name), and the app tries
 them in order. Tailscale is found through its CLI (Homebrew's, or the
 standalone app's own) and looked at again every 20 s: start or stop it and
-the tower follows. `[lan] tailscale = "off"` in config.toml keeps it to the
+the tower follows. The LAN address is looked at as often: take the Mac from
+home to the office and the tower listens on the new network within 20 s
+(pair again there: the QR then has the new address). `[lan] tailscale = "off"` in config.toml keeps it to the
 LAN. `tower phone devices` and the pairing view say which addresses it
 listens on and whether Tailscale is running or stopped. The API, the
 pairing flow and the security model:
