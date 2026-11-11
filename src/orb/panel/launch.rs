@@ -134,6 +134,16 @@ pub(super) struct Dry {
     pub first_line: bool,
 }
 
+/// A folder as the user writes it: `~/Work/eyz/eyzflow`.
+fn tilde(folder: &str) -> String {
+    let home = crate::config::home();
+    let home = home.to_string_lossy();
+    match folder.strip_prefix(home.as_ref()) {
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => folder.to_string(),
+    }
+}
+
 /// A launch's receipt (the plan of a dry run) as the lines the launcher
 /// shows. None when it isn't a receipt.
 pub(super) fn plan_from(receipt: &Value) -> Option<Dry> {
@@ -145,7 +155,13 @@ pub(super) fn plan_from(receipt: &Value) -> Option<Dry> {
     let account = a["account"].as_str().or_else(|| sessions[0]["account"].as_str()).filter(|x| !x.is_empty());
     let on = account.map(|x| format!(" on {x}")).unwrap_or_default();
     let mut lines = vec![format!("{}{space}", if receipt["made"] == false { JOINS } else { NAMES })];
-    lines.push(if n == 1 { format!("Open 1 session{on}: {repos}") } else { format!("Open {n} sessions{on}: {repos}") });
+    let _ = repos;
+    lines.push(if n == 1 { format!("Open 1 session{on}:") } else { format!("Open {n} sessions{on}:") });
+    // Each with its folder.
+    for s in sessions {
+        let folder = s["repo"].as_str().unwrap_or("");
+        lines.push(format!("{} in {}", repo_name(folder), tilde(folder)));
+    }
     let own = sessions.iter().filter(|s| s["worktree"].as_str().is_some_and(|w| !w.is_empty())).count();
     lines.push(match (own, n) {
         (0, _) => match a["worktrees_why"].as_str().map(|w| w.trim_start_matches("none: ").trim_start_matches("off ")).filter(|w| !w.is_empty()) {
@@ -591,7 +607,13 @@ impl Panel {
                 .child(
                     v_flex()
                         .min_w_0()
-                        .child(div().font_weight(FontWeight::SEMIBOLD).text_color(g.text).child(repo_name(repo).to_string()))
+                        .child(
+                            h_flex()
+                                .flex_wrap()
+                                .gap_x(px(8.0))
+                                .child(div().font_weight(FontWeight::SEMIBOLD).text_color(g.text).child(repo_name(repo).to_string()))
+                                .child(div().text_size(px(12.0)).text_color(g.faint).child(tilde(repo))),
+                        )
                         .when(!why.is_empty(), |el| el.child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.muted).child(why.clone()))),
                 )
         }));
@@ -831,7 +853,14 @@ mod tests {
         let dry = plan_from(&receipt).unwrap();
         assert_eq!(
             dry.lines,
-            ["Name the space fix-login", "Open 2 sessions on orca: eyzflow, mediaroom", "Give each its own worktree, branch and dev port", "Introduce them to each other and hand out the goal"]
+            [
+                "Name the space fix-login",
+                "Open 2 sessions on orca:",
+                "eyzflow in ~/Work/eyz/eyzflow",
+                "mediaroom in ~/Work/eyz/mediaroom/",
+                "Give each its own worktree, branch and dev port",
+                "Introduce them to each other and hand out the goal"
+            ]
         );
         assert_eq!(dry.assumed, "It takes the setup “eyzflow + mediaroom on orca” (the first of 2).");
         // A standing space joined by name: no worktrees, and it says why; an account it picked itself is said too.
@@ -845,7 +874,7 @@ mod tests {
         joined["assumed"]["setup_why"] = "the one named".into();
         let dry = plan_from(&joined).unwrap();
         assert_eq!(dry.assumed, "The account: the default one: the setup names none.", "a setup that was named to it isn't its own choice");
-        assert_eq!(dry.lines, ["Join the space M5 Pro", "Open 1 session on orca: eyzflow", "No worktrees: it is a standing space, so each session works in its repo itself", "Hand out the goal"]);
+        assert_eq!(dry.lines, ["Join the space M5 Pro", "Open 1 session on orca:", "eyzflow in ~/Work/eyz/eyzflow", "No worktrees: it is a standing space, so each session works in its repo itself", "Hand out the goal"]);
         assert!(dry.assumed.ends_with("The account: the default one: the setup names none."), "{}", dry.assumed);
         // Not a receipt: no word.
         assert!(plan_from(&serde_json::json!({})).is_none() && plan_from(&serde_json::json!({ "space": "x", "sessions": [] })).is_none());

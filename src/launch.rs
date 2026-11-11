@@ -115,6 +115,12 @@ const ASKING: &[&str] = &[
     "these", "are", "here", "ticket", "task", "issue", "repo", "repos", "repository", "repositories", "project", "projects", "both", "two", "work",
 ];
 
+/// A line that asks to open sessions: "open a session at eyzflow and
+/// mediaroom", "start eyzflow and mediaroom", "spin up sessions in …".
+fn asks_for_sessions(line: &str) -> bool {
+    line.split(|c: char| !c.is_alphanumeric()).any(|w| ["open", "opens", "start", "starts", "launch", "spin"].contains(&w.to_lowercase().as_str()))
+}
+
 /// The goal's first line, up to a colon that brings the material in ("this is the ticket:").
 fn asking_line(goal: &str) -> &str {
     let first = goal.trim_start().lines().next().unwrap_or("");
@@ -127,6 +133,11 @@ fn asking_line(goal: &str) -> &str {
 /// folder's name (`mediaroom` in `eyz-mediaroom-serverless`; at least five
 /// letters). The rest of the goal (a pasted ticket) is never read for them.
 pub fn repos_named(goal: &str, folders: &[std::path::PathBuf]) -> Vec<(String, std::path::PathBuf)> {
+    // Only a line that asks to open sessions names repos: a ticket's title
+    // ("EYZFlow Support – Enable …") names the product, not what to open.
+    if !asks_for_sessions(asking_line(goal)) {
+        return vec![];
+    }
     let parts = |name: &str| -> Vec<String> { name.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(String::from).collect() };
     let name_of = |p: &std::path::PathBuf| p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
     let words: Vec<String> = asking_line(goal).split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_')).filter(|w| w.len() >= 3).map(str::to_lowercase).collect();
@@ -201,11 +212,42 @@ pub fn title_line<'a>(goal: &'a str, repos: &[String]) -> (&'a str, bool) {
 /// (the first only asked for sessions).
 fn space_name_why(goal: &str, repos: &[String]) -> (String, bool) {
     match title_line(goal, repos) {
-        (line, true) => (telling(line, &[], 2).join("-"), true),
+        (line, true) => match title_words(line) {
+            t if t.is_empty() => (telling(line, &[], 2).join("-"), true),
+            t => (t.join("-"), true),
+        },
         (_, false) => match telling(asking_line(goal), repos, 2) {
             t if t.is_empty() => (space_name(goal), false),
             t => (t.join("-"), false),
         },
+    }
+}
+
+/// Verbs a ticket's title opens with that say nothing of what it is about.
+const TITLE_VERBS: &[&str] = &["enable", "add", "implement", "build", "create", "introduce", "allow", "provide", "support", "improve", "update", "make", "set", "setup", "let"];
+
+/// The two words that name a ticket's title: after the product it opens
+/// with ("EYZFlow Support – …", "Billing: …") and a leading verb ("Enable
+/// …"), its first and last telling words ("Enable Automatic Message and
+/// Reply Translation": automatic, translation); a plain title keeps its
+/// first two ("Fix the login redirect": fix, login).
+fn title_words(title: &str) -> Vec<String> {
+    let title = title.trim();
+    let after = [" \u{2013} ", " \u{2014} ", " - ", ": "].iter().find_map(|d| title.split_once(d).map(|(_, r)| r.trim())).filter(|r| r.split_whitespace().count() >= 2).unwrap_or(title);
+    let mut words: Vec<String> = after
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .filter(|w| !FILLER.contains(&w.as_str()) && !ASKING.contains(&w.as_str()))
+        .collect();
+    let trimmed = after.len() < title.len() || words.first().is_some_and(|w| TITLE_VERBS.contains(&w.as_str()));
+    if words.len() > 1 && TITLE_VERBS.contains(&words[0].as_str()) {
+        words.remove(0);
+    }
+    match words.len() {
+        0..=2 => words,
+        _ if trimmed => vec![words[0].clone(), words[words.len() - 1].clone()],
+        _ => words.into_iter().take(2).collect(),
     }
 }
 
@@ -831,7 +873,12 @@ mod tests {
         let ticket = "open a session at eyzflow and mediaroom. this is the ticket:\nEYZFlow Support \u{2013} Enable Automatic Message and Reply Translation\n\nCustomers write in many languages.   Support answers in German.\n\n- Detect the language\n- Translate both ways, landing in the admin dashboard";
         let p = plan(ticket, None, None, &w).unwrap();
         assert_eq!(p.sessions.iter().map(|x| x.folder.clone()).collect::<Vec<_>>(), [flow.to_string_lossy().into_owned(), room.to_string_lossy().into_owned()]);
-        assert_eq!(p.space, "eyzflow-support", "named from the ticket's title, not from \"open a session\"");
+        assert_eq!(p.space, "automatic-translation", "named from the ticket's title, past its product and verb, not from \"open a session\"");
+        // A ticket's title names the product, not what to open: no repos are read from it (it is drafted).
+        let titled = "EYZFlow Support \u{2013} Enable Automatic Message and Reply Translation\n\nDescription: we need translation";
+        assert!(repos_named(titled, &w.projects).is_empty());
+        assert_eq!(title_words("Billing: add CSV export for invoices"), ["csv", "invoices"]);
+        assert_eq!(title_words("Fix the login redirect"), ["fix", "login"]);
         assert_eq!(p.account.as_deref(), Some("default"));
         assert_eq!(p.assumed["setup_why"], "the repos its first line names");
         assert_eq!(p.assumed["account_why"], "the default one: the goal names none");
