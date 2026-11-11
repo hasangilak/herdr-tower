@@ -143,6 +143,39 @@ pub(super) struct Card {
     options_open: bool,
     /// It stopped and the user wants another go: the questions show again.
     again: bool,
+    /// Where the dialog was (its tab, and which tabs were answered there)
+    /// when the card last followed it.
+    followed: Option<(usize, Vec<bool>)>,
+}
+
+/// A tab of a set's dialog the user answered in the session's terminal:
+/// it stands, and the card asks it no more.
+pub(super) fn there(set: &QuestionSet, t: usize) -> bool {
+    set.kind == "claude-ask" && set.tabs.len() > 1 && set.tabs.get(t).is_some_and(|tab| tab.answered)
+}
+
+/// Every question of the set was answered in the terminal: only Submit is left.
+pub(super) fn all_there(set: &QuestionSet) -> bool {
+    (0..set.tabs.len()).all(|t| there(set, t))
+}
+
+/// The first question still open after `t` (the review: `tabs.len()`).
+pub(super) fn next_open(set: &QuestionSet, t: usize) -> usize {
+    (t + 1..set.tabs.len()).find(|i| !there(set, *i)).unwrap_or(set.tabs.len())
+}
+
+/// The card follows its dialog: when the dialog shows another tab, or other
+/// tabs answered (the user answering it in the terminal), the card goes to
+/// where the dialog is (its review to the card's). A card the user moves on
+/// the Mac stays where they put it while the dialog stays put.
+pub(super) fn follow_dialog(card: &mut Card, set: &QuestionSet) {
+    let n = set.tabs.len();
+    let now = (set.current_tab, set.tabs.iter().map(|t| t.answered).collect::<Vec<bool>>());
+    if n < 2 || card.sending || card.followed.as_ref() == Some(&now) {
+        return;
+    }
+    card.followed = Some(now);
+    card.step = set.current_tab.min(n);
 }
 
 /// What a number key, or the tap it stands for, does on a set's card.
@@ -174,7 +207,10 @@ pub(super) fn keys(set: &QuestionSet, step: usize, busy: bool, again: bool) -> V
     }
     let n = set.tabs.len();
     if n > 1 && step >= n {
-        return vec![Key::Submit, Key::Change];
+        return if all_there(set) { vec![Key::Submit] } else { vec![Key::Submit, Key::Change] };
+    }
+    if there(set, step) {
+        return vec![];
     }
     let Some(tab) = set.tabs.get(step) else { return vec![] };
     if unread(set, step) && n > 1 {
@@ -271,6 +307,12 @@ impl Panel {
                 self.tower.update(cx, |t, _| t.acts.dismissed.insert(id));
             }
         }
+        // Each card follows its dialog (answered tab by tab in the terminal, it moves on).
+        for set in &sets {
+            if let Some(card) = self.asks.cards.get_mut(&set.id) {
+                follow_dialog(card, set);
+            }
+        }
         // A decision with no dialog behind it has a card too (its "Other" field).
         open.extend(self.decisions(cx).into_iter().filter(|d| d.live()).map(|d| d.id));
         self.asks.cards.retain(|id, _| open.contains(id));
@@ -353,6 +395,10 @@ impl Panel {
         let card = self.asks.cards.get(&set.id);
         let mut out = vec![];
         for (t, tab) in set.tabs.iter().enumerate() {
+            // Answered in the terminal: it stands, and nothing is sent for it.
+            if there(set, t) {
+                continue;
+            }
             if unread(set, t) {
                 return Err(t);
             }
@@ -383,9 +429,11 @@ impl Panel {
             }
         };
         // What the queue says once it has landed.
-        let said = match set.tabs.len() {
-            1 => model::receipt_text(&self.answer_summary(set, 0, cx).unwrap_or_default()),
-            n => format!("Answered {n} questions."),
+        let said = match (set.tabs.len(), answers.len()) {
+            (1, _) => model::receipt_text(&self.answer_summary(set, 0, cx).unwrap_or_default()),
+            (_, 0) => "Submitted the answers given in the terminal.".to_string(),
+            (_, 1) => "Answered 1 question.".to_string(),
+            (_, k) => format!("Answered {k} questions."),
         };
         // The decision this set stands for. The daemon's own (`d…`) is
         // answered by its id, so every session that asks the same gets the
@@ -491,7 +539,7 @@ impl Panel {
                 self.tap(set, step, toggle(&current, multi, i), cx)
             }
             Key::Submit => self.submit(set, cx),
-            Key::Change => self.go(&set.id, 0, cx),
+            Key::Change => self.go(&set.id, if there(set, 0) { next_open(set, 0) } else { 0 }, cx),
             Key::Show => self.show_in_herdr(&set.session, cx),
             Key::Again => {
                 self.asks.cards.entry(set.id.clone()).or_default().again = true;
@@ -512,7 +560,7 @@ impl Panel {
 
     /// The question is answered: send it, or on to the next one.
     fn commit(&mut self, set: &QuestionSet, t: usize, cx: &mut Context<Self>) {
-        if set.tabs.len() == 1 { self.submit(set, cx) } else { self.go(&set.id, t + 1, cx) }
+        if set.tabs.len() == 1 { self.submit(set, cx) } else { self.go(&set.id, next_open(set, t), cx) }
     }
 
     /// A question set as the queue's open card: who waits and why, then one
@@ -522,6 +570,7 @@ impl Panel {
         let id = set.id.clone();
         let (step, sending, error, note, again) = {
             let c = self.asks.cards.entry(id.clone()).or_default();
+            follow_dialog(c, set);
             c.step = c.step.min(if n > 1 { n } else { 0 });
             if c.tabs.is_empty() {
                 c.tabs = set.tabs.clone();
@@ -537,6 +586,8 @@ impl Panel {
         let key_of = |k: Key| keys.iter().position(|x| *x == k);
         let (tag, rest) = if stopped {
             (tag.to_string(), "stopped".to_string())
+        } else if n > 1 && step >= n && all_there(set) {
+            ("Review".to_string(), format!("{n} answered in the terminal"))
         } else if n > 1 && step >= n {
             ("Review".to_string(), format!("{n} answers"))
         } else if n > 1 {
@@ -593,6 +644,12 @@ impl Panel {
         let now = effective(&chosen, recs.as_ref());
         let key_of = |k: Key| keys.iter().position(|x| *x == k);
         let mut out: Vec<AnyElement> = vec![];
+        if there(set, t) {
+            out.push(card_title(if tab.question.is_empty() { &tab.title } else { &tab.question }));
+            out.push(cstat(answered_there_line(tab), false));
+            out.extend(self.ask_nav(set, t, false, busy, cx));
+            return out;
+        }
         if unread(set, t) && n > 1 {
             out.push(card_title(&tab.title));
             out.push(cstat("The tower hasn't read this question yet. It shows here in a moment; or answer it in the session.", false));
@@ -827,7 +884,7 @@ impl Panel {
             row = row.child(mbtn(format!("back-{id}"), "Back", false, None).on_click(cx.listener(move |this, _, _, cx| this.go(&id2, t - 1, cx))));
         }
         if next {
-            let label = if n == 1 { "Answer" } else if t + 1 == n { "Review" } else { "Next" };
+            let label = if n == 1 { "Answer" } else if next_open(set, t) == n { "Review" } else { "Next" };
             let s = set.clone();
             row = row.child(
                 mbtn(format!("next-{id}"), label, n == 1, None)
@@ -844,7 +901,7 @@ impl Panel {
         let mut out: Vec<AnyElement> = vec![card_title("Review your answers")];
         let mut rows = v_flex().gap(px(6.0));
         for t in 0..set.tabs.len() {
-            let answer = self.answer_summary(set, t, cx);
+            let answer = if there(set, t) { Some(answered_there_line(&set.tabs[t])) } else { self.answer_summary(set, t, cx) };
             let id2 = set.id.clone();
             let tab = &set.tabs[t];
             rows = rows.child(
@@ -868,6 +925,8 @@ impl Panel {
         }
         out.push(rows.into_any_element());
         let (s1, s2) = (set.clone(), set.clone());
+        // Everything answered in the terminal: only Submit is left to do.
+        let change = !all_there(set);
         out.push(
             acts_row()
                 .child(
@@ -875,11 +934,19 @@ impl Panel {
                         .when(busy, |el| el.opacity(0.5))
                         .when(!busy, |el| el.on_click(cx.listener(move |this, _, _, cx| this.ask_key(&s1, Key::Submit, cx)))),
                 )
-                .child(mbtn(format!("change-{}", set.id), "Change", false, key_of(Key::Change)).on_click(cx.listener(move |this, _, _, cx| this.ask_key(&s2, Key::Change, cx))))
+                .when(change, |row| {
+                    row.child(mbtn(format!("change-{}", set.id), "Change", false, key_of(Key::Change)).on_click(cx.listener(move |this, _, _, cx| this.ask_key(&s2, Key::Change, cx))))
+                })
                 .into_any_element(),
         );
         out
     }
+}
+
+/// What a card says of a question answered in the session's terminal: with
+/// its answer when the screen showed it.
+pub(super) fn answered_there_line(tab: &Tab) -> String {
+    if tab.answer.trim().is_empty() { "Answered in the terminal".to_string() } else { format!("Answered in the terminal: {}", tab.answer.trim()) }
 }
 
 /// Who asks a set's question: its session, and with it every other session
@@ -951,7 +1018,7 @@ mod tests {
     }
 
     fn asked(tabs: usize, recs: Option<usize>, status: &str) -> QuestionSet {
-        let one = Tab { title: "DB".into(), question: "Which database?".into(), options: vec![Opt::default(), Opt::default(), Opt::default(), Opt::default()], multi: false, allows_other: true, answered: false };
+        let one = Tab { title: "DB".into(), question: "Which database?".into(), options: vec![Opt::default(), Opt::default(), Opt::default(), Opt::default()], multi: false, allows_other: true, answered: false, answer: String::new() };
         QuestionSet {
             id: "q".into(),
             kind: "claude-ask".into(),
@@ -991,7 +1058,7 @@ mod tests {
 
     fn tab(multi: bool) -> Tab {
         let opt = |l: &str| Opt { label: l.into(), description: String::new(), key: String::new() };
-        Tab { title: "DB".into(), question: "Which database?".into(), options: vec![opt("Postgres"), opt("SQLite"), opt("MySQL")], multi, allows_other: true, answered: false }
+        Tab { title: "DB".into(), question: "Which database?".into(), options: vec![opt("Postgres"), opt("SQLite"), opt("MySQL")], multi, allows_other: true, answered: false, answer: String::new() }
     }
 
     fn recs() -> TabRecs {
@@ -1069,5 +1136,48 @@ mod tests {
         let gone: HashSet<String> = ["a".to_string()].into();
         assert_eq!(escalated(&state, &gone).len(), 1);
         assert!(escalated(&json!({}), &HashSet::new()).is_empty());
+    }
+
+    /// The dialog answered tab by tab in the terminal: the card goes where
+    /// the dialog is, asks no more what was answered there, and with all of
+    /// it answered offers Submit only. Moved on the Mac, it stays put while
+    /// the dialog does.
+    #[test]
+    fn the_card_follows_its_dialog_answered_in_the_terminal() {
+        let mut set = asked(4, Some(3), "open");
+        let mut card = Card::default();
+        follow_dialog(&mut card, &set);
+        assert_eq!(card.step, 0);
+        // On the Mac the user looks at the second question; the dialog hasn't moved.
+        card.step = 1;
+        follow_dialog(&mut card, &set);
+        assert_eq!(card.step, 1, "stays where the user put it");
+        // In the terminal: three answered, the dialog on the fourth.
+        for t in 0..3 {
+            set.tabs[t].answered = true;
+        }
+        set.tabs[1].answer = "Search".into();
+        set.current_tab = 3;
+        follow_dialog(&mut card, &set);
+        assert_eq!(card.step, 3, "the card is where the dialog is: 4 of 4");
+        assert!(there(&set, 0) && there(&set, 2) && !there(&set, 3));
+        assert_eq!(keys(&set, 3, false, false), [Key::Rec(0), Key::Rec(1), Key::Rec(2)], "the open question's answers");
+        assert!(keys(&set, 1, false, false).is_empty(), "nothing to pick on a question answered there");
+        assert_eq!((next_open(&set, 0), next_open(&set, 3)), (3, 4), "Next skips what was answered there");
+        assert_eq!(answered_there_line(&set.tabs[1]), "Answered in the terminal: Search");
+        assert_eq!(answered_there_line(&set.tabs[0]), "Answered in the terminal");
+        assert_eq!(keys(&set, 4, false, false), [Key::Submit, Key::Change]);
+        // The fourth answered there too, the dialog on its review: Submit only.
+        set.tabs[3].answered = true;
+        set.current_tab = 4;
+        follow_dialog(&mut card, &set);
+        assert_eq!(card.step, 4);
+        assert!(all_there(&set));
+        assert_eq!(keys(&set, 4, false, false), [Key::Submit], "only Submit is left");
+        // A single question has no tabs to follow.
+        let one = asked(1, Some(3), "open");
+        let mut c = Card { step: 0, ..Default::default() };
+        follow_dialog(&mut c, &one);
+        assert!(!there(&one, 0) && c.step == 0);
     }
 }

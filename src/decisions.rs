@@ -526,6 +526,32 @@ pub fn options_of(set: &QuestionSet) -> Vec<Opt> {
     }
 }
 
+/// A question decision's title: what its dialog asks now. With several
+/// questions, the one it is on (else the first still open), and how many
+/// more are open; those the user answered in the terminal already say so;
+/// all of them answered there: only Submit is left.
+fn question_title(set: &QuestionSet) -> String {
+    let asked = |t: &crate::questions::Tab| t.question.trim().to_string();
+    let first = set.tabs.first().map(asked).filter(|q| !q.is_empty()).unwrap_or_else(|| set.title.trim().to_string());
+    let n = set.tabs.len();
+    if n < 2 {
+        return first;
+    }
+    let there = crate::questions::answered_there(set).len();
+    let open: Vec<usize> = (0..n).filter(|i| !set.tabs[*i].answered).collect();
+    let cur = open.iter().copied().find(|i| *i == set.current_tab).or_else(|| open.iter().copied().find(|i| *i > set.current_tab)).or(open.first().copied());
+    let Some(cur) = cur else {
+        return format!("All {n} answered in the terminal, not submitted yet: {first}");
+    };
+    let q = Some(asked(&set.tabs[cur])).filter(|q| !q.is_empty()).unwrap_or(first);
+    match (open.len() - 1, there) {
+        (0, 0) => q,
+        (more, 0) => format!("{q} (and {more} more)"),
+        (0, there) => format!("{q} ({there} answered in the terminal)"),
+        (more, there) => format!("{q} (and {more} more; {there} answered in the terminal)"),
+    }
+}
+
 /// A question set that is the user's to answer, as a decision sees it. None:
 /// the tower answers it, or nobody has decided yet.
 pub fn asked(set: &QuestionSet) -> Option<Asked> {
@@ -538,10 +564,7 @@ pub fn asked(set: &QuestionSet) -> Option<Asked> {
         _ => Kind::Permission,
     };
     let title = match kind {
-        Kind::Question => {
-            let first = set.tabs.first().map(|t| t.question.trim()).filter(|q| !q.is_empty()).unwrap_or(set.title.trim());
-            if set.tabs.len() > 1 { format!("{first} (and {} more)", set.tabs.len() - 1) } else { first.to_string() }
-        }
+        Kind::Question => question_title(set),
         _ => set.title.clone(),
     };
     Some(Asked {
@@ -1293,7 +1316,9 @@ pub fn takers<'a>(
     }
     let (mut take, mut skip) = (vec![], vec![]);
     for set in open {
-        if set.id == card.id || crate::questions::answers_mean_the_same(card, set, answers) {
+        // Only submitting (every tab was answered in its terminal): that card's dialog, nobody else's.
+        let submit_only = answers.is_empty() && set.id != card.id;
+        if set.id == card.id || (!submit_only && crate::questions::answers_mean_the_same(card, set, answers)) {
             take.push(set);
         } else {
             skip.push((set.session.clone(), "it offers other answers than the card showed: it stays open and gets its own card".to_string()));
@@ -2007,5 +2032,41 @@ mod tests {
         assert_eq!((d.state, d.closed_ms, d.answer.as_str()), (State::Answered, Some(3 * MIN), ""), "what it was answered with comes from its screen or its words");
         // The next sync, without them: nothing more happens to it.
         assert!(b.sync_questions(&[], &|_| State::Stopped, 4 * MIN).closed.is_empty());
+    }
+
+    /// A question decision's title follows its dialog: the question it is
+    /// on, what is open, what was answered in the terminal.
+    #[test]
+    fn a_questions_title_follows_its_dialog() {
+        use crate::questions::Tab;
+        let tab = |q: &str| Tab { title: q.into(), question: format!("{q}?"), ..Default::default() };
+        let mut set = QuestionSet { id: "q1".into(), kind: "claude-ask".into(), tabs: vec![tab("Database"), tab("Features"), tab("Deploy"), tab("Region")], ..Default::default() };
+        assert_eq!(question_title(&set), "Database? (and 3 more)");
+        set.tabs[0].answered = true;
+        set.tabs[1].answered = true;
+        set.current_tab = 2;
+        assert_eq!(question_title(&set), "Deploy? (and 1 more; 2 answered in the terminal)");
+        set.tabs[2].answered = true;
+        set.current_tab = 3;
+        assert_eq!(question_title(&set), "Region? (3 answered in the terminal)");
+        set.tabs[3].answered = true;
+        set.current_tab = 4;
+        assert_eq!(question_title(&set), "All 4 answered in the terminal, not submitted yet: Database?");
+        let one = QuestionSet { kind: "claude-ask".into(), tabs: vec![tab("Color")], ..Default::default() };
+        assert_eq!(question_title(&one), "Color?");
+    }
+
+    /// Only submitting (every tab answered in the terminal) goes to the card it was given on, nobody else's dialog.
+    #[test]
+    fn submit_only_goes_to_its_own_card() {
+        let sets = vec![waits("t1", "web", "Shop", "merge PR #12"), waits("t2", "api", "Shop", "merge PR #12")];
+        let mut b = Book::default();
+        b.sync_questions(&asked_all(&sets), &|_| State::Stopped, MIN);
+        let d = b.open[0].clone();
+        let (take, _) = takers(&d, &json!({ "answers": [], "shown": sets[1].id }), &[], &sets).unwrap();
+        assert_eq!(take.iter().map(|s| s.session.as_str()).collect::<Vec<_>>(), ["t2"]);
+        let answers = vec![crate::questions::Answer { tab: 0, choice: json!({"other": "merged"}), attachments: vec![] }];
+        let (take, _) = takers(&d, &json!({ "answers": [], "shown": sets[1].id }), &answers, &sets).unwrap();
+        assert_eq!(take.len(), 2, "an answer that means the same goes to every session that asks it, as before");
     }
 }

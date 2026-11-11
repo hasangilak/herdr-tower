@@ -51,7 +51,14 @@ A screen it can't read gives no question set: the user answers as before,
 through the tower ("approve it", "say no").
 
 Every change of herdr-core's status line (a new tab, a new question) reads
-the screen again; the set's `id` (a hash of the session, kind, title, detail
+the screen again, and so does the user answering the dialog in the terminal
+tab by tab (which changes nothing in herdr-core's status): while a dialog of
+several questions is open, its screen is looked at again about every 1.5
+seconds, and read again whole when it shows another tab or other tabs
+answered (`Asks::follow`, `questions::dialog_moved`). `current_tab` and each
+tab's `answered` (and `answer`: the review tab lists the answers given, a
+multi-choice tab shows its ticks) follow the dialog, and so do the cards on
+the Mac and the phone, and the decision's title; the set's `id` (a hash of the session, kind, title, detail
 and questions: another command or plan is another set) stays the same while
 the questions do, so recommendations stay with it. When the session stops
 being blocked, its set closes, and the same dialog asked again later (the
@@ -71,7 +78,9 @@ the session still shows it.
   "tabs": [
     {"title": "Database", "question": "Which database should the app use?",
      "options": [{"label": "Postgres", "description": "…", "key": "1"}, …],
-     "multi": false, "allows_other": true, "answered": false},
+     "multi": false, "allows_other": true,
+     "answered": false,             // ticked in the dialog's tab bar (answered there)
+     "answer": "SQLite"},           // what it was answered with, when the screen shows it (left out otherwise)
     …
   ],
   "current_tab": 0,                // tabs.len(): the review tab
@@ -268,6 +277,15 @@ key:
    Never blind: anything else stops it.
 5. Menus (permission, plan, Codex): the option's number, and Enter if the
    number only moved the cursor; done when the prompt is gone.
+
+What was answered in the dialog already stands: answers for tabs it shows
+answered are left out, and the keys start from the tab it is on. When every
+answer given was for such a tab, nothing is typed and the answer says so
+("Nothing was typed: … answered in its terminal already"); with every tab
+answered there, `"answers": []` with `submit` only submits. The tower never
+answers a dialog itself (`auto`) once the user is in it (a tab answered
+there, or the dialog on another tab than it opened on): it becomes the
+user's card, without a word.
 
 On any surprise it stops and says where (`status: failed`, `error`), and
 the user can finish in the terminal. When they do (or answer it there in

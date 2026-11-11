@@ -373,6 +373,8 @@ pub fn start(shared: Shared, mouth: Mouth, alerts: Alerts, watches: Watches, ask
     radar.asks.set_notify(move |address, text| r.announce(address, text));
     // The cards the last run left, settled before the first look reads the dialogs again.
     radar.asks.restore();
+    // A dialog answered tab by tab in the terminal: its card follows.
+    radar.asks.follow();
     let r = radar.clone();
     thread::Builder::new().name("reconcile".into()).spawn(move || r.reconcile(before)).ok();
     let r = radar.clone();

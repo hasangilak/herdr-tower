@@ -92,6 +92,20 @@ impl std::fmt::Display for Held {
 
 impl std::error::Error for Held {}
 
+/// The user is answering the dialog in its terminal (a tab is answered
+/// there, or it is on another tab than it opened on): the tower types
+/// nothing of its own into it, and it is the user's card, quietly.
+#[derive(Debug)]
+struct Busy(String);
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Busy {}
+
 /// An answer that comes too late: the question was answered (or closed, or
 /// read again) meanwhile. Nothing was typed; the tower doesn't take it to
 /// the user as a failure.
@@ -641,6 +655,44 @@ impl Asks {
         });
     }
 
+    /// From now on (the daemon's): every open tabbed dialog is looked at
+    /// again about every 1.5 seconds while its session shows it. The user
+    /// may be answering it in the terminal, tab by tab, which changes nothing
+    /// in Herdr's status: when its screen shows another tab, or other tabs
+    /// answered, it is read again whole, and its card (the Mac's, the
+    /// phone's, its decision's) follows.
+    pub fn follow(&self) {
+        let me = self.clone();
+        let _ = std::thread::Builder::new().name("questions-follow".into()).spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(1_500));
+                me.look_again();
+            }
+        });
+    }
+
+    /// One look at every open tabbed dialog (one `hc read` each).
+    fn look_again(&self) {
+        let open: Vec<QuestionSet> = {
+            let i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            i.sets
+                .iter()
+                // Being typed into (the driver reads it itself), or being read: not now.
+                .filter(|s| s.kind == "claude-ask" && !s.session.contains('/') && matches!(s.state.phase, Phase::Open | Phase::Failed { .. }))
+                .filter(|s| !i.reading.contains_key(&s.session))
+                .cloned()
+                .collect()
+        };
+        for set in open {
+            let Ok(out) = hc::run(&["read", &set.session]) else { continue };
+            let Some(screen) = questions::parse_screen(&out.stdout) else { continue };
+            if questions::dialog_moved(&set, &screen) {
+                eprintln!("[questions] {} ({}): its dialog moved on in the terminal; reading it again", set.id, set.session);
+                self.refresh(&set.session);
+            }
+        }
+    }
+
     /// A waiting reply's session has `status` now: stopping for a dialog
     /// isn't the turn's end the reply waits for (its count goes up by one).
     fn reply_sees(&self, address: &str, status: &SessionStatus) {
@@ -873,6 +925,12 @@ impl Asks {
                     set.created_ms = set.created_ms.or(o.created_ms);
                     set.space = set.space.take().or_else(|| o.space.clone());
                     set.state = o.state.clone();
+                    // What a tab was answered with stays known after the screen stops showing it.
+                    for (t, was) in set.tabs.iter_mut().zip(&o.tabs) {
+                        if t.answered && t.answer.is_empty() && was.answered {
+                            t.answer = was.answer.clone();
+                        }
+                    }
                     card::sync(&mut set);
                     i.sets[k] = set.clone();
                     false
@@ -1301,6 +1359,9 @@ impl Asks {
             Err(e) => {
                 if let Some(held) = e.downcast_ref::<Held>() {
                     self.escalate(&set.id, &held.0);
+                } else if let Some(busy) = e.downcast_ref::<Busy>() {
+                    eprintln!("[questions] {}: not answering {id}: {busy}", set.session);
+                    self.escalate_quietly(&set.id, &busy.0);
                 } else if e.downcast_ref::<Late>().is_some() || e.downcast_ref::<Refused>().is_some() {
                     // Answered (or closed) meanwhile: nothing for the user to do.
                     eprintln!("[questions] {}: not answering {id} for the user: {e:#}", set.session);
@@ -1327,6 +1388,23 @@ impl Asks {
         self.publish();
         self.event("update", Some(&set), id);
         self.tell_escalated(&set);
+    }
+
+    /// The user's card after all, said to nobody: they are in its dialog already.
+    fn escalate_quietly(&self, id: &str, why: &str) {
+        let set = {
+            let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(s) = i.sets.iter_mut().find(|s| s.id == id) else { return };
+            if card::apply(s, &Ev::Escalate).is_err() {
+                return;
+            }
+            s.reason = why.to_string();
+            s.clone()
+        };
+        self.publish();
+        // Told, as far as the decision goes: nothing says it later either.
+        let _ = self.tells(&set.id, false);
+        self.event("update", Some(&set), id);
     }
 
     /// One sentence: what is asked, and what the tower would pick.
@@ -1438,7 +1516,21 @@ impl Asks {
                 bail!("the questions changed since they were shown (now {}); the card shows them now: check it and submit again", shown.id);
             }
         }
-        let answers = if auto { self.recheck(&now, answers).map_err(Held)? } else { answers.to_vec() };
+        // The user is in the dialog, answering it in the terminal: the tower's own answer stays out.
+        let there = questions::answered_there(&now);
+        if auto && now.kind == "claude-ask" && now.tabs.len() > 1 && (!there.is_empty() || now.current_tab != 0) {
+            bail!(Busy(format!("the user is answering it in its terminal ({} of {} answered there)", there.len(), now.tabs.len())));
+        }
+        // What the user answered in the terminal stands: those tabs get nothing typed, and the
+        // keys start where the dialog is now (its tab: `now.current_tab`).
+        let (answers, skipped) = questions::answers_left(&now, answers);
+        if !skipped.is_empty() {
+            eprintln!("[questions] {}: tab(s) {skipped:?} answered in its terminal already; their answers are left out", now.id);
+        }
+        if let Some(why) = questions::nothing_to_type(&now, &answers, &skipped, submit) {
+            bail!("{why}");
+        }
+        let answers = if auto { self.recheck(&now, &answers).map_err(Held)? } else { answers };
         // Checked and marked at once: a second answer (the phone, the panel, the tower) waits its turn.
         let tracked = match self.start_answering(&now.id, by) {
             Ok(t) => t,
@@ -2737,5 +2829,39 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(lines(&record, 1).is_empty());
         assert_eq!(d.get(&id).unwrap().state, crate::decisions::State::Stopped);
+    }
+
+    /// The dialog read again as the user answers it in the terminal: the
+    /// same set moves on (its tab, what is answered), keeps its decision, and
+    /// what the review showed of an answer stays known once it doesn't show.
+    #[test]
+    fn a_dialog_read_again_tab_by_tab_follows_and_keeps_its_answers() {
+        let (a, d, user) = deciding(|| crate::tell::Level::Decisions);
+        let tabs = questions::transcript_questions(&fixture("claude-ask-transcript.jsonl")).unwrap();
+        let read = |name: &str| {
+            let mut s = questions::build("t21", "web", false, &questions::parse_screen(&fixture(name)).unwrap(), Some(tabs.clone()), "", "");
+            s.at_ms = crate::history::now_ms();
+            s
+        };
+        let first = read("claude-ask-tab1.txt");
+        a.upsert(first.clone());
+        a.escalate(&first.id, "the user decides");
+        let id = d.for_question(&first.id)[0].clone();
+        assert_eq!(user.lock().unwrap().len(), 1);
+        // The user ticks Features in the terminal, then goes to the review.
+        let review = read("claude-ask-review-tagged.txt");
+        assert_eq!(review.id, first.id);
+        a.upsert(review);
+        let now = a.get(&first.id).unwrap();
+        assert_eq!((now.current_tab, now.tabs[1].answered, now.tabs[1].answer.as_str(), now.decision.as_deref()), (3, true, "Search (full text)", Some("escalate")));
+        assert!(d.get(&id).unwrap().title.contains("2 answered in the terminal"), "{}", d.get(&id).unwrap().title);
+        // Back on a question tab: the review's answer isn't on screen any more, and is still known.
+        let mut back = read("claude-ask-tab3.txt");
+        back.tabs[1].answered = true;
+        a.upsert(back);
+        let now = a.get(&first.id).unwrap();
+        assert_eq!((now.current_tab, now.tabs[1].answer.as_str()), (2, "Search (full text)"));
+        assert_eq!(user.lock().unwrap().len(), 1, "nothing said again");
+        assert_eq!(d.get(&id).unwrap().state, crate::decisions::State::Open);
     }
 }
