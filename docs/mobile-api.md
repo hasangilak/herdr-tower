@@ -26,8 +26,10 @@ The API is **off by default**.
 
 ```sh
 tower phone enable      # [lan] enabled = true in config.toml, and starts it if the voice runs
-tower phone pair        # a one-time code and a QR for the app
-tower phone devices     # paired phones, where it listens, Tailscale (running or stopped); --json for all of it
+tower phone pair        # a one-time code and a QR for the app, the network, and what it asks of the phone
+tower phone devices     # paired phones (the networks each knows, whether it can reach the tower here), Tailscale; --json for all of it
+tower phone network     # the network this Mac is on now; `network name "Office"` names it ("" forgets the name)
+tower phone rename <id> "<name>"   # a paired phone's name
 tower phone revoke <id> # or `all`: those tokens stop working at once
 tower phone disable     # stops the API and ends open event streams (phones stay paired)
 ```
@@ -41,7 +43,19 @@ port = 7843
 bind = "auto"         # this Mac's address on its default-route network, or an IP of this Mac
 allow_public = false  # refuse anything but private/link-local/100.64.0.0/10 (Tailscale) addresses
 tailscale = "auto"    # also listen on this Mac's Tailscale IPv4 while Tailscale runs; "off" not to
+
+[lan.networks]        # names for the networks this Mac is on, by range (`tower phone network name`, Settings > Phone)
+"10.10.30" = "Office"
+"192.168.2" = "Home"
 ```
+
+**A network** is told by this Mac's address on it, since macOS keeps the
+Wi-Fi's name (SSID) from apps without location access: the /24 of the LAN
+listener's IPv4 (`10.10.30` for 10.10.30.116), or the address itself for
+IPv6. Named under `[lan.networks]`, it reads by its name ("Office");
+unnamed, as "the network 10.10.30.x". (`HERDER_TOWER_LAN_IP_FILE` names a
+file whose one line stands in for this Mac's address, read on every look:
+a sandbox can move "networks" with it.)
 
 **Tailscale.** With `tailscale = "auto"` (the default) the API listens on
 two addresses, same port, same certificate: the LAN address as before, and
@@ -71,8 +85,13 @@ address, in order: `[{"kind": "lan", "host": "192.168.1.20", "port": 7843},
 {"kind": "tailscale", "host": "100.68.110.33", "port": 7843, "dns_name":
 "mac.tailnet.ts.net"}]`, `[]` when off), `tailscale` (`{"installed": true,
 "running": true, "state": "running", "ip": "100.68.110.33", "dns_name":
-"mac.tailnet.ts.net"}`, `null` until the API has started once) and `phone`
-(the name of the phone that is the voice, or `null`).
+"mac.tailnet.ts.net"}`, `null` until the API has started once), `phone`
+(the name of the phone that is the voice, or `null`), `network` (the LAN
+listener's network: `{"range": "10.10.30", "name": "Office" | null, "lan":
+{"host": "10.10.30.116", "port": 7843} | null}`, `null` while the API is
+off or without a LAN address) and `phone_hint` (`"Phone: pair again on this
+network"` while the Mac's windows say it, else `null`: see "Pairing on more
+than one network").
 
 ## Security model
 
@@ -93,7 +112,9 @@ So:
    (someone in between, another machine) fails the handshake. Hostname
    checks are not used (the certificate's name is `herder-tower`).
 3. **Pairing by a one-time code shown on the Mac**: 8 digits, valid 5
-   minutes, one use. Wrong tries are counted by address: after 5 from one
+   minutes, one use. Pairing again with the same `install_id` (the same
+   app install) takes the code too; it gives that device a new token, and
+   the old one stops working at once (its open streams close). Wrong tries are counted by address: after 5 from one
    address the code is void for that address (others can still pair), and
    after 30 in all it is void for everyone. Each wrong try also waits a
    second. Opening a new code replaces the old one.
@@ -151,7 +172,9 @@ the same tokens, the same limits (the tailnet's address counts as private).
    MagicDNS name. An app that doesn't know `hosts` and `dns` ignores them and
    pairs over `h`/`p` exactly as before.
 
-   `tower phone pair --json` (the same in the daemon's `phone pair` answer):
+   `tower phone pair --json` (the same in the daemon's `phone pair` answer;
+   it also has `network`, as in the state, for the Mac to say what the
+   phone must be on):
 
    ```json
    {
@@ -202,24 +225,105 @@ the same tokens, the same limits (the tailnet's address counts as private).
    POST /v1/pair
    Content-Type: application/json
 
-   {"code": "<the 8 digits>", "name": "Pixel 9"}
+   {"code": "<the 8 digits>", "name": "Pixel 9", "install_id": "k3J9-2fQx_8aZ0pLm"}
    ```
 
    ```json
-   200 {"token": "htk_…", "device": {"id": "d_3fa9c2e1", "name": "Pixel 9"}, "fingerprint": "<hex>", "api": 1, "features": ["quiet", "acts"]}
+   200 {"token": "htk_…", "device": {"id": "d_3fa9c2e1", "name": "Pixel 9"}, "fingerprint": "<hex>", "api": 1,
+        "features": ["quiet", "acts", "pairing"], "repaired": false,
+        "hosts": [{"kind": "lan", "host": "10.10.30.116", "port": 7843}],
+        "network": {"range": "10.10.30", "name": "Office", "lan": {"host": "10.10.30.116", "port": 7843}}, "magic_dns": null}
+   400 {"error": {"code": "bad_install_id", "message": "…"}}
    403 {"error": {"code": "pairing_closed", "message": "…"}}
    403 {"error": {"code": "wrong_code", "message": "…", "tries_left": 4}}
    ```
 
+   `install_id` (optional): a random id the app makes once per install and
+   keeps, 8 to 64 letters, digits, `-` and `_` (anything else is `400
+   bad_install_id`, and the code is not used up). When a paired device has
+   the same `install_id`, that device is **paired again in place**: the
+   same `device.id`, its replies route kept, its name updated if `name` is
+   given, a new token (the old one stops working at once, and its streams
+   close), and `"repaired": true`. Otherwise it is a new device
+   (`"repaired": false`). Without `install_id` (an older app) it is always
+   a new device, as before. The answer also says where the tower is now
+   (`hosts`, `network`, `magic_dns`, as `GET /v1/network`): store them.
+
 4. The app stores every address (`hosts`, else `host`/`port`), the
    MagicDNS name, the fingerprint and the token, and from then on sends the
-   token with every call. To connect it tries the addresses in order (the
+   token with every call (and merges the addresses the stream sends: see
+   "Pairing on more than one network"). To connect it tries the addresses in order (the
    LAN first: on the home network it is the direct path), moving on after a
    short connect timeout (2 to 3 s); the MagicDNS name can stand in for the
    tailscale entry's IP if that changed. The certificate pin is the same
    for all of them; no hostname is checked. A paired app refreshes its
    list from `GET /v1/state` (`lan_hosts`): a Mac that starts Tailscale
    later, or moves to another LAN address, is found there.
+
+## Pairing on more than one network
+
+A phone knows only the addresses it was given. Paired at home
+(192.168.2.211), it can't find the Mac at the office (10.10.30.116), even
+on the office Wi-Fi, unless both run Tailscale. What the tower does about
+it:
+
+- The LAN listener follows this Mac's network (within 20 s), and every open
+  event stream gets the new addresses at once (the `hosts` event): a phone
+  connected over Tailscale while the Mac moves learns the new LAN address
+  before it needs it.
+- Each paired device keeps the networks it was paired on or connected from
+  (its `networks` in devices.json and in `tower phone devices --json`:
+  `{"range", "name" (then), "host", "port", "first_ms", "last_ms"}`; the
+  tailnet's has range `tailnet`), noted when it pairs (every address
+  listened on then) and when its event stream connects (the address it
+  came in on). From those the Mac says, per phone, whether it **can reach
+  the tower here** (it knows the LAN address the Mac has now, or Tailscale
+  is listened on and it knows the tailnet's address) or was **paired on
+  another network** (pair it again here, or use Tailscale). Settings >
+  Phone and `tower phone devices` show it.
+- Pairing again from the same install updates that phone's entry
+  (`install_id`, above) instead of adding another. Entries an older app
+  made are not merged by themselves (nothing says they are one phone):
+  Settings > Phone removes the stale ones.
+- When the phones used in the last day all were paired elsewhere, and
+  Tailscale isn't running, both of the Mac's windows say once, quietly,
+  under their status: "Phone: pair again on this network" (`phone_hint` in
+  the state), which opens Settings at the Phone card. Never spoken, never a
+  decision; gone once a phone pairs or connects here, or Tailscale runs.
+
+**What the Android app must do** (with `pairing` in `features`; an older
+tower ignores `install_id` and sends no `hosts` event, and all of this
+still works there as far as it can):
+
+1. **Send `install_id`** in every `POST /v1/pair`: a random id made once
+   per install and kept with the app's settings (16 random bytes as
+   base64url without padding, 22 characters, fits the 8 to 64 letters,
+   digits, `-` and `_`). A new install (or cleared data) makes a new one.
+2. **A QR for a tower it is already paired with re-pairs that entry.** When
+   a scanned QR's `fp` is the fingerprint of a tower the app has stored, it
+   doesn't add a second tower: it pairs with the same `install_id`, puts
+   the new token in that entry (the old one no longer works), takes
+   `device.id` from the answer (the same one when `repaired` is true; a new
+   one when the Mac had forgotten the phone, or is older), and merges the
+   addresses of the QR (`hosts`, else `h`/`p`) and of the answer (`hosts`,
+   `magic_dns`). The entry's other settings stay.
+3. **Merge `hosts`** from the stream's `hello`, every `hosts` event, and
+   the answers of `POST /v1/pair` and `GET /v1/network` (or the state's
+   `lan_hosts`) into the stored addresses: add the new ones, keep the old
+   ones (home and the office, for when it is back there; at most 8, the
+   longest unused going first), and try them in this order: the latest
+   list's, in its order, then the others, the one that last answered
+   first. Update the MagicDNS name when one comes. Never drop the
+   `tailscale` entry because a list came without it (Tailscale was stopped
+   for a while). `network.name` (or "the network 10.10.30.x") can name
+   where the phone is connected.
+4. **When no stored address answers** (each tried with the short connect
+   timeout), say: "Can't reach the tower on this network. Pair again here
+   (scan the QR in Settings → Phone on the Mac), or turn on Tailscale on
+   both." with a button that opens the scanner (and keep the stored
+   pairing: back on a known network, it connects again). A `401
+   unauthorized` is another thing: this phone's token was revoked or
+   replaced, pair again.
 
 ## Conventions
 
@@ -250,8 +354,9 @@ the same tokens, the same limits (the tailnet's address counts as private).
 
 | Call | Returns |
 |---|---|
-| `GET /v1/hello` | `{"api":1,"tower":"0.1.0","device":{"id","name"},"voice":"af_bella","phone_is_voice":bool,"audio_route":"phone"\|"mac","features":["quiet","acts"]}`. Use it to check a stored token, and to see what this tower has (`features`: see "Versioning"). |
+| `GET /v1/hello` | `{"api":1,"tower":"0.1.0","device":{"id","name"},"voice":"af_bella","phone_is_voice":bool,"audio_route":"phone"\|"mac","features":["quiet","acts","pairing"]}`. Use it to check a stored token, and to see what this tower has (`features`: see "Versioning"). |
 | `GET /v1/state` | The daemon's state (below). Also pushed on the event stream. |
+| `GET /v1/network` | `{"hosts": [Host], "network": {"range", "name", "lan": {"host", "port"} \| null} \| null, "magic_dns": string \| null, "tailscale": {…}}`: where the tower can be reached now (every address as the pairing lists them, the network, the MagicDNS name while the tailnet is listened on, Tailscale as in the state). The same as the `hosts` event. |
 | `GET /v1/agents?all=1` | `tower agents --json`: `{"agents":[…],"unreachable":[…]}`; each agent has `address, account, machine, name, spoken, agent, status, doing, title, folder, where`. `all=1` adds plain shells. Slow-ish (asks Herdr, and other machines). |
 | `GET /v1/spaces` | `tower spaces --json`: `{"focus": name or null, "spaces":[{"space","focus","follow","mute","agenda","goal","done_when","standing","state","report","quiet_since_ms","ready_since_ms","closed_ms","archived","unread","unread_asked","unread_needs_you","running_jobs","sessions":[{"address","name","status","account"}],"last_activity_ms"}]}`. `goal` is the same as `agenda`; `state` is the space's as a mission (`open`, `quiet`, `ready`, `closed`: docs/quiet-tower.md, step 5 and 8); a space quiet for a day, or closed, is left out. `unread`: held news not yet read; of it, `unread_asked`: reports on work the user asked for (a watch's or a job's), `unread_needs_you`: someone there blocked on or waiting for the user. Show a space with either above 0 as needing a look (the panel marks it amber). |
 | `GET /v1/jobs?status=open\|finished\|all&session=t3&limit=50` | `{"jobs":[{"job","session","name","space","account","status","asked","summary","started_ms","updated_ms"}]}`, newest first. `status`: `working`, `blocked`, `done`, `failed`, `error`, `exited`. |
@@ -361,6 +466,7 @@ each have their own call and their own event (`GET /v1/decisions`,
 | `POST /v1/prs/{owner}/{repo}/{number}/merge` | `{"token":"…"}` or `{"token":"…","override":true}` | Step two: merges with the repo's default method, pinned to the commit confirmed, never forced. `override: true` only after the user said a second time that the failing checks are unrelated. `200 {"merged":true,"pr":{…}}`; `403 bad_token` (missing, used, another PR or device, expired: confirm again); `409 {"error":{"code":"blocked"\|"needs_override"\|"changed"\|"merge_failed","message":"…"}}` (`changed`: new commits since the confirmation; `merge_failed`: GitHub refused, e.g. a required review). The token is used up either way. |
 | `POST /v1/questions/{id}/interpret` | `{"tab":0,"text":"the second one"}` | `{"tab","choice":{"options":[1],"other":null}}`: a spoken answer as a choice, to show before sending. |
 | `POST /v1/questions/{id}/voice?tab=N` | a WAV take | `{"tab","heard","choice"}`: transcribed by the Mac's Whisper, then as `interpret`. |
+| `PATCH /v1/device` (or `PUT`) | `{"name": "Work phone"}` | Renames this phone (as Settings > Phone and `tower phone rename` do). `200 {"device": {"id", "name"}}`; `400 bad_name` (empty). |
 | `DELETE /v1/device` | | Unpairs this phone (its token stops working). |
 
 ### Files with an ask
@@ -1139,7 +1245,8 @@ line of JSON `data`. A comment line `: ping` comes every 10 s.
 
 | `event` | `data` |
 |---|---|
-| `hello` | `{"api":1,"device":"d_…","voice":bool,"features":["quiet","acts"]}`, first |
+| `hello` | `{"api":1,"device":"d_…","voice":bool,"features":["quiet","acts","pairing"],"hosts":[Host],"network":{…}\|null,"magic_dns":…}`, first: `hosts`, `network` and `magic_dns` as `GET /v1/network` |
+| `hosts` | `{"hosts": [Host], "network": {…} \| null, "magic_dns": …, "tailscale": {…}}` (as `GET /v1/network`): the tower's addresses changed (this Mac moved to another network, Tailscale started or stopped, the network was named). Merge `hosts` into the stored addresses. |
 | `state` | the whole state, first right after `hello`, then whenever something in it changes (at most 4 a second). A change to the decisions, the missions or a thread alone sends their own event, not this one. |
 | `decisions` | `{"count": n, "decisions": [Decision]}`: every open decision in queue order, each with `muted`; `count` is how many are outside muted spaces (the badge). Right after the first `state`, then whenever the list changes: one opened, closed or changed, or the order moved (the tower orders them again every 30 s). See "Notifying". |
 | `missions` | the answer of `GET /v1/missions`, right after the first `decisions`, then whenever it changes (a session's status or last words, a goal, follow, mute, a request, a space's tower, a space opening, going quiet or closing) |
@@ -1293,6 +1400,7 @@ stream's `hello` event). A tower from before there were features sends no
 
 | Feature | The tower has |
 |---|---|
+| `pairing` | Pairing on more than one network: `install_id` and `repaired` on `POST /v1/pair` (and `hosts`, `network`, `magic_dns` in its answer), `GET /v1/network`, `hosts`, `network` and `magic_dns` in the stream's `hello`, the `hosts` event, `PATCH /v1/device`, and `network` and `phone_hint` in the state |
 | `acts` | Acts and what came with them: `GET /v1/acts`, `/v1/acts/{id}`, `POST /v1/acts/{id}/undo`, the chat's `kind: "act"` messages and the `act` event; `rule` in a decision's answer and `POST /v1/decisions/{id}/rule`; `voice` in `/v1/tell` and `tell_voice` in the state |
 | `quiet` | Everything under "The Quiet Tower": the `/v1/decisions`, `/v1/missions`, `/v1/spaces/{space}/…`, `/v1/thread`, `/v1/setups`, `/v1/launch`, `/v1/actions`, `/v1/tell` and `/v1/model` calls; `space` on `POST /v1/ask`, on chat messages, and as a filter of `/v1/history` and `/v1/chat`; the `decisions`, `missions`, `thread` and `action` events; `decisions_count`, `tell_level`, `brain_model` and `brains` in the state |
 

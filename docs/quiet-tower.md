@@ -1302,11 +1302,13 @@ section says what was built and how it hangs together.
 | `GET /v1/history` | gains `?space=<name>` | A space's Record |
 
 `GET /v1/hello` (and the pairing answer, and the stream's `hello`) has
-`"features": ["quiet", "acts"]`: an app checks `quiet` before it uses any
+`"features": ["quiet", "acts", "pairing"]`: an app checks `quiet` before it uses any
 of this, and falls back to the question sets and PR chips on a tower
 without it; `acts` says the tower keeps acts (the chat's `act` messages,
-`/v1/acts`, the undo, `/v1/decisions/{id}/rule`, `voice` in `/v1/tell`). `api`
-stays 1: nothing that was there changed.
+`/v1/acts`, the undo, `/v1/decisions/{id}/rule`, `voice` in `/v1/tell`);
+`pairing` says a phone pairs again in place and learns the tower's new
+addresses while connected (mobile-api.md, "Pairing on more than one
+network"). `api` stays 1: nothing that was there changed.
 
 ```
 Decision { "id", "key", "kind": "permission"|"question"|"merge"|"choice"|"failed"|"raised"|"blocked",
