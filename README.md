@@ -558,9 +558,14 @@ standalone app's own) and looked at again every 20 s: start or stop it and
 the tower follows. The LAN address is looked at as often: take the Mac from
 home to the office and the tower listens on the new network within 20 s,
 and a phone connected meanwhile (over Tailscale, say) is sent the new
-address. A phone that wasn't must be paired again there (the QR then has
-the new address), or use Tailscale; pairing again from the same app install
-updates that phone instead of adding another. A network is told by the
+address. A phone that wasn't finds the Mac by **Bonjour**: the tower
+advertises itself on the network it is on (`_herdr-tower._tcp`, under the
+Mac's name, with its certificate's fingerprint), and the app, when no
+address it knows answers, looks for the one whose fingerprint it pinned
+and connects there with the same pin and token, so one pairing works on
+every network the two share (`[lan] bonjour = false` turns it off; mDNS
+doesn't cross networks, so away from it, use Tailscale). Pairing again
+from the same app install updates that phone instead of adding another. A network is told by the
 Mac's address range (macOS keeps the Wi-Fi's name from apps), and can be
 named once: `tower phone network name "Office"` (or "Name this network" in
 Settings → Phone), kept under `[lan.networks]` in config.toml. `[lan] tailscale = "off"` in config.toml keeps it to the
@@ -570,7 +575,8 @@ pairing flow and the security model:
 [docs/mobile-api.md](docs/mobile-api.md).
 
 The full window does the same without a terminal, in Settings' **Phone**
-card: which network the Mac is on and its address (named in place), whether
+card: which network the Mac is on and its address (named in place; "found
+by name on this network" while Bonjour advertises it there), whether
 Tailscale runs (stopped: "Open Tailscale"), turning the API on or off, and
 **Pair a phone**, which opens the QR code (and the code to type) in place
 with its 5-minute countdown, a fresh one when it runs out, and what the

@@ -37,6 +37,8 @@ pub struct Status {
     pub connected: Vec<(String, String)>,
     /// The windows say `network::HINT` (the phones in use can't reach the tower here).
     pub hint: bool,
+    /// The name Bonjour finds the tower by on this network, while it is advertised.
+    pub bonjour: Option<String>,
 }
 
 impl Status {
@@ -193,6 +195,7 @@ pub fn status() -> Status {
             .and_then(|v| v["connected"].as_array().map(|a| a.iter().filter_map(|c| Some((c["device"].as_str()?.to_string(), c["via"].as_str()?.to_string()))).collect()))
             .unwrap_or_default(),
         hint: info.as_ref().is_some_and(|v| v["phone_hint"].is_string()),
+        bonjour: info.as_ref().and_then(|v| v["bonjour"]["name"].as_str().map(String::from)),
     }
 }
 
@@ -453,7 +456,8 @@ pub fn cmd(action: &str, id: Option<&str>, value: Option<&str>, json: bool) -> R
             }
             if let Some(net) = st.here.label() {
                 let at = st.here.lan.as_ref().map(|(h, _)| format!(" · {h}")).unwrap_or_default();
-                println!("This Mac is on {net}{at}.");
+                let found = st.bonjour.as_ref().map(|n| format!(", found by name on this network (Bonjour: {n:?})")).unwrap_or_default();
+                println!("This Mac is on {net}{at}{found}.");
             }
             println!("{}", st.tailscale.line(st.url.is_some()));
             // (Read again, so a damaged file is said, not shown as no phones.)

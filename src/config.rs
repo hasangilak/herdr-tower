@@ -425,11 +425,27 @@ pub struct Lan {
     /// (`tower phone network name "Office"`, or Settings > Phone).
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub networks: std::collections::BTreeMap<String, String>,
+    /// Be found by name on the local network (Bonjour: `_herdr-tower._tcp`
+    /// on the LAN listener's interface), so a paired phone finds this Mac on
+    /// whatever Wi-Fi both are on. On by default.
+    pub bonjour: bool,
+    /// The name it is found by; empty: this Mac's name (Sharing's Computer Name).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub bonjour_name: String,
 }
 
 impl Default for Lan {
     fn default() -> Self {
-        Self { enabled: false, port: 7843, bind: "auto".into(), allow_public: false, tailscale: "auto".into(), networks: Default::default() }
+        Self {
+            enabled: false,
+            port: 7843,
+            bind: "auto".into(),
+            allow_public: false,
+            tailscale: "auto".into(),
+            networks: Default::default(),
+            bonjour: true,
+            bonjour_name: String::new(),
+        }
     }
 }
 
