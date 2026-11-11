@@ -298,7 +298,7 @@ folded into one line, and **Record**, **Shots**, **Projects** and
   plan (each session's part and its order, how the repos fit together, the
   risks, the open questions, how it is tested) and publishes it to your
   claude.ai account, private, as an HTML page or a Whiteboard ("The tower's
-  brain is writing the plan… (a minute or two)", then **Plan · page ·
+  brain is writing the plan… (it reads the repos first: about five minutes)", then **Plan · page ·
   Open**). Under the card is the chat about it: ask about the plan or
   change it ("which session starts first?", "leave the dashboard out") in
   "Ask about the plan or change it…" with **Send**; the planner's answers

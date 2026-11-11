@@ -1284,7 +1284,7 @@ this ticket:
 - **None**: "Or see the plan first:" **Plan as a page** · **Plan as a
   whiteboard** (`tower plan new --form … --draft '<the card's draft>'
   --ticket-file <the ticket, in a temporary file>`), and what it does.
-- **Writing**: "The tower's brain is writing the plan… (a minute or two)"
+- **Writing**: "The tower's brain is writing the plan… (it reads the repos first: about five minutes)"
   (while the planner starts: "…starting the planner…"), and that it
   publishes to the user's claude.ai account, private.
 - **Blocked**: "The planner waits on a question in its terminal

@@ -283,7 +283,7 @@ pub(super) fn plan_line(p: &PlanView) -> (String, bool) {
         ("failed", _, _) => (format!("The plan didn't come: {}.", p.why.trim_end_matches('.')), true),
         (_, true, _) => ("The planner waits on a question in its terminal (publishing the plan may ask for your go-ahead). Answer it there.".into(), false),
         ("writing", _, "starting") => ("The tower's brain is starting the planner…".into(), false),
-        _ => ("The tower's brain is writing the plan… (a minute or two)".into(), false),
+        _ => ("The tower's brain is writing the plan… (it reads the repos first: about five minutes)".into(), false),
     }
 }
 
@@ -1446,7 +1446,7 @@ mod tests {
         let mut p = PlanView { id: "p3".into(), status: "writing".into(), planner: "starting".into(), ..Default::default() };
         assert_eq!(plan_line(&p), ("The tower's brain is starting the planner…".to_string(), false));
         p.planner = "working".into();
-        assert_eq!(plan_line(&p).0, "The tower's brain is writing the plan… (a minute or two)");
+        assert_eq!(plan_line(&p).0, "The tower's brain is writing the plan… (it reads the repos first: about five minutes)");
         p.blocked = true;
         assert!(plan_line(&p).0.starts_with("The planner waits on a question in its terminal"));
         p.status = "failed".into();
