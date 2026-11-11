@@ -668,6 +668,7 @@ tower queue list | cancel <id> | retarget <id> <t>   # what waits (in order, kep
 tower dispatch --json '{"request":"…","tasks":[…]}'   # several tasks: each to its project's session or a new one (--dry-run)
 tower agenda [--all] | tasks         # what the user asked for and isn't finished: each request, its tasks and their state
 tower agenda show|close|abandon|verify|fail|requeue <id> …   # one request (a3) or task (a3.2); close --force drops what's left
+tower agenda forget <id>             # take a finished request (a test, a mistake) out of the ledger; the record keeps what was said
 tower sessions [<t>]                 # what each agent session's hooks said: prompt, last answer, state
 tower introduce [<space>] [--dry-run]  # the Claude sessions of a space, told who the others are (done by itself as one joins)
 tower hooks install|remove|status    # the hooks that let the tower see every Claude Code and Codex session

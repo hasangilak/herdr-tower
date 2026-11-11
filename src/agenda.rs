@@ -1653,6 +1653,18 @@ pub fn act(l: &mut Ledger, c: &Cmd, heard: &Heard, now: u64) -> Result<Acted> {
             let (abandoned, cancel) = l.abandon(&c.target, &c.text, now)?;
             Ok(Acted { value: json!({ "abandoned": abandoned, "cancelled": cancel }), cancel, changed: true })
         }
+        "forget" => {
+            let id = match l.resolve(&c.target)? {
+                Target::Agenda(a) => a,
+                Target::Task(_) => bail!("tower agenda forget takes an agenda (`a3`), not a task"),
+            };
+            let open: Vec<String> = l.agenda(&id).map(|a| a.unfinished().iter().map(|t| t.id.clone()).collect()).unwrap_or_default();
+            if !open.is_empty() {
+                bail!("{id} still has unfinished tasks ({}): close it first (`tower agenda close {id} --force`)", open.join(", "));
+            }
+            l.agendas.retain(|a| a.id != id);
+            Ok(Acted { value: json!({ "forgotten": id }), cancel: vec![], changed: true })
+        }
         "verify" | "fail" => {
             let tasks: Vec<String> = match l.resolve(&c.target)? {
                 Target::Task(t) => vec![t],
@@ -2699,6 +2711,21 @@ mod tests {
         let back: Ledger = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
         assert_eq!(back.agenda(&id).unwrap().receipt_ms, Some(now + 5));
         assert!(!serde_json::to_string(&Agenda::default()).unwrap().contains("receipt_ms"));
+    }
+
+    #[test]
+    fn forget_takes_a_finished_agenda_out_of_the_ledger_and_refuses_an_open_one() {
+        let now = 9_000_000_000;
+        let (mut l, agenda, ids) = ledger_with(1, now);
+        let forget = |l: &mut Ledger, target: &str| act(l, &Cmd { action: "forget".into(), target: target.into(), ..Default::default() }, &Heard::default(), now);
+        let refused = forget(&mut l, &agenda).err().unwrap().to_string();
+        assert!(refused.contains("still has unfinished tasks") && refused.contains(&ids[0]), "{refused}");
+        assert!(forget(&mut l, &ids[0]).err().unwrap().to_string().contains("not a task"));
+        act(&mut l, &Cmd { action: "close".into(), target: agenda.clone(), force: true, ..Default::default() }, &Heard::default(), now).unwrap();
+        let done = forget(&mut l, &agenda).unwrap();
+        assert_eq!((done.value["forgotten"].as_str(), done.changed), (Some(agenda.as_str()), true));
+        assert!(l.agenda(&agenda).is_none() && l.agendas.is_empty());
+        assert!(forget(&mut l, &agenda).is_err(), "gone");
     }
 
     #[test]
