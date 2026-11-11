@@ -399,11 +399,16 @@ pub struct Lan {
     /// Also listen on this Mac's Tailscale address (100.64/10), while
     /// Tailscale runs: `auto` (the default) or `off`.
     pub tailscale: String,
+    /// `[lan.networks]`: the names the user gave the networks this Mac is
+    /// on, by range (the /24 of its address there): `"10.10.30" = "Office"`
+    /// (`tower phone network name "Office"`, or Settings > Phone).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub networks: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Lan {
     fn default() -> Self {
-        Self { enabled: false, port: 7843, bind: "auto".into(), allow_public: false, tailscale: "auto".into() }
+        Self { enabled: false, port: 7843, bind: "auto".into(), allow_public: false, tailscale: "auto".into(), networks: Default::default() }
     }
 }
 

@@ -82,6 +82,13 @@ pub struct State {
     pub tailscale: Option<serde_json::Value>,
     /// The paired phone that is the tower's voice now (the Mac is silent), or null.
     pub phone: Option<String>,
+    /// The network the phone API's LAN listener is on: `{"range":
+    /// "10.10.30", "name": "Office" | null, "lan": {"host", "port"} | null}`
+    /// (null while the API is off, or without a LAN address).
+    pub network: Option<serde_json::Value>,
+    /// Said once in both windows when the phones in use can't reach the
+    /// tower on this network (`lan::network::hint`), else null.
+    pub phone_hint: Option<String>,
     /// The latest screenshots sessions sent (`tower screenshot`), newest
     /// first, at most 30: `{id, at, session, name, space, account, job, caption, path, url}`.
     pub screenshots: Vec<serde_json::Value>,
@@ -188,6 +195,8 @@ impl State {
             lan_hosts: vec![],
             tailscale: None,
             phone: None,
+            network: None,
+            phone_hint: None,
             screenshots: vec![],
             questions: vec![],
             question_policy: "normal".into(),

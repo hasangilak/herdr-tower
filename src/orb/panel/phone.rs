@@ -679,6 +679,8 @@ mod tests {
             created_ms: 1,
             last_seen_ms: 0,
             audio_route: "phone".into(),
+            install_id: None,
+            networks: vec![],
         };
         let st = |url: Option<&str>, ids: &[&str]| Status {
             enabled: true,
