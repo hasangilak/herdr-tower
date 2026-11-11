@@ -145,6 +145,11 @@ pub struct State {
     /// dir, plan_md, url, why, thread: [{from: "user" | "planner", text,
     /// at}], created_ms, ready_ms, updated_ms, closed_ms, launched}`.
     pub plan: Option<serde_json::Value>,
+    /// The PRs' reviews (see `crate::reviews`): every one not over, and
+    /// those over in the last day, the latest first, as `Review::view`
+    /// writes them (`{key, repo, number, url, space, owner, owner_name,
+    /// reviewer, reviewer_name, status, rounds, critical, line, chip, …}`).
+    pub reviews: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -217,6 +222,7 @@ impl State {
             brain_model: serde_json::Value::Null,
             acts: vec![],
             plan: None,
+            reviews: vec![],
         }
     }
 

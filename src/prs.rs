@@ -86,6 +86,10 @@ pub struct Pr {
     /// The last time `gh` couldn't say (kept until it can).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Its review (`crate::reviews`), as the chip and the merge card show
+    /// it; none when its space has review off, or it got no reviewer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review: Option<crate::reviews::Brief>,
 }
 
 impl Pr {
@@ -362,6 +366,10 @@ pub fn gate(pr: &Pr) -> Gate {
     if pr.mergeable == "unknown" && pr.open() {
         g.warnings.push("GitHub hasn't worked out yet whether it merges cleanly.".into());
     }
+    // A review that isn't agreed: said plainly; the merge stays the user's.
+    if let Some(w) = pr.review.as_ref().and_then(crate::reviews::merge_warning) {
+        g.warnings.push(w);
+    }
     g
 }
 
@@ -583,6 +591,17 @@ impl Prs {
         &self.gh
     }
 
+    /// Its review as it stands now (`crate::reviews`): the chip, the merge
+    /// card and the phones follow. Nothing when it is the same.
+    pub fn set_review(&self, k: &str, review: Option<crate::reviews::Brief>) {
+        let Some(mut pr) = self.get(k) else { return };
+        if pr.review == review {
+            return;
+        }
+        pr.review = review;
+        self.store(pr, "update", true);
+    }
+
     /// Bumped at every change (the event stream's chat diff looks).
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::SeqCst)
@@ -617,9 +636,18 @@ impl Prs {
     }
 
     /// Stores `pr` as it is now, tells listeners (`op`: open, update, closed).
+    /// Its review stays as `set_review` last put it: a look at GitHub that
+    /// began before the review moved doesn't take it back.
     fn put(&self, pr: Pr, op: &str) {
+        self.store(pr, op, false);
+    }
+
+    fn store(&self, mut pr: Pr, op: &str, review: bool) {
         {
             let mut all = self.lock();
+            if !review && let Some(old) = all.get(&pr.key()) {
+                pr.review = old.review.clone();
+            }
             all.insert(pr.key(), pr.clone());
             self.save(&all);
         }
@@ -727,6 +755,9 @@ impl Prs {
         } else {
             // Only when it was looked at changed: saved, nobody told.
             let mut all = self.lock();
+            if let Some(old) = all.get(&pr.key()) {
+                pr.review = old.review.clone();
+            }
             all.insert(pr.key(), pr.clone());
             self.save(&all);
         }
@@ -1014,6 +1045,28 @@ esac
         let pr = prs.get("o/app#12").unwrap();
         assert!(pr.settled && next_check(&pr).is_none());
         assert_eq!(*seen.lock().unwrap(), ["open open pending", "update open passing", "closed merged passing"]);
+    }
+
+    #[test]
+    fn a_prs_review_is_kept_through_its_polls_and_said_before_a_merge() {
+        let gh = fake_gh("review");
+        serve(&gh, 12, "OPEN", passing(), "abc");
+        let prs = Prs::at(gh.with_file_name("prs.json"), gh.clone());
+        prs.found(&[("o/app".into(), 12)], "t58", "mediaroom", Some("shop"), true);
+        // A look at GitHub that began before the review moved doesn't take it back.
+        let stale = prs.get("o/app#12").unwrap();
+        let brief = crate::reviews::Brief { status: "changes".into(), rounds: 2, critical: 2, line: "Review: 2 critical, round 2".into(), ..Default::default() };
+        prs.set_review("o/app#12", Some(brief.clone()));
+        prs.put(Pr { title: "renamed".into(), ..stale }, "update");
+        let pr = prs.get("o/app#12").unwrap();
+        assert_eq!((pr.title.as_str(), pr.review.as_ref()), ("renamed", Some(&brief)));
+        serve(&gh, 12, "OPEN", json!([]), "abc");
+        prs.poll("o/app#12");
+        assert_eq!(prs.get("o/app#12").unwrap().review, Some(brief.clone()));
+        // The merge stays the user's: said plainly, not blocked.
+        let g = gate(&prs.get("o/app#12").unwrap());
+        assert!(g.blocked.is_none() && g.warnings.contains(&"The review isn't agreed: 2 critical issues open, round 2.".to_string()), "{g:?}");
+        assert_eq!(prs.get("o/app#12").unwrap().view()["review"]["line"], "Review: 2 critical, round 2");
     }
 
     #[test]

@@ -309,6 +309,7 @@ question set behind it (a raise) has that block now too.
 | A question set that is the user's (`decision: escalate`; a "waits for you" card is one) | `permission` for a permission, plan or approval menu; `question` otherwise | `ask:<space>:<what it asks>` | The tower's recommendations, the first one the pick (for a set with several questions, option *i* answers each with its recommendation *i*); with none, a menu's own options and no pick; a wait card has none |
 | The PRs of one repo that wait for a merge in one space (`waiting` and open in `prs.json`) | `merge` | `merge:<space>:<owner/repo>` | One per PR, in order. The pick is the first, when it can be merged, its checks pass and its base is not production |
 | `tower raise` | `raised`; `choice` with `--options` | `raise:<space>:<the line>` | As given, the first one the pick |
+| A PR's review stuck after three rounds ("PR review") | `choice` (`why` `review`), about the owner and the reviewer | `raise:<space>:<its line>` | "Side with the owner", "Side with the reviewer", "I'll look"; no pick |
 | An agenda task that failed again after a retry | `failed` | `failed:<space>:<task id>` | "Try again", "Drop it"; no pick |
 | A session blocked on something the tower can't read (no question set comes of it: a dialog it doesn't know) | `blocked` | `blocked:<space>:<address>` | None. It is answered in the session itself ("Show in Herdr"); it closes by itself, as `answered`, once the session is no longer blocked, and as `stopped` when the session is gone. Told once at a quiet level, as the plain notice was; every time at `everything` |
 
@@ -766,7 +767,8 @@ is under `missions`, by space name:
     "quiet_since_ms": n, "ready_since_ms": n, "idle_since_ms": n,
     "closed_ms": n, "archived_ms": n,
     "worktrees": [ { "repo": "…", "path": "…", "branch": "…" } ],   // made by the tower for it
-    "setup": "name"             // the setup `tower launch` made it with
+    "setup": "name",            // the setup `tower launch` made it with
+    "review": false             // its PRs get no reviewer ("PR review"); left out while on
 } }
 ```
 
@@ -825,6 +827,11 @@ a machine, can't be asked, nothing moves that round.
   before its first session.
 - `tower space report <space> "<text>"`: the closing report (the brain's
   answer to the `[space]` note). Kept with the mission and shown with it.
+- `tower space review <space> on|off`: whether the PRs its sessions open
+  get a reviewer ("PR review"). On unless turned off; a mission from before
+  the switch reads as on. Off ends a reviewer that is open there (the
+  daemon looks at once). A name no space has yet is kept for the space that
+  will have it. Prints `{"space","goal","done_when","standing","review","state","report"}` when piped.
 - `tower space close <space> [--force]` (the user's word only):
   1. refuses while an agent session there is `working` or `blocked`, naming
      them, unless `--force` (a brain doesn't count: it is the one closing);
@@ -887,7 +894,8 @@ missions --json`:
 "missions": { "spaces": [Mission], "quiet": ["name"], "closed_today": ["name"] }
 
 Mission { "name", "goal": "" when none, "done_when": "" when none,
-          "standing": bool, "state": "open" | "ready" | "quiet",
+          "standing": bool, "review": bool,   // its PRs get a reviewer ("PR review")
+          "state": "open" | "ready" | "quiet",
           "follow": bool, "mute": bool,
           "needs": n,            // open decisions in that space, muted or not
           "report": "" when none,
@@ -995,7 +1003,8 @@ them, and is written back without them. A role is keyed by the repo as
 ### `tower launch`
 
 `tower launch "<goal>" [--setup <name>] [--name <space>] [--repo <folder>…]
-[--title "<goal>"] [--done-when "<…>"] [--account <a>] [--dry-run] [--json]`:
+[--title "<goal>"] [--done-when "<…>"] [--account <a>] [--review|--no-review]
+[--dry-run] [--json]`:
 
 - the repos: those `--repo` gives (each must be a folder; nothing else is
   opened); else those of the project `--setup` names; else those the
@@ -1031,6 +1040,11 @@ them, and is written back without them. A role is keyed by the repo as
   words after its colon is those words. `--done-when` gives it instead (""
   is kept empty);
 - the account: `--account`, else the project's, else the default one;
+- whether its PRs get a reviewer ("PR review"): `--review` or
+  `--no-review`, else as the space has it (on, for a new space). Kept as
+  `missions.<space>.review`, and in the receipt as `"review": bool` (in
+  words: "Each PR its sessions open gets a reviewer session…", or "Its PRs
+  get no reviewer");
 - it sets the goal (`agendas`) and the done-when (`missions.<space>.done_when`,
   as `tower space goal --done-when` sets it) and makes the mission, opens
   one agenda (the request) whose words are the whole ticket under the
@@ -1046,7 +1060,7 @@ them, and is written back without them. A role is keyed by the repo as
 - it prints one receipt:
 
     ```
-    { "space", "goal": the title, "done_when", "made": bool (false: it joined a space), "dry_run": bool,
+    { "space", "goal": the title, "done_when", "made": bool (false: it joined a space), "dry_run": bool, "review": bool,
       "agenda": id or null, "repos_from": "first-line" | "setup" | "repos",
       "sessions": [ { "name", "repo", "address", "account", "worktree", "branch",
                       "port", "task": agenda task or null, "error": text or null,
@@ -1140,6 +1154,12 @@ the tower will do.
   changed, the button is Draft the space again.
 - A tower whose `launch --help` has no `--draft` gets the launcher as it
   was: the first project, its plan, Launch.
+- **Review its PRs**: a switch under the draft card, and under the plan of
+  a goal whose first line names its repos, on at first, with a line on
+  what it does ("Each PR its sessions open gets a reviewer session that
+  looks for critical issues only … Merging stays yours."; off: "No
+  reviewer: its PRs come to you as they are."). Launch carries it as
+  `--review` or `--no-review`.
 - Launch's receipt names the space, whose view opens with what was done
   said at its top; an error stays here.
 - **Or see the plan first**: under the draft's Launch and Start over,
@@ -1355,6 +1375,153 @@ worktree with the same `worktrees::add`).
   keeps its own worktree (`<project>-<name>`, branch `tower/<name>`), not
   the space's.
 - Closing the space removes its clean worktrees (step 5 and 8).
+
+## PR review: every PR gets a reviewer, and the two agree
+
+The model is `src/reviews.rs`; the daemon runs it in `src/daemon/reviews.rs`
+and keeps it in `reviews.json` (the state folder) across restarts.
+
+### The switch
+
+A space's `review` (`missions.<space>.review`, on unless the user turned
+it off; a mission from before reads as on): `tower space review <space>
+on|off`, the space's **Review PRs** switch, New space's **Review its PRs**
+(`tower launch --review|--no-review`). A closed or archived space's PRs
+get no reviewer. Turning it off ends a reviewer that is open there.
+
+### A PR found
+
+The tower finds a PR when a session's turn prints its link (`prs`). When it
+is new, open, of a session in a space with review on, the tower opens ONE
+reviewer for it (`Book::wants_reviewer`): never for a PR a reviewer opened
+(by the store, or its terminal's label `tower.role=reviewer`), never twice
+for one PR (a review is kept before its reviewer opens, and the record of
+one that is over still counts).
+
+- **Who**: `tower start --no-act --no-watch --no-track --no-worktree --name
+  <name> --cwd <folder> --space <space> [--account <the owner's>] "<its
+  first task>"` (this program, `HERDER_TOWER_BIN` when set), then labelled
+  `tower.role=reviewer` and `tower.review=<key>`. Same space, same account
+  as the PR's session (its **owner**).
+- **Its name**: `<space>-review-<repo>-<n>` in Herdr's name alphabet, cut to
+  48 characters as session names are (the space's part gives way first, the
+  number stays), never `tower-…` (`review-<repo>-<n>-<space>` then), made
+  unique among the live terminals (`reviews::reviewer_name`).
+- **Where**: a git worktree of the owner's repo (the repo the tower gave it
+  a worktree of, else the checkout its folder is in) detached at the PR's
+  head: `<repo>/../.tower-worktrees/<space>/review-<repo>-<n>`. The head
+  commit is the PR's `headRefOid` when the repo has it (the owner pushed it
+  from here), else fetched from the remote that is the PR's repo
+  (`pull/<n>/head`, then its branch), never from another one. When there is
+  no checkout to be had, a folder of its own (`<state>/reviews/<name>/`),
+  where it reads the PR with `gh pr diff`. Either way a
+  `.claude/settings.local.json` there lets it read, comment, `tower review`
+  and `tower queue`, and denies `git push|commit|merge|rebase|reset`, `gh pr
+  merge|close|edit|ready`, Edit and Write: on no branch, it can't push to
+  the owner's.
+- **Its first task** (`reviews::instructions`): the PR (link, title,
+  branches), its owner (name, address), the space's goal and done-when, its
+  folder, and the review: CRITICAL issues only (wrong behaviour against the
+  ticket or goal, a crash, security, data loss or corruption, a build or
+  test failure it introduces, an API or contract break with another repo;
+  nothing about style, naming or nits). Each one a PR review comment opening
+  with `Critical:`, inline where it can (`gh api repos/<repo>/pulls/<n>/comments
+  … commit_id=<head> path line side=RIGHT`, else `gh pr comment`); the list
+  and the links to the owner itself (`tower queue <owner> "…"`); then
+  `tower review report <key> --critical <n> "<one line>"`. None critical:
+  approve at once (`gh pr review --approve`; on a PR of its own account,
+  which GitHub won't approve, `--comment "Approved: …"`), tell the owner,
+  `tower review agree <key>`. Told it's fixed: check again (`gh pr checkout
+  <n> --detach`), then agree or post what is still critical and report
+  again. It never merges, closes, pushes or edits the owner's code, and asks
+  the user nothing.
+- **Introduced**: the introductions (`introduce`) take it as a newcomer;
+  its task there is "reviewing PR #n (<repo>) for critical issues only".
+  Its turns' ends make no PR chip, card or question (`asks`).
+
+### The rounds
+
+The tower passes nothing between the two: they talk directly (`tower
+queue`, a peer message). It keeps the record and escalates.
+
+- `tower review report <pr> --critical <n> "<line>"` (the reviewer): `n` >
+  0 is a **round**. The status is `changes`, and the owner gets ONE quiet
+  note (`sendq::add_note`): "[tower] The reviewer (<name> <address>) left N
+  critical comments on PR #n (<repo>): fix them, push, answer each thread,
+  then tell the reviewer (tower queue <address> "…"). If you like, tell the
+  tower too: tower review fixed <key> "<one line>"." Nothing of the
+  comments themselves. `n` = 0: back to `reviewing`, to agree next.
+- `tower review fixed <pr> "<line>"` (the owner, optional: the next report
+  is what counts): `reviewing` again, the line kept.
+- **Stuck**: the third round with no agreement is `stuck` and ONE decision
+  for the user (raised with its options: kind `choice`, `why` `review`, key
+  `raise:<space>:<line>`, about both sessions): "The reviewer and the owner of PR #n (<repo>) don't
+  agree on: <the last report's line>", with the PR's link, the round and
+  who is who as its detail, and "Side with the owner" (the change stands;
+  the reviewer approves and agrees), "Side with the reviewer" (the owner
+  fixes what is still critical; the reviewer checks again) and "I'll look"
+  (both leave it until the user says more), no pick. The answer's words go
+  to both sessions (step 3). No note to the owner while it waits; a round
+  after the user answered notes the owner again; never a second decision.
+- `tower review agree <pr> ["<line>"]` (the reviewer): `agreed`, over.
+
+### The end
+
+Agreed, the PR merged or closed, the space closed or archived, its review
+turned off, the PR's own session gone (nobody is left to fix it; the PR
+stays the user's to merge), its reviewer's terminal gone, or a reviewer that never opened
+(five minutes on, none under its name): the review is over (`ended` with
+why, unless agreed). Its reviewer session ends (`hc kill`, `hc rm`), its
+checkout is taken away (`git worktree remove --force`: nothing in it is
+anyone's work), and a decision still open about it is settled. The record
+stays. Every 20 seconds the daemon looks at each review not over, and at
+once after `tower space review … off`.
+
+### The store and the commands
+
+`reviews.json`: `{"reviews": [Review]}`, every review not over and the last
+50 over:
+
+```
+Review { "key": "owner/repo#12", "repo", "number", "url", "title", "base", "head", "head_sha",
+         "space", "owner", "owner_name", "owner_created_ms", "reviewer", "reviewer_name", "reviewer_created_ms",
+         "account", "folder", "checkout_of",
+         "status": "reviewing" | "changes" | "agreed" | "stuck" | "ended",
+         "rounds": n, "critical": n, "line": the last word on it, "fixed": the owner's last word,
+         "decision": the stuck decision's id, "created_ms", "updated_ms", "ended_ms",
+         "steps": [ { "at_ms", "what": "opened" | "started" | "report" | "fixed" | "stuck" | "agreed" | "ended",
+                      "by", "critical", "text" } ] }
+```
+
+- `tower review [list]`, `tower review show <pr>` (JSON when piped or with
+  `--json`; from `reviews.json` when the daemon isn't running):
+  `{"reviews": [Review + "chip"]}`, `{"review": Review + "chip"}`. A PR is
+  its key, its link, or `#12` (the caller's own, else the only one open).
+- `tower review report <pr> --critical <n> "<line>"`: `{"review",
+  "noted_owner": bool, "decision": id or null}`; `agree <pr> ["<line>"]`:
+  `{"review", "ends": the reviewer's address}`; `fixed <pr> "<line>"`:
+  `{"review"}`. A review that is over refuses them.
+- The socket: `{"cmd":"review","action":"list"|"show"|"report"|"agree"|"fixed"|"sweep","pr","critical","text","from"}`.
+- History: kind `review` (`id` the PR's key, `status`, `record: true`):
+  opened, each round, fixed, agreed, ended. Never a chat message.
+
+### What shows it
+
+- **The PR** (`prs.json`, the chat's chip, `GET /v1/prs`, the `pr` event)
+  carries `review`: `{status, rounds, critical, reviewer, reviewer_name,
+  line}`, `line` being what the chip says (`reviews::chip_line`):
+  "Reviewing…", "Reviewing the fixes… (after round 1)", "Review: 2 critical,
+  round 2", "Review: stuck after 3 rounds, yours to decide", "Review:
+  agreed", "Review: ended without agreement" ("…, N critical left").
+- **The merge card**: each PR's row has that line (amber until agreed); a
+  merge decision's `prs[]` carry `review`, and a review that isn't agreed
+  is among the merge's `warnings` (`prs::gate`, `reviews::merge_warning`):
+  "The review isn't done: its reviewer is still reading it.", "The review
+  isn't agreed: 2 critical issues open, round 2.", "… the reviewer and the
+  owner disagree after 3 rounds.", "Its review ended without agreement."
+  The merge stays the user's: it never blocks it.
+- **The state** has `reviews`: every review not over and those over in the
+  last day, the latest first (`Review` + `chip`).
 
 ## Step 7: a tower per open space
 
@@ -1640,7 +1807,10 @@ where the full window is, `panel/` the views).
   sidebar (All spaces, each open space, New space, the quiet fold,
   Record, Shots, Settings) and a main pane:
   - All spaces: the queue and the missions list.
-  - A space: its goal and done-when, Follow and Mute, its closing report,
+  - A space: its goal and done-when, Follow, Mute and **Review PRs** (`tower
+    space review <space> on|off`; off, a line says its PRs get no
+    reviewer; on, a line per open PR of the space with a review: "PR #12
+    (shop) · Review: 2 critical, round 2 · fix-login-review-shop-12"), its closing report,
     what needs you there, its requests, its sessions (with worktree and
     port), the thread between its sessions (the latest five, "N earlier"
     for the rest the state holds: each with who wrote to whom and when,
@@ -1680,8 +1850,12 @@ where the full window is, `panel/` the views).
 - `spaces.json`: `follow` and `mute` (for a switch set before the state
   says so). The windows never write it.
 - `prs.json`: a merge decision's PRs as the tower knows them (the commit a
-  merge is pinned to, each check by name). A PR that isn't in it is drawn
-  from the decision's own `prs[]` (`title`, `checks`, `merge`).
+  merge is pinned to, each check by name, its `review`). A PR that isn't in
+  it is drawn from the decision's own `prs[]` (`title`, `checks`, `merge`,
+  `review`). Each row of a merge card says where its PR's review stands
+  ("Reviewing…", "Review: 2 critical, round 2", "Review: agreed"; amber
+  until it is agreed), and asked to merge a PR whose review isn't agreed
+  it says so among its warnings: the merge is still the user's.
 - `history.jsonl`: the Record, and the reply to the user's last request
   (an `answer`, or a `receipt` that was told; never an entry with `record:
   true`), with the `act` entries that name that request (`act.request_at`):
@@ -1710,7 +1884,8 @@ question set's `status: failed`, and offers the session or another try.
 - A merge runs in the window's process (`prs::merge`, pinned to the commit
   shown), then tells the daemon (`PrMerged`).
 - What the full window sets runs the `tower` CLI: `tower tell <level>`;
-  `tower space follow|unfollow|mute|unmute <space>`; `tower space goal
+  `tower space follow|unfollow|mute|unmute <space>`; `tower space review
+  <space> on|off`; `tower space goal
   <space> "<goal>" --done-when "<…>"` then `tower space standing <space>
   on|off`; `tower space close <space>` (and `--force` after a refusal),
   whose JSON receipt is said in a sentence; `tower setups --json`; `tower
@@ -1718,8 +1893,9 @@ question set's `status: failed`, and offers the session or another try.
   for the preview and the same without `--dry-run` to launch (its receipt
   names the space, whose view then opens); `tower launch "<ticket>"
   --draft --json` (and `--adjust … --prior …`) for a draft, and `tower
-  launch "<ticket>" --repo … --name … --title … --done-when … --json` to
-  launch it.
+  launch "<ticket>" --repo … --name … --title … --done-when … --review|--no-review --json` to
+  launch it (`--review` or `--no-review` on a plain launch too, as the
+  switch stands).
 - The input in a space's view runs `tower ask --space <space> "<text>"`
   (step 7): the daemon hands it to that space's brain, or to the main one
   as `In <space>: <text>` when the space has none that can take it. The
@@ -1748,7 +1924,9 @@ takes the keyboard; a spot off the screen's edge keeps them out of the way.
 `HERDER_TOWER_ORB_ANSWER=<decision id>:<n>[:rule]` has the full window
 answer that card with its option `n` (from 0) two and a half seconds after
 the start, as a click on it would, and with `:rule` take its receipt's
-"Make it a rule": for looking at what an answer leaves behind.
+"Make it a rule": for looking at what an answer leaves behind. On a merge
+card `n` is its button (0 asks about the first PR, which shows what
+merging it does and its warnings; nothing merges before Confirm).
 A whole tower for them to read runs in a sandbox with `HERDER_TOWER_VOICE=off
 tower daemon` (no speakers, no Kokoro, no Whisper, no microphone, no talk
 key; its own `HERDER_TOWER_HOME`, `_STATE`, `_DATA`, and stand-ins named by

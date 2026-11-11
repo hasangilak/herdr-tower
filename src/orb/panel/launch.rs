@@ -254,15 +254,31 @@ pub(super) fn draft_from(v: &Value) -> Option<Drafted> {
 }
 
 /// What Launch runs for a draft: exactly what its card says, for `ticket`
-/// (and with the plan `plan` it was planned with: its sessions get it).
-pub(super) fn confirm_args(ticket: &str, d: &Drafted, plan: Option<&str>) -> Vec<String> {
+/// (and with the plan `plan` it was planned with: its sessions get it), and
+/// whether its PRs get a reviewer (`review`: the card's switch).
+pub(super) fn confirm_args(ticket: &str, d: &Drafted, plan: Option<&str>, review: bool) -> Vec<String> {
     let mut args = vec!["launch".to_string(), ticket.to_string()];
     args.extend(crate::ticket::confirm_flags(&d.raw));
     if let Some(id) = plan {
         args.extend(["--plan".to_string(), id.to_string()]);
     }
+    args.push(review_flag(review).into());
     args.push("--json".into());
     args
+}
+
+/// `--review` or `--no-review`, as the switch stands.
+pub(super) fn review_flag(on: bool) -> &'static str {
+    if on { "--review" } else { "--no-review" }
+}
+
+/// What the "Review its PRs" switch says it does, as it stands.
+pub(super) fn review_note(on: bool) -> &'static str {
+    if on {
+        "Each PR its sessions open gets a reviewer session that looks for critical issues only (behaviour, crashes, security, data, the build, contracts) and agrees with the PR's session before you merge. Merging stays yours."
+    } else {
+        "No reviewer: its PRs come to you as they are."
+    }
 }
 
 /// What Plan runs: the planner for this draft, in `form` (`page` or
@@ -385,6 +401,9 @@ pub(super) struct LaunchUi {
     chat_scroll: Option<std::time::Instant>,
     /// Waits for the typing to pause before the tower is asked again.
     dry_wait: Option<Task<()>>,
+    /// "Review its PRs": each PR its sessions open gets a reviewer
+    /// (`--review`, on by default; off is `--no-review`).
+    review: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -428,6 +447,7 @@ impl LaunchUi {
             chat_seen: (String::new(), 0, false),
             chat_scroll: None,
             dry_wait: None,
+            review: true,
             _subs: subs,
         }
     }
@@ -636,6 +656,7 @@ impl Panel {
         if let Some(setup) = full.launch.setup().filter(|_| !full.launch.drafts()) {
             args.extend(["--setup".to_string(), setup.name.clone()]);
         }
+        args.push(review_flag(full.launch.review).into());
         args.push("--json".into());
         self.launch_args(&goal, args, missions, cx);
     }
@@ -653,7 +674,7 @@ impl Panel {
             None => return,
         };
         let with = plan.as_ref().filter(|p| p.url.is_some()).map(|p| p.id.clone());
-        let args = confirm_args(&ticket, &d, with.as_deref());
+        let args = confirm_args(&ticket, &d, with.as_deref(), full.launch.review);
         // A plan that goes without it (not written yet, failed) is closed (`--plan` closes a written one itself).
         if let Some(p) = any.filter(|p| with.as_deref() != Some(p.id.as_str())) {
             self.plan_close(&p.id, cx);
@@ -1151,6 +1172,23 @@ impl Panel {
             ),
         };
         let can = !goal.is_empty() && !busy && !drafting;
+        // "Review its PRs", on the draft and on the plan (not while a ticket is only to be drafted).
+        let reviewing = ui.review;
+        let review_row = (draft.is_some() || !drafts).then(|| {
+            h_flex()
+                .w_full()
+                .gap(px(10.0))
+                .items_center()
+                .px(px(4.0))
+                .child(tg("launch-review", "Review its PRs", reviewing).on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(full) = this.full.as_mut() {
+                        full.launch.review = !reviewing;
+                    }
+                    cx.notify();
+                })))
+                .child(div().flex_1().min_w_0().text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child(review_note(reviewing)))
+                .into_any_element()
+        });
         let mut actions: Vec<AnyElement> = vec![];
         match (&draft, drafts) {
             (Some(_), _) if chatting => {
@@ -1257,7 +1295,7 @@ impl Panel {
             .children(stale_line)
             .child(v_flex().gap(px(7.0)).child(label("Goal")).child(field(&goal_field)).child(div().px(px(4.0)).text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child(hint)))
             .child(v_flex().gap(px(7.0)).child(label("Project")).child(projects).children(self.said("setups")))
-            .child(v_flex().gap(px(7.0)).child(label(section)).child(middle).children(self.said("draft")))
+            .child(v_flex().gap(px(7.0)).child(label(section)).child(middle).children(review_row).children(self.said("draft")))
             .when(!plan_items.is_empty(), |el| el.child(v_flex().gap(px(10.0)).children(plan_items)))
             .child(v_flex().gap(px(10.0)).children(actions))
             .children(self.said("plan"))
@@ -1405,12 +1443,17 @@ mod tests {
         // Launch runs exactly the card.
         let ticket = "EYZFlow Support – Translate messages\n\nCustomers write in many languages.";
         assert_eq!(
-            confirm_args(ticket, &d, None),
+            confirm_args(ticket, &d, None, true),
             [
                 "launch", ticket, "--repo", "/w/eyz/eyz-customer-support", "--repo", "/w/eyz/eyzflow-admin-dashboard", "--name", "support-translation", "--title", "EYZFlow Support – Translate messages",
-                "--done-when", "Messages show translated; replies go out translated", "--account", "default", "--setup", "EYZFlow", "--json",
+                "--done-when", "Messages show translated; replies go out translated", "--account", "default", "--setup", "EYZFlow", "--review", "--json",
             ]
         );
+        // The card's "Review its PRs" switch, off: no reviewer.
+        let off = confirm_args(ticket, &d, None, false);
+        assert_eq!(&off[off.len() - 2..], ["--no-review", "--json"]);
+        assert!(!off.contains(&"--review".to_string()));
+        assert!(review_note(true).contains("critical issues only") && review_note(false).starts_with("No reviewer"));
         // A draft is asked for the ticket (and the project picked); a redraft brings the words and the draft before.
         assert_eq!(draft_args(ticket, None, None), ["launch", ticket, "--draft", "--json"]);
         let again = draft_args(ticket, Some("EYZFlow"), Some(("leave the dashboard out", &d)));
@@ -1439,9 +1482,9 @@ mod tests {
         let parsed = crate::plans::parse_args(&say_args("p3", "--json is a word")[1..]).unwrap();
         assert_eq!((parsed.id.as_deref(), parsed.words.as_str(), parsed.who), (Some("p3"), "--json is a word", Some(crate::plans::Who::User)));
         // Launch with a published plan: the sessions get it.
-        let launch = confirm_args("T", &d, Some("p3"));
-        assert_eq!(&launch[launch.len() - 3..], ["--plan", "p3", "--json"]);
-        assert!(!confirm_args("T", &d, None).contains(&"--plan".to_string()));
+        let launch = confirm_args("T", &d, Some("p3"), true);
+        assert_eq!(&launch[launch.len() - 4..], ["--plan", "p3", "--review", "--json"]);
+        assert!(!confirm_args("T", &d, None, true).contains(&"--plan".to_string()));
         // How a plan that isn't ready stands, in a line.
         let mut p = PlanView { id: "p3".into(), status: "writing".into(), planner: "starting".into(), ..Default::default() };
         assert_eq!(plan_line(&p), ("The tower's brain is starting the planner…".to_string(), false));
