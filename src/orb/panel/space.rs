@@ -115,6 +115,21 @@ pub(super) fn closed_line(name: &str, out: &str) -> String {
     parts.join(" ")
 }
 
+/// The reviews of a space's open PRs, a line each: "PR #12 · Review: 2
+/// critical, round 2 · fix-login-review-app-12".
+pub(super) fn review_lines(space: &str, prs: &std::collections::BTreeMap<String, crate::prs::Pr>) -> Vec<String> {
+    let mut list: Vec<&crate::prs::Pr> = prs.values().filter(|p| p.open() && p.space.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(space)) && p.review.is_some()).collect();
+    list.sort_by_key(|p| (p.repo.clone(), p.number));
+    list.iter()
+        .filter_map(|p| {
+            let r = p.review.as_ref()?;
+            let line = if r.line.is_empty() { crate::reviews::chip_line(r) } else { r.line.clone() };
+            let who = if r.reviewer_name.is_empty() { String::new() } else { format!(" · {}", r.reviewer_name) };
+            Some(format!("PR #{} ({}) · {line}{who}", p.number, p.repo.rsplit('/').next().unwrap_or(&p.repo)))
+        })
+        .collect()
+}
+
 /// The tower refused to close a space because a session there still works
 /// or waits (`--force` would close it anyway).
 pub(super) fn refused_close(error: &str) -> bool {
@@ -225,6 +240,28 @@ impl Panel {
         });
     }
 
+    /// Review its PRs, or stop: `tower space review <space> on|off`, shown at
+    /// once and taken back with the command's error if the tower refuses.
+    pub(super) fn set_review(&mut self, space: &str, on: bool, cx: &mut Context<Self>) {
+        let place = format!("space:{space}");
+        if self.running(&place) {
+            return;
+        }
+        let name = space.to_string();
+        self.tower.update(cx, |t, cx| {
+            t.set_mark(&name, |m| m.review = Some(on));
+            cx.notify();
+        });
+        self.run(&place, vec!["space".into(), "review".into(), space.to_string(), if on { "on" } else { "off" }.into()], cx, move |this, result, cx| {
+            if result.is_err() {
+                this.tower.update(cx, |t, cx| {
+                    t.set_mark(&name, |m| m.review = None);
+                    cx.notify();
+                });
+            }
+        });
+    }
+
     /// "Close this space": `tower space close` (`force`: though a session
     /// there still works), then back to every space with what it did.
     fn close_space(&mut self, space: &str, force: bool, cx: &mut Context<Self>) {
@@ -268,13 +305,14 @@ impl Panel {
                 sub.push(named("Done when", m.done_when.trim()));
             }
         }
-        let (m1, n1, n2) = (m.clone(), name.to_string(), name.to_string());
-        let (follow, mute) = (m.follow, m.mute);
+        let (m1, n1, n2, n3) = (m.clone(), name.to_string(), name.to_string(), name.to_string());
+        let (follow, mute, review) = (m.follow, m.mute, m.review);
         let toggles = h_flex()
             .gap(px(6.0))
             .child(tg("space-goal", if m.goal.trim().is_empty() && !m.standing { "Set a goal" } else { "Goal" }, editing).on_click(cx.listener(move |this, _, window, cx| this.toggle_goal(&m1, window, cx))))
             .child(tg("space-follow", "Follow", follow).on_click(cx.listener(move |this, _, _, cx| this.set_switch(&n1, true, !follow, cx))))
             .child(tg("space-mute", "Mute", mute).on_click(cx.listener(move |this, _, _, cx| this.set_switch(&n2, false, !mute, cx))))
+            .child(tg("space-review", "Review PRs", review).on_click(cx.listener(move |this, _, _, cx| this.set_review(&n3, !review, cx))))
             .into_any_element();
         let head = whead(name, sub, Some(toggles));
 
@@ -332,6 +370,12 @@ impl Panel {
         }
         if m.mute {
             items.push(eff("Muted. Its decisions stay here and leave the orb’s count and the main queue."));
+        }
+        // Its PRs' reviews: where each stands; or that its PRs get none.
+        if !m.review {
+            items.push(eff("PR review is off. A PR a session opens here gets no reviewer: you review it yourself."));
+        } else {
+            items.extend(review_lines(name, &self.tower.read(cx).prs).into_iter().map(eff));
         }
         // Its goal is met: the closing report, and the way to close it.
         if m.ready() {

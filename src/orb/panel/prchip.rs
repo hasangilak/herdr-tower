@@ -94,6 +94,19 @@ impl Line {
         self.gate.blocked.is_none() && self.gate.needs_override.is_none()
     }
 
+    /// Where its review stands, for its row (`crate::reviews::chip_line`)
+    /// and in what colour: agreed is good news, the rest is to mind.
+    fn review(&self) -> Option<(String, u32)> {
+        let r = self.pr.review.as_ref()?;
+        let line = if r.line.is_empty() { crate::reviews::chip_line(r) } else { r.line.clone() };
+        let color = match r.status.as_str() {
+            "agreed" => CYAN,
+            "ended" => 0xcdd6e6,
+            _ => AMBER,
+        };
+        Some((line, color))
+    }
+
     /// How it stands, for its row: the words and whether they are bad news.
     fn standing(&self) -> (String, u32) {
         let c = &self.pr.checks;
@@ -270,6 +283,7 @@ impl Panel {
                             .child(div().flex_none().text_color(rgb(color)).child(word)),
                     )
                     .when(!l.pr.title.is_empty(), |el| el.child(div().text_size(px(12.0)).text_color(g.faint).truncate().child(l.pr.title.clone())))
+                    .children(l.review().map(|(line, color)| div().text_size(px(12.0)).text_color(rgb(color)).truncate().child(line)))
                     .when(can_ask, |el| {
                         el.cursor_pointer().hover(|s| s.bg(rgba(LINE))).on_click(cx.listener(move |this, _, _, cx| this.merge_act(&d2, MergeAct::Ask(key.clone()), cx)))
                     }),
@@ -332,6 +346,7 @@ fn described(r: &PrRef) -> Pr {
             .into(),
             ..Default::default()
         },
+        review: r.review.clone(),
         ..Default::default()
     }
 }
@@ -408,6 +423,34 @@ mod tests {
         assert!(merge_acts(&[draft.clone()]).is_empty());
         assert_eq!(draft.standing().0, "a draft");
         assert_eq!(others_line(&only[0], &[only[0].clone(), draft]).as_deref(), Some("#9 can't be merged yet."));
+    }
+
+    #[test]
+    fn a_merge_cards_row_says_where_its_review_stands_and_merging_stays_the_users() {
+        let brief = |status: &str, rounds: u32, critical: u32| {
+            let mut b = crate::reviews::Brief { status: status.into(), rounds, critical, ..Default::default() };
+            b.line = crate::reviews::chip_line(&b);
+            b
+        };
+        let with = |b: Option<crate::reviews::Brief>| {
+            let mut l = line(12, "dev", "passing", Step::Idle);
+            l.pr.review = b;
+            l.gate = gate(&l.pr);
+            l
+        };
+        assert_eq!(with(None).review(), None, "no review: no line");
+        assert_eq!(with(Some(brief("reviewing", 0, 0))).review(), Some(("Reviewing…".into(), AMBER)));
+        assert_eq!(with(Some(brief("changes", 2, 2))).review(), Some(("Review: 2 critical, round 2".into(), AMBER)));
+        assert_eq!(with(Some(brief("agreed", 2, 0))).review(), Some(("Review: agreed".into(), CYAN)));
+        // Not agreed: said plainly when it is asked about, and still the user's to merge.
+        let open = [with(Some(brief("changes", 2, 2)))];
+        assert!(open[0].gate.warnings.iter().any(|w| w == "The review isn't agreed: 2 critical issues open, round 2."));
+        assert_eq!(merge_acts(&open), [("Merge #12".to_string(), true, MergeAct::Start("acme/shop#12".into()))]);
+        let agreed = with(Some(brief("agreed", 2, 0)));
+        assert!(agreed.gate.warnings.iter().all(|w| !w.contains("review")));
+        // One the window knows only from its decision keeps its review.
+        let r = PrRef { repo: "acme/shop".into(), number: 7, review: Some(brief("stuck", 3, 1)), ..Default::default() };
+        assert_eq!(described(&r).review.unwrap().line, "Review: stuck after 3 rounds, yours to decide");
     }
 
     #[test]

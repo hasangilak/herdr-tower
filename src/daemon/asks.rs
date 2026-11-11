@@ -871,6 +871,12 @@ impl Asks {
         if super::watch::left_alone(t) {
             return;
         }
+        // A PR's reviewer (`reviews`): it talks to the PR's owner itself, and
+        // what it can't agree on comes to the user as the review's own
+        // decision. Its turn's end opens no PR, card or question.
+        if super::reviews::is_reviewer(address) || super::reviews::labelled_reviewer(t) {
+            return;
+        }
         let (me, address, t) = (self.clone(), address.to_string(), t.clone());
         let ended_ms = crate::history::now_ms();
         std::thread::spawn(move || {

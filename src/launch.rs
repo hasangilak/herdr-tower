@@ -74,6 +74,9 @@ pub struct Plan {
     /// The plan it was planned with (`--plan`): each session's first
     /// instruction carries its link and its part of it.
     pub plan: Option<crate::plans::PlanBrief>,
+    /// The PRs its sessions open get a reviewer (`crate::reviews`):
+    /// `--review` / `--no-review`, else as the space has it (on for a new one).
+    pub review: bool,
 }
 
 /// What a launch is asked beside its goal, each as `tower launch` takes it.
@@ -93,6 +96,9 @@ pub struct Ask<'a> {
     pub account: Option<&'a str>,
     /// `--plan`: the plan it was planned with (`tower plan`).
     pub plan: Option<&'a str>,
+    /// `--review` (true) or `--no-review` (false): whether the PRs its
+    /// sessions open get a reviewer. Neither: as the space has it (on).
+    pub review: Option<bool>,
 }
 
 /// What a plan is made from: what there is now.
@@ -110,6 +116,8 @@ pub struct World {
     pub worktrees: bool,
     /// Spaces the user keeps (`tower space standing`).
     pub standing: Vec<String>,
+    /// Spaces whose PRs get no reviewer (`tower space review <space> off`).
+    pub no_review: Vec<String>,
     /// The project folders (`projects::candidates`): the repos a goal names.
     pub projects: Vec<std::path::PathBuf>,
 }
@@ -542,6 +550,7 @@ pub fn plan_with(goal: &str, ask: &Ask, w: &World) -> Result<Plan> {
         Err(e) => return Err(e),
     };
     let standing = w.standing.iter().any(|s| s.eq_ignore_ascii_case(&space));
+    let review = ask.review.unwrap_or_else(|| !w.no_review.iter().any(|s| s.eq_ignore_ascii_case(&space)));
     let mut taken: BTreeSet<String> = w.names.iter().cloned().collect();
     let mut sessions = vec![];
     for repo in &setup.repos {
@@ -576,7 +585,7 @@ pub fn plan_with(goal: &str, ask: &Ask, w: &World) -> Result<Plan> {
         "name": space, "name_why": name_why,
         "worktrees": sessions.iter().any(|s| s.worktree.is_some()), "worktrees_why": worktrees_why,
     });
-    Ok(Plan { goal, done_when, ticket, repos_from, space, joins, setup: setup.clone(), account, sessions, assumed, plan: None })
+    Ok(Plan { goal, done_when, ticket, repos_from, space, joins, setup: setup.clone(), account, sessions, assumed, plan: None, review })
 }
 
 /// What a session of the plan is asked first: the whole ticket (with its
@@ -638,6 +647,7 @@ pub fn receipt(p: &Plan, started: &[Value], agenda: Option<&str>, dry_run: bool)
         "repos_from": p.repos_from,
         "assumed": p.assumed,
         "plan": p.plan.as_ref().map(|b| json!({ "id": b.id, "url": b.url })),
+        "review": p.review,
     })
 }
 
@@ -670,6 +680,11 @@ pub fn said(r: &Value) -> String {
         Some(a) => out += &format!("The goal is its first request ({a}): one task per session. They are introduced to each other as they join.\n"),
         None if dry => out += "The goal would be its first request: one agenda, one task per session.\n",
         None => out += "The goal went to each session as its first task (the voice isn't running, so no agenda follows it).\n",
+    }
+    if r["review"] == false {
+        out += "Its PRs get no reviewer (--no-review).\n";
+    } else if r["review"] == true {
+        out += "Each PR its sessions open gets a reviewer session, for critical issues only (--no-review: none).\n";
     }
     let a = &r["assumed"];
     out += &format!(
@@ -705,6 +720,7 @@ fn world() -> Result<World> {
         accounts: crate::accounts::list().unwrap_or_default(),
         worktrees: cfg.spaces.worktrees,
         standing: kept.missions.iter().filter(|(_, m)| m.standing).map(|(n, _)| n.clone()).collect(),
+        no_review: kept.missions.iter().filter(|(_, m)| !m.review).map(|(n, _)| n.clone()).collect(),
         projects: crate::projects::candidates(&crate::projects::roots()),
     })
 }
@@ -751,6 +767,8 @@ pub fn open(p: &Plan, by: Option<&str>, each: &mut dyn FnMut(&Value)) -> Result<
         if !p.done_when.is_empty() {
             m.done_when = p.done_when.clone();
         }
+        // Whether its PRs get a reviewer: as asked, else as it was (on for a new space).
+        m.review = p.review;
     });
     // One request: the whole ticket, under its title; each session's first task joins it.
     let agenda = match crate::protocol::is_running() {
@@ -948,6 +966,7 @@ mod tests {
             accounts: accounts(&["default", "orca"]),
             worktrees: true,
             standing: vec!["M5 Pro".into()],
+            no_review: vec![],
             projects: vec![],
         };
         let p = plan("  Fix the   login redirect on eyzflow ", None, None, &w).unwrap();
@@ -1060,7 +1079,7 @@ mod tests {
         let w = World { setups: vec![project, setup("other", "default", &["/w"])], accounts: accounts(&["default", "orca"]), worktrees: true, spaces: vec!["msg".into()], ..Default::default() };
         let ticket = "EYZFlow Support – Enable Automatic Message and Reply Translation\n\nAcceptance criteria:\n- Messages show translated";
         let repos = vec![s(&room)];
-        let ask = Ask { repos: &repos, name: Some("msg-translation"), title: Some("Translate support messages"), done_when: Some("both languages show"), account: None, setup: Some("EYZFlow"), plan: None };
+        let ask = Ask { repos: &repos, name: Some("msg-translation"), title: Some("Translate support messages"), done_when: Some("both languages show"), account: None, setup: Some("EYZFlow"), plan: None, review: None };
         let p = plan_with(ticket, &ask, &w).unwrap();
         // Only the repo asked for, though the project has two; its account and its role come with the project.
         assert_eq!((p.sessions.len(), p.sessions[0].folder.as_str(), p.sessions[0].why.as_str()), (1, s(&room).as_str(), "the media backend"));
@@ -1095,6 +1114,17 @@ mod tests {
         // An empty done-when is kept empty, not filled from the ticket.
         let ask = Ask { repos: &repos, done_when: Some(""), ..Default::default() };
         assert_eq!(plan_with(ticket, &ask, &w).unwrap().done_when, "");
+        // Its PRs get a reviewer: on unless --no-review, or the space was turned off before.
+        let p = plan_with(ticket, &Ask { repos: &repos, ..Default::default() }, &w).unwrap();
+        assert!(p.review && receipt(&p, &[], None, true)["review"] == true);
+        assert!(said(&receipt(&p, &[], None, true)).contains("Each PR its sessions open gets a reviewer session"));
+        let off = plan_with(ticket, &Ask { repos: &repos, review: Some(false), ..Default::default() }, &w).unwrap();
+        assert!(!off.review && receipt(&off, &[], None, true)["review"] == false);
+        assert!(said(&receipt(&off, &[], None, true)).contains("Its PRs get no reviewer (--no-review)."));
+        let kept_off = World { no_review: vec!["Msg-Translation".into()], ..w.clone() };
+        let ask = Ask { repos: &repos, name: Some("msg-translation"), ..Default::default() };
+        assert!(!plan_with(ticket, &ask, &kept_off).unwrap().review, "as the space has it");
+        assert!(plan_with(ticket, &Ask { review: Some(true), ..ask }, &kept_off).unwrap().review, "--review turns it on");
         // A folder that isn't there, an unknown project or account: an error, nothing guessed.
         let gone = vec!["/no/such/folder".to_string()];
         assert!(plan_with(ticket, &Ask { repos: &gone, ..Default::default() }, &w).unwrap_err().to_string().contains("no such folder"));

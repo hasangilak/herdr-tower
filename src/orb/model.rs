@@ -158,6 +158,8 @@ pub struct PrRef {
     pub session: String,
     /// None from a daemon that doesn't say.
     pub merge: Option<MergeGate>,
+    /// Its review (`crate::reviews`), when it has one.
+    pub review: Option<crate::reviews::Brief>,
 }
 
 impl PrRef {
@@ -431,6 +433,7 @@ pub fn adapt(sets: &[QuestionSet], prs: &BTreeMap<String, Pr>, agents: &Value, s
                 note: p.checks_line(),
                 session: p.session.clone(),
                 merge: None,
+                review: p.review.clone(),
             })
             .collect();
         let key = format!("merge:{repo}@{space}");
@@ -591,6 +594,10 @@ pub struct Mission {
     #[serde(deserialize_with = "or_default")]
     pub done_when: String,
     pub standing: bool,
+    /// Its PRs get a reviewer (`crate::reviews`): on unless the user turned
+    /// it off, and on from a daemon that doesn't say.
+    #[serde(default = "yes")]
+    pub review: bool,
     pub state: Phase,
     pub follow: bool,
     pub mute: bool,
@@ -807,6 +814,7 @@ impl Member {
 pub struct Marks {
     pub follow: Option<bool>,
     pub mute: Option<bool>,
+    pub review: Option<bool>,
 }
 
 /// A space's mark: an amber count, the same as an outline when it is muted,
@@ -844,6 +852,7 @@ impl Missions {
             m.follow = m.follow || follows.iter().any(|f| f.eq_ignore_ascii_case(&m.name));
             m.follow = marks.get(&m.name).and_then(|mark| mark.follow).unwrap_or(m.follow);
             m.mute = muted.iter().any(|n| n.eq_ignore_ascii_case(&m.name));
+            m.review = marks.get(&m.name).and_then(|mark| mark.review).unwrap_or(m.review);
         }
     }
 
@@ -931,6 +940,7 @@ pub fn adapt_missions(spaces: &Spaces, live: &[Live], known: &[String], agents: 
             goal: spaces.agendas.get(&l.name).cloned().unwrap_or_default(),
             done_when: kept.map(|m| m.done_when.clone()).unwrap_or_default(),
             standing: kept.is_some_and(|m| m.standing),
+            review: kept.is_none_or(|m| m.review),
             report: kept.map(|m| m.report.clone()).unwrap_or_default(),
             state: if kept.is_some_and(|m| m.state == crate::missions::State::Ready) { Phase::Ready } else { Phase::Open },
             sessions: l
@@ -1984,14 +1994,14 @@ mod tests {
         let number = |marks: &HashMap<String, Marks>, state: &Value, mutes: &[String]| count(&all, &muted_spaces(&all, state, mutes, marks));
         assert_eq!(number(&marks, &state, &[]), 1, "isa is muted by the state");
         // Muted here: off the count at once.
-        marks.insert("sandbox".into(), Marks { follow: Some(true), mute: Some(true) });
+        marks.insert("sandbox".into(), Marks { follow: Some(true), mute: Some(true), review: None });
         assert_eq!(number(&marks, &state, &[]), 0);
         let mut m = missions(&state, &Spaces::default(), &[], &[], &all);
         m.mark(&[], &muted_spaces(&all, &state, &[], &marks), &marks);
         assert_eq!((m.open[0].follow, m.open[0].mute, m.open[0].chip()), (true, true, Chip::Muted(1)));
         assert!(main_queue(&all, &m.muted()).is_empty());
         // Unmuted here, before the state says so.
-        marks.insert("isa".into(), Marks { follow: None, mute: Some(false) });
+        marks.insert("isa".into(), Marks { follow: None, mute: Some(false), review: None });
         assert_eq!(number(&marks, &state, &[]), 1);
         // The state doesn't agree yet: both stay.
         settle_marks(&mut marks, &state, &all, &[], &[]);
@@ -1999,7 +2009,7 @@ mod tests {
         // It says the same: forgotten, one switch at a time.
         let agreed = json!({ "missions": [{ "name": "sandbox", "state": "open", "mute": true }, { "name": "isa", "state": "open", "follow": true }] });
         settle_marks(&mut marks, &agreed, &all, &[], &[]);
-        assert_eq!(marks.get("sandbox"), Some(&Marks { follow: Some(true), mute: None }));
+        assert_eq!(marks.get("sandbox"), Some(&Marks { follow: Some(true), mute: None, review: None }));
         assert!(!marks.contains_key("isa"));
         // Followed in spaces.json (any case): that settles it too, and marks a mission.
         settle_marks(&mut marks, &agreed, &all, &["SANDBOX".to_string()], &[]);
@@ -2019,7 +2029,7 @@ mod tests {
         assert_eq!(muted, ["landing".to_string(), "Sandbox".to_string()].into(), "spelt as the decisions spell it");
         assert_eq!((ids(&main_queue(&all, &muted)), count(&all, &muted)), (vec!["pr"], 1));
         // Unmuted here: back in the queue before the daemon says so.
-        let mut marks: HashMap<String, Marks> = [("landing".to_string(), Marks { follow: None, mute: Some(false) })].into();
+        let mut marks: HashMap<String, Marks> = [("landing".to_string(), Marks { follow: None, mute: Some(false), review: None })].into();
         assert_eq!(count(&all, &muted_spaces(&all, &json!({}), &["sandbox".to_string()], &marks)), 2);
         // The daemon still says muted: the switch stays; once it doesn't, it is forgotten.
         settle_marks(&mut marks, &json!({}), &all, &[], &[]);
@@ -2027,9 +2037,9 @@ mod tests {
         settle_marks(&mut marks, &json!({}), &all[..2], &[], &[]);
         assert!(marks.is_empty());
         // Muted here, then listed in spaces.json: forgotten too.
-        let mut marks: HashMap<String, Marks> = [("isa".to_string(), Marks { follow: Some(false), mute: Some(true) })].into();
+        let mut marks: HashMap<String, Marks> = [("isa".to_string(), Marks { follow: Some(false), mute: Some(true), review: None })].into();
         settle_marks(&mut marks, &json!({}), &all, &[], &[]);
-        assert_eq!(marks.get("isa"), Some(&Marks { follow: None, mute: Some(true) }), "not followed anywhere: that much is settled");
+        assert_eq!(marks.get("isa"), Some(&Marks { follow: None, mute: Some(true), review: None }), "not followed anywhere: that much is settled");
         settle_marks(&mut marks, &json!({}), &all, &[], &["ISA".to_string()]);
         assert!(marks.is_empty());
     }

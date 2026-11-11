@@ -226,7 +226,9 @@ types the answers into the session, the card says how that goes, and when
 several sessions asked the same thing they all get the answer. If typing
 stops half way, the card says so and offers the session or another try. A
 merge card lists its pull requests, into dev before into main, each with
-its checks; its button asks about one, "Confirm" merges it (a PR whose
+its checks and where its review stands ("Review: 2 critical, round 2",
+in amber until it is agreed); its button asks about one (a review that
+isn't agreed is said among what to mind, and the merge is still yours), "Confirm" merges it (a PR whose
 checks fail takes a third step, from its own row; a draft or a conflict is
 held back). What the brain raised shows its choices as buttons, the
 tower's pick in amber with its reason, and Other; a task that failed twice
@@ -264,7 +266,8 @@ folded into one line, and **Record**, **Shots**, **Projects** and
   "ready to close"), its sessions, whether they have their own worktrees,
   and how many messages they wrote each other.
 - **A space**: its goal and what counts as done (the **Goal** button
-  changes them, or makes it a standing space), **Follow** and **Mute**, its
+  changes them, or makes it a standing space), **Follow**, **Mute** and
+  **Review PRs** (with a line per open PR on where its review stands), its
   closing report with **Close this space** once it is ready (and when it
   would close by itself), what needs you there (a muted space's decisions
   show only here), its requests, its sessions (status, last words, worktree
@@ -286,7 +289,9 @@ folded into one line, and **Record**, **Shots**, **Projects** and
   the ticket ("Reading the ticket…", a few seconds) and shows the draft as
   a card: the space's name, its goal (the ticket's title), done when (its
   acceptance criteria), each session's repo and why it is in it, and the
-  project and account. **Launch** opens exactly that; **Adjust it in
+  project and account, with a **Review its PRs** switch under it (on: each
+  PR its sessions open gets a reviewer; it is under the plan of a goal
+  whose first line names its repos too). **Launch** opens exactly that; **Adjust it in
   words…** with **Redraft** gets a new draft in its place ("leave the
   dashboard out", "call it msg-translation"); **Start over** drops it.
   Nothing opens before Launch. The whole ticket goes to the sessions as
@@ -465,6 +470,29 @@ that runs `tower queue <address> "<message>"` sends a message, not a task
 (the same queue: it waits for a busy receiver and arrives once, with the
 sender's name on it). `tower thread [<space>]` lists what a space's
 sessions wrote, and the space's view shows the latest.
+
+**Every PR gets a reviewer.** When a session of a space opens a PR (its
+turn prints the link), the tower opens one reviewer session for it: same
+space, repo and account, named `<space>-review-<repo>-<n>`, in a checkout
+of its own detached at the PR's head
+(`.tower-worktrees/<space>/review-<repo>-<n>`, where it may read and comment
+but never push, merge or edit). It looks for **critical issues only**
+(wrong behaviour against the goal, a crash, security, data loss, a build or
+test failure, a contract broken with another repo; never style or nits),
+posts each as a `Critical:` comment on the PR, messages the PR's session
+itself, and reports to the tower (`tower review report`). The tower passes
+nothing between them: it sends the PR's session one short note per round
+(who the reviewer is, and to fix, push, answer the threads and tell it),
+shows the review on the PR's chip and the merge card ("Reviewing…",
+"Review: 2 critical, round 2", "Review: agreed"), and after three rounds
+without agreement puts it to you as one decision ("Side with the owner",
+"Side with the reviewer", "I'll look"), whose answer goes to both. Merging
+stays yours: a review that isn't agreed is said on the merge card, never
+in the way. Agreed, the PR merged or closed, the space closed or its
+review turned off, the reviewer ends; the record stays (`tower review`).
+It is on for every space; New space's **Review its PRs** switch (`tower
+launch --no-review`), the space's own **Review PRs** switch and `tower
+space review <space> off` turn it off.
 
 ### A tower per space, and the model they run on
 
@@ -738,9 +766,9 @@ tower behavior list                  # how the tower works; add, edit, disable, 
 tower questions                      # what sessions ask now; tower answer <id> --json '[…]', tower dismiss <id>
 tower policy [normal|keep-moving|ask-everything]   # how much the tower answers for you
 tower start --name n --cwd d "task"  # a new Claude session on an account (--account), watched; with --space of a space that has a goal, in that space's worktree of d (--no-worktree: in d itself)
-tower launch "<goal>" [--setup <name>] [--name <space>] [--dry-run]   # open a space for a goal: a session per repo (named in its first line, or a project's), each in its worktree, the goal handed out
+tower launch "<goal>" [--setup <name>] [--name <space>] [--no-review] [--dry-run]   # open a space for a goal: a session per repo (named in its first line, or a project's), each in its worktree, the goal handed out; its PRs get a reviewer unless --no-review
 tower launch "<ticket>" --draft [--adjust "<words>" --prior '<draft>']   # the brain drafts the space from the ticket; nothing opens
-tower launch "<ticket>" --repo <dir> [--repo …] --name <space> --title "<goal>" [--done-when "<…>"] [--account <a>] [--setup <project>] [--plan <id>]   # launch a draft as it was confirmed (with its plan)
+tower launch "<ticket>" --repo <dir> [--repo …] --name <space> --title "<goal>" [--done-when "<…>"] [--account <a>] [--setup <project>] [--plan <id>] [--review|--no-review]   # launch a draft as it was confirmed (with its plan)
 tower plan new --form page|whiteboard --draft '<draft>' --ticket-file <f>   # the planner writes the draft's plan and publishes it as an artifact
 tower plan say <id> "<words>" [--as user|planner]   # the chat about a plan: yours goes to the planner, the planner's is its answer
 tower plan draft <id> --json-file <f> | published <id> --url <link> | failed <id> "<why>"   # what the planner reports
@@ -754,6 +782,10 @@ tower space report <space> "<text>"  # its closing report (the brain writes it w
 tower space close <space> [--force]  # end its sessions, remove its clean worktrees, archive it
 tower space follow|unfollow <space>  # its finished requests' receipts reach you as they land
 tower space mute|unmute <space>      # what needs you there stays in its own view, off the orb's number
+tower space review <space> on|off    # whether the PRs its sessions open get a reviewer session (on by default; off ends one that is open)
+tower review [list] | show <pr> [--json]   # the PRs' reviews: who reviews which PR, its rounds, where it stands (reviews.json)
+tower review report <pr> --critical <n> "…" | agree <pr> ["…"]   # the reviewer's word: a round's critical issues, or agreement (it ends then)
+tower review fixed <pr> "…"          # the PR's own session: it fixed what was critical (optional: the next report is what counts)
 tower thread [<space>] [-n 50]       # what the sessions of a space wrote to each other
 tower raise <t> --why <kind> "<the decision>" [--options '[…]']   # put a decision to the user (the brain does this)
 tower receipt [--agenda <id>] "…"    # the one line for a finished request (the brain does this)

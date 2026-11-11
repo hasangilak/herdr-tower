@@ -399,7 +399,7 @@ pub fn check(reply: &Value, ticket: &str, w: &World, pick: Option<&str>) -> Resu
 /// said: `draft`, `project`, `notes`, `dropped`, and each session's `why`.
 pub fn receipt(d: &Draft, ticket: &str, w: &World) -> Result<Value> {
     let repos: Vec<String> = d.repos.iter().map(|(f, _)| f.clone()).collect();
-    let ask = Ask { setup: d.project.as_deref(), name: Some(&d.space), repos: &repos, title: Some(&d.goal), done_when: Some(&d.done_when), account: d.account.as_deref(), plan: None };
+    let ask = Ask { setup: d.project.as_deref(), name: Some(&d.space), repos: &repos, title: Some(&d.goal), done_when: Some(&d.done_when), account: d.account.as_deref(), plan: None, review: None };
     let mut plan = launch::plan_with(ticket, &ask, w)?;
     for s in plan.sessions.iter_mut() {
         if let Some((_, why)) = d.repos.iter().find(|(f, _)| *f == s.folder || whole(f) == s.folder).filter(|(_, why)| !why.is_empty()) {

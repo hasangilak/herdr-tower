@@ -138,6 +138,23 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<String>,
     },
+    /// A PR's review (`tower review`, see `crate::reviews`): `list` (no
+    /// `pr`) or `show`; the reviewer's `report` (with `critical`) and
+    /// `agree`, the owner's `fixed`, each with its line (`text`); `sweep`
+    /// looks at every review now (a space's review was turned off).
+    /// `from`: the terminal that ran it.
+    Review {
+        #[serde(default)]
+        action: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        pr: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        critical: Option<u32>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+    },
     /// What only the user can decide, in queue order (`tower decisions`).
     /// No `space`: the main queue (muted spaces left out). `space`: that
     /// space's own. `all`: the last ones that closed too.
@@ -314,6 +331,8 @@ fn wait_for(req: &Request) -> Duration {
         Request::Queue { .. } | Request::Agenda { .. } => Duration::from_secs(90),
         // It asks Herdr about every session first.
         Request::Missions => Duration::from_secs(60),
+        // A report queues a note to the owner; a sweep may end reviewers.
+        Request::Review { .. } => Duration::from_secs(60),
         // An undo ends terminals and takes worktrees away.
         Request::Act { action, .. } if action == "undo" => Duration::from_secs(120),
         // Ending a brain's terminal, and Herdr's answers on the way (a plan's planner too).
@@ -393,6 +412,12 @@ mod tests {
         assert!(matches!(serde_json::from_str::<Request>(r#"{"cmd":"decisions"}"#).unwrap(), Request::Decisions { space: None, all: false }));
         assert!(matches!(serde_json::from_str::<Request>(r#"{"cmd":"missions"}"#).unwrap(), Request::Missions));
         assert_eq!(serde_json::to_string(&Request::Missions).unwrap(), r#"{"cmd":"missions"}"#);
+        let report: Request = serde_json::from_str(r#"{"cmd":"review","action":"report","pr":"o/app#12","critical":2,"text":"two","from":"t9"}"#).unwrap();
+        assert!(matches!(report, Request::Review { ref action, critical: Some(2), from: Some(ref f), .. } if action == "report" && f == "t9"));
+        assert_eq!(
+            serde_json::to_string(&Request::Review { action: "list".into(), pr: String::new(), critical: None, text: String::new(), from: None }).unwrap(),
+            r#"{"cmd":"review","action":"list"}"#
+        );
         let own: Request = serde_json::from_str(r#"{"cmd":"decisions","space":"Shop","all":true}"#).unwrap();
         assert!(matches!(own, Request::Decisions { space: Some(ref s), all: true } if s == "Shop"));
         // What the tower opened: recorded by the command that opened it, undone by its id or the latest.
