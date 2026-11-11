@@ -464,6 +464,9 @@ struct Orb {
     /// The pointer is over the orb.
     inside: bool,
     hover: Option<Task<()>>,
+    /// A click on the orb just closed the panel: hovering doesn't bring it
+    /// back until the pointer has left the orb.
+    rest: bool,
     _watch_pointer: Task<()>,
     _subs: Vec<Subscription>,
 }
@@ -544,12 +547,16 @@ impl Orb {
             panel: None,
             inside: false,
             hover: None,
+            rest: false,
             _watch_pointer: watch_pointer,
             _subs: subs,
         }
     }
 
     fn hovered(&mut self, on: bool, cx: &mut Context<Self>) {
+        if !on {
+            self.rest = false;
+        }
         if on && self.press.is_none() {
             self.hover = Some(cx.spawn(async move |this, cx: &mut AsyncApp| {
                 cx.background_executor().timer(Duration::from_millis(CAPTION_DELAY_MS)).await;
@@ -683,7 +690,7 @@ impl Orb {
     /// Hovering: the panel as a peek, unless it is open already.
     fn peek(&mut self, cx: &mut Context<Self>) {
         // In full mode (open or not), the full window has taken the floating panel's place.
-        if self.tower.read(cx).full_mode || full_open(&self.tower, cx) {
+        if self.rest || self.tower.read(cx).full_mode || full_open(&self.tower, cx) {
             return;
         }
         if self.press.is_none() && !self.panel_open(cx) {
@@ -710,30 +717,32 @@ impl Orb {
         }
     }
 
-    /// A click: pins a peek, closes a pinned panel, else opens it pinned.
-    /// In full mode it closes the full window when it is open and opens it
-    /// when it isn't; the floating panel stays away until the user switches
-    /// back to it ("Floating" in the full window).
+    /// A click: closes the panel when it shows (a peek or pinned; a click
+    /// inside a peek is what pins it), else opens it pinned. In full mode it
+    /// closes the full window when it is open and opens it when it isn't;
+    /// the floating panel stays away until the user switches back to it
+    /// ("Floating" in the full window).
     fn toggle_panel(&mut self, cx: &mut Context<Self>) {
+        // What hovering was about to show is not shown now.
+        self.hover = None;
         if full_open(&self.tower, cx) {
             close_full(&self.tower, cx);
             mac::give_back_focus();
+            self.rest = true;
             return;
         }
         if self.tower.read(cx).full_mode {
             open_full(&self.tower, None, None, None, true, true, cx);
             return;
         }
-        if self.peeking(cx) {
-            if let Some(p) = &self.panel {
-                let view = p.view.clone();
-                let _ = p.handle.update(cx, |_, window, cx| view.update(cx, |panel, cx| panel.pin(window, cx)));
-            }
-        } else if self.panel_open(cx) {
-            self.close_panel(true, cx);
-        } else {
-            self.open_panel(false, cx);
+        if self.panel_open(cx) {
+            // A peek never had the keyboard; a pinned panel hands it back.
+            let pinned = !self.peeking(cx);
+            self.close_panel(pinned, cx);
+            self.rest = true;
+            return;
         }
+        self.open_panel(false, cx);
     }
 
     /// Opens the panel beside the orb (on whichever side has room). A peek

@@ -1137,7 +1137,8 @@ where the full window is, `panel/` the views).
 - **Floating panel** (380 × 640, today's size; F1 to F9, I1 to I4): the
   status line, the queue (one card open, the rest behind it), the open
   spaces as chips with their state, the main tower's last reply, the input.
-  Hovering the orb peeks at it and a click pins it. It replaces the chat as
+  Hovering the orb peeks at it; a click inside the peek pins it; a click on
+  the orb closes it when it shows, and opens it pinned when it doesn't. It replaces the chat as
   the panel's home.
 - **Full window** (960 × 640 at first; W1 to W20), opened from the floating
   panel in its place: the panel closes (after the click is handled: a

@@ -72,8 +72,10 @@ Then:
   spaces left out; no number when there are none; `9+` past nine). It
   reaches for the pointer, gives where you press it and sloshes when
   dragged. Hover to peek at the panel (below): it goes when the pointer
-  leaves the orb and the panel. Click to pin it, with the keyboard; Esc or
-  another click closes it. Right-click shows the tower's own terminal,
+  leaves the orb and the panel; a click inside it keeps it, with the
+  keyboard. A click on the orb opens the panel when it isn't showing and
+  closes it when it is (a peek or kept), and it doesn't peek again until the
+  pointer has left the orb; Esc closes it too. Right-click shows the tower's own terminal,
   ⌥-click mutes or unmutes the tower; drag it anywhere (it comes back there
   next time). ⌘⇧K, from any app, shows or hides it. It is its own small
   window (no Dock icon), so it works with Herdr closed.
