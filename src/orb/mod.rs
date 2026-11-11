@@ -707,7 +707,7 @@ impl Orb {
     /// While the full window is open, it brings that forward instead.
     fn toggle_panel(&mut self, cx: &mut Context<Self>) {
         if full_open(&self.tower, cx) {
-            open_full(&self.tower, None, None, None, true, cx);
+            open_full(&self.tower, None, None, None, true, true, cx);
             return;
         }
         if self.peeking(cx) {
@@ -926,8 +926,9 @@ fn full_open(tower: &Entity<Tower>, cx: &mut App) -> bool {
 /// Shows the full window at `to` (where it was, with none): opens it beside
 /// `anchor` (the floating panel) or in the middle of the screen, or brings it
 /// forward if it is open. `spot`: exactly there instead. `focus`: it takes
-/// the keyboard, as a click on "Full window" means it to.
-fn open_full(tower: &Entity<Tower>, to: Option<nav::Scope>, anchor: Option<mac::Rect>, spot: Option<(f64, f64)>, focus: bool, cx: &mut App) {
+/// the keyboard, as a click on "Full window" means it to. `replace`: it
+/// takes the floating panel's place, which closes (the user opened it).
+fn open_full(tower: &Entity<Tower>, to: Option<nav::Scope>, anchor: Option<mac::Rect>, spot: Option<(f64, f64)>, focus: bool, replace: bool, cx: &mut App) {
     if let Some(to) = to {
         tower.update(cx, |t, cx| {
             t.nav.go(to);
@@ -958,7 +959,7 @@ fn open_full(tower: &Entity<Tower>, to: Option<nav::Scope>, anchor: Option<mac::
     // Where the user last put it, if that is still on a screen; else in the
     // floating panel's place when it takes it (the user opened it), or beside it.
     let (x, y) = spot.or_else(|| saved.map(|s| nav::keep_on(&mac::screens(), s.0, s.1, w, h))).unwrap_or_else(|| match anchor {
-        Some(a) if focus => nav::place_over(a, screen, w, h),
+        Some(a) if replace => nav::place_over(a, screen, w, h),
         _ => nav::place(anchor, screen, w, h),
     });
     let options = WindowOptions {
@@ -998,7 +999,7 @@ fn open_full(tower: &Entity<Tower>, to: Option<nav::Scope>, anchor: Option<mac::
             let floating = tower.update(cx, |t, cx| {
                 t.full = Some(handle);
                 cx.notify();
-                let f = if focus { t.floating.take() } else { None };
+                let f = if replace { t.floating.take() } else { None };
                 if let Some(f) = f {
                     t.pinned = t.pinned.filter(|h| *h != f);
                     t.keyed = Some(handle);
@@ -1082,7 +1083,7 @@ fn close_full(tower: &Entity<Tower>, cx: &mut App) {
 
 /// "Full window": opens it, or closes it when it is open.
 fn toggle_full(tower: &Entity<Tower>, anchor: Option<mac::Rect>, cx: &mut App) {
-    if full_open(tower, cx) { close_full(tower, cx) } else { open_full(tower, None, anchor, None, true, cx) }
+    if full_open(tower, cx) { close_full(tower, cx) } else { open_full(tower, None, anchor, None, true, true, cx) }
 }
 
 /// The full window closed itself (Esc): a pinned floating panel has the
@@ -1327,7 +1328,8 @@ pub fn run(ui_dir: Option<PathBuf>) -> Result<()> {
                 t.nav.goal = from_start_goal();
             });
             let beside = orb.borrow().as_ref().and_then(|h| h.update(cx, |orb, _, _| orb.panel.as_ref().map(|p| p.frame)).ok().flatten());
-            open_full(&tower, None, beside, spot, false, cx);
+            // `HERDER_TOWER_ORB_WINDOW_REPLACES`: it takes the floating panel's place, as a click does, without the keyboard.
+            open_full(&tower, None, beside, spot, false, std::env::var_os("HERDER_TOWER_ORB_WINDOW_REPLACES").is_some(), cx);
         }
 
         // The daemon rewrites one file whenever something changes.

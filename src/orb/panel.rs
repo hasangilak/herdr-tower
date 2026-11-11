@@ -769,7 +769,7 @@ impl Panel {
     /// The full window at `to` (opened beside this one, or brought forward).
     fn show_full(&mut self, to: super::nav::Scope, window: &mut Window, cx: &mut Context<Self>) {
         let beside = super::mac::Win::of(window).map(|w| w.frame());
-        super::open_full(&self.tower.clone(), Some(to), beside, None, true, cx);
+        super::open_full(&self.tower.clone(), Some(to), beside, None, true, true, cx);
     }
 
     /// A bare digit answers the open card of the view showing (1 is its
