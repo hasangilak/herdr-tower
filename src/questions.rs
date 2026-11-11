@@ -1657,6 +1657,22 @@ pub fn text_recs(v: &Value) -> Result<(Vec<Tab>, Vec<TabRecs>)> {
 
 /// One reply to a text question set: each question's answer (numbered when
 /// there are several), files attached as the panel does.
+/// The user's own words in `answers`: what they typed or said (a string
+/// choice, an `other` or `spoken`), not an option they picked. None: they
+/// only picked.
+pub fn users_words(answers: &[Answer]) -> Option<String> {
+    let words: Vec<String> = answers
+        .iter()
+        .filter_map(|a| match &a.choice {
+            Value::String(s) => Some(s.trim().to_string()),
+            Value::Object(o) => o.get("other").or_else(|| o.get("spoken")).and_then(Value::as_str).map(|s| s.trim().to_string()),
+            _ => None,
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!words.is_empty()).then(|| words.join("\n"))
+}
+
 pub fn compose_reply(set: &QuestionSet, answers: &[Answer]) -> Result<String> {
     if answers.is_empty() {
         bail!("no answer");
@@ -2035,6 +2051,19 @@ mod tests {
 
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(format!("{}/tests/fixtures/questions/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    #[test]
+    fn the_users_own_words_in_an_answer_are_what_they_typed_or_said_not_what_they_picked() {
+        let a = |choice: Value| Answer { tab: 0, choice, attachments: vec![] };
+        assert_eq!(users_words(&[a(json!("Yes, fix both: test it, then report"))]).as_deref(), Some("Yes, fix both: test it, then report"));
+        assert_eq!(users_words(&[a(json!({ "options": [0], "other": "and keep the old page a week" }))]).as_deref(), Some("and keep the old page a week"));
+        assert_eq!(users_words(&[a(json!({ "spoken": "ship it on Monday" }))]).as_deref(), Some("ship it on Monday"));
+        assert_eq!(users_words(&[a(json!(1))]), None, "an option picked");
+        assert_eq!(users_words(&[a(json!({ "options": [0, 2] }))]), None);
+        assert_eq!(users_words(&[a(json!("  "))]), None);
+        // A bare yes is the user's, but no request: `introduce::users_task` leaves it out.
+        assert_eq!(users_words(&[a(json!("yes"))]).as_deref().and_then(crate::introduce::users_task), None);
     }
 
     #[test]

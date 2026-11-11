@@ -783,9 +783,11 @@ for **Herdr Core**, because the voice runs in a Herdr terminal.
   restart, Herdr reading it a moment without its agent); a terminal's
   introduction is forgotten an hour after it is gone. A dispatch's sessions
   are one introduction (the set must hold 30 s). What a session is "working
-  on" is your own request to it (the task the tower gave it for you, or what
-  you typed in its terminal), never a message from another session; with
-  none, it says "no task reported yet". Kept in
+  on" is your own request to it (the task the tower gave it for you, what
+  you typed in its terminal, or what you answered its question with in
+  words of your own on a card: not an option you picked, nor a bare "yes"),
+  never a message from another session; once that is done it reads "last
+  asked for: …", and with none, "no task reported yet". Kept in
   `~/.local/state/herder-tower/introductions.json`; never the tower's own
   terminals, Codex, or sessions in other spaces or on other machines; on the
   first run what is already open is only recorded. `[sessions] introduce =
