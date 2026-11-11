@@ -107,6 +107,7 @@ mod record;
 mod session;
 mod settings;
 mod space;
+mod talk;
 mod viewer;
 mod window;
 

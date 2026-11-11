@@ -85,6 +85,10 @@ pub(super) struct FullUi {
     /// The thread's messages shown whole (by `space::thread_key`), the
     /// spaces whose earlier messages show too, and the one just copied.
     pub thread_open: HashSet<String>,
+    /// The conversation column: its scroll, and what it last showed (its
+    /// view, how many messages, the latest's time), to go to its end on a new one.
+    pub chat_scroll: gpui::ScrollHandle,
+    pub chat_seen: Option<(Option<String>, usize, u64)>,
     /// How wide a thread message's text is, in points, as last drawn.
     pub text_w: f32,
     pub thread_earlier: HashSet<String>,
@@ -114,6 +118,8 @@ impl FullUi {
             phone_anchor: gpui::ScrollAnchor::for_handle(scroll),
             to_phone: None,
             thread_open: HashSet::new(),
+            chat_scroll: gpui::ScrollHandle::new(),
+            chat_seen: None,
             text_w: 600.0,
             thread_earlier: HashSet::new(),
             copied: None,
@@ -207,16 +213,6 @@ pub(super) fn whead(title: &str, sub: Vec<AnyElement>, right: Option<AnyElement>
 }
 
 /// `Goal …`, `Done when …`: a word in white, then what it is.
-/// `named`, cut to `lines` lines with an ellipsis (a long goal in a head).
-pub(super) fn named_short(word: &str, text: &str, lines: usize) -> AnyElement {
-    h_flex()
-        .items_start()
-        .gap(px(5.0))
-        .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).text_color(glass().text).child(word.to_string()))
-        .child(div().min_w_0().flex_1().line_clamp(lines).text_ellipsis().child(text.to_string()))
-        .into_any_element()
-}
-
 pub(super) fn named(word: &str, text: &str) -> AnyElement {
     h_flex()
         .items_start()
@@ -535,7 +531,20 @@ impl Panel {
                 (h, b, None, false)
             }
         };
-        let foot = match reply {
+        // A view with a conversation (All spaces, a space): it has a column of
+        // its own beside the sidebar, the whole of it, with the input under it.
+        let talk: Option<Option<String>> = match &scope {
+            Scope::All => Some(None),
+            Scope::Space(name) => Some(Some(name.clone())),
+            _ => None,
+        };
+        let talk_w = {
+            let room = f32::from(window.viewport_size().width) - SIDE_W;
+            (room * 0.4).clamp(320.0, 480.0)
+        };
+        let chat = talk.as_ref().map(|space| self.chat_column(space.as_deref(), talk_w, window, cx));
+        let input = input && chat.is_none();
+        let foot = match reply.filter(|_| chat.is_none()) {
             Some(space) => self.foot_items(space.as_deref(), cx),
             None => vec![],
         };
@@ -568,6 +577,7 @@ impl Panel {
             .size_full()
             .items_start()
             .child(side)
+            .children(chat)
             .child(
                 v_flex()
                     .flex_1()

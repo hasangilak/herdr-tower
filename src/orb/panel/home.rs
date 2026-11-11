@@ -1025,7 +1025,7 @@ impl Panel {
 
     /// A reply's receipt: what the tower opened, what it assumed as chips,
     /// and Undo while that is still possible; once undone, how it closed.
-    fn act_items(&mut self, a: &ActShown, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    pub(super) fn act_items(&mut self, a: &ActShown, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if a.undone {
             let (head, rest) = closing_parts(a.closing.as_deref().unwrap_or("Closed it."));
             return vec![

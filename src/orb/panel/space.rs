@@ -30,7 +30,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use super::home::{CARD, LINE, SOFT, acts_row, bay_label, cstat, empty_box, mbtn, sign, tg};
 use super::launch::field;
 use super::session::last_words;
-use super::window::{bay, eff, lrow, mark_box, named, named_short, nm, pg, whead};
+use super::window::{bay, eff, lrow, mark_box, nm, pg, whead};
 use super::{AMBER, CYAN, Panel, glass};
 use crate::orb::model::{self, Chip, Decision, Member, Mission, Missions};
 use crate::orb::nav::Scope;
@@ -261,13 +261,8 @@ impl Panel {
             sub.push(div().child("A standing space: the tower never closes it and opens no worktrees here.").into_any_element());
         } else if m.goal.trim().is_empty() {
             sub.push(div().child("No goal: it has no end, and the tower opens no worktrees here.").into_any_element());
-        } else {
-            // Its first two lines; all of it under Goal.
-            sub.push(named_short("Goal", m.goal.trim(), 2));
-            if !m.done_when.trim().is_empty() {
-                sub.push(named("Done when", m.done_when.trim()));
-            }
         }
+        // The goal and what counts as done: a block of their own under the head (not while it is being changed).
         let (m1, n1, n2) = (m.clone(), name.to_string(), name.to_string());
         let (follow, mute) = (m.follow, m.mute);
         let toggles = h_flex()
@@ -279,6 +274,10 @@ impl Panel {
         let head = whead(name, sub, Some(toggles));
 
         let mut items: Vec<AnyElement> = vec![];
+        let editing_goal = self.full.as_ref().and_then(|f| f.edit.as_ref()).is_some_and(|e| e.space == name);
+        if !m.standing && !m.goal.trim().is_empty() && !editing_goal {
+            items.push(goal_block(m.goal.trim(), m.done_when.trim()));
+        }
         // The goal, being changed.
         if let Some(edit) = self.full.as_ref().and_then(|f| f.edit.as_ref()).filter(|e| e.space == name) {
             let standing = edit.standing;
@@ -615,6 +614,54 @@ fn sender_colour(address: &str) -> u32 {
     COLOURS[n as usize % COLOURS.len()]
 }
 
+/// A space's goal, and what counts as done as a list, each its own line
+/// with room around it.
+fn goal_block(goal: &str, done_when: &str) -> AnyElement {
+    let g = glass();
+    let done = done_items(done_when);
+    v_flex()
+        .w_full()
+        .px(px(16.0))
+        .py(px(14.0))
+        .gap(px(10.0))
+        .rounded(px(18.0))
+        .bg(rgba(CARD))
+        .border_1()
+        .border_color(rgba(LINE))
+        .child(bay_label("Goal").px(px(0.0)))
+        .child(div().text_size(px(16.0)).line_height(px(23.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.text).child(goal.to_string()))
+        .when(!done.is_empty(), |el| {
+            el.child(div().pt(px(4.0)).child(bay_label("Done when").px(px(0.0)))).child(v_flex().gap(px(8.0)).children(done.into_iter().map(|d| {
+                h_flex()
+                    .items_start()
+                    .gap(px(10.0))
+                    .text_size(px(13.5))
+                    .line_height(px(20.0))
+                    .child(div().flex_none().text_color(g.faint).child("•"))
+                    .child(div().flex_1().min_w_0().text_color(g.text).child(d))
+            })))
+        })
+        .into_any_element()
+}
+
+/// What counts as done, a condition each: split where the goal joined them
+/// ("; ", or its lines), without list marks.
+fn done_items(done_when: &str) -> Vec<String> {
+    done_when
+        .split(['\n', ';'])
+        .map(|s| s.trim().trim_start_matches(['-', '*', '•']).trim())
+        .map(|s| s.trim_end_matches('…').trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let mut c = s.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,6 +687,16 @@ mod tests {
         assert_eq!(said_text("From Shop › web (t7h): the build is green"), "the build is green");
         assert_eq!(said_text("From t7h: fixed (see PR 12). Next is the editor."), "fixed (see PR 12). Next is the editor.");
         assert_eq!(said_text("From the orb session: hello"), "From the orb session: hello", "not a session's signature");
+    }
+
+    #[test]
+    fn done_when_is_a_list_a_condition_each() {
+        assert_eq!(
+            done_items("Incoming support messages have a Translate Message option; the user's message language is detected automatically;  "),
+            ["Incoming support messages have a Translate Message option", "The user's message language is detected automatically"]
+        );
+        assert_eq!(done_items("- one\n- two"), ["One", "Two"]);
+        assert!(done_items("").is_empty());
     }
 
     #[test]
