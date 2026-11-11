@@ -292,8 +292,10 @@ pub fn users_turn(terminal: &str) -> bool {
 /// when that runs an agent with one (`claude -n web "<task>"`, `cca orca -n web "<task>"`).
 pub fn given_task(t: &serde_json::Value) -> Option<String> {
     let argv: Vec<&str> = t["argv"].as_array()?.iter().filter_map(serde_json::Value::as_str).collect();
-    let program = argv.first()?.rsplit('/').next().unwrap_or("");
-    if !["claude", "cca", "codex"].contains(&program) || argv.len() < 2 {
+    // The agent program, also behind the login shell `tower start` runs it in
+    // (`/bin/zsh -lic '"$@"; exec "$0" -li' /bin/zsh …/cca default -n web "<task>"`).
+    let program = argv.iter().position(|a| ["claude", "cca", "codex"].contains(&a.rsplit('/').next().unwrap_or("")))?;
+    if argv.len() < program + 2 {
         return None;
     }
     let last = *argv.last()?;
@@ -310,6 +312,18 @@ mod tests {
     use super::*;
 
     const T0: u64 = 1_000_000;
+
+    #[test]
+    fn the_first_task_tower_start_gives_a_session_is_the_towers_start() {
+        let mut l = Log::default();
+        let task = "This is a throwaway check of the tower's session introductions. Reply with the single word ok.";
+        let t = serde_json::json!({ "argv": ["/bin/zsh", "-lic", "\"$@\"; exec \"$0\" -li", "/bin/zsh", "/Users/u/.local/bin/cca", "default", "-n", "intro-check", task] });
+        // Its prompt comes a while later (after a folder trust prompt): still the start.
+        assert_eq!(l.whose("t8f", task, given_task(&t).as_deref(), T0 + 200_000), Whose::Tower("start".into()));
+        assert!(!l.users("t8f", T0 + 200_000));
+        // What the user types after it is theirs.
+        assert_eq!(l.whose("t8f", "now also check the docs", given_task(&t).as_deref(), T0 + 300_000), Whose::User);
+    }
 
     #[test]
     fn a_prompt_the_tower_typed_a_moment_ago_is_the_towers() {
@@ -430,6 +444,12 @@ mod tests {
         let t = serde_json::json!({ "argv": ["/usr/local/bin/claude", "-n", "web"] });
         assert_eq!(given_task(&t), None, "a name is no task");
         assert_eq!(given_task(&serde_json::json!({ "argv": ["/bin/zsh", "-l"] })), None);
+        // Behind the login shell `tower start` runs the agent in, as Herdr lists it.
+        let started = serde_json::json!({ "argv": ["/bin/zsh", "-lic", "\"$@\"; exec \"$0\" -li", "/bin/zsh", "/Users/u/.local/bin/cca", "default", "-n", "intro-check", "This is a throwaway check. Reply with ok."] });
+        assert_eq!(given_task(&started).as_deref(), Some("This is a throwaway check. Reply with ok."));
+        let named_only = serde_json::json!({ "argv": ["/bin/zsh", "-lic", "\"$@\"; exec \"$0\" -li", "/bin/zsh", "/Users/u/.local/bin/cca", "default", "-n", "web"] });
+        assert_eq!(given_task(&named_only), None, "a name is no task, behind the shell too");
+        assert_eq!(given_task(&serde_json::json!({ "argv": ["/bin/zsh", "-lic", "\"$@\"; exec \"$0\" -li", "/bin/zsh", "/usr/local/bin/claude"] })), None);
         assert_eq!(given_task(&serde_json::json!({ "argv": ["codex", "--yolo"] })), None);
         assert_eq!(given_task(&serde_json::json!({})), None);
     }

@@ -136,9 +136,10 @@ enum Cmd {
     /// The agenda ledger: every request of the user's and the tasks handed out for it, until each
     /// is verified or dropped. `tower agenda` (open ones), `tasks` (what's unfinished), `show <id>`,
     /// `new "<the user's words>"`, `close <id> [--force]`, `abandon <id|task>`, `verify <task>`,
-    /// `fail <task> "<why>"`, `requeue <task> [<session>]`.
+    /// `fail <task> "<why>"`, `requeue <task> [<session>]`, `forget <id>` (takes a finished one out of
+    /// the ledger, as if it never was: a test, a mistake).
     Agenda {
-        /// list | tasks | show | new | close | abandon | verify | fail | requeue
+        /// list | tasks | show | new | close | abandon | verify | fail | requeue | forget
         #[arg(default_value = "list")]
         action: String,
         /// The agenda or task (`a3`, `a3.2`), then words (why, a note) or, for requeue, a session.
@@ -1844,7 +1845,7 @@ fn agenda_cmd(action: &str, args: &[String], all: bool, force: bool, title: Opti
     };
     match action {
         "list" | "tasks" => {}
-        "show" | "close" | "abandon" | "verify" | "fail" => {
+        "show" | "close" | "abandon" | "verify" | "fail" | "forget" => {
             c.target = need("agenda or task")?;
             c.text = args[1..].join(" ");
         }
@@ -1854,7 +1855,7 @@ fn agenda_cmd(action: &str, args: &[String], all: bool, force: bool, title: Opti
             c.text = args.get(2..).map(|r| r.join(" ")).unwrap_or_default();
         }
         "new" => c.text = args.join(" "),
-        other => bail!("tower agenda {other}: use list, tasks, show, new, close, abandon, verify, fail or requeue"),
+        other => bail!("tower agenda {other}: use list, tasks, show, new, close, abandon, verify, fail, requeue or forget"),
     }
     let v = agenda_do(&c)?;
     if !std::io::stdout().is_terminal() {
@@ -1911,6 +1912,7 @@ fn agenda_cmd(action: &str, args: &[String], all: bool, force: bool, title: Opti
             list_line("Cancelled in the queue", &v["cancelled"]);
         }
         "verify" | "fail" => list_line(if action == "verify" { "Verified" } else { "Failed" }, &v["moved"]),
+        "forget" => println!("Forgot {}: it is out of the ledger (the record keeps what was said).", v["forgotten"].as_str().unwrap_or("")),
         "requeue" => println!(
             "{} {} as #{} for {} ({}).",
             v["task"].as_str().unwrap_or(""),
