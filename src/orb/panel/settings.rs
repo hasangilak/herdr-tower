@@ -14,7 +14,10 @@
 //! - **Questions it answers for you**: the policy, as before.
 //! - **Follow and Mute**, per open space (the switches each space has at
 //!   its top).
-//! - **Behaviors** and **Phone**: a line each, and the way to their views.
+//! - **Behaviors**: a line, and the way to its view.
+//! - **Phone** (`phone`), the width of the pane: where the tower can be
+//!   reached now (the network, Tailscale), pairing a phone in place, and the
+//!   paired phones. `Scope::Phone` opens Settings scrolled to it.
 //! - **Accounts** (the accounts mod's) and the **saved setups** the
 //!   launcher offers (`tower setups`).
 
@@ -368,16 +371,9 @@ impl Panel {
                 acts_row().child(mbtn("open-behaviors", "Open behaviors", false, None).on_click(cx.listener(|this, _, _, cx| this.nav_to(Scope::Behaviors, cx)))).into_any_element(),
             ],
         );
-        let phone = card(
-            "Phone",
-            vec![
-                para(match self.phone.summary() {
-                    Some(line) => format!("Pair the Android app and choose where its replies are heard. {line}"),
-                    None => "Pair the Android app and choose where its replies are heard.".to_string(),
-                }),
-                acts_row().child(mbtn("open-phone", "Pair a phone", false, None).on_click(cx.listener(|this, _, _, cx| this.nav_to(Scope::Phone, cx)))).into_any_element(),
-            ],
-        );
+        // The phone: as wide as the pane, and where `Scope::Phone` scrolls to.
+        let anchor = self.full.as_ref().map(|f| f.phone_anchor.clone());
+        let phone = div().id("phone-card").w_full().anchor_scroll(anchor).child(self.phone_card(cx)).into_any_element();
 
         // Accounts, and the setups the launcher offers.
         let accounts = card(
@@ -419,8 +415,8 @@ impl Panel {
         saved.extend(self.said("setups"));
         let setups = card("Saved setups", saved);
 
-        let grid = div().w_full().grid().grid_cols(2).gap(px(12.0)).children([tell, brain, voice, questions, follow, behaviors, phone, accounts, setups]).into_any_element();
-        (head, vec![grid])
+        let grid = |cards: Vec<AnyElement>| div().w_full().grid().grid_cols(2).gap(px(12.0)).children(cards).into_any_element();
+        (head, vec![v_flex().w_full().gap(px(12.0)).child(grid(vec![tell, brain, voice, questions, follow, behaviors])).child(phone).child(grid(vec![accounts, setups])).into_any_element()])
     }
 }
 

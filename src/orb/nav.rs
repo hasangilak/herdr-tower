@@ -3,8 +3,9 @@
 //! that lights, and the way back from a view that has one.
 //!
 //! - `Scope` is the view: every space, one space, the launcher, the record,
-//!   the screenshots, the settings and what opens from them (behaviors,
-//!   pairing a phone), or one session of a space.
+//!   the screenshots, the settings and what opens from them (behaviors; the
+//!   phone is a card of the settings, which `Phone` opens at), or one
+//!   session of a space.
 //! - `Nav` is the scope with what goes with it: the record's space filter
 //!   (opened from inside a space it starts on that space), the quiet fold,
 //!   and a line said once at the top of a view (a space launched, a space
@@ -35,7 +36,8 @@ pub enum Scope {
     Settings,
     /// From Settings.
     Behaviors,
-    /// From Settings: pairing the phone app.
+    /// Settings at its Phone card (pairing the phone app, the paired
+    /// phones): a link, the window shows `Settings` scrolled there.
     Phone,
     /// One session, from its space (`space` is empty when it has none).
     Session { space: String, addr: String },
@@ -72,7 +74,7 @@ impl Scope {
     /// words and where it leads.
     pub fn back(&self) -> Option<(String, Scope)> {
         match self {
-            Scope::Behaviors | Scope::Phone => Some(("Back to Settings".into(), Scope::Settings)),
+            Scope::Behaviors => Some(("Back to Settings".into(), Scope::Settings)),
             Scope::Session { space, .. } if !space.is_empty() => Some((format!("Back to {space}"), Scope::Space(space.clone()))),
             Scope::Session { .. } => Some(("Back to All spaces".into(), Scope::All)),
             _ => None,
@@ -330,10 +332,10 @@ mod tests {
     #[test]
     fn what_opens_from_another_view_has_a_way_back() {
         assert_eq!(Scope::Behaviors.back(), Some(("Back to Settings".into(), Scope::Settings)));
-        assert_eq!(Scope::Phone.back(), Some(("Back to Settings".into(), Scope::Settings)));
         assert_eq!(session("isa", "t3").back(), Some(("Back to isa".into(), Scope::Space("isa".into()))));
         assert_eq!(session("", "t3").back(), Some(("Back to All spaces".into(), Scope::All)));
-        for s in [Scope::All, Scope::Space("isa".into()), Scope::New, Scope::Record, Scope::Shots, Scope::Settings] {
+        // The phone is Settings itself, at its card: nothing to go back to.
+        for s in [Scope::All, Scope::Space("isa".into()), Scope::New, Scope::Record, Scope::Shots, Scope::Settings, Scope::Phone] {
             assert_eq!(s.back(), None, "{s:?}");
         }
     }

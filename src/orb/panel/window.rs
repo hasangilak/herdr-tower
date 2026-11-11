@@ -15,8 +15,8 @@
 //! - **The main pane** shows what the sidebar picked (`crate::orb::nav`):
 //!   every space (here: the queue beside the missions), one space (`space`),
 //!   the launcher (`launch`), the record (`record`), the screenshots, the
-//!   settings (`settings`) with the behaviors and the phone, one session
-//!   (`session`).
+//!   settings (`settings`) with the behaviors and the phone (`Scope::Phone`
+//!   opens Settings at its Phone card), one session (`session`).
 //! - **The input** under the queue goes to the main tower; under a space, to
 //!   that space's own where this tower has one (`tower ask --space`), else
 //!   to the main tower with the space named (`cli::ask`), and it says which.
@@ -70,12 +70,20 @@ pub(super) struct FullUi {
     pub space_tower: Option<bool>,
     /// The brains' model and effort as just chosen here, until the state says them too.
     pub model: Option<(Option<String>, Option<String>)>,
+    /// Settings' pane, scrolled to its Phone card when `Scope::Phone` is asked for.
+    pub settings_scroll: gpui::ScrollHandle,
+    pub phone_anchor: gpui::ScrollAnchor,
+    /// Settings was asked for at its Phone card: scrolled there once it is
+    /// drawn, and again until this moment (the cards above it grow as what
+    /// they show arrives).
+    pub to_phone: Option<std::time::Instant>,
     /// Kept while the window is: its size and spot are saved as the user resizes it.
     pub _resizing: Option<gpui::Subscription>,
 }
 
 impl FullUi {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Panel>) -> Self {
+        let scroll = gpui::ScrollHandle::new();
         Self {
             shown: None,
             launch: launch::LaunchUi::new(window, cx),
@@ -88,6 +96,9 @@ impl FullUi {
             drag: None,
             space_tower: None,
             model: None,
+            settings_scroll: scroll.clone(),
+            phone_anchor: gpui::ScrollAnchor::for_handle(scroll),
+            to_phone: None,
             _resizing: Some(cx.observe_window_bounds(window, |this, window, _| this.resized(window))),
         }
     }
@@ -312,21 +323,32 @@ impl Panel {
         let now = history::now_ms();
         // (Not before Herdr's spaces were read: a window that has just opened knows none.)
         let known = !names.is_empty() || self.live_read;
-        let scope = self.tower.update(cx, |t, _| {
+        let (scope, to_phone) = self.tower.update(cx, |t, _| {
             if known {
                 t.nav.settle(&names, now);
             }
-            t.nav.scope.clone()
+            // The phone is a card of Settings: asked for, Settings opens there.
+            let to_phone = t.nav.scope == Scope::Phone;
+            if to_phone {
+                t.nav.go(Scope::Settings);
+            }
+            (t.nav.scope.clone(), to_phone)
         });
         let Some(full) = self.full.as_mut() else { return };
+        if to_phone {
+            full.to_phone = Some(std::time::Instant::now() + std::time::Duration::from_millis(1500));
+        }
         if full.shown.as_ref() == Some(&scope) {
+            if to_phone {
+                cx.notify();
+            }
             return;
         }
         let from = full.shown.replace(scope.clone());
         // What a command said belongs to the view it was asked in.
         full.notes.clear();
         full.edit = None;
-        if from == Some(Scope::Phone) {
+        if from == Some(Scope::Settings) {
             self.phone_leave();
         }
         self.watch_session(if let Scope::Session { addr, .. } = &scope { Some(addr.as_str()) } else { None }, cx);
@@ -335,6 +357,10 @@ impl Panel {
             Scope::Phone | Scope::Settings => {
                 self.phone_tick(cx);
                 self.read_setups(cx);
+                // `HERDER_TOWER_ORB_PAIR=open` (looking at it with test data): the pairing box opens, once.
+                if to_phone && super::phone::pair_from_start() {
+                    self.phone_pair(cx);
+                }
             }
             Scope::New => self.read_setups(cx),
             Scope::Space(_) => self.learn_space_tower(cx),
@@ -458,7 +484,7 @@ impl Panel {
                 let (h, b) = self.shots_pane(cx);
                 (h, b, None, false)
             }
-            Scope::Settings => {
+            Scope::Settings | Scope::Phone => {
                 let (h, b) = self.settings_view(&missions, cx);
                 (h, b, None, false)
             }
@@ -466,10 +492,6 @@ impl Panel {
                 let (h, b) = self.behaviors_pane(window, cx);
                 let typing = !self.behaviors.editing();
                 (h, b, typing.then_some(None), typing)
-            }
-            Scope::Phone => {
-                let (h, b) = self.phone_pane(cx);
-                (h, b, None, false)
             }
             Scope::Session { space, addr } => {
                 let (h, b) = self.session_pane(space, addr, &all, &missions, cx);
@@ -484,11 +506,25 @@ impl Panel {
         // The window is moved by its header strip (and the sidebar's top).
         let head = self.grip("head-grip", head, cx);
         let me = cx.entity().downgrade();
+        // Asked for at the Phone card: scrolled there on the next frame (the card is laid out by then).
+        let settings = matches!(scope, Scope::Settings | Scope::Phone);
+        let scroll = self.full.as_mut().filter(|_| settings).map(|f| {
+            match f.to_phone {
+                Some(until) if std::time::Instant::now() < until => {
+                    f.phone_anchor.scroll_to(window, cx);
+                    window.request_animation_frame();
+                }
+                Some(_) => f.to_phone = None,
+                None => {}
+            }
+            f.settings_scroll.clone()
+        });
         let pane = div()
             .id(SharedString::from(format!("pane-{}", scope_key(&scope))))
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .when_some(scroll, |el, s| el.track_scroll(&s))
             .child(v_flex().w_full().gap(px(16.0)).pb(px(4.0)).children(notice.map(eff)).when(!undo.is_empty(), |el| el.child(v_flex().gap(px(8.0)).children(undo))).children(items));
         h_flex()
             .size_full()
@@ -651,6 +687,7 @@ impl Panel {
                 list = list.child(names);
             }
         }
+        let hint = self.phone_hint(cx);
         let foot = |id: &'static str, text: &'static str, side: Side, to: Scope| {
             let on = here == side;
             div()
@@ -692,7 +729,8 @@ impl Panel {
                             // Closes the full window (as Esc, or a click on the orb, does); the orb opens it again.
                             .child(dismiss_mark("close-full").on_click(cx.listener(|this, _, window, cx| this.close(window, cx)))),
                     )
-                    .child(div().text_size(px(12.5)).text_color(g.muted).child(status)),
+                    .child(div().text_size(px(12.5)).text_color(g.muted).child(status))
+                    .children(hint),
             )
             .child(div().id("side-list").flex_1().min_h_0().overflow_y_scroll().child(list))
             .child(
@@ -807,16 +845,6 @@ impl Panel {
         (whead("Behaviors", vec![div().child(line).into_any_element()], Some(back)), self.behaviors_view(window, cx))
     }
 
-    /// Pairing a phone, from Settings (W19).
-    fn phone_pane(&mut self, cx: &mut Context<Self>) -> (AnyElement, Vec<AnyElement>) {
-        let back = tg("back-settings", "Back to Settings", false).on_click(cx.listener(|this, _, _, cx| this.nav_to(Scope::Settings, cx))).into_any_element();
-        let head = whead(
-            "Pair a phone",
-            vec![div().child("Scan the code in the Tower app on Android. It works once, for 5 minutes.").into_any_element()],
-            Some(back),
-        );
-        (head, self.phone_view(cx))
-    }
 }
 
 #[cfg(test)]

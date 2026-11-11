@@ -98,8 +98,13 @@ impl Host {
     pub fn line(&self) -> String {
         let kind = if self.kind == "tailscale" { "Tailscale" } else { "Local network" };
         let dns = self.dns_name.as_ref().map(|n| format!(" ({n})")).unwrap_or_default();
-        format!("{kind} {}:{}{dns}", self.host, self.port)
+        format!("{kind} {}{dns}", addr(&self.host, self.port))
     }
+}
+
+/// `10.10.30.116:7843`, `[fd00::1]:7843`.
+pub fn addr(host: &str, port: impl std::fmt::Display) -> String {
+    if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") }
 }
 
 /// Tailscale as the phone API sees it.
@@ -160,6 +165,14 @@ impl Tailscale {
 
 pub fn status() -> Status {
     let info = daemon("status", "").ok();
+    // A network reads by the name it has now, if the user named it since the phone was there.
+    let names = config::Config::load().map(|c| c.lan.networks).unwrap_or_default();
+    let mut devices = Devices::load_from(&Devices::path()).unwrap_or_default().devices;
+    for k in devices.iter_mut().flat_map(|d| d.networks.iter_mut()) {
+        if let Some(n) = names.get(&k.range).filter(|n| !n.trim().is_empty()) {
+            k.name = Some(n.clone());
+        }
+    }
     Status {
         enabled: config::Config::load().map(|c| c.lan.enabled).unwrap_or(false),
         voice: info.is_some(),
@@ -170,7 +183,7 @@ pub fn status() -> Status {
             None => Tailscale::here(),
         },
         pairing_expires_in_s: info.as_ref().and_then(|v| v["pairing_expires_in_s"].as_u64()),
-        devices: Devices::load_from(&Devices::path()).unwrap_or_default().devices,
+        devices,
         here: match &info {
             Some(v) => Here::of(&v["network"], &v["hosts"]),
             None => here_off(),
@@ -350,7 +363,7 @@ pub fn cmd(action: &str, id: Option<&str>, value: Option<&str>, json: bool) -> R
                     println!("  {:<12} {}", if i == 0 { "address" } else { "or" }, h.line());
                 }
             } else {
-                println!("  address      {}:{}", v["host"].as_str().unwrap_or(""), v["port"]);
+                println!("  address      {}", addr(v["host"].as_str().unwrap_or(""), &v["port"]));
             }
             println!("  code         {} {}", &code[..4.min(code.len())], &code[4.min(code.len())..]);
             println!("  certificate  {}", tls::grouped(v["fingerprint"].as_str().unwrap_or("")));
@@ -383,7 +396,7 @@ pub fn cmd(action: &str, id: Option<&str>, value: Option<&str>, json: bool) -> R
                     }
                     match (here.label(), &here.lan) {
                         (None, _) => println!("This Mac has no network address now (is Wi-Fi on?)."),
-                        (Some(net), Some((host, port))) => println!("This Mac is on {net} · {host} (the phone API listens on {host}:{port})."),
+                        (Some(net), Some((host, port))) => println!("This Mac is on {net} · {host} (the phone API listens on {}).", addr(host, port)),
                         (Some(net), None) => println!("This Mac is on {net}. The phone API isn't listening (tower phone enable)."),
                     }
                     if let (Some(range), None) = (&here.range, &here.name) {
@@ -443,11 +456,12 @@ pub fn cmd(action: &str, id: Option<&str>, value: Option<&str>, json: bool) -> R
                 println!("This Mac is on {net}{at}.");
             }
             println!("{}", st.tailscale.line(st.url.is_some()));
-            let d = Devices::load_from(&Devices::path())?;
-            if d.devices.is_empty() {
+            // (Read again, so a damaged file is said, not shown as no phones.)
+            Devices::load_from(&Devices::path())?;
+            if st.devices.is_empty() {
                 println!("No paired phones.");
             }
-            for x in &d.devices {
+            for x in &st.devices {
                 println!("  {:<12} {:<24} replies on the {:<5}  {}", x.id, x.name, x.audio_route, st.seen_line(x));
                 let knows = network::knows_line(&x.networks);
                 println!("  {:<12} {}", "", if knows.is_empty() { "Knows no network yet".to_string() } else { format!("Knows {knows}") });
