@@ -1330,10 +1330,9 @@ where the full window is, `panel/` the views).
   it **minimizes** the full window into the orb when it is on screen and
   brings it back when it isn't. Minimized, the window is kept as it is,
   out of sight (`orderOut:`): the same page, scroll and typed draft come
-  back; dictation isn't mirrored into it meanwhile. Esc and the – beside
-  "Floating" minimize it too. The × in the window's top right corner
-  closes it: the window goes, and the orb opens a new one (at the page the
-  tower's `nav` holds). **Floating**, beside "Tower", is back
+  back; dictation isn't mirrored into it meanwhile. Esc and the round
+  minimize button beside "Floating" minimize it too; it has no close
+  button. **Floating**, beside "Tower", is back
   to the floating panel (`"mode": "floating"`): the full window closes and
   the panel opens, pinned. It has a
   sidebar (All spaces, each open space, New space, the quiet fold,

@@ -729,10 +729,9 @@ impl Panel {
         .detach();
     }
 
-    /// The window goes (Esc in the floating panel, the full window's close
-    /// button). The floating panel hands the keyboard back to the app that
-    /// had it; the full window leaves it to a pinned floating panel if there
-    /// is one.
+    /// The window goes (Esc in the floating panel). The floating panel hands
+    /// the keyboard back to the app that had it; the full window leaves it to
+    /// a pinned floating panel if there is one.
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let me = window.window_handle();
         window.remove_window();

@@ -223,8 +223,8 @@ The orb remembers which of the two you use. Once you open the full window
 you are in full mode: a click on the orb minimizes the full window into the
 orb, kept as it is (the same page, what you typed), and the next click
 brings it back; hovering the orb doesn't bring up the floating panel. Esc
-and the – beside "Floating" minimize it too. The × in the window's top
-right corner closes it; the orb then opens a new one. **Floating**, beside
+and the round minimize button beside "Floating" minimize it too.
+**Floating**, beside
 "Tower", switches back: the full window closes, the floating panel opens,
 and the orb opens the floating panel from then on. The mode is kept in
 `window.json` with the window's spot and size. Both windows show one model:

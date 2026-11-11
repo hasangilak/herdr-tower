@@ -184,14 +184,29 @@ pub(super) fn acts_row() -> gpui::Div {
     h_flex().flex_wrap().gap(px(8.0)).items_center()
 }
 
-/// The little x that takes a card off the queue (and closes the full window).
+/// The little x that takes a card off the queue.
 pub(super) fn dismiss_mark(id: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
     glyph_mark(id, IconName::Close)
 }
 
-/// The little line that minimizes the full window into the orb.
+/// Minimizes the full window into the orb: a round switch on the glass, as
+/// tall as the pills beside it (`tg`), its line in the middle.
 pub(super) fn minimize_mark(id: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
-    glyph_mark(id, IconName::Minus)
+    div()
+        .id(id.into())
+        .flex_none()
+        .size(px(28.0))
+        .rounded_full()
+        .border_1()
+        .border_color(rgba(LINE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .text_color(glass().muted)
+        .hover(|s| s.bg(rgba(SOFT)).text_color(glass().text))
+        .active(|s| s.bg(rgba(0xffffff2b)))
+        .child(Icon::new(IconName::Minus).small())
 }
 
 fn glyph_mark(id: impl Into<SharedString>, icon: IconName) -> gpui::Stateful<gpui::Div> {
@@ -202,7 +217,7 @@ fn glyph_mark(id: impl Into<SharedString>, icon: IconName) -> gpui::Stateful<gpu
         .rounded_full()
         .cursor_pointer()
         .text_color(glass().faint)
-        .hover(|s| s.bg(rgba(SOFT)).text_color(glass().text))
+        .hover(|s| s.bg(rgba(SOFT)))
         .child(Icon::new(icon).xsmall())
 }
 
