@@ -200,6 +200,16 @@ pub(super) fn whead(title: &str, sub: Vec<AnyElement>, right: Option<AnyElement>
 }
 
 /// `Goal …`, `Done when …`: a word in white, then what it is.
+/// `named`, cut to `lines` lines with an ellipsis (a long goal in a head).
+pub(super) fn named_short(word: &str, text: &str, lines: usize) -> AnyElement {
+    h_flex()
+        .items_start()
+        .gap(px(5.0))
+        .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).text_color(glass().text).child(word.to_string()))
+        .child(div().min_w_0().flex_1().line_clamp(lines).text_ellipsis().child(text.to_string()))
+        .into_any_element()
+}
+
 pub(super) fn named(word: &str, text: &str) -> AnyElement {
     h_flex()
         .items_start()

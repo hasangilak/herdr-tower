@@ -61,11 +61,13 @@ pub(super) fn repo_name(path: &str) -> &str {
 }
 
 /// The name a space gets from its goal, by the tower's own rule
-/// (`launch::space_name`): its first two words that carry meaning, in lower
-/// case with a dash (`Fix the login redirect`: `fix-login`), numbered when a
-/// space of that name is there already; `space` from no words at all.
+/// (`launch::space_name_of`): its first two words that carry meaning, in
+/// lower case with a dash (`Fix the login redirect`: `fix-login`), not the
+/// words that only ask for sessions, numbered when a space of that name is
+/// there already; `space` from no words at all. (The tower's own plan, which
+/// also knows the repos the goal names, replaces it as soon as it comes.)
 pub(super) fn slug(goal: &str, taken: &[&str]) -> String {
-    let base = match crate::launch::space_name(goal) {
+    let base = match crate::launch::space_name_of(goal, &[]) {
         b if b.is_empty() => "space".to_string(),
         b => b,
     };
@@ -136,6 +138,7 @@ pub(super) fn plan_from(receipt: &Value) -> Option<Dry> {
     // to it: that is the choice above), and an account it had to pick.
     let mut assumed = match (a["setup"].as_str().filter(|x| !x.is_empty()), a["setup_why"].as_str().filter(|x| !x.is_empty())) {
         (Some(_), Some("the one named")) => String::new(),
+        (Some(_), Some("the repos its first line names")) => "It opens the repos the goal's first line names.".to_string(),
         (Some(setup), Some(why)) => format!("It takes the setup “{setup}” ({why})."),
         (Some(setup), None) => format!("It takes the setup “{setup}”."),
         _ => String::new(),
@@ -203,7 +206,8 @@ pub(super) struct LaunchUi {
 
 impl LaunchUi {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Panel>) -> Self {
-        let goal = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 3).placeholder("What should it get done?"));
+        // A whole ticket fits: it grows to 14 lines, then scrolls.
+        let goal = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 14).placeholder("open sessions in eyzflow and mediaroom: then the ticket, as long as it is"));
         let subs = vec![cx.subscribe_in(&goal, window, |this, _, ev: &InputEvent, _, cx| {
             if matches!(ev, InputEvent::Change) {
                 this.ask_plan(cx);
@@ -360,7 +364,7 @@ impl Panel {
         let chosen = setup.as_ref().map(|s| s.name.clone());
         let setups: AnyElement = match ui.setups.as_deref() {
             None => cstat("Asking the tower…", false),
-            Some([]) => cstat("No saved setups yet. Add one in a terminal: tower setup add \"<name>\" --account <account> --repo <folder>", false),
+            Some([]) => cstat("None needed: the tower opens the repos your goal's first line names, on your default account.", false),
             Some(list) => h_flex()
                 .flex_wrap()
                 .gap(px(6.0))
@@ -395,11 +399,23 @@ impl Panel {
             let m = missions.clone();
             el.on_click(cx.listener(move |this, _, _, cx| this.launch(&m, cx)))
         });
+        // How long it is, and what the first line is for: a pasted ticket can be the rest.
+        let words = ui.goal.read(cx).value().split_whitespace().count();
+        let hint = format!(
+            "{}The first line says what to open (\"open sessions in eyzflow and mediaroom\"); the rest can be the whole ticket, and goes to the sessions as it is.",
+            if words > 0 { format!("{words} word{} · ", if words == 1 { "" } else { "s" }) } else { String::new() }
+        );
         let body = v_flex()
             .w_full()
-            .max_w(px(560.0))
+            .max_w(px(760.0))
             .gap(px(16.0))
-            .child(v_flex().gap(px(7.0)).child(label("Goal")).child(field(&ui.goal)))
+            .child(
+                v_flex()
+                    .gap(px(7.0))
+                    .child(label("Goal"))
+                    .child(field(&ui.goal))
+                    .child(div().px(px(4.0)).text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child(hint)),
+            )
             .child(v_flex().gap(px(7.0)).child(label("Setup")).child(setups).children(self.said("setups")))
             .child(
                 v_flex()
@@ -439,6 +455,8 @@ mod tests {
         assert_eq!(slug("Case exports as PDF", &["sandbox", "Case-Exports"]), "case-exports-2");
         assert_eq!(slug("Case exports as PDF", &["case-exports", "case-exports-2"]), "case-exports-3");
         assert_eq!(slug("", &["space"]), "space-2");
+        // A goal that opens by asking for sessions is not named "open-session".
+        assert_eq!(slug("open a session at eyzflow and mediaroom. this is the ticket: EYZFlow Support", &[]), "eyzflow-mediaroom");
     }
 
     #[test]

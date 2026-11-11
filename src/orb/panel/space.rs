@@ -30,7 +30,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use super::home::{CARD, LINE, SOFT, acts_row, bay_label, cstat, empty_box, mbtn, sign, tg};
 use super::launch::field;
 use super::session::last_words;
-use super::window::{bay, eff, lrow, mark_box, named, nm, pg, whead};
+use super::window::{bay, eff, lrow, mark_box, named, named_short, nm, pg, whead};
 use super::{AMBER, CYAN, Panel, glass};
 use crate::orb::model::{self, Chip, Decision, Member, Mission, Missions};
 use crate::orb::nav::Scope;
@@ -135,7 +135,8 @@ impl Panel {
             return cx.notify();
         }
         let mut make = |text: &str, hint: &'static str| {
-            let f = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 3).placeholder(hint));
+            // A long goal (a pasted ticket) is all there to read and change: up to 14 lines, then it scrolls.
+            let f = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 14).placeholder(hint));
             let text = text.to_string();
             f.update(cx, |s, cx| {
                 // What is there, with the caret after it.
@@ -261,7 +262,8 @@ impl Panel {
         } else if m.goal.trim().is_empty() {
             sub.push(div().child("No goal: it has no end, and the tower opens no worktrees here.").into_any_element());
         } else {
-            sub.push(named("Goal", m.goal.trim()));
+            // Its first two lines; all of it under Goal.
+            sub.push(named_short("Goal", m.goal.trim(), 2));
             if !m.done_when.trim().is_empty() {
                 sub.push(named("Done when", m.done_when.trim()));
             }

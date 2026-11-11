@@ -29,6 +29,8 @@ use crate::worktrees::{self, Place};
 const NAME_CHARS: usize = 48;
 /// How a space got its name, in the receipt.
 const NAME_WHY: &str = "the goal's first two words, small ones left out";
+/// The same, when the goal's first line only asks for sessions.
+const NAME_NEXT_WHY: &str = "the first two words of the line after the one that asks for sessions (the ticket's title)";
 
 /// One session of the plan: a repo of the setup.
 #[derive(Debug, Clone, PartialEq)]
@@ -71,6 +73,94 @@ pub struct World {
     pub worktrees: bool,
     /// Spaces the user keeps (`tower space standing`).
     pub standing: Vec<String>,
+    /// The project folders (`projects::candidates`): the repos a goal names.
+    pub projects: Vec<std::path::PathBuf>,
+}
+
+/// Words of a goal's first line that say how, not what: "open a session at …".
+const ASKING: &[&str] = &[
+    "open", "opens", "start", "starts", "make", "create", "spin", "up", "launch", "session", "sessions", "at", "into", "please", "this", "is",
+    "these", "are", "here", "ticket", "task", "issue", "repo", "repos", "repository", "repositories", "project", "projects", "both", "two", "work",
+];
+
+/// The goal's first line, up to a colon that brings the material in ("this is the ticket:").
+fn asking_line(goal: &str) -> &str {
+    let first = goal.trim_start().lines().next().unwrap_or("");
+    first.split_once(':').map(|(a, _)| a).unwrap_or(first)
+}
+
+/// The repos a goal's first line names ("open a session at eyzflow and
+/// mediaroom. this is the ticket: …"), in the order it names them: a word
+/// that is a project folder's whole name, or a distinctive part of only one
+/// folder's name (`mediaroom` in `eyz-mediaroom-serverless`; at least five
+/// letters). The rest of the goal (a pasted ticket) is never read for them.
+pub fn repos_named(goal: &str, folders: &[std::path::PathBuf]) -> Vec<(String, std::path::PathBuf)> {
+    let parts = |name: &str| -> Vec<String> { name.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(String::from).collect() };
+    let name_of = |p: &std::path::PathBuf| p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+    let words: Vec<String> = asking_line(goal).split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_')).filter(|w| w.len() >= 3).map(str::to_lowercase).collect();
+    let mut out: Vec<(String, std::path::PathBuf)> = vec![];
+    for w in words {
+        if FILLER.contains(&w.as_str()) || ASKING.contains(&w.as_str()) {
+            continue;
+        }
+        let exact: Vec<&std::path::PathBuf> = folders.iter().filter(|p| name_of(p) == w).collect();
+        let found = match exact.as_slice() {
+            [] if w.len() >= 5 => {
+                let part: Vec<&std::path::PathBuf> = folders.iter().filter(|p| parts(&name_of(p)).contains(&w)).collect();
+                match part.as_slice() {
+                    [one] => Some((*one).clone()),
+                    _ => None,
+                }
+            }
+            [] => None,
+            many => {
+                // The same name twice (two roots): the checkout, else the first.
+                Some(many.iter().find(|p| p.join(".git").is_dir()).copied().unwrap_or(many[0]).clone())
+            }
+        };
+        if let Some(f) = found
+            && !out.iter().any(|(_, o)| *o == f)
+        {
+            out.push((w, f));
+        }
+    }
+    out
+}
+
+/// The space's name for `goal`: from its first line, without the words that
+/// only ask for sessions and the repos it names; a first line that is only
+/// that ("open a session at eyzflow and mediaroom. this is the ticket:")
+/// names it from the next line (the ticket's title).
+pub fn space_name_of(goal: &str, repos: &[String]) -> String {
+    space_name_why(goal, repos).0
+}
+
+/// `space_name_of`, and whether the name came from the line after the first
+/// (the first only asked for sessions).
+fn space_name_why(goal: &str, repos: &[String]) -> (String, bool) {
+    let telling = |line: &str, drop_repos: bool| -> Vec<String> {
+        let plain: String = line.chars().filter(|c| !matches!(c, '\'' | '’' | '`')).collect();
+        plain
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_lowercase)
+            .filter(|w| !FILLER.contains(&w.as_str()) && !ASKING.contains(&w.as_str()) && !(drop_repos && repos.iter().any(|r| r.eq_ignore_ascii_case(w))))
+            .take(2)
+            .collect()
+    };
+    let first = telling(asking_line(goal), true);
+    if !first.is_empty() || repos.is_empty() {
+        return (if first.is_empty() { space_name(goal) } else { first.join("-") }, false);
+    }
+    let next = goal.trim_start().lines().skip(1).find(|l| !l.trim().is_empty()).unwrap_or("");
+    let rest = match goal.trim_start().lines().next().unwrap_or("").split_once(':') {
+        Some((_, after)) if !after.trim().is_empty() => after,
+        _ => next,
+    };
+    match telling(rest, false) {
+        t if t.is_empty() => (space_name(goal), false),
+        t => (t.join("-"), true),
+    }
 }
 
 /// Small words that say nothing about what a space is for.
@@ -115,13 +205,62 @@ fn session_name(space: &str, folder: &str, taken: &mut BTreeSet<String>) -> Stri
     name
 }
 
+/// A goal as typed or pasted: each line's runs of spaces one space, the
+/// lines kept, at most one empty line between paragraphs, none at the ends.
+pub fn tidy(goal: &str) -> String {
+    let mut out: Vec<String> = vec![];
+    for line in goal.lines().map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")) {
+        if line.is_empty() && out.last().is_none_or(|l: &String| l.is_empty()) {
+            continue;
+        }
+        out.push(line);
+    }
+    while out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
+    out.join("\n")
+}
+
 /// What a launch would do.
 pub fn plan(goal: &str, setup: Option<&str>, name: Option<&str>, w: &World) -> Result<Plan> {
-    let goal = goal.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Each line's spaces made one, the lines kept (a pasted ticket keeps its paragraphs and lists).
+    let goal = tidy(goal);
     if goal.is_empty() {
         bail!("tower launch \"<the goal, in a sentence>\" [--setup <name>] [--name <space>] [--dry-run]");
     }
-    let (setup, setup_why) = crate::setups::pick(&w.setups, setup)?;
+    // The repos: a setup that was named; else those the goal's first line
+    // names, on the default account; else a saved setup.
+    let named = repos_named(&goal, &w.projects);
+    let (setup, setup_why): (Setup, String) = match setup.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(asked) => {
+            let (s, why) = crate::setups::pick(&w.setups, Some(asked))?;
+            (s.clone(), why)
+        }
+        None if !named.is_empty() => {
+            let same = |a: &str, b: &Path| Path::new(crate::dispatch::expand(a.trim()).trim_end_matches('/')) == b;
+            // A saved setup that has every repo the goal names keeps its account.
+            match w.setups.iter().find(|s| named.iter().all(|(_, f)| s.repos.iter().any(|r| same(r, f)))) {
+                Some(s) => (s.clone(), "the one that has the repos the goal names".to_string()),
+                None => {
+                    let words: Vec<&str> = named.iter().map(|(w, _)| w.as_str()).collect();
+                    (
+                        Setup { name: format!("the goal's {}", words.join(" and ")), account: String::new(), repos: named.iter().map(|(_, f)| f.to_string_lossy().into_owned()).collect() },
+                        "the repos its first line names".to_string(),
+                    )
+                }
+            }
+        }
+        None if w.setups.is_empty() => bail!(
+            "name the repos in the goal's first line (\"open sessions in eyzflow and mediaroom\"): no project folder fits the words of \"{}\". Or save a setup: tower setup add \"<name>\" --account <account> --repo <folder>",
+            asking_line(&goal).trim()
+        ),
+        None => {
+            let (s, why) = crate::setups::pick(&w.setups, None)?;
+            (s.clone(), why)
+        }
+    };
+    let from_goal = setup_why == "the repos its first line names";
+    let setup = &setup;
     if setup.repos.is_empty() {
         bail!("the setup \"{}\" has no repos: tower setup add \"{}\" --account <account> --repo <folder>", setup.name, setup.name);
     }
@@ -131,17 +270,18 @@ pub fn plan(goal: &str, setup: Option<&str>, name: Option<&str>, w: &World) -> R
             (there.cloned().unwrap_or_else(|| n.to_string()), "as given".to_string(), there.is_some())
         }
         None => {
-            let base = match space_name(&goal) {
-                b if b.is_empty() => "space".to_string(),
-                b => b,
-            };
+            let repo_words: Vec<String> = named.iter().map(|(w, _)| w.clone()).collect();
+            let (base, from_next) = space_name_why(&goal, &repo_words);
+            let base = if base.is_empty() { "space".to_string() } else { base };
             let name = unique(&base, &w.spaces);
-            let why = if name == base { NAME_WHY.to_string() } else { format!("{NAME_WHY}; \"{base}\" is taken") };
+            let rule = if from_next { NAME_NEXT_WHY } else { NAME_WHY };
+            let why = if name == base { rule.to_string() } else { format!("{rule}; \"{base}\" is taken") };
             (name, why, false)
         }
     };
     // The account as the mod knows it; none known: plain `claude`, and it says so.
     let (account, account_why) = match crate::accounts::resolve(Some(&setup.account).filter(|a| !a.trim().is_empty()).map(String::as_str), &w.accounts) {
+        Ok(Some(a)) if setup.account.trim().is_empty() && from_goal => (Some(a), "the default one: the goal names none".to_string()),
         Ok(Some(a)) if setup.account.trim().is_empty() => (Some(a), "the default one: the setup names none".to_string()),
         Ok(a) => (a, "the setup's".to_string()),
         Err(_) if w.accounts.is_empty() => (None, format!("the setup's is \"{}\", but no accounts are known (cca isn't installed): plain claude", setup.account)),
@@ -286,6 +426,7 @@ fn world() -> Result<World> {
         accounts: crate::accounts::list().unwrap_or_default(),
         worktrees: cfg.spaces.worktrees,
         standing: kept.missions.iter().filter(|(_, m)| m.standing).map(|(n, _)| n.clone()).collect(),
+        projects: crate::projects::candidates(&crate::projects::roots()),
     })
 }
 
@@ -448,6 +589,41 @@ mod tests {
     }
 
     #[test]
+    fn with_no_setup_the_goals_first_line_names_the_repos_and_its_ticket_names_the_space() {
+        let base = temp("launch-goal-repos");
+        let (flow, room) = (repo(&base, "eyzflow"), repo(&base, "eyz-mediaroom-serverless"));
+        let others: Vec<std::path::PathBuf> = ["eyzflow-admin-dashboard", "eyz-customer-support", "eyz-openpencil", "landing-design"].iter().map(|n| repo(&base, n)).collect();
+        let projects: Vec<std::path::PathBuf> = [vec![flow.clone(), room.clone()], others].concat();
+        let w = World { accounts: accounts(&["default", "orca"]), worktrees: true, projects, ..Default::default() };
+        let ticket = "open a session at eyzflow and mediaroom. this is the ticket:\nEYZFlow Support \u{2013} Enable Automatic Message and Reply Translation\n\nCustomers write in many languages.   Support answers in German.\n\n- Detect the language\n- Translate both ways, landing in the admin dashboard";
+        let p = plan(ticket, None, None, &w).unwrap();
+        assert_eq!(p.sessions.iter().map(|x| x.folder.clone()).collect::<Vec<_>>(), [flow.to_string_lossy().into_owned(), room.to_string_lossy().into_owned()]);
+        assert_eq!(p.space, "eyzflow-support", "named from the ticket's title, not from \"open a session\"");
+        assert_eq!(p.account.as_deref(), Some("default"));
+        assert_eq!(p.assumed["setup_why"], "the repos its first line names");
+        assert_eq!(p.assumed["account_why"], "the default one: the goal names none");
+        assert!(p.assumed["name_why"].as_str().unwrap().contains("the ticket's title"));
+        // The ticket keeps its paragraphs and list for the sessions; spaces inside a line are one.
+        assert!(p.goal.contains("languages. Support answers in German.\n\n- Detect the language\n- Translate"), "{}", p.goal);
+        assert!(instruction(&p, &p.sessions[0]).starts_with("open a session at eyzflow and mediaroom. this is the ticket:\nEYZFlow Support"));
+        // Words of the ticket ("support", "admin dashboard", "landing") name no repo: only the first line counts.
+        assert_eq!(repos_named(ticket, &w.projects).iter().map(|(w, _)| w.as_str()).collect::<Vec<_>>(), ["eyzflow", "mediaroom"]);
+        // "open" is no repo, though eyz-openpencil has it inside a word: a part must be a whole part of one folder.
+        assert!(repos_named("open the pencil thing", &w.projects).is_empty());
+        // Nothing named, no setup: it says how to name them, instead of sending you to a terminal.
+        let err = plan("Fix the flaky tests", None, None, &w).unwrap_err().to_string();
+        assert!(err.contains("name the repos in the goal's first line"), "{err}");
+        // A saved setup that has the named repos keeps its account.
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let with = World { setups: vec![setup("flow on orca", "orca", &[&s(&flow), &s(&room)])], ..w.clone() };
+        let q = plan(ticket, None, None, &with).unwrap();
+        assert_eq!((q.account.as_deref(), q.assumed["setup_why"].as_str()), (Some("orca"), Some("the one that has the repos the goal names")));
+        // A goal of one line names its space from its own words, the repo left out.
+        assert_eq!(space_name_of("Fix the login redirect in eyzflow", &["eyzflow".into()]), "fix-login");
+        assert_eq!(tidy("  a  b \n\n\n\n c \n\n"), "a b\n\nc");
+    }
+
+    #[test]
     fn a_launch_is_planned_without_asking_and_says_what_it_assumed() {
         let base = temp("launch-plan");
         let (flow, room) = (repo(&base, "eyzflow"), repo(&base, "eyz-mediaroom-serverless"));
@@ -462,6 +638,7 @@ mod tests {
             accounts: accounts(&["default", "orca"]),
             worktrees: true,
             standing: vec!["M5 Pro".into()],
+            projects: vec![],
         };
         let p = plan("  Fix the   login redirect on eyzflow ", None, None, &w).unwrap();
         assert_eq!((p.goal.as_str(), p.space.as_str(), p.joins), ("Fix the login redirect on eyzflow", "fix-login-2", false));
