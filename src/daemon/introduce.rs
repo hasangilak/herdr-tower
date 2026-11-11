@@ -40,12 +40,20 @@ fn enabled() -> bool {
     crate::config::Config::live().sessions.introduce
 }
 
-/// What a session is on now: the agenda's task for it, else the prompt its
-/// hooks last saw (unwrapped; an introduction is none).
-fn task_now(address: &str) -> Option<String> {
-    super::agendas::task_of(address)
-        .and_then(|t| introduce::task_from_prompt(&t))
-        .or_else(|| super::sessions::registry().get(address).and_then(|s| introduce::task_from_prompt(&s.prompt)))
+/// What the user has a session on now: the agenda's task for it that the
+/// user asked for (a message from another session is none), else its
+/// latest prompt when that was the user's own (`typed`: not one the tower
+/// or another session typed). None: the last request of the user's it had
+/// stands (`Book::tasks_for`).
+fn task_now(address: &str) -> Option<(String, bool)> {
+    let on = super::agendas::users_task_of(address).and_then(|t| introduce::users_task(&t)).or_else(|| {
+        if !super::typed::users_turn(address) {
+            return None;
+        }
+        super::sessions::registry().get(address).and_then(|s| introduce::users_task(&s.prompt))
+    });
+    // Else what the user last asked it for (the agenda ledger keeps it), over by now.
+    on.map(|t| (t, false)).or_else(|| super::agendas::users_last_task_of(address, |t| introduce::users_task(t).is_some()).and_then(|t| introduce::users_task(&t)).map(|t| (t, true)))
 }
 
 impl Introducer {
@@ -133,7 +141,22 @@ impl Introducer {
         let mut groups = introduce::group(members);
         // Each one's task: what it's on now, else the last real task it had.
         let mut b = lock(&self.book);
-        if b.tasks_for(&mut groups, |m| task_now(&m.address)) {
+        let done = std::cell::RefCell::new(std::collections::HashSet::new());
+        let mut changed = b.tasks_for(&mut groups, |m| {
+            task_now(&m.address).map(|(t, over)| {
+                if over {
+                    done.borrow_mut().insert(m.key());
+                }
+                t
+            })
+        });
+        for m in groups.values_mut().flatten() {
+            m.task_done |= done.borrow().contains(&m.key());
+        }
+        // Who had an introduction is kept while their terminals are seen.
+        let present: std::collections::BTreeSet<String> = groups.values().flatten().map(Member::key).collect();
+        changed |= b.keep_introduced(&present, crate::history::now_ms());
+        if changed {
             self.save(&b);
         }
         Some(groups)
@@ -158,16 +181,26 @@ impl Introducer {
         };
         for space in due {
             if let Some(ms) = groups.get(&space) {
-                self.send(&space, ms);
+                // Only those that have had none: the newcomer, not everyone again.
+                self.send(&space, ms, true);
             }
         }
     }
 
-    /// Hands the introduction to every member (queued: each gets it once it's free), and books it.
-    fn send(&self, space: &str, members: &[Member]) -> Vec<Value> {
+    /// Hands the introduction to the members (queued: each gets it once it's
+    /// free), and books it. `only_new`: only to those that have had none
+    /// (none of them: nothing is sent, the book takes the set as it is).
+    fn send(&self, space: &str, members: &[Member], only_new: bool) -> Vec<Value> {
+        let to: Vec<Member> = if only_new { lock(&self.book).recipients(space, members).into_iter().cloned().collect() } else { members.to_vec() };
+        if to.is_empty() {
+            let mut b = lock(&self.book);
+            b.known_now(space, members);
+            self.save(&b);
+            return vec![];
+        }
         let mut out = vec![];
         let mut reached = vec![];
-        for m in members {
+        for m in &to {
             let text = introduce::compose(space, m, members);
             match self.sendq.add_note(&m.address, &text) {
                 Ok((added, ..)) => {
@@ -186,11 +219,17 @@ impl Introducer {
         }
         if !reached.is_empty() {
             let mut b = lock(&self.book);
-            b.sent(space, members, crate::history::now_ms());
+            b.introduced_to(space, members, &reached, crate::history::now_ms());
             self.save(&b);
-            let names: Vec<String> = members.iter().map(|m| format!("{} ({})", m.label(), m.address)).collect();
-            eprintln!("[introduce] {space}: introduced {}", names.join(", "));
-            let (sp, text) = (space.to_string(), format!("Introduced the Claude sessions in {space} to each other: {}", names.join(", ")));
+            let named = |ms: &[&Member]| ms.iter().map(|m| format!("{} ({})", m.label(), m.address)).collect::<Vec<_>>().join(", ");
+            let text = if reached.len() == members.len() {
+                format!("Introduced the Claude sessions in {space} to each other: {}", named(&members.iter().collect::<Vec<_>>()))
+            } else {
+                let others: Vec<&Member> = members.iter().filter(|m| !reached.iter().any(|r| r.address == m.address)).collect();
+                format!("Introduced {} to the other Claude sessions in {space}: {}", named(&reached.iter().collect::<Vec<_>>()), named(&others))
+            };
+            eprintln!("[introduce] {space}: {text}");
+            let sp = space.to_string();
             crate::history::later(move || crate::history::record_space("introduce", &sp, None, &text));
         }
         out
@@ -230,6 +269,7 @@ impl Introducer {
             let messages: Vec<Value> = members.iter().map(|m| json!({ "to": m.address, "name": m.label(), "text": introduce::compose(&sp, m, members) })).collect();
             return Ok(json!({ "space": sp, "dry_run": true, "messages": messages }));
         }
-        Ok(json!({ "space": sp, "dry_run": false, "sent": self.send(&sp, members) }))
+        // Asked for by hand: to every one of them, introduced before or not.
+        Ok(json!({ "space": sp, "dry_run": false, "sent": self.send(&sp, members, false) }))
     }
 }

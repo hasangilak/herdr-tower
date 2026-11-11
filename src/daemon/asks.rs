@@ -1763,6 +1763,10 @@ impl Asks {
         } else {
             type_into(&set.session, &text)?;
         }
+        // Words of the user's own in it: their request in that session (what it works on now).
+        if let Some(words) = questions::users_words(answers) {
+            super::agendas::answered_on_card(&set.session, &words);
+        }
         let done = {
             let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             match i.sets.iter_mut().find(|s| s.id == set.id) {

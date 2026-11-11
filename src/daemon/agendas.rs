@@ -50,10 +50,51 @@ pub fn radar_note() -> Option<String> {
     RUNNING.get()?.lock().radar_note()
 }
 
-/// What `session` is on, from the agenda ledger: its latest unfinished task's instruction.
-pub fn task_of(session: &str) -> Option<String> {
+/// The user answered `session`'s question on a card with words of their own
+/// (`questions::users_words`), and the tower typed them in: like what they
+/// type in its terminal, their request there (an agenda of origin
+/// `terminal`, and in the record), unless it only answers ("yes", "2").
+pub fn answered_on_card(session: &str, words: &str) {
+    let Some(words) = crate::introduce::users_task(words) else { return };
+    let (session, at_ms) = (session.to_string(), now_ms());
+    std::thread::spawn(move || {
+        let Some(agendas) = RUNNING.get() else { return };
+        let t = crate::hc::get(&session);
+        let (name, space) = t.as_ref().map(|t| (crate::hc::spoken_name(t), crate::spaces::space_of(t))).unwrap_or_default();
+        let r = agendas.typed(agenda::Typed {
+            session: session.clone(),
+            name: name.clone(),
+            created_ms: t.as_ref().and_then(crate::hc::created_ms),
+            space: space.clone(),
+            words: words.clone(),
+            at_ms,
+        });
+        crate::history::append(crate::history::Entry {
+            kind: "request".into(),
+            text: words,
+            source: Some(format!("answer:{session}")),
+            session: Some(session),
+            name: Some(name).filter(|n| !n.is_empty()),
+            space,
+            agenda: Some(r.agenda),
+            record: true,
+            ..Default::default()
+        });
+    });
+}
+
+/// What the user has `session` on: the instruction of its unfinished task,
+/// unless that is a message from another session (`Task::is_message`).
+pub fn users_task_of(session: &str) -> Option<String> {
     let l = RUNNING.get()?.lock();
-    l.unfinished_on(session).map(|t| t.instruction.clone())
+    l.unfinished_users_on(session).map(|t| t.instruction.clone())
+}
+
+/// What the user last asked `session` for, done or not: the newest task on
+/// it that is no message from another session and passes `is_request`.
+pub fn users_last_task_of(session: &str, is_request: impl Fn(&str) -> bool) -> Option<String> {
+    let l = RUNNING.get()?.lock();
+    l.latest_users_on(session, is_request).map(|t| t.instruction.clone())
 }
 
 /// What was asked of `session` lately: the instruction of the task it is

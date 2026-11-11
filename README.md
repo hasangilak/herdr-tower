@@ -774,15 +774,25 @@ for **Herdr Core**, because the voice runs in a Herdr terminal.
   renamed) after every change, so it survives restarts.
 - Sessions in one space know each other: when a Claude session joins a
   Herdr space that has other Claude sessions (`tower start`, `dispatch`, or
-  one you open), the tower sends each of them, through the send queue
+  one you open), the tower sends the newcomer, through the send queue
   (never into a working session), the others' names, addresses, folders
-  and tasks, and how to reach them (`tower queue <address> "…"`, `hc read
-  <address> --lines 60`). Once per change of who is there (a dispatch's
-  sessions are one introduction: the set must hold 30 s), kept in
+  and what you asked each of them for, and how to reach them (`tower queue
+  <address> "…"`, `hc read <address> --lines 60`). Each session gets one
+  introduction: those already there are not introduced again when another
+  joins, nor is a session that drops out of view and comes back (a tower
+  restart, Herdr reading it a moment without its agent); a terminal's
+  introduction is forgotten an hour after it is gone. A dispatch's sessions
+  are one introduction (the set must hold 30 s). What a session is "working
+  on" is your own request to it (the task the tower gave it for you, what
+  you typed in its terminal, or what you answered its question with in
+  words of your own on a card: not an option you picked, nor a bare "yes"),
+  never a message from another session; once that is done it reads "last
+  asked for: …", and with none, "no task reported yet". Kept in
   `~/.local/state/herder-tower/introductions.json`; never the tower's own
   terminals, Codex, or sessions in other spaces or on other machines; on the
   first run what is already open is only recorded. `[sessions] introduce =
-  false` turns it off; `tower introduce <space> --dry-run` shows it.
+  false` turns it off; `tower introduce <space> --dry-run` shows it, and
+  `tower introduce <space>` sends it again to every one of them.
 - How much it tells you (`[tell] level` in config.toml, `tower tell`;
   docs/quiet-tower.md): at `decisions` and `results` a turn of the brain
   that starts with the tower's own note (`[watch]`, `[queue]`, `[agenda]`)

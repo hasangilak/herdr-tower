@@ -569,6 +569,14 @@ pub struct Reg {
     pub tag: Tag,
 }
 
+impl Agenda {
+    /// A request of the user's: asked of the tower (`user`) or typed in a
+    /// session's own terminal (`terminal`), not handed out by the tower on its own.
+    pub fn users(&self) -> bool {
+        self.origin == "user" || self.origin == TERMINAL
+    }
+}
+
 /// The origin of the user's own work typed in a session's terminal (see `Ledger::typed`).
 pub const TERMINAL: &str = "terminal";
 
@@ -946,6 +954,31 @@ impl Ledger {
             .filter(|a| a.live())
             .flat_map(|a| a.tasks.iter())
             .filter(|t| !session.is_empty() && t.session == session && !t.state.settled())
+            .max_by_key(|t| (t.delivered_ms, t.created_at_ms))
+    }
+
+    /// `unfinished_on`, of what the user asked for: a request of theirs
+    /// (origin `user`, or `terminal`: typed in the session); what the tower
+    /// handed out on its own (origin `tower`, messages between sessions an
+    /// older tower kept as tasks among it) and a message from another
+    /// session (`Task::is_message`) are no work of the user's.
+    pub fn unfinished_users_on(&self, session: &str) -> Option<&Task> {
+        self.agendas
+            .iter()
+            .filter(|a| a.live() && a.users())
+            .flat_map(|a| a.tasks.iter())
+            .filter(|t| !session.is_empty() && t.session == session && !t.state.settled() && !t.is_message())
+            .max_by_key(|t| (t.delivered_ms, t.created_at_ms))
+    }
+
+    /// The newest task on `session`, done or not, of what the user asked for
+    /// (as `unfinished_users_on`) and that `is_request` takes.
+    pub fn latest_users_on(&self, session: &str, is_request: impl Fn(&str) -> bool) -> Option<&Task> {
+        self.agendas
+            .iter()
+            .filter(|a| a.users())
+            .flat_map(|a| a.tasks.iter())
+            .filter(|t| !session.is_empty() && t.session == session && !t.is_message() && is_request(&t.instruction))
             .max_by_key(|t| (t.delivered_ms, t.created_at_ms))
     }
 
@@ -2666,6 +2699,23 @@ mod tests {
         let back: Ledger = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
         assert_eq!(back.agenda(&id).unwrap().receipt_ms, Some(now + 5));
         assert!(!serde_json::to_string(&Agenda::default()).unwrap().contains("receipt_ms"));
+    }
+
+    #[test]
+    fn what_a_session_is_on_for_the_user_is_a_request_of_theirs() {
+        let now = 9_000_000_000;
+        let (mut l, agenda, ids) = ledger_with(1, now);
+        l.apply(&ids[0], TaskEv::Delivered { session: "t1".into(), name: "api".into(), created_ms: None, space: Some("B2C".into()), at_ms: now, fresh: false }, now).unwrap();
+        let any = |_: &str| true;
+        assert_eq!(l.unfinished_users_on("t1").map(|t| t.instruction.as_str()), Some("task number 0: fix the login bug"));
+        assert_eq!(l.latest_users_on("t1", any).map(|t| t.instruction.as_str()), Some("task number 0: fix the login bug"));
+        // Handed out by the tower on its own (a message between sessions an older tower kept, too): not the user's.
+        l.agenda_mut(&agenda).unwrap().origin = "tower".into();
+        assert!(l.unfinished_users_on("t1").is_none() && l.latest_users_on("t1", any).is_none());
+        assert!(l.unfinished_on("t1").is_some(), "it is still the session's task");
+        // The user's again, but the text answers a question: `is_request` leaves it out.
+        l.agenda_mut(&agenda).unwrap().origin = TERMINAL.into();
+        assert!(l.latest_users_on("t1", |t| !t.starts_with("task number")).is_none());
     }
 
     #[test]
