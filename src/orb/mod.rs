@@ -26,7 +26,8 @@
 //! --ui-dir`), without the keyboard being taken: `HERDER_TOWER_ORB_PANEL=show`
 //! has the panel up from the start, `HERDER_TOWER_ORB_WINDOW=show` the full
 //! window (`show:<view>` at a view, as `nav::Scope::parse` reads it); either
-//! with `@<x>,<y>` opens at that spot, in screen points.
+//! with `@<x>,<y>` opens at that spot, in screen points. With `show:phone`,
+//! `HERDER_TOWER_ORB_PAIR=open` opens the Phone card's pairing box too.
 
 mod liquid;
 mod mac;
