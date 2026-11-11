@@ -687,7 +687,9 @@ impl Panel {
                         h_flex()
                             .items_center()
                             .child(div().flex_1().text_size(px(19.0)).line_height(px(23.0)).font_weight(FontWeight::SEMIBOLD).child("Tower"))
-                            // Closes the full window (as Esc, or a click on the orb, does).
+                            // Back to the floating panel: it opens, this window closes, the orb opens the panel from now on.
+                            .child(tg("to-floating", "Floating", false).on_click(cx.listener(|this, _, window, cx| crate::orb::to_floating(&this.tower.clone(), window, cx))))
+                            // Closes the full window (as Esc, or a click on the orb, does); the orb opens it again.
                             .child(dismiss_mark("close-full").on_click(cx.listener(|this, _, window, cx| this.close(window, cx)))),
                     )
                     .child(div().text_size(px(12.5)).text_color(g.muted).child(status)),

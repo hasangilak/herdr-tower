@@ -1148,9 +1148,13 @@ where the full window is, `panel/` the views).
   its edges, never under 820 × 520 nor over the screen. Where it is and its
   size are kept in `window.json` (the state folder, beside `orb.json`),
   moved wholly onto a screen (`nav::keep_on`), and it opens there next
-  time (in the floating panel's place until it was ever moved). While it
-  is open the orb doesn't peek, and a click on the orb closes it, as Esc
-  and the × beside "Tower" do. It has a
+  time (in the floating panel's place until it was ever moved). Opening
+  it by choice (Full window, a space chip) is **full mode**, kept in
+  `window.json` as `"mode": "full"`: the orb doesn't peek, a click on it
+  closes the full window when it is open and opens it when it isn't; Esc
+  and the × beside "Tower" close it. **Floating**, beside "Tower", is back
+  to the floating panel (`"mode": "floating"`): the full window closes and
+  the panel opens, pinned. It has a
   sidebar (All spaces, each open space, New space, the quiet fold,
   Record, Shots, Settings) and a main pane:
   - All spaces: the queue and the missions list.

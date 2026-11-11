@@ -217,9 +217,14 @@ keyboard's digits too).
 panel closes), about 960 × 640 at first, the same glass. Move it by its top
 (the header strip, or "Tower" at the top of its sidebar) and resize it by
 its edges, down to 820 × 520; it opens where you left it, at that size.
-While it is open the orb doesn't peek: a click on the orb closes the full
-window, as do Esc and the × beside "Tower". Both windows show one model: a
-card answered or picked in one is so in the other. A sidebar on the left: **All spaces** with the count of what is
+The orb remembers which of the two you use. Once you open the full window
+you are in full mode: a click on the orb closes the full window and the
+next one opens it again, and hovering the orb doesn't bring up the floating
+panel. Esc and the × beside "Tower" close it too. **Floating**, beside
+"Tower", switches back: the full window closes, the floating panel opens,
+and the orb opens the floating panel from then on. The mode is kept in
+`window.json` with the window's spot and size. Both windows show one model:
+a card answered or picked in one is so in the other. A sidebar on the left: **All spaces** with the count of what is
 yours, each open space with its mark and a line (its sessions, "standing",
 "ready to close"), **New space**, the quiet spaces and what closed today
 folded into one line, and **Record**, **Shots** and **Settings** at the

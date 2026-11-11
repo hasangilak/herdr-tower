@@ -107,6 +107,11 @@ struct Tower {
     /// The floating panel while it is open (a peek or pinned): it closes
     /// when the user opens the full window, which takes its place.
     floating: Option<AnyWindowHandle>,
+    /// The orb opens the full window rather than the floating panel: the
+    /// user switched to it last ("Full window"), and not back ("Floating").
+    full_mode: bool,
+    /// The orb's window: the full window's "Floating" opens the panel through it.
+    orb: Option<WindowHandle<Orb>>,
     /// The floating panel while it is pinned: the keyboard is its again when
     /// the full window closes.
     pinned: Option<AnyWindowHandle>,
@@ -138,6 +143,8 @@ impl Tower {
             nav: Default::default(),
             full: None,
             floating: None,
+            full_mode: saved_full_mode(),
+            orb: None,
             pinned: None,
             keyed: None,
             live: vec![],
@@ -675,8 +682,8 @@ impl Orb {
 
     /// Hovering: the panel as a peek, unless it is open already.
     fn peek(&mut self, cx: &mut Context<Self>) {
-        // The full window is open: it has taken the floating panel's place.
-        if full_open(&self.tower, cx) {
+        // In full mode (open or not), the full window has taken the floating panel's place.
+        if self.tower.read(cx).full_mode || full_open(&self.tower, cx) {
             return;
         }
         if self.press.is_none() && !self.panel_open(cx) {
@@ -704,12 +711,17 @@ impl Orb {
     }
 
     /// A click: pins a peek, closes a pinned panel, else opens it pinned.
-    /// While the full window is open, it closes that (the orb opens and
-    /// closes whichever of the two is up).
+    /// In full mode it closes the full window when it is open and opens it
+    /// when it isn't; the floating panel stays away until the user switches
+    /// back to it ("Floating" in the full window).
     fn toggle_panel(&mut self, cx: &mut Context<Self>) {
         if full_open(&self.tower, cx) {
             close_full(&self.tower, cx);
             mac::give_back_focus();
+            return;
+        }
+        if self.tower.read(cx).full_mode {
+            open_full(&self.tower, None, None, None, true, true, cx);
             return;
         }
         if self.peeking(cx) {
@@ -937,6 +949,10 @@ fn open_full(tower: &Entity<Tower>, to: Option<nav::Scope>, anchor: Option<mac::
             cx.notify();
         });
     }
+    // The user chose it (a click on Full window, a space chip, the orb in full mode): full mode.
+    if replace {
+        set_full_mode(tower, true, cx);
+    }
     if full_open(tower, cx) {
         // From another window's click: forward, with the keyboard.
         if let Some(h) = tower.read(cx).full
@@ -1064,10 +1080,44 @@ fn window_position_file() -> PathBuf {
     config::state_dir().join("window.json")
 }
 
+/// What `window.json` holds (nothing yet: an empty object).
+fn window_file() -> Value {
+    std::fs::read_to_string(window_position_file()).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).filter(Value::is_object).unwrap_or_else(|| serde_json::json!({}))
+}
+
+fn write_window_file(v: &Value) {
+    let _ = std::fs::create_dir_all(config::state_dir());
+    let _ = std::fs::write(window_position_file(), v.to_string());
+}
+
 /// The full window was moved or resized: it opens there, at that size, next time.
 pub(crate) fn save_window_frame(x: f64, y: f64, w: f64, h: f64) {
-    let _ = std::fs::create_dir_all(config::state_dir());
-    let _ = std::fs::write(window_position_file(), serde_json::json!({ "x": x, "y": y, "w": w, "h": h }).to_string());
+    let mut v = window_file();
+    for (k, n) in [("x", x), ("y", y), ("w", w), ("h", h)] {
+        v[k] = serde_json::json!(n);
+    }
+    write_window_file(&v);
+}
+
+/// Which of the two the orb opens: the full window (`true`) or the floating panel.
+fn saved_full_mode() -> bool {
+    window_file()["mode"].as_str() == Some("full")
+}
+
+/// The user switched to the full window (`true`) or back to the floating
+/// panel: the orb opens that one from now on, across restarts.
+fn set_full_mode(tower: &Entity<Tower>, full: bool, cx: &mut App) {
+    let changed = tower.update(cx, |t, cx| {
+        let changed = t.full_mode != full;
+        t.full_mode = full;
+        cx.notify();
+        changed
+    });
+    if changed {
+        let mut v = window_file();
+        v["mode"] = serde_json::json!(if full { "full" } else { "floating" });
+        write_window_file(&v);
+    }
 }
 
 /// Where the user last put the full window and its size (none kept: the
@@ -1078,6 +1128,29 @@ fn saved_window() -> Option<(f64, f64, f64, f64)> {
     let w = v["w"].as_f64().unwrap_or(panel::FULL_W as f64);
     let h = v["h"].as_f64().unwrap_or(panel::FULL_H as f64);
     Some((x, y, w, h))
+}
+
+/// "Floating" in the full window: back to the floating panel. The full
+/// window goes (`window`: it, from its own click), the orb opens the panel
+/// from now on, and the panel opens now, pinned, once the click is handled.
+fn to_floating(tower: &Entity<Tower>, window: &mut Window, cx: &mut App) {
+    set_full_mode(tower, false, cx);
+    let orb = tower.update(cx, |t, cx| {
+        t.full = None;
+        cx.notify();
+        t.orb
+    });
+    window.remove_window();
+    cx.defer(move |cx| match orb {
+        Some(o) => {
+            let _ = o.update(cx, |orb, _, cx| {
+                if !orb.panel_open(cx) {
+                    orb.open_panel(false, cx);
+                }
+            });
+        }
+        None => mac::give_back_focus(),
+    });
 }
 
 /// Closes the full window from another window (the floating panel's button).
@@ -1330,6 +1403,8 @@ pub fn run(ui_dir: Option<PathBuf>) -> Result<()> {
         mac::accessory_app();
         let tower = cx.new(|_| Tower::new(&ui_dir));
         let orb = Rc::new(RefCell::new(open_orb(tower.clone(), cx)));
+        let handle = *orb.borrow();
+        tower.update(cx, |t, _| t.orb = handle);
         if let Some((scope, filter, spot)) = window_from_start() {
             tower.update(cx, |t, _| {
                 t.nav.go(scope);
@@ -1520,4 +1595,30 @@ pub fn spawn() -> Result<bool> {
     }
     cmd.spawn().context("starting the orb")?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_window_file_keeps_the_frame_and_the_mode_apart() {
+        // The tests' state folder is a scratch one (HERDER_TOWER_STATE); this file is this test's alone.
+        let _ = std::fs::remove_file(window_position_file());
+        assert!(!saved_full_mode(), "no file: the floating panel, as before");
+        save_window_frame(10.0, 20.0, 1200.0, 760.0);
+        let mut v = window_file();
+        v["mode"] = serde_json::json!("full");
+        write_window_file(&v);
+        assert!(saved_full_mode());
+        // Moving or resizing the window keeps the mode; the mode kept the frame.
+        save_window_frame(30.0, 40.0, 1100.0, 700.0);
+        assert!(saved_full_mode());
+        assert_eq!(saved_window(), Some((30.0, 40.0, 1100.0, 700.0)));
+        // A file from before the mode was kept: the floating panel.
+        write_window_file(&serde_json::json!({ "x": 1.0, "y": 2.0 }));
+        assert!(!saved_full_mode());
+        assert_eq!(saved_window(), Some((1.0, 2.0, panel::FULL_W as f64, panel::FULL_H as f64)));
+        let _ = std::fs::remove_file(window_position_file());
+    }
 }
