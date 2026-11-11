@@ -229,6 +229,35 @@ impl Decisions {
         }
     }
 
+    /// The question set `set` was answered in its session's own terminal: the
+    /// decision it stood in closes now, as answered (or, while other sessions
+    /// still ask the same, its session leaves it), and the state carries it
+    /// at once (the Mac's windows, the phone's `decisions` event). Not written
+    /// down here: the caller writes the line once it knows what was chosen.
+    /// The decisions it was in: (id, over now).
+    pub fn answered_in_terminal(&self, set: &str) -> Vec<(String, bool)> {
+        if !lock(&self.book).open.iter().any(|d| d.sessions.iter().any(|w| w.question_id.as_deref() == Some(set))) {
+            return vec![];
+        }
+        let out = self.change(|b, now| b.answered_in_terminal(set, now));
+        for (id, over) in &out {
+            eprintln!("[decisions] {id}: {set} was answered in its terminal{}", if *over { "; the decision is over" } else { "" });
+        }
+        out
+    }
+
+    /// What a decision was answered with, kept on it (open or closed lately).
+    pub fn note_answer(&self, id: &str, with: &str) {
+        self.change(|b, _| b.note_answer(id, with));
+    }
+
+    /// A decision that closed without its line in the record: written now, as any other.
+    pub fn record_closed(&self, id: &str) {
+        if let Some(d) = self.get(id).filter(|d| d.closed_ms.is_some()) {
+            record(&d);
+        }
+    }
+
     /// A session as the radar sees it: working on something else (`waiting`
     /// false), or waiting again.
     pub fn session_seen(&self, address: &str, waiting: bool) {
@@ -625,8 +654,17 @@ fn record(d: &Decision) {
     if cfg!(test) {
         return;
     }
+    let entry = entry_of(d);
+    crate::history::later(move || crate::history::append(entry));
+}
+
+/// The record's line for a decision that is over.
+fn entry_of(d: &Decision) -> crate::history::Entry {
     let who = d.sessions.first().cloned();
-    let entry = crate::history::Entry {
+    // Blocked on what the tower couldn't read, and no longer: the user answered it in its terminal.
+    let there = d.kind == decisions::Kind::Blocked && d.state == State::Answered;
+    crate::history::Entry {
+        source: who.as_ref().filter(|_| there).map(|w| format!("terminal:{}", w.address)),
         kind: "decision".into(),
         id: Some(d.id.clone()),
         session: who.as_ref().map(|w| w.address.clone()),
@@ -637,8 +675,7 @@ fn record(d: &Decision) {
         text: if d.answer.is_empty() { d.title.clone() } else { format!("{} -> {}", d.title, d.answer) },
         record: true,
         ..Default::default()
-    };
-    crate::history::later(move || crate::history::append(entry));
+    }
 }
 
 #[cfg(test)]
@@ -904,6 +941,11 @@ mod tests {
         assert_eq!(s.get().decisions_count, 1);
         quiet.session_blocked("t4", false);
         assert_eq!((s.get().decisions.len(), s.get().decisions_count), (0, 0), "answered in its terminal: gone");
+        // Answered there, as its line in the record says (the Mac's Record: "You answered").
+        let over = quiet.list(None, true)["closed"][0]["id"].as_str().map(String::from).and_then(|id| quiet.get(&id)).unwrap();
+        let e = entry_of(&over);
+        assert_eq!((e.status.as_deref(), e.source.as_deref(), e.session.as_deref()), (Some("answered"), Some("terminal:t4"), Some("t4")));
+        assert_eq!(e.text, "Asks to use Frobnicate: step 2 -> in its own terminal");
         // The tower tells everything: the plain notice each time, as before.
         let loud = Decisions::telling(shared(), || Level::Everything);
         assert!(loud.blocked(None, Who::new("t4", "api"), "Asks to use Frobnicate"));

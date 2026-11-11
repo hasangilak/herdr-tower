@@ -1034,6 +1034,30 @@ impl Book {
         Changes { fresh: vec![], closed: over.iter().filter_map(|id| self.answered(id, "in its own terminal", now)).collect() }
     }
 
+    /// The question set `set` was answered in its session's own terminal: its
+    /// session leaves the decision it stood in, as answered, and a decision
+    /// nobody else asks any more is over, answered (other sessions that ask
+    /// the same still wait on their own dialogs). What it was answered with
+    /// is the caller's to say (`note_answer`), once it knows. The decisions
+    /// it was in: (id, over now).
+    pub fn answered_in_terminal(&mut self, set: &str, now: u64) -> Vec<(String, bool)> {
+        let mut out = vec![];
+        for d in self.open.iter_mut().filter(|d| d.kind.asks()) {
+            if !d.sessions.iter().any(|w| w.question_id.as_deref() == Some(set)) {
+                continue;
+            }
+            d.sessions.retain(|w| w.question_id.as_deref() != Some(set));
+            d.left = Some(d.left.map_or(State::Answered, |l| l.over(State::Answered)));
+            out.push((d.id.clone(), d.sessions.is_empty()));
+        }
+        for (id, over) in &out {
+            if *over {
+                self.answered(id, "", now);
+            }
+        }
+        out
+    }
+
     /// The tasks that still stand failed after a retry: a `failed` decision
     /// about any other task is over (it was sent again, verified or dropped).
     pub fn sync_failed(&mut self, still: &[String], now: u64) -> Changes {
@@ -1964,5 +1988,24 @@ mod tests {
         // The other one's session ends: over, stopped.
         let ch = b.session_gone("t5", 6 * MIN);
         assert_eq!((ch.closed.len(), ch.closed[0].state, b.open.len()), (1, State::Stopped, 0));
+    }
+
+    /// A question set answered in its session's own terminal: that session
+    /// leaves its decision as answered; the decision ends with the last one.
+    #[test]
+    fn a_set_answered_in_its_terminal_leaves_its_decision_as_answered() {
+        let mut b = Book::default();
+        let sets = vec![waits("t1", "web", "Shop", "merge PR #12"), waits("t2", "api", "Shop", "merge PR #12")];
+        b.sync_questions(&asked_all(&sets), &|_| State::Stopped, MIN);
+        let id = b.open[0].id.clone();
+        assert_eq!(b.open[0].sessions.len(), 2);
+        assert_eq!(b.answered_in_terminal(&sets[0].id, 2 * MIN), [(id.clone(), false)]);
+        assert_eq!(b.open[0].sessions.iter().map(|w| w.address.as_str()).collect::<Vec<_>>(), ["t2"], "the other still waits on its own");
+        assert!(b.answered_in_terminal("q000000000000", 2 * MIN).is_empty(), "a set no decision stands for");
+        assert_eq!(b.answered_in_terminal(&sets[1].id, 3 * MIN), [(id.clone(), true)]);
+        let d = b.find(&id).unwrap();
+        assert_eq!((d.state, d.closed_ms, d.answer.as_str()), (State::Answered, Some(3 * MIN), ""), "what it was answered with comes from its screen or its words");
+        // The next sync, without them: nothing more happens to it.
+        assert!(b.sync_questions(&[], &|_| State::Stopped, 4 * MIN).closed.is_empty());
     }
 }

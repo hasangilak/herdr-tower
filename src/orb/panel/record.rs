@@ -37,6 +37,12 @@ const TOGETHER_MS: u64 = 2 * 60 * 1000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum What {
     Asked,
+    /// What the user typed in a session's own terminal: their request there.
+    Typed,
+    /// A question the user answered in its session's own terminal.
+    AnsweredThere,
+    /// A reply the tower held, not sent: the user answered in the terminal.
+    NotSent,
     Replied,
     Finished,
     Started,
@@ -98,6 +104,7 @@ impl What {
             ("space", "ready") => What::SpaceReady,
             ("space", "closed") => What::SpaceClosed,
             ("queue", "queued") => What::Queued,
+            ("queue", "not-sent") => What::NotSent,
             ("queue", "delivered" | "sent") => What::Delivered,
             ("alert", "ready") => What::Ready,
             ("answered", _) => What::Answered,
@@ -134,6 +141,9 @@ impl Row {
     pub(super) fn label(&self) -> String {
         match self.what {
             What::Asked => "You asked".into(),
+            What::Typed => "You typed".into(),
+            What::AnsweredThere => "You answered".into(),
+            What::NotSent => "Not sent".into(),
             What::Replied => "Tower replied".into(),
             What::Finished => "Finished".into(),
             What::Started => "Started".into(),
@@ -194,7 +204,13 @@ pub(super) fn rows(entries: &[Value]) -> Vec<Row> {
         if kind.is_empty() || is_test(&name) {
             continue;
         }
-        let what = What::of(&kind, &status);
+        // Typed, or answered, in a session's own terminal.
+        let there = s(e, "source").starts_with("terminal:");
+        let what = match What::of(&kind, &status) {
+            What::Asked if there => What::Typed,
+            What::Decided if there => What::AnsweredThere,
+            w => w,
+        };
         // A session by what it is within its space (`crate::names`): the row's space says the rest.
         let within = Some(s(e, "space")).filter(|sp| !sp.is_empty());
         let named = if name.is_empty() { session.clone() } else { crate::names::label(within.as_deref(), &name) };
@@ -232,7 +248,7 @@ pub(super) fn rows(entries: &[Value]) -> Vec<Row> {
                 (_, text) => text,
             },
             // `<what was asked> -> <what it was answered with>`, as the daemon writes it.
-            What::Decided | What::Dismissed | What::Over => s(e, "text").replacen(" -> ", " → ", 1),
+            What::Decided | What::Dismissed | What::Over | What::AnsweredThere => s(e, "text").replacen(" -> ", " → ", 1),
             What::Finished | What::Report | What::NeedsYou | What::Failed if kind == "watch" => crate::chat::report_text(&s(e, "text")).trim().to_string(),
             _ => s(e, "text"),
         };
@@ -317,8 +333,8 @@ impl Panel {
             }
             let pill = div().flex_none().px(px(8.0)).py(px(1.0)).rounded_full().border_1().text_size(px(11.0)).line_height(px(15.0));
             let pill = match r.what {
-                What::Asked => pill.bg(rgb(PALE)).border_color(rgb(PALE)).text_color(rgb(NAVY)),
-                What::Answered | What::Decided | What::SpaceReady => pill.border_color(rgb(CYAN)).text_color(rgb(CYAN)),
+                What::Asked | What::Typed => pill.bg(rgb(PALE)).border_color(rgb(PALE)).text_color(rgb(NAVY)),
+                What::Answered | What::Decided | What::AnsweredThere | What::SpaceReady => pill.border_color(rgb(CYAN)).text_color(rgb(CYAN)),
                 What::Raised | What::NeedsYou => pill.border_color(rgb(AMBER)).text_color(rgb(AMBER)),
                 What::Failed | What::Undelivered => pill.border_color(rgb(ROSE)).text_color(rgb(ROSE)),
                 _ => pill.border_color(rgba(LINE)).text_color(g.muted),
@@ -495,5 +511,24 @@ mod tests {
         let rows = rows(&entries);
         let texts: Vec<&str> = rows.iter().rev().map(|r| r.text.as_str()).collect();
         assert_eq!(texts, ["2 screenshots: First", "1 screenshot: Later", "1 screenshot", "between", "1 screenshot"]);
+    }
+
+    /// What the user did in a session's own terminal reads as theirs, where they did it.
+    #[test]
+    fn what_the_user_did_in_a_terminal_reads_as_theirs() {
+        let entries = vec![
+            json!({ "at": 10, "kind": "request", "source": "terminal:t5", "session": "t5", "name": "Shop api", "space": "Shop", "text": "add rate limiting to the login endpoint", "agenda": "a7", "record": true }),
+            json!({ "at": 20, "kind": "decision", "id": "d0123456789ab", "status": "answered", "source": "terminal:t5", "session": "t5", "name": "Shop api", "space": "Shop", "text": "Allow Bash: npm test? -> Answered in Shop › api: No", "record": true }),
+            json!({ "at": 30, "kind": "queue", "status": "not-sent", "session": "t5", "name": "Shop api", "space": "Shop", "text": "Not sent: you answered it in the terminal (the reply was \"Yes, open it.\")", "record": true }),
+        ];
+        let rows = rows(&entries);
+        let got: Vec<(String, String, &str)> = rows.iter().rev().map(|r| (r.label(), r.place(), r.text.as_str())).collect();
+        let want = [
+            ("You typed", "Shop › api", "add rate limiting to the login endpoint"),
+            ("You answered", "Shop › api", "Allow Bash: npm test? → Answered in Shop › api: No"),
+            ("Not sent", "Shop › api", "Not sent: you answered it in the terminal (the reply was \"Yes, open it.\")"),
+        ];
+        assert_eq!(got.iter().map(|(l, p, t)| (l.as_str(), p.as_str(), *t)).collect::<Vec<_>>(), want);
+        assert_eq!(of_space(&rows, Some("Shop")).len(), 3, "in that space's record");
     }
 }

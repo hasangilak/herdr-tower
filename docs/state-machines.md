@@ -391,6 +391,15 @@ Where it differs from the design above:
   answer to a *replaced* card follows it to the screen and goes in when its
   tabs didn't change; a late answer to a *dismissed* dialog still up goes in.
   After a restart only the sets that closed at the restore are remembered.
+- **Answered in the terminal** is `Closed{Unblocked}` (the radar saw the
+  session go on) or `Closed{AnsweredElsewhere}` (an answer found the dialog
+  gone), and it is acted on: the set's decision closes in the same step
+  (`Book::answered_in_terminal`), the record gets its line once what was
+  chosen is known, a screen read before it can't bring the card back, and
+  the driver's keys stop once the set is closed (`Guarded`). A dialog still
+  up that the tower can't read any more is `Closed{Unread}`: not answered
+  (its decision `stopped`). docs/quiet-tower.md, "Answered in the
+  session's own terminal".
 - **Restart**: a restored set the brain never decided gets its 40 s wait
   again; one decided `auto` but not typed goes to the user (the tower doesn't
   type after a restart without a fresh look); one being typed comes back
@@ -424,7 +433,11 @@ follow-up adds an id to the same task). `dispatch`, `queue` (`add`,
 the instruction; what goes out while the user's request is under half an
 hour old joins its agenda, more for a session whose task waits on a
 question is that task again, and work the brain starts on its own gets an
-agenda with `origin: tower`.
+agenda with `origin: tower`. What the user types in a session's own
+terminal (its prompt hook, and nothing the tower typed: `daemon::typed`)
+is an agenda with `origin: terminal` (`Ledger::typed`): one task, running
+from the start, with no queue id; more typed there while it is unfinished
+is a follow-up of it, and nothing the tower hands that session joins it.
 
 ```rust
 pub enum TaskState { Queued, Running, Blocked, DoneClaimed, Verified, Failed, Stalled, Abandoned }
@@ -446,6 +459,13 @@ pub enum AgendaState { Open, Done, Closed, Abandoned }
 | failed, never retried (`retries` 0), at `tower tell decisions|results`, unless `[agenda] retry_failed = false` | the daemon sends it once more by itself | queued (`retries` 1) |
 | failed after a retry | it becomes a `failed` decision for the user (`raised`), once | failed |
 | any but verified | the queue id cancelled, `tower agenda abandon`, `close --force` | abandoned |
+| done-claimed, of an agenda of origin `terminal` | (the user saw its turn end there) | verified |
+| any, of origin `terminal` | more typed in its terminal while it is unfinished | running |
+
+An agenda of origin `terminal` is never news for a brain (`Ledger::news`
+skips it), is never sent again or made a decision when it fails
+(`failures`), owes no receipt, and doesn't count as work asked of its
+session (`at_work_on`, the idle check).
 
 Refused moves are values (`Refused::Same`, `Settled`, `NotNow`): once a
 task is failed, verified or abandoned, what its session does next is the

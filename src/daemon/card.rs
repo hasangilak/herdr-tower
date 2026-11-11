@@ -67,6 +67,9 @@ pub enum CloseWhy {
     /// The session stopped showing it without the tower answering
     /// (answered in the terminal, or it moved on).
     Unblocked,
+    /// The session still waits, on a screen the tower can't read now: not
+    /// answered, only out of sight.
+    Unread,
     /// The brain read the message and found it asks nothing.
     NothingAsked,
     /// The user dismissed a text question.
@@ -87,6 +90,7 @@ impl CloseWhy {
                 format!("the questions changed since they were shown (now {by}); the card shows them now: check it and submit again")
             }
             CloseWhy::SessionGone => format!("{who} isn't there any more: its question went with it"),
+            CloseWhy::Unread => format!("{who} shows something the tower can't read now: answer it in the session"),
             CloseWhy::NothingAsked => format!("{id} turned out to ask nothing"),
             CloseWhy::Dismissed => format!("{id} was dismissed"),
         }

@@ -135,9 +135,14 @@ pub fn same_tab(a: &Tab, b: &Tab) -> bool {
 }
 
 /// `new` is `old`'s dialog read again: the same session, kind and tabs (by
-/// title), whatever more is known of their questions now.
+/// title), whatever more is known of their questions now. A menu (a
+/// permission, a plan, Codex's approval) is about one command or plan: the
+/// next one, after the user answered this one in the terminal, is another.
 pub fn redrawn(old: &QuestionSet, new: &QuestionSet) -> bool {
-    old.session == new.session && old.kind == new.kind && old.tabs.iter().map(|t| &t.title).eq(new.tabs.iter().map(|t| &t.title))
+    old.session == new.session
+        && old.kind == new.kind
+        && old.tabs.iter().map(|t| &t.title).eq(new.tabs.iter().map(|t| &t.title))
+        && (old.kind == "claude-ask" || old.detail.trim() == new.detail.trim())
 }
 
 /// Answers given to `old` are good for `new`: it is the same dialog and every
@@ -1146,6 +1151,70 @@ pub fn message_from_screen(screen: &str) -> Option<String> {
     (!t.is_empty()).then_some(t)
 }
 
+/// What the user chose in a dialog they answered in the session's own
+/// terminal, as its screen shows it once the dialog is gone: Claude Code's
+/// "User answered Claude's questions" (each question by its tab's title when
+/// there are several), its plan approved or rejected, a permission turned
+/// down, Codex's "You approved codex to run …". None when the screen doesn't
+/// say (a permission granted only shows its command running), or still
+/// shows the dialog.
+pub fn chosen_on_screen(set: &QuestionSet, screen: &str) -> Option<String> {
+    if parse_screen(screen).is_some_and(|s| set.tabs.iter().any(|t| same_question(&s.question, &t.question)) && s.detail.trim() == set.detail.trim()) {
+        return None;
+    }
+    let lines: Vec<&str> = screen.lines().map(|l| l.trim_end()).filter(|l| !is_rule(l)).collect();
+    let plain = |s: &str| crate::introduce::task_from_prompt(s).unwrap_or_else(|| s.split_whitespace().collect::<Vec<_>>().join(" "));
+    let last = |f: &dyn Fn(&str) -> bool| lines.iter().rev().take(80).map(|l| l.trim()).find(|l| f(&l.to_lowercase())).map(str::to_string);
+    match set.kind.as_str() {
+        "claude-ask" => {
+            let at = lines.iter().rposition(|l| l.contains("User answered Claude's questions"))?;
+            let mut pairs: Vec<(String, String)> = vec![];
+            for l in &lines[at + 1..] {
+                let t = l.trim().trim_start_matches('⎿').trim();
+                match t.strip_prefix("· ").and_then(|r| r.split_once(" → ")) {
+                    Some((q, a)) => pairs.push((q.trim().to_string(), a.trim().to_string())),
+                    // An answer wrapped onto the next line.
+                    None if !t.is_empty() && l.starts_with(' ') && !t.starts_with(['⏺', '✻', '❯', '•']) => match pairs.last_mut() {
+                        Some((_, a)) => {
+                            a.push(' ');
+                            a.push_str(t);
+                        }
+                        None => break,
+                    },
+                    None => break,
+                }
+            }
+            let pairs: Vec<(String, String)> = pairs.into_iter().map(|(q, a)| (q, plain(&a))).filter(|(_, a)| !a.is_empty()).collect();
+            match pairs.as_slice() {
+                [] => None,
+                [(_, a)] => Some(a.clone()),
+                _ => Some(
+                    pairs
+                        .iter()
+                        .map(|(q, a)| {
+                            let title = set.tabs.iter().find(|t| same_question(q, &t.question)).map(|t| t.title.trim()).filter(|t| !t.is_empty());
+                            format!("{}: {a}", title.unwrap_or(q))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ),
+            }
+        }
+        "claude-plan" => {
+            let said = last(&|l| l.contains("approved claude's plan") || l.contains("rejected claude's plan"))?;
+            Some(if said.to_lowercase().contains("approved") { "approved the plan".into() } else { "rejected the plan".into() })
+        }
+        "claude-permission" => {
+            last(&|l| l.contains("user rejected") || l.contains("interrupted by user") || l.contains("doesn't want to proceed")).map(|_| "No".to_string())
+        }
+        "codex-menu" => {
+            let said = last(&|l| l.contains("you approved codex") || l.contains("you canceled") || l.contains("you did not approve") || l.contains("you denied"))?;
+            Some(said.trim_start_matches(['✔', '✓', '✗', '✘', '×', ' ']).trim().to_string())
+        }
+        _ => None,
+    }
+}
+
 /// Worth asking the brain: the message's end asks the user something.
 /// Cheap and generous; the brain decides.
 pub fn looks_like_question(message: &str) -> bool {
@@ -1386,6 +1455,10 @@ pub fn wait_set(session: &str, name: &str, message: &str, request: &str, context
 
 /// A wait set's `reason`: what the card says about why it's the user's.
 pub const WAITS: &str = "it waits for you to do this";
+
+/// The `reason` of a question asked at the end of a turn the user typed in
+/// the session's own terminal: theirs, as it is, with no note to the brain.
+pub const TYPED_THERE: &str = "asked at the end of a turn you typed in its terminal";
 
 /// What is said of a turn that waits on the user.
 pub fn wait_line(name: &str, request: &str) -> String {
@@ -2685,5 +2758,30 @@ mod tests {
         for msg in ["I merged PR #1248 and verified dev; prod is healthy.", "Done. All tests pass.", "I created a branch for the task and pushed it.", ""] {
             assert!(!ready_only(msg), "{msg}");
         }
+    }
+
+    /// What the user chose in a dialog they answered in the terminal, as the screen shows it after.
+    #[test]
+    fn what_was_chosen_in_the_terminal_reads_off_the_screen() {
+        let tabs = transcript_questions(&fixture("claude-ask-transcript.jsonl")).unwrap();
+        let screen = parse_screen(&fixture("claude-ask-tab1.txt")).unwrap();
+        let ask = build("t1", "qfix ask", false, &screen, Some(tabs), "", "");
+        assert_eq!(
+            chosen_on_screen(&ask, &fixture("claude-ask-answered.txt")).as_deref(),
+            Some("Features: Search (full text), Auth (sign in); Deploy: Railway, with a staging app and preview deploys per PR; Database: SQLite (single file)")
+        );
+        assert_eq!(chosen_on_screen(&ask, &fixture("claude-ask-tab1.txt")), None, "the dialog is still up: nothing chosen yet");
+        let one = "⏺ User answered Claude's questions:\n  ⎿  · Which database should the app use? → Postgres (managed, scales)\n\n✻ Working…\n";
+        assert_eq!(chosen_on_screen(&ask, one).as_deref(), Some("Postgres (managed, scales)"), "one question: just the answer");
+
+        let perm = build("t37", "qfix perm", false, &parse_screen(&fixture("claude-permission.txt")).unwrap(), None, "approve Bash: touch /tmp/x", "");
+        assert_eq!(chosen_on_screen(&perm, "⏺ Bash(touch /tmp/x)\n  ⎿  User rejected tool use\n").as_deref(), Some("No"));
+        assert_eq!(chosen_on_screen(&perm, "⏺ Bash(touch /tmp/x)\n  ⎿  (No content)\n"), None, "granted: the screen doesn't say how (once, or always)");
+        assert_eq!(chosen_on_screen(&perm, &fixture("claude-permission.txt")), None);
+
+        let codex = build("t9", "qfix codex", true, &parse_screen(&fixture("codex-approval.txt")).unwrap(), None, "", "");
+        let after = "• Running npm test\n✔ You approved codex to run npm test this time\n\n› ";
+        assert_eq!(chosen_on_screen(&codex, after).as_deref(), Some("You approved codex to run npm test this time"));
+        assert_eq!(chosen_on_screen(&codex, "✗ You canceled the request to run rm -rf build\n").as_deref(), Some("You canceled the request to run rm -rf build"));
     }
 }
