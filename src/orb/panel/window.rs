@@ -94,62 +94,48 @@ impl FullUi {
 }
 
 /// A press on the window's header or the sidebar's top: where the pointer
-/// and the window were, and whether it has become a drag.
+/// was. It becomes a move once the pointer travels; until then it is a click.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Drag {
     mouse: (f64, f64),
-    origin: (f64, f64),
-    moved: bool,
 }
 
 /// A press that moves less than this is a click, not a drag (points).
 const DRAG_SLOP: f64 = 4.0;
 
 impl Panel {
-    /// A press where the window can be taken by: it may become a drag.
-    fn drag_start(&mut self, window: &Window) {
-        if let (Some(full), Some(win)) = (self.full.as_mut(), crate::orb::mac::Win::of(window)) {
-            let f = win.frame();
-            full.drag = Some(Drag { mouse: crate::orb::mac::mouse(), origin: (f.x, f.y), moved: false });
+    /// A press where the window can be taken by: it may become a move.
+    fn drag_start(&mut self, _window: &Window) {
+        if let Some(full) = self.full.as_mut() {
+            full.drag = Some(Drag { mouse: crate::orb::mac::mouse() });
         }
     }
 
-    /// The pointer moved with the button down: the window follows it.
+    /// The pointer moved with the button down: past a few points, macOS
+    /// moves the window from here (as any window's title bar does), so a
+    /// click on a button in the header stays a click. Where it is put is
+    /// kept by `resized` (a move changes its bounds too).
     fn drag_moved(&mut self, window: &Window) {
-        let Some(d) = self.full.as_mut().and_then(|f| f.drag.as_mut()) else { return };
+        let Some(d) = self.full.as_ref().and_then(|f| f.drag) else { return };
         let m = crate::orb::mac::mouse();
-        let (dx, dy) = (m.0 - d.mouse.0, m.1 - d.mouse.1);
-        if !d.moved && dx.hypot(dy) < DRAG_SLOP {
+        if (m.0 - d.mouse.0).hypot(m.1 - d.mouse.1) < DRAG_SLOP {
             return;
         }
-        d.moved = true;
-        if let Some(win) = crate::orb::mac::Win::of(window) {
-            win.set_origin(d.origin.0 + dx, d.origin.1 + dy);
+        if let Some(full) = self.full.as_mut() {
+            full.drag = None;
+        }
+        window.start_window_move();
+    }
+
+    /// Let go without moving: it was a click.
+    fn drag_end(&mut self, _window: &Window) {
+        if let Some(full) = self.full.as_mut() {
+            full.drag = None;
         }
     }
 
-    /// Let go: where it was dropped is kept (wholly on a screen), and it opens there next time.
-    fn drag_end(&mut self, window: &Window) {
-        let Some(d) = self.full.as_mut().and_then(|f| f.drag.take()) else { return };
-        if !d.moved {
-            return;
-        }
-        if let Some(win) = crate::orb::mac::Win::of(window) {
-            let f = win.frame();
-            let (x, y) = crate::orb::nav::keep_on(&crate::orb::mac::screens(), f.x, f.y, f.w, f.h);
-            if (x, y) != (f.x, f.y) {
-                win.set_origin(x, y);
-            }
-            crate::orb::save_window_frame(x, y, f.w, f.h);
-        }
-    }
-
-    /// The user resized it (its edges): that size, and where it is, are
-    /// kept for next time.
+    /// The user moved or resized it: where it is and its size are kept for next time.
     pub(super) fn resized(&mut self, window: &Window) {
-        if self.full.as_ref().is_some_and(|f| f.drag.is_some()) {
-            return;
-        }
         if let Some(win) = crate::orb::mac::Win::of(window) {
             let f = win.frame();
             crate::orb::save_window_frame(f.x, f.y, f.w, f.h);
@@ -161,6 +147,8 @@ impl Panel {
         div()
             .id(id)
             .w_full()
+            // The strip above it too, as a title bar's.
+            .pt(px(20.0))
             .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _: &gpui::MouseDownEvent, window, _| this.drag_start(window)))
             .child(el)
             .into_any_element()
@@ -511,7 +499,6 @@ impl Panel {
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .pt(px(20.0))
                     .px(px(18.0))
                     .pb(px(16.0))
                     .gap(px(16.0))
@@ -520,7 +507,7 @@ impl Panel {
                     .when(!foot.is_empty(), |el| el.child(v_flex().gap(px(8.0)).children(foot)))
                     .when(input, |el| el.child(self.input(window, cx))),
             )
-            // A move keeps going wherever the pointer goes; the window follows it.
+            // A press on a grip becomes a move once the pointer travels (`drag_moved`).
             .child(
                 gpui::canvas(
                     |_, _, _| {},
@@ -682,7 +669,6 @@ impl Panel {
             .w(px(SIDE_W))
             .h_full()
             .flex_none()
-            .pt(px(18.0))
             .px(px(10.0))
             .pb(px(14.0))
             .gap(px(12.0))
@@ -693,6 +679,7 @@ impl Panel {
             .child(
                 v_flex()
                     .id("side-grip")
+                    .pt(px(18.0))
                     .px(px(8.0))
                     .gap(px(3.0))
                     .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _: &gpui::MouseDownEvent, window, _| this.drag_start(window)))

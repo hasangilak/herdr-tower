@@ -969,7 +969,8 @@ fn open_full(tower: &Entity<Tower>, to: Option<nav::Scope>, anchor: Option<mac::
         show: false,
         // As the panel: it takes the keyboard without bringing the app forward.
         kind: WindowKind::PopUp,
-        is_movable: false,
+        // Moved by its header and the sidebar's top (`Panel::drag_moved` hands the move to macOS).
+        is_movable: true,
         // Its edges resize it (`mac::Win::resizable`: the flag alone does nothing without a title bar).
         is_resizable: true,
         window_min_size: Some(size(px(panel::FULL_MIN_W), px(panel::FULL_MIN_H))),
