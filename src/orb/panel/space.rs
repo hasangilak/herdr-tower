@@ -566,23 +566,26 @@ fn thread_key(m: &model::Message) -> String {
 }
 
 /// What a message says, without the "From t7r (Android). " it opens with:
-/// the row names who wrote it already.
+/// the row names who wrote it already. Only an opening the tower reads as
+/// a session's signature (`peers::sender_in`) goes: "From t7h: …", "From
+/// t2. …", "From t7r (Android). …", "From Shop › web (t7h): …".
 fn said_text(text: &str) -> String {
     let t = text.trim();
-    let Some(rest) = t.strip_prefix("From ") else { return t.to_string() };
-    let Some((who, after)) = rest.split_once(' ') else { return t.to_string() };
-    if who.is_empty() || who.len() > 24 || who.contains(|c: char| c == '.' || c == ',') {
+    if crate::peers::sender_in(t).is_none() {
         return t.to_string();
     }
-    // "(Android). " or "(Mac tower): " after the address, or a bare ". " / ": ".
-    let after = match after.strip_prefix('(').and_then(|a| a.split_once(')')) {
-        Some((desc, more)) if desc.len() <= 40 => more,
-        _ => after,
+    let head: String = t.lines().next().unwrap_or("").chars().take(200).collect();
+    // Where the signature ends: its first ": " or ". ", or past the brackets that come before it.
+    let Some(stop) = [": ", ". "].iter().filter_map(|p| head.find(p)).min() else { return t.to_string() };
+    let rest = match head[..stop].find('(') {
+        Some(open) => match head[open..].find(')') {
+            Some(close) => t[open + close + 1..].trim_start_matches([':', '.']),
+            None => return t.to_string(),
+        },
+        None => &t[stop + 2..],
     };
-    match after.strip_prefix(". ").or_else(|| after.strip_prefix(": ")).or_else(|| after.strip_prefix("). ")) {
-        Some(body) if !body.trim().is_empty() => body.trim().to_string(),
-        _ => t.to_string(),
-    }
+    let rest = rest.trim();
+    if rest.is_empty() { t.to_string() } else { rest.to_string() }
 }
 
 /// Longer than its first lines show.
@@ -620,6 +623,9 @@ mod tests {
         assert_eq!(said_text("From now on, run the tests first."), "From now on, run the tests first.");
         assert_eq!(said_text("From t7r (Android)."), "From t7r (Android).");
         assert_eq!(said_text("  The api is on 3001 "), "The api is on 3001");
+        assert_eq!(said_text("From Shop › web (t7h): the build is green"), "the build is green");
+        assert_eq!(said_text("From t7h: fixed (see PR 12). Next is the editor."), "fixed (see PR 12). Next is the editor.");
+        assert_eq!(said_text("From the orb session: hello"), "From the orb session: hello", "not a session's signature");
     }
 
     #[test]
