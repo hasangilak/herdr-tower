@@ -3,19 +3,24 @@
 //! `tower up` starts two Herdr terminals: `tower-voice` (this program's
 //! daemon: Whisper ears, Kokoro mouth, a radar on every session) and `tower`
 //! (a Claude Code or Codex session that steers the others through `hc`).
+//! The daemon then starts a `tower-<space>` beside them for each open space
+//! (see `brains`).
 
 // GPUI comes through GPUI Kit; its macros expect the crate to be called `gpui`.
 extern crate gpui_kit as gpui;
 
 mod accounts;
+mod acts;
 mod agenda;
 mod answers;
 mod activity;
 mod behaviors;
 mod brain;
+mod brains;
 mod chat;
 mod config;
 mod daemon;
+mod decisions;
 mod dispatch;
 mod draft;
 mod hc;
@@ -23,7 +28,11 @@ mod history;
 mod hooks;
 mod install;
 mod introduce;
+mod launch;
+mod missions;
+mod names;
 mod orb;
+mod peers;
 mod phone;
 mod protocol;
 mod projects;
@@ -31,9 +40,12 @@ mod prs;
 mod questions;
 mod screenshots;
 mod selftest;
+mod setups;
 mod spaces;
 mod split;
+mod tell;
 mod text;
+mod worktrees;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -72,14 +84,37 @@ enum Cmd {
         #[arg(long)]
         no_orb: bool,
     },
-    /// Stop the voice and the brain.
+    /// Stop the voice and the brains (the main one, and each space's own).
     Down {
-        /// Leave the brain running.
+        /// Leave the brains running.
         #[arg(long)]
         keep_brain: bool,
     },
-    /// Stop and start the voice (after a config change). The brain keeps running.
-    Restart,
+    /// Stop and start the voice (after a config change). The brains keep running, and the new
+    /// voice finds them again. `--brain`: restart the brains too (each starts a new conversation).
+    Restart {
+        /// The brains too: the main one, and each space's own.
+        #[arg(long)]
+        brain: bool,
+    },
+    /// The model the tower's brains run on (the main one, and each space's own), and their effort:
+    /// `tower model` (the setting, what each running brain was started with, whether a restart is
+    /// needed), `tower model claude-fable-5-2 --effort high`, `tower model --effort xhigh`. Models:
+    /// claude-fable-5-2, claude-opus-5-5 (the default, at high effort), claude-sonnet-5-5,
+    /// claude-haiku-5-5, or any name the program takes. Kept in config.toml (`[brains]`); a change
+    /// applies when a brain starts. `--restart` restarts the brains now.
+    Model {
+        /// The model.
+        model: Option<String>,
+        /// low | medium | high | xhigh | max
+        #[arg(long)]
+        effort: Option<String>,
+        /// Restart the brains now, so they start on it (each starts a new conversation).
+        #[arg(long)]
+        restart: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Send a session an instruction now if it's free, or queue it until it stops working
     /// (delivered in order, kept across restarts). `tower queue list`, `tower queue cancel <id>`.
     Queue {
@@ -202,8 +237,62 @@ enum Cmd {
         /// Not into the ledger: a queued start stands for it already.
         #[arg(long, hide = true)]
         no_track: bool,
+        /// Work in the folder itself, not in the space's worktree of it (a session opened for a
+        /// space with a goal that isn't standing gets a git worktree and a dev port of its own
+        /// otherwise; a space with no goal never does).
+        #[arg(long)]
+        no_worktree: bool,
+        /// Not kept as an act of its own: `tower launch` keeps one for the whole space.
+        #[arg(long, hide = true)]
+        no_act: bool,
         /// Its first task.
         task: Vec<String>,
+    },
+    /// Open a space for a goal, in one go: `tower launch "Fix the login redirect"`. It names the
+    /// space from the goal, makes it, opens a session per repo of a setup (`tower setups`) on its
+    /// account, each in its own git worktree with a dev port, sets the goal and hands it out as the
+    /// first request. It asks nothing, and prints what it assumed. `--dry-run`: only the plan.
+    Launch {
+        /// The goal, in a sentence.
+        #[arg(required = true)]
+        goal: Vec<String>,
+        /// The setup to open it with (default: the only one, else the first).
+        #[arg(long)]
+        setup: Option<String>,
+        /// The space's name (default: the goal's first two words that carry meaning, made unique).
+        #[arg(long)]
+        name: Option<String>,
+        /// Print the plan and do nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// The setups `tower launch` opens a space with: a name, a Claude account, and the repos that
+    /// get a session each (`[[setups]]` in config.toml). The first is the default.
+    Setups {
+        #[arg(long)]
+        json: bool,
+    },
+    /// `tower setup add "<name>" --account <account> --repo <folder> [--repo <folder>…]` (the same
+    /// name again changes it), `tower setup remove "<name>"`.
+    Setup {
+        /// add | remove
+        action: String,
+        /// The setup's name.
+        name: Vec<String>,
+        /// add: the Claude account its sessions run on (`tower accounts`; default: the first).
+        #[arg(long)]
+        account: Option<String>,
+        /// add: a repo's folder (or a project's name), once per repo.
+        #[arg(long)]
+        repo: Vec<String>,
+    },
+    /// Every space as a mission: its goal and state (open, quiet, ready to close), what needs you
+    /// there, its sessions (with worktree and port) and its requests. JSON when piped.
+    Missions {
+        #[arg(long)]
+        json: bool,
     },
     /// The folder a project's name means ("sandbox project", "mediaroom"): the
     /// best match under ~/Work (and one level below), and what else came close.
@@ -275,11 +364,33 @@ enum Cmd {
         #[arg(long)]
         session: Option<String>,
     },
+    /// What only you can decide, in queue order (heaviest first: sessions waiting x how long): what
+    /// sessions ask, PRs waiting for a merge, what the tower raised, tasks that failed twice. JSON when
+    /// piped. `--space <s>`: that space's own (a muted space's too). `--all`: the last ones that closed too.
+    Decisions {
+        /// One space's decisions (its name or a part of it).
+        #[arg(long)]
+        space: Option<String>,
+        #[arg(long)]
+        json: bool,
+        /// Those that closed lately too.
+        #[arg(long)]
+        all: bool,
+    },
     /// Answer a question set: `tower answer <id|session> --json '[{"tab":0,"choice":1}, {"tab":1,"choice":{"other":"…"}}]'`.
+    /// Answer a decision (`tower decisions`): `tower answer <id> --choice 0` (an option, by its number) or
+    /// `--other "<your words>"`; for one that asks a question, `--json` with its answers works too.
     Answer {
         target: String,
-        #[arg(long)]
+        /// A question set's answers.
+        #[arg(long, default_value = "")]
         json: String,
+        /// An option, by its number (from 0).
+        #[arg(long)]
+        choice: Option<usize>,
+        /// Your own words.
+        #[arg(long)]
+        other: Option<String>,
         /// Fill in the answers but don't send them.
         #[arg(long)]
         no_submit: bool,
@@ -305,11 +416,79 @@ enum Cmd {
         #[arg(long)]
         none: bool,
     },
-    /// Dismiss a question set (it shows no more).
+    /// Dismiss a question set, or a decision (it shows no more; nothing is sent).
     Dismiss { id: String },
     /// How session questions are handled: normal (the tower answers routine
     /// ones, the user decides the rest), keep-moving, or ask-everything.
     Policy { policy: Option<String> },
+    /// How much the tower tells you: `decisions` (only what you must decide, and answers to what
+    /// you ask), `results` (also one receipt when a request is finished) or `everything` (every
+    /// delivery, finish and note, as before). `--voice`: what it says out loud: `off` (nothing:
+    /// the mute), `decisions` (a decision, once, in a sentence, and nothing else) or `replies`
+    /// (the default: its answers too). Neither: what they are. Kept in config.toml.
+    Tell {
+        /// decisions | results | everything
+        level: Option<String>,
+        /// off | decisions | replies
+        #[arg(long)]
+        voice: Option<String>,
+    },
+    /// Undo what the tower opened for you: `tower undo` (the latest, when it was opened in the
+    /// last ten minutes) or `tower undo <id>` (`tower acts` lists them). It ends the sessions that
+    /// act opened and removes the worktrees it made for them (each only when nothing in it would
+    /// be lost), or closes the space it launched. Refused, saying why, when a session was given
+    /// more work since or its worktree holds changes; `--force` undoes it anyway.
+    Undo {
+        /// The act (`r…`).
+        id: Option<String>,
+        /// Though work would be lost: the sessions are ended, a worktree with changes is kept.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// What the tower opened for you lately, newest first, with what it assumed and whether it
+    /// can be undone (JSON when piped).
+    Acts {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Put a decision in front of the user (the tower's brain calls it):
+    /// `tower raise t5 --why merge "Merge PR #42 into main: the checks pass"`.
+    Raise {
+        /// The session it is about.
+        session: String,
+        /// The kind of decision: merge, deploy, delete, data, secrets, money, design, failed, waiting.
+        #[arg(long)]
+        why: String,
+        /// The choices to offer, the recommended one first: `[{"label":"…","why":"…"}]`.
+        #[arg(long)]
+        options: Option<String>,
+        /// The decision, in one line.
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
+    /// The one line for a finished request (the tower's brain calls it). Shown and said when you
+    /// want results (`tower tell results`, or you follow its space); kept in the record otherwise.
+    Receipt {
+        /// The agenda it closes (`a3`): refused while its tasks are open, and a second time.
+        #[arg(long)]
+        agenda: Option<String>,
+        /// What was done, in one line.
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
+    /// What the sessions of a space wrote to each other (`tower queue` from one session to
+    /// another), newest last. No space: every space's.
+    Thread {
+        /// The space (its name or a part of it).
+        space: Vec<String>,
+        #[arg(long)]
+        json: bool,
+        /// How many messages.
+        #[arg(short, default_value_t = 50)]
+        n: usize,
+    },
     /// Speak text.
     Say {
         text: Vec<String>,
@@ -331,8 +510,14 @@ enum Cmd {
     Cancel,
     /// Microphone mode: ptt, handsfree or off.
     Mode { mode: String },
-    /// Send text to the brain as if spoken.
-    Ask { text: Vec<String> },
+    /// Send text to the brain as if spoken. `--space <space>`: to that space's own brain, when it
+    /// has one that can take it (else to the main brain, with the space named).
+    Ask {
+        /// The space it is asked in (its name or a part of it).
+        #[arg(long)]
+        space: Option<String>,
+        text: Vec<String>,
+    },
     /// Tell the brain when a terminal stops working.
     Watch { terminal: String, note: Vec<String> },
     /// Record a job in the tower's history: `start`, `done`, `failed` or `update`.
@@ -367,10 +552,33 @@ enum Cmd {
         #[arg(long)]
         clear: bool,
     },
-    /// A space's agenda: `tower space agenda b2c "Answer support tickets"` ("" clears it).
-    Space { what: String, space: String, text: Vec<String> },
-    /// Every Herdr space: focus, agenda, unread news, sessions (JSON when piped).
-    Spaces,
+    /// A space is a mission with an end. `tower space goal b2c "Answer support tickets" [--done-when
+    /// "the queue is empty"]` ("" clears it; `agenda` is the same). `tower space standing <space>
+    /// on|off`: a space you keep (never ready, never closed by the tower, no worktrees).
+    /// `tower space report <space> "<text>"`: its closing report. `tower space close <space>
+    /// [--force]`: ends its sessions, removes its clean worktrees, archives it (refused while a
+    /// session there works or waits for you, unless --force).
+    /// `tower space follow|unfollow <space>`: its finished requests' receipts reach you as they land.
+    /// `tower space mute|unmute <space>`: what needs you there stays in its own view (`tower decisions
+    /// --space <space>`), off the orb's count and out of the main queue.
+    Space {
+        /// goal | agenda | standing | report | close | follow | unfollow | mute | unmute
+        what: String,
+        space: String,
+        text: Vec<String>,
+        /// goal: what counts as done.
+        #[arg(long)]
+        done_when: Option<String>,
+        /// close: though a session there still works or waits for you.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Every Herdr space: focus, goal, state, unread news, sessions (JSON when piped). A space
+    /// quiet for a day, or closed, is left out unless `--all`.
+    Spaces {
+        #[arg(long)]
+        all: bool,
+    },
     /// Catch up on held news, one space at a time, the most pressing first;
     /// what is printed is marked read.
     Digest {
@@ -426,9 +634,13 @@ enum Cmd {
     Selftest,
     /// Run the voice daemon in the foreground (`tower up` does this in a Herdr terminal).
     Daemon,
-    /// Called by the brain's agent when it finishes a turn.
+    /// Called by the brain's agent when it finishes a turn (a space's own brain names itself).
     #[command(hide = true)]
-    Hook { kind: String, arg: Option<String> },
+    Hook {
+        kind: String,
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 fn main() {
@@ -457,10 +669,13 @@ fn run(cli: Cli) -> Result<()> {
                 let which = which.unwrap_or_else(|| cfg.brain.clone());
                 let address = brain::launch(&cfg, &which)?;
                 println!("Brain ({which}) running as {address}.");
+                if cfg.brains.per_space {
+                    println!("Each open space gets a tower of its own (tower-<space>) with its first session: tower status lists them.");
+                }
                 if show {
                     show_terminal(&address)?;
                 }
-                let _ = protocol::send(&Request::Say { text: "Tower online.".into(), interrupt: true, kind: String::new() });
+                let _ = protocol::send(&Request::Say { text: "Tower online.".into(), interrupt: true, kind: String::new(), from: None, brain: None });
             }
             Ok(())
         }
@@ -468,11 +683,17 @@ fn run(cli: Cli) -> Result<()> {
             let _ = protocol::send(&Request::Quit);
             brain::stop(brain::VOICE_NAME);
             if !keep_brain {
+                // The spaces' own first: nothing is left to start them again.
+                let own = brains::stop_space_brains();
                 brain::stop(brain::NAME);
+                if !own.is_empty() {
+                    println!("Stopped the spaces' own brains: {}.", own.join(", "));
+                }
             }
             println!("Tower stopped.");
             Ok(())
         }
+        Cmd::Model { model, effort, restart, json } => brains::cmd_model(model, effort, restart, json),
         Cmd::Queue { args } => queue_cmd(&args),
         Cmd::Dispatch { json, dry_run } => dispatch::run(&json, dry_run),
         Cmd::Sessions { terminal } => {
@@ -538,11 +759,23 @@ fn run(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Restart => {
+        Cmd::Restart { brain: brains_too } => {
             let _ = protocol::send(&Request::Quit);
             brain::stop(brain::VOICE_NAME);
             brain::launch_voice()?;
             println!("Voice restarted.");
+            if brains_too {
+                // By the voice, which outlives them (this command may run in a brain's own terminal).
+                let r = protocol::send(&Request::Brains { action: "restart".into(), space: String::new() })?;
+                if !r.ok {
+                    bail!("{}", r.error.unwrap_or_default());
+                }
+                let names: Vec<String> = r.state.unwrap_or_default()["restarted"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(String::from)).collect();
+                match names.is_empty() {
+                    true => println!("No brain was running: nothing to restart (tower up starts the main one)."),
+                    false => println!("Restarting the brains: {}.", names.join(", ")),
+                }
+            }
             Ok(())
         }
         Cmd::Status => {
@@ -551,11 +784,19 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Agents { all } => agents(all),
-        Cmd::Start { account, name, cwd, on, space, new_space, no_watch, agenda, title, plan_id, no_track, task } => {
+        Cmd::Start { account, name, cwd, on, space, new_space, no_watch, agenda, title, plan_id, no_track, no_worktree, no_act, task } => {
             let tag = (!no_track).then(|| agenda::Tag { agenda, title: title.unwrap_or_default(), plan_id: plan_id.unwrap_or_default(), ..Default::default() });
             let space = space.map(|s| spaces::Asked { name: s, new: new_space });
-            start(account.as_deref(), &name, cwd, on.as_deref(), space.as_ref(), no_watch, tag, &task.join(" "))
+            start(account.as_deref(), &name, cwd, on.as_deref(), space.as_ref(), no_watch, tag, &task.join(" "), no_worktree, !no_act)
         }
+        Cmd::Launch { goal, setup, name, dry_run, json } => launch::cmd(&goal.join(" "), setup.as_deref(), name.as_deref(), dry_run, json),
+        Cmd::Setups { json } => setups::cmd_list(json),
+        Cmd::Setup { action, name, account, repo } => match action.as_str() {
+            "add" => setups::cmd_add(&name.join(" "), account.as_deref(), &repo),
+            "remove" | "rm" | "delete" => setups::cmd_remove(&name.join(" ")),
+            other => bail!("tower setup {other}: use `tower setup add \"<name>\" --account <account> --repo <folder>` or `tower setup remove \"<name>\"` (`tower setups` lists them)"),
+        },
+        Cmd::Missions { json } => missions::cmd_missions(json),
         Cmd::Agenda { action, args, all, force, title, space } => agenda_cmd(&action, &args, all, force, title, space),
         Cmd::Introduce { space, dry_run } => introduce_cmd(&space.join(" "), dry_run),
         Cmd::Accounts { on } => list_accounts(on.as_deref()),
@@ -581,8 +822,20 @@ fn run(cli: Cli) -> Result<()> {
             print_json(&v);
             Ok(())
         }
-        Cmd::Answer { target, json, no_submit, here } => {
-            let answers: Value = serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("--json: {e}"))?;
+        Cmd::Decisions { space, json, all } => decisions_cmd(space, json, all),
+        Cmd::Answer { target, json, choice, other, no_submit, here } => {
+            let decision = decisions::is_id(&target);
+            let answers: Value = match (choice, other, json.trim()) {
+                // A decision takes its option's number or the user's words; a question set, the same for its one question.
+                (Some(n), _, _) if decision => json!({ "choice": n }),
+                (None, Some(text), _) if decision => json!({ "other": text }),
+                (Some(n), _, _) => json!([{ "tab": 0, "choice": n }]),
+                (None, Some(text), _) => json!([{ "tab": 0, "choice": { "other": text } }]),
+                (None, None, "") => bail!(
+                    "tower answer <id> --json '[{{\"tab\":0,\"choice\":1}}]' (a question set), or --choice <n> / --other \"<words>\" (a decision: tower decisions)"
+                ),
+                (None, None, j) => serde_json::from_str(j).map_err(|e| anyhow::anyhow!("--json: {e}"))?,
+            };
             if here {
                 let Some(set) = daemon::asks::detect(&target) else { bail!("{target} isn't blocked on a dialog the tower can read") };
                 let answers: Vec<questions::Answer> = serde_json::from_value(answers)?;
@@ -595,8 +848,19 @@ fn run(cli: Cli) -> Result<()> {
                     Err(stop) => bail!("stopped at {stop}"),
                 };
             }
-            answers::answer(&target, answers, !no_submit)?;
-            println!("Answered{}.", if no_submit { " (filled in, not sent)" } else { "" });
+            let v = answers::answer(&target, answers, !no_submit)?;
+            if !decision {
+                println!("Answered{}.", if no_submit { " (filled in, not sent)" } else { "" });
+            } else if std::io::stdout().is_terminal() {
+                let n = |k: &str| v[k].as_array().map(Vec::len).unwrap_or(0);
+                match v["state"].as_str() {
+                    Some("answering") => println!("Answering {target}: its answer is going in to {} session(s).", n("answered")),
+                    _ if !v["task"].is_null() => println!("Answered {target}: its task {} is {}.", v["task"].as_str().unwrap_or(""), if v["abandoned"].is_null() { "sent again" } else { "dropped" }),
+                    _ => println!("Answered {target}: \"{}\" went to {} session(s).", v["answer"].as_str().unwrap_or(""), n("sent")),
+                }
+            } else {
+                print_json(&v);
+            }
             Ok(())
         }
         Cmd::Recommend { id, json, decision, reason, none } => {
@@ -641,13 +905,61 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Screenshots { last, session } => screenshots::cmd_list(last, session.as_deref()),
         Cmd::Phone { action, id, value, json } => phone::cmd(&action, id.as_deref(), value.as_deref(), json),
         Cmd::Say { text, interrupt, alert } => {
-            ok(Request::Say { text: text.join(" "), interrupt, kind: if alert { "alert".into() } else { String::new() } })
+            ok(Request::Say { text: text.join(" "), interrupt, kind: if alert { "alert".into() } else { String::new() }, from: peers::caller(), brain: None })
         }
+        Cmd::Tell { level, voice } => tell_cmd(level.as_deref(), voice.as_deref()),
+        Cmd::Undo { id, force, json } => undo_cmd(id.as_deref(), force, json),
+        Cmd::Acts { json } => acts_cmd(json),
+        Cmd::Raise { session, why, options, text } => {
+            let options: Option<Value> = match options.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
+                Some(o) => match serde_json::from_str::<Value>(o) {
+                    Ok(v) if v.is_array() => Some(v),
+                    Ok(_) => bail!("--options is a list: '[{{\"label\":\"…\",\"why\":\"…\"}}]'"),
+                    Err(e) => bail!("--options: {e}"),
+                },
+                None => None,
+            };
+            let r = protocol::send(&Request::Raise { session, why, text: text.join(" "), options, from: peers::caller() })?;
+            if !r.ok {
+                bail!("{}", r.error.unwrap_or_default());
+            }
+            let v = r.state.unwrap_or_default();
+            if std::io::stdout().is_terminal() {
+                let (id, name, session) = (v["id"].as_str().unwrap_or(""), v["name"].as_str().unwrap_or(""), v["session"].as_str().unwrap_or(""));
+                if v["new"] == true {
+                    println!("Raised for the user as {id}, about {name} ({session}). It is shown, and said once: don't say or raise it again.");
+                } else {
+                    println!(
+                        "Already in front of the user as {id} ({}; raised {} time(s), {} session(s) waiting): nothing new is shown or said.",
+                        v["title"].as_str().unwrap_or(""),
+                        v["count"],
+                        v["waiting"]
+                    );
+                }
+            } else {
+                print_json(&v);
+            }
+            Ok(())
+        }
+        Cmd::Receipt { agenda, text } => {
+            let r = protocol::send(&Request::Receipt { text: text.join(" "), agenda, from: peers::caller() })?;
+            if !r.ok {
+                bail!("{}", r.error.unwrap_or_default());
+            }
+            let v = r.state.unwrap_or_default();
+            if std::io::stdout().is_terminal() {
+                println!("{}", if v["told"] == true { "Receipt shown and said to the user." } else { "Receipt kept in the record: nothing is shown or said (`tower tell results`, or `tower space follow <space>`, to hear them)." });
+            } else {
+                print_json(&v);
+            }
+            Ok(())
+        }
+        Cmd::Thread { space, json, n } => peers::cmd(&space.join(" "), json, n),
         Cmd::Hush => ok(Request::Hush),
         Cmd::Talk { action } => ok(Request::Talk { action }),
         Cmd::Cancel => ok(Request::Cancel),
         Cmd::Mode { mode } => ok(Request::Mode { mode }),
-        Cmd::Ask { text } => ok(Request::Ask { text: text.join(" ") }),
+        Cmd::Ask { space, text } => ok(Request::Ask { text: text.join(" "), space: space.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) }),
         Cmd::Job { action, terminal, text, status } => {
             let text = text.join(" ");
             match action.as_str() {
@@ -685,11 +997,19 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Focus { space, clear } => spaces::cmd_focus(Some(space.join(" ")).filter(|s| !s.is_empty()), clear),
-        Cmd::Space { what, space, text } => match what.as_str() {
-            "agenda" => spaces::cmd_agenda(space, text.join(" ")),
-            other => bail!("tower space {other}: use `tower space agenda <space> \"<text>\"`"),
+        Cmd::Space { what, space, text, done_when, force } => match what.as_str() {
+            "goal" | "agenda" => missions::cmd_goal(space, text.join(" "), done_when),
+            "report" => missions::cmd_report(space, text.join(" ")),
+            // The space's name may be several words.
+            "standing" => missions::cmd_standing(std::iter::once(space).chain(text).collect()),
+            "close" => missions::cmd_close(std::iter::once(space).chain(text).collect::<Vec<_>>().join(" "), force),
+            "follow" | "unfollow" => spaces::cmd_follow(std::iter::once(space).chain(text).collect::<Vec<_>>().join(" "), what == "follow"),
+            "mute" | "unmute" => spaces::cmd_mute(std::iter::once(space).chain(text).collect::<Vec<_>>().join(" "), what == "mute"),
+            other => bail!(
+                "tower space {other}: use `tower space goal <space> \"<goal>\" [--done-when \"<…>\"]`, `standing <space> on|off`, `report <space> \"<text>\"`, `close <space> [--force]`, or `follow|unfollow|mute|unmute <space>`"
+            ),
         },
-        Cmd::Spaces => spaces::cmd_spaces(),
+        Cmd::Spaces { all } => spaces::cmd_spaces(all),
         Cmd::Digest { list, skip, space, peek } => spaces::cmd_digest(list, skip, space, peek),
         Cmd::Log { text, session } => {
             match session {
@@ -710,16 +1030,18 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Doctor => install::doctor(),
         Cmd::Daemon => daemon::run(),
         Cmd::Selftest => selftest::run(),
-        Cmd::Hook { kind, arg } => {
+        Cmd::Hook { kind, args } => {
+            let arg = args.first().map(String::as_str);
             match kind.as_str() {
-                "claude" => hooks::claude_stop(),
-                "claude-notify" => hooks::claude_notify(),
-                "codex" => hooks::codex(arg),
+                // A space's own brain's hooks say whose they are: `tower hook claude tower-<space>`.
+                "claude" => hooks::claude_stop(arg),
+                "claude-notify" => hooks::claude_notify(arg),
+                "codex" => hooks::codex(&args),
                 "activity-prompt" => activity::hook("prompt"),
                 "activity-pre" => activity::hook("pre"),
                 "activity-post" => activity::hook("post"),
                 // Every agent session's hooks: `tower hook agent claude|codex`.
-                "agent" => hooks::agent(arg.as_deref().unwrap_or("claude")),
+                "agent" => hooks::agent(arg.unwrap_or("claude")),
                 // The brain's Bash calls: one hand-off per task.
                 "brain-guard" => hooks::brain_guard(),
                 _ => {}
@@ -769,6 +1091,86 @@ fn show_history(jobs: Option<&str>, session: Option<&str>, n: usize) -> Result<(
     Ok(())
 }
 
+/// `tower tell [decisions|results|everything] [--voice off|decisions|replies]`:
+/// how much it tells and what it says out loud, or set them.
+fn tell_cmd(level: Option<&str>, voice: Option<&str>) -> Result<()> {
+    let level = level.map(tell::parse).transpose()?;
+    let voice = voice.map(tell::parse_voice).transpose()?;
+    let (level, voice) = if protocol::is_running() {
+        // The voice keeps them, shows them, and has the brain read its instructions again.
+        let r = protocol::send(&Request::Tell { level: level.map(|l| l.word().into()), voice: voice.map(|v| v.word().into()) })?;
+        if !r.ok {
+            bail!("{}", r.error.unwrap_or_default());
+        }
+        let v = r.state.unwrap_or_default();
+        (
+            v["level"].as_str().and_then(tell::Level::parse).unwrap_or_else(tell::level),
+            v["voice"].as_str().and_then(tell::Voice::parse).unwrap_or_else(tell::voice),
+        )
+    } else {
+        // The voice isn't running: kept for when it starts.
+        if let Some(l) = level {
+            tell::set(l)?;
+        }
+        if let Some(v) = voice {
+            tell::set_voice(v)?;
+        }
+        (level.unwrap_or_else(tell::level), voice.unwrap_or_else(tell::voice))
+    };
+    if std::io::stdout().is_terminal() {
+        println!("{level}. {}", level.says());
+        println!("Voice: {voice}. {}", voice.says());
+    } else {
+        print_json(&json!({ "level": level.word(), "voice": voice.word() }));
+    }
+    Ok(())
+}
+
+/// `tower undo [<id>] [--force]`: the daemon ends what that act opened.
+fn undo_cmd(id: Option<&str>, force: bool, as_json: bool) -> Result<()> {
+    let r = protocol::send(&Request::Act { action: "undo".into(), id: id.map(String::from), force, act: None, from: peers::caller() })?;
+    if !r.ok {
+        bail!("{}", r.error.unwrap_or_default());
+    }
+    let v = r.state.unwrap_or_default();
+    if as_json || !std::io::stdout().is_terminal() {
+        print_json(&v);
+    } else {
+        println!("{} ({}: {})", v["closing"].as_str().unwrap_or("Undone."), v["act"]["id"].as_str().unwrap_or(""), v["act"]["line"].as_str().unwrap_or(""));
+    }
+    Ok(())
+}
+
+/// `tower acts`: what the tower opened lately.
+fn acts_cmd(as_json: bool) -> Result<()> {
+    let r = protocol::send(&Request::Act { action: "list".into(), id: None, force: false, act: None, from: None })?;
+    if !r.ok {
+        bail!("{}", r.error.unwrap_or_default());
+    }
+    let v = r.state.unwrap_or_default();
+    if as_json || !std::io::stdout().is_terminal() {
+        print_json(&v);
+        return Ok(());
+    }
+    let list = v["acts"].as_array().cloned().unwrap_or_default();
+    if list.is_empty() {
+        println!("Nothing was opened lately.");
+    }
+    for a in list {
+        let how = match (a["state"].as_str(), a["undo"]["possible"].as_bool()) {
+            (Some("undone"), _) => "undone".to_string(),
+            (_, Some(true)) => "can be undone".to_string(),
+            _ => format!("undo needs --force: {}", a["undo"]["why"].as_str().unwrap_or("")),
+        };
+        let assumed: Vec<String> = a["assumed"].as_array().into_iter().flatten().map(|c| format!("{} {} ({})", c["what"].as_str().unwrap_or(""), c["value"].as_str().unwrap_or(""), c["why"].as_str().unwrap_or(""))).collect();
+        println!("{}  {}  [{how}]", a["id"].as_str().unwrap_or(""), a["line"].as_str().unwrap_or(""));
+        if !assumed.is_empty() {
+            println!("    assumed: {}", assumed.join("; "));
+        }
+    }
+    Ok(())
+}
+
 fn ok(req: Request) -> Result<()> {
     let r = protocol::send(&req)?;
     if !r.ok {
@@ -782,6 +1184,44 @@ fn queue_id(s: &str) -> Result<u64> {
     s.trim_start_matches('#').parse().map_err(|_| anyhow::anyhow!("{s} isn't an id (tower queue list shows them)"))
 }
 
+/// `tower decisions`: what only the user can decide, in queue order.
+fn decisions_cmd(space: Option<String>, as_json: bool, all: bool) -> Result<()> {
+    let r = protocol::send(&Request::Decisions { space, all })?;
+    if !r.ok {
+        bail!("{}", r.error.unwrap_or_default());
+    }
+    let v = r.state.unwrap_or_default();
+    if as_json || !std::io::stdout().is_terminal() {
+        print_json(&v);
+        return Ok(());
+    }
+    let rows = |key: &str| -> Vec<decisions::Decision> { v[key].as_array().into_iter().flatten().filter_map(|d| serde_json::from_value(d.clone()).ok()).collect() };
+    let list = rows("decisions");
+    if list.is_empty() {
+        match v["space"].as_str() {
+            Some(s) => println!("Nothing needs you in {s}."),
+            None => println!("Nothing needs you."),
+        }
+    }
+    for d in &list {
+        println!("{}", d.row());
+        for (i, o) in d.options.iter().enumerate() {
+            println!("      {i}. {}{}{}", o.label, if o.pick { " (the tower's pick)" } else { "" }, if o.why.is_empty() { String::new() } else { format!(": {}", o.why) });
+        }
+    }
+    if !list.is_empty() {
+        println!("(tower answer <id> --choice <n> | --other \"<words>\"; tower dismiss <id>; a merge is its PR's Merge button)");
+    }
+    let closed = rows("closed");
+    if !closed.is_empty() {
+        println!("Closed lately:");
+        for d in &closed {
+            println!("{}  {:<10} {}  {}", d.id, d.state.word(), phone::ago(d.closed_ms.unwrap_or(d.last_ms)), d.title);
+        }
+    }
+    Ok(())
+}
+
 fn queue_cmd(args: &[String]) -> Result<()> {
     let q = |action: &str, session: &str, text: String, id: Option<u64>, after: Vec<u64>| Request::Queue {
         action: action.into(),
@@ -791,6 +1231,7 @@ fn queue_cmd(args: &[String]) -> Result<()> {
         after,
         start: vec![],
         tag: None,
+        from: None,
     };
     let usage = "usage: tower queue <session> [--after <id>[,<id>]] [--agenda <id>] \"<instruction>\" | list | cancel <id> | retarget <id> <session>";
     let req = match args.first().map(String::as_str) {
@@ -819,8 +1260,10 @@ fn queue_cmd(args: &[String]) -> Result<()> {
                 }
             }
             let mut req = q("add", session, rest.join(" "), None, after);
-            if let Request::Queue { tag, .. } = &mut req {
+            if let Request::Queue { tag, from, .. } = &mut req {
                 *tag = Some(agenda::Tag { agenda: agenda_id, ..Default::default() });
+                // Who is asking: the terminal this runs in, when it runs in Herdr.
+                *from = peers::caller();
             }
             req
         }
@@ -840,6 +1283,14 @@ fn queue_cmd(args: &[String]) -> Result<()> {
         return Ok(());
     }
     match action.as_str() {
+        // One session writing to another: delivered, and nothing more happens.
+        "add" if v["peer"] == true => println!(
+            "{} {} ({}): the tower put your name on it.{}",
+            if v["sent"] == true { "Message sent to" } else { "Message queued for" },
+            v["session"].as_str().unwrap_or(""),
+            v["name"].as_str().unwrap_or(""),
+            if v["sent"] == true { "" } else { " It goes in when that session stops working; you are told only if it can't be delivered." }
+        ),
         "add" if v["sent"] == true => println!(
             "Sent #{} to {} ({}): it was free. Watching it: you'll get a [watch] message when it stops working.{}",
             v["id"],
@@ -921,7 +1372,8 @@ fn agent_rows(all: bool) -> (Vec<Value>, Vec<Value>) {
                 for t in list {
                     let status = hc::status_word(&t);
                     let name = t["name"].as_str().unwrap_or("");
-                    if name == brain::NAME || name == brain::VOICE_NAME {
+                    // The tower's own terminals (its brains, its voice) are no agents to steer.
+                    if name == brain::VOICE_NAME || (machine.is_none() && brain::is_brain_name(name)) {
                         continue;
                     }
                     if status.is_none() && !all {
@@ -953,20 +1405,48 @@ fn agent_rows(all: bool) -> (Vec<Value>, Vec<Value>) {
 
 /// `tower start`: a Claude Code session on an account, through `cca <account>`.
 #[allow(clippy::too_many_arguments)]
-fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str>, space: Option<&spaces::Asked>, no_watch: bool, tag: Option<agenda::Tag>, task: &str) -> Result<()> {
+fn start(
+    account: Option<&str>,
+    name: &str,
+    cwd: Option<String>,
+    on: Option<&str>,
+    space: Option<&spaces::Asked>,
+    no_watch: bool,
+    tag: Option<agenda::Tag>,
+    task: &str,
+    no_worktree: bool,
+    keep_act: bool,
+) -> Result<()> {
+    // `tower` and `tower-…` are the towers' own terminals: a session called so would be taken for one.
+    if let Some(why) = brain::not_a_sessions_name(name) {
+        bail!("{why}");
+    }
+    // What it settles by itself, and why: it asks nothing, and says so afterwards (`assumed`).
+    let asked_account = account.map(str::trim).filter(|a| !a.is_empty()).map(String::from);
     // The space first: it may say which machine the session runs on. One
     // that doesn't exist yet is made below; of several, the closest is taken.
     let spaces = if space.is_some() { spaces::windows() } else { vec![] };
     let mut notes: Vec<String> = vec![];
+    let mut space_why = "the one the window shows: none was named".to_string();
     let (target, new_space) = match space {
         Some(want) => match spaces::best_window(want, &spaces) {
-            spaces::Placing::One(w) | spaces::Placing::Closest(w, _) if want.new && !w.name.eq_ignore_ascii_case(want.name.trim()) => (None, Some(want.name.trim().to_string())),
-            spaces::Placing::One(w) => (Some(w.clone()), None),
-            spaces::Placing::Closest(w, others) => {
-                notes.push(format!("\"{}\" matched several spaces ({}): took \"{}\"", want.name, others.join(", "), w.name));
+            spaces::Placing::One(w) | spaces::Placing::Closest(w, _) if want.new && !w.name.eq_ignore_ascii_case(want.name.trim()) => {
+                space_why = "made: a new space was asked for".into();
+                (None, Some(want.name.trim().to_string()))
+            }
+            spaces::Placing::One(w) => {
+                space_why = if w.name.eq_ignore_ascii_case(want.name.trim()) { "as asked".into() } else { format!("the one \"{}\" names", want.name.trim()) };
                 (Some(w.clone()), None)
             }
-            spaces::Placing::New(name) => (None, Some(name)),
+            spaces::Placing::Closest(w, others) => {
+                notes.push(format!("\"{}\" matched several spaces ({}): took \"{}\"", want.name, others.join(", "), w.name));
+                space_why = format!("the closest to \"{}\" (it also matched {})", want.name.trim(), others.join(", "));
+                (Some(w.clone()), None)
+            }
+            spaces::Placing::New(name) => {
+                space_why = "made: no space had that name".into();
+                (None, Some(name))
+            }
         },
         None => (None, None),
     };
@@ -985,6 +1465,17 @@ fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str
         }
     };
     let account = accounts::resolve(account, &known)?;
+    let account_why = match (&account, &asked_account) {
+        (None, _) => "none: no accounts are known here, so it runs plain claude".to_string(),
+        (Some(a), Some(asked)) if a.eq_ignore_ascii_case(asked) => "as asked".to_string(),
+        (Some(_), Some(asked)) => format!("what \"{asked}\" names"),
+        (Some(_), None) => "the default one: none was named".to_string(),
+    };
+    let mut folder_why = match (&cwd, on) {
+        (Some(_), _) => "as asked".to_string(),
+        (None, Some(m)) => format!("{m}'s home: none was named"),
+        (None, None) => "the folder the command ran in: none was named".to_string(),
+    };
     // `~` in --cwd, as a shell would have it.
     let cwd = cwd.map(|c| match c.strip_prefix("~/") {
         Some(rest) if on.is_none() => dirs::home_dir().unwrap_or_default().join(rest).to_string_lossy().into_owned(),
@@ -1002,6 +1493,7 @@ fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str
                     m.folder,
                     if others.is_empty() { String::new() } else { format!(" (also close: {})", others.join(", ")) }
                 ));
+                folder_why = format!("the best match for \"{c}\"{}", if others.is_empty() { String::new() } else { format!(" (also close: {})", others.join(", ")) });
                 chosen = Some((m.folder.clone(), others));
                 Some(m.path.to_string_lossy().into_owned())
             }
@@ -1009,8 +1501,51 @@ fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str
         },
         c => c,
     };
+    // A session opened for a mission (a space with a goal, or one `tower
+    // launch` made, that isn't standing) works in that space's git worktree
+    // of its repo, with a dev port of its own (see `worktrees`). Not in a
+    // space with no goal, not on another machine, not in a folder that is no
+    // git checkout.
+    let space_name = target.as_ref().map(|t| t.name.clone()).or_else(|| new_space.clone());
+    let project = cwd.clone();
+    let mut made: Option<worktrees::Made> = None;
+    let mut port: Option<u16> = None;
+    let mut cwd = cwd;
+    if let Some(sp) = space_name.as_deref().filter(|_| on.is_none() && !no_worktree) {
+        let rules = config::Config::load().map(|c| c.spaces).unwrap_or_default();
+        let folder = cwd.clone().or_else(|| target.as_ref().map(|t| t.folder.clone()).filter(|f| !f.is_empty()));
+        if let Some(folder) = folder.filter(|_| rules.worktrees && missions::is_mission(sp)) {
+            match worktrees::ensure(std::path::Path::new(&folder), sp) {
+                Ok(Some(m)) => {
+                    port = worktrees::pick_port(&rules.port_range, &worktrees::handed_ports());
+                    notes.push(format!(
+                        "it works in {} worktree of {} at {} (branch {}){}",
+                        if m.fresh { "a fresh" } else { "the space's" },
+                        m.place.repo,
+                        m.place.path,
+                        m.place.branch,
+                        port.map(|p| format!(", with port {p} for a dev server")).unwrap_or_default()
+                    ));
+                    // Remembered with the space before the session opens: closing the space finds it either way.
+                    if worktrees::place(std::path::Path::new(&m.place.repo), sp).path == m.place.path {
+                        missions::opened(sp, Some(&m.place));
+                    }
+                    cwd = Some(m.cwd.clone());
+                    made = Some(m);
+                }
+                Ok(None) => {}
+                Err(e) => notes.push(format!("no worktree ({e:#}): it works in {folder} itself")),
+            }
+        }
+    }
+    // Where it works and its port are said after its task.
+    let first = match (made.as_ref().map(|m| worktrees::briefing(m, port)), task.trim().is_empty()) {
+        (Some(b), false) => format!("{task}\n\n{b}"),
+        (Some(b), true) => b,
+        (None, _) => task.to_string(),
+    };
     let cca = cca.unwrap_or_else(|| "cca".into());
-    let how = accounts::Start { name, cwd: cwd.as_deref(), on, task, account: account.as_deref(), cca: &cca };
+    let how = accounts::Start { name, cwd: cwd.as_deref(), on, task: &first, account: account.as_deref(), cca: &cca };
     let (address, placed) = match (&target, &new_space) {
         (Some(sp), _) => (start_in_space(sp, &how, &spaces)?, Some(sp.name.clone())),
         (None, Some(name)) => {
@@ -1035,6 +1570,13 @@ fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str
             (address, placed)
         }
     };
+    // What it was given stays on its terminal, and its space is a mission the tower knows (open again, if it was closed).
+    worktrees::label(&address, made.as_ref().map(|m| &m.place), port);
+    if space.is_some()
+        && let Some(sp) = &placed
+    {
+        missions::opened(sp, None);
+    }
     let on_account = account.as_deref().map(|a| format!(" on the {a} account")).unwrap_or_default();
     let in_space = match &placed {
         Some(sp) => format!(" in space \"{sp}\""),
@@ -1051,7 +1593,8 @@ fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str
     let tracked = match tag {
         Some(mut tag) if !task.trim().is_empty() && protocol::is_running() => {
             tag.space = placed.clone();
-            tag.project = cwd.clone().unwrap_or_default();
+            // The project is the repo, not the space's worktree of it.
+            tag.project = project.clone().or_else(|| cwd.clone()).unwrap_or_default();
             protocol::send(&Request::Queue {
                 action: "track".into(),
                 session: address.clone(),
@@ -1060,6 +1603,7 @@ fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str
                 after: vec![],
                 start: vec![],
                 tag: Some(tag),
+                from: None,
             })
             .ok()
             .filter(|r| r.ok)
@@ -1072,20 +1616,73 @@ fn start(account: Option<&str>, name: &str, cwd: Option<String>, on: Option<&str
     if protocol::is_running() {
         let _ = protocol::send(&Request::Introduce { action: "kick".into(), space: String::new(), dry_run: false });
     }
+    let given = made.as_ref().map(|m| m.place.clone());
+    // What was settled without asking, for the receipt and for `tower undo`.
+    let folder = project.clone().or_else(|| on.is_none().then(|| std::env::current_dir().ok().map(|d| d.to_string_lossy().into_owned())).flatten());
+    let assumed = json!({
+        "account": account, "account_why": account_why,
+        "model": "default model", "model_why": "none was asked for: a session starts on its account's model",
+        "folder": folder, "folder_why": folder_why,
+        "worktree": given.as_ref().map(|p| p.path.clone()),
+        "worktree_why": match &made {
+            Some(m) if m.fresh => format!("made for this space, on the branch {}", m.place.branch),
+            Some(m) => format!("this space's worktree of the repo, which was there already (branch {})", m.place.branch),
+            None => "none: it works in the folder itself".to_string(),
+        },
+        "space": placed, "space_why": if placed.is_some() { space_why } else { "none: no Herdr window shows one".to_string() },
+        "name": name, "name_why": "as asked",
+    });
+    // Which terminal it is: an address can come back for another one.
+    let made_ms = hc::get(&address).and_then(|t| hc::created_ms(&t));
+    let act = match keep_act && protocol::is_running() {
+        true => {
+            let opened = acts::Opened {
+                address: address.clone(),
+                name: name.to_string(),
+                created_ms: made_ms,
+                worktree: given.clone(),
+                fresh: made.as_ref().is_some_and(|m| m.fresh),
+                first: first.clone(),
+                task: tracked["task"].as_str().map(String::from),
+                more: None,
+            };
+            let what = json!({ "kind": "start", "space": placed, "space_made": new_space.is_some(), "sessions": [opened], "assumed": assumed });
+            protocol::send(&Request::Act { action: "record".into(), id: None, force: false, act: Some(what), from: peers::caller() })
+                .ok()
+                .filter(|r| r.ok)
+                .and_then(|r| r.state)
+                .and_then(|v| v["id"].as_str().map(String::from))
+        }
+        false => None,
+    };
     if std::io::stdout().is_terminal() {
         println!(
-            "Started {name} as {address}{in_space}{on_account}.{}{}{}",
+            "Started {name} as {address}{in_space}{on_account}.{}{}{}{}",
             notes.iter().map(|n| format!(" {}{}.", n[..1].to_uppercase(), &n[1..])).collect::<String>(),
             if watched { " Watching it: you'll get a [watch] message when it stops working. End your turn now." } else { "" },
-            agenda_said(&tracked)
+            agenda_said(&tracked),
+            act.as_deref().map(|id| format!(" To take it back: tower undo {id}.")).unwrap_or_default()
         );
     } else {
         let mut v = json!({
             "address": address, "name": name, "space": placed, "account": account, "watching": watched,
             "queue_id": tracked["id"], "agenda": tracked["agenda"], "task": tracked["task"],
+            "assumed": assumed, "act": act,
         });
         if new_space.is_some() {
             v["space_made"] = json!(true);
+        }
+        if let Some(ms) = made_ms {
+            v["created_ms"] = json!(ms);
+        }
+        if let Some(p) = &given {
+            v["worktree"] = json!(p.path);
+            v["branch"] = json!(p.branch);
+            v["repo"] = json!(p.repo);
+            v["worktree_fresh"] = json!(made.as_ref().is_some_and(|m| m.fresh));
+        }
+        if let Some(p) = port {
+            v["port"] = json!(p);
         }
         if let Some((folder, others)) = chosen {
             v["folder"] = json!(folder);
@@ -1120,6 +1717,14 @@ fn agenda_judged(terminal: &str, ok: bool, text: &str) {
     };
     if let Some(t) = v["task"].as_str() {
         println!("Agenda task {t} is {}.", if ok { "verified" } else { "failed" });
+    }
+    // It failed a moment ago and the tower sent it once more by itself: this word is about the try before.
+    if let Some(t) = v["retried"].as_str() {
+        println!("Agenda task {t} failed before, and the tower sent it once more by itself: it is on its way again. Nothing to do; if it fails again, the tower asks the user.");
+    }
+    // The request is finished: its one receipt is due (the brain's own words say it when the tower tells everything).
+    if let Some(a) = v["agenda_done"].as_str().filter(|_| tell::level().quiet()) {
+        println!("That was the last of {a}: the request is finished. Give its receipt once: tower receipt --agenda {a} \"<one line: what was done>\"");
     }
 }
 
@@ -1329,7 +1934,7 @@ fn start_in_space(sp: &spaces::Window, how: &accounts::Start, all: &[spaces::Win
     if !folder.is_empty() {
         args.extend(["--folder", &folder]);
     }
-    let out = match std::process::Command::new("herdr-app").args(&args).stdin(std::process::Stdio::null()).output() {
+    let out = match std::process::Command::new(config::herdr_app_bin()).args(&args).stdin(std::process::Stdio::null()).output() {
         Ok(o) => o,
         Err(e) => bail!("herdr-app: {e}"),
     };
@@ -1348,7 +1953,7 @@ fn start_in_space(sp: &spaces::Window, how: &accounts::Start, all: &[spaces::Win
     if let Some(was) = all.iter().find(|s| s.active)
         && was.id != sp.id
     {
-        let _ = std::process::Command::new("herdr-app").args(["do", "space.select", "--id", &was.id]).output();
+        let _ = std::process::Command::new(config::herdr_app_bin()).args(["do", "space.select", "--id", &was.id]).output();
     }
     Ok(address)
 }
@@ -1365,7 +1970,7 @@ fn new_space_with(name: &str, how: &accounts::Start, all: &[spaces::Window]) -> 
     if let Some(m) = how.on {
         args.extend(["--machine", m]);
     }
-    let out = match std::process::Command::new("herdr-app").args(&args).stdin(std::process::Stdio::null()).output() {
+    let out = match std::process::Command::new(config::herdr_app_bin()).args(&args).stdin(std::process::Stdio::null()).output() {
         Ok(o) => o,
         Err(e) => bail!("herdr-app: {e}"),
     };
@@ -1381,7 +1986,7 @@ fn new_space_with(name: &str, how: &accounts::Start, all: &[spaces::Window]) -> 
     let _ = hc::run(&["label", &address, &label]);
     // space.new shows the new space; give the window back to the one it showed.
     if let Some(was) = all.iter().find(|s| s.active) {
-        let _ = std::process::Command::new("herdr-app").args(["do", "space.select", "--id", &was.id]).output();
+        let _ = std::process::Command::new(config::herdr_app_bin()).args(["do", "space.select", "--id", &was.id]).output();
     }
     Ok(address)
 }
@@ -1458,7 +2063,7 @@ fn behavior_cmd(action: &str, arg: &[String], title: Option<String>, category: O
     let by = behaviors::caller();
     let (b, c) = behaviors::apply(op, by)?;
     let view = c.view();
-    let _ = protocol::send(&Request::BehaviorsChanged { by: by.into(), change: view.clone() });
+    let _ = protocol::send(&Request::BehaviorsChanged { by: by.into(), change: view.clone(), from: peers::caller() });
     if json || !std::io::stdout().is_terminal() {
         print_json(&json!({ "behavior": b, "change": view }));
     } else {
@@ -1502,7 +2107,7 @@ pub fn show_terminal(address: &str) -> Result<()> {
     } else {
         vec!["do", "terminal.keep", "--terminal", &addr, "--place", "tab"]
     };
-    let out = std::process::Command::new("herdr-app").args(&args).output();
+    let out = std::process::Command::new(config::herdr_app_bin()).args(&args).output();
     match out {
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => bail!("herdr-app: {}{}", String::from_utf8_lossy(&o.stdout).trim(), String::from_utf8_lossy(&o.stderr).trim()),

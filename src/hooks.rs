@@ -9,16 +9,44 @@ use serde_json::Value;
 
 use crate::protocol::{self, Request};
 
+/// Whose hook this is: the main brain's, or a space's own (its hooks name
+/// it: `tower hook claude tower-<space>`).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Who {
+    /// A space's brain, by its terminal's name (None: the main brain).
+    brain: Option<String>,
+    /// Its space, as its folder says.
+    space: Option<String>,
+}
+
+impl Who {
+    fn of(brain: Option<&str>) -> Who {
+        match brain.map(str::trim).filter(|b| crate::brains::is_space_brain(b)) {
+            Some(b) => Who { brain: Some(b.to_string()), space: crate::brains::card_of(b).map(|c| c.space) },
+            None => Who::default(),
+        }
+    }
+
+    fn name(&self) -> Option<String> {
+        self.brain.clone()
+    }
+}
+
 /// Claude Code's Stop hook: JSON on stdin with the transcript's path.
-pub fn claude_stop() {
-    // The turn is over: the orb's working line gives way to the answer.
-    crate::activity::clear();
+/// `brain`: the space's brain whose hook it is (None: the main brain's).
+pub fn claude_stop(brain: Option<&str>) {
+    let who = Who::of(brain);
+    // The turn is over: the orb's working line (the main brain's) gives way to the answer.
+    if who.brain.is_none() {
+        crate::activity::clear();
+    }
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let v: Value = serde_json::from_str(&input).unwrap_or_default();
     // A turn that answered a `[question]` note (recommendations): nothing to say or keep.
-    if v["transcript_path"].as_str().and_then(last_prompt).is_some_and(|p| crate::brain::is_question_prompt(&p)) {
-        let _ = protocol::send(&Request::Say { text: String::new(), interrupt: false, kind: "answer".into() });
+    let prompt = v["transcript_path"].as_str().and_then(last_prompt);
+    if prompt.as_deref().is_some_and(crate::brain::is_question_prompt) {
+        let _ = protocol::send(&Request::Say { text: String::new(), interrupt: false, kind: "answer".into(), from: None, brain: who.name() });
         return;
     }
     let text = v["last_assistant_message"]
@@ -27,44 +55,100 @@ pub fn claude_stop() {
         .filter(|s| !s.trim().is_empty())
         .or_else(|| v["transcript_path"].as_str().and_then(last_assistant_text));
     match text {
-        Some(text) => say(&text, "answer"),
+        Some(text) => finish(&text, prompt.as_deref(), &who),
         // Nothing to say, but the turn is over all the same.
         None => {
-            let _ = protocol::send(&Request::Say { text: String::new(), interrupt: false, kind: "answer".into() });
+            let _ = protocol::send(&Request::Say { text: String::new(), interrupt: false, kind: "answer".into(), from: None, brain: who.name() });
         }
     }
 }
 
+/// What the brain's words at the end of a turn are.
+#[derive(Debug, PartialEq)]
+enum Said {
+    /// Its answer to the user: a chat message, spoken.
+    Answer,
+    /// A note turn at a quiet level: kept for the record, about this
+    /// session (None: no one session). Not a chat message, not spoken.
+    Note(Option<String>),
+}
+
+/// How a turn that began with `prompt` ends at `level` (see `tell`): a
+/// note from the tower itself is answered for the record unless the tower
+/// tells everything; what the user asked is always answered to them.
+fn said_as(prompt: Option<&str>, level: crate::tell::Level) -> Said {
+    match prompt {
+        Some(p) if level.quiet() && crate::brain::is_note_prompt(p) => Said::Note(crate::brain::note_session(p)),
+        _ => Said::Answer,
+    }
+}
+
+/// A brain's turn is over with `text`, after `prompt`. A space's own
+/// brain's answer is kept as that space's, and said like the main one's.
+fn finish(text: &str, prompt: Option<&str>, who: &Who) {
+    match said_as(prompt, crate::tell::level()) {
+        Said::Answer => say(text, "answer", who),
+        Said::Note(session) => {
+            crate::history::record_note(session.as_deref(), text, who.space.clone());
+            // The turn is over all the same.
+            let _ = protocol::send(&Request::Say { text: String::new(), interrupt: false, kind: "answer".into(), from: None, brain: who.name() });
+        }
+    }
+}
+
+/// What a brain's permission question is said as: the main brain's in its
+/// own voice, a space's by its space.
+fn go_ahead(msg: &str, who: &Who) -> String {
+    let msg = msg.trim_end_matches('.');
+    match (&who.brain, &who.space) {
+        (None, _) => format!("I need your go-ahead: {}.", msg.replace("Claude needs", "I need")),
+        (Some(_), Some(space)) => format!("The {space} tower needs your go-ahead: {}.", msg.replace("Claude needs", "it needs")),
+        (Some(b), None) => format!("{} needs your go-ahead: {}.", b.replace('-', " "), msg.replace("Claude needs", "it needs")),
+    }
+}
+
 /// Claude Code's Notification hook: say permission questions out loud.
-pub fn claude_notify() {
+pub fn claude_notify(brain: Option<&str>) {
+    let who = Who::of(brain);
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let v: Value = serde_json::from_str(&input).unwrap_or_default();
     let msg = v["message"].as_str().unwrap_or("");
     let lower = msg.to_lowercase();
     if lower.contains("permission") || lower.contains("approve") || lower.contains("confirm") {
-        say(&format!("I need your go-ahead: {}.", msg.trim_end_matches('.').replace("Claude needs", "I need")), "alert");
+        say(&go_ahead(msg, &who), "alert", &who);
     }
 }
 
-/// Codex's `notify` program: the event is the last argument.
-pub fn codex(arg: Option<String>) {
-    crate::activity::clear();
-    let v: Value = arg.as_deref().and_then(|a| serde_json::from_str(a).ok()).unwrap_or_default();
+/// Codex's `notify` program: the event is the last argument; a space's own
+/// brain's name comes before it.
+pub fn codex(args: &[String]) {
+    let (brain, event) = match args {
+        [event] => (None, Some(event)),
+        [brain, event, ..] => (Some(brain.as_str()), Some(event)),
+        [] => (None, None),
+    };
+    let who = Who::of(brain);
+    if who.brain.is_none() {
+        crate::activity::clear();
+    }
+    let v: Value = event.and_then(|a| serde_json::from_str(a).ok()).unwrap_or_default();
     if v["type"] == "agent-turn-complete"
         && let Some(text) = v["last-assistant-message"].as_str()
     {
-        say(text, "answer");
+        // What the turn was given, when Codex says: its latest input.
+        let prompt = v["input-messages"].as_array().and_then(|a| a.last()).and_then(Value::as_str);
+        finish(text, prompt, &who);
     }
 }
 
-fn say(text: &str, kind: &str) {
+fn say(text: &str, kind: &str, who: &Who) {
     if text.trim().is_empty() {
         return;
     }
     // The text without its screenshot markers; the screenshots beside it.
-    crate::history::record_said(kind, text);
-    let _ = protocol::send(&Request::Say { text: text.to_string(), interrupt: false, kind: kind.into() });
+    crate::history::record_said(kind, text, who.space.clone());
+    let _ = protocol::send(&Request::Say { text: text.to_string(), interrupt: false, kind: kind.into(), from: None, brain: who.name() });
 }
 
 /// Every agent session's hooks (Claude Code's and Codex's, installed by
@@ -275,8 +359,9 @@ fn shell_words(line: &str) -> Vec<String> {
     out
 }
 
+/// A brain's own folder (the main one's, or a space's): it has its own hooks.
 fn is_brain_dir(cwd: &str) -> bool {
-    !cwd.is_empty() && std::path::Path::new(cwd).starts_with(crate::config::brain_dir())
+    crate::brains::is_brain_folder(cwd)
 }
 
 /// No daemon to take it: kept for its next start (a bounded file).
@@ -377,6 +462,49 @@ mod tests {
         let r = guard_reason("Fix the login in eyzflow. Also add a mute button to herder tower.", &projects).unwrap();
         assert!(r.contains("eyzflow: ") && r.contains("herder tower: ") && r.contains("tower dispatch"), "{r}");
         assert!(guard_reason("Fix the login in eyzflow and add a test for it.", &projects).is_none());
+    }
+
+    #[test]
+    fn a_note_turn_ends_in_the_record_and_the_users_turn_in_an_answer() {
+        use crate::tell::Level::*;
+        let watch = "[watch] t3 (api) is now done. You had asked it: fix the login. Read its screen and tell me what happened, briefly.";
+        for level in [Decisions, Results] {
+            assert_eq!(said_as(Some(watch), level), Said::Note(Some("t3".into())), "kept as a note about its session");
+            assert_eq!(said_as(Some("<hc from=\"tower-voice\">[agenda] a3 is done: every task is settled"), level), Said::Note(None));
+            assert_eq!(said_as(Some("[queue] t5 (web) is gone, with 1 instruction(s) queued for it (#4)"), level), Said::Note(Some("t5".into())));
+            // A session that wrote to the brain (`tower queue tower "…"`): a note from it, not the user asking.
+            let from = crate::peers::Sender { address: "t7h".into(), name: "orb rust".into(), space: Some("Shop".into()) };
+            assert_eq!(said_as(Some(&crate::peers::for_brain(&from, "the build is green")), level), Said::Note(Some("t7h".into())));
+            assert_eq!(said_as(Some(&crate::peers::signed(&from, "the build is green")), level), Said::Answer, "untagged, it read as the user's");
+            // What the user asked is answered to them at every level.
+            assert_eq!(said_as(Some("[voice] what did the [watch] say?"), level), Said::Answer);
+            assert_eq!(said_as(Some("typed at the keyboard"), level), Said::Answer);
+            assert_eq!(said_as(None, level), Said::Answer, "no transcript to go by: an answer, as before");
+        }
+        // Telling everything: a note's news is an answer for the chat and the voice, as before.
+        assert_eq!(said_as(Some(watch), Everything), Said::Answer);
+        assert_eq!(said_as(Some("[agenda] a3 is done"), Everything), Said::Answer);
+    }
+
+    #[test]
+    fn a_hook_says_whose_it_is() {
+        // The main brain's hooks name nobody; a name that is no space's brain is the main brain too.
+        assert_eq!(Who::of(None), Who::default());
+        assert_eq!(Who::of(Some("tower")), Who::default());
+        assert_eq!(Who::of(Some("tower-voice")), Who::default());
+        // A space's own: its name goes with what it says (its space comes from its folder).
+        let own = Who::of(Some(" tower-no-such-space-here "));
+        assert_eq!((own.name().as_deref(), own.space.clone()), (Some("tower-no-such-space-here"), None));
+        // A brain's folder has its own hooks: the agent hooks leave it alone.
+        assert!(is_brain_dir(&crate::config::brain_dir().to_string_lossy()));
+        assert!(is_brain_dir(&crate::brains::dir_for("Sandbox").to_string_lossy()));
+        assert!(!is_brain_dir("/w/app") && !is_brain_dir(""));
+        // A permission question on a brain's own screen, said by whose it is.
+        let asks = "Claude needs your permission to use Bash.";
+        assert_eq!(go_ahead(asks, &Who::default()), "I need your go-ahead: I need your permission to use Bash.");
+        let sandbox = Who { brain: Some("tower-sandbox".into()), space: Some("Sandbox".into()) };
+        assert_eq!(go_ahead(asks, &sandbox), "The Sandbox tower needs your go-ahead: it needs your permission to use Bash.");
+        assert_eq!(go_ahead(asks, &Who { space: None, ..sandbox }), "tower sandbox needs your go-ahead: it needs your permission to use Bash.");
     }
 
     #[test]

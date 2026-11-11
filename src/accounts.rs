@@ -144,6 +144,10 @@ struct Cache {
 static PIDS: Mutex<Option<HashMap<u32, String>>> = Mutex::new(None);
 
 fn cache_path() -> PathBuf {
+    // Tests keep theirs in a temporary folder, never in the user's state folder.
+    if cfg!(test) {
+        return std::env::temp_dir().join(format!("herder-tower-test-{}", std::process::id())).join("accounts.json");
+    }
     config::state_dir().join("accounts.json")
 }
 

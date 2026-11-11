@@ -1,0 +1,1454 @@
+# Quiet Tower
+
+The tower does the work and keeps the record. It speaks in two cases: the user
+asked, or the decision is the user's. Everything else it writes down.
+
+This file is the contract for that change. The design, with every screen and
+state drawn (codes like F1, W5, C3, A2 below refer to its "Every state"
+gallery), is the artifact "Quiet Tower"; its source is `docs/quiet-tower.html`.
+
+Measured on 10 Nov 2026, from `history.jsonl`: 8 requests from the user, 277
+messages back, 111 of them to say nothing was needed; 112 "waits for you"
+alerts, 28 from sessions with no task; 50 of 126 queued instructions were one
+session writing to another, each filed as a task, watched, reported to the
+brain and narrated.
+
+## Three lanes
+
+| Lane | What | How it reaches the user |
+|---|---|---|
+| Yours | A decision only the user can make: merges, deploys, deletes, production data, secrets, money, design choices, a task that failed twice | One card per decision, the orb's amber count, one spoken sentence (if voice is on) |
+| Asked | The answer to something the user said or typed | One reply, where they asked. A command gets a receipt, never a question |
+| Record | Everything else: starts, deliveries, finishes, messages between sessions, routine answers, retries | Written to the record. Never spoken, never pushed |
+
+## One setting: how much it tells you
+
+`config.toml`:
+
+```toml
+[tell]
+level = "decisions"   # decisions | results | everything
+```
+
+- `decisions` (the default): only the Yours lane and direct replies reach the user.
+- `results`: also one receipt when a request the user made is finished.
+- `everything`: today's behaviour, unchanged. Every step below keeps this
+  level working as before, so the user can always go back.
+
+`tower tell [decisions|results|everything]` reads or sets it (kept in
+config.toml, read live by the daemon; `tell_level` in the state). A word
+config.toml doesn't know is `decisions`. Setting it also writes the brain's
+instructions again and tells the brain to read them, because they say what
+a note is at that level; an edit of config.toml by hand reaches the daemon
+at once and the brain at its next start (or `tower tell <level>`).
+`tower install` tells a running brain to read its instructions again when
+they changed.
+
+### What it says out loud
+
+A second word in the same table says what is spoken (the design's Voice
+setting, W17):
+
+```toml
+[tell]
+voice = "replies"   # off | decisions | replies
+```
+
+- `off`: nothing. No words, no bell, no chimes. It is the mute.
+- `decisions`: a decision, once, in one sentence (a question a session
+  asks, a wait, a merge, what was raised, a task that failed twice, a
+  session blocked or stuck on an error). Nothing else: no answer, no
+  "Okay.", no receipt, no other news. The microphone's own two tones still
+  answer the talk key.
+- `replies` (the default): its answers to what the user asks too, with
+  their acknowledgement, and whatever else the level lets through (a
+  receipt at `results`, the news at `everything`). This is the tower as it
+  spoke before the setting. An answer is spoken whether the request was
+  spoken or typed (the design says "when you spoke to it"; the tower has
+  always answered a typed request aloud, and that is kept).
+
+`tower tell --voice off|decisions|replies` sets it (alone, or with a
+level); `tower tell` prints both (`{"level", "voice"}` when piped). It is
+kept in config.toml and read live: a hand edit reaches the mouth within two
+seconds. `tower mute on` is `voice = "off"`, and `tower mute off` goes back
+to what it was before the mute (`decisions` stays `decisions`; kept in the
+mute file `muted` in the state folder, so past a restart too). The state
+has `tell_voice` (`off`, `decisions`, `replies`) beside `muted` (true
+exactly when it is `off`). The socket: `{"cmd":"tell","voice":"decisions"}`
+(with or without `level`); the answer is `{"level", "voice"}` plus `"was"`
+and `"voice_was"` for what was set.
+
+What each sound is, is said where it is made (`tell::Spoken`: `Reply`,
+`Ack`, `Decision`, `Receipt`, `News`, `Chime`) and asked of the setting
+when its turn comes (`tell::Voice::speaks`), so a sentence that waited
+while the setting changed is not said after all. What is not said still
+shows (`said` in the state), as while muted. "Always on this Mac"
+(`tower mac-voice`) is a switch of its own: where speech plays, not whether.
+
+Per space: **follow** (that space's results reach the user as they land) and
+**mute** (its decisions stay in its own tower: off the orb's count and out of
+the main queue). `tower space follow|unfollow|mute|unmute <space>`.
+
+Both are kept in `spaces.json` as lists of space names (`follow`, `mute`;
+left out while empty), and `tower spaces` shows them per space (`follow`,
+`mute`). `spaces::followed`, `spaces::muted_in`. A name is matched in any
+case. A muted space's decisions are also not said (step 3).
+
+What "written to the record" means in the history (`history.jsonl`): an
+entry with `"record": true` is not a chat message (the panel and the phone
+use one rule, `chat::shown`) and was never spoken. It is decided when the
+entry is written, so changing the level never changes what the chat showed
+before.
+
+## Step 1: note turns are silent
+
+A brain turn whose prompt is a note from the tower itself (`[watch]`,
+`[queue]`, `[agenda]`; `brain::is_note_prompt`) is a *note turn*.
+(`brain::is_news_prompt` keeps its old meaning, `[watch]` and `[queue]`
+only: at `everything` it still decides which words come after the bell.)
+
+At level `decisions` or `results`:
+
+- What the brain writes on a note turn is not a chat message and is not
+  spoken (its text blocks as it writes them, its final message, and a
+  `tower say` from its own terminal). The final message is kept in the
+  history as kind `note` with `record: true`, and with the session, name
+  and space of the session the note names (the first address in it; a note
+  about no one session has none), so the record has it.
+- The brain puts something in front of the user only by a command:
+  - `tower raise <session> --why "<category>" "<the decision, one line>" [--options '<json>']`
+    makes a decision (step 3). `--why` is required; `--options` is a JSON
+    list of `{"label","why","text"}` (or plain words), the recommended one
+    first. It writes a history entry of kind `raised` (`id` = the
+    decision's, `session`, `name`, `space`, `why`, `text`, `options`;
+    `record: true` when it was raised before) and, the first time, the
+    alert a session that needs the user makes ("<name> needs you: <text>.
+    I'd say: <pick>", shown, said once, held by the focus like any such
+    alert). Raised again it is the same decision and says nothing.
+  - `tower receipt [--agenda <id>] "<one line>"` is the single receipt for a
+    finished request. It is shown (a tower message in the chat) and spoken
+    at level `results` (and `everything`), or when one of the request's
+    spaces is followed; otherwise it goes to the record. History kind
+    `receipt` (`text`, `agenda`, `space`, and `record: true` when it was
+    only kept). With `--agenda` (an agenda's id, or one of its tasks') it
+    is refused while that agenda has open tasks, and a second time
+    (`receipt_ms` on the agenda); the receipt of work the tower started on
+    its own (the agenda's origin is `tower`) is told only for a followed
+    space. Without `--agenda` the tower can't tell the space, so only the
+    level decides. `tower job done` on a session says when that finished a
+    request of the user's (within the last half hour, no receipt yet), with
+    the command to give it.
+- `[queue] delivered …` notes are not sent to the brain at all; they go to
+  the record (the `queue` entries the history already had). The same for
+  `[queue] started …`. What is stuck (`is gone`, `is error`, `can't
+  reach`, parked) still reaches the brain.
+- "X is done" alerts are record entries, not chat items and not spoken.
+  So are the other finishes: a watch's report unless the session is
+  blocked or hit an error, a `tower job done` line, a question the tower
+  answered by itself. What needs the user (`blocked`, `error`, `failed`)
+  is shown at every level.
+- Every note the brain gets at these levels ends with one sentence saying
+  it is for the record and how to answer it (`tell::NOTE_TAIL`), since the
+  notes' own words still say "tell me what happened".
+- The fixed core prompt (`assets/tower-core.md`) and the built-in behaviors
+  say this: a note is news for the record; answer it only by acting
+  (`tower job done`, `tower agenda verify`, `tower raise`, `tower receipt`);
+  write nothing for the user. The lines "Tell the user what happened" and
+  "Never answer one with silence toward the user" go. They go at these two
+  levels: the brain's instructions are written for the level in force
+  (lines of the core that start with `{quiet}` or `{everything}` are for
+  those levels only), so at `everything` the brain still reads the old
+  lines and tells the news as before.
+- A `[voice]` turn (the user asked) is unchanged: its answer is a chat
+  message and is spoken.
+
+## Step 2: sessions talk without the tower in between
+
+- `tower queue` records who called it: `from` = `HC_TERMINAL_ID` of the
+  caller (as `tower screenshot` finds its session), carried in
+  `Request::Queue`. `tower dispatch` and `tower start` send none: what they
+  hand out is always work.
+- An instruction whose sender is an agent session other than the brain
+  (the terminal named `tower`, or a space tower `tower-…`) is a **peer
+  message**. An agent session is a terminal Herdr reports an agent for
+  (Claude Code, Codex); a plain shell, the panel, the phone and
+  `tower-voice` are the user's or the tower's, so an instruction as before.
+  A brain is known by its own name in Herdr, the one it was started with
+  (`brain::brain_of`): a terminal started by hand as `tower-…` counts as
+  one. A session in a space's tab has no name of its own, only the label
+  `tower.name`, and is never a brain whatever it is called; `tower start`
+  refuses to call a session `tower` or `tower-…`, and `tower launch` names
+  a session `<repo>-<space>` where `<space>-<repo>` would be such a name.
+  This holds at `decisions` and `results`. At `everything` a session's
+  instruction is handled as it was (a task, watched, told to the brain);
+  it only gains the sender's name. A peer message is:
+  - delivered with the same queue guarantees (waits for a busy receiver, in
+    order, once, kept across restarts);
+  - the daemon puts the sender's name on it ("From <space> › <name>
+    (<address>): …") unless the text already starts with "From ";
+  - no agenda task, no job, no watch for the brain, and no `[queue]`,
+    `[watch]` or `[agenda]` note to any brain about it;
+  - recorded in the history as kind `peer` when it arrives (`session` and
+    `name` = receiver, `from` and `from_name` = sender, `space` = the
+    receiver's, else the sender's, `status` = `delivered`, `text` as the
+    sender wrote it, `record: true`).
+- A peer message that cannot be delivered (receiver gone, parked): the
+  sender is told with one queued message, and it is recorded (`status` =
+  `undelivered`). The user is not told. It is taken out of the queue, not
+  parked; several lost messages from one sender to one receiver make one
+  note. A receiver that isn't there when `tower queue` runs is the
+  command's own error, as before.
+- `tower thread [<space>] [--json] [-n 50]` lists the peer messages of a
+  space, newest last (no space: every space's):
+  `{"space", "messages":[{"at","from","from_name","to","to_name","text","space","delivered"}]}`.
+  The state and the phone API carry the same thread per space: `state.json`
+  has `threads`, by space name, the last 50 each with the text cut to 400
+  characters. The phone's `state` (the call and the event) leaves `threads`
+  out, since it is sent on every change; `GET /v1/thread` (step 11) serves
+  it from the history, whole and in pages, and a new message is a `thread`
+  event.
+- The introduction text keeps `tower queue <address> "<message>"` and says
+  the tower adds the sender's name.
+- A session's message to a brain (`tower queue tower "…"`, or to a space's
+  `tower-…`) goes in tagged: `[session] From <space> › <name> (<address>):
+  <text>`, with one sentence saying how to answer it (`peers::for_brain`).
+  `[session]` is a note tag (`brain::is_note_prompt`), so the brain's turn
+  on it is a note turn: nothing it writes is shown or spoken, and its final
+  message is kept as a `note` about that session. The thread keeps the
+  message as the session wrote it.
+
+## Step 3: what needs you is a decision
+
+A **decision** is the one thing shown to the user in the Yours lane. The
+model is `src/decisions.rs`; the daemon holds it in `src/daemon/decisions.rs`
+and keeps it in `decisions.json` (the state folder) across restarts.
+
+```
+Decision { id, key, kind, space, sessions[], title, why, options[], pick,
+           prs[], question_id, task, first_ms, last_ms, count, state }
+kind  = permission | question | merge | choice | failed | raised | blocked
+state = open | answering | answered | stopped | dismissed
+```
+
+`id` is `d` and 12 hex digits (a question set's is `q…`). It belongs to
+this decision from when it opened: the same thing needing the user again,
+after it closed, is a new decision with a new id.
+
+### Where they come from
+
+| Source | Kind | Key | Options |
+|---|---|---|---|
+| A question set that is the user's (`decision: escalate`; a "waits for you" card is one) | `permission` for a permission, plan or approval menu; `question` otherwise | `ask:<space>:<what it asks>` | The tower's recommendations, the first one the pick (for a set with several questions, option *i* answers each with its recommendation *i*); with none, a menu's own options and no pick; a wait card has none |
+| The PRs of one repo that wait for a merge in one space (`waiting` and open in `prs.json`) | `merge` | `merge:<space>:<owner/repo>` | One per PR, in order. The pick is the first, when it can be merged, its checks pass and its base is not production |
+| `tower raise` | `raised`; `choice` with `--options` | `raise:<space>:<the line>` | As given, the first one the pick |
+| An agenda task that failed again after a retry | `failed` | `failed:<space>:<task id>` | "Try again", "Drop it"; no pick |
+| A session blocked on something the tower can't read (no question set comes of it: a dialog it doesn't know) | `blocked` | `blocked:<space>:<address>` | None. It is answered in the session itself ("Show in Herdr"); it closes by itself, as `answered`, once the session is no longer blocked, and as `stopped` when the session is gone. Told once at a quiet level, as the plain notice was; every time at `everything` |
+
+- Text in a key is normalised: lowercased, every run of punctuation and
+  whitespace one space, cut to 300 characters. What a question set asks is
+  every question of the set; for a menu, its title and a hash of its detail
+  (another command or plan is another decision).
+- **One key per decision.** The same key again updates `last_ms`, adds
+  one to `count` and adds the session to `sessions`; it never makes a second
+  decision. Three sessions asking the same thing are one decision with
+  `waiting: 3`. Each session keeps its own question set (`questions` is
+  unchanged); the decision's `question_id` is its first session's, and
+  each row of `sessions` has its own.
+- A merge decision's `prs` are in order: a non-production base first
+  (`prs::is_prod`: main, master, prod, production, release, live are
+  production), then by number. It changes in place as PRs open, merge,
+  close or their checks move; `count` goes up when another PR joins.
+- A `tower raise` about something already in front of the user joins that
+  decision instead of making one (the answer says `"new": false,
+  "folded": true`): `--why merge` naming a PR number a merge decision of
+  that space lists (or, naming none, about one of its sessions); `--why
+  waiting|blocked|question` about a session with an open question
+  decision; `--why failed` about a session with an open failed decision.
+- **A failed task.** The tower did not retry by itself before: a failed
+  task was told to the brain, which asked the user or ran `tower agenda
+  requeue`. Now, at `decisions` and `results`, a task that fails (its
+  session says it couldn't, its turn fails, or `tower job failed` / `tower
+  agenda fail` says so) is sent to its session once more by the daemon,
+  within ten minutes of failing ("That didn't work (<why>). Try it once
+  more: …"), and the brain gets an `[agenda]` note saying so. One that
+  failed longer ago (before a restart, under an older tower) is left as it
+  is. On the task, `retries` counts tries after a failure (the daemon's, or
+  `tower agenda requeue`) and `retried_ms` says when; a `tower job failed`
+  that arrives within ten minutes of the retry, while the new try runs, is
+  taken as word on the try before and changes nothing. A task that fails
+  with `retries >= 1` becomes a `failed` decision (`raised` on the task),
+  at every level; at the quiet levels the brain is told it is one and not
+  to raise it. A retry that can't be sent (the session has ended) counts as
+  tried. At `everything` nothing is retried by the daemon (the brain hears
+  of the failure and asks the user, as before).
+  The retry re-sends an instruction unasked, so it has a switch in
+  config.toml, read live:
+
+  ```toml
+  [agenda]
+  retry_failed = true   # false: the tower sends nothing again by itself
+  ```
+
+  With `retry_failed = false` a first failure is neither retried nor a
+  decision: the ledger's `[agenda]` note tells the brain (as at
+  `everything`), which raises it (`tower raise … --why failed`) or sends it
+  again (`tower agenda requeue`); a task that fails after any retry is
+  still a `failed` decision.
+
+### When one closes
+
+- A question's: when no set with its key is the user's any more. `answered`
+  when one of its sets was answered (from the tower, or in the session),
+  else `dismissed` when one was dismissed, else `stopped`. It is
+  `answering` while an answer goes in (keys into a dialog, or a reply
+  waiting for its session to stop).
+- A merge's: when none of its PRs is open and waiting (`answered` when one
+  was merged, else `stopped`), or when its space is closed or archived
+  (`stopped`). Not when its sessions end: a PR that is still open and
+  waiting is still the user's. A session that ends stays in its
+  `sessions` with `waiting: false` (so `waiting` can be 0, and it sorts
+  after those somebody waits on).
+- A failed task's: when it is answered, or the task is no longer failed
+  (sent again, verified or dropped by anyone): `answered`.
+- Any but a merge: `tower answer`, `tower dismiss`, or when all its
+  sessions are gone (`stopped`). A session that ends leaves its decisions.
+- When a space goes quiet (its last session is gone) what was raised there
+  and its failed tasks close (`stopped`), its merges stay; when it is
+  closed or archived its merges close too (`Book::space_over`). The PRs of
+  a merge closed that way, and of a dismissed one, make no decision again
+  while they wait (`settled_prs` in `decisions.json`).
+- A decision raised about a session that had already ended has no sessions
+  and stays until it is answered or dismissed.
+- The last 50 that closed are kept (`tower decisions --all`).
+
+### Idle is not blocked
+
+A turn that ends saying only that the session is ready (it waits for
+instructions, has no task yet, stands by: `questions::ready_only`), from a
+session nothing was asked of, is `ready`. It makes no question set, no
+alert and no decision; a record entry says "<name> is ready".
+
+- "Nothing was asked of it" (`asks::has_work`): no instruction waits for it
+  in the queue, and it is on no agenda task (one queued, running or blocked,
+  or one whose state changed in the last minute), or that task itself told
+  it to wait for instructions.
+- A session that was asked something and ends that way still makes its
+  "waits for you" card, as before.
+- A sentence that names something for the user to do (merge, review, test,
+  decide, a PR or issue number, "blocked", "before I …") is never ready. A
+  question, a request, or word that something is wrong (blocked, failed,
+  missing, can't) in the last four sentences makes the whole message a real
+  wait.
+- The agenda's judge takes "waiting for your instructions" as done, not as
+  a question, when that is what the task asked for.
+- "Waits for you" cards an older tower made for such turns are dropped at
+  the next start.
+
+### Order, and who waits
+
+- `waiting` counts the sessions blocked on it now: a session waits unless
+  it is `working` on something else (the radar says). A question's
+  sessions wait for as long as their set is open.
+- **Order.** `weight = sessions waiting × time since first_ms`, heaviest
+  first, then oldest first, then by id. The time is in milliseconds, so two
+  decisions in their first minute are still ordered. The daemon publishes
+  the order again every 30 seconds.
+
+### Mute
+
+A muted space's decisions are left out of the main queue and the orb's
+count, are not said, and make no alert. They are returned when that space
+is asked for, and `state.json` carries them marked `muted: true`.
+
+### Telling the user once
+
+- When a decision first appears: one alert (a chat item) and one spoken
+  sentence, through the alert a blocked session makes (held by the focus,
+  silent while the tower is muted). A question: "<name> asks: <what>. I'd
+  say: <pick>." A wait: "<name> waits for you: <request>". A merge: "<name>
+  opened PR #N into <base>: it waits for your merge, in the chat". A raise:
+  "<name> needs you: <text>. I'd say: <pick>". A failed task: "<name> needs
+  you: "<task>" failed after a retry: <why>. Try it again, or drop it?".
+- The same key again says nothing and adds no chat item, at `decisions`
+  and `results`. At `everything` the alerts the tower always made stay
+  (one per question set, per raise, per turn that ends on a PR), and a
+  failed task is told by the brain as before.
+- A watched session that ends its turn waiting for the user: at the quiet
+  levels the tower says it itself, the plain "<name> is waiting for you"
+  beside it is only written down, and the brain's `[watch]` note says the
+  tower has put it to the user and not to raise it again.
+- A merge decision made beside a wait for something else (a session asks
+  for a review of its PR) is in the queue without a sentence of its own.
+- What is open when the daemon starts was told by the run before: nothing
+  is said again for it.
+- Not a decision: a session blocked on a dialog the tower cannot read
+  (another machine's, an unknown menu). It still gets the plain notice each
+  time it blocks.
+
+### Commands and requests
+
+- `tower decisions [--space <s>] [--all] [--json]`: the queue in order.
+  JSON when piped or with `--json`: `{"space": name or null, "count": n,
+  "decisions": [Decision], "closed": [Decision]}` (`closed` with `--all`,
+  newest first). No space: the main queue, muted spaces left out. `--space`
+  (a name, or a part of it): that space's own, muted or not.
+- `tower answer <id> --choice <n>` (an option's index, from 0) or
+  `--other "<words>"`; `--json` takes `{"choice": n}`, `{"other": "…"}`, or
+  for a question the answers a question set takes. What it does, by kind:
+  - `question`, `permission`: answers the question set of every session of
+    the decision (`asks.answer`, as `tower answer <question id>` does).
+    `--other` works when the set has one question. Answer:
+    `{"ok":true,"id","state":"answering"|"answered","answered":[{"session","question","status"}],"errors":[…]}`.
+  - `raised`, `choice`: the chosen option's `text` (or "About "<title>":
+    the user decided: <label>.") goes to its waiting sessions through the
+    queue as an instruction (to all of them when none waits), and the
+    decision closes. Answer: `{"ok":true,"id","state":"answered","answer","sent":[{"session","name","queue_id","sent"}],"errors":[…]}`.
+  - `failed`: `0` sends the task again (`tower agenda requeue`), `1` drops
+    it (`abandon`), `--other` sends it again with those words.
+  - `merge`: refused, naming its PRs. A merge is the PR's own flow (the
+    panel's chip, the phone's `/v1/prs/{key}/confirm` then `/merge`), by
+    `prs[].key`. Nothing merges through the socket.
+- `tower dismiss <id>`: out of the queue, nothing sent (a question's sets
+  are dismissed with it).
+- `tower answer` and `tower dismiss` still take a question set's id as
+  before; `tower questions` is unchanged.
+- `tower space mute|unmute <space>`.
+- The socket: `{"cmd":"decisions","space":null,"all":false}`; `answer`
+  (`target` a decision id, `answers` the body above) and `dismiss` (`id`).
+
+### In `state.json`
+
+- `decisions`: every open decision in queue order, in the JSON shape under
+  step 11, each with `muted`. The main queue is those with `muted: false`.
+  (The phone's state leaves the list out and keeps the count: step 11.)
+- `decisions_count`: how many of them are outside muted spaces (the orb's
+  number).
+- `questions` is unchanged.
+
+`decisions.json`: `{"open": [Decision], "closed": [Decision], "settled_prs":
+{"owner/repo#n": "dismissed"|"stopped"}}`, each decision as stored (the
+shape below plus `told`, `tabs`, `left`, `answer`, `closed_ms`, and each
+option's `answers` or `text`).
+
+## A command gets a receipt: acts, and undo
+
+Asked to open a session or a space, the tower takes the defaults, acts, and
+keeps an **act**: what it opened, what it assumed and why, and the request
+it answered (F5, F6, W11, A8). The model is `src/acts.rs`; the daemon keeps
+them in `src/daemon/acts.rs` and in `acts.json` (the state folder, the last
+50) across restarts.
+
+```
+Act { "id": "r" + 12 hex digits, "kind": "start" | "launch",
+      "at_ms", "by": "tower" | "tower-<slug>" | "phone:<device>" | "cli" | "<a session's address>",
+      "space": name or null,
+      "line": "Opened notes fix in sandbox.",       // the reply, in one line
+      "sessions": [ { "address", "name", "label", "worktree": path or null, "branch": name or null } ],
+      "assumed": [ { "what": "account" | "model" | "folder" | "worktree" | "space" | "name" | "setup" | "worktrees",
+                     "value": "orca", "why": "what \"second\" names" } ],
+      "request": { "at": the request's history `at`, "text" } or null,
+      "state": "done" | "undone",
+      "undo": { "possible": bool, "why": text or null },
+      "closing": "Closed it. Nothing else changed." or null, "undone_ms": n or null }
+```
+
+- **Who makes one.** `tower start` after it opened its session (unless
+  `--no-act`, which `tower launch` passes: a launch keeps one act for its
+  whole space, with its sessions that opened), so a `tower dispatch` that
+  starts sessions makes one through its starts. The command sends the
+  daemon `{"cmd":"act","action":"record","act":{kind, space, space_made,
+  goal, sessions:[{address,name,worktree:{repo,path,branch}|null,fresh,first,task}],
+  assumed}, "from": <its HC_TERMINAL_ID>}`.
+- **What was assumed.** `tower start` prints `assumed` as `tower launch`
+  does, each thing with its why: `{"account","account_why","model",
+  "model_why","folder","folder_why","worktree","worktree_why","space",
+  "space_why","name","name_why"}` (`account_why`: "as asked", "what
+  \"second\" names", "the default one: none was named"; `model`: "default
+  model", since a session starts on its account's own; `folder_why`: "as
+  asked", "the best match for \"notes\"", "the folder the command ran in";
+  `space_why`: "as asked", "made: no space had that name", "the one the
+  window shows"), and `act` (the act's id), and `worktree_fresh`. The act's
+  `assumed` is the same as a list of chips (a folder and a worktree by
+  their last part).
+- **Whose request.** Run by a brain (`from` is the main brain's terminal or
+  a space's own) on a turn the user began (not a note turn), the act
+  answers the latest request asked of that brain in the last half hour
+  (`acts::request_for`): `request` names it. Sessions opened one by one for
+  the same request are **one act** (a second `start` joins the first: one
+  line, "Opened 2 sessions in M5 Pro: api and web.", one Undo). Run on a
+  note turn, from a shell, the full window, a phone or the tower's own
+  queue, it answers none: it is kept and can be undone by its id.
+- **History.** Kind `act`: `{"kind":"act","id":"r…","status":"done",
+  "text": the line,"space","act":{kind,by,assumed,sessions,request_at,
+  request_space}}`, with `record: true` when it answered no request. Said
+  again when a session joins it, and once more when it is undone
+  (`"status":"undone"`, `text` the closing line). `chat::shown` takes one
+  that answered a request: it is that request's receipt in the chat (one
+  message, `kind: act`, changed in place).
+- **Published.** `state.json` has `acts`, the latest 10, newest first, as
+  above; the phones get an `act` event at every change, and the chat
+  message carries it (step 11).
+- **Undo.** `tower undo [<id>] [--force] [--json]` (no id: the latest act,
+  when it was made in the last 10 minutes and isn't undone); `tower acts
+  [--json]` lists them (`{"acts":[Act]}`, newest first). The socket:
+  `{"cmd":"act","action":"undo","id":…,"force":bool}` and
+  `{"cmd":"act","action":"list"}`. Undoing (`acts::undo`):
+  - the space the act made (`space_made`: a launch that made its space, a
+    `tower start` that made one), with no agent session in it but the
+    act's own, is closed as `tower space close --force` closes one (its
+    brain, its requests, its terminals, its clean worktrees);
+  - otherwise each of its sessions that is still live is ended (`hc kill`,
+    `hc rm`) after its agenda task is dropped, what waits for it in the
+    queue is cancelled and its watch is forgotten (so nothing is told as
+    stalled or failed), and each worktree the act made (`fresh`) is removed
+    when nothing in it would be lost and no other live session works in it.
+    A worktree that was there before is left there;
+  - it is **refused**, naming the session and why, when a session was given
+    more work than its first instruction (a prompt its hooks report, or an
+    instruction queued to it, that is not its first instruction, the
+    tower's introduction or another session's message: `acts::is_work`), or
+    when its worktree holds changes that are nowhere else
+    (`worktrees::dirty`). `--force` undoes it anyway: the sessions are
+    ended, and a worktree with changes is kept and named;
+  - it answers `{"act": Act, "closing", "sessions_ended": [address],
+    "worktrees_removed": [path], "kept_worktrees": [{"path","why"}],
+    "space_closed": bool}`, and the act is `undone` with its `closing`
+    ("Closed it. Nothing else changed.", or "Closed it. Kept its worktree:
+    … (1 uncommitted change (notes.txt)).").
+- **The reply.** Both windows show the act with the reply to its request
+  (`home::last_reply_with`): its line, what was assumed as chips (why, on
+  hover), the tower's own words under it, and **Undo** (`tower undo <id>`).
+  Where work would be lost the block says why and offers "Undo anyway"
+  (`--force`). Undone, it shows the closing line and nothing else.
+- **The brain** is told (in `assets/tower-core.md`) to act with the
+  defaults, say in one short line what was opened, never ask which
+  account, model, folder, space or name, and to run `tower undo` on the
+  user's word ("undo that").
+
+## Make it a rule
+
+After a card is answered on the Mac, its receipt line stays about 8 seconds
+(`model::RULE_MS`), or until the next card is answered, and carries "Make
+it a rule" (`home::make_rule`). It asks the tower of that decision's space,
+as a typed request (`tower ask [--space <space>] …`, so a space's own tower
+when it has one):
+
+```
+Make this a rule: when a session in <space> asks "<the decision's title>", answer "<the answer given>" without asking me.
+```
+
+- The wording and when it is offered are one function for the Mac and the
+  phone (`decisions::rule_for`): only for a `question` or a `choice`
+  answered in words (an option's label, or the user's own; a question set
+  with several questions offers none), never for a `merge`, a
+  `permission`, a `failed` task or a plain `raised`, and never when the
+  title, the reason or the answer is about what the user always decides
+  (`decisions::always_yours`: a deploy or release, a delete or overwrite,
+  production, secrets, money).
+- The tower's existing behavior flow does the rest: it adds a behavior
+  (`tower behavior add`, category "Questions 90/10"), which shows in the
+  chat with what changed and can be undone there. The core prompt tells it
+  to write the rule narrowly (that space, that kind of question, that
+  answer) and never for the always-ask list; the 90/10 behavior tells it to
+  answer such a question with that rule from then on.
+- `tower answer <decision>` (and the phone's `/answer`) says `"rule":
+  {"can": bool, "text": the request or null}`.
+
+## Names you can read
+
+A session is its space and what it works on: `sandbox › mediaroom` where it
+is written, "the mediaroom session in sandbox" where it is said
+(`src/names.rs`, the one place).
+
+- What it works on is its own name when it has one, without its space's
+  words in front (`fix-login-eyzflow` in the space "fix-login" is
+  `eyzflow`), else its project: the repo of the worktree the tower gave it
+  (`tower.repo`), else the folder it runs in, without the name of the
+  folder it is in (`eyz/eyz-mediaroom-serverless` is `mediaroom
+  serverless`), else its address. This short name is what `hc::spoken_name`
+  returns, so it is what a decision's `sessions[].name`, a mission's
+  `sessions[].name`, a thread's `from_name` and `to_name`, `agents[].name`
+  and the history's `name` hold: each has its space beside it.
+- `names::shown(space, name)` and `names::said(space, name)` put the two
+  together, and read a name an older tower kept ("Claude in eyz mediaroom
+  serverless") the new way. A space's own brain is `sandbox › tower` and
+  "the sandbox tower"; the main one "the tower".
+- A notice about a session ("mediaroom asks: …", "… waits for you", "…
+  needs you", "… finished", "… hit an error") is written with the first and
+  spoken with the second (`names::notice`, applied where the radar shows
+  and says it): the chat has `sandbox › mediaroom asks: Which database?`
+  and the voice says "The mediaroom session in sandbox asks: Which
+  database?".
+
+## Step 5 and 8: a space is a mission with an end
+
+The model is `src/missions.rs`; the daemon runs it in
+`src/daemon/missions.rs` (every 20 seconds, and at once when a session
+starts, stops or ends, or a `tower space` command changed something).
+
+### In `spaces.json`
+
+A space's goal is its agenda, where it always was (`agendas`, by space
+name; the orb's panel reads and writes it there). The rest of the mission
+is under `missions`, by space name:
+
+```
+"agendas":  { "<space>": "<goal>" }
+"missions": { "<space>": {
+    "done_when": "…",          // left out while empty
+    "standing": true,           // left out while false
+    "state": "open" | "quiet" | "ready" | "closed",
+    "report": "…", "report_ms": n,   // the closing report; left out while there is none
+    "report_asked_ms": n,       // when the brain was asked for it
+    "born_ms": n,               // when the tower first knew the space
+    "goal_ms": n,               // when its goal was last set
+    "seen_ms": n,               // when a live session was first seen there
+    "quiet_since_ms": n, "ready_since_ms": n, "idle_since_ms": n,
+    "closed_ms": n, "archived_ms": n,
+    "worktrees": [ { "repo": "…", "path": "…", "branch": "…" } ],   // made by the tower for it
+    "setup": "name"             // the setup `tower launch` made it with
+} }
+```
+
+`follow` and `mute` stay the spaces' own lists. Fields that don't apply
+are left out. A spaces file from before missions loads as it is. Every
+change goes through `spaces::update` (one writer at a time, under a file
+lock): the missions, a goal, follow and mute, the focus and the digest's
+read marks. `tower space follow|unfollow|mute|unmute` also has the daemon
+look at the missions at once, so `missions[].follow` and `.mute` in the
+state say it without waiting for the next look.
+
+### States
+
+- **open**: it has live sessions, or the tower learnt of it in the last 10
+  minutes (a space just launched, a goal set ahead of its sessions).
+- **quiet**: no live session, from the moment the last one goes. Its held
+  news is marked read (`read_ms`: its unread counts are 0), what was raised
+  there and its failed tasks close, its merges stay (step 3), and a record
+  entry says so. A session there again makes it open. After 24 hours quiet
+  it is **archived** (`archived_ms`): kept in the file, left out of `tower
+  spaces`, `tower missions` and `state.json`; its merges close then.
+- **ready**: it has a goal, isn't standing, has at least one request
+  (agenda) finished since the mission began and its goal was set, no
+  unfinished one, and no open decision. The daemon
+  then asks the brain once for a closing report, in a note: `[space]
+  "<name>" looks finished: … Write its closing report now …: tower space
+  report "<name>" "<the report>"`. `[space]` is a note tag
+  (`brain::is_note_prompt`), so that turn is a note turn; at `everything`
+  the brain also says in one line that the space is ready to close. A new
+  request or a new decision there (or `standing on`, or the goal cleared)
+  takes it back to open, and its report is dropped.
+- **closed**: by `tower space close`, or by itself (below). Closed spaces
+  stay closed whatever is seen there; `tower space goal` with a goal, or a
+  session opened there by `tower start` / `tower launch`, starts the
+  mission over as open.
+- A **standing** space is one the user keeps: never ready, never closed by
+  the tower, and its sessions get no worktrees (step 10). It still goes
+  quiet and is archived like any other.
+- A space with **no goal** is not a mission yet: it is never ready, so the
+  tower never closes it, and its sessions get no worktrees (step 10). It
+  is listed with the others (`goal: ""`), goes quiet and is archived.
+
+A "live session" is an agent session (Claude Code, Codex) in the space:
+not a plain program, not a brain (`tower`, `tower-…`), not `tower-voice`.
+A space's sessions are read from Herdr's core (`hc ls`, each one's labels
+from `hc get`, kept 30 seconds), here and on every machine. When Herdr, or
+a machine, can't be asked, nothing moves that round.
+
+### Commands
+
+- `tower space goal <space> "<goal>" [--done-when "<what counts as done>"]`
+  ("" clears the goal; `tower space agenda` is the same command). Prints
+  `{"space","goal","done_when","standing","state","report"}` when piped.
+- `tower space standing <space> on|off`. A name no space has yet is kept
+  for the space that will have it (`on` only), so a space can be standing
+  before its first session.
+- `tower space report <space> "<text>"`: the closing report (the brain's
+  answer to the `[space]` note). Kept with the mission and shown with it.
+- `tower space close <space> [--force]` (the user's word only):
+  1. refuses while an agent session there is `working` or `blocked`, naming
+     them, unless `--force` (a brain doesn't count: it is the one closing);
+  2. closes the open requests (agendas) that are about that space only
+     (`tower agenda close --force`: their unfinished tasks are abandoned);
+  3. ends the space's own brain (step 7), then the space's terminals.
+     Herdr closes a whole space in one command
+     (`herdr-app do space.close '{"id":…,"confirmed":true}'`, which ends
+     every terminal in it and removes the space). A space that holds the
+     tower's own terminals (`tower`, `tower-voice`) is never closed whole:
+     its other terminals are ended one by one (`hc kill`, then `hc rm`) and
+     Herdr's space stays. The same one by one when Herdr refuses, or when
+     its window doesn't show the space (then by the terminals' `where`);
+  4. removes the worktrees the tower made for it, each only when clean: no
+     uncommitted change (the copied `.env*` files aside) and no commit on
+     its branch that is on no remote and no other branch. A dirty one is
+     kept, stays in `missions.<space>.worktrees`, and is named with why.
+     Branches are never deleted. If a terminal couldn't be ended, every
+     worktree is kept;
+  5. writes a record entry (`history.jsonl`: `kind: "space"`, `status:
+     "closed"`, `space`, `text: "<name> is closed. <report>"`, `record:
+     true`). The same kind records `quiet` and `ready`;
+  6. sets `state: closed`, `closed_ms`, `archived_ms`, marks its held news
+     read, and ends a focus on it. The daemon then closes its decisions,
+     merges too.
+
+  It prints `{"closed": name, "sessions_ended": [{"address","name"}],
+  "sessions_left": [{"address","name","why"}], "herdr_space": "closed" |
+  "kept" | "not shown", "worktrees_removed": [path], "kept_worktrees":
+  [{"path","branch","repo","why"}], "requests_closed": [agenda id],
+  "tower_ended": [its own brain's name, when it had one], "report": "…"}`.
+  It works with no daemon running.
+- **Auto-close.** A ready space whose sessions have all been `idle` or
+  `done` for `[spaces] auto_close_hours` (0, the default, is never; say 24 for a day), without a break,
+  is closed the same way, without `--force` (`idle_since_ms` is when that
+  wait began). So is a space that was ready when its last session left,
+  after its day quiet. A close that fails is tried again after the same
+  hours (a quiet one is archived instead).
+- `tower spaces [--all]`: each row gains `goal` (the same as `agenda`),
+  `done_when`, `standing`, `state`, `report`, `quiet_since_ms`,
+  `ready_since_ms`, `closed_ms`, `archived`. Archived spaces (quiet for a
+  day, or closed) are left out unless `--all`.
+- `tower missions [--json]`: what `state.json` has under `missions` (below).
+  The daemon looks at the sessions again first; with no daemon it is built
+  from Herdr and the tower's files (then without `said`).
+
+```toml
+[spaces]
+worktrees = true          # step 10
+port_range = "3000-3050"  # step 10
+auto_close_hours = 0      # the default: a ready space waits for the user; 24 closes it after a day idle
+```
+
+### `missions` in `state.json`
+
+Also the answer to `{"cmd":"missions"}` on the socket and to `tower
+missions --json`:
+
+```
+"missions": { "spaces": [Mission], "quiet": ["name"], "closed_today": ["name"] }
+
+Mission { "name", "goal": "" when none, "done_when": "" when none,
+          "standing": bool, "state": "open" | "ready" | "quiet",
+          "follow": bool, "mute": bool,
+          "needs": n,            // open decisions in that space, muted or not
+          "report": "" when none,
+          "sessions": [ { "address", "name", "status",
+                          "account": name or null,
+                          "worktree": path or null, "branch": name or null, "port": n or null,
+                          "said": its last words (cut to 240 characters) or null } ],
+          "requests": [ { "id", "title", "state": "open"|"done"|"closed"|"abandoned",
+                          "done": n, "total": n } ],
+          "thread_count": n,
+          "tower": { "name", "status": "ready"|"working"|"starting"|"blocked"|"off",
+                     "address": address or null } or null,   // its own brain (step 7)
+          "quiet_since_ms": n or null, "ready_since_ms": n or null,
+          "auto_close_ms": n or null }
+```
+
+- `spaces`: every mission that is not closed and not archived, in a stable
+  order: the open and ready ones first (those with `needs` > 0, then those
+  with a session `working`, then the rest; then by name, any case), then
+  the quiet ones (by name).
+- `quiet`: the names of the quiet ones in `spaces` (the fold).
+- `closed_today`: spaces closed since local midnight, oldest first.
+- A session's `name` is its name within its space, as `agents[].name` has
+  it (`fix the eyzflow` for a session named `fix-the-eyzflow`, `eyzflow`
+  for `fix-login-eyzflow` in the space "fix-login", its project when it
+  has no name: see "Names you can read"); `status` is
+  Herdr's word (`idle`, `working`, `blocked`, `done`, `error`). `said`
+  comes from the session's hooks, so it is null until its first turn ends.
+- `requests`: the space's open agendas (oldest first), then those finished
+  since local midnight (newest first). `done` counts tasks that are
+  verified or dropped; `title` is cut to 80 characters.
+- `thread_count`: the messages in the space's thread as the state carries
+  it (at most 50).
+- `auto_close_ms`: when a ready space closes by itself (null: not ready,
+  a session isn't idle, or `auto_close_hours = 0`).
+- The phone's `state` (the call and the event) leaves `missions` out, as it
+  does `threads` and `decisions`: `GET /v1/missions` (step 11) serves it
+  (the daemon's own look, as `{"cmd":"missions"}` answers it), and a change
+  is a `missions` event.
+
+## Step 9: one sentence launches a space
+
+```toml
+[[setups]]
+name = "eyzflow + mediaroom on orca"
+account = "orca"
+repos = ["~/Work/eyz/eyzflow", "~/Work/eyz/eyz-mediaroom-serverless"]
+```
+
+- `tower setups [--json]`: `{"setups":[{"name","account","repos":[…]}]}`.
+  The first is the default.
+- `tower setup add "<name>" --account <account> --repo <folder> [--repo
+  <folder>…]`: the same name again (any case) changes that setup in its
+  place. The account is checked against `cca` (none given: the first); a
+  repo that is no folder is taken as a project's name and matched
+  (`projects::best`), and the answer says which folder it took.
+  `tower setup remove "<name>"`. Both edit config.toml's text, so the rest
+  of the file stays as it is, and refuse a change after which the file
+  wouldn't read.
+- `tower launch "<goal>" [--setup <name>] [--name <space>] [--dry-run]
+  [--json]`:
+  - the space's name is the goal's first two words that carry meaning,
+    lower-cased, joined with a dash: `Fix the login redirect` is
+    `fix-login`. The small words `the a an to for of and in on with my our
+    new some` are passed over (`launch::space_name`); a goal made of them
+    only keeps its first two. It gets `-2`, `-3`, …
+    while a space has it (Herdr's, and those the tower remembers, closed
+    ones too). `--name` is taken as given; a space that has that name
+    already is joined, not made;
+  - the setup is the one named (its whole name, or a part), else the only
+    one, else the first. No setup at all is an error that says how to add
+    one. It never asks;
+  - it sets the goal and makes the mission, opens one agenda for the goal
+    (the request; only while the daemon runs), then runs `tower start
+    --space <space> --new-space --account <the setup's> --agenda <id>` once
+    per repo, so each session is named `<space-slug>-<repo-name>` (shown
+    `<space> › <repo-name>`, said "the <repo-name> session in <space>"),
+    works in the space's worktree of its repo with
+    a dev port (step 10), and has the goal as its first task: the goal,
+    that it is the space's goal and which part is this session's, the
+    other sessions' names, then where it works. The introduction between
+    them is the daemon's, as sessions join;
+  - it prints one receipt:
+
+    ```
+    { "space", "goal", "made": bool (false: it joined a space), "dry_run": bool,
+      "agenda": id or null,
+      "sessions": [ { "name", "repo", "address", "account", "worktree", "branch",
+                      "port", "task": agenda task or null, "error": text or null } ],
+      "assumed": { "setup", "setup_why", "account", "account_why",
+                   "name", "name_why", "worktrees": bool, "worktrees_why" },
+      "act": the id of the act kept for it (`tower undo <id>`), when the daemon runs }
+    ```
+
+    `--dry-run` prints the same plan (no `address`, `port`, `task`) and
+    does nothing: no space, no session, no worktree, no file touched. A
+    session that didn't open has its `error`; the others still open.
+
+## Step 10: every mission gets its own worktrees
+
+The code is `src/worktrees.rs` (`tower dispatch`'s `isolate` makes its
+worktree with the same `worktrees::add`).
+
+- Only a **mission** gets worktrees: a space that has a goal, or that
+  `tower launch` made (`missions.<space>.setup`), and that isn't standing
+  (`missions::works_in_worktrees`). A space with no goal is the user's own:
+  a session opened there works in the repo itself, with no port handed
+  out, as before the Quiet Tower. Setting a goal (`tower space goal`) makes
+  it a mission from the next session on; clearing the goal undoes that.
+- When the tower opens a session for a mission (`tower launch`, `tower
+  start --space …`, a `tower dispatch` task with a `space` that starts a
+  session), `[spaces] worktrees` is true, the
+  session runs on this Mac and its folder is in a git checkout, the session
+  runs in a git worktree: `<repo>/../.tower-worktrees/<space-slug>/<repo-name>`
+  on the branch `<space-slug>/<repo-name>`, made from the repo's HEAD
+  (`<space-slug>`: the space's name lower-cased, anything but `a-z 0-9 _`
+  a dash). A worktree or a branch that is there already is used as it is,
+  so a second session for the same repo in the same space shares the
+  worktree. `--cwd` inside the repo starts the session in the same folder
+  inside the worktree. `.tower-worktrees/` ignores itself (its own
+  `.gitignore`).
+- The repo's untracked top-level `.env*` files are copied into a fresh
+  worktree (never over a file that is there).
+- The session gets a dev port from `[spaces] port_range` (default
+  `"3000-3050"`): the first that no live session was given, passing over a
+  port something listens on now while another is free.
+- Its first instruction ends with: "You work in a fresh worktree of <repo>
+  at <path> on branch <b>; dependencies may need installing (<files>
+  copied from the repo); use port <p> for a dev server." (for a worktree
+  that was there: "You work in this space's worktree of <repo> at <path> on
+  branch <b>, which was there already; use port <p> …").
+- What it was given is kept on its terminal as Herdr labels
+  (`tower.worktree`, `tower.branch`, `tower.repo`, `tower.port`), so it
+  lives and ends with the terminal; the daemon copies it to the session in
+  its registry (`tower sessions`: `worktree`, `branch`, `port`) and
+  `missions` shows it. `tower start` prints `worktree`, `branch`, `repo`,
+  `worktree_fresh` (it made that worktree now) and `port`. The space's
+  mission lists the worktrees made for it.
+- `tower start --no-worktree` opts one session out (it gets no port
+  either). A space with no goal, a standing space, a start without
+  `--space`, a folder that is no git checkout, `--on <machine>`, or
+  `worktrees = false` behaves as before. If the worktree can't be made the session opens in the folder
+  itself and the answer says so.
+- `tower dispatch` takes a session in a space's worktree as the one "in
+  the project's folder": for a task that names a space, that space's
+  worktree first, then the project's own checkout; for a task that names
+  none, the checkout first, then any worktree of it. An `isolate` task
+  keeps its own worktree (`<project>-<name>`, branch `tower/<name>`), not
+  the space's.
+- Closing the space removes its clean worktrees (step 5 and 8).
+
+## Step 7: a tower per open space
+
+The model is `src/brains.rs`; the daemon runs it in `src/daemon/brains.rs`.
+A "brain" below is a tower's own agent session: the main one is the
+terminal `tower`, a space's own is `tower-<space-slug>`.
+
+```toml
+[brains]
+per_space = true              # false: one brain for everything, as before
+model = "claude-opus-5-5"     # see "The brains' model"
+effort = "high"
+```
+
+(The table is `[brains]`, not `[brain]`: config.toml already has `brain =
+"claude" | "codex"` as a word, and a table of that name would be the same
+key twice, which no build could read.)
+
+### Names, folders, terminals
+
+- A space's brain is the Herdr terminal `tower-<space-slug>`
+  (`brains::name_for`): the slug worktrees and launch use (`worktrees::slug`:
+  lower case, `a-z 0-9 _`, a dash for every run of anything else). Herdr's
+  names end at 32 letters, so a longer one is cut to 27 and gets `-` and 4
+  hex digits of its own. A space called "voice" gets `tower-voice-space`
+  (`tower-voice` is the daemon's terminal).
+- It runs in its own folder, `<config dir>/brains/<name without tower->/`
+  (`~/.config/herder-tower/brains/sandbox/`; under `HERDER_TOWER_HOME` in a
+  sandbox), beside the main brain's `brain/`. The folder holds:
+  - `CLAUDE.md` and `AGENTS.md`: the main brain's instructions (the same
+    core and behaviors, at the level in force), with one line at the top
+    saying whose file it is, and at the end the section "Your space":
+    the space's name, its goal and done-when (or that it is standing, or
+    has no goal), its sessions (address, name, status, worktree, port) and
+    its open requests as they stood when the file was written, how to see
+    them now (`tower missions`, `tower agenda`, `tower decisions --space`),
+    how to read its thread (`tower thread "<space>"`), and the rules: it
+    handles this space only; what crosses spaces goes to the main tower
+    with `tower queue tower "…"`; sessions are opened only in this space;
+    it never closes the space or starts a tower; its instructions are this
+    file. No other space's sessions or requests are in it.
+  - `.claude/settings.json`: the main brain's hooks and permissions, with
+    its name on the two hooks that bring its words (`tower hook claude
+    tower-<slug>`, `tower hook claude-notify tower-<slug>`), `brain-guard`,
+    and no activity hooks (the orb's working line is the main brain's).
+    For Codex: `notify=["tower","hook","codex","tower-<slug>"]`.
+  - `brain.json`: `{"name", "space", "mission"}` (`mission`: the space's
+    row of `missions`, as the section was written from).
+  The folder is written at each start, again at every look while the brain
+  runs (only when something changed; the brain isn't told), and by `tower
+  install`, `tower tell` and a behavior change (then every running brain
+  gets `[behaviors] …: read <its own file> again, and write nothing`, each
+  with its own path; the brain that made the change isn't told).
+- It is started like the main brain: a hidden terminal (`hc run --bg
+  --name tower-<slug> --no-notify --no-parent --cwd <its folder> --label
+  tower.space=<space> -- <program> …`), tied to its space by the label
+  `tower.space`. It is not a tab of its space: Herdr's `tab.new` shows the
+  tab it makes (it would take the window, and what the user is typing),
+  and a tab's terminal has no name to write to. `tower show tower-<slug>`
+  puts it in a tab. Its first-run "trust this folder?" question is
+  answered by the tower, as the main brain's is.
+
+### When a space has one
+
+Every 20 seconds, and at once when a session starts or ends (with the
+missions' look), `brains::step` decides:
+
+- **Start**: the space has at least one live agent session (as missions
+  count them: an agent, in the space, not a brain), it isn't closed or
+  archived, `per_space` is on, the main brain runs, and no brain of that
+  space runs. A standing space and one with no goal get one too. A space
+  `tower launch` made gets its own when its first session reports.
+- **Stop**: the space is closed or archived (at once); Herdr's window is
+  open and no longer has the space (at once: the user closed it in Herdr);
+  the space has had no live session for 3 minutes (`IDLE_GRACE_MS`, so a
+  session that restarts doesn't bounce it); `per_space` was turned off.
+- **Again, later each time**: a brain that isn't there while its space is
+  due one is started again after 15 s, 30 s, 1, 2, 4, 8, then every 10
+  minutes (`backoff_ms`); one that ran 5 minutes is answered at once the
+  next time.
+- `tower space close` ends the space's brain before anything else (through
+  the daemon, which also holds it off for 2 minutes; with no daemon, by
+  its name), so Herdr's `space.close` then closes the whole space as
+  before. Its receipt gains `"tower_ended": ["tower-<slug>"]`.
+- A daemon that starts finds the brains that run again (the radar's first
+  look), so `tower restart` leaves them running.
+
+### Who gets what
+
+`brains::route(space, per_space, known brains)`: the brain of that space
+when it **can take it** (its terminal is live and reports `idle`, `working`
+or `done`), else the main brain. So everything about a space with no brain,
+with one that is starting (no status yet), waits on its own screen
+(`blocked`), is in an error or has ended, and everything when `per_space`
+is off, goes to the main brain. If handing it to a space's brain fails at
+that moment, it goes to the main brain too. Nothing is dropped.
+
+| What | Its space | Goes to |
+|---|---|---|
+| `[watch]`, `[queue]`, `[agenda]` (the radar's outbox) | the session's (`where`), as the radar knows it | that space's brain, else main |
+| `[space]` (a space is ready to close) | the space | that space's brain, else main |
+| `[question]`, `[question-text]` | the space of the session the note names (`brain::session_in`) | that space's brain, else main |
+| `[session]`: a session runs `tower queue tower "…"` | the sender's | the sender's own space's brain; from a space without one: main |
+| `[session]`: a session runs `tower queue tower-<slug> "…"` | | that brain, as addressed |
+| `[session]`: one brain writes to another (`tower queue tower "…"` from a space's brain; `tower queue tower-<slug> "…"` from the main one) | | as addressed, at every level; it arrives as `[session] From <space> › tower <slug> (<address>): …` (from the main one: `From tower (<address>): …`) |
+| `[behaviors]` | | every running brain, each told its own file |
+| `tower ask "<text>"`, the voice, the floating panel | none | main |
+| `tower ask --space <space> "<text>"` (a space's view) | the space (its whole name in any case, else a part of it) | that space's brain, with `[radar]` listing that space's sessions only; else main, as `In <space>: <text>` |
+
+- **History.** A request a space's brain took is `{"kind":"request",
+  "text", "source", "space": "<space>"}`, and that brain's answer
+  `{"kind":"answer", "text", "space": "<space>"}`. The main brain's carry
+  no `space`; a request that fell back to it is kept as it was sent (`"In
+  <space>: <text>"`, no `space`), which is what a space's view already
+  reads as its own. A space brain's note turn is a `note` with its
+  session's space (its own space when the note names no session).
+- **Its words.** Each brain has its own turn (`brain::Turn`: watch, note,
+  question), set as a note goes in and by its own transcript, which the
+  narrator follows per brain (`~/.claude/projects/<its folder>`). A space
+  brain's answer to a request is a chat message and is spoken like the main
+  brain's; what it writes on a note turn is not shown or spoken at the
+  quiet levels. Its Stop hook says whose words it brings (`Request::Say`
+  has `brain`).
+- **Decisions and receipts.** `tower raise` and `tower receipt` say which
+  terminal ran them (`from`): what a space's brain raises carries its
+  space whatever session it names, and its receipt without `--agenda` is
+  its space's.
+- **The radar** treats every `tower` and `tower-…` terminal on this Mac as
+  a brain, not an agent: no watch, no question set, no decision, no alert,
+  not in `agents`, not introduced, no task dispatched to it, no agenda
+  task for what is queued to it. A session a space's brain starts is shown
+  in a tab like one the main brain starts. The daemon routes to, restarts
+  and stops only the brains it runs: the main one, and a `tower-…` whose
+  folder is under its own `brains/` (one named by hand, or another
+  tower's, is left alone). A test daemon (`HERDER_TOWER_TEST=1`) runs no
+  space brains and touches none.
+
+### What says so
+
+- `missions[].tower` (in `state.json`, `tower missions`, the socket's
+  `missions`): `{"name": "tower-sandbox", "status": "ready" | "working" |
+  "starting" | "blocked" | "off", "address": "t12" | null}`, or `null` when
+  the space has none and is due none (`per_space` off, no live session).
+  `ready`: idle or done; `starting`: live, no status yet; `blocked`: it
+  waits on its own screen or is in an error (its notes go to the main
+  brain meanwhile); `off`: due one that doesn't run (it died and is waiting
+  to be started again, or the main brain is down). It is never one of
+  `missions[].sessions`. With no daemon, `tower missions` reads the brains
+  from Herdr (then never `off`).
+- `brains` in `state.json` (what `tower status` prints): every brain that
+  runs, the main one first: `[{"name", "space": name or null, "address",
+  "status": Herdr's word or "starting", "model": name or null, "effort":
+  level or null}]` (`model` and `effort` as its command line says).
+  `brain` and `brain_app` stay the main brain's.
+- `{"cmd":"brains"}` on the socket: `{"brains": [as above]}`;
+  `{"cmd":"brains","action":"close","space":"<space>"}`: `{"ended":
+  [names]}`; `{"cmd":"brains","action":"restart"}`: `{"restarted":
+  [names]}`.
+- `tower up` starts the main brain; the daemon starts the spaces' own.
+  `tower down` stops them all (`--keep-brain`: none). `tower restart`
+  restarts the voice and leaves every brain running; `tower restart
+  --brain` restarts the brains too. `tower doctor` lists them.
+
+## The brains' model
+
+One setting for every tower brain, the main one and each space's own:
+
+```toml
+[brains]
+model = "claude-opus-5-5"   # the default when the key is absent
+effort = "high"             # low | medium | high | xhigh | max; the default when absent
+```
+
+- The picker offers `claude-fable-5-2` (Fable 5.2), `claude-opus-5-5`
+  (Opus 5.5), `claude-sonnet-5-5` (Sonnet 5.5) and `claude-haiku-5-5`
+  (Haiku 5.5). The command line takes any other name the program does (an
+  alias, a full name), as typed; one of the four may be given by its
+  picker name ("opus 5.5").
+- **How it is applied.** A brain is started as `claude -n <its name>
+  --model <model> --effort <effort> <claude_args…>` (`brains::argv`):
+  both hold for that session only. The tower never types `/model` or
+  `/effort` into a brain (that would save the choice as the account's
+  default), and sets neither `ANTHROPIC_MODEL` nor
+  `CLAUDE_CODE_EFFORT_LEVEL`. So a change applies when a brain starts.
+- **The user's own arguments win.** If `claude_args` contains `--model`
+  (or `--model=…`), the tower passes no `--model` of its own; the same for
+  `--effort`. The report says so (`locked_by_args`, `locked`).
+- **Codex.** With `brain = "codex"` the model comes from `codex_model`,
+  `codex_effort` and `codex_args`, as before: the report says so, setting a
+  model is refused, and nothing is changed.
+- **An install from before this.** The keys `claude_model` and
+  `claude_effort` are read only from a file that has them and no `[brains]
+  model` / `effort` (key by key); they are no longer written. A file with
+  neither gets the defaults, so a brain that ran on the old built-in
+  `sonnet` at `medium` starts on Opus 5.5 at `high` the next time it
+  starts, and until then `restart_needed` is true.
+
+### Commands and requests
+
+- `tower model` prints the report; `tower model <model> [--effort
+  <level>]` and `tower model --effort <level>` set it (config.toml's text
+  is edited in place: only the `[brains]` keys change, and a change after
+  which the file wouldn't read is refused); `--restart` restarts every
+  brain that runs, now; `--json` (or a pipe) prints the report as JSON.
+  It works with no daemon (then it restarts only the main brain, and the
+  spaces' own come back on the setting when the voice starts).
+- The socket: `{"cmd":"model"}` asks; `{"cmd":"model","model":"…",
+  "effort":"…","restart":true}` sets (each field optional). The answer is
+  the report with `"restarted": [names]`. The daemon does the restart
+  itself (it outlives the brains, so the main brain can ask for its own):
+  the spaces' brains are stopped and started by the next look, the main
+  one is stopped and started on the program it ran.
+- A restarted brain starts a new conversation.
+
+### The report (`brain_model` in `state.json`)
+
+```
+"brain_model": {
+  "program": "claude" | "codex",
+  "model": "claude-opus-5-5",          // the setting
+  "effort": "high",
+  "choices": { "models": [ { "id": "claude-fable-5-2", "label": "Fable 5.2" }, … four ],
+               "efforts": ["low", "medium", "high", "xhigh", "max"] },
+  "running": [ { "brain": "tower", "space": null, "address": "t7",
+                 "model": "sonnet" | null, "effort": "medium" | null,   // as its command line says
+                 "restart": true } ],                                    // it was started on something else
+  "restart_needed": true,              // any of `running` has `restart`
+  "locked_by_args": false,             // claude_args set the model or the effort
+  "locked": { "model": name or null, "effort": level or null },
+  "says": "The tower's brain runs on sonnet at medium effort. Opus 5.5 at high effort applies when it restarts."
+}
+```
+
+`running` has the main brain first, then the spaces' own by name. What a
+brain "was started with" is read off its terminal's command line (`hc
+get`'s `argv`), so it is true for a brain an older tower started too.
+`restart` compares it with what a start would give now (the setting, or
+what `claude_args` say). `says` is the sentence the Settings card and
+`tower model` show.
+
+### In Settings
+
+"Tower's model" (`src/orb/panel/settings.rs`): the four models and the
+five efforts as choices (`tower model <id>`, `tower model --effort
+<level>`; the choice shows at once and goes back, with the command's error
+in its place, if the tower refuses), `says` (with "A change applies when
+the tower's brain restarts." when nothing else says so), and "Restart the
+tower's brain" (`tower model --restart`) while `restart_needed`.
+
+## Steps 4 and 6: the orb, the floating panel, the full window
+
+Built in `src/orb/` (`model.rs` is the one model for both windows, `nav.rs`
+where the full window is, `panel/` the views).
+
+- **The orb** shows an amber number: open decisions outside muted spaces
+  (O1 to O3). It replaces the red dot. No number when there are none.
+- **Floating panel** (380 × 640, today's size; F1 to F9, I1 to I4): the
+  status line, the queue (one card open, the rest behind it), the open
+  spaces as chips with their state, the main tower's last reply, the input.
+  Hovering the orb peeks at it and a click pins it. It replaces the chat as
+  the panel's home.
+- **Full window** (about 960 × 640; W1 to W20), opened from the floating
+  panel. It is moved by its header strip (the view's title and what is
+  beside it) or by the sidebar's top ("Tower" and the status line): press
+  and drag, as the orb is dragged. Where it is dropped is kept in
+  `window.json` (the state folder, beside `orb.json`), moved wholly onto
+  the screen its middle is on (`nav::keep_on`), and it opens there next
+  time (beside the floating panel until it was ever moved). It has a
+  sidebar (All spaces, each open space, New space, the quiet fold,
+  Record, Shots, Settings) and a main pane:
+  - All spaces: the queue and the missions list.
+  - A space: its goal and done-when, Follow and Mute, its closing report,
+    what needs you there, its requests, its sessions (with worktree and
+    port), the thread between its sessions, and an input that goes to that
+    space's tower. Its head says "its own tower" when it has one that runs
+    (`missions[].tower`; "is starting", "waits on its own screen" when so).
+  - New space: goal, setup, what the tower will do, Launch.
+  - Record: the history, filtered by space (the old Chat and Activity).
+  - Shots, Settings (how much it tells you, the tower's model, voice as a
+    three-way choice "Off / Decisions / Replies and decisions" with
+    "Always on this Mac" as its own switch, questions policy, Follow and
+    Mute, behaviors, phone, accounts, setups), a session's own view.
+- Number keys answer the open card. Cards are C1 to C6.
+- One model feeds both sizes: answering or picking a card in one shows in
+  the other.
+
+### What the windows read
+
+- `state.json`: `decisions` (in the daemon's order; the queue is those
+  whose `state` is `open` or `answering`, the main queue those not
+  `muted`), `missions` (`spaces`, `quiet`, `closed_today`), `threads`,
+  `tell_level`, `questions` (the question set behind a `question` or
+  `permission` decision, for its card's steps), `agents`, `screenshots`,
+  `question_policy`, `behaviors`, `muted`, `tell_voice` (none on an older
+  daemon: `muted` says off or replies), `voice_on_mac`, `talk_key`, `acts`
+  (what the tower opened: the reply's receipt, its chips and whether Undo
+  is offered), `brain_model` (the Settings card; none on an older daemon: the card says
+  so).
+  The orb's number is counted from `decisions`: those that are `open`,
+  not muted, and not muted or dismissed here a moment ago. One whose
+  answer is going in (`answering`) isn't counted, so for those seconds the
+  number is one less than `decisions_count`.
+- `spaces.json`: `follow` and `mute` (for a switch set before the state
+  says so). The windows never write it.
+- `prs.json`: a merge decision's PRs as the tower knows them (the commit a
+  merge is pinned to, each check by name). A PR that isn't in it is drawn
+  from the decision's own `prs[]` (`title`, `checks`, `merge`).
+- `history.jsonl`: the Record, and the reply to the user's last request
+  (an `answer`, or a `receipt` that was told; never an entry with `record:
+  true`), with the `act` entries that name that request (`act.request_at`):
+  the act is shown as `state.json` has it now, or, when the tower no longer
+  holds it, as its last entry left it (then with no Undo).
+- A state without `decisions` or `missions` (an older daemon) is read
+  through `model::adapt` and `adapt_missions`: its escalated question sets,
+  the waiting PRs of `prs.json`, `spaces.json` and Herdr's spaces.
+
+### What a decision's `state` means to a card
+
+`open`: a card. `answering`: a short "Sending your answer" card, not
+counted. `answered`, `stopped`, `dismissed`: gone (the state lists open
+ones only). `stopped` is over without an answer: its sessions are gone. An
+answer that stops half way (the dialog changed while it was typed) leaves
+the decision `open` again; the card then says "It stopped", from its
+question set's `status: failed`, and offers the session or another try.
+
+### What they do
+
+- A card's answer goes through the daemon's socket, as `tower answer`
+  does: `{"choice": n}` or `{"other": "…"}` for what was raised or failed,
+  the question set's answers for a question. A decision of the daemon's
+  (`d…`) is answered and dismissed by its own id, so every session that
+  asks the same gets the answer; an older daemon's by its question set's.
+- A merge runs in the window's process (`prs::merge`, pinned to the commit
+  shown), then tells the daemon (`PrMerged`).
+- What the full window sets runs the `tower` CLI: `tower tell <level>`;
+  `tower space follow|unfollow|mute|unmute <space>`; `tower space goal
+  <space> "<goal>" --done-when "<…>"` then `tower space standing <space>
+  on|off`; `tower space close <space>` (and `--force` after a refusal),
+  whose JSON receipt is said in a sentence; `tower setups --json`; `tower
+  launch "<goal>" --setup "<name>" --dry-run --json` for the preview and
+  the same without `--dry-run` to launch (its receipt names the space,
+  whose view then opens).
+- The input in a space's view runs `tower ask --space <space> "<text>"`
+  (step 7): the daemon hands it to that space's brain, or to the main one
+  as `In <space>: <text>` when the space has none that can take it. The
+  placeholder says which ("Tell the <space> tower…" when
+  `missions[].tower` says one runs, else "Tell the tower about
+  <space>…"). On a tower whose `ask` has no `--space` (an older build) the
+  window sends `tower ask "In <space>: <text>"` itself. Either way the
+  reply shows in that space's view: an `answer` with that `space`, or the
+  answer to a request that starts with `In <space>:`.
+- "Tower's model" in Settings runs `tower model <id>`, `tower model
+  --effort <level>` and `tower model --restart` (see "The brains' model").
+- Voice in Settings runs `tower tell --voice off|decisions|replies`; the
+  panel's Mute and ⌥-click on the orb stay `tower mute`.
+- Undo on a reply runs `tower undo <id> --json` (and `--force` from "Undo
+  anyway"); "Make it a rule" on a receipt runs `tower ask [--space <space>]
+  "Make this a rule: …"`.
+
+### Looking at them without the keyboard
+
+`tower orb --ui-dir <dir>` with `HERDER_TOWER_ORB_PANEL=show[@<x>,<y>]`
+(the floating panel up from the start) and
+`HERDER_TOWER_ORB_WINDOW=show[:<view>][@<x>,<y>]` (the full window at
+`all`, `space=<name>`, `new[=<goal>]`, `record[=<space>]`, `shots`,
+`settings`, `behaviors`, `phone`, `session=<space>/<address>`). Neither
+takes the keyboard; a spot off the screen's edge keeps them out of the way.
+`HERDER_TOWER_ORB_ANSWER=<decision id>:<n>[:rule]` has the full window
+answer that card with its option `n` (from 0) two and a half seconds after
+the start, as a click on it would, and with `:rule` take its receipt's
+"Make it a rule": for looking at what an answer leaves behind.
+A whole tower for them to read runs in a sandbox with `HERDER_TOWER_VOICE=off
+tower daemon` (no speakers, no Kokoro, no Whisper, no microphone, no talk
+key; its own `HERDER_TOWER_HOME`, `_STATE`, `_DATA`, and stand-ins named by
+`HERDER_TOWER_HC`, `HERDER_TOWER_HERDR_APP`, `TOWER_CCA`, `HERDER_TOWER_GH`).
+
+## Step 11: the phone
+
+The Android app (its own repo, `~/Work/herder-tower-android`) opens on the
+queue and notifies for a decision and for nothing else (A1 to A12; picture
+in `docs/quiet-tower-android.png`). The phone API has what it needs, all
+under `/v1`, authenticated as before. **The contract the app is built
+against is [mobile-api.md](mobile-api.md), "The Quiet Tower"** (every
+shape, error and event), with a walk through every call in
+[mobile-api-quiet-walkthrough.md](mobile-api-quiet-walkthrough.md). This
+section says what was built and how it hangs together.
+
+### The calls
+
+| Call | Body | Answer |
+|---|---|---|
+| `GET /v1/decisions?space=<name>&all=1` | | `{"space", "count", "decisions": [Decision]}` in queue order (`tower decisions --json`). Without `space`, muted spaces are left out; with it, that space's only, muted or not. `all=1`: `closed` too |
+| `GET /v1/decisions/{id}` | | `{"decision": Decision}`, open or closed lately |
+| `POST /v1/decisions/{id}/answer` | `{"choice": n}`, `{"other": "text"}`, or what `/v1/questions/{id}/answer` takes (`{answers, submit}`; as a form with files too) | What `tower answer <id>` prints, by kind (step 3). `409 closed` (with `state`) when it is over already; `400 merge` (with `prs`) for a merge |
+| `DELETE /v1/decisions/{id}` | | `{"dismissed": id, "state"}` |
+| `POST /v1/decisions/{id}/interpret` · `/voice?tab=N` | `{"tab", "text"}` · a WAV | A spoken answer as a choice: a question's as `/v1/questions/{id}/interpret`; for the others their options are the one tab, and `answer` is the body to send |
+| `GET /v1/missions` | | `{"spaces": [Mission], "quiet": [name], "closed_today": [name]}` |
+| `POST /v1/spaces/{space}/goal` | `{"goal", "done_when", "standing"}`, each optional | What `tower space goal` prints, with `mission` (its row of the missions, or null) |
+| `POST /v1/spaces/{space}/follow` · `/mute` | `{"on": bool}` | `{"space", "follow"\|"mute", "mission"}` |
+| `POST /v1/spaces/{space}/close` | `{"force": bool}` | `202 {"action": Action}`; `409 busy` (with `sessions`) while a session works or is blocked, unless `force` |
+| `GET /v1/thread?space=<name>&limit=50&before=<id>` | | `{"space", "messages": [{"id","at","from","from_name","to","to_name","text","space","delivered"}], "more"}`, newest last |
+| `GET /v1/setups` | | `{"setups": [{"name","account","repos"}]}` |
+| `POST /v1/launch` | `{"goal", "setup", "name", "dry_run"}` (`goal` required) | `dry_run`: `200`, the plan (`tower launch --dry-run --json`). Else `202 {"action": Action}` |
+| `GET /v1/actions` · `/v1/actions/{id}` | | `{"actions": [Action]}` · `{"action": Action}` |
+| `GET /v1/tell` · `POST /v1/tell` | `{"level", "voice"}`, each optional | `{"level", "voice"}` · the same with `"was"` and `"voice_was"` for what was set. `400 bad_level`, `400 bad_voice` |
+| `GET /v1/acts` · `/v1/acts/{id}` | | `{"acts": [Act]}`, newest first · `{"act": Act}`; `404 no_act` |
+| `POST /v1/acts/{id}/undo` | `{"force": bool}` | `200` what `tower undo` prints (`act`, `closing`, …). `409 held` (with `sessions`: who and why) while work would be lost, unless `force`; `409 undone`; `409 cannot_undo`; `404 no_act` |
+| `POST /v1/decisions/{id}/rule` | `{"answer": text}`, optional | `202 {"sent": the request, "space"}`: asked of that space's tower as `/v1/ask` asks. `409 not_answered`, `409 no_rule`, `404 no_decision` |
+| `GET /v1/model` · `POST /v1/model` | `{"model", "effort", "restart"}`, each optional | The report under "The brains' model", with `restarted` |
+| `POST /v1/ask` | gains `"space": name` (a `space` field in the form) | `202 {"sent", "attachments", "space"}`; `404 no_space` |
+| `GET /v1/chat` | gains `?space=<name>` and `?main=1` | Every message has `space` |
+| `GET /v1/history` | gains `?space=<name>` | A space's Record |
+
+`GET /v1/hello` (and the pairing answer, and the stream's `hello`) has
+`"features": ["quiet", "acts"]`: an app checks `quiet` before it uses any
+of this, and falls back to the question sets and PR chips on a tower
+without it; `acts` says the tower keeps acts (the chat's `act` messages,
+`/v1/acts`, the undo, `/v1/decisions/{id}/rule`, `voice` in `/v1/tell`). `api`
+stays 1: nothing that was there changed.
+
+```
+Decision { "id", "key", "kind": "permission"|"question"|"merge"|"choice"|"failed"|"raised"|"blocked",
+           "space": name or null,
+           "sessions":[{"address","name","waiting":bool,"question_id"?}], "waiting": n,
+           "title", "why", "options":[{"label","why","pick":bool}], "pick": label or null,
+           "prs":[{"key","repo","number","base","title","url",
+                   "checks":"pass"|"pending"|"fail"|"none","note","session",
+                   "merge":{"can","blocked","needs_override","warnings"}}],
+           "question_id": id or null, "task": id or null,
+           "first_ms", "last_ms", "count",
+           "state": "open"|"answering"|"answered"|"stopped"|"dismissed",
+           "muted": bool }
+Mission  { "name", "goal", "done_when", "standing", "state": "open"|"quiet"|"ready",
+           "follow", "mute", "needs": n, "report",
+           "sessions":[{"address","name","status","account","worktree","branch","port","said"}],
+           "requests":[{"id","title","state","done","total"}], "thread_count",
+           "tower": {"name","status","address"} or null,
+           "quiet_since_ms", "ready_since_ms", "auto_close_ms" }
+Action   { "id": "act_" + 8 hex digits, "kind": "launch"|"close", "space",
+           "state": "running"|"done"|"failed",
+           "plan": a launch's dry-run receipt (null for a close),
+           "receipt": a launch's receipt so far, then whole; a close's when done; else null,
+           "error": why it failed, or null,
+           "by": "phone:<device>", "started_ms", "finished_ms" }
+```
+
+The exact `Mission` (what is null, what is "", the order of the list) is
+under "`missions` in `state.json`" above. A closed space is not in the
+list: its name is in `closed_today` on the day it closed.
+
+`prs` is `[]` for anything but a merge. `checks` is `none` when no checks
+ran; `note` says the checks in words ("1 check failing: lint"); `merge` is
+what a PR's chip has (`prs::Gate`). `why` is the reason a question went to
+the user, `merge`, the category `tower raise` gave, or `failed`. `task` is
+a failed decision's agenda task. A merge is never answered by its
+decision: the app goes to the PR's own `/v1/prs/{owner}/{repo}/{number}/confirm`
+and `/merge`, by `prs[].repo` and `prs[].number`.
+
+### One way in
+
+The phone does what the Mac's windows and the CLI do, through the same
+functions (`src/daemon/lan/tower.rs`: the trait `Tower`; `src/daemon/desk.rs`:
+the daemon is one):
+
+| Phone | The same as |
+|---|---|
+| `/v1/decisions`, `/v1/decisions/{id}` | `{"cmd":"decisions"}` (`Decisions::listed`: a space by its whole name, where the CLI's `--space` takes a part) |
+| `…/answer`, `DELETE` | `{"cmd":"answer"}`, `{"cmd":"dismiss"}` with a decision's id: `Decisions::answer_with` and `dismiss_with` (`src/daemon/decisions.rs`), carried out with the daemon's question sets, send queue and agenda ledger. They return `Refused` (unknown, closed, a merge, a bad answer, its questions' own errors, failed): the socket prints it as a sentence, the phone gives each its status and code |
+| `/v1/missions` | `{"cmd":"missions"}` (`Missions::now`: it looks first) |
+| `…/goal` | `tower space goal` and `tower space standing`: `missions::goal_in`, `standing_in`, under `spaces::update` |
+| `…/follow`, `…/mute` | `tower space follow\|mute`: `spaces::set_follow` / `set_mute` under `spaces::update`; a mute republishes the queue; the missions are looked at again for the answer |
+| `…/close` | `tower space close`: `missions::holding` for the refusal, `missions::close(space, force, false)` (the voice closes it itself), then its decisions and the missions follow |
+| `/v1/setups`, `/v1/launch` | `tower setups`, `tower launch`: `setups::value`, `launch::planned`, `launch::open` (which now reports after each session) |
+| `/v1/tell`, `/v1/model` | `{"cmd":"tell"}`, `{"cmd":"model"}` |
+| `/v1/acts`, `…/undo` | `{"cmd":"act","action":"list"}`, `{"cmd":"act","action":"undo"}`: `Acts::list`, `Daemon::undo` (`acts::undo` with the daemon's queue, ledger, watches and missions) |
+| `/v1/decisions/{id}/rule` | "Make it a rule" on the Mac: `Decisions::rule_of` (`decisions::rule_for`), then the same `ask` |
+| `/v1/ask` with `space` | `{"cmd":"ask","space"}`: `stt::deliver_to` |
+
+The phone API starts when the daemon is whole (it is handed the daemon,
+`Lan::attach`), a moment later than before; until then these calls would
+answer `503 starting`.
+
+### What takes a while is an action
+
+A launch opens a session per repo (`tower start` each, up to three minutes
+before one is given up), a close ends terminals and removes worktrees.
+Neither holds a phone's call open, and neither blocks the listener (every
+call has its own thread, and the work its own after the call has
+answered). `POST /v1/launch` makes the plan at once (so a setup nobody has,
+or a repo that is no folder, is the call's own error), answers `202` with
+an action that carries it, and opens that very plan (it is not planned a
+second time: what the action shows is what is opened). `POST /v1/spaces/{space}/close`
+checks at once that no session there works or waits (`409 busy`, naming
+them), then answers `202` with an action. Every step is an `action` event
+(begun; a launch's receipt so far after each session; done or failed), and
+`GET /v1/actions/{id}` says the same to a phone that was away. One launch
+at a time, and one close per space (`409 launching` / `closing`, with the
+running action's id, so a second tap finds the first). Actions live in the
+daemon's memory (the last 50): a restart forgets them, and what they did
+is in the missions.
+
+### The state, and the events
+
+The phone's state (`GET /v1/state`, the `state` event) has
+`decisions_count`, `tell_level`, `tell_voice`, `brain_model` and `brains`,
+and none of the lists: `decisions`, `missions`, `threads` and `acts` are
+taken out of it
+(`state.json` on the Mac keeps them all). A `state` event is sent only when
+something the phone's state carries changed (its `version` and
+`updated_ms` aside), so a change to the queue or a mission alone doesn't
+send it.
+
+The event stream gains:
+
+- `decisions`: `{"count", "decisions": [Decision]}`, every open one in
+  queue order with `muted` (the main queue is those not muted; `count` is
+  `decisions_count`). Sent right after the first `state`, then whenever
+  the list changes, the 30-second reorder included.
+- `missions`: what `GET /v1/missions` answers, after the first
+  `decisions`, then whenever it changes.
+- `thread`: `{"space", "message"}` when a `peer` entry is written to the
+  history (right after that entry's `history` event).
+- `action`: an action, at each step.
+- `act`: an act (the shape under "A command gets a receipt"), when it is
+  kept, when a session joins it, when it can no longer be undone lightly,
+  and when it is undone.
+
+**The chat.** What the tower opened in answer to a request is one message
+of the chat, `role: "tower"`, `kind: "act"`, where it was opened (so
+between the request and the tower's own words): `text` is the act's line
+(its closing line once undone), `act` the act as it is now, `space` the
+conversation it was asked in. It changes in place (a `chat` event, `op:
+"update"`). An act the tower no longer holds (older than its last 50)
+shows as its history entry left it, with `undo.possible: false`. The
+answer to `POST /v1/decisions/{id}/answer` has `rule` (`{"can", "text"}`).
+
+**New, or changed.** The app notifies for a new decision and for nothing
+else, from the `decisions` event alone: it keeps the ids it has seen, and a
+decision whose id it has not seen, that is not `muted` and is `open`, is
+new. An id is a decision's for its whole life; the same key again (another
+session, the same line raised again, another PR of the repo) changes
+`count`, `last_ms`, `sessions` or `prs`, never the id; the same thing
+needing the user again after it closed is another decision, with another
+id. A muted space's decision is seen and never notified.
+
+### Whose conversation
+
+A request asked in a space's view and the answer to it belong to that
+space's conversation, on the Mac and on the phone. Every chat message has
+`space` (`chat::thread_with`): a request's is the space it was asked in
+(its history entry's `space` when the space's own tower took it; the space
+named in front, `In <space>: …`, when the main tower took it for a space it
+keeps); an answer's is its request's (the main tower's answers are matched
+to its requests in order); for anything else it is where it comes from.
+`chat::in_conversation` is the one rule for both filters: a space's own
+conversation is its requests, answers and receipts; the main one is
+everything but the requests and answers that have a space.
+
+### Tests
+
+`cargo test lan` runs the listener over HTTPS with a pinned certificate and
+a paired phone, against a tower of the test's own (real decisions and
+question sets, a `spaces.json` in a temporary folder, a launch that goes
+when the test says): every call's answer and its errors, names with spaces,
+slashes and letters outside ASCII, the events for a new decision and for a
+repeat, a launch step by step, and the calls from before still answering.
+
+## Reference
+
+- The design's source: `docs/quiet-tower.html` (open it in a browser). Its
+  script holds the mock's model and drawing code, which says exactly what
+  each view shows.
+- The numbers above: `~/.local/share/herder-tower/history.jsonl`,
+  `agendas.json` and the brain's transcripts for 10 Nov 2026.

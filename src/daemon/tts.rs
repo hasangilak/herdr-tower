@@ -15,6 +15,11 @@
 //! Muted (`tower mute`), nothing makes a sound: no words, no bell, no
 //! chimes. What it would have said still shows (`said`), and alerts are
 //! counted, so unmuting can say how many were missed.
+//!
+//! What is said at all is the voice setting (`tell::Voice`, `[tell] voice`):
+//! `off` is the mute, `decisions` says a decision's sentence and nothing
+//! else, `replies` says its answers too. Each sound says what it is
+//! (`tell::Spoken`), and the setting is asked when its turn comes.
 
 use std::collections::VecDeque;
 use std::num::NonZero;
@@ -31,19 +36,23 @@ use rodio::buffer::SamplesBuffer;
 
 use super::lan::hub::Hub;
 use super::queue::{Kind, Queue};
+use crate::tell::{Spoken, Voice};
 use super::state::{MISSED_MAX, Shared, lock, now_ms};
 use super::timing;
 
 pub enum Msg {
     Say {
         text: String,
-        kind: Kind,
+        /// An answer, a receipt, or other news.
+        what: Spoken,
         interrupt: bool,
     },
     /// An alert about one agent: what to say, its address and status.
+    /// `yours`: it needs the user (a decision's sentence), not other news.
     Alert {
         text: String,
         about: Option<(String, String)>,
+        yours: bool,
     },
     /// A short tone: listening started (`true`) or stopped.
     Chime(bool),
@@ -63,7 +72,9 @@ pub enum Msg {
     /// A request reached the brain (`true`: the user took something back,
     /// "never mind": a short reply is not said).
     /// `.1`: the phone whose replies go to it alone (its route is `phone`).
-    Asked(bool, Option<String>),
+    /// A request went in: it takes something back, the phone it came from, and
+    /// whether it was spoken (a typed one gets its answer in writing only).
+    Asked(bool, Option<String>, bool),
     /// The brain's turn is over: its answer is all in.
     Answered,
 }
@@ -91,6 +102,9 @@ pub struct Mouth {
     mute_lock: Arc<Mutex<()>>,
     /// The file that keeps the mute (see `mute_file`).
     mute_path: PathBuf,
+    /// What is said while not muted: `Voice::Decisions` or `Voice::Replies`
+    /// (as its number). Unmuting goes back to it.
+    mode: Arc<AtomicU8>,
     /// Everything plays here, never on a phone (`voice_on_mac`).
     on_mac: Arc<AtomicBool>,
     shared: Shared,
@@ -115,14 +129,33 @@ fn muted_at_start(path: &Path, shared: &Shared) -> bool {
     muted
 }
 
-/// Keeps the mute on disk. A failure is only a warning: the mute holds
-/// all the same, until the voice restarts.
-fn save_mute(path: &Path, on: bool) -> Result<()> {
+/// The voice setting as the number kept for it, and back.
+fn mode_number(v: Voice) -> u8 {
+    if v == Voice::Decisions { 1 } else { 2 }
+}
+
+fn mode_of(n: u8) -> Voice {
+    if n == 1 { Voice::Decisions } else { Voice::Replies }
+}
+
+/// What is said once the tower talks again: what config.toml says, or, while
+/// that is `off`, what the mute file kept (`replies` when it kept nothing).
+fn mode_at_start(path: &Path, setting: Voice) -> Voice {
+    match setting {
+        Voice::Off => std::fs::read_to_string(path).ok().and_then(|t| Voice::parse(&t)).filter(|v| *v != Voice::Off).unwrap_or_default(),
+        v => v,
+    }
+}
+
+/// Keeps the mute on disk, with what was said before it (`was`: an unmute
+/// goes back to that, past a restart too). A failure is only a warning: the
+/// mute holds all the same, until the voice restarts.
+fn save_mute(path: &Path, on: bool, was: Voice) -> Result<()> {
     if on {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        std::fs::write(path, "muted\n").with_context(|| format!("writing {}", path.display()))?;
+        std::fs::write(path, format!("{was}\n")).with_context(|| format!("writing {}", path.display()))?;
     } else {
         match std::fs::remove_file(path) {
             Ok(()) => {}
@@ -169,6 +202,7 @@ impl Mouth {
     }
 
     /// Flips the mute; returns whether it is muted now.
+    #[cfg(test)]
     pub fn toggle_muted(&self) -> Result<bool> {
         let _held = lock(&self.mute_lock);
         let on = !self.muted();
@@ -176,13 +210,39 @@ impl Mouth {
         Ok(on)
     }
 
+    /// What the tower says out loud now: `off` while muted.
+    pub fn voice(&self) -> Voice {
+        if self.muted() { Voice::Off } else { self.mode() }
+    }
+
+    /// What it says while not muted (what an unmute goes back to).
+    pub fn mode(&self) -> Voice {
+        mode_of(self.mode.load(Ordering::SeqCst))
+    }
+
+    /// Sets what the tower says out loud (`tower tell --voice`): `off` is
+    /// the mute; `decisions` and `replies` unmute it. Like the mute, it
+    /// never fails. (Kept in config.toml by the caller.)
+    pub fn set_voice(&self, voice: Voice) -> Result<()> {
+        let _held = lock(&self.mute_lock);
+        if voice != Voice::Off && self.mode.swap(mode_number(voice), Ordering::SeqCst) != mode_number(voice) {
+            eprintln!("[speech] voice: {voice}");
+        }
+        self.apply_mute(voice == Voice::Off);
+        Ok(())
+    }
+
     /// `set_muted`, with `mute_lock` held.
     fn apply_mute(&self, on: bool) {
-        if let Err(e) = save_mute(&self.mute_path, on) {
+        if let Err(e) = save_mute(&self.mute_path, on, self.mode()) {
             eprintln!("[speech] warning: {e:#}: the {} holds until the voice restarts", if on { "mute" } else { "unmute" });
         }
         let was = self.muted.swap(on, Ordering::SeqCst);
-        self.shared.update(|s| s.muted = on);
+        let voice = if on { Voice::Off } else { self.mode() };
+        self.shared.update(|s| {
+            s.muted = on;
+            s.tell_voice = voice.word().into();
+        });
         if was == on {
             return;
         }
@@ -203,14 +263,30 @@ impl Mouth {
     }
 
     pub fn say_as(&self, text: impl Into<String>, kind: Kind, interrupt: bool) {
-        let _ = self.tx.send(Msg::Say { text: text.into(), kind, interrupt });
+        let what = if kind == Kind::Reply { Spoken::Reply } else { Spoken::News };
+        let _ = self.tx.send(Msg::Say { text: text.into(), what, interrupt });
+    }
+
+    /// The one line for a finished request: news the user asked to hear,
+    /// after the bell, in its turn.
+    pub fn receipt(&self, text: impl Into<String>) {
+        let _ = self.tx.send(Msg::Say { text: text.into(), what: Spoken::Receipt, interrupt: false });
     }
 
     /// News nobody asked for. `about`: the agent's address and status, so
     /// it can be dropped if that changes before it is said.
     pub fn alert(&self, text: impl Into<String>, about: Option<(&str, &str)>) {
         let about = about.map(|(a, s)| (a.to_string(), s.to_string()));
-        let _ = self.tx.send(Msg::Alert { text: text.into(), about });
+        let _ = self.tx.send(Msg::Alert { text: text.into(), about, yours: false });
+    }
+
+    /// What only the user can decide or unblock, in a sentence: a question
+    /// a session asks, a wait, a merge, what the brain raised, a session
+    /// stuck on an error. It is said when the voice setting is `decisions`
+    /// too. `about`: as for `alert`.
+    pub fn needs_you(&self, text: impl Into<String>, about: Option<(&str, &str)>) {
+        let about = about.map(|(a, s)| (a.to_string(), s.to_string()));
+        let _ = self.tx.send(Msg::Alert { text: text.into(), about, yours: true });
     }
 
     pub fn chime(&self, on: bool) {
@@ -224,8 +300,8 @@ impl Mouth {
 
     /// A request reached the brain: its answer is next. `request`: what was asked.
     /// `phone`: it came from that paired phone, whose replies are heard there only.
-    pub fn asked(&self, request: &str, phone: Option<String>) {
-        let _ = self.tx.send(Msg::Asked(crate::text::is_dismissal(request), phone));
+    pub fn asked(&self, request: &str, phone: Option<String>, spoken: bool) {
+        let _ = self.tx.send(Msg::Asked(crate::text::is_dismissal(request), phone, spoken));
     }
 
     /// The brain's answer is all in.
@@ -300,10 +376,11 @@ impl Mouth {
 
     /// A mouth with its messages, and its own mute file at `mute_path`
     /// (read as at start-up).
-    fn for_test(hub: Arc<Hub>, mute_path: PathBuf) -> (Mouth, Receiver<Msg>) {
+    pub(super) fn for_test(hub: Arc<Hub>, mute_path: PathBuf) -> (Mouth, Receiver<Msg>) {
         let (tx, rx) = channel();
         let (player, _out) = Player::new();
         let shared = Shared::new(super::state::State::new("ptt", "test", "test"));
+        let mode = mode_at_start(&mute_path, Voice::default());
         let muted = muted_at_start(&mute_path, &shared);
         let mouth = Mouth {
             tx,
@@ -315,6 +392,7 @@ impl Mouth {
             muted: Arc::new(AtomicBool::new(muted)),
             mute_lock: Arc::new(Mutex::new(())),
             mute_path,
+            mode: Arc::new(AtomicU8::new(mode_number(mode))),
             on_mac: Arc::new(AtomicBool::new(false)),
             shared,
         };
@@ -324,7 +402,7 @@ impl Mouth {
 
 /// A mute file of its own for each test mouth, under `mute_file`'s folder.
 #[cfg(test)]
-fn test_mute_path() -> PathBuf {
+pub(super) fn test_mute_path() -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = mute_file().with_file_name(format!("mouth-{}", N.fetch_add(1, Ordering::SeqCst)));
     dir.join("muted")
@@ -345,6 +423,8 @@ pub struct Settings {
     pub alert_max_age: Duration,
     /// Everything plays on this Mac, never on a phone (at start).
     pub on_mac: bool,
+    /// What is said out loud (`[tell] voice`, at start).
+    pub says: Voice,
 }
 
 /// Opens the default speakers. rodio asks for about 50 ms of buffer
@@ -366,20 +446,37 @@ fn open_speakers() -> Result<rodio::MixerDeviceSink> {
     Err(first).context("opening the speakers")
 }
 
+/// `HERDER_TOWER_VOICE=off`: the tower without its voice, for a daemon run
+/// in a sandbox beside the real one (its own `HERDER_TOWER_HOME`, `_STATE`
+/// and `_DATA`). It opens no speakers, loads neither Kokoro nor Whisper,
+/// and leaves the microphone and the talk key alone; its socket, its
+/// state, its queue, its radar and its record work as always. Nothing is
+/// ever said.
+pub fn voiceless() -> bool {
+    std::env::var("HERDER_TOWER_VOICE").is_ok_and(|v| v.eq_ignore_ascii_case("off"))
+}
+
 /// Starts the speech thread. Kokoro loads (and on first use downloads,
 /// about 330 MB) before this returns, so the first sentence is quick.
 pub fn start(settings: Settings, shared: Shared, hub: Arc<Hub>) -> Result<Mouth> {
-    let sink = open_speakers()?;
-    let player = Arc::new(Player::connect_new(sink.mixer()));
-    let bell = Player::connect_new(sink.mixer());
+    // Without a voice (`voiceless`): players nothing listens to, and no engine.
+    let (sink, player, bell, engine) = if voiceless() {
+        eprintln!("[speech] HERDER_TOWER_VOICE=off: no speakers, nothing is said");
+        (None, Player::new().0, Player::new().0, None)
+    } else {
+        let sink = open_speakers()?;
+        let (player, bell) = (Player::connect_new(sink.mixer()), Player::connect_new(sink.mixer()));
+        let engine = loqui::Engine::builder().preload(true).build().context("loading Kokoro")?;
+        // Make sure the voice exists and is downloaded before anyone waits on it.
+        engine
+            .speak(&loqui::SpeakRequest { voice: settings.voice.clone(), speed: settings.speed, ..loqui::SpeakRequest::new("Ready.") })
+            .with_context(|| format!("trying voice {:?}", settings.voice))?;
+        (Some(sink), player, bell, Some(engine))
+    };
+    let player = Arc::new(player);
     let volume = settings.volume.clamp(0.0, 1.0);
     player.set_volume(volume);
     bell.set_volume(volume);
-    let engine = loqui::Engine::builder().preload(true).build().context("loading Kokoro")?;
-    // Make sure the voice exists and is downloaded before anyone waits on it.
-    engine
-        .speak(&loqui::SpeakRequest { voice: settings.voice.clone(), speed: settings.speed, ..loqui::SpeakRequest::new("Ready.") })
-        .with_context(|| format!("trying voice {:?}", settings.voice))?;
     let acks: Vec<(String, Vec<f32>)> = settings
         .acks
         .iter()
@@ -390,13 +487,20 @@ pub fn start(settings: Settings, shared: Shared, hub: Arc<Hub>) -> Result<Mouth>
                 format: loqui::Format::Pcm,
                 ..loqui::SpeakRequest::new(a.clone())
             };
+            let engine = engine.as_ref()?;
             engine.speak(&req).map_err(|e| eprintln!("[tts] ack {a:?}: {e}")).ok().map(|s| (a.clone(), pcm(&s.audio)))
         })
         .collect();
 
     let (tx, rx) = channel();
     let mute_path = mute_file();
-    let muted = muted_at_start(&mute_path, &shared);
+    // What an unmute goes back to, read before the mute file is written again.
+    let mode = mode_at_start(&mute_path, settings.says);
+    // Muted by `tower mute` (the file is there), or by `[tell] voice = "off"`.
+    let muted = muted_at_start(&mute_path, &shared) || settings.says == Voice::Off;
+    if muted && let Err(e) = save_mute(&mute_path, true, mode) {
+        eprintln!("[speech] warning: {e:#}");
+    }
     let mouth = Mouth {
         tx,
         generation: Arc::new(AtomicU64::new(0)),
@@ -407,15 +511,21 @@ pub fn start(settings: Settings, shared: Shared, hub: Arc<Hub>) -> Result<Mouth>
         muted: Arc::new(AtomicBool::new(muted)),
         mute_lock: Arc::new(Mutex::new(())),
         mute_path,
+        mode: Arc::new(AtomicU8::new(mode_number(mode))),
         on_mac: Arc::new(AtomicBool::new(settings.on_mac)),
         shared: shared.clone(),
     };
-    shared.update(|s| s.voice_on_mac = settings.on_mac);
+    eprintln!("[speech] voice: {}", mouth.voice());
+    shared.update(|s| {
+        s.voice_on_mac = settings.on_mac;
+        s.muted = muted;
+        s.tell_voice = mouth.voice().word().into();
+    });
     if settings.on_mac {
         eprintln!("[speech] voice on this Mac: nothing goes to the phones");
     }
     let speech = Speech {
-        engine: Some(engine),
+        engine,
         q: Queue::new(settings.alert_max_age),
         settings,
         acks,
@@ -424,6 +534,7 @@ pub fn start(settings: Settings, shared: Shared, hub: Arc<Hub>) -> Result<Mouth>
         generation: mouth.generation.clone(),
         held: mouth.held.clone(),
         muted: mouth.muted.clone(),
+        mode: mouth.mode.clone(),
         on_mac: mouth.on_mac.clone(),
         shared,
         playing: VecDeque::new(),
@@ -434,6 +545,7 @@ pub fn start(settings: Settings, shared: Shared, hub: Arc<Hub>) -> Result<Mouth>
         acked: false,
         dismissed: false,
         turn_phone: None,
+        turn_spoken: true,
         replies_started: 0,
         next_ack: 0,
         last_alert: None,
@@ -442,14 +554,16 @@ pub fn start(settings: Settings, shared: Shared, hub: Arc<Hub>) -> Result<Mouth>
     thread::Builder::new().name("tts".into()).spawn(move || {
         // The output device lives as long as this thread.
         let mut sink = sink;
-        sink.log_on_drop(false);
+        if let Some(sink) = sink.as_mut() {
+            sink.log_on_drop(false);
+        }
         speech.run(rx);
     })?;
     Ok(mouth)
 }
 
 struct Speech {
-    /// None in tests: nothing is made.
+    /// None in tests and without a voice (`voiceless`): nothing is made.
     engine: Option<loqui::Engine>,
     q: Queue,
     settings: Settings,
@@ -460,6 +574,8 @@ struct Speech {
     held: Arc<AtomicU8>,
     /// Muted (`tower mute`): what comes in is dropped unsaid.
     muted: Arc<AtomicBool>,
+    /// What is said while not muted (`Mouth::mode`).
+    mode: Arc<AtomicU8>,
     /// Everything plays here, never on a phone.
     on_mac: Arc<AtomicBool>,
     shared: Shared,
@@ -479,6 +595,10 @@ struct Speech {
     /// The current request came from this phone (route `phone`): its
     /// replies and acknowledgement are heard there only.
     turn_phone: Option<String>,
+    /// The current request was spoken (to a microphone, the Mac's or a
+    /// phone's). A typed one is answered in writing: its reply and its
+    /// "Okay." are shown, not said.
+    turn_spoken: bool,
     replies_started: u64,
     next_ack: usize,
     /// When the last alert sentence was queued: alerts in a row share a bell.
@@ -546,20 +666,27 @@ impl Speech {
         }
     }
 
+    /// Whether a sound of this kind is made now: the voice setting, and for
+    /// a reply or the acknowledgement, whether the request was spoken.
+    fn says(&self, what: Spoken) -> bool {
+        self.voice().speaks(what) && (self.turn_spoken || !matches!(what, Spoken::Reply | Spoken::Ack))
+    }
+
     fn message(&mut self, m: Msg) {
         match m {
             Msg::Chime(on) => {
-                if !self.is_muted() {
+                if self.voice().speaks(Spoken::Chime) {
                     self.bell.append(chime(on));
                 }
             }
             Msg::Ack { delay } => {
                 self.acked = false;
-                if !self.acks.is_empty() && !self.is_muted() {
+                if !self.acks.is_empty() && self.says(Spoken::Ack) {
                     self.ack = Some((Instant::now() + delay, self.replies_started));
                 }
             }
-            Msg::Say { text, kind, interrupt } => {
+            Msg::Say { text, what, interrupt } => {
+                let kind = if what == Spoken::Reply { Kind::Reply } else { Kind::Alert };
                 if self.is_muted() {
                     // Not heard, but it shows; news (a watch's report the brain tells) is kept as missed.
                     if !text.trim().is_empty() {
@@ -568,6 +695,15 @@ impl Speech {
                         if kind == Kind::Alert {
                             self.missed(&text);
                         }
+                    }
+                    return;
+                }
+                // Not what the voice setting says out loud (or an answer to
+                // something typed): it shows, as while muted.
+                if !self.says(what) {
+                    if !text.trim().is_empty() {
+                        eprintln!("[speech] voice is {}: not saying {text:?}", self.voice());
+                        self.show_said(&text);
                     }
                     return;
                 }
@@ -584,7 +720,7 @@ impl Speech {
                     None => text,
                 };
                 self.show_said(&text);
-                let item = self.q.item(kind, &text, None);
+                let item = self.q.item_as(what, &text, None);
                 if interrupt {
                     self.generation.fetch_add(1, Ordering::SeqCst);
                     self.player.clear();
@@ -599,7 +735,7 @@ impl Speech {
                     eprintln!("[speech] already waiting to be said: {text:?}");
                 }
             }
-            Msg::Alert { text, about } => {
+            Msg::Alert { text, about, yours } => {
                 self.show_said(&text);
                 if self.is_muted() {
                     // Kept, so unmuting can say what was missed.
@@ -607,7 +743,12 @@ impl Speech {
                     self.missed(&text);
                     return;
                 }
-                let item = self.q.item(Kind::Alert, &text, about);
+                let what = if yours { Spoken::Decision } else { Spoken::News };
+                if !self.voice().speaks(what) {
+                    eprintln!("[speech] voice is {}: not saying the alert {text:?}", self.voice());
+                    return;
+                }
+                let item = self.q.item_as(what, &text, about);
                 if self.q.push(item) {
                     eprintln!("[speech] alert queued: {text:?} ({} waiting)", self.q.len());
                 }
@@ -659,12 +800,14 @@ impl Speech {
                 self.dismissed = false;
                 // A take from the Mac's microphone.
                 self.turn_phone = None;
+                self.turn_spoken = true;
             }
             Msg::Expect(false) => self.awaiting = None,
-            Msg::Asked(dismissed, phone) => {
+            Msg::Asked(dismissed, phone, spoken) => {
                 self.acked = false;
                 self.dismissed = dismissed;
                 self.turn_phone = phone;
+                self.turn_spoken = spoken;
                 let n = self.q.asked();
                 if n > 0 {
                     eprintln!("[speech] new request: dropped {n} old replies");
@@ -687,7 +830,7 @@ impl Speech {
     fn maybe_ack(&mut self) {
         let Some((at, before)) = self.ack else { return };
         let generation = self.generation.load(Ordering::SeqCst);
-        if self.is_muted() {
+        if !self.says(Spoken::Ack) {
             self.ack = None;
             return;
         }
@@ -707,6 +850,10 @@ impl Speech {
     }
 
     fn speak_next(&mut self) {
+        // What waited while the voice setting changed is no longer said.
+        for text in self.q.keep_spoken(self.voice()) {
+            eprintln!("[speech] voice is {}: dropped {text:?}", self.voice());
+        }
         if self.engine.is_none() {
             return;
         }
@@ -768,6 +915,11 @@ impl Speech {
 
     fn is_muted(&self) -> bool {
         self.muted.load(Ordering::SeqCst)
+    }
+
+    /// What is said out loud now (`Mouth::voice`).
+    fn voice(&self) -> Voice {
+        if self.is_muted() { Voice::Off } else { mode_of(self.mode.load(Ordering::SeqCst)) }
     }
 
     /// A hush or a mute came from another thread between the last check and
@@ -940,6 +1092,7 @@ mod tests {
                 alert_wait: Duration::from_secs(10),
                 alert_max_age: Duration::from_secs(60),
                 on_mac: false,
+                says: Voice::default(),
             },
             acks: vec![("Got it.".into(), vec![0.0; 10])],
             player: mouth.player.clone(),
@@ -947,6 +1100,7 @@ mod tests {
             generation: mouth.generation.clone(),
             held: mouth.held.clone(),
             muted: mouth.muted.clone(),
+            mode: mouth.mode.clone(),
             on_mac: mouth.on_mac.clone(),
             shared: mouth.shared.clone(),
             playing: VecDeque::new(),
@@ -957,6 +1111,7 @@ mod tests {
             acked: false,
             dismissed: false,
             turn_phone: None,
+            turn_spoken: true,
             replies_started: 0,
             next_ack: 0,
             last_alert: None,
@@ -995,6 +1150,114 @@ mod tests {
         assert_eq!(speech.q.len(), 2, "the missed line and the reply");
         assert_eq!(speech.bell.len(), 1);
         assert!(speech.ack.is_some());
+    }
+
+    /// What waits to be said, in the order it would be.
+    fn waiting(speech: &mut Speech) -> Vec<String> {
+        speech.q.keep_spoken(speech.voice());
+        std::iter::from_fn(|| speech.q.next(true, |_| None)).map(|n| n.text).collect()
+    }
+
+    #[test]
+    fn the_voice_setting_decides_what_is_said() {
+        // Every kind of speech there is: an answer, its acknowledgement, a decision's
+        // sentence, other news (an alert, what the brain tells unasked), a receipt, a chime.
+        let all = |mouth: &Mouth| {
+            mouth.say("Two requests are open.", false);
+            mouth.ack(Duration::ZERO);
+            mouth.needs_you("The api session in sandbox asks: which database?", Some(("t5", "blocked")));
+            mouth.alert("The web session in sandbox finished.", Some(("t6", "done")));
+            mouth.say_as("The docs are updated.", Kind::Alert, false);
+            mouth.receipt("The login fix is merged into dev.");
+            mouth.chime(true);
+        };
+        // Replies: all of it, as before the setting.
+        let (mouth, mut speech, rx) = pair();
+        assert_eq!((mouth.voice(), mouth.shared.get().tell_voice.as_str()), (Voice::Replies, "replies"));
+        all(&mouth);
+        deliver(&mut speech, &rx);
+        assert!(speech.ack.is_some());
+        assert_eq!(speech.bell.len(), 1);
+        assert_eq!(
+            waiting(&mut speech),
+            ["Two requests are open.", "The api session in sandbox asks: which database?", "The web session in sandbox finished.", "The docs are updated.", "The login fix is merged into dev."]
+        );
+        // Decisions: the decision's sentence and nothing else (the microphone's tone still answers the key).
+        let (mouth, mut speech, rx) = pair();
+        mouth.set_voice(Voice::Decisions).unwrap();
+        assert_eq!((mouth.voice(), mouth.muted(), mouth.shared.get().tell_voice.as_str()), (Voice::Decisions, false, "decisions"));
+        all(&mouth);
+        deliver(&mut speech, &rx);
+        assert!(speech.ack.is_none(), "no \"Okay.\"");
+        assert_eq!(speech.bell.len(), 1);
+        assert_eq!(waiting(&mut speech), ["The api session in sandbox asks: which database?"]);
+        assert_eq!(mouth.shared.get().said, "The login fix is merged into dev.", "what it would have said still shows");
+        assert!(mouth.shared.get().missed_while_muted.is_empty(), "nothing is owed for later: it isn't muted");
+        // Off: nothing at all. It is the mute.
+        let (mouth, mut speech, rx) = pair();
+        mouth.set_voice(Voice::Off).unwrap();
+        assert_eq!((mouth.voice(), mouth.muted(), mouth.shared.get().muted, mouth.shared.get().tell_voice.as_str()), (Voice::Off, true, true, "off"));
+        all(&mouth);
+        deliver(&mut speech, &rx);
+        assert!(speech.ack.is_none());
+        assert_eq!(speech.bell.len(), 0);
+        assert!(waiting(&mut speech).is_empty());
+        // What waited when the setting changed is no longer said.
+        let (mouth, mut speech, rx) = pair();
+        all(&mouth);
+        deliver(&mut speech, &rx);
+        mouth.set_voice(Voice::Decisions).unwrap();
+        deliver(&mut speech, &rx);
+        assert_eq!(waiting(&mut speech), ["The api session in sandbox asks: which database?"]);
+    }
+
+    #[test]
+    fn a_typed_request_is_answered_in_writing_and_a_spoken_one_out_loud() {
+        // Typed (the panel, `tower ask`, the phone's text box): its answer and its "Okay." show, unsaid.
+        let (mouth, mut speech, rx) = pair();
+        mouth.asked("what's left?", None, false);
+        mouth.ack(Duration::ZERO);
+        mouth.say("Two requests are open.", false);
+        deliver(&mut speech, &rx);
+        assert!(speech.ack.is_none(), "no spoken Okay for a typed request");
+        assert_eq!(mouth.shared.get().said, "Two requests are open.", "the answer is still shown");
+        assert!(waiting(&mut speech).is_empty(), "and not said");
+        // What only the user can decide is said whatever the request was.
+        mouth.needs_you("The api session in sandbox asks: which database?", Some(("t5", "blocked")));
+        deliver(&mut speech, &rx);
+        assert_eq!(waiting(&mut speech), ["The api session in sandbox asks: which database?"]);
+        // Spoken: as always.
+        mouth.asked("what's left?", None, true);
+        mouth.ack(Duration::ZERO);
+        mouth.say("Two requests are open.", false);
+        deliver(&mut speech, &rx);
+        assert!(speech.ack.is_some());
+        assert_eq!(waiting(&mut speech), ["Two requests are open."]);
+    }
+
+    #[test]
+    fn muting_is_the_voice_off_and_unmuting_goes_back() {
+        let dir = mute_file().with_file_name("voice-back");
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("muted");
+        let (mouth, _speech, _rx) = pair_at(file.clone());
+        mouth.set_voice(Voice::Decisions).unwrap();
+        // `tower mute on`: off, and what it was is kept with the mute.
+        mouth.set_muted(true).unwrap();
+        assert_eq!((mouth.voice(), mouth.mode(), std::fs::read_to_string(&file).unwrap().trim().to_string()), (Voice::Off, Voice::Decisions, "decisions".to_string()));
+        // A restart while muted, with `voice = "off"` in config.toml: still off, and it still knows what to go back to.
+        assert_eq!(mode_at_start(&file, Voice::Off), Voice::Decisions);
+        assert_eq!(mode_at_start(&file, Voice::Replies), Voice::Replies, "config.toml says otherwise: that");
+        let (again, _s, _r) = pair_at(file.clone());
+        assert!(again.muted() && again.voice() == Voice::Off);
+        // `tower mute off`: back to decisions, not to everything.
+        mouth.set_muted(false).unwrap();
+        assert_eq!((mouth.voice(), mouth.shared.get().tell_voice.as_str(), file.exists()), (Voice::Decisions, "decisions", false));
+        // An older tower's mute file names nothing: unmuting is replies.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, "muted\n").unwrap();
+        assert_eq!(mode_at_start(&file, Voice::Off), Voice::Replies);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

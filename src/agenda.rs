@@ -65,6 +65,12 @@ pub const REMIND_MS: u64 = 6 * 3_600_000;
 pub const MAX_REMINDERS: u32 = 3;
 /// Settled agendas are kept this long, then dropped (the newest few hundred stay regardless).
 const KEEP_SETTLED_MS: u64 = 30 * 24 * 3_600_000;
+/// A task that failed is sent once more by the tower itself (a quiet level) only this soon after
+/// it failed: one that failed long ago (before a restart, under an older tower) is left as it is.
+/// For this long after that retry, the brain's word that it failed is about the try before.
+pub const AUTO_RETRY_MS: u64 = 10 * 60_000;
+/// A finished request's receipt is asked for (`tower job done` says so) this long after it finished.
+pub const RECEIPT_DUE_MS: u64 = 30 * 60_000;
 const KEEP_AGENDAS: usize = 300;
 const KEEP_STEPS: usize = 60;
 
@@ -269,6 +275,16 @@ pub struct Task {
     pub why: String,
     /// Sent again by the reconciler.
     pub reprompts: u32,
+    /// Tried again after it failed: by the tower itself (once, see
+    /// `Ledger::failures`) or with `tower agenda requeue`.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub retries: u32,
+    /// When it was last tried again after a failure (0: never).
+    #[serde(skip_serializing_if = "is_zero_ms")]
+    pub retried_ms: u64,
+    /// It failed again after a retry, and that is in front of the user as a decision.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub raised: bool,
     /// The last sign of life: a hook event, a turn, its screen changing.
     pub progress_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -281,6 +297,14 @@ pub struct Task {
     pub told: String,
     pub told_ms: u64,
     pub history: Vec<Step>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_zero_ms(n: &u64) -> bool {
+    *n == 0
 }
 
 impl Task {
@@ -339,6 +363,12 @@ impl Task {
                 if !text.is_empty() && text != self.instruction && !self.followups.contains(&text) {
                     self.followups.push(text.clone());
                 }
+                // A try after it failed: counted, and what the user was asked about the failure is over.
+                if self.state == TaskState::Failed {
+                    self.retries += 1;
+                    self.retried_ms = now;
+                }
+                self.raised = false;
                 // The next try binds afresh, from its queue id.
                 self.delivered_ms = 0;
                 self.question.clear();
@@ -428,6 +458,9 @@ pub struct Agenda {
     pub told_done: bool,
     pub reminded: u32,
     pub reminded_ms: u64,
+    /// When its receipt was given (`tower receipt`): one per request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_ms: Option<u64>,
 }
 
 impl Agenda {
@@ -593,6 +626,27 @@ pub enum Action {
     Reprompt { task: String, session: String, text: String },
 }
 
+/// What is done about a task that failed (`Ledger::failures`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum FailedTask {
+    /// The first time: its instruction goes to its session once more.
+    Retry { task: String, session: String, text: String, why: String },
+    /// Again, after a retry: the user's to decide (try once more, or drop it).
+    Decide { task: String, title: String, session: String, name: String, space: Option<String>, why: String },
+}
+
+/// Why a task's instruction doesn't go to the terminal that has its
+/// session's address now: it isn't the one the task was handed to (`given`:
+/// when that one was made; `there`: when the one there now was). An address
+/// comes back for the next terminal, and what the tower sends by itself must
+/// never land in a stranger. None: the same one, or nothing says otherwise.
+pub fn another_terminal(session: &str, given: Option<u64>, there: Option<u64>) -> Option<String> {
+    match (given, there) {
+        (Some(was), Some(now)) if was != now => Some(format!("{session} is another terminal now than the one the task was given to")),
+        _ => None,
+    }
+}
+
 /// A note for the brain.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Note {
@@ -701,6 +755,45 @@ impl Ledger {
         bail!("no agenda or task {target} (`tower agenda` lists them)")
     }
 
+    /// The one receipt for a finished request (`target`: its agenda, or one
+    /// of its tasks): refused while tasks are open, and a second time. Its
+    /// agenda's id, the spaces it was about, and whether the user asked for
+    /// it (not work the tower started on its own).
+    pub fn receipt(&mut self, target: &str, now: u64) -> Result<(String, Vec<String>, bool)> {
+        let id = match self.resolve(target)? {
+            Target::Agenda(a) => a,
+            Target::Task(t) => self.agenda_of(&t).map(|a| a.id.clone()).unwrap_or_default(),
+        };
+        let Some(a) = self.agenda_mut(&id) else { bail!("no agenda {target} (`tower agenda` lists them)") };
+        let open: Vec<String> = a.unfinished().iter().map(|t| format!("{} \"{}\" is {}", t.id, t.title, t.state)).collect();
+        if !open.is_empty() {
+            bail!("{id} isn't finished: {}. Verify or drop what is open first; its receipt comes once, at the end.", open.join("; "));
+        }
+        if a.receipt_ms.is_some() {
+            bail!("{id} has its receipt already: one per request");
+        }
+        a.receipt_ms = Some(now);
+        let mut spaces = a.spaces.clone();
+        for s in a.tasks.iter().filter_map(|t| t.space.clone()) {
+            if !spaces.contains(&s) {
+                spaces.push(s);
+            }
+        }
+        Ok((id, spaces, a.origin != "tower"))
+    }
+
+    /// The request of the user's that `session` worked on, finished within
+    /// the last `within` ms, whose receipt hasn't been given: the latest.
+    pub fn receipt_due(&self, session: &str, now: u64, within: u64) -> Option<&Agenda> {
+        self.agendas.iter().rev().find(|a| {
+            a.state == AgendaState::Done
+                && a.receipt_ms.is_none()
+                && a.origin != "tower"
+                && a.closed_ms.is_some_and(|c| now.saturating_sub(c) < within)
+                && a.tasks.iter().any(|t| t.session == session)
+        })
+    }
+
     /// A new agenda for `words`. A request that has one already gets that one.
     pub fn open(&mut self, words: &str, title: &str, origin: &str, request_ms: u64, spaces: &[String], now: u64) -> String {
         if request_ms > 0
@@ -726,6 +819,85 @@ impl Ledger {
     /// The task the send queue's id stands for.
     pub fn by_queue_id(&self, id: u64) -> Option<&Task> {
         self.agendas.iter().flat_map(|a| a.tasks.iter()).find(|t| t.queue_ids.contains(&id))
+    }
+
+    /// The task `session` is on, or was until `within` ms ago: one handed
+    /// out and not through its turn yet (queued, running, blocked), or one
+    /// whose turn just ended. None: nothing was asked of it lately.
+    pub fn at_work_on(&self, session: &str, now: u64, within: u64) -> Option<&Task> {
+        self.agendas
+            .iter()
+            .flat_map(|a| a.tasks.iter())
+            .filter(|t| !session.is_empty() && t.session == session)
+            .filter(|t| matches!(t.state, TaskState::Queued | TaskState::Running | TaskState::Blocked) || now.saturating_sub(t.since_ms) < within)
+            .max_by_key(|t| (t.delivered_ms, t.created_at_ms))
+    }
+
+    /// The tasks that stand failed and aren't dealt with. One that just
+    /// failed for the first time is sent once more by the tower itself
+    /// (`retry`: at a quiet level; while the tower tells everything the
+    /// brain hears of it and asks the user, as before). One that failed
+    /// again after a retry (the tower's, or `tower agenda requeue`) is the
+    /// user's to decide, once.
+    pub fn failures(&self, retry: bool, now: u64) -> Vec<FailedTask> {
+        let mut out = vec![];
+        for t in self.agendas.iter().filter(|a| a.live()).flat_map(|a| a.tasks.iter()).filter(|t| t.state == TaskState::Failed) {
+            if t.retries == 0 {
+                if retry && !t.session.is_empty() && now.saturating_sub(t.since_ms) <= AUTO_RETRY_MS {
+                    out.push(FailedTask::Retry {
+                        task: t.id.clone(),
+                        session: t.session.clone(),
+                        text: t.followups.last().cloned().unwrap_or_else(|| t.instruction.clone()),
+                        why: t.why.clone(),
+                    });
+                }
+            } else if !t.raised {
+                out.push(FailedTask::Decide {
+                    task: t.id.clone(),
+                    title: t.title.clone(),
+                    session: t.session.clone(),
+                    name: t.name.clone(),
+                    space: t.space.clone(),
+                    why: t.why.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// The task on `session` that failed a moment ago and is on its way
+    /// again (tried once more, its new turn not over): word that "it failed"
+    /// now is about the try before, which is dealt with.
+    pub fn retrying(&self, session: &str, now: u64) -> Option<String> {
+        self.unfinished_on(session)
+            .filter(|t| matches!(t.state, TaskState::Queued | TaskState::Running) && t.retries > 0 && now.saturating_sub(t.retried_ms) <= AUTO_RETRY_MS)
+            .map(|t| t.id.clone())
+    }
+
+    /// The tower's own retry of a failed task couldn't be sent (`why`): it
+    /// counts as tried, so the failure goes to the user.
+    pub fn retry_unsent(&mut self, task: &str, why: &str) {
+        if let Some(t) = self.task_mut(task) {
+            t.retries += 1;
+            t.why = format!("{}; and it couldn't be sent again: {why}", t.why.trim_end_matches('.'));
+        }
+    }
+
+    /// A task's second failure is in front of the user as a decision.
+    /// `told`: the brain hears of it from that (it isn't told the failure again).
+    pub fn decided(&mut self, task: &str, told: bool, now: u64) {
+        if let Some(t) = self.task_mut(task) {
+            t.raised = true;
+            if told {
+                t.told = format!("{}:{}", t.state.word(), t.why);
+                t.told_ms = now;
+            }
+        }
+    }
+
+    /// The tasks whose second failure is in front of the user now.
+    pub fn failed_twice(&self) -> Vec<String> {
+        self.agendas.iter().filter(|a| a.live()).flat_map(|a| a.tasks.iter()).filter(|t| t.state == TaskState::Failed && t.raised).map(|t| t.id.clone()).collect()
     }
 
     /// The latest task on `session` that isn't settled, in an agenda still open.
@@ -1071,6 +1243,47 @@ impl Ledger {
         self.agendas.iter().filter(|a| a.live()).collect()
     }
 
+    /// The requests about one space, for its mission: those still open and
+    /// those finished since `since_ms`, each with its tasks settled out of
+    /// all of them; and how many of each.
+    pub fn requests_of(&self, space: &str, since_ms: u64) -> Requests {
+        let about = |a: &Agenda| {
+            a.spaces.iter().chain(a.tasks.iter().filter_map(|t| t.space.as_ref())).any(|s| s.eq_ignore_ascii_case(space.trim()))
+        };
+        let mut out = Requests::default();
+        let row = |a: &Agenda| {
+            serde_json::json!({
+                "id": a.id,
+                "title": clip(&a.title_or_words(), 80),
+                "state": a.state.word(),
+                "done": a.tasks.iter().filter(|t| t.state.settled()).count(),
+                "total": a.tasks.len(),
+            })
+        };
+        for a in self.agendas.iter().filter(|a| about(a) && a.live()) {
+            out.open += 1;
+            out.rows.push(row(a));
+        }
+        for a in self.agendas.iter().rev().filter(|a| about(a) && !a.live() && a.closed_ms.is_some_and(|c| c >= since_ms)) {
+            out.finished += 1;
+            out.rows.push(row(a));
+        }
+        out
+    }
+
+    /// The open requests that are about `space` and no other: closed with it.
+    pub fn only_in(&self, space: &str) -> Vec<String> {
+        self.agendas
+            .iter()
+            .filter(|a| a.live())
+            .filter(|a| {
+                let mut spaces = a.spaces.iter().chain(a.tasks.iter().filter_map(|t| t.space.as_ref())).peekable();
+                spaces.peek().is_some() && spaces.all(|s| s.eq_ignore_ascii_case(space.trim()))
+            })
+            .map(|a| a.id.clone())
+            .collect()
+    }
+
     /// One short line for the brain with each request: what is still open.
     pub fn radar_note(&self) -> Option<String> {
         let open = self.open_agendas();
@@ -1231,11 +1444,36 @@ pub fn act(l: &mut Ledger, c: &Cmd, heard: &Heard, now: u64) -> Result<Acted> {
             Ok(Acted { value: json!({ "action": c.action, "moved": moved }), cancel: vec![], changed: !moved.is_empty() })
         }
         "judge" => {
+            // "It failed", about a task the tower just sent once more: that is the try before.
+            let retried = (!c.ok).then(|| l.retrying(&c.session, now)).flatten();
+            if retried.is_some() {
+                return Ok(Acted { value: json!({ "task": null, "retried": retried, "agenda_done": null }), cancel: vec![], changed: false });
+            }
             let task = l.judged(&c.session, c.ok, &c.text, now);
-            Ok(Acted { value: json!({ "task": task }), cancel: vec![], changed: task.is_some() })
+            // The user's request this session worked on, when it is finished
+            // now (by this, or checked by the tower itself a moment ago) and
+            // its receipt is still to come.
+            let done = l.receipt_due(&c.session, now, RECEIPT_DUE_MS).map(|a| a.id.clone());
+            Ok(Acted { value: json!({ "task": task, "agenda_done": done }), cancel: vec![], changed: task.is_some() })
+        }
+        // `tower receipt --agenda <id>`: marks the request as receipted.
+        "receipt" => {
+            let (id, spaces, asked) = l.receipt(&c.target, now)?;
+            Ok(Acted { value: json!({ "agenda": id, "spaces": spaces, "asked": asked }), cancel: vec![], changed: true })
         }
         other => bail!("tower agenda {other}: use list, tasks, show, new, close, abandon, verify, fail or requeue"),
     }
+}
+
+/// A space's requests (`Ledger::requests_of`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Requests {
+    /// `{id, title, state, done, total}`: the open ones, oldest first, then those finished lately, newest first.
+    pub rows: Vec<serde_json::Value>,
+    /// Still open.
+    pub open: usize,
+    /// Done, closed or dropped since then.
+    pub finished: usize,
 }
 
 /// What `resolve` found.
@@ -1582,7 +1820,12 @@ pub fn judge(asked: &[&str], said: &str) -> Verdict {
         return Verdict::Unclear("it said nothing at the end of its turn".into());
     }
     if let Some(r) = crate::questions::waits_for_user(said) {
-        return Verdict::Asks(r);
+        // Told to wait for instructions, and it says it does: that is what
+        // it was asked, not a question for the user.
+        let as_asked = crate::questions::ready_only(said) && asked.iter().any(|a| crate::questions::ready_only(a));
+        if !as_asked {
+            return Verdict::Asks(r);
+        }
     }
     let low = said.to_lowercase().replace(['’', '‘'], "'");
     let fail = FAIL.iter().find(|p| low.contains(*p));
@@ -2021,6 +2264,86 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_sent_again_into_a_terminal_that_only_has_the_address() {
+        // The task went to the terminal made at 7; the one at its address now was made at 9.
+        let why = another_terminal("t5", Some(7), Some(9)).unwrap();
+        assert_eq!(why, "t5 is another terminal now than the one the task was given to");
+        assert_eq!(another_terminal("t5", Some(7), Some(7)), None, "the same terminal");
+        // Nothing to tell them apart by (an older task, a look that didn't say): as before.
+        assert_eq!((another_terminal("t5", None, Some(9)), another_terminal("t5", Some(7), None)), (None, None));
+        // A retry that isn't sent counts as tried: the failure is the user's to decide, not sent anywhere.
+        let now = 9_000_000_000;
+        let (mut l, _, ids) = ledger_with(1, now);
+        l.apply(&ids[0], TaskEv::Fail { why: "the tests fail".into() }, now).unwrap();
+        assert!(matches!(&l.failures(true, now + 1)[..], [FailedTask::Retry { .. }]));
+        l.retry_unsent(&ids[0], &why);
+        assert!(matches!(&l.failures(true, now + 2)[..], [FailedTask::Decide { why, .. }] if why.contains("another terminal now")));
+    }
+
+    #[test]
+    fn a_task_that_fails_is_tried_once_more_and_then_is_the_users() {
+        let now = 9_000_000_000;
+        let (mut l, _, ids) = ledger_with(1, now);
+        l.task_mut(&ids[0]).unwrap().space = Some("Shop".into());
+        assert!(l.failures(true, now).is_empty(), "nothing failed");
+        l.apply(&ids[0], TaskEv::Fail { why: "it says it couldn't: the tests fail".into() }, now).unwrap();
+        // While the tower tells everything, the brain hears of it and asks the user, as before.
+        assert!(l.failures(false, now).is_empty());
+        // One that failed long ago (before a restart, under an older tower) is left as it is.
+        assert!(l.failures(true, now + AUTO_RETRY_MS + 1).is_empty());
+        // At a quiet level the tower sends it once more by itself.
+        let f = l.failures(true, now + 5);
+        assert!(matches!(&f[..], [FailedTask::Retry { task, session, why, .. }] if task == &ids[0] && session == "t1" && why.contains("the tests fail")), "{f:?}");
+        l.requeue(&ids[0], 50, "", now + 1);
+        let t = l.task(&ids[0]).unwrap();
+        assert_eq!((t.state, t.retries, t.retried_ms, t.raised), (TaskState::Queued, 1, now + 1, false));
+        assert!(l.failures(true, now + 1).is_empty(), "it is on its way again");
+        // The brain's word on the try before comes late (`tower job failed`): it doesn't fail the new try.
+        let late = act(&mut l, &Cmd { action: "judge".into(), session: "t1".into(), ok: false, text: "the tests fail".into(), ..Default::default() }, &Heard::default(), now + 30_000).unwrap();
+        assert_eq!((late.value["retried"].as_str(), late.value["task"].is_null(), late.changed), (Some(ids[0].as_str()), true, false));
+        assert_eq!(l.task(&ids[0]).unwrap().state, TaskState::Queued);
+        // It fails again: the user's to decide, at every level, once.
+        l.apply(&ids[0], TaskEv::Fail { why: "its turn failed: rate limit".into() }, now + 2).unwrap();
+        assert!(l.retrying("t1", now + 3).is_none());
+        for retry in [true, false] {
+            let f = l.failures(retry, now + 2);
+            assert!(matches!(&f[..], [FailedTask::Decide { task, space, why, .. }] if task == &ids[0] && space.as_deref() == Some("Shop") && why.contains("rate limit")), "{f:?}");
+        }
+        assert!(l.failed_twice().is_empty());
+        l.decided(&ids[0], true, now + 3);
+        assert!(l.failures(true, now + 3).is_empty() && l.failed_twice() == ids);
+        assert!(l.news(now + 3 + GRACE_TROUBLE_MS).is_empty(), "the brain isn't told the failure again: the decision says it");
+        // The user says try again: a new try, and the decision about the old failure is over.
+        l.requeue(&ids[0], 51, "", now + 4);
+        let t = l.task(&ids[0]).unwrap();
+        assert_eq!((t.state, t.retries, t.raised), (TaskState::Queued, 2, false));
+        assert!(l.failed_twice().is_empty());
+        // A retry that can't be sent (its session is gone) counts as tried.
+        let (mut l, _, ids) = ledger_with(1, now);
+        l.apply(&ids[0], TaskEv::Fail { why: "it says it couldn't".into() }, now).unwrap();
+        l.retry_unsent(&ids[0], "t1 has ended");
+        assert!(matches!(&l.failures(true, now)[..], [FailedTask::Decide { why, .. }] if why.contains("couldn't be sent again: t1 has ended")));
+        // Kept across a restart, and absent from a task that never failed.
+        l.decided(&ids[0], false, now);
+        let back: Ledger = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        assert_eq!((back.task(&ids[0]).unwrap().retries, back.task(&ids[0]).unwrap().raised), (1, true));
+        let fresh = serde_json::to_string(&Task::default()).unwrap();
+        assert!(!fresh.contains("retries") && !fresh.contains("retried_ms") && !fresh.contains("raised"), "{fresh}");
+    }
+
+    #[test]
+    fn a_session_is_at_work_while_its_task_is_open_or_just_ended() {
+        let now = 9_000_000_000;
+        let (mut l, _, ids) = ledger_with(2, now);
+        assert_eq!(l.at_work_on("t1", now, 60_000).map(|t| t.id.as_str()), Some(ids[0].as_str()), "handed out, not through its turn");
+        assert!(l.at_work_on("t9", now, 60_000).is_none() && l.at_work_on("", now, 60_000).is_none());
+        l.apply(&ids[0], TaskEv::Verify { how: "checked".into() }, now + 1_000).unwrap();
+        assert!(l.at_work_on("t1", now + 2_000, 60_000).is_some(), "its turn ended a moment ago");
+        assert!(l.at_work_on("t1", now + 120_000, 60_000).is_none(), "long done: nothing was asked of it lately");
+        assert!(l.at_work_on("t2", now + 120_000, 60_000).is_some());
+    }
+
+    #[test]
     fn judging_last_messages() {
         let asked = ["Fix the failing login test in the api and make sure the suite passes"];
         assert!(matches!(judge(&asked, "Fixed the login test: the fixture used an expired token. The suite passes now."), Verdict::Done(_)));
@@ -2029,6 +2352,11 @@ mod tests {
         assert!(matches!(judge(&asked, "I looked around the repository."), Verdict::Unclear(_)));
         assert!(matches!(judge(&asked, ""), Verdict::Unclear(_)));
         assert!(matches!(judge(&["update the docs"], "Updated the docs ✅"), Verdict::Done(_)));
+        // Waiting for instructions is a question, unless that is what it was told to do.
+        assert!(matches!(judge(&asked, "I'm waiting for your instructions."), Verdict::Asks(_)));
+        let wait = ["First task: read CLAUDE.md and README.md, then wait for your instructions"];
+        assert!(!matches!(judge(&wait, "I've read CLAUDE.md and README.md. I'm on dev and waiting for your instructions."), Verdict::Asks(_)));
+        assert!(matches!(judge(&wait, "Read both. Please merge PR #12 first."), Verdict::Asks(_)), "a real wait still is one");
         // Seen live: a background job "will create" the file; and a file name holding "DONE".
         let web = ["Run the shell command: sleep 240 && echo ok > DONE-web.txt . When finished, reply with one sentence saying you created DONE-web.txt."];
         assert!(matches!(
@@ -2099,6 +2427,47 @@ mod tests {
         let tagged: crate::protocol::Request =
             serde_json::from_str(r#"{"cmd":"queue","action":"add","session":"t1","text":"x","tag":{"agenda":"a2","title":"t"}}"#).unwrap();
         assert!(matches!(tagged, crate::protocol::Request::Queue { tag: Some(Tag { agenda: Some(ref a), .. }), .. } if a == "a2"));
+    }
+
+    #[test]
+    fn a_finished_request_gets_one_receipt() {
+        let now = 1_000_000;
+        let (mut l, id, tasks) = ledger_with(2, now);
+        l.task_mut(&tasks[0]).unwrap().space = Some("Shop".into());
+        let e = l.receipt(&id, now).unwrap_err().to_string();
+        assert!(e.contains("isn't finished") && e.contains(&tasks[0]), "{e}");
+        for t in &tasks {
+            l.apply(t, TaskEv::Verify { how: "checked".into() }, now).unwrap();
+        }
+        let cmd = Cmd { action: "receipt".into(), target: tasks[1].clone(), ..Default::default() };
+        let acted = act(&mut l, &cmd, &Heard::default(), now + 5).unwrap();
+        assert_eq!((acted.value["agenda"].as_str(), acted.changed), (Some(id.as_str()), true), "by one of its tasks, too");
+        assert_eq!(acted.value["spaces"], serde_json::json!(["Shop"]));
+        assert_eq!(acted.value["asked"], true, "a request of the user's");
+        assert_eq!(l.agenda(&id).unwrap().receipt_ms, Some(now + 5));
+        assert!(l.receipt(&id, now + 9).unwrap_err().to_string().contains("has its receipt already"));
+        // `tower job done` on a request's last open task says the request is done, until it has its receipt.
+        let (mut j, jid, jtasks) = ledger_with(2, now);
+        let judge = |l: &mut Ledger, session: &str| act(l, &Cmd { action: "judge".into(), session: session.into(), ok: true, ..Default::default() }, &Heard::default(), now).unwrap().value;
+        let first = judge(&mut j, "t1");
+        assert_eq!((first["task"].as_str(), first["agenda_done"].is_null()), (Some(jtasks[0].as_str()), true), "one task is still open");
+        assert_eq!(judge(&mut j, "t2")["agenda_done"].as_str(), Some(jid.as_str()));
+        // The tower had checked it by itself already: the brain's `tower job done` still hears the request is done.
+        let again = judge(&mut j, "t2");
+        assert_eq!((again["task"].is_null(), again["agenda_done"].as_str()), (true, Some(jid.as_str())));
+        assert!(j.receipt_due("t2", now + RECEIPT_DUE_MS + 1, RECEIPT_DUE_MS).is_none(), "not for a request finished long ago");
+        j.receipt(&jid, now).unwrap();
+        assert!(judge(&mut j, "t2")["agenda_done"].is_null(), "it has its receipt");
+        // Work the tower started on its own is no request of the user's.
+        j.agenda_mut(&jid).unwrap().receipt_ms = None;
+        j.agenda_mut(&jid).unwrap().origin = "tower".into();
+        assert!(j.receipt_due("t2", now, RECEIPT_DUE_MS).is_none());
+        assert!(!j.receipt(&jid, now).unwrap().2);
+        assert!(l.receipt("a99", now).is_err());
+        // Kept across a restart, and absent from an agenda that has none.
+        let back: Ledger = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        assert_eq!(back.agenda(&id).unwrap().receipt_ms, Some(now + 5));
+        assert!(!serde_json::to_string(&Agenda::default()).unwrap().contains("receipt_ms"));
     }
 
     #[test]

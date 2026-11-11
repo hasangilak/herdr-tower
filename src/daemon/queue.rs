@@ -11,6 +11,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::tell::{Spoken, Voice};
 use crate::text;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,6 +24,9 @@ pub enum Kind {
 
 pub struct Item {
     pub kind: Kind,
+    /// What it is, for the voice setting (`tell::Voice`): an answer, a
+    /// decision's sentence, a receipt, other news.
+    pub what: Spoken,
     parts: VecDeque<String>,
     norm: String,
     /// An alert about one agent: its address and the status it had.
@@ -54,8 +58,15 @@ impl Queue {
     }
 
     pub fn item(&self, kind: Kind, text: &str, about: Option<(String, String)>) -> Item {
+        self.item_as(if kind == Kind::Reply { Spoken::Reply } else { Spoken::News }, text, about)
+    }
+
+    /// An item that is `what`: an answer goes first, anything else waits as an alert.
+    pub fn item_as(&self, what: Spoken, text: &str, about: Option<(String, String)>) -> Item {
+        let kind = if matches!(what, Spoken::Reply | Spoken::Ack) { Kind::Reply } else { Kind::Alert };
         Item {
             kind,
+            what,
             parts: super::tts::quick_start(text::sentences(text)).into(),
             norm: text::normalize(text),
             about,
@@ -103,6 +114,21 @@ impl Queue {
 
     pub fn len(&self) -> usize {
         self.items.len()
+    }
+
+    /// What `voice` doesn't say is dropped unsaid (an item once begun is
+    /// finished): the setting may have changed while it waited. Returns
+    /// what was dropped.
+    pub fn keep_spoken(&mut self, voice: Voice) -> Vec<String> {
+        let mut dropped = vec![];
+        self.items.retain(|i| {
+            let keep = i.started || voice.speaks(i.what);
+            if !keep {
+                dropped.push(i.parts.iter().cloned().collect::<Vec<_>>().join(" "));
+            }
+            keep
+        });
+        dropped
     }
 
     pub fn has_alerts(&self) -> bool {
@@ -217,6 +243,45 @@ mod tests {
         let a = old.item(Kind::Alert, "Old news.", None);
         old.push(a);
         assert!(texts(&mut old, true, |_| None).is_empty());
+    }
+
+    #[test]
+    fn the_voice_setting_says_what_is_still_said() {
+        let fill = || {
+            let mut q = q();
+            for (what, text) in [
+                (Spoken::Reply, "Two requests are open."),
+                (Spoken::Decision, "The api session in sandbox asks: which database?"),
+                (Spoken::Receipt, "The login fix is merged."),
+                (Spoken::News, "Eyzflow finished."),
+            ] {
+                let i = q.item_as(what, text, None);
+                q.push(i);
+            }
+            q
+        };
+        // Replies: everything, the answer first.
+        let mut all = fill();
+        assert!(all.keep_spoken(Voice::Replies).is_empty());
+        assert_eq!(texts(&mut all, true, |_| None).len(), 4);
+        // Decisions: the decision's sentence and nothing else.
+        let mut some = fill();
+        assert_eq!(some.keep_spoken(Voice::Decisions), ["Two requests are open.", "The login fix is merged.", "Eyzflow finished."]);
+        assert_eq!(texts(&mut some, true, |_| None), ["The api session in sandbox asks: which database?"]);
+        // Off: nothing.
+        let mut none = fill();
+        assert_eq!(none.keep_spoken(Voice::Off).len(), 4);
+        assert!(texts(&mut none, true, |_| None).is_empty());
+        // A sentence already begun is finished, whatever the setting is now.
+        let mut begun = q();
+        let i = begun.item_as(Spoken::Reply, "The first sentence is long enough. The second follows it.", None);
+        begun.push(i);
+        assert!(begun.next(true, |_| None).is_some());
+        assert!(begun.keep_spoken(Voice::Decisions).is_empty());
+        assert_eq!(texts(&mut begun, true, |_| None), ["The second follows it."]);
+        // What a thing is decides its turn: an answer first, the rest as alerts.
+        assert_eq!((q().item(Kind::Reply, "x", None).what, q().item(Kind::Alert, "x", None).what), (Spoken::Reply, Spoken::News));
+        assert_eq!((q().item_as(Spoken::Decision, "x", None).kind, q().item_as(Spoken::Receipt, "x", None).kind), (Kind::Alert, Kind::Alert));
     }
 
     #[test]

@@ -117,6 +117,10 @@ pub struct QuestionSet {
     /// (an address can come back for another one).
     #[serde(skip)]
     pub created_ms: Option<u64>,
+    /// The Herdr space its session is in: what it asks is one decision per
+    /// space (`decisions`).
+    #[serde(skip)]
+    pub space: Option<String>,
 }
 
 /// The same question on both: its title, wording, kind and options (a
@@ -141,6 +145,22 @@ pub fn redrawn(old: &QuestionSet, new: &QuestionSet) -> bool {
 /// they didn't see).
 pub fn answers_still_fit(old: &QuestionSet, new: &QuestionSet, answers: &[Answer]) -> bool {
     redrawn(old, new) && answers.iter().all(|a| matches!((old.tabs.get(a.tab), new.tabs.get(a.tab)), (Some(o), Some(n)) if same_tab(o, n)))
+}
+
+/// Answers put together on the card of `shown` mean the same in `other`
+/// (another session that asks the same): every tab they answer offers there
+/// the options the card showed, in that order. An option is chosen by its
+/// place, so the same place under other options is another answer; words
+/// that are only typed mean the same anywhere.
+pub fn answers_mean_the_same(shown: &QuestionSet, other: &QuestionSet, answers: &[Answer]) -> bool {
+    answers.iter().all(|a| {
+        let typed = a.choice.as_object().is_some_and(|o| o.get("other").is_some_and(Value::is_string) && !o.contains_key("option") && !o.contains_key("options") && !o.contains_key("spoken"));
+        match (shown.tabs.get(a.tab), other.tabs.get(a.tab)) {
+            (Some(x), Some(y)) if typed => x.allows_other == y.allows_other,
+            (Some(x), Some(y)) => x.multi == y.multi && x.options.iter().map(|o| o.label.trim()).eq(y.options.iter().map(|o| o.label.trim())),
+            _ => false,
+        }
+    })
 }
 
 // ---- reading the screen ----
@@ -1189,6 +1209,68 @@ pub fn waits_for_user(message: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// A turn's end that only says the session is ready: it waits for
+/// instructions, has no task yet, stands by. Nothing in it is for the user
+/// to do or decide, so on its own it is no wait (`waits_for_user` takes
+/// "waiting for your instructions" for one). True when, among the last few
+/// sentences, one says so and none hands the user anything else (a merge, a
+/// review, a question) or says something is wrong (it is blocked, it failed).
+pub fn ready_only(message: &str) -> bool {
+    let plain = plain_words(message);
+    let chars: Vec<char> = plain.chars().collect();
+    let tail: String = chars[chars.len().saturating_sub(700)..].iter().collect();
+    let trouble = [
+        "blocked", "stuck", "error", "failed", "fails", "failing", "can't", "cannot", "couldn't", "could not", "unable", "missing", "denied", "not allowed",
+        "i need", "requires your", "fehlgeschlagen", "fehler",
+        // Something didn't go as it should, in other words: the user is told, not left with "is ready".
+        "n't", " not ", "rejected", "refused", "timed out", "conflict", "broke", "crash", "wrong", "problem", "abgelehnt", " nicht ",
+    ];
+    let mut ready = false;
+    for s in split_sentences(&tail).iter().rev().take(4) {
+        if says_ready(s) {
+            ready = true;
+            continue;
+        }
+        let l = s.to_lowercase().replace(['’', '‘'], "'");
+        if asks_the_user(s) || s.contains('?') || trouble.iter().any(|w| l.contains(w)) {
+            return false;
+        }
+    }
+    ready
+}
+
+/// One sentence says the session is ready for instructions, and names
+/// nothing for the user to do.
+fn says_ready(sentence: &str) -> bool {
+    let l = format!(" {} ", sentence.to_lowercase().replace(['’', '‘'], "'").replace([',', ';', ':', '(', ')', '"', '.', '!', '?'], " "));
+    let l = l.split_whitespace().collect::<Vec<_>>().join(" ");
+    let l = format!(" {l} ");
+    // It waits (or is ready) for instructions or a task, in so many words.
+    let verbs = ["waiting for", "wait for", "waits for", "waiting on", "wait on", "await", "awaiting", "ready for", "standing by for"];
+    let objects = [
+        "your instruction", "instruction", "my instruction", "further instruction", "your next instruction", "the next instruction", "more instruction",
+        "new instruction", "your next task", "a task", "your task", "the next task", "my next task", "the first task", "your first task", "a new task",
+    ];
+    let outright = [
+        "no task yet", "have no task", "no tasks yet", "don't have a task", "do not have a task", "no instructions yet", "ready when you are", "standing by",
+        "tell me what to do", "what would you like me to do", "what would you like me to work on", "what should i work on", "how can i help",
+        "auf deine anweisung", "auf anweisungen", "auf weitere anweisungen", "noch keine aufgabe",
+    ];
+    let ready = outright.iter().any(|p| l.contains(p)) || verbs.iter().any(|v| objects.iter().any(|o| l.contains(&format!(" {v} {o}"))));
+    if !ready {
+        return false;
+    }
+    // Something concrete beside it: not only ready.
+    let concrete = [
+        "merg", " pr ", "pull request", "approv", "review", "test", "deploy", "releas", "decid", "decision", "confirm", "sign off", "sign-off", "log in",
+        "login", "sign in", "click", "verify", "check", "look at", "restart", "install", "permission", "access", "credential", "token", "password", "secret",
+        "blocked", "stuck", "error", "fail", "can't", "cannot", "unable", "conflict", " which ", "whether", "before i ", " how to ", "freigeb", "freigabe",
+        "prüf", "entscheid", "bestätig",
+    ];
+    let numbered = sentence.split('#').skip(1).any(|r| r.starts_with(|c: char| c.is_ascii_digit()));
+    !numbered && !concrete.iter().any(|w| l.contains(w))
 }
 
 /// A sentence that names what it is about only by "it", "this", "them":
@@ -2552,6 +2634,56 @@ mod tests {
             "Please note: the build takes 4 minutes.\nIt finished and all tests pass.\nThe APK is in the shots.\nNothing else changed.\nAll good.",
         ] {
             assert_eq!(waits_for_user(msg), None, "{msg}");
+        }
+    }
+
+    /// Idle is not blocked: a session that only says it is ready waits for
+    /// nothing the user has to do. (The first four are from the tower's own
+    /// log, where each became a "waits for you" alert.)
+    #[test]
+    fn a_turn_that_only_says_it_is_ready_is_not_a_wait() {
+        for msg in [
+            "I'm waiting for your instructions",
+            "I have no task yet and I'm waiting for your instructions",
+            "I'm on dev and waiting for your instructions",
+            "First task: read CLAUDE.md and README.md, then wait for your instructions",
+            "I've read CLAUDE.md and README.md.\n\nI'm on `dev`, the tree is clean. Waiting for your instructions.",
+            "Understood: the web session is t5 and the api session is t7. I have no task yet.",
+            "Ready when you are.",
+            "Standing by for your next task.",
+            "Got it. Awaiting further instructions.",
+            "I know who the others are now. What would you like me to work on?",
+            "Alles klar. Ich warte auf deine Anweisungen.",
+        ] {
+            assert!(ready_only(msg), "{msg}");
+        }
+        // Real waits are never swallowed: something there is the user's to do.
+        for msg in [
+            "waits for you to merge PR #1250",
+            "Still waiting on you: merging #1273 into dev",
+            "PR #1250 (dev to main) is open and its checks passed. The merge command is blocked for me, so you need to merge it. I'll wait.",
+            "Plan is ready. Waiting for your approval.",
+            "I'm waiting for your instructions on whether to merge #1273 into dev.",
+            "I'm blocked on the migration and waiting for your instructions.",
+            "Waiting for your instructions before I deploy.",
+            "I'm waiting for your instructions. Also, please review PR #77.",
+            "Should I open the PR now? I'm waiting for your instructions.",
+            "The new APK is at /tmp/app.apk. You need to install it on the phone and test the header.",
+            "Waiting for your review.",
+            "Ready for you to test.",
+            "Blocked: the AWS credentials are missing. Waiting for your instructions.",
+            "The build failed on the lint step. I'm waiting for your instructions.",
+            "The staging deploy was rejected with a 403. What would you like me to do?",
+            "The migration didn't apply. I'm waiting for your instructions.",
+            "The push was refused by the remote. Standing by.",
+            "Two files are in conflict after the rebase. Ready when you are.",
+            "The request timed out twice. Awaiting further instructions.",
+        ] {
+            assert!(!ready_only(msg), "{msg}");
+        }
+        // What merely happened is neither.
+        for msg in ["I merged PR #1248 and verified dev; prod is healthy.", "Done. All tests pass.", "I created a branch for the task and pushed it.", ""] {
+            assert!(!ready_only(msg), "{msg}");
         }
     }
 }

@@ -37,7 +37,7 @@ pub fn path() -> PathBuf {
 
 /// `[sessions] introduce` (read each time: switching it needs no restart).
 fn enabled() -> bool {
-    crate::config::Config::load().map(|c| c.sessions.introduce).unwrap_or(true)
+    crate::config::Config::live().sessions.introduce
 }
 
 /// What a session is on now: the agenda's task for it, else the prompt its

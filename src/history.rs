@@ -23,7 +23,14 @@ pub struct Entry {
     pub at: u64,
     /// `request` (the user, spoken or typed), `answer` (the brain),
     /// `watch` (a watched session reporting back), `alert`, `job`,
-    /// `summary` (of a session) or `note`.
+    /// `summary` (of a session), `note` (a line of activity, or what the
+    /// brain wrote on a note turn at a quiet level), `peer` (one session's
+    /// message to another), `raised` (a decision put to the user), `receipt`
+    /// (the one line for a finished request), `space` (a space went quiet,
+    /// is ready to close, or was closed: `status`, and for a close its
+    /// report), `act` (what the tower opened for a request, and its undo),
+    /// and others (`queue`, `screenshot`, `pr`, `behavior`, `introduce`,
+    /// `answered`).
     pub kind: String,
     /// The session's address (`t3`, `vps/t2`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -71,6 +78,29 @@ pub struct Entry {
     /// `behavior`: what changed, line by line (`+ `, `- `, `  `).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
+    /// Written down, not told (see `tell`): not a chat message, never spoken.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub record: bool,
+    /// `peer`: the session that wrote it (`session` is the one it is for).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// `peer`: the sender's name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_name: Option<String>,
+    /// `raised`: the kind of decision (merge, deploy, delete, money, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    /// `raised`: the choices offered, as the brain gave them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<serde_json::Value>,
+    /// `receipt`: the request (its agenda's id) it closes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agenda: Option<String>,
+    /// `act`: what the tower opened (`crate::acts`): `{kind, by, assumed,
+    /// sessions, request_at}`. Its `id` is the act's, its `status` `done`
+    /// or `undone`, its `text` the line the reply shows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub act: Option<serde_json::Value>,
 }
 
 pub fn path() -> PathBuf {
@@ -169,18 +199,19 @@ pub fn record(kind: &str, text: &str) {
     append(Entry { kind: kind.into(), text: text.into(), ..Default::default() });
 }
 
-/// What the brain said (its Stop hook): the text without its screenshot
-/// markers, and the screenshots they name.
-pub fn record_said(kind: &str, text: &str) {
+/// What a brain said (its Stop hook): the text without its screenshot
+/// markers, and the screenshots they name. `space`: a space's own brain's
+/// words are that space's (None: the main brain's).
+pub fn record_said(kind: &str, text: &str, space: Option<String>) {
     let (clean, refs) = crate::text::shot_refs(text);
     if refs.is_empty() {
-        return record(kind, text);
+        return append(Entry { kind: kind.into(), text: text.into(), space, ..Default::default() });
     }
     let shots = resolve_shots(&refs, &load());
     if clean.trim().is_empty() && shots.is_empty() {
         return;
     }
-    append(Entry { kind: kind.into(), text: clean, shots, ..Default::default() });
+    append(Entry { kind: kind.into(), text: clean, shots, space, ..Default::default() });
 }
 
 /// How many screenshots one message carries.
@@ -216,13 +247,35 @@ pub fn resolve_shots(refs: &[crate::text::ShotRef], entries: &[Entry]) -> Vec<St
 }
 
 pub fn record_session(kind: &str, session: &str, text: &str, status: Option<&str>) {
+    record_session_as(kind, session, text, status, false);
+}
+
+/// `record_session`; `record`: written down only, not a chat message (see `tell`).
+pub fn record_session_as(kind: &str, session: &str, text: &str, status: Option<&str>, record: bool) {
     let mut e = about(kind, session, text);
     e.status = status.map(String::from);
+    e.record = record;
     append(e);
 }
 
-/// What the user asked. A message typed in the orb's panel may end with the
-/// files attached to it (see `compose`).
+/// What a brain wrote on a note turn at a quiet level: kept as a `note`
+/// about the session the note was about (None: no one session), without its
+/// screenshot markers. By a space's own brain (`space`), a note about no
+/// one session, or one whose space Herdr doesn't say, is that space's.
+pub fn record_note(session: Option<&str>, text: &str, space: Option<String>) {
+    let (clean, _) = crate::text::shot_refs(text);
+    if clean.trim().is_empty() {
+        return;
+    }
+    let mut e = match session {
+        Some(t) => about("note", t, &clean),
+        None => Entry { kind: "note".into(), text: clean, ..Default::default() },
+    };
+    e.space = e.space.filter(|s| !s.is_empty()).or(space);
+    e.record = true;
+    append(e);
+}
+
 /// An entry about a space (and, when given, one of its sessions).
 pub fn record_space(kind: &str, space: &str, session: Option<&str>, text: &str) {
     let mut e = match session {
@@ -233,10 +286,13 @@ pub fn record_space(kind: &str, space: &str, session: Option<&str>, text: &str) 
     append(e);
 }
 
-pub fn record_request(message: &str, source: &str) {
+/// What the user asked. A message typed in the orb's panel may end with the
+/// files attached to it (see `compose`). What was asked of a space's own
+/// brain (`space`) is that space's request, answered there.
+pub fn record_request(message: &str, source: &str, space: Option<String>) {
     let (text, attachments) = split(message);
     let source = (!source.is_empty()).then(|| source.to_string());
-    append(Entry { kind: "request".into(), text, attachments, source, ..Default::default() });
+    append(Entry { kind: "request".into(), text, attachments, source, space, ..Default::default() });
 }
 
 /// A job starts: the brain handed `session` this work. Returns its id.
@@ -373,6 +429,8 @@ pub fn job_update(session: &str, status: JobState, text: &str) {
     // By hand, any job may go anywhere (the table never refuses it).
     let next = job.map(|j| j.status.clone()).unwrap_or_default().next(&JobEv::ByHand(status.clone())).unwrap_or(status);
     e.status = Some(next.word().to_string());
+    // A finish is written down, not told, unless the tower tells everything.
+    e.record = crate::tell::for_record(crate::tell::level(), next.word());
     append(e);
 }
 
@@ -411,7 +469,12 @@ pub fn job_watched(session: &str, status: JobState, asked: &str) {
 
 /// Every entry, oldest first. Lines that don't parse are skipped.
 pub fn load() -> Vec<Entry> {
-    let Ok(text) = std::fs::read_to_string(path()) else { return vec![] };
+    load_from(&path())
+}
+
+/// `load`, of the history in `path`.
+pub fn load_from(path: &std::path::Path) -> Vec<Entry> {
+    let Ok(text) = std::fs::read_to_string(path) else { return vec![] };
     text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
 }
 

@@ -41,8 +41,22 @@ pub fn install(keys: bool) -> Result<()> {
     } else {
         println!("✓ {} (kept)", config::config_file().display());
     }
+    let prompt = config::brain_dir().join("CLAUDE.md");
+    let before = std::fs::read_to_string(&prompt).ok();
+    // (Each space's own brain that has a folder gets its instructions and hooks written again too.)
     brain::write_files()?;
     println!("✓ {}", config::brain_dir().display());
+    let own = crate::brains::cards();
+    if !own.is_empty() {
+        println!("✓ {} ({} space brain folder(s))", config::brains_dir().display(), own.len());
+    }
+    // A brain that runs has the old instructions in mind: it reads the new ones.
+    if before.is_some() && before != std::fs::read_to_string(&prompt).ok() {
+        let told: Vec<String> = crate::daemon::brains::reread("the tower was updated and your instructions changed", None).into_iter().filter_map(|h| h.join().ok().flatten()).collect();
+        if !told.is_empty() {
+            println!("✓ told to read its instructions again: {}", told.join(", "));
+        }
+    }
 
     // 3. The orb has the tower's keys now; take the old mod's out of Herdr.
     let _ = keys;
@@ -212,6 +226,19 @@ pub fn doctor() -> Result<()> {
     check(voice, format!("voice daemon {}", if voice { "running" } else { "not running (tower up)" }));
     let b = hc::get(brain::NAME).filter(|t| t["state"] == "live");
     check(b.is_some(), format!("brain {}", b.as_ref().and_then(hc::status_word).unwrap_or_else(|| "not running".into())));
+    // What the brains run on, and each space's own.
+    let known = crate::brains::known_from_herdr();
+    let model = crate::brains::report(&cfg, &crate::daemon::brains::running_of(&known));
+    println!("  model: {}", model["says"].as_str().unwrap_or(""));
+    let own: Vec<String> = known.iter().filter(|k| k.live).filter_map(|k| k.space.as_ref().map(|s| format!("{} for {s} ({})", k.name, k.word()))).collect();
+    println!(
+        "  spaces' own brains: {}",
+        match (cfg.brains.per_space, own.is_empty()) {
+            (false, _) => "off ([brains] per_space = false): one brain for everything".to_string(),
+            (true, true) => "none running (each open space gets one with its first session)".to_string(),
+            (true, false) => own.join(", "),
+        }
+    );
     let machines = hc::machines();
     println!("  machines: {}", if machines.is_empty() { "none added (hc machine add <ssh host>)".into() } else { machines.join(", ") });
     // Whether the tower sees every agent session (their hooks).

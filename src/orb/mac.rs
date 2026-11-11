@@ -53,6 +53,13 @@ impl Win {
         Rect { x: f.origin.x, y: f.origin.y, w: f.size.width, h: f.size.height }
     }
 
+    /// Ordered in (on a screen or not).
+    pub fn is_visible(self) -> bool {
+        // SAFETY: -isVisible on a live NSWindow.
+        let v: cocoa::base::BOOL = unsafe { msg_send![self.0, isVisible] };
+        v != NO
+    }
+
     pub fn set_origin(self, x: f64, y: f64) {
         // SAFETY: -setFrameOrigin: on a live NSWindow, on the main thread.
         unsafe {
@@ -116,6 +123,11 @@ pub struct Rect {
 impl Rect {
     pub fn contains(&self, x: f64, y: f64) -> bool {
         x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
+    }
+
+    /// The same, `by` points larger on every side.
+    pub fn grown(&self, by: f64) -> Rect {
+        Rect { x: self.x - by, y: self.y - by, w: self.w + 2.0 * by, h: self.h + 2.0 * by }
     }
 }
 

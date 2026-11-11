@@ -7,9 +7,18 @@ does, and be the tower's voice: you speak into the phone, the Mac's Whisper
 transcribes it, and the tower's replies come back as text and as Kokoro audio
 played on the phone.
 
-Source: `src/daemon/lan/` (server, auth, TLS, hub, audio), `src/phone.rs`
-(`tower phone`). Tests: `cargo test lan` (with an HTTPS client that pins the
-certificate the way the app must).
+Since the Quiet Tower ([quiet-tower.md](quiet-tower.md)) it also has the
+queue of decisions, the spaces as missions, the threads between their
+sessions, launching and closing a space, how much the tower tells and the
+model its brains run on: see "The Quiet Tower" below, and
+[mobile-api-quiet-walkthrough.md](mobile-api-quiet-walkthrough.md) for every
+one of those calls made with `curl` against a running tower, with its real
+answers.
+
+Source: `src/daemon/lan/` (server, auth, TLS, hub, audio; `quiet.rs` for the
+Quiet Tower's calls, `tower.rs` for what they ask of the daemon),
+`src/phone.rs` (`tower phone`). Tests: `cargo test lan` (with an HTTPS
+client that pins the certificate the way the app must).
 
 ## Turning it on
 
@@ -101,13 +110,15 @@ So:
    16 KiB. The token is checked from the head, **before any body is read**,
    and each call has its own body limit (`413 too_large` beyond it):
    `POST /v1/pair` 4 KiB; a plain WAV (`/v1/voice`, `/v1/transcribe`,
-   `/v1/questions/{id}/voice`) 24 MiB; multipart (`/v1/ask`, the voice
-   calls, `/v1/questions/{id}/answer`) 100 MiB; every other call 1 MiB.
+   `/v1/questions/{id}/voice`, `/v1/decisions/{id}/voice`) 24 MiB;
+   multipart (`/v1/ask`, the voice calls, `/v1/questions/{id}/answer`,
+   `/v1/decisions/{id}/answer`) 100 MiB; every other call 1 MiB.
    Recordings are 0.2 to 120 s (checked from the WAV header).
 8. **Text from the phone** that is typed into a session (`/v1/ask` text,
-   typed answers to questions, an approve/refuse note) loses its control
-   characters (C0 and C1, escape sequences' introducers among them), except
-   newlines and tabs. An address must start with a letter or digit.
+   typed answers to questions and decisions, an approve/refuse note, a
+   goal) loses its control characters (C0 and C1, escape sequences'
+   introducers among them), except newlines and tabs. An address must start
+   with a letter or digit.
 
 What's left, honestly: anyone on the same network can see that a TLS server
 runs on the port, and could try codes during the 5 minutes a code is open
@@ -190,7 +201,7 @@ the same tokens, the same limits (the tailnet's address counts as private).
    ```
 
    ```json
-   200 {"token": "htk_…", "device": {"id": "d_3fa9c2e1", "name": "Pixel 9"}, "fingerprint": "<hex>", "api": 1}
+   200 {"token": "htk_…", "device": {"id": "d_3fa9c2e1", "name": "Pixel 9"}, "fingerprint": "<hex>", "api": 1, "features": ["quiet", "acts"]}
    403 {"error": {"code": "pairing_closed", "message": "…"}}
    403 {"error": {"code": "wrong_code", "message": "…", "tries_left": 4}}
    ```
@@ -215,23 +226,32 @@ the same tokens, the same limits (the tailnet's address counts as private).
 - Times are Unix milliseconds (`*_ms`).
 - Errors: `{"error": {"code": "<word>", "message": "<for a person>"}}` with
   status 400 (bad request), 401 `unauthorized` (missing, unknown or revoked
-  token: re-pair), 403 (pairing), 404, 413 (a body over the call's limit,
-  `too_large`; files), 415 (audio, files), 429
-  `too_many_failures`, 503 (the brain, `hc`, or the transcriber isn't there).
+  token: re-pair), 403 (pairing), 404, 409 (it can't be done as things
+  stand: answered already, a session at work, the same thing under way),
+  413 (a body over the call's limit, `too_large`; files), 415 (audio,
+  files), 429 `too_many_failures`, 503 (the brain, `hc`, or the transcriber
+  isn't there; `starting`: the tower is still starting, try again in a
+  moment). Some errors carry more beside `code` and `message` (`state`,
+  `sessions`, `action`, `prs`, `tries_left`): each call says which.
 - Addresses (`t3`, `vps/t3`) are URL-encoded in paths: `vps%2Ft3`. A `+`
   in a path is a plus; only in a query string is it a space.
+- A **space** is named by its whole name, in any case, URL-encoded: in a
+  path, `/v1/spaces/B2C%20support/goal` (a `/` in a name is `%2F`); in a
+  query, `?space=B2C%20support` or `?space=B2C+support`. In a path, or in
+  a body, a name no space has is `404 no_space`; a `?space=` filter that
+  fits nothing answers an empty list.
 
 ## Reading: what the panel shows
 
 | Call | Returns |
 |---|---|
-| `GET /v1/hello` | `{"api":1,"tower":"0.1.0","device":{"id","name"},"voice":"af_bella","phone_is_voice":bool}`. Use it to check a stored token. |
+| `GET /v1/hello` | `{"api":1,"tower":"0.1.0","device":{"id","name"},"voice":"af_bella","phone_is_voice":bool,"audio_route":"phone"\|"mac","features":["quiet","acts"]}`. Use it to check a stored token, and to see what this tower has (`features`: see "Versioning"). |
 | `GET /v1/state` | The daemon's state (below). Also pushed on the event stream. |
 | `GET /v1/agents?all=1` | `tower agents --json`: `{"agents":[…],"unreachable":[…]}`; each agent has `address, account, machine, name, spoken, agent, status, doing, title, folder, where`. `all=1` adds plain shells. Slow-ish (asks Herdr, and other machines). |
-| `GET /v1/spaces` | `tower spaces --json`: `{"focus": name or null, "spaces":[{"space","focus","agenda","unread","unread_asked","unread_needs_you","running_jobs","sessions":[{"address","name","status","account"}],"last_activity_ms"}]}`. `unread`: held news not yet read; of it, `unread_asked`: reports on work the user asked for (a watch's or a job's), `unread_needs_you`: someone there blocked on or waiting for the user. Show a space with either above 0 as needing a look (the panel marks it amber). |
+| `GET /v1/spaces` | `tower spaces --json`: `{"focus": name or null, "spaces":[{"space","focus","follow","mute","agenda","goal","done_when","standing","state","report","quiet_since_ms","ready_since_ms","closed_ms","archived","unread","unread_asked","unread_needs_you","running_jobs","sessions":[{"address","name","status","account"}],"last_activity_ms"}]}`. `goal` is the same as `agenda`; `state` is the space's as a mission (`open`, `quiet`, `ready`, `closed`: docs/quiet-tower.md, step 5 and 8); a space quiet for a day, or closed, is left out. `unread`: held news not yet read; of it, `unread_asked`: reports on work the user asked for (a watch's or a job's), `unread_needs_you`: someone there blocked on or waiting for the user. Show a space with either above 0 as needing a look (the panel marks it amber). |
 | `GET /v1/jobs?status=open\|finished\|all&session=t3&limit=50` | `{"jobs":[{"job","session","name","space","account","status","asked","summary","started_ms","updated_ms"}]}`, newest first. `status`: `working`, `blocked`, `done`, `failed`, `error`, `exited`. |
-| `GET /v1/history?limit=100&session=t3&kind=summary,answer&before_ms=…` | `{"entries":[…]}`, oldest first, the latest `limit`. Page back with `before_ms` = the first entry's `at`. Summaries are `kind=summary`. |
-| `GET /v1/chat?before=h120&limit=50` | `{"messages":[…], "more": bool}`: **the main chat thread**, the same one the Mac panel shows, newest last; `before` pages back (the first message's `id`), `more` says older ones remain. See "The chat" below. |
+| `GET /v1/history?limit=100&session=t3&kind=summary,answer&space=B2C%20support&before_ms=…` | `{"entries":[…]}`, oldest first, the latest `limit`. Page back with `before_ms` = the first entry's `at`. Summaries are `kind=summary`. `space` keeps one space's entries (its whole name, any case): with it, this is that space's Record. |
+| `GET /v1/chat?before=h120&limit=50` | `{"messages":[…], "more": bool}`: **the chat thread**, the same one the Mac shows, newest last; `before` pages back (the first message's `id`), `more` says older ones remain. With `space=<name>`: the conversation with that space's own tower only; with `main=1`: the main one without those; with neither, every message. See "The chat" below. |
 | `GET /v1/questions` | `{"questions":[…]}`: what blocked sessions ask, as question sets (see [questions.md](questions.md)); also in the state (`questions`; each agent's `question` id). A set with `kind: "text"`, `decision: "escalate"` and `reason: "it waits for you to do this"` is a session that stopped for the user to act (merge, approve, test, decide): its `title` is the request; no recommendations will come (show "waits for you" and a reply box, not a spinner). |
 | `GET /v1/questions/{id}` | One set. `404 no_question`. |
 | `GET /v1/prs` | `{"prs":[…]}`: the PRs the tower's sessions opened, open ones and those closed in the last day, waiting ones first (see "PRs" below). |
@@ -245,10 +265,29 @@ the same tokens, the same limits (the tailnet's address counts as private).
 | `GET /v1/sessions/{address}/screen?lines=60` | `{"address","screen"}`: what that terminal shows (to see what a blocked agent asks). Up to 400 lines. |
 
 A history entry: `{"at", "kind", "session"?, "name"?, "space"?, "job"?,
-"account"?, "status"?, "text", "attachments"?, "held"?}`. `kind`: `request`
-(the user), `answer` (the tower), `watch`, `alert`, `job`, `summary`, `note`,
-`screenshot` (with `id`, `caption`, `path`; fetch it from `/v1/screenshots/{id}`).
-Keys are left out when empty.
+"account"?, "status"?, "text", "attachments"?, "held"?, "source"?, "id"?,
+"record"?, "from"?, "from_name"?, "why"?, "options"?, "agenda"?}`. Keys
+are left out when empty (`record` and `held` when false). `kind`:
+
+| `kind` | What | Carries |
+|---|---|---|
+| `request` | What the user asked | `source` (`mac`, `voice`, `phone:<device>`), `attachments`; `space` when it was asked of a space's own tower |
+| `answer` | A tower's answer | `space` when a space's own tower gave it |
+| `watch`, `alert`, `job`, `summary` | News about a session | `session`, `name`, `space`, `status`, `job` |
+| `note` | A line of activity; at a quiet level, what a tower wrote on a note turn | `record: true` then, with the `session`, `name` and `space` it was about |
+| `peer` | One session's message to another (a space's thread) | `from`, `from_name` (the sender), `session`, `name` (the receiver), `space`, `status` (`delivered` or `undelivered`), `record: true` |
+| `raised` | A decision put to the user (`tower raise`) | `id` (the decision's), `session`, `name`, `space`, `why`, `options`; `record: true` when it was raised before |
+| `decision` | A decision that is over | `id`, `space`, `status` (`answered`, `dismissed`, `stopped`), `why`, `text` ("<title> -> <answer>"), `record: true` |
+| `receipt` | The one line for a finished request | `agenda`, `space`; `record: true` when it was only kept |
+| `space` | A space went quiet, is ready to close, or was closed | `space`, `status` (`quiet`, `ready`, `closed`), `record: true` |
+| `screenshot` | A picture a session sent | `id`, `caption`, `path` (fetch it from `/v1/screenshots/{id}`) |
+| `queue`, `pr`, `behavior`, `introduce`, `answered` | The send queue, a PR found, a behavior changed, sessions introduced, a question the tower answered | |
+
+**`record: true`** means written down, not told: such an entry was never
+spoken and is not a chat message (the chat leaves it out, and so does a
+`chat` event). The Record view shows everything; the chat shows what was
+told. It is decided when the entry is written, so the past never changes
+when the tell level does.
 
 The state (`GET /v1/state`, event `state`):
 
@@ -264,6 +303,9 @@ The state (`GET /v1/state`, event `state`):
   "alerts": [{"at_ms": 0, "terminal": "t22", "text": "Claude in eyzflow is done", "level": "done"}],
   "agents": [{"address": "t22", "name": "Claude in eyzflow", "status": "working", "app": "claude-code", "account": "default"}],
   "error": "", "talk_key": "ctrl", "voice": "af_bella", "stt_model": "…",
+  "decisions_count": 2, "tell_level": "decisions",
+  "brains": [{"name": "tower", "space": null, "address": "t7", "status": "idle", "model": "claude-opus-5-5", "effort": "high"}],
+  "brain_model": {"program": "claude", "model": "claude-opus-5-5", "effort": "high", "…": "see \"The brains' model\""},
   "lan": "https://192.168.1.20:7843",
   "lan_hosts": [{"kind": "lan", "host": "192.168.1.20", "port": 7843}, {"kind": "tailscale", "host": "100.68.110.33", "port": 7843, "dns_name": "mac.tailnet.ts.net"}],
   "tailscale": {"installed": true, "running": true, "state": "running", "ip": "100.68.110.33", "dns_name": "mac.tailnet.ts.net"},
@@ -283,11 +325,19 @@ is sent when it changes too.
 `listening`, `thinking`, `blocked`, `armed`, `standby`, `idle`. Unknown keys
 may be added later: ignore them.
 
+The state stays small, because it is sent whole whenever it changes. Of the
+Quiet Tower it has `decisions_count` (the open decisions outside muted
+spaces: the badge), `tell_level`, `brain_model` (the model picker's report)
+and `brains` (the towers that run: the main one, and each space's own). The
+lists are not in it: the decisions, the missions and the spaces' threads
+each have their own call and their own event (`GET /v1/decisions`,
+`/v1/missions`, `/v1/thread`; events `decisions`, `missions`, `thread`).
+
 ## Acting: what the panel does
 
 | Call | Body | Does |
 |---|---|---|
-| `POST /v1/ask` | `{"text": "what's everyone doing?"}`, or multipart with images (below) | Sends it to the tower like typing in the panel (it arrives as `[voice] …`). `202 {"sent": text, "attachments": [paths]}`. The canned "Okay." is played (on the phone when it's the voice). |
+| `POST /v1/ask` | `{"text": "what's everyone doing?"}`, or multipart with images (below). Optional `"space": "B2C support"` (a field named `space` in the form): asked in that space's view | Sends it to the tower like typing in the panel (it arrives as `[voice] …`). With `space`, to that space's own tower when it has one that can take it, else to the main tower with the space named in front (`In B2C support: …`); `404 no_space` for a name no space has (nothing is sent, no file saved). `202 {"sent": text, "attachments": [paths]}`, with `"space": name` when one was given. The canned "Okay." is played (on the phone when it's the voice). |
 | `POST /v1/agents/{address}/answer` | `{"decision": "approve"\|"refuse", "note": "only the read"}` | Tells the tower, as the user would: "Approve what t22 is asking for. only the read". The tower reads the session's screen and answers it, as today. `202`. |
 | `POST /v1/sessions/{address}/show` | | Brings that session on screen in the Mac's Herdr window (as `tower show <t>`: focuses its tab, or gives it one). `200 {"shown": address}`, `404 no_session`, `400 bad_address`, `503 herdr` (the window isn't open). |
 | `POST /v1/focus` | `{"space": "B2C support"}` or `{"space": null}` | Focuses a space (its news is spoken, others held) or clears focus. `200 {"focus": name or null}`; `404 no_space`. |
@@ -353,12 +403,25 @@ may be empty when there are files.
 
 A multipart body is 100 MiB at most; a JSON ask 1 MiB.
 
+Asked in a space's view, the form has one more field, `space`:
+
+```
+--…  Content-Disposition: form-data; name="space"
+B2C support
+```
+
+A spoken request in a space's view goes the same way: transcribe the take
+(`POST /v1/transcribe`), then `POST /v1/ask` with the text and `space`.
+(`POST /v1/voice` hands what it heard to the main tower.)
+
 ## The chat
 
-There is one chat thread, the tower's, on every screen: the Mac panel and
-every phone show the same messages. It lives on the Mac in the history
+There is one chat thread, the tower's, on every screen: the Mac and every
+phone show the same messages. It lives on the Mac in the history
 (`history.jsonl`, kept across restarts); what the phone sends goes into it
-(marked with its source) and shows in the panel, and the other way round.
+(marked with its source) and shows on the Mac, and the other way round.
+Inside it, each space that has a tower of its own has its own conversation
+(`space`, below).
 
 A message:
 
@@ -366,9 +429,10 @@ A message:
 {
   "id": "h812", "at": 1794158000000, "updated_at": 1794158000000,
   "role": "user",                // user | tower | screenshots | event
-  "kind": "request",             // the history's: request, answer, screenshot, watch, alert, job, summary
+  "kind": "request",             // the history's: request, answer, receipt, screenshot, watch, alert, job, summary
   "text": "[Image #1] [File #2: notes.pdf] compare these",
   "source": "phone:d_9fce5c6c",  // mac (typed in the panel, tower ask) | voice (the Mac's microphone) | phone:<device> | tower
+  "space": null,                 // a space's name: see "Whose conversation"
   "attachments": [
     {"n": 1, "kind": "image", "name": "1-login.png", "path": "/…/attachments/…/1-login.png", "url": "/v1/attachments/1794-phone/1-login.png"},
     {"n": 2, "kind": "file",  "name": "2-notes.pdf", "path": "/…/2-notes.pdf", "url": null}
@@ -380,8 +444,10 @@ A message:
 - **user**: what the user asked, typed or spoken, from any screen. The text
   keeps the panel's tokens; `attachments[n-1]` is the file for token `#n`
   (`kind` `image`, `video` or `file`; pictures have a `url`).
-- **tower**: an answer. Screenshots it attached (`[shot:…]` in what it
-  wrote; never in `text`) are in `screenshots`:
+- **tower**: an answer, or the one receipt for a finished request (`kind`
+  `receipt`: only one the user was told; a receipt kept for the record is
+  no message). Screenshots it attached (`[shot:…]` in what it wrote; never
+  in `text`) are in `screenshots`:
   `{"id","caption","session","name","account","at","url"}`.
 - **screenshots**: a card of screenshots a session sent (several sent by
   the same session within two minutes make one card; `updated_at` moves
@@ -397,6 +463,41 @@ A message:
 `id` is `h<line>`: stable, unique, in order. What the tower is writing
 right now isn't a message yet: the state's `work` (its working line) and
 `said` (what it is saying) show it until the answer lands.
+
+### Whose conversation: `space`
+
+Every message has `space` (a space's name, or `null`).
+
+- On a **request** (`kind: "request"`): the space in whose view it was
+  asked (`POST /v1/ask` with `space`, the Mac's space view, `tower ask
+  --space`). `null`: asked of the tower itself.
+- On an **answer** (`kind: "answer"`): the space of the request it
+  answers. A space's own tower's answers carry its space; the main
+  tower's answer to a request that named a space is that space's too.
+- On anything else, where it comes from: a `receipt`'s request's space, a
+  piece of news' or a PR's session's space.
+
+So the app shows two kinds of conversation from one thread:
+
+- **A space's own**: the messages of kind `request`, `answer` or `receipt`
+  whose `space` is that space. `GET /v1/chat?space=<name>` returns exactly
+  these.
+- **The main one**: everything else, that is every message except the
+  requests and answers that have a `space`. `GET /v1/chat?main=1` returns
+  exactly these. (A receipt that names a space is in both: it is the reply
+  to a request that may have been asked in either place.)
+
+`GET /v1/chat` with neither returns every message, as it always did, and a
+`chat` event carries each message with its `space`: put it where the rule
+says.
+
+A space that has no tower of its own that can take a request (it has no
+live session, its tower is starting or waits on its own screen, or
+`[brains] per_space` is off) has it handed to the main tower with the space
+named in front: such a request's `text` is `In <space>: <what was asked>`,
+and its `space` is still that space. The app may show the text without that
+prefix in the space's own conversation. Which tower a space has is in
+`GET /v1/missions` (`tower`).
 
 ## PRs
 
@@ -455,6 +556,575 @@ event pr   {"op":"closed","pr":{…,"state":"merged"}}
 event chat {"op":"update","message":{"id":"h1840","role":"pr",…,"pr":{…,"state":"merged"}}}
 ```
 
+## The Quiet Tower
+
+The tower does the work and keeps the record; it speaks when the user
+asked, or when the decision is the user's ([quiet-tower.md](quiet-tower.md)).
+For the app that means: it opens on the **queue** of decisions and notifies
+for a new decision and for nothing else; a **space** is a mission, with a
+goal, the thread between its sessions and (usually) a tower of its own; one
+sentence **launches** a space; and the user chooses **how much the tower
+tells** them and the **model** its brains run on.
+
+A tower has all of this when `GET /v1/hello` lists the feature `quiet` (see
+"Versioning"). Every call here needs the bearer token, like the rest
+(`503 starting` is what one would get from a tower that is not whole yet;
+the API starts only once it is).
+[mobile-api-quiet-walkthrough.md](mobile-api-quiet-walkthrough.md) is each
+of them run with `curl` against a tower, with what came back.
+
+| Call | Body | Returns |
+|---|---|---|
+| `GET /v1/decisions?space=<name>&all=1` | | `{"space": name or null, "count": n, "decisions": [Decision]}` in queue order. Without `space`: the main queue, muted spaces left out. With it: that space's own, muted or not. `all=1` adds `"closed": [Decision]`, the last 50 that closed, newest first. |
+| `GET /v1/decisions/{id}` | | `{"decision": Decision}`: an open one, or one that closed lately. `404 no_decision`. |
+| `POST /v1/decisions/{id}/answer` | `{"choice": n}`, `{"other": "text"}`, or a question's answers (below) | What the answer did (below). `409 closed` when it is over already. |
+| `DELETE /v1/decisions/{id}` | | Dismisses it: out of the queue, nothing sent (a question's sets are dismissed with it). `200 {"dismissed": id, "state": "dismissed"}`; for one that is over already, `200` with the `state` it ended in. `404 no_decision`; `409 cannot_dismiss` (it can't go now: its answer is going in, say). |
+| `POST /v1/decisions/{id}/interpret` | `{"tab": 0, "text": "the second one"}` | A spoken answer as a choice, to show before sending (below). |
+| `POST /v1/decisions/{id}/voice?tab=N` | a WAV take | The same from a recording, with `heard`. |
+| `GET /v1/missions` | | `{"spaces": [Mission], "quiet": [name], "closed_today": [name]}` |
+| `POST /v1/spaces/{space}/goal` | `{"goal": "…", "done_when": "…", "standing": false}`, each optional, at least one | Sets what is given (`goal: ""` clears the goal). `200 {"space", "goal", "done_when", "standing", "state", "report", "mission": Mission or null}`. `400 bad_goal`, `404 no_space`. |
+| `POST /v1/spaces/{space}/follow` | `{"on": true}` | `200 {"space", "follow": bool, "mission": Mission or null}`. `400 bad_on`, `404 no_space`. |
+| `POST /v1/spaces/{space}/mute` | `{"on": true}` | `200 {"space", "mute": bool, "mission": Mission or null}`. Its decisions leave (or rejoin) the main queue and the count at once. `400 bad_on`, `404 no_space`. |
+| `POST /v1/spaces/{space}/close` | `{"force": false}` (optional) | Closes the space. `202 {"action": Action}`: see "Actions". `409 busy` while a session there works or waits for the user (unless `force`), `409 closing`, `404 no_space`. |
+| `GET /v1/thread?space=<name>&limit=50&before=h120` | | `{"space", "messages": [Message], "more": bool}`: what the sessions of a space wrote to each other, newest last; pages like the chat. |
+| `GET /v1/setups` | | `{"setups": [{"name", "account", "repos": [folder]}]}`: what a space can be launched with. The first is the default. |
+| `POST /v1/launch` | `{"goal": "Fix the login redirect", "setup": "eyzflow", "name": "login", "dry_run": false}` (`goal` required) | With `dry_run`: `200`, the plan. Without: `202 {"action": Action}`, see "Actions". `400 empty`, `400 bad_launch`, `404 no_setup`, `409 no_setups`, `409 launching`. |
+| `GET /v1/actions` | | `{"actions": [Action]}`, newest first: the launches and closes the phones started since the tower started (the last 50). |
+| `GET /v1/actions/{id}` | | `{"action": Action}`. `404 no_action`. |
+| `POST /v1/decisions/{id}/rule` | `{"answer": "A sidebar"}` (optional) | Makes the answer just given a standing rule: see "Make it a rule". `202 {"sent": the request, "space": name or null}`. `409 not_answered`, `409 no_rule`, `404 no_decision`. |
+| `GET /v1/acts` | | `{"acts": [Act]}`, newest first: what the tower opened lately (the last 50), each with what it assumed and whether it can be undone. See "Acts". |
+| `GET /v1/acts/{id}` | | `{"act": Act}`. `404 no_act`. |
+| `POST /v1/acts/{id}/undo` | `{"force": false}` (optional) | Ends what that act opened. `200 {"act": Act, "closing", "sessions_ended", "worktrees_removed", "kept_worktrees", "space_closed"}`. `409 held` while work would be lost (unless `force`), `409 undone`, `409 cannot_undo`, `404 no_act`. |
+| `GET /v1/tell` | | `{"level": "decisions"\|"results"\|"everything", "voice": "off"\|"decisions"\|"replies"}` |
+| `POST /v1/tell` | `{"level": "results", "voice": "decisions"}`, each optional, at least one | `200 {"level", "voice"}`, with `"was"` when the level was set and `"voice_was"` when the voice was. `400 bad_level`, `400 bad_voice`. |
+| `GET /v1/model` | | The brains' model report (below), with `"restarted": []`. |
+| `POST /v1/model` | `{"model": "claude-fable-5-2", "effort": "high", "restart": false}`, each optional, at least one | The report, with `restarted` (the names of the brains restarted). `400 bad_model`, `400 bad_effort`, `409 codex`. |
+
+### A decision
+
+A decision is the one thing put in front of the user: something only they
+can decide. Three sessions asking the same thing are one decision; two PRs
+of one repo waiting for a merge in one space are one decision.
+
+```json
+{
+  "id": "d4f7981cc13c3",             // d + 12 hex digits: this decision, from when it opened
+  "key": "raise:fix-login:tabs or a sidebar for the settings",
+  "kind": "choice",                  // permission | question | merge | choice | failed | raised | blocked
+  "space": "fix-login",              // or null
+  "sessions": [
+    {"address": "t3", "name": "fix login eyzflow", "waiting": true},
+    {"address": "t5", "name": "fix login mediaroom", "waiting": true}
+  ],
+  "waiting": 2,                      // how many of them are blocked on it now
+  "title": "Tabs or a sidebar for the settings?",
+  "why": "design",
+  "options": [
+    {"label": "Tabs", "why": "matches the mock", "pick": true},
+    {"label": "A sidebar", "why": "more room for later sections", "pick": false}
+  ],
+  "pick": "Tabs",                    // the tower's pick (an option's label), or null
+  "prs": [],                         // a merge's PRs, in the order to merge them
+  "question_id": null,               // a question's or a permission's question set
+  "task": null,                      // a failed decision's agenda task
+  "first_ms": 1794368747886,
+  "last_ms": 1794368749472,
+  "count": 2,
+  "state": "open",                   // open | answering | answered | stopped | dismissed
+  "muted": false
+}
+```
+
+| `kind` | It is | `options` | Answered with |
+|---|---|---|---|
+| `question` | What a session asks: a dialog of questions, a question at the end of its turn, or a turn that ended waiting for the user ("waits for you") | The tower's recommendations, the first one its pick (for a set of several questions, option *i* answers each with its recommendation *i*). None for a wait. | `{"choice": n}`, `{"other": "text"}` (one question only), or the answers a question set takes |
+| `permission` | A permission, plan or approval menu a session is blocked on | The recommendations; with none, the menu's own options and no pick | the same |
+| `choice` | Raised by the tower with choices | As raised, the first one the pick | `{"choice": n}` or `{"other": "text"}` |
+| `raised` | Raised by the tower, in a line | None | `{"other": "text"}` |
+| `failed` | A task that failed again after one retry | "Try again", "Drop it"; no pick | `{"choice": 0}` (again), `{"choice": 1}` (drop), `{"other": "what to do instead"}` (again, with those words) |
+| `merge` | The PRs of one repo that wait for a merge in one space | One per PR, in order; the pick is the first when it can be merged, its checks pass and its base is not production | Not here: see "A merge" |
+| `blocked` | A session blocked on something the tower can't read (a dialog it doesn't know): no question set comes of it, but the user still has to act | None | Not here: it is answered in the session itself. Offer "Show on Mac" (`POST /v1/sessions/{address}/show`, the address from `sessions`). Answering returns `400 bad_answer`. It closes by itself (`answered`) once the session is no longer blocked |
+
+- A `kind` the app doesn't know (a newer tower's) is still the user's: show it as a plain card with its `title` and `sessions` and count it; never leave it out.
+- `id` is stable for the life of the decision. The same thing needing the
+  user again after it closed is another decision, with another id.
+- `key` is what makes two sightings the same decision (the space and what
+  is asked, lowercased, punctuation dropped). The same key again never
+  makes a second decision: it adds 1 to `count`, moves `last_ms`, and adds
+  its session to `sessions`. `first_ms` is when it opened and never moves.
+- `sessions` are the sessions it is about. `waiting` on a session: blocked
+  on it now (false: it works on something else meanwhile); `question_id`
+  on a session of a `question` or `permission`: that session's own
+  question set. The decision's `question_id` is its first session's: the
+  set to show as the card's steps (`GET /v1/questions/{id}`, or
+  `questions` in the state) when it has several questions, more than its
+  options say, or a dialog to follow.
+- `why`: the reason a question went to the user (the tower's words), the
+  category a raise gave (`merge`, `deploy`, `delete`, `data`, `secrets`,
+  `money`, `design`, `failed`, `waiting`, …), `merge`, or `failed`.
+- `state`: `open` is a card. `answering`: its answer is going in (keys
+  into a dialog, or a reply waiting for its session to stop): show
+  "Sending your answer", and don't count it. `answered`, `stopped` (over
+  without an answer: its sessions are gone, its PRs closed), `dismissed`:
+  over. The queue lists only `open` and `answering` ones; a closed one is
+  read by its id or with `all=1`. An answer that stops half way (the
+  dialog changed while it was typed) leaves it `open` again, and its
+  question set says so (`status: "failed"`, `error`).
+- `muted`: its space is muted. A muted space's decisions are not in the
+  main queue (`GET /v1/decisions` without `space`) nor in `count` /
+  `decisions_count`, and the tower says nothing about them; they are in
+  the space's own queue (`?space=`), and in the `decisions` event marked
+  `muted: true`.
+- **Order**: by weight, sessions waiting × time since `first_ms`,
+  heaviest first, then oldest first. The tower orders them again every 30
+  seconds; show them in the order given.
+
+### Answering
+
+```
+POST /v1/decisions/d4f7981cc13c3/answer   {"choice": 0}
+→ 200 {"ok": true, "id": "d4f7981cc13c3", "state": "answered", "answer": "Tabs",
+       "sent": [{"session": "t3", "name": "fix login eyzflow", "queue_id": 7, "sent": true},
+                {"session": "t5", "name": "fix login mediaroom", "queue_id": 8, "sent": false}],
+       "errors": []}
+```
+
+`choice` is an option's index, from 0. `other` is the user's own words.
+What the answer does, and what comes back, by kind:
+
+- **`choice`, `raised`**: the chosen option's words (or the user's) go to
+  the sessions that wait on it, through the send queue, as an instruction
+  (to all its sessions when none waits), and the decision closes.
+  `sent[].sent` is false when that session is busy: it gets it when it
+  stops. `200 {"ok", "id", "state": "answered", "answer", "sent": […],
+  "errors": […]}`.
+- **`question`, `permission`**: the question set of every session of the
+  decision is answered (typed into its dialog, or sent as a reply).
+  `200 {"ok", "id", "state": "answering"|"answered", "answered":
+  [{"session", "question", "status"}], "errors": […]}`. This call returns
+  when the typing is done, which can take some seconds per session. Its
+  body is `{"choice": n}`, `{"other": "text"}`, or exactly what
+  `POST /v1/questions/{id}/answer` takes: `{"answers": [{"tab": 0,
+  "choice": 1}, {"tab": 1, "choice": {"options": [0, 2], "other": "…"}}],
+  "submit": true}`. As a multipart form too: that JSON as a part named
+  `json`, files for tab N's typed answer as parts named `tab<N>` (the same
+  kinds and sizes as `/v1/ask`'s files; with `{"other": "text"}` and one
+  question, the files go with it as `tab0`).
+- **`failed`**: `{"choice": 0}` sends the task to its session once more,
+  `{"choice": 1}` drops it, `{"other": "…"}` sends it again with those
+  words. `200 {"ok", "id", "state": "answered", "task", "requeued": {…}}`
+  (or `"abandoned": {…}`).
+- **`merge`**: `400 merge` (below).
+
+Errors, each `{"error": {"code", "message", …}}`:
+
+| Status | `code` | When |
+|---|---|---|
+| 404 | `no_decision` | No decision has that id |
+| 409 | `closed` | It is over already: answered on another screen or in the session, dismissed, or its sessions are gone. `error.state` says how (`answered`, `dismissed`, `stopped`). Drop the card; nothing was sent. |
+| 400 | `bad_answer` | The body doesn't fit: no such option, no `choice`, `other` or `answers`, `other` for a set of several questions, empty words |
+| 400 | `merge` | It is a merge: `error.prs` lists its PRs' keys |
+| 400 | `bad_json`, `bad_multipart`, `no_json` | The body doesn't read (`no_json`: a form without its `json` part) |
+| 400 | `bad_answers`, `bad_tab`, `no_files` | A form's answers don't read, name a tab the set doesn't have, or the decision is no question (only a question's typed answer takes files) |
+| 413, 415 | `too_many_files`, `image_too_large`, `file_too_large`, `not_an_image` | A file is refused, as for `/v1/ask`; nothing is typed or saved |
+| 409 | `stopped`, `changed`, `answered`, `cannot_answer` | A question's answer didn't go in, as `/v1/questions/{id}/answer` says it: the typing `stopped` half way, the dialog `changed` (asks something else now), it was `answered` in the session meanwhile, or it can't be answered now. The decision is still open unless the next `decisions` event says otherwise. For a `choice`, `raised` or `failed`: `cannot_answer` when the queue or the ledger refused it. |
+
+**A merge** is not answered through its decision: merging is the PR's own
+two-step flow, which shows the user what merging would do before it is
+done. Each of the decision's `prs` has what the app needs:
+
+```json
+{"key": "o/app#12", "repo": "o/app", "number": 12, "base": "dev", "title": "…",
+ "url": "https://github.com/o/app/pull/12",
+ "checks": "pass",                 // pass | pending | fail | none (no checks ran)
+ "note": "checks passing",         // the checks in words ("1 check failing: lint")
+ "session": "t58",
+ "merge": {"can": true, "blocked": null, "needs_override": null, "warnings": []}}
+```
+
+`repo` is `owner/name`: call `POST /v1/prs/{owner}/{name}/{number}/confirm`,
+show its answer, then `…/merge` with the token (see "PRs"). `merge` is what
+a PR chip has. When its PRs are merged or closed the decision closes by
+itself (`answered` when one merged); `DELETE` takes it out of the queue
+without merging, and those PRs make no decision again while they wait.
+
+**A spoken answer** (`…/interpret` with text from `/v1/transcribe`, or
+`…/voice` with a WAV take) is read against the decision before anything is
+sent:
+
+```
+POST /v1/decisions/d4f7981cc13c3/interpret   {"text": "the first one"}
+→ 200 {"tab": 0, "choice": {"options": [0], "other": null}, "answer": {"choice": 0}}
+```
+
+- For a `question` or `permission` it is exactly `/v1/questions/{id}/interpret`
+  on its question set: `tab` is the question, and `choice` goes into that
+  tab's answer (`{"tab": 0, "choice": {"options": [0], "other": null}}`).
+  No `answer` key.
+- For a `choice`, `raised` or `failed` there is one "tab", its options
+  (`tab` 0), and `answer` is the body to send to `…/answer`: `{"choice":
+  n}`, `{"other": "the words"}`, or `null` when nothing was said.
+- `…/voice` adds `"heard": "the first one"`. `400 bad_tab`, `400 merge`,
+  `404 no_decision`, `409 closed`; for a take, `415 bad_audio` and
+  `400 bad_length` as `/v1/voice`.
+
+### Notifying: a new decision, and nothing else
+
+The app notifies the user when a decision is new, and for nothing else:
+not for a repeat, not for a change, not for news. The `decisions` event is
+enough to do it:
+
+1. Keep the set of decision ids the app has seen, on the device (it must
+   survive the app being closed). Every id in every `decisions` event, or
+   in a `GET /v1/decisions` answer, goes into it: muted or not, whatever
+   its `state`.
+2. A decision is **new** when its id is not in that set. Notify for it
+   when it is new, `muted` is `false` and `state` is `open`. Then add it.
+3. Everything else is a change to something already shown, and is silent:
+   - the same thing asked or raised again (another session, the same
+     line, another PR of the repo) is the same `id` with a higher `count`,
+     a later `last_ms`, and maybe one more entry in `sessions` or `prs`.
+     Never a new id;
+   - `waiting` going up or down, `options` or `pick` changing, `state`
+     moving between `open` and `answering`, the order changing;
+   - a muted space's decision is seen (and remembered) but never notified,
+     not when the space is unmuted either, as on the Mac.
+4. An id that was in the last event and is not in this one is over
+   (answered, dismissed, stopped): take its card and its notification away.
+
+The stream sends a `decisions` event right after `hello` and `state`, so an
+app that was away catches up on connecting with the same rule: what it has
+not seen yet is new. `count` in the event (and `decisions_count` in the
+state) is the badge: the open decisions outside muted spaces, those whose
+answer is going in included.
+
+A decision is also said on the Mac once, when it first appears (an alert:
+a chat message of role `event`, and one spoken sentence, as an `audio` clip
+when a phone is the voice). The app needs neither to notify.
+
+### A mission
+
+Every space is a mission: what it is for, who is in it, what it asks of the
+user, and where it stands.
+
+```json
+{
+  "spaces": [{
+    "name": "fix-login",
+    "goal": "Fix the login redirect",          // "" when it has none
+    "done_when": "The redirect lands on the dashboard",   // "" when none
+    "standing": false,                         // true: the user keeps it; it is never ready, never closed by the tower
+    "state": "open",                           // open | ready | quiet
+    "follow": false, "mute": false,
+    "needs": 1,                                // its open decisions, muted or not
+    "report": "",                              // its closing report, once the tower wrote one
+    "sessions": [{"address": "t3", "name": "fix login eyzflow", "status": "working",
+                  "account": "orca", "worktree": "/…/.tower-worktrees/fix-login/eyzflow",
+                  "branch": "fix-login/eyzflow", "port": 3001,
+                  "said": "The redirect now goes through /auth/callback."}],
+    "requests": [{"id": "a1", "title": "Fix the login redirect", "state": "open", "done": 0, "total": 2}],
+    "thread_count": 2,
+    "tower": {"name": "tower-fix-login", "status": "ready", "address": "t4"},
+    "quiet_since_ms": null, "ready_since_ms": null, "auto_close_ms": null
+  }],
+  "quiet": [],
+  "closed_today": ["write-docs"]
+}
+```
+
+- `spaces`: every space that is not closed and not archived, in the order
+  to show them: the open and ready ones first (those with `needs` > 0,
+  then those with a session `working`, then the rest; then by name), then
+  the quiet ones. `quiet`: the names of the quiet ones (the fold).
+  `closed_today`: spaces closed since local midnight, oldest first; a
+  closed space is in no other list.
+- `state`: `open` (it has live sessions, or is new); `ready` (it has a
+  goal, every request there is finished, and nothing waits for the user:
+  the tower has written its `report` or is about to, and closes it by
+  itself after `[spaces] auto_close_hours` left alone: `auto_close_ms`
+  says when, null when it won't); `quiet` (no session left, since
+  `quiet_since_ms`; archived a day later).
+- A session's `status` is Herdr's word (`idle`, `working`, `blocked`,
+  `done`, `error`); `account`, `worktree`, `branch`, `port` and `said`
+  (its last words, cut to 240 characters) are null when not known.
+- `requests`: what the user asked for there (the open ones, oldest first,
+  then those finished today): `state` `open`, `done`, `closed` or
+  `abandoned`; `done` of `total` tasks are finished.
+- `thread_count`: how many messages its thread holds in the tower's memory
+  (at most 50): whether there is a thread to show.
+- `tower`: the space's own tower (its own brain), or null when it has none
+  and is due none. `status`: `ready` (it takes requests), `working`,
+  `starting`, `blocked` (it waits on its own screen), `off` (due one that
+  doesn't run right now). While it is not `ready` or `working`, a request
+  asked in the space goes to the main tower. Show "its own tower" in the
+  space's head when it is `ready` or `working`.
+- `follow`: its results reach the user as they land (a receipt is told
+  whatever the tell level). `mute`: what needs the user there stays in the
+  space's own queue.
+
+`POST /v1/spaces/{space}/goal`, `/follow` and `/mute` answer with the
+space's mission as it is right after the change (`mission`; null for a
+space that is closed). A space gets a goal by its launch, by this call, or
+on the Mac (`tower space goal`); `standing: true` keeps a space the tower
+would otherwise close when its work is done.
+
+### A space's thread
+
+Sessions of a space write to each other without the tower in between
+(`tower queue`, run by a session). What they wrote is the space's thread:
+
+```
+GET /v1/thread?space=fix-login&limit=50
+→ 200 {"space": "fix-login", "more": false, "messages": [
+    {"id": "h31", "at": 1794368771000, "from": "t3", "from_name": "fix login eyzflow",
+     "to": "t5", "to_name": "fix login mediaroom", "text": "Which port does the api listen on?",
+     "space": "fix-login", "delivered": true},
+    {"id": "h34", "at": 1794368776000, "from": "t5", "from_name": "fix login mediaroom",
+     "to": "t3", "to_name": "fix login eyzflow", "text": "3001. The redirect goes through /auth/callback.",
+     "space": "fix-login", "delivered": true}
+  ]}
+```
+
+Newest last. `limit` is 50 by default, 200 at most. `before` pages back
+(the first message's `id`), `more` says older ones remain, as in the chat.
+Without `space`: every space's. A message is listed when it arrives at its
+receiver; `delivered: false` is one that could not be delivered (its
+receiver was gone: the sender is told, the user is not). `id` is the
+message's line in the history, like a chat message's. A space nobody wrote
+in has an empty thread. A new message is a `thread` event:
+`{"space": "fix-login", "message": {…}}`.
+
+### Actions: launching a space, and closing one
+
+`POST /v1/launch` with `dry_run: true` answers at once with the plan, and
+does nothing:
+
+```json
+{"space": "fix-login", "goal": "Fix the login redirect", "made": true, "dry_run": true, "agenda": null,
+ "sessions": [{"name": "fix-login-eyzflow", "repo": "~/Work/eyz/eyzflow", "address": null, "account": "orca",
+               "worktree": "/…/.tower-worktrees/fix-login/eyzflow", "branch": "fix-login/eyzflow",
+               "port": null, "task": null, "error": null}],
+ "assumed": {"setup": "eyzflow + mediaroom on orca", "setup_why": "the first of 2",
+             "account": "orca", "account_why": "the setup's",
+             "name": "fix-login", "name_why": "the goal's first two words, small ones left out",
+             "worktrees": true, "worktrees_why": "one per repo, on a branch of its own"}}
+```
+
+It never asks: the space's name comes from the goal (or is `name`, taken as
+given: a space that has that name already is joined, `made: false`), the
+setup is the one named by `setup` (its whole name, or a part), else the
+first, and `assumed` says what it chose and why. Show the plan before
+launching ("what the tower will do").
+
+Launching for real opens a session per repo of the setup, each in a
+worktree of its own: seconds each, sometimes minutes. Closing a space ends
+its sessions and removes its worktrees. Neither holds the call open. Both
+answer `202` at once with an **action**, and go on by themselves:
+
+```json
+{"action": {
+  "id": "act_8eb036fb",
+  "kind": "launch",                  // launch | close
+  "space": "fix-login",
+  "state": "running",                // running | done | failed
+  "plan": { … },                     // a launch: the plan, as a dry run prints it; null for a close
+  "receipt": null,                   // see below
+  "error": null,                     // why it failed
+  "by": "phone:d_187d916b",
+  "started_ms": 1794368740438,
+  "finished_ms": null
+}}
+```
+
+- Follow it on the event stream (`action` events carry the whole action at
+  each step), or ask `GET /v1/actions/{id}`. `GET /v1/actions` lists them
+  after a reconnect. Actions are kept in the tower's memory: after a
+  restart of the tower an id is `404 no_action` (what it did is in
+  `GET /v1/missions`).
+- **A launch**: `receipt` is null until the first session has opened;
+  then it is the receipt so far, the plan's shape with `dry_run: false`:
+  a session that has opened has its `address`, `port` and `task`, one that
+  couldn't open has its `error`, the others are as planned. One `action`
+  event per session. When all are through: `state: "done"`, and `receipt`
+  is the whole one (`agenda`: the request the goal became). When no
+  session opened at all: `state: "failed"`, `error`, and `receipt` says
+  why for each. The new space is in the `missions` event as soon as its
+  first session is there; open its view on `done`.
+- **A close**: `receipt` is null while it runs. On `done`:
+  `{"closed": name, "sessions_ended": [{"address","name"}], "sessions_left":
+  [{"address","name","why"}], "herdr_space": "closed"|"kept"|"not shown",
+  "worktrees_removed": [path], "kept_worktrees": [{"path","branch","repo","why"}],
+  "requests_closed": [id], "tower_ended": [name], "report": "…"}`. A
+  worktree with uncommitted work, or commits that are on no remote and no
+  other branch, is kept and named with why: say so to the user. `failed`
+  with `error` when it couldn't be closed (a session there started working
+  meanwhile, say).
+- One launch runs at a time: another `POST /v1/launch` meanwhile is
+  `409 {"error": {"code": "launching", "message", "action": "<its id>"}}`
+  (a second tap finds the first). A space that is being closed is
+  `409 closing`, with `action` likewise.
+
+What can be refused before anything starts is said in the call's own
+answer, not in an action:
+
+| Status | `code` | When |
+|---|---|---|
+| 400 | `empty` | No `goal` |
+| 409 | `no_setups` | The tower has no setup yet (they are made on the Mac: `tower setup add`, or Settings) |
+| 404 | `no_setup` | `setup` names none |
+| 400 | `bad_launch` | The plan can't be made: a repo of the setup is no folder, its account isn't known, … (`message` says) |
+| 409 | `busy` | A close without `force`, while a session there is `working` or `blocked`: `error.sessions` lists them (`{"address", "name", "status"}`). Ask the user, then send `{"force": true}` (their work in progress is cut off). |
+| 404 | `no_space` | A close of a space nobody has |
+
+### Acts: what the tower opened, and taking it back
+
+A command gets a receipt, never a question: asked to open a session or a
+space, the tower takes the defaults, acts, and keeps an **act**. A tower
+that has them says `"acts"` in `features`.
+
+```
+Act { "id": "r3f9a2c1b7d04",                 // r and 12 hex digits
+      "kind": "start" | "launch", "at_ms": 1794371414922,
+      "by": "tower" | "tower-<space>" | "phone:<device>" | "cli" | "<a session's address>",
+      "space": "M5 Pro" or null,
+      "line": "Opened notes fix in M5 Pro.",  // what was opened, in one line
+      "sessions": [ { "address": "t9", "name": "notes-fix", "label": "notes fix",
+                      "worktree": path or null, "branch": name or null } ],
+      "assumed": [ { "what": "account", "value": "orca", "why": "what \"second\" names" },
+                   { "what": "model", "value": "default model", "why": "none was asked for: a session starts on its account's model" },
+                   { "what": "folder", "value": "notes", "why": "the best match for \"notes\"" } ],
+      "request": { "at": 1794371413527, "text": "open a session in the notes project on my second account" } or null,
+      "state": "done" | "undone",
+      "undo": { "possible": true, "why": null },
+      "closing": null, "undone_ms": null }
+```
+
+- `assumed` is what the tower settled by itself or was told, for chips
+  (`what`: `account`, `model`, `folder`, `worktree`, `space`, `name`; for a
+  launch `setup`, `account`, `name`, `worktrees`); `why` is one phrase.
+- `request` is the request it answered (its chat message's `at`), when the
+  tower opened it on a turn the user began; null for one opened from a
+  shell, a window, a phone, or on the tower's own account. Sessions opened
+  one by one for the same request are one act.
+- `undo.possible` is false once it is undone, and while a session of it
+  was given more work than its first instruction (`why` says which and
+  what). A worktree with changes is only found when the undo is tried.
+
+**In the chat** an act that answered a request is one message, where it was
+opened: `{"id": "h5", "role": "tower", "kind": "act", "text": the line (the
+closing line once undone), "space": the conversation it was asked in or
+null, "act": Act, "at", "updated_at", …}`. It changes in place (`chat`
+event, `op: "update"`) when another session joins it, when it can no longer
+be undone lightly, and when it is undone. The tower's own words follow as
+its `answer` message. An act the tower no longer holds shows as it was,
+with `undo.possible: false`. Every change is also an `act` event (`data`:
+the Act). The phone's `state` doesn't carry the list.
+
+**Undo**: `POST /v1/acts/{id}/undo`.
+
+```
+→ 200 {"act": Act (state "undone", closing set), "closing": "Closed it. Nothing else changed.",
+       "sessions_ended": ["t9"], "worktrees_removed": [path], "kept_worktrees": [{"path", "why"}],
+       "space_closed": false}
+→ 409 {"error": {"code": "held", "message": "not undone: fix-login-eyzflow (t7) has work in its worktree that is nowhere else: 1 uncommitted change (notes.txt). Send {\"force\": true} to undo it anyway.",
+                 "sessions": [{"address": "t7", "name": "fix-login-eyzflow", "why": "has work in its worktree that is nowhere else: 1 uncommitted change (notes.txt)"}]}}
+→ 409 {"error": {"code": "undone", "message": "r… is undone already", "state": "undone"}}
+```
+
+It ends the sessions the act opened and removes the worktrees it made for
+them (each only when nothing in it would be lost), or closes the space it
+made when nothing else is in it. With `{"force": true}` the sessions are
+ended although work would be lost; a worktree with changes is still kept,
+and named in `kept_worktrees` and in `closing`. The call answers when it is
+done (a few seconds: it waits for the sessions' programs to end). A launch
+the phone started names its act in the action's receipt (`receipt.act`).
+
+### Make it a rule
+
+After a decision is answered, the user can turn the answer into a standing
+rule with one tap. The answer to `POST /v1/decisions/{id}/answer` says
+whether that is offered, and what would be asked:
+
+```
+"rule": { "can": true, "text": "Make this a rule: when a session in Shop asks \"Tabs or a sidebar for settings?\", answer \"A sidebar\" without asking me." }
+"rule": { "can": false, "text": null }
+```
+
+It is offered only for a `question` or a `choice` answered in words
+(`{"choice": n}` or `{"other": "…"}`; a question answered step by step with
+`answers` says `can: false`, since the tower doesn't know its words), never
+for a `merge`, a `permission`, a `failed` task or a plain `raised`, and
+never for a deploy, a delete, production data, secrets or money.
+
+`POST /v1/decisions/{id}/rule` (body optional: `{"answer": "…"}`, the
+answer in words when the app knows it and the tower doesn't) asks the tower
+of that decision's space exactly as `POST /v1/ask` with `space` would, with
+that text: `202 {"sent": text, "space": name or null}`. The tower adds a
+behavior, which arrives as a `behaviors` event and a `behavior` card in the
+chat with what changed, and can be undone there. `409 not_answered` (it is
+still open), `409 no_rule` (none is offered for it), `404 no_decision`,
+`503 brain`.
+
+### How much the tower tells
+
+`GET /v1/tell`, `POST /v1/tell {"level": …, "voice": …}`; `tell_level` and
+`tell_voice` in the state.
+
+| `voice` | It says out loud |
+|---|---|
+| `off` | Nothing (the mute: `muted` in the state is true) |
+| `decisions` | A decision, once, in one sentence. Nothing else: no answer, no receipt |
+| `replies` (the default) | Its answers to what the user asks too |
+
+It applies to what a phone plays as the tower's voice as well: at
+`decisions` no `reply` or `ack` clip is sent, only the `alert` of a decision.
+
+| `level` | Reaches the user |
+|---|---|
+| `decisions` (the default) | Decisions, and direct replies to what they asked |
+| `results` | Also one receipt when a request of theirs is finished |
+| `everything` | Every start, finish and report, as before the Quiet Tower |
+
+Setting it takes effect at once (the tower's brains read their instructions
+again). It changes what is told from then on, never what the chat showed
+before.
+
+### The brains' model
+
+`GET /v1/model` (also `brain_model` in the state):
+
+```json
+{
+  "program": "claude",               // or "codex"
+  "model": "claude-opus-5-5",        // the setting
+  "effort": "high",                  // low | medium | high | xhigh | max
+  "choices": {"models": [{"id": "claude-fable-5-2", "label": "Fable 5.2"}, {"id": "claude-opus-5-5", "label": "Opus 5.5"},
+                         {"id": "claude-sonnet-5-5", "label": "Sonnet 5.5"}, {"id": "claude-haiku-5-5", "label": "Haiku 5.5"}],
+              "efforts": ["low", "medium", "high", "xhigh", "max"]},
+  "running": [{"brain": "tower", "space": null, "address": "t7", "model": "sonnet", "effort": "medium", "restart": true}],
+  "restart_needed": true,
+  "locked_by_args": false,
+  "locked": {"model": null, "effort": null},
+  "says": "The tower's brain runs on sonnet at medium effort. Opus 5.5 at high effort applies when it restarts.",
+  "restarted": []
+}
+```
+
+One setting for every tower brain, the main one and each space's own. Draw
+the picker from `choices`; show `says`. A change applies when a brain
+starts, so after `POST /v1/model {"model": …}` the report has
+`restart_needed: true` and each of `running` whose `restart` is true still
+runs on what it was started with (`model` and `effort` there are null when
+its command line names none). `POST /v1/model {"restart": true}` (alone, or
+with the change) restarts every brain that runs, now: `restarted` lists
+them, each starts a new conversation, and for a few seconds a space's
+`tower` is `off` or `starting`. `locked_by_args`: the user's own
+`claude_args` in config.toml set the model or the effort (`locked` says
+which), and that wins over the choice here: show it, and that the choice is
+kept. `model` may be a picker id, a picker label ("Opus 5.5") or any name
+the program takes. `409 codex` when the tower's brain is Codex (its model
+comes from its own settings; nothing is changed).
+
 ## Live updates: `GET /v1/events`
 
 Server-Sent Events (`text/event-stream`), one long response. Use OkHttp's
@@ -464,8 +1134,13 @@ line of JSON `data`. A comment line `: ping` comes every 10 s.
 
 | `event` | `data` |
 |---|---|
-| `hello` | `{"api":1,"device":"d_…","voice":bool}`, first |
-| `state` | the whole state, first right after `hello`, then whenever it changes (at most 4 a second) |
+| `hello` | `{"api":1,"device":"d_…","voice":bool,"features":["quiet","acts"]}`, first |
+| `state` | the whole state, first right after `hello`, then whenever something in it changes (at most 4 a second). A change to the decisions, the missions or a thread alone sends their own event, not this one. |
+| `decisions` | `{"count": n, "decisions": [Decision]}`: every open decision in queue order, each with `muted`; `count` is how many are outside muted spaces (the badge). Right after the first `state`, then whenever the list changes: one opened, closed or changed, or the order moved (the tower orders them again every 30 s). See "Notifying". |
+| `missions` | the answer of `GET /v1/missions`, right after the first `decisions`, then whenever it changes (a session's status or last words, a goal, follow, mute, a request, a space's tower, a space opening, going quiet or closing) |
+| `thread` | `{"space": name or null, "message": {…}}`: a session wrote to another (`message` as `GET /v1/thread` lists it); it follows that message's own `history` event |
+| `act` | an Act (see "Acts"): what the tower opened was kept, another session joined it, it can no longer be undone lightly, or it was undone |
+| `action` | an action (a launch or a close a phone started), at each step: when it begins, as each session of a launch opens, and when it is over (see "Actions") |
 | `history` | one new history entry (as in `/v1/history`), as it's written |
 | `pr` | `{"op": "open"\|"update"\|"closed", "pr": {…}}`: a PR a session opened appeared, changed (checks, mergeable, waiting) or closed (merged or closed). |
 | `question` | `{"op": "open"\|"update"\|"closed", "id", "question": {…}}`: a question set appeared, changed (recommendations arrived, the dialog moved to another tab, answering started, finished or stopped) or closed (the session moved on). |
@@ -605,3 +1280,30 @@ Change it with `PUT /v1/device/audio`, in the Mac panel's Phone section, or
 Everything is under `/v1`. Additions (new keys, events, calls) don't change
 the version; the app must ignore what it doesn't know. A breaking change gets
 `/v2`, and `GET /v1/hello`'s `api` says what the tower speaks.
+
+What a tower has beyond the first `/v1` is named in **`features`** (a list
+of words, in `GET /v1/hello`, in `POST /v1/pair`'s answer and in the
+stream's `hello` event). A tower from before there were features sends no
+`features`: read that as `[]`.
+
+| Feature | The tower has |
+|---|---|
+| `acts` | Acts and what came with them: `GET /v1/acts`, `/v1/acts/{id}`, `POST /v1/acts/{id}/undo`, the chat's `kind: "act"` messages and the `act` event; `rule` in a decision's answer and `POST /v1/decisions/{id}/rule`; `voice` in `/v1/tell` and `tell_voice` in the state |
+| `quiet` | Everything under "The Quiet Tower": the `/v1/decisions`, `/v1/missions`, `/v1/spaces/{space}/…`, `/v1/thread`, `/v1/setups`, `/v1/launch`, `/v1/actions`, `/v1/tell` and `/v1/model` calls; `space` on `POST /v1/ask`, on chat messages, and as a filter of `/v1/history` and `/v1/chat`; the `decisions`, `missions`, `thread` and `action` events; `decisions_count`, `tell_level`, `brain_model` and `brains` in the state |
+
+Both ways round:
+
+- **A newer app, an older tower** (no `quiet`): none of those calls exist
+  there (`404 not_found`), and the app works as before: what needs the user
+  is the escalated question sets (`GET /v1/questions`, the `question`
+  event) and the waiting PRs (`GET /v1/prs`, the `pr` event), and there is
+  one conversation. Check `features` once after connecting, not call by
+  call.
+- **An older app, a newer tower**: every call, key and event it knows is
+  as it was. It gets events it doesn't know (`decisions`, `missions`,
+  `thread`, `action`) and keys it doesn't know (`space` on a message,
+  `features`), and ignores them. Two things it may notice: at the tell
+  level `decisions` (the default) the tower writes most news down instead
+  of telling it, so fewer `event` messages reach the chat (they are in
+  `/v1/history` with `record: true`); and `state` events come only when
+  something in the state changed.

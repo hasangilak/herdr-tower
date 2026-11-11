@@ -10,6 +10,9 @@
 //! (`questions::safe_auto`: only a plain one-time yes) and the user's policy
 //! override the brain; both are checked again on the screen right before an
 //! answer is typed for the user.
+//!
+//! A set that is the user's is a decision (`decisions`): the same thing
+//! asked by several sessions of a space is one, told once.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -158,6 +161,9 @@ struct Saved {
     dismissed: Vec<(String, String)>,
     replies: HashMap<String, Reply>,
     noted: Vec<String>,
+    /// Kept by a tower that makes no card of a turn that only says its
+    /// session is ready (false: an older one's file, looked through once).
+    ready_checked: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -166,6 +172,8 @@ struct SavedSet {
     set: QuestionSet,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     created_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    space: Option<String>,
 }
 
 impl Saved {
@@ -232,16 +240,28 @@ pub struct Asks {
     notify: Arc<std::sync::OnceLock<Notify>>,
     /// Tells the brain (`[question] …`); tests keep what it would have been told.
     brain: Note,
+    /// What needs the user, one decision per key: the sets that are theirs
+    /// go there (none: tests that keep no decisions).
+    decisions: Arc<std::sync::OnceLock<super::decisions::Decisions>>,
 }
 
 impl Asks {
     pub fn new(shared: Shared, hub: Arc<Hub>, policy: &str) -> Asks {
+        // To the brain of the asking session's space, when it has one (the note names the session).
         let brain: Note = Arc::new(|text: &str| {
-            if let Err(e) = crate::brain::note(text) {
+            if let Err(e) = super::brains::note_about(text, false) {
                 eprintln!("[questions] the brain can't take it: {e:#}");
             }
         });
-        let me = Asks { inner: Arc::new(Mutex::new(Inner::default())), store: None, shared, hub, notify: Arc::new(std::sync::OnceLock::new()), brain };
+        let me = Asks {
+            inner: Arc::new(Mutex::new(Inner::default())),
+            store: None,
+            shared,
+            hub,
+            notify: Arc::new(std::sync::OnceLock::new()),
+            brain,
+            decisions: Arc::default(),
+        };
         me.set_policy(policy);
         me
     }
@@ -256,6 +276,30 @@ impl Asks {
         crate::config::state_dir().join("questions.json")
     }
 
+    /// Tells no brain anything (tests outside this file: nothing reaches a real session).
+    #[cfg(test)]
+    pub fn telling_no_brain(mut self) -> Asks {
+        self.brain = Arc::new(|_: &str| ());
+        self
+    }
+
+    /// The sets that are the user's become decisions there, from now on.
+    pub fn with_decisions(self, decisions: super::decisions::Decisions) -> Asks {
+        let _ = self.decisions.set(decisions);
+        self
+    }
+
+    /// Whether the user is told of a set that is theirs now. It is one
+    /// decision per key: told when the decision first appears, and the same
+    /// thing asked again says nothing; unless the tower tells everything,
+    /// when it is told as it was before (`loud`). Never from a muted space.
+    fn tells(&self, set: &str, loud: bool) -> bool {
+        match self.decisions.get() {
+            Some(d) => d.tells(&d.for_question(set), loud),
+            None => loud,
+        }
+    }
+
     /// Writes what a restart needs (every change to the cards ends here).
     fn save(&self) {
         let Some(store) = &self.store else { return };
@@ -263,10 +307,11 @@ impl Asks {
         let saved = {
             let i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             Saved {
-                sets: i.sets.iter().map(|s| SavedSet { set: s.clone(), created_ms: s.created_ms }).collect(),
+                sets: i.sets.iter().map(|s| SavedSet { set: s.clone(), created_ms: s.created_ms, space: s.space.clone() }).collect(),
                 dismissed: i.dismissed.clone(),
                 replies: i.replies.clone(),
                 noted: i.noted.clone(),
+                ready_checked: true,
             }
         };
         if let Err(e) = saved.write(&store.0) {
@@ -285,24 +330,41 @@ impl Asks {
         let Some(store) = &self.store else { return };
         let saved = Saved::load(&store.0);
         if saved.sets.is_empty() && saved.replies.is_empty() && saved.dismissed.is_empty() {
+            // No card is left: a decision that stood for one is over.
+            self.publish();
             return;
         }
         let mut looked: HashMap<String, Terminal> = HashMap::new();
         let mut look = |a: &str| looked.entry(a.to_string()).or_insert_with(|| Terminal::of(a)).clone();
-        self.restore_from(saved, &mut look, crate::history::now_ms());
+        // What was asked of a session, as the ledger's file says (the queue and the ledger start after this).
+        let now = crate::history::now_ms();
+        let ledger = crate::agenda::Ledger::load_from(&crate::agenda::path());
+        let asked = |a: &str| ledger.at_work_on(a, now, 60_000).is_some_and(|t| !questions::ready_only(&t.instruction));
+        self.restore_from(saved, &mut look, &asked, now);
     }
 
-    fn restore_from(&self, saved: Saved, look: &mut dyn FnMut(&str) -> Terminal, now_ms: u64) {
+    /// `asked`: something was asked of that session (`has_work`, as far as the files say).
+    fn restore_from(&self, saved: Saved, look: &mut dyn FnMut(&str) -> Terminal, asked: &dyn Fn(&str) -> bool, now_ms: u64) {
         let mut kept: Vec<QuestionSet> = vec![];
         let mut over: Vec<QuestionSet> = vec![];
+        // An older tower made a "waits for you" card of a turn that only said its session was ready.
+        // This one never does, so its own cards are never looked through for that.
+        let older = !saved.ready_checked;
         for s in saved.sets {
             let mut set = s.set;
             set.created_ms = s.created_ms;
+            set.space = s.space;
             set.state = card::SetState::from_wire(&set.status, set.decision.as_deref(), set.error.as_deref());
             card::sync(&mut set);
             let t = look(&set.session);
             let why = match &t {
                 _ if !t.same(set.created_ms) => Some(CloseWhy::SessionGone),
+                // Idle is not blocked: a card that only said its session was ready (an older tower made those).
+                // By the whole message it kept, not the one sentence in its title: "The build failed.
+                // I'm waiting for your instructions." is a real wait.
+                _ if older && set.reason == questions::WAITS && questions::ready_only(if set.detail.trim().is_empty() { &set.title } else { &set.detail }) && !asked(&set.session) => {
+                    Some(CloseWhy::NothingAsked)
+                }
                 Terminal::Live { status, .. } if set.kind != "text" && *status != SessionStatus::Blocked => Some(over_why(&set, false)),
                 Terminal::Live { status, .. } if set.kind == "text" && matches!(status, SessionStatus::Working | SessionStatus::Starting) => {
                     Some(over_why(&set, false))
@@ -417,7 +479,11 @@ impl Asks {
 
     fn publish(&self) {
         self.save();
-        let sets = self.list();
+        let (sets, past) = {
+            let i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let past: Vec<(String, crate::decisions::State)> = i.past.iter().map(|p| (p.id.clone(), ended_as(p))).collect();
+            (i.sets.clone(), past)
+        };
         let by_session: HashMap<String, String> = sets.iter().map(|s| (s.session.clone(), s.id.clone())).collect();
         self.shared.update(|st| {
             st.questions = sets.iter().map(|s| serde_json::to_value(s).unwrap_or_default()).collect();
@@ -425,6 +491,10 @@ impl Asks {
                 a.question = by_session.get(&a.address).cloned();
             }
         });
+        // The sets that are the user's, as decisions: one per key.
+        if let Some(d) = self.decisions.get() {
+            d.sync_questions(&sets, &|id| past.iter().rev().find(|(p, _)| p == id).map(|(_, s)| *s).unwrap_or(crate::decisions::State::Stopped));
+        }
     }
 
     fn event(&self, op: &str, set: Option<&QuestionSet>, id: &str) {
@@ -558,12 +628,24 @@ impl Asks {
             None => {
                 let had = self.list().iter().any(|s| s.session == address && s.kind != "text");
                 self.close_where(address, |s| s.kind != "text", |s| over_why(s, false), true);
-                // Blocked on something it can't read: the plain notice, as before.
+                // Blocked on something it can't read: a decision of its own (on
+                // the orb's count, in the queue, with Herdr one tap away), told
+                // as the plain notice was: once at a quiet level.
                 if !had
                     && let Some(t) = hc::get(address).filter(|t| hc::status(t) == SessionStatus::Blocked)
                     && !super::watch::left_alone(&t)
                 {
-                    self.tell(address, &blocked_notice(&hc::spoken_name(&t), &t["status"]));
+                    let notice = blocked_notice(&hc::spoken_name(&t), &t["status"]);
+                    let told = match self.decisions.get() {
+                        Some(d) => {
+                            let who = crate::decisions::Who::new(address, &hc::spoken_name(&t));
+                            d.blocked(crate::spaces::space_of(&t), who, &blocked_title(&t["status"]))
+                        }
+                        None => true,
+                    };
+                    if told {
+                        self.tell(address, &notice);
+                    }
                 }
                 None
             }
@@ -587,32 +669,46 @@ impl Asks {
             let context = crate::history::jobs(&crate::history::load()).into_iter().find(|j| j.session == address).map(|j| j.title).unwrap_or_default();
             let waits = questions::waits_for_user(&message);
             let watched = reported.lock().unwrap_or_else(|e| e.into_inner()).contains(&address);
+            let (name, space) = (hc::spoken_name(&t), crate::spaces::space_of(&t));
+            // It only says it is ready: that hands the user nothing.
+            let ready = questions::ready_only(&message);
             // PRs it opened (or ends on): chips in the chat, waiting for the user's merge.
             let found = crate::prs::links(&format!("{message}\n{}", turn_transcript(&address, &t)));
             if !found.is_empty()
                 && let Some(store) = crate::prs::daemon()
             {
-                let name = hc::spoken_name(&t);
-                let open = store.found(&found, &address, &name, crate::spaces::space_of(&t).as_deref(), true);
+                let open = store.found(&found, &address, &name, space.as_deref(), true);
                 // Its wait is the merge (or it just ended on the PR): the chip is what the user acts on.
-                let on_merge = waits.as_deref().is_none_or(|r| r.to_lowercase().contains("merg"));
+                let on_merge = waits.as_deref().filter(|_| !ready).is_none_or(|r| r.to_lowercase().contains("merg"));
                 if !open.is_empty() && on_merge {
-                    if !watched {
+                    // One merge decision per repo and space: said when it first appears.
+                    let tells = match me.decisions.get() {
+                        Some(d) => d.tells_merge(&open, !watched),
+                        None => !watched,
+                    };
+                    if tells {
                         me.tell(&address, &pr_line(&name, &open));
                     }
                     return;
                 }
             }
+            // Idle is not blocked: no card, no alert, no decision.
+            if idle_ready(&address, &message) {
+                eprintln!("[questions] {address} ({name}) is ready: it only says it waits for instructions, and nothing was asked of it");
+                me.shared.record(&address, &format!("{name} is ready"), "ready");
+                return;
+            }
             if let Some(request) = waits {
-                me.waiting(&address, &hc::spoken_name(&t), hc::created_ms(&t), &message, &request, &context, watched);
+                me.waiting_in(space, &address, &name, hc::created_ms(&t), &message, &request, &context, watched);
                 return;
             }
             if !questions::looks_like_question(&message) {
                 return;
             }
-            let mut set = questions::text_set(&address, &hc::spoken_name(&t), &message, &context);
+            let mut set = questions::text_set(&address, &name, &message, &context);
             set.at_ms = crate::history::now_ms();
             set.created_ms = hc::created_ms(&t);
+            set.space = space;
             me.upsert(set);
         });
     }
@@ -621,12 +717,23 @@ impl Asks {
     /// straight to them (the brain can't merge or test for them, so it isn't
     /// asked to answer it), the session's open job blocked on it, and the
     /// request said in plain words: by the tower, unless a watch reports
-    /// this turn to the brain (it says it then, naming the space).
+    /// this turn to the brain (it says it then, naming the space). At a
+    /// quiet level the tower says it itself either way, and once per
+    /// decision: the same wait from another session of the space adds its
+    /// session to the card and says nothing.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn waiting(&self, address: &str, name: &str, created_ms: Option<u64>, message: &str, request: &str, context: &str, watched: bool) -> Option<QuestionSet> {
+        self.waiting_in(None, address, name, created_ms, message, request, context, watched)
+    }
+
+    /// `waiting`, for a session in `space`.
+    #[allow(clippy::too_many_arguments)]
+    fn waiting_in(&self, space: Option<String>, address: &str, name: &str, created_ms: Option<u64>, message: &str, request: &str, context: &str, watched: bool) -> Option<QuestionSet> {
         let mut set = questions::wait_set(address, name, message, request, context);
         set.at_ms = crate::history::now_ms();
         set.created_ms = created_ms;
+        set.space = space;
         let known = self.get(&set.id).is_some();
         let set = self.upsert(set);
         if known {
@@ -635,7 +742,7 @@ impl Asks {
         eprintln!("[questions] {address} ({name}) waits for the user: {request}");
         let (a, r) = (address.to_string(), request.to_string());
         crate::history::later(move || crate::history::job_follow(&a, crate::history::JobState::Blocked, &r));
-        if !watched {
+        if self.tells(&set.id, !watched) {
             self.tell(address, &questions::wait_line(name, request));
         }
         Some(set)
@@ -674,6 +781,7 @@ impl Asks {
                     set.answered_with = o.answered_with.clone();
                     set.replaces = set.replaces.take().or_else(|| o.replaces.clone());
                     set.created_ms = set.created_ms.or(o.created_ms);
+                    set.space = set.space.take().or_else(|| o.space.clone());
                     set.state = o.state.clone();
                     card::sync(&mut set);
                     i.sets[k] = set.clone();
@@ -693,6 +801,7 @@ impl Asks {
                         // decides it still), with what was recommended for the
                         // questions that didn't change.
                         set.replaces = Some(old.id.clone());
+                        set.space = set.space.take().or_else(|| old.space.clone());
                         if old.state.decision == Decision::Escalated {
                             set.state.decision = Decision::Escalated;
                             set.reason = old.reason.clone();
@@ -911,7 +1020,9 @@ impl Asks {
                     format!("answered for you: {picked}, because {}", if set.reason.is_empty() { "it's routine" } else { &set.reason });
                 eprintln!("[questions] {}: {line}", set.session);
                 let (a, l) = (set.session.clone(), line.clone());
-                crate::history::later(move || crate::history::record_session("answered", &a, &l, Some("auto")));
+                // A routine answer is written down, not told, unless the tower tells everything.
+                let record = crate::tell::for_record(crate::tell::level(), "auto");
+                crate::history::later(move || crate::history::record_session_as("answered", &a, &l, Some("auto"), record));
                 if let Some(s) = self.inner.lock().unwrap_or_else(|e| e.into_inner()).sets.iter_mut().find(|s| s.id == now.id) {
                     s.answered_with = picked;
                 }
@@ -964,6 +1075,11 @@ impl Asks {
             .map(|o| format!(" I'd say: {}.", o.label.trim_end_matches('.')))
             .unwrap_or_default();
         let line = format!("{} asks: {}{more}.{pick}", set.name, what.trim_end_matches(['.', '?']));
+        // One decision per key: the same thing asked again by another session says nothing.
+        if !self.tells(&set.id, true) {
+            eprintln!("[questions] {} ({}): in front of the user already, not said again", set.id, set.session);
+            return;
+        }
         self.tell(&set.session, &line);
     }
 
@@ -1287,7 +1403,35 @@ pub fn detect(address: &str) -> Option<QuestionSet> {
     let mut set = questions::build(&addr, &hc::spoken_name(&t), app == "codex", &screen, transcript, msg, &context);
     set.at_ms = crate::history::now_ms();
     set.created_ms = hc::created_ms(&t);
+    set.space = crate::spaces::space_of(&t);
     Some(set)
+}
+
+/// How a set that is over ended, for the decision it stood in.
+fn ended_as(p: &QuestionSet) -> crate::decisions::State {
+    use crate::decisions::State;
+    match &p.state.phase {
+        Phase::Dismissed | Phase::Closed { why: CloseWhy::Dismissed } => State::Dismissed,
+        Phase::Closed { why: CloseWhy::AnsweredHere | CloseWhy::AnsweredElsewhere | CloseWhy::Unblocked } => State::Answered,
+        _ => State::Stopped,
+    }
+}
+
+/// Something was asked of the session: an instruction waits for it in the
+/// queue, or it is on an agenda task (other than one that itself told it to
+/// wait for instructions).
+pub(super) fn has_work(address: &str) -> bool {
+    if super::sendq::waiting_counts().get(address).copied().unwrap_or(0) > 0 {
+        return true;
+    }
+    super::agendas::working_on(address).is_some_and(|asked| !questions::ready_only(&asked))
+}
+
+/// Idle is not blocked: a turn's end that only says the session is ready
+/// (`questions::ready_only`), from a session nothing was asked of. It is no
+/// wait for the user: no card, no alert, no decision.
+pub fn idle_ready(address: &str, message: &str) -> bool {
+    questions::ready_only(message) && !has_work(address)
 }
 
 /// The one-line notice for a blocked session, from herdr-core's status
@@ -1320,6 +1464,16 @@ pub fn blocked_notice(name: &str, status: &Value) -> String {
         return format!("{name} has questions");
     }
     format!("{name} needs you")
+}
+
+/// The same as a decision's title, which names no session (its card shows
+/// who): "Asks to run npm test", "Has a plan ready for you to approve".
+pub fn blocked_title(status: &Value) -> String {
+    let line = blocked_notice("\u{1}", status);
+    let rest = line.strip_prefix("\u{1} ").unwrap_or(&line);
+    let rest = if rest == "needs you" { "Needs you: it shows something the tower can't read" } else { rest };
+    let mut c = rest.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1405,6 +1559,101 @@ mod tests {
         assert_eq!(said().len(), 1);
         // Its job stays blocked while the card is open (the radar asks).
         assert!(a.waits_on("tw-wait-1") && a.waits_on("tw-wait-2") && !a.waits_on("tw-other"));
+    }
+
+    /// Asks whose sets that are the user's become decisions, in a tower that
+    /// tells `level`; and what the user is told.
+    fn deciding(level: fn() -> crate::tell::Level) -> (Asks, super::super::decisions::Decisions, Arc<Mutex<Vec<String>>>) {
+        let (a, _) = asks();
+        let d = super::super::decisions::Decisions::telling(a.shared.clone(), level);
+        let a = a.with_decisions(d.clone());
+        let user = Arc::new(Mutex::new(Vec::<String>::new()));
+        let u = user.clone();
+        a.set_notify(move |addr, text| u.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{addr}: {text}")));
+        (a, d, user)
+    }
+
+    /// Three sessions end their turns waiting for the same thing: one
+    /// decision with three waiting, one alert, one sentence. It closes when
+    /// they are answered, dismissed, or gone.
+    #[test]
+    fn the_same_wait_from_three_sessions_is_one_decision_said_once() {
+        let (a, d, user) = deciding(|| crate::tell::Level::Decisions);
+        let said = || user.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let msg = "PR #1273 is ready. Still waiting on you: merging #1273 into dev.";
+        let req = questions::waits_for_user(msg).unwrap();
+        // The first is watched: at a quiet level the brain's words are for the record, so the tower says it itself.
+        let first = a.waiting("tw-d1", "web", None, msg, &req, "", true).unwrap();
+        a.waiting("tw-d2", "api", None, msg, &req, "", false).unwrap();
+        a.waiting("tw-d3", "sdk", None, msg, &req, "", false).unwrap();
+        assert_eq!(said(), vec![format!("tw-d1: web waits for you: {}", req.trim_end_matches('.'))], "said once, for the first");
+        let st = a.shared.get();
+        assert_eq!(st.questions.len(), 3, "each session keeps its card");
+        assert_eq!((st.decisions.len(), st.decisions_count), (1, 1), "one decision");
+        let v = &st.decisions[0];
+        assert_eq!((v["kind"].as_str(), v["waiting"].as_u64(), v["count"].as_u64(), v["state"].as_str()), (Some("question"), Some(3), Some(3), Some("open")));
+        assert_eq!((v["title"].as_str(), v["why"].as_str(), v["question_id"].as_str()), (Some(req.as_str()), Some(questions::WAITS), Some(first.id.as_str())));
+        let id = v["id"].as_str().unwrap().to_string();
+        assert_eq!(d.for_question(&first.id), vec![id.clone()]);
+        // One of them works again (it was answered in its terminal): two wait.
+        a.seen("tw-d1", &json!({}), &SessionStatus::Working);
+        let st = a.shared.get();
+        assert_eq!((st.decisions.len(), st.decisions[0]["waiting"].as_u64(), st.decisions[0]["id"].as_str()), (1, Some(2), Some(id.as_str())));
+        // One is dismissed, the last one's session ends: the decision is over, as answered (one of them was).
+        let second = a.list().into_iter().find(|s| s.session == "tw-d2").unwrap();
+        a.dismiss(&second.id).unwrap();
+        assert_eq!(a.shared.get().decisions_count, 1);
+        a.seen("tw-d3", &Value::Null, &SessionStatus::Gone);
+        assert_eq!((a.shared.get().decisions.len(), a.shared.get().decisions_count), (0, 0));
+        assert_eq!(d.get(&id).map(|d| d.state), Some(crate::decisions::State::Answered));
+        // The same wait later is a new decision, said again.
+        a.waiting("tw-d4", "docs", None, msg, &req, "", false).unwrap();
+        assert_eq!(said().len(), 2);
+        assert_ne!(a.shared.get().decisions[0]["id"].as_str(), Some(id.as_str()));
+        // Dismissed, it is over as dismissed.
+        let fourth = a.list().into_iter().find(|s| s.session == "tw-d4").unwrap();
+        a.dismiss(&fourth.id).unwrap();
+        assert_eq!(d.list(None, true)["closed"][0]["state"], "dismissed");
+    }
+
+    /// The same permission asked in two sessions: one decision with the
+    /// tower's pick, said once. While the tower tells everything, each is
+    /// said, as before; the decision is still one.
+    #[test]
+    fn a_repeat_is_not_said_at_decisions_but_still_is_at_everything() {
+        let ask = |a: &Asks, n: u64, session: &str, name: &str| {
+            let mut p = perm("approve Bash: git push origin main");
+            (p.id, p.session, p.name) = (format!("q{n:012x}"), session.into(), name.into());
+            a.upsert(p.clone());
+            let recs = json!([{"tab": 0, "options": [{"label": "Yes", "why": "the tests pass", "choice": 0}, {"label": "No", "why": "", "choice": 2}]}]);
+            a.recommend(&p.id, &recs, Some("auto"), "routine", false).unwrap()
+        };
+        for (level, alerts) in [(|| crate::tell::Level::Decisions, 1), (|| crate::tell::Level::Results, 1), (|| crate::tell::Level::Everything, 2)] as [(fn() -> crate::tell::Level, usize); 3] {
+            let (a, _, user) = deciding(level);
+            ask(&a, 1, "tw-p1", "web");
+            ask(&a, 2, "tw-p2", "api");
+            let said = user.lock().unwrap().clone();
+            assert_eq!(said.len(), alerts, "{said:?}");
+            assert!(said[0].starts_with("tw-p1: web asks: Allow Bash: git push origin main") && said[0].ends_with("I'd say: Yes."), "{said:?}");
+            let st = a.shared.get();
+            assert_eq!((st.decisions.len(), st.questions.len()), (1, 2));
+            let v = &st.decisions[0];
+            assert_eq!((v["kind"].as_str(), v["waiting"].as_u64(), v["pick"].as_str(), v["why"].as_str()), (Some("permission"), Some(2), Some("Yes"), Some("it pushes or merges to a shared branch")), "why: the rule that made it the user's");
+            assert_eq!(v["options"][0], json!({ "label": "Yes", "why": "the tests pass", "pick": true }));
+        }
+    }
+
+    /// Idle is not blocked: a session that only says it is ready, with
+    /// nothing asked of it, waits for nothing the user must do.
+    #[test]
+    fn a_session_that_only_says_it_is_ready_is_not_waiting_for_the_user() {
+        for msg in ["I'm waiting for your instructions", "I have no task yet and I'm waiting for your instructions", "I'm on dev and waiting for your instructions"] {
+            assert!(questions::waits_for_user(msg).is_some(), "what made it a wait before: {msg}");
+            assert!(idle_ready("tw-idle", msg), "{msg}");
+        }
+        for msg in ["Still waiting on you: merging #1273 into dev", "PR #1250 is open, so you need to merge it. I'll wait."] {
+            assert!(!idle_ready("tw-idle", msg), "a real wait: {msg}");
+        }
     }
 
     /// t41's two-tab dialog: read from the screen only (tab 1 has no question
@@ -1749,7 +1998,7 @@ mod tests {
             "t41" => live(1, "idle"),
             _ => Terminal::Gone,
         };
-        b.restore_from(Saved::load(&path), &mut look, now);
+        b.restore_from(Saved::load(&path), &mut look, &|_| false, now);
         let cards: Vec<(String, String, Option<String>)> = b.list().iter().map(|s| (s.session.clone(), s.status.clone(), s.decision.clone())).collect();
         assert_eq!(
             cards,
@@ -1781,17 +2030,48 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_keeps_every_card_that_waits_for_the_user() {
+        let dir = tmp("restart-waits");
+        let path = dir.0.join("questions.json");
+        let idle = |_: &str| Terminal::Live { created_ms: Some(1), status: SessionStatus::Idle };
+        {
+            let (a, _) = stored(&path);
+            // A real wait whose asking sentence, alone, reads as "ready".
+            a.waiting("t9", "api", Some(1), "The build failed on the lint step. I'm waiting for your instructions.", "I'm waiting for your instructions.", "", false).unwrap();
+            // A session that was asked something and ends "waiting for your instructions": its card too.
+            a.waiting("t8", "web", Some(1), "I'm waiting for your instructions.", "I'm waiting for your instructions.", "", false).unwrap();
+            assert_eq!(a.list().len(), 2);
+        }
+        // The tower restarts (an install, `tower restart`): both are still the user's.
+        let (b, _) = stored(&path);
+        b.restore_from(Saved::load(&path), &mut { idle }, &|_| false, 2);
+        assert_eq!(b.list().iter().map(|s| s.session.as_str()).collect::<Vec<_>>(), ["t9", "t8"], "no card is dropped by a restart");
+        // An older tower's file (it has no mark): its card for a turn that only said "ready" goes, once,
+        // judged by the whole message; a real wait and one of a session that was asked something stay.
+        let mut older: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        older.as_object_mut().unwrap().remove("ready_checked");
+        std::fs::write(&path, older.to_string()).unwrap();
+        let (c, _) = stored(&path);
+        c.restore_from(Saved::load(&path), &mut { idle }, &|_| false, 3);
+        assert_eq!(c.list().iter().map(|s| s.session.as_str()).collect::<Vec<_>>(), ["t9"]);
+        std::fs::write(&path, older.to_string()).unwrap();
+        let (d, _) = stored(&path);
+        d.restore_from(Saved::load(&path), &mut { idle }, &|a| a == "t8", 3);
+        assert_eq!(d.list().len(), 2);
+    }
+
+    #[test]
     fn a_broken_or_old_file_never_stops_the_start() {
         let dir = tmp("broken");
         let path = dir.0.join("questions.json");
         std::fs::write(&path, "{ not json").unwrap();
         let (a, _) = stored(&path);
-        a.restore_from(Saved::load(&path), &mut |_| Terminal::Unknown, 1);
+        a.restore_from(Saved::load(&path), &mut |_| Terminal::Unknown, &|_| false, 1);
         assert!(a.list().is_empty());
         assert!(std::fs::read_dir(&dir.0).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().contains("bad-")), "kept aside");
         // Words this tower doesn't know, and fields it doesn't have: loaded as open, undecided.
         std::fs::write(&path, r#"{"sets": [{"id": "q1", "session": "t9", "kind": "claude-permission", "status": "pondering", "decision": "later", "future": 1}], "extra": true}"#).unwrap();
-        a.restore_from(Saved::load(&path), &mut |_| Terminal::Live { created_ms: None, status: SessionStatus::Blocked }, 1);
+        a.restore_from(Saved::load(&path), &mut |_| Terminal::Live { created_ms: None, status: SessionStatus::Blocked }, &|_| false, 1);
         let s = a.get("q1").unwrap();
         assert_eq!((s.status.as_str(), s.decision.as_deref()), ("open", None));
     }

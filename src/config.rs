@@ -19,6 +19,11 @@ pub fn brain_dir() -> PathBuf {
     config_dir().join("brain")
 }
 
+/// Where each space's own brain has its folder (`brains/<space-slug>/`, see `crate::brains`).
+pub fn brains_dir() -> PathBuf {
+    config_dir().join("brains")
+}
+
 /// `~/.local/state/herder-tower`: the daemon's socket.
 pub fn state_dir() -> PathBuf {
     std::env::var_os("HERDER_TOWER_STATE").map(PathBuf::from).unwrap_or_else(|| home().join(".local/state/herder-tower"))
@@ -57,6 +62,12 @@ pub fn hc_bin() -> PathBuf {
         }
     }
     home().join(".local/bin/herdr-core")
+}
+
+/// The `herdr-app` program (Herdr's window: its spaces and tabs): on PATH,
+/// or `HERDER_TOWER_HERDR_APP` (a stand-in, for trying things out).
+pub fn herdr_app_bin() -> PathBuf {
+    std::env::var_os("HERDER_TOWER_HERDR_APP").filter(|p| !p.is_empty()).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("herdr-app"))
 }
 
 /// This program, as installed (a stable path for hooks and the mod).
@@ -98,13 +109,13 @@ pub struct Config {
     pub input_device: String,
     /// Which agent is the brain: `claude` or `codex`.
     pub brain: String,
-    /// The brain's model when it is Claude Code (`sonnet`, `opus`, `haiku`
-    /// or a full model name; empty: Claude Code's own default). A voice
-    /// waits for every step it takes, so a fast one matters most.
-    pub claude_model: String,
-    /// Its effort: `low`, `medium`, `high`, `xhigh`, `max` (empty: Claude
-    /// Code's own default, which may be your `effortLevel`).
-    pub claude_effort: String,
+    /// The brain's model before `[brains] model` (`tower model`) chose it:
+    /// still read from a file that has it and no `[brains] model`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_model: Option<String>,
+    /// Its effort, likewise (`[brains] effort` now).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_effort: Option<String>,
     /// Extra arguments for `claude` when it is the brain.
     pub claude_args: Vec<String>,
     /// The brain's model when it is Codex (`gpt-6.1-terra`, ...; empty:
@@ -152,6 +163,111 @@ pub struct Config {
     pub alert_wait_ms: u64,
     /// An alert that waited longer than this (seconds) is dropped unsaid.
     pub alert_max_age_secs: u64,
+    /// How much the tower tells the user (`[tell]`, `tower tell`).
+    pub tell: Tell,
+    /// Spaces as missions (`[spaces]`): worktrees, dev ports, closing by itself.
+    pub spaces: Spaces,
+    /// The agenda ledger (`[agenda]`).
+    pub agenda: Agenda,
+    /// The tower's brains (`[brains]`): one per open space, and the model they run on.
+    pub brains: Brains,
+    /// What `tower launch` opens (`[[setups]]`, `tower setups`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub setups: Vec<Setup>,
+}
+
+/// `[brains]` in config.toml: one setting for every tower brain, the main
+/// one and each space's own (see `crate::brains`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Brains {
+    /// Each open space with a live session has a tower of its own
+    /// (`tower-<space>`). Off: one brain for everything.
+    pub per_space: bool,
+    /// The model a brain is started on when it is Claude Code (`tower
+    /// model`): a full name or one of the program's own aliases.
+    pub model: String,
+    /// Its effort: `low`, `medium`, `high`, `xhigh` or `max`.
+    pub effort: String,
+    /// The model comes from the older `claude_model` key (the file has no `[brains] model`).
+    #[serde(skip)]
+    pub model_from_old_key: bool,
+    /// The effort comes from the older `claude_effort` key.
+    #[serde(skip)]
+    pub effort_from_old_key: bool,
+}
+
+impl Default for Brains {
+    fn default() -> Self {
+        Self {
+            per_space: true,
+            model: crate::brains::DEFAULT_MODEL.into(),
+            effort: crate::brains::DEFAULT_EFFORT.into(),
+            model_from_old_key: false,
+            effort_from_old_key: false,
+        }
+    }
+}
+
+/// `[spaces]` in config.toml.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Spaces {
+    /// A session the tower opens for a space that isn't standing works in a
+    /// git worktree of its repo (see `crate::worktrees`).
+    pub worktrees: bool,
+    /// The dev ports handed out to those sessions, one each: `"3000-3050"`.
+    pub port_range: String,
+    /// A space that is ready to close, its sessions all idle this many
+    /// hours, is closed by the tower itself. 0 (the default): never; a ready
+    /// space waits for the user to close it.
+    pub auto_close_hours: u64,
+}
+
+impl Default for Spaces {
+    fn default() -> Self {
+        Self { worktrees: true, port_range: "3000-3050".into(), auto_close_hours: 0 }
+    }
+}
+
+/// `[agenda]` in config.toml.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Agenda {
+    /// A task that failed is sent to its session once more by the tower
+    /// itself (at `tower tell decisions|results`). Off: nothing is sent
+    /// again unasked; the brain hears of the failure and puts it to the user.
+    pub retry_failed: bool,
+}
+
+impl Default for Agenda {
+    fn default() -> Self {
+        Self { retry_failed: true }
+    }
+}
+
+/// One `[[setups]]` entry: the repos a space is launched with, and the
+/// Claude account its sessions run on.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Setup {
+    pub name: String,
+    pub account: String,
+    /// Folders (`~` allowed), one session each.
+    pub repos: Vec<String>,
+}
+
+/// `[tell]` in config.toml.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tell {
+    /// `decisions` (only what the user must decide, and direct replies),
+    /// `results` (also one receipt when a request is finished) or
+    /// `everything` (every note told, as before). See `crate::tell`.
+    pub level: crate::tell::Level,
+    /// What it says out loud: `off`, `decisions` (a decision, once, and
+    /// nothing else) or `replies` (the default: its answers too).
+    pub voice: crate::tell::Voice,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,8 +323,8 @@ impl Default for Config {
             talk_key: "ctrl".into(),
             input_device: String::new(),
             brain: "claude".into(),
-            claude_model: "sonnet".into(),
-            claude_effort: "medium".into(),
+            claude_model: None,
+            claude_effort: None,
             claude_args: vec![],
             codex_model: String::new(),
             // Measured with the tower's prompt: Terra at its usual xhigh with
@@ -230,6 +346,11 @@ impl Default for Config {
             alert_cue: true,
             alert_wait_ms: 20_000,
             alert_max_age_secs: 90,
+            tell: Tell::default(),
+            spaces: Spaces::default(),
+            agenda: Agenda::default(),
+            brains: Brains::default(),
+            setups: vec![],
         }
     }
 }
@@ -296,10 +417,58 @@ impl Config {
     pub fn load() -> Result<Self> {
         let path = config_file();
         match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).with_context(|| format!("reading {}", path.display())),
+            Ok(text) => Self::from_text(&text).with_context(|| format!("reading {}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
+    }
+
+    /// The settings as config.toml has them now, for what reads them while
+    /// it runs (the daemon's looks, every few seconds). A file that doesn't
+    /// read just then (a hand edit saved with a typo, a write caught half
+    /// way) keeps the last settings that did read, never the defaults: the
+    /// defaults close spaces by themselves, send failed tasks again and
+    /// start a brain per space, and the user may have turned those off.
+    pub fn live() -> Self {
+        static LAST: std::sync::Mutex<Option<Config>> = std::sync::Mutex::new(None);
+        Self::kept(Self::load(), &mut LAST.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// `live`, of a read and the last one that worked (before any did: the defaults).
+    fn kept(read: Result<Self>, last: &mut Option<Config>) -> Self {
+        match read {
+            Ok(cfg) => {
+                *last = Some(cfg.clone());
+                cfg
+            }
+            Err(e) => {
+                eprintln!("[config] {e:#}; keeping the settings as they last read");
+                last.clone().unwrap_or_default()
+            }
+        }
+    }
+
+    /// The settings a config.toml's text holds. The brains' model and
+    /// effort are `[brains] model` and `effort`; a file that says neither
+    /// but still has the older `claude_model` / `claude_effort` keeps what
+    /// those say; with none of them, the defaults.
+    pub fn from_text(text: &str) -> Result<Self> {
+        let mut cfg: Config = toml::from_str(text)?;
+        let raw: toml::Value = toml::from_str(text)?;
+        let said = |key: &str| raw.get("brains").and_then(|b| b.get(key)).and_then(|v| v.as_str()).is_some_and(|s| !s.trim().is_empty());
+        let old = |v: &Option<String>| v.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+        let defaults = Brains::default();
+        match (said("model"), old(&cfg.claude_model)) {
+            (true, _) => cfg.brains.model = cfg.brains.model.trim().to_string(),
+            (false, Some(m)) => (cfg.brains.model, cfg.brains.model_from_old_key) = (m, true),
+            (false, None) => cfg.brains.model = defaults.model,
+        }
+        match (said("effort"), old(&cfg.claude_effort)) {
+            (true, _) => cfg.brains.effort = cfg.brains.effort.trim().to_string(),
+            (false, Some(e)) => (cfg.brains.effort, cfg.brains.effort_from_old_key) = (e, true),
+            (false, None) => cfg.brains.effort = defaults.effort,
+        }
+        Ok(cfg)
     }
 
     /// Writes the defaults, commented, unless a config exists.
@@ -312,5 +481,135 @@ impl Config {
         let text = toml::to_string_pretty(&Self::default())?;
         std::fs::write(&path, format!("# herder-tower settings. Restart with `tower restart` after a change.\n\n{text}"))?;
         Ok(true)
+    }
+}
+
+/// Sets `key = <value>` under `[table]` in a config.toml's text, keeping
+/// the rest as it is (comments, order, the other tables). `value` is
+/// written as given: a TOML value (`true`, `"high"`). The table is added at
+/// the end when the file has none.
+pub fn with_table_key(text: &str, table: &str, key: &str, value: &str) -> String {
+    let line = format!("{key} = {value}");
+    let header = format!("[{table}]");
+    let is_header = |l: &str| l.split('#').next().unwrap_or("").trim() == header;
+    // Where a table's last key ends: before the blank lines and the comments that lead into the next one.
+    let end = |out: &[String]| out.iter().rposition(|l| !l.trim().is_empty() && !l.trim().starts_with('#')).map(|i| i + 1).unwrap_or(out.len());
+    let mut out: Vec<String> = vec![];
+    let (mut inside, mut done, mut saw) = (false, false, false);
+    for l in text.lines() {
+        let t = l.trim();
+        if t.starts_with('[') {
+            if inside && !done {
+                out.insert(end(&out), line.clone());
+                done = true;
+            }
+            inside = !done && is_header(t);
+            saw |= inside;
+        } else if inside && !done && !t.starts_with('#') && t.split('=').next().map(str::trim) == Some(key) {
+            out.push(line.clone());
+            done = true;
+            continue;
+        }
+        out.push(l.to_string());
+    }
+    if inside && !done {
+        out.insert(end(&out), line.clone());
+        done = true;
+    }
+    if !saw && !done {
+        if out.last().is_some_and(|l| !l.trim().is_empty()) {
+            out.push(String::new());
+        }
+        out.push(header);
+        out.push(line);
+    }
+    out.join("\n") + "\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_that_stops_reading_keeps_what_the_user_turned_off() {
+        // The user turned off the three things the tower does by itself.
+        let off = Config::from_text("[spaces]\nauto_close_hours = 0\n\n[agenda]\nretry_failed = false\n\n[brains]\nper_space = false\n").unwrap();
+        let mut last = None;
+        let now = Config::kept(Ok(off), &mut last);
+        assert_eq!((now.spaces.auto_close_hours, now.agenda.retry_failed, now.brains.per_space), (0, false, false));
+        // A hand edit saved with a typo: the next look still has them off (the defaults are 24, true, true).
+        let broken = Config::from_text("[spaces]\nauto_close_hours = 0\nvoice = \n");
+        assert!(broken.is_err());
+        let now = Config::kept(broken, &mut last);
+        assert_eq!((now.spaces.auto_close_hours, now.agenda.retry_failed, now.brains.per_space), (0, false, false));
+        let d = Config::default();
+        assert_eq!((d.spaces.auto_close_hours, d.agenda.retry_failed, d.brains.per_space), (0, true, true), "a ready space waits for the user");
+        // Fixed, with other words: those hold from then on.
+        let now = Config::kept(Config::from_text("[spaces]\nauto_close_hours = 48\n"), &mut last);
+        assert_eq!((now.spaces.auto_close_hours, last.as_ref().map(|c| c.spaces.auto_close_hours)), (48, Some(48)));
+    }
+
+    /// A config.toml as an install from before the brains' own table has it.
+    const OLD: &str = "# herder-tower settings.\n\nvoice = \"af_bella\"\nbrain = \"claude\"\nclaude_args = []\ncodex_args = []\n\n[vad]\nratio = 3.0\n\n[alerts]\nblocked = true # say so\n\n[[setups]]\nname = \"web\"\naccount = \"orca\"\nrepos = [\"~/w/web\"]\n";
+
+    #[test]
+    fn a_file_that_says_nothing_gets_the_defaults() {
+        let cfg = Config::from_text(OLD).unwrap();
+        assert_eq!((cfg.brains.model.as_str(), cfg.brains.effort.as_str(), cfg.brains.per_space), ("claude-opus-5-5", "high", true));
+        assert!(!cfg.brains.model_from_old_key && !cfg.brains.effort_from_old_key);
+        assert_eq!(cfg.brain, "claude", "which program the brain is stays its own key");
+        // No file at all: the same.
+        let none = Config::default();
+        assert_eq!((none.brains.model.as_str(), none.brains.effort.as_str(), none.brains.per_space), ("claude-opus-5-5", "high", true));
+        // The defaults as a new install writes them say so in the file, and never the older keys.
+        let written = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(written.contains("[brains]\nper_space = true\nmodel = \"claude-opus-5-5\"\neffort = \"high\""), "{written}");
+        assert!(!written.contains("claude_model") && !written.contains("claude_effort") && !written.contains("old_key"), "{written}");
+        assert_eq!(Config::from_text(&written).unwrap().brains, Brains::default());
+    }
+
+    #[test]
+    fn the_older_keys_are_kept_until_the_brains_table_says_otherwise() {
+        let old = OLD.replace("claude_args = []", "claude_model = \"sonnet\"\nclaude_effort = \"medium\"\nclaude_args = []");
+        let cfg = Config::from_text(&old).unwrap();
+        assert_eq!((cfg.brains.model.as_str(), cfg.brains.effort.as_str()), ("sonnet", "medium"), "what the file says is kept");
+        assert!(cfg.brains.model_from_old_key && cfg.brains.effort_from_old_key);
+        // The picker's choice wins, key by key.
+        let picked = with_table_key(&old, "brains", "model", "\"claude-fable-5-2\"");
+        let cfg = Config::from_text(&picked).unwrap();
+        assert_eq!((cfg.brains.model.as_str(), cfg.brains.effort.as_str()), ("claude-fable-5-2", "medium"));
+        assert!(!cfg.brains.model_from_old_key && cfg.brains.effort_from_old_key);
+        // An empty value says nothing.
+        let empty = OLD.replace("claude_args = []", "claude_model = \"\"\nclaude_args = []") + "\n[brains]\nmodel = \" \"\n";
+        let cfg = Config::from_text(&empty).unwrap();
+        assert_eq!((cfg.brains.model.as_str(), cfg.brains.model_from_old_key), ("claude-opus-5-5", false));
+    }
+
+    #[test]
+    fn a_key_is_set_in_its_table_and_the_rest_of_the_file_stays() {
+        // No table yet: added at the end, after everything else.
+        let a = with_table_key(OLD, "brains", "model", "\"claude-sonnet-5-5\"");
+        assert!(a.starts_with(OLD.trim_end()), "{a}");
+        assert!(a.ends_with("\n[brains]\nmodel = \"claude-sonnet-5-5\"\n"), "{a}");
+        // A second key joins the table; the first is changed in its place.
+        let b = with_table_key(&a, "brains", "effort", "\"xhigh\"");
+        assert!(b.ends_with("\n[brains]\nmodel = \"claude-sonnet-5-5\"\neffort = \"xhigh\"\n"), "{b}");
+        let c = with_table_key(&b, "brains", "model", "\"claude-haiku-5-5\"");
+        assert!(c.ends_with("\n[brains]\nmodel = \"claude-haiku-5-5\"\neffort = \"xhigh\"\n"), "{c}");
+        let d = with_table_key(&c, "brains", "per_space", "false");
+        let cfg = Config::from_text(&d).unwrap();
+        assert_eq!((cfg.brains.model.as_str(), cfg.brains.effort.as_str(), cfg.brains.per_space), ("claude-haiku-5-5", "xhigh", false));
+        // Nothing else was lost: the comment, the other tables, the setups.
+        assert!(d.contains("# herder-tower settings.") && d.contains("blocked = true # say so"));
+        assert_eq!((cfg.voice.as_str(), cfg.brain.as_str(), cfg.vad.ratio, cfg.setups.len(), cfg.setups[0].name.as_str()), ("af_bella", "claude", 3.0, 1, "web"));
+        // A table in the middle of the file: the key lands in it, not in the next one.
+        let mid = "[brains]\nper_space = false\n\n# the phone\n[lan]\nenabled = true\n";
+        let e = with_table_key(mid, "brains", "model", "\"x\"");
+        assert_eq!(e, "[brains]\nper_space = false\nmodel = \"x\"\n\n# the phone\n[lan]\nenabled = true\n");
+        // A key of the same name in another table, or commented out, is left alone.
+        let other = "[tell]\nlevel = \"results\"\n\n[brains] # the towers\n# model = \"old\"\neffort = \"low\"\n";
+        let f = with_table_key(other, "brains", "model", "\"y\"");
+        assert_eq!(f, "[tell]\nlevel = \"results\"\n\n[brains] # the towers\n# model = \"old\"\neffort = \"low\"\nmodel = \"y\"\n");
+        assert_eq!(with_table_key("", "brains", "per_space", "true"), "[brains]\nper_space = true\n");
     }
 }

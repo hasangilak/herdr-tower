@@ -137,6 +137,24 @@ It needs the user as a blocked session does:
   out of focus, as "In <space>: …". When the brain watches that session, the
   watch's report says it instead (`[watch] … It is waiting for the user to
   act: "…"`), marked blocked, and the job is blocked rather than done.
+  (At the quiet levels of `tower tell` the tower says it itself either way,
+  once per decision: see "Decisions" below.)
+
+Idle is not blocked: a turn that ends saying only that the session is
+ready ("I'm waiting for your instructions", "I have no task yet":
+`questions::ready_only`), from a session nothing was asked of (no
+instruction queued for it, no agenda task it is on, or one that itself told
+it to wait for instructions), makes no card, no alert and no decision.
+
+## Decisions
+
+A set that is the user's (`decision: escalate`, a wait card too) is a
+**decision** (`src/decisions.rs`, docs/quiet-tower.md step 3): one per
+space and what is asked. The same thing asked by another session of the
+space joins that decision (`waiting` counts them) instead of making a
+second one; each session keeps its own set here. The decision's options are
+the recommendations (the first is the pick), and `tower answer <decision
+id> --choice <n>` answers every set in it. It closes with its sets.
 
 ## Recommendations
 
@@ -268,7 +286,9 @@ itself).
 ## Notices
 
 Questions go through the brain: the user hears only escalated ones, in one
-sentence with the tower's pick. Other blocked sessions (and dialogs the tower
+sentence with the tower's pick, once per decision: at `tower tell
+decisions|results` the same thing asked by another session of the space
+says nothing (at `everything` each set is said, as before). Other blocked sessions (and dialogs the tower
 can't read) get the notice from herdr-core's status line, in a sentence: "The orb session asks: Which
 database should the app use?", "… asks to run touch /tmp/x", "… has a plan
 ready for you to approve", "… asks to edit login.rs"; just "… needs you"

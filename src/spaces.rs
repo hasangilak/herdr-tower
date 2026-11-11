@@ -22,7 +22,13 @@
 //! anyway (it is asked for), and its held news is on the radar line.
 //!
 //! `spaces.json` (beside `state.json`, which the orb watches) keeps the
-//! focus, each space's agenda, and how far its held news has been read.
+//! focus, each space's agenda (its goal), how far its held news has been
+//! read, which spaces the user follows (their finished requests' receipts
+//! reach the user whatever the tell level is: see `tell`), which are muted
+//! (their decisions stay out of the main queue and the orb's count: see
+//! `decisions`), and each space as a mission with an end (`missions`: what
+//! counts as done, whether it is open, quiet, ready to close or closed, its
+//! closing report, the worktrees the tower made for it: see `crate::missions`).
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -50,6 +56,58 @@ pub struct Spaces {
     pub read_ms: BTreeMap<String, u64>,
     /// Passed over in a catch-up at this time; it comes round again with newer news.
     pub skipped_ms: BTreeMap<String, u64>,
+    /// Spaces the user follows (`tower space follow`): their results reach
+    /// the user as they land.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub follow: std::collections::BTreeSet<String>,
+    /// Spaces the user muted (`tower space mute`): what needs them there
+    /// stays in that space's own view, off the orb's count and out of the
+    /// main queue, and isn't said.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub mute: std::collections::BTreeSet<String>,
+    /// Each space as a mission (see `crate::missions`), by its name. Its
+    /// goal is its agenda above.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub missions: BTreeMap<String, crate::missions::Mission>,
+}
+
+/// Whether `space` is muted, by its name (any case).
+pub fn muted_in(s: &Spaces, space: &str) -> bool {
+    let want = space.trim();
+    !want.is_empty() && s.mute.iter().any(|m| m.eq_ignore_ascii_case(want))
+}
+
+/// Mutes a space, or lets it be heard again. True when that changed something.
+pub fn set_mute(s: &mut Spaces, space: &str, on: bool) -> bool {
+    let was = muted_in(s, space);
+    if on && !was {
+        s.mute.insert(space.trim().to_string());
+    } else if !on && was {
+        s.mute.retain(|m| !m.eq_ignore_ascii_case(space.trim()));
+    }
+    was != on
+}
+
+/// Whether `space` is followed, by its name (any case).
+pub fn followed_in(s: &Spaces, space: &str) -> bool {
+    let want = space.trim();
+    !want.is_empty() && s.follow.iter().any(|f| f.eq_ignore_ascii_case(want))
+}
+
+/// Whether the user follows `space` now.
+pub fn followed(space: &str) -> bool {
+    followed_in(&load(), space)
+}
+
+/// Follows a space, or stops. True when that changed something.
+pub fn set_follow(s: &mut Spaces, space: &str, on: bool) -> bool {
+    let was = followed_in(s, space);
+    if on && !was {
+        s.follow.insert(space.trim().to_string());
+    } else if !on && was {
+        s.follow.retain(|f| !f.eq_ignore_ascii_case(space.trim()));
+    }
+    was != on
 }
 
 pub fn path_in(ui_dir: &Path) -> PathBuf {
@@ -73,8 +131,40 @@ pub fn save_to(ui_dir: &Path, s: &Spaces) {
     }
 }
 
-pub fn save(s: &Spaces) {
-    save_to(&config::ui_dir(), s)
+/// Reads `spaces.json`, changes it and writes it back when it changed, one
+/// writer at a time (the voice's look at the missions and a `tower space`
+/// command never undo each other).
+pub fn update_in<R>(ui_dir: &Path, f: impl FnOnce(&mut Spaces) -> R) -> R {
+    use std::os::fd::AsRawFd;
+    let dir = ui_dir.parent().unwrap_or(ui_dir);
+    let _ = std::fs::create_dir_all(dir);
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(".spaces.lock")).ok();
+    if let Some(l) = &lock {
+        // SAFETY: flock on a file we hold open; released when it closes.
+        unsafe { libc::flock(l.as_raw_fd(), libc::LOCK_EX) };
+    }
+    // A file that is there and doesn't read (a hand edit, a word a later tower wrote) is about to
+    // be written over with what this one knows: its goals, kept spaces and worktrees are kept aside first.
+    let text = std::fs::read_to_string(path_in(ui_dir)).ok();
+    let unreadable = text.as_deref().filter(|t| !t.trim().is_empty() && serde_json::from_str::<Spaces>(t).is_err());
+    let mut s = load_from(ui_dir);
+    let before = s.clone();
+    let r = f(&mut s);
+    if s != before {
+        if let Some(text) = unreadable {
+            let aside = dir.join(format!("spaces.bad-{}.json", history::now_ms()));
+            match std::fs::write(&aside, text) {
+                Ok(()) => eprintln!("[spaces] {} doesn't read; kept as {} before it is written again", path_in(ui_dir).display(), aside.display()),
+                Err(e) => eprintln!("[spaces] {} doesn't read, and couldn't be kept aside ({e})", path_in(ui_dir).display()),
+            }
+        }
+        save_to(ui_dir, &s);
+    }
+    r
+}
+
+pub fn update<R>(f: impl FnOnce(&mut Spaces) -> R) -> R {
+    update_in(&config::ui_dir(), f)
 }
 
 /// The focus as it stands at `now`: none once `hours` have passed since it
@@ -90,19 +180,25 @@ pub fn active_focus(s: &Spaces, now_ms: u64, hours: u64) -> Option<&str> {
 /// The focus now, for the daemon: a focus past its hours is cleared (and
 /// said in the log); one an older tower set without a time is dated now.
 pub fn focus_now(hours: u64) -> Option<String> {
-    let mut s = load();
+    let s = load();
     let f = s.focus.clone()?;
     let now = history::now_ms();
+    // (Each change under the file's lock: the missions are kept in the same file.)
     if s.focus_ms.is_none() {
-        s.focus_ms = Some(now);
-        save(&s);
+        update(|s| {
+            if s.focus.is_some() && s.focus_ms.is_none() {
+                s.focus_ms = Some(now);
+            }
+        });
         return Some(f);
     }
     if active_focus(&s, now, hours).is_none() {
         eprintln!("[spaces] the focus on {f} ended after {hours} h: every space's news is spoken again");
-        s.focus = None;
-        s.focus_ms = None;
-        save(&s);
+        update(|s| {
+            if s.focus.as_deref() == Some(f.as_str()) {
+                (s.focus, s.focus_ms) = (None, None);
+            }
+        });
         return None;
     }
     Some(f)
@@ -312,6 +408,45 @@ pub fn resolve(want: &str, known: &[String]) -> Option<String> {
     by(&|k| k == w).or_else(|| by(&|k| k.starts_with(&w))).or_else(|| by(&|k| k.contains(&w)))
 }
 
+/// The space of exactly that name (any case). Of two that differ only in
+/// case it is the one spelled just so, else neither.
+pub fn exactly(want: &str, known: &[String]) -> Option<String> {
+    let w = want.trim();
+    if w.is_empty() {
+        return None;
+    }
+    if let Some(k) = known.iter().find(|k| k.trim() == w) {
+        return Some(k.clone());
+    }
+    let mut same = known.iter().filter(|k| k.trim().eq_ignore_ascii_case(w));
+    let first = same.next()?;
+    same.all(|k| k == first).then(|| first.clone())
+}
+
+/// A space by what someone called it, for what can't be taken back
+/// (closing it): its whole name, else the only one the words are a part
+/// of. Several that fit are named (`Err`), never chosen between; none is an
+/// empty `Err`.
+pub fn resolve_only(want: &str, known: &[String]) -> std::result::Result<String, Vec<String>> {
+    if let Some(k) = exactly(want, known) {
+        return Ok(k);
+    }
+    let w = want.trim().to_lowercase();
+    if w.is_empty() {
+        return Err(vec![]);
+    }
+    let mut hits: Vec<String> = vec![];
+    for k in known.iter().filter(|k| k.to_lowercase().contains(&w)) {
+        if !hits.contains(k) {
+            hits.push(k.clone());
+        }
+    }
+    match hits.len() {
+        1 => Ok(hits.remove(0)),
+        _ => Err(hits),
+    }
+}
+
 /// A space in Herdr's window, for placing a new session in it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Window {
@@ -326,7 +461,7 @@ pub struct Window {
 
 /// Herdr's spaces with their ids, from `herdr-app ls` (empty when Herdr isn't open).
 pub fn windows() -> Vec<Window> {
-    let Ok(out) = std::process::Command::new("herdr-app").arg("ls").stdin(std::process::Stdio::null()).output() else { return vec![] };
+    let Ok(out) = std::process::Command::new(config::herdr_app_bin()).arg("ls").stdin(std::process::Stdio::null()).output() else { return vec![] };
     let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
     windows_from(&v)
 }
@@ -421,7 +556,7 @@ pub struct Live {
 
 /// Herdr's spaces, from `herdr-app ls` (empty when Herdr isn't open).
 pub fn live() -> Vec<Live> {
-    let Ok(out) = std::process::Command::new("herdr-app").arg("ls").stdin(std::process::Stdio::null()).output() else { return vec![] };
+    let Ok(out) = std::process::Command::new(config::herdr_app_bin()).arg("ls").stdin(std::process::Stdio::null()).output() else { return vec![] };
     let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
     v["spaces"]
         .as_array()
@@ -450,10 +585,63 @@ pub fn live() -> Vec<Live> {
         .unwrap_or_default()
 }
 
+/// A terminal in a space, as Herdr's window has it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Term {
+    pub address: String,
+    pub name: String,
+    /// `idle`, `working`, ... ("" for a plain program).
+    pub status: String,
+    /// `claude-code`, `codex`, or "" for a plain program.
+    pub app: String,
+}
+
+/// A space of Herdr's window with every terminal in it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tree {
+    pub window: Window,
+    pub terminals: Vec<Term>,
+}
+
+/// Herdr's spaces with their terminals, from `herdr-app ls` (empty when Herdr isn't open).
+pub fn tree() -> Vec<Tree> {
+    let Ok(out) = std::process::Command::new(config::herdr_app_bin()).arg("ls").stdin(std::process::Stdio::null()).output() else { return vec![] };
+    tree_from(&serde_json::from_slice(&out.stdout).unwrap_or_default())
+}
+
+pub fn tree_from(v: &Value) -> Vec<Tree> {
+    let windows = windows_from(v);
+    v["spaces"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            let window = windows.iter().find(|w| Some(w.id.as_str()) == s["id"].as_str())?.clone();
+            let terminals = s["tabs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|tab| tab["terminals"].as_array().cloned().unwrap_or_default())
+                .filter_map(|t| {
+                    let raw = t["terminal"].as_str().filter(|a| !a.is_empty())?;
+                    // A space on another machine names its terminals as that machine does.
+                    let address = match &window.machine {
+                        Some(m) if !raw.contains('/') => format!("{m}/{raw}"),
+                        _ => raw.to_string(),
+                    };
+                    let word = |k: &str| t[k].as_str().unwrap_or("").to_string();
+                    Some(Term { address, name: word("name"), status: word("status"), app: word("app") })
+                })
+                .collect();
+            Some(Tree { window, terminals })
+        })
+        .collect()
+}
+
 /// Every space the tower knows: Herdr's, and those in the history or with an agenda.
 pub fn known(live: &[Live], entries: &[Entry], s: &Spaces) -> Vec<String> {
     let mut names: Vec<String> = live.iter().map(|l| l.name.clone()).collect();
-    for n in entries.iter().filter_map(|e| e.space.clone()).chain(s.agendas.keys().cloned()) {
+    for n in entries.iter().filter_map(|e| e.space.clone()).chain(s.agendas.keys().cloned()).chain(s.missions.keys().cloned()) {
         if !names.contains(&n) {
             names.push(n);
         }
@@ -461,7 +649,8 @@ pub fn known(live: &[Live], entries: &[Entry], s: &Spaces) -> Vec<String> {
     names
 }
 
-fn pick(want: &str) -> Result<String> {
+/// The space `want` means, among every space the tower knows.
+pub fn pick(want: &str) -> Result<String> {
     let names = known(&live(), &history::load(), &load());
     match resolve(want, &names) {
         Some(n) => Ok(n),
@@ -472,11 +661,9 @@ fn pick(want: &str) -> Result<String> {
 // ---- `tower focus`, `tower space agenda`, `tower spaces`, `tower digest` ----
 
 pub fn cmd_focus(space: Option<String>, clear: bool) -> Result<()> {
-    let mut s = load();
+    let s = load();
     if clear {
-        s.focus = None;
-        s.focus_ms = None;
-        save(&s);
+        update(|s| (s.focus, s.focus_ms) = (None, None));
         println!("No focus: news from every space is spoken.");
         return Ok(());
     }
@@ -488,9 +675,10 @@ pub fn cmd_focus(space: Option<String>, clear: bool) -> Result<()> {
         return Ok(());
     };
     let name = pick(&want)?;
-    s.focus = Some(name.clone());
-    s.focus_ms = Some(history::now_ms());
-    save(&s);
+    let s = update(|s| {
+        (s.focus, s.focus_ms) = (Some(name.clone()), Some(history::now_ms()));
+        s.clone()
+    });
     let held: usize = unread(&history::load(), &s).iter().filter(|(k, _)| **k != name).map(|(_, v)| v.len()).sum();
     println!(
         "Focused on {name}: its news is spoken, other spaces' is held{}.",
@@ -499,39 +687,60 @@ pub fn cmd_focus(space: Option<String>, clear: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_agenda(space: String, text: String) -> Result<()> {
+/// `tower space follow|unfollow <space>`.
+pub fn cmd_follow(space: String, on: bool) -> Result<()> {
     let name = pick(&space)?;
-    let mut s = load();
-    if text.trim().is_empty() {
-        s.agendas.remove(&name);
-        println!("{name}: agenda cleared.");
+    // One writer at a time: the daemon keeps the missions in the same file.
+    update(|s| set_follow(s, &name, on));
+    // The missions in the state say so at once (the daemon looks again by itself otherwise).
+    crate::missions::poke();
+    if on {
+        println!("Following {name}: when a request there is finished, its receipt is shown and said.");
     } else {
-        s.agendas.insert(name.clone(), text.trim().to_string());
-        println!("{name}: {}", text.trim());
+        println!("Not following {name}: its results are kept in the record (unless the tower tells results: tower tell).");
     }
-    save(&s);
+    Ok(())
+}
+
+/// `tower space mute|unmute <space>`.
+pub fn cmd_mute(space: String, on: bool) -> Result<()> {
+    let name = pick(&space)?;
+    // One writer at a time: the daemon keeps the missions in the same file.
+    update(|s| set_mute(s, &name, on));
+    // The daemon's queue and count follow at once (it looks again by itself
+    // otherwise), and so do the missions in the state.
+    if crate::protocol::is_running() {
+        let _ = crate::protocol::send(&crate::protocol::Request::Decisions { space: None, all: false });
+    }
+    crate::missions::poke();
+    if on {
+        println!("Muted {name}: what needs you there stays in its own view (`tower decisions --space \"{name}\"`), off the orb's count, and isn't said.");
+    } else {
+        println!("Unmuted {name}: what needs you there is in the queue and on the orb's count again.");
+    }
     Ok(())
 }
 
 /// Every space, as `tower spaces` prints it when piped (and the phone API serves it).
 pub fn spaces_value() -> Value {
-    let (focus, rows) = rows();
+    let (focus, rows) = rows(false);
     json!({ "focus": focus, "spaces": rows })
 }
 
 /// Focuses a space (None: no focus). Returns the focused space's full name.
 pub fn set_focus(space: Option<&str>) -> Result<Option<String>> {
-    let mut s = load();
-    s.focus = match space.map(str::trim).filter(|w| !w.is_empty()) {
+    let focus = match space.map(str::trim).filter(|w| !w.is_empty()) {
         Some(want) => Some(pick(want)?),
         None => None,
     };
-    s.focus_ms = s.focus.is_some().then(history::now_ms);
-    save(&s);
-    Ok(s.focus)
+    update(|s| {
+        s.focus = focus.clone();
+        s.focus_ms = s.focus.is_some().then(history::now_ms);
+    });
+    Ok(focus)
 }
 
-fn rows() -> (Option<String>, Vec<Value>) {
+fn rows(all: bool) -> (Option<String>, Vec<Value>) {
     focus_now(config::Config::load().map(|c| c.alerts.focus_hours).unwrap_or(8));
     let s = load();
     let entries = history::load();
@@ -541,14 +750,29 @@ fn rows() -> (Option<String>, Vec<Value>) {
     let names = known(&live, &entries, &s);
     let rows: Vec<Value> = names
         .iter()
+        // A space quiet for a day, or closed, is out of the listing unless asked for.
+        .filter(|n| all || !s.missions.get(*n).is_some_and(|m| m.archived_ms.is_some()))
         .map(|n| {
             let sessions = live.iter().find(|l| &l.name == n).map(|l| l.sessions.clone()).unwrap_or_default();
             let running = jobs.iter().filter(|j| &j.space == n && j.open()).count();
             let last = entries.iter().rev().find(|e| e.space.as_ref() == Some(n)).map(|e| e.at).unwrap_or(0);
+            let m = s.missions.get(n).cloned().unwrap_or_default();
             json!({
                 "space": n,
                 "focus": s.focus.as_ref() == Some(n),
+                "follow": followed_in(&s, n),
+                "mute": muted_in(&s, n),
+                // The space's goal, under both names.
                 "agenda": s.agendas.get(n),
+                "goal": s.agendas.get(n),
+                "done_when": Some(&m.done_when).filter(|d| !d.is_empty()),
+                "standing": m.standing,
+                "state": m.state.word(),
+                "report": Some(&m.report).filter(|r| !r.is_empty()),
+                "quiet_since_ms": m.quiet_since_ms,
+                "ready_since_ms": m.ready_since_ms,
+                "closed_ms": m.closed_ms,
+                "archived": m.archived_ms.is_some(),
                 "unread": unread.get(n).map(|v| v.len()).unwrap_or(0),
                 // Of those: reports on work the user asked for, and someone needing them.
                 "unread_asked": unread.get(n).map(|v| Held::of(n, v).asked).unwrap_or(0),
@@ -565,18 +789,21 @@ fn rows() -> (Option<String>, Vec<Value>) {
     (s.focus, rows)
 }
 
-pub fn cmd_spaces() -> Result<()> {
-    let (focus, rows) = rows();
+/// `tower spaces [--all]`.
+pub fn cmd_spaces(all: bool) -> Result<()> {
+    let (focus, rows) = rows(all);
     if std::io::stdout().is_terminal() {
         for r in &rows {
             let busy = r["sessions"].as_array().map(|a| a.iter().filter(|t| t["status"] == "working").count()).unwrap_or(0);
             println!(
-                "{} {:<20} {:>2} unread  {} working  {}",
+                "{} {:<20} {:<8} {:>2} unread  {} working  {}{}",
                 if r["focus"] == true { "◉" } else { " " },
                 r["space"].as_str().unwrap_or(""),
+                if r["archived"] == true && r["state"] != "closed" { "archived" } else { r["state"].as_str().unwrap_or("") },
                 r["unread"],
                 busy,
-                r["agenda"].as_str().unwrap_or("")
+                r["goal"].as_str().unwrap_or(""),
+                if r["standing"] == true { "  (standing)" } else { "" }
             );
         }
         if focus.is_none() {
@@ -635,7 +862,7 @@ fn agenda_tail(space: Option<&str>) {
 /// what is delivered is marked read. `--list` only says which spaces have
 /// news; `--skip` passes over the next one (or `--space`).
 pub fn cmd_digest(list: bool, skip: bool, space: Option<String>, peek: bool) -> Result<()> {
-    let mut s = load();
+    let s = load();
     let entries = history::load();
     let unread = unread(&entries, &s);
     let order = digest_order(&unread, &s);
@@ -673,16 +900,14 @@ pub fn cmd_digest(list: bool, skip: bool, space: Option<String>, peek: bool) -> 
     let items = unread.get(&target).cloned().unwrap_or_default();
     if skip {
         let latest = items.iter().map(|e| e.at).max().unwrap_or_else(history::now_ms);
-        s.skipped_ms.insert(target.clone(), latest);
-        save(&s);
+        update(|s| s.skipped_ms.insert(target.clone(), latest));
         println!("Skipped {target} for now (still unread).");
     } else {
         print!("{}", digest_text(&target, &items, &s));
         agenda_tail(Some(&target));
         if !peek {
             let latest = items.iter().map(|e| e.at).max().unwrap_or_else(history::now_ms);
-            s.read_ms.insert(target.clone(), latest);
-            save(&s);
+            update(|s| s.read_ms.insert(target.clone(), latest));
         }
     }
     let after = digest_order(&unread, &s);
@@ -735,6 +960,27 @@ fn picks_a_space_by_part_of_its_name() {
     assert!(e.contains("no space matches") && e.contains("\"M5 Pro\""), "{e}");
     assert!(pick_window("x", &[]).unwrap_err().to_string().contains("isn't open"));
     assert!(pick_window(" ", &l).is_err());
+}
+
+#[test]
+fn a_spaces_terminals_come_with_it() {
+    let v = json!({ "spaces": [
+        { "id": "sp1", "name": "Shop", "folder": "/w/shop", "machine": null, "active": true, "tabs": [
+            { "id": "tab1", "name": "web", "terminals": [{ "terminal": "t3", "pane": "p3", "status": "working", "app": "claude-code", "name": "shop-web", "sub_agents": [] }] },
+            { "id": "tab2", "name": "sh", "terminals": [{ "terminal": "t4", "pane": "p4", "status": null, "app": null, "name": null }, { "terminal": "", "pane": "p5" }] },
+        ] },
+        { "id": "sp2", "name": "Far", "folder": "/srv", "machine": "vps", "active": false, "tabs": [
+            { "id": "tab3", "name": "api", "terminals": [{ "terminal": "t2", "status": "idle", "app": "codex", "name": "api" }, { "terminal": "vps/t9", "status": "idle", "app": "claude-code", "name": "x" }] },
+        ] },
+        { "id": "sp3", "name": "Empty", "tabs": [] },
+    ]});
+    let t = tree_from(&v);
+    assert_eq!(t.iter().map(|x| (x.window.name.as_str(), x.terminals.len())).collect::<Vec<_>>(), [("Shop", 2), ("Far", 2), ("Empty", 0)]);
+    assert_eq!(t[0].terminals[0], Term { address: "t3".into(), name: "shop-web".into(), status: "working".into(), app: "claude-code".into() });
+    assert_eq!(t[0].terminals[1], Term { address: "t4".into(), ..Default::default() }, "a plain program: no status, no app");
+    // A space on another machine names its terminals as that machine does.
+    assert_eq!(t[1].terminals.iter().map(|x| x.address.as_str()).collect::<Vec<_>>(), ["vps/t2", "vps/t9"]);
+    assert!(tree_from(&json!({})).is_empty());
 }
 
 /// "Open … in a new space called sandbox": `tower start --space` makes it,
@@ -861,6 +1107,54 @@ fn starting_in_a_space_never_stops_to_ask() {
     }
 
     #[test]
+    fn a_followed_space_is_kept_with_the_spaces() {
+        let dir = std::env::temp_dir().join(format!("tower-spaces-follow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ui = dir.join("ui");
+        let mut s = load_from(&ui);
+        assert!(!followed_in(&s, "B2C support"), "nothing is followed until the user says so");
+        assert!(set_follow(&mut s, "B2C support", true));
+        assert!(!set_follow(&mut s, "b2c SUPPORT", true), "already");
+        save_to(&ui, &s);
+        let back = load_from(&ui);
+        assert!(followed_in(&back, "b2c support") && !followed_in(&back, "B2B ticketing") && !followed_in(&back, ""));
+        // A receipt from there reaches the user at `decisions`; one from elsewhere is kept.
+        use crate::tell::{Level, receipt_told};
+        assert!(receipt_told(Level::Decisions, true, followed_in(&back, "B2C support")));
+        assert!(!receipt_told(Level::Decisions, true, followed_in(&back, "B2B ticketing")));
+        assert!(receipt_told(Level::Results, true, followed_in(&back, "B2B ticketing")), "every space's, at results");
+        let mut s = back;
+        assert!(set_follow(&mut s, "b2c support", false));
+        assert!(!followed_in(&s, "B2C support"));
+        // A spaces file from before this has none, and one without any doesn't mention it.
+        let old: Spaces = serde_json::from_str(r#"{"focus":"A","agendas":{"A":"x"}}"#).unwrap();
+        assert!(old.follow.is_empty());
+        assert!(!serde_json::to_string(&s).unwrap().contains("follow"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_muted_space_is_kept_with_the_spaces() {
+        let dir = std::env::temp_dir().join(format!("tower-spaces-mute-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ui = dir.join("ui");
+        let mut s = load_from(&ui);
+        assert!(!muted_in(&s, "Docs"), "nothing is muted until the user says so");
+        assert!(set_mute(&mut s, "Docs", true) && !set_mute(&mut s, "docs ", true), "once");
+        // Muting and following are each their own.
+        assert!(set_follow(&mut s, "Docs", true));
+        save_to(&ui, &s);
+        let back = load_from(&ui);
+        assert!(muted_in(&back, "DOCS") && followed_in(&back, "Docs") && !muted_in(&back, "Shop") && !muted_in(&back, ""));
+        let mut s = back;
+        assert!(set_mute(&mut s, "docs", false) && !muted_in(&s, "Docs") && followed_in(&s, "Docs"));
+        // A spaces file from before this has none, and one without any doesn't mention it.
+        let old: Spaces = serde_json::from_str(r#"{"focus":"A","follow":["A"]}"#).unwrap();
+        assert!(old.mute.is_empty() && !serde_json::to_string(&s).unwrap().contains("mute"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn digest_goes_by_urgency_then_recency_and_skips_wait() {
         let entries = vec![
             e(10, "Done space", Some("done"), true),
@@ -887,6 +1181,47 @@ fn starting_in_a_space_never_stops_to_ask() {
         assert_eq!(resolve("B2B Ticketing", &known).as_deref(), Some("B2B ticketing"));
         assert_eq!(resolve("support", &known).as_deref(), Some("B2C support"));
         assert_eq!(resolve("nothing", &known), None);
+    }
+
+    #[test]
+    fn a_file_that_doesnt_read_is_kept_aside_before_it_is_written_over() {
+        let dir = std::env::temp_dir().join(format!("tower-spaces-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ui = dir.join("ui");
+        std::fs::create_dir_all(&ui).unwrap();
+        // A state word this tower doesn't know (a hand edit, a later tower): the whole file doesn't read.
+        let old = r#"{"agendas": {"Shop": "Ship the checkout"}, "missions": {"Shop": {"standing": true, "state": "paused", "born_ms": 1}}}"#;
+        std::fs::write(path_in(&ui), old).unwrap();
+        assert!(load_from(&ui).missions.is_empty());
+        update_in(&ui, |s| s.focus = Some("Docs".into()));
+        assert_eq!(load_from(&ui).focus.as_deref(), Some("Docs"));
+        let aside: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("spaces.bad-")).collect();
+        assert_eq!(aside.len(), 1, "what it held isn't lost");
+        assert_eq!(std::fs::read_to_string(aside[0].path()).unwrap(), old);
+        // A file that reads is written as ever, with nothing put aside.
+        update_in(&ui, |s| s.focus = None);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("spaces.bad-")).count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_cant_be_taken_back_never_guesses_between_spaces() {
+        let known: Vec<String> = ["Work A", "Work B", "shop-2", "Workshop", "M5 Pro", "M5 Pro"].map(String::from).to_vec();
+        // A whole name, in any case; a part that fits one space only.
+        assert_eq!(resolve_only("work a", &known), Ok("Work A".to_string()));
+        assert_eq!(resolve_only("m5", &known), Ok("M5 Pro".to_string()), "the same name twice is one space");
+        assert_eq!(resolve_only("shop-", &known), Ok("shop-2".to_string()));
+        // A part that fits several: they are named, and none is taken (`resolve` takes the first).
+        assert_eq!(resolve("work", &known).as_deref(), Some("Work A"));
+        assert_eq!(resolve_only("work", &known), Err(vec!["Work A".to_string(), "Work B".to_string(), "Workshop".to_string()]));
+        assert_eq!(resolve_only("shop", &known), Err(vec!["shop-2".to_string(), "Workshop".to_string()]));
+        assert_eq!(resolve_only("nothing", &known), Err(vec![]));
+        assert_eq!(resolve_only(" ", &known), Err(vec![]));
+        // Two that differ only in case: the one spelled just so, else neither.
+        let twins: Vec<String> = ["Shop", "shop"].map(String::from).to_vec();
+        assert_eq!((exactly("shop", &twins), exactly("Shop", &twins), exactly("SHOP", &twins)), (Some("shop".to_string()), Some("Shop".to_string()), None));
+        assert_eq!(resolve_only("SHOP", &twins), Err(twins.clone()));
+        assert_eq!(exactly("sho", &twins), None);
     }
 
     #[test]

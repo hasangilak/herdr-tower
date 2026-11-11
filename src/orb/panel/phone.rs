@@ -1,7 +1,9 @@
-//! The panel's Phone view: the phone API for the Android app (on or off,
-//! every address it listens on, and Tailscale: running or stopped), pairing a phone with a QR code of the one-time link,
-//! and the paired phones, each revocable. Everything goes through
-//! `crate::phone`, as `tower phone` does. The code is never logged.
+//! The phone, from Settings in the full window (W19 in the design): the
+//! phone API for the Android app (on or off, every address it listens on,
+//! and Tailscale: running or stopped), pairing a phone with a QR code of the
+//! one-time link, and the paired phones, each with where its replies are
+//! heard, each revocable. Everything goes through `crate::phone`, as `tower
+//! phone` does. The code is never logged.
 
 use std::time::{Duration, Instant};
 
@@ -114,9 +116,16 @@ pub(super) fn pairing_outcome(before: &[String], status: &Status) -> Option<Resu
 }
 
 impl PhoneView {
-    /// Something went wrong in Settings: said under the phone's status.
-    pub(super) fn note_error(&mut self, e: String) {
-        self.note = Some((false, e));
+    /// How the phone API stands, in a sentence, once it is known (for
+    /// Settings' own card).
+    pub(super) fn summary(&self) -> Option<String> {
+        let st = self.status.as_ref()?;
+        let phones = match st.devices.len() {
+            0 => "no phone is paired".to_string(),
+            1 => "1 phone is paired".to_string(),
+            n => format!("{n} phones are paired"),
+        };
+        Some(if st.url.is_some() { format!("It is on, and {phones}.") } else { format!("It is off, and {phones}.") })
     }
 }
 
@@ -258,63 +267,14 @@ impl Panel {
         .detach();
     }
 
-    /// Settings: where the tower's voice plays.
-    fn voice_items(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let g = glass();
-        let on = self.tower.read(cx).voice_on_mac();
-        let about = if on {
-            "Everything the tower says plays here, even while a phone is the voice or asked it something."
-        } else {
-            "Off: a phone that is the voice plays it, and a phone hears its own replies. This Mac otherwise."
-        };
-        // A switch: the track, and its knob at the end that is on.
-        let switch = div()
-            .flex_none()
-            .w(px(38.0))
-            .h(px(22.0))
-            .p(px(2.0))
-            .flex()
-            .items_center()
-            .rounded_full()
-            .when(on, |el| el.bg(rgb(super::NAVY)).justify_end())
-            .when(!on, |el| el.bg(rgba(0xffffff26)).justify_start())
-            .child(div().size(px(18.0)).rounded_full().bg(if on { rgb(super::PALE) } else { rgb(0xffffff) }));
-        vec![
-            div().pt_2().text_xs().font_weight(FontWeight::MEDIUM).text_color(g.faint).child("VOICE").into_any_element(),
-            h_flex()
-                .id("voice-on-mac")
-                .gap_3()
-                .items_center()
-                .px_3()
-                .py_2()
-                .rounded(px(14.0))
-                .cursor_pointer()
-                .when(on, |el| el.bg(rgb(super::PALE)).text_color(rgb(super::NAVY)))
-                .when(!on, |el| el.bg(g.bubble_tower).hover(|s| s.bg(rgba(0xffffff33))))
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .gap(px(2.0))
-                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Play voice on this Mac"))
-                        .child(div().text_xs().opacity(0.8).child(about)),
-                )
-                .child(switch)
-                .on_click(cx.listener(|_, _, _, cx| crate::orb::toggle_mac_voice(cx)))
-                .into_any_element(),
-        ]
-    }
-
-    pub(super) fn phone_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// The view's body: the phone API, pairing, the paired phones.
+    pub(super) fn phone_view(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let g = glass();
         let section = |t: &str| div().pt_2().text_xs().font_weight(FontWeight::MEDIUM).text_color(g.faint).child(t.to_uppercase());
-        // Settings: how questions are handled, then the phone app.
-        let mut items: Vec<AnyElement> = vec![self.behaviors_entry(cx)];
-        items.extend(self.policy_items(cx));
-        items.extend(self.voice_items(cx));
+        let mut items: Vec<AnyElement> = vec![];
         let busy = self.phone.busy;
         let Some(st) = self.phone.status.clone() else {
-            items.push(div().pt_4().text_sm().text_color(g.muted).child("Looking…").into_any_element());
+            items.push(div().text_sm().text_color(g.muted).child("Looking…").into_any_element());
             return body(items);
         };
         let on = st.url.is_some();
@@ -570,14 +530,8 @@ pub(super) fn glyph(color: gpui::Hsla) -> gpui::Div {
         .child(div().w(px(3.5)).h(px(1.5)).rounded_full().bg(color))
 }
 
-fn body(items: Vec<AnyElement>) -> AnyElement {
-    div()
-        .id("phone")
-        .flex_1()
-        .min_h_0()
-        .overflow_y_scroll()
-        .child(v_flex().w_full().px_5().pb_4().gap_2().children(items))
-        .into_any_element()
+fn body(items: Vec<AnyElement>) -> Vec<AnyElement> {
+    vec![v_flex().w_full().max_w(px(520.0)).gap_2().children(items).into_any_element()]
 }
 
 /// A rounded button: filled (the action to take) or outlined.

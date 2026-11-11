@@ -35,6 +35,10 @@ pub struct State {
     pub speaking: bool,
     /// The tower is muted (`tower mute`): it says nothing, here or on a phone.
     pub muted: bool,
+    /// What it says out loud (`tower tell --voice`): `off` (the mute),
+    /// `decisions` (a decision, once, and nothing else) or `replies` (its
+    /// answers too).
+    pub tell_voice: String,
     /// Everything said plays on this Mac (`tower mac-voice`), never on a phone.
     pub voice_on_mac: bool,
     /// What is being said is an alert, not a reply to the user.
@@ -90,6 +94,43 @@ pub struct State {
     pub question_policy: String,
     /// The user's behaviors: `{count, enabled, by_category, updated_ms}`.
     pub behaviors: serde_json::Value,
+    /// How much the tower tells the user (`tower tell`): `decisions`,
+    /// `results` or `everything`.
+    pub tell_level: String,
+    /// What the sessions of each space wrote to each other (see `peers`):
+    /// by space, the last 50 each, newest last:
+    /// `{at, from, from_name, to, to_name, text, space, delivered}`.
+    pub threads: std::collections::BTreeMap<String, Vec<serde_json::Value>>,
+    /// What only the user can decide (see `decisions`), every open one in
+    /// queue order (heaviest first): `{id, key, kind, space, sessions,
+    /// waiting, title, why, options, pick, prs, question_id, task, first_ms,
+    /// last_ms, count, state, muted}`. The main queue is those whose space
+    /// isn't muted (`muted: false`).
+    pub decisions: Vec<serde_json::Value>,
+    /// The open decisions outside muted spaces: the orb's number.
+    pub decisions_count: usize,
+    /// Every space as a mission (see `crate::missions`): `{"spaces":
+    /// [Mission], "quiet": [name], "closed_today": [name]}`, the open ones
+    /// first (those that need the user, then those at work, then the rest;
+    /// then by name), then the quiet ones. `Mission`: `{name, goal,
+    /// done_when, standing, state, follow, mute, needs, report, sessions,
+    /// requests, thread_count, quiet_since_ms, ready_since_ms, auto_close_ms}`.
+    pub missions: serde_json::Value,
+    /// The brains that run (see `crate::brains`), the main one first:
+    /// `{name, space, address, status, model, effort}` (`space` null for
+    /// the main one; `model` and `effort` as its command line says, null
+    /// when it names none).
+    pub brains: Vec<serde_json::Value>,
+    /// The brains' model (`tower model`): `{program, model, effort,
+    /// choices: {models: [{id, label}], efforts}, running: [{brain, space,
+    /// address, model, effort, restart}], restart_needed, locked_by_args,
+    /// locked: {model, effort}, says}`.
+    pub brain_model: serde_json::Value,
+    /// What the tower opened for the user lately (see `crate::acts`), newest
+    /// first, at most 10: `{id, kind, at_ms, by, space, line, sessions,
+    /// assumed: [{what, value, why}], request: {at, text} or null, state:
+    /// "done" | "undone", undo: {possible, why}, closing}`.
+    pub acts: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -124,6 +165,7 @@ impl State {
             transcribing: false,
             speaking: false,
             muted: false,
+            tell_voice: crate::tell::Voice::default().word().into(),
             voice_on_mac: false,
             announcing: false,
             brain: "absent".into(),
@@ -150,6 +192,14 @@ impl State {
             questions: vec![],
             question_policy: "normal".into(),
             behaviors: serde_json::Value::Null,
+            tell_level: crate::tell::Level::default().word().into(),
+            threads: Default::default(),
+            decisions: vec![],
+            decisions_count: 0,
+            missions: serde_json::json!({ "spaces": [], "quiet": [], "closed_today": [] }),
+            brains: vec![],
+            brain_model: serde_json::Value::Null,
+            acts: vec![],
         }
     }
 
@@ -238,6 +288,13 @@ impl Shared {
         }
     }
 
+    /// News that is only written down (a finish at a quiet level, see
+    /// `tell`): into the history, not into the alerts and not a chat message.
+    pub fn record(&self, terminal: &str, text: &str, level: &str) {
+        let (t, x, l) = (terminal.to_string(), text.to_string(), level.to_string());
+        crate::history::later(move || crate::history::record_session_as("alert", &t, &x, Some(&l), true));
+    }
+
     pub fn alert(&self, terminal: &str, text: &str, level: &str) {
         let alert = Alert { at_ms: now_ms(), terminal: terminal.into(), text: text.into(), level: level.into() };
         let (t, x, l) = (terminal.to_string(), text.to_string(), level.to_string());
@@ -290,6 +347,18 @@ fn to_json(s: &State) -> serde_json::Value {
     v
 }
 
+/// The behaviors as their files have them now (`behaviors::Store::summary`),
+/// into the state when they differ from what it carries: the count follows
+/// the files, not only the changes the tower was told of. True when it
+/// changed.
+pub fn follow_behaviors(shared: &Shared, now: serde_json::Value) -> bool {
+    if shared.with(|s| s.behaviors == now) {
+        return false;
+    }
+    shared.update(|s| s.behaviors = now);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +374,28 @@ mod tests {
         shared.update(|s| s.behaviors = serde_json::json!({ "count": 1 }));
         shared.update(|s| s.behaviors = serde_json::json!({ "count": 1 }));
         assert_eq!(shared.get().version, 2);
+    }
+
+    #[test]
+    fn the_behaviors_count_follows_their_files() {
+        let dir = std::env::temp_dir().join(format!("tower-state-behaviors-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = crate::behaviors::Store { dir: dir.clone() };
+        // The daemon started before anything was seeded: none.
+        let shared = Shared::new(State::new("ptt", "test", "test"));
+        shared.update(|s| s.behaviors = store.summary());
+        assert_eq!(shared.get().behaviors["count"], 0);
+        // An install seeds them, and tells nobody: the next look has them.
+        let seeded = store.seed().unwrap().len() as u64;
+        assert!(seeded > 0);
+        assert!(follow_behaviors(&shared, store.summary()));
+        let b = shared.get().behaviors;
+        assert_eq!((b["count"].as_u64(), b["enabled"].as_u64()), (Some(seeded), Some(seeded)));
+        // Nothing moved since: the state isn't written again.
+        let version = shared.get().version;
+        assert!(!follow_behaviors(&shared, store.summary()));
+        assert_eq!(shared.get().version, version);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

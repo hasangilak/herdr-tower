@@ -12,8 +12,10 @@ pub mod auth;
 pub mod http;
 pub mod hub;
 pub mod multipart;
+mod quiet;
 pub mod tailscale;
 pub mod tls;
+pub mod tower;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -38,6 +40,11 @@ use tls::Identity;
 
 /// The API version in every path (`/v1/...`).
 pub const API: u32 = 1;
+/// What this tower's API has beyond the first `/v1` (`GET /v1/hello`'s
+/// `features`): an app checks a name here before it uses that part.
+/// `quiet`: the decisions, missions, threads, launch, tell level and model
+/// calls, a request's `space`, and the events that go with them.
+pub const FEATURES: &[&str] = &["quiet", "acts"];
 const MAX_CONNECTIONS: usize = 32;
 /// Connections open at once from one address.
 const MAX_PER_IP: usize = 8;
@@ -56,7 +63,6 @@ pub struct Ctx {
     pub shared: Shared,
     pub mouth: Mouth,
     pub hub: Arc<Hub>,
-    pub ack: Option<Duration>,
     pub stt: Sender<Utterance>,
     /// The open question sets (blocked sessions' dialogs).
     pub asks: super::asks::Asks,
@@ -138,6 +144,12 @@ pub struct Lan {
     /// The certificate's folder (elsewhere in tests).
     identity_dir: std::path::PathBuf,
     detect: Detect,
+    /// The rest of the tower (`tower::Tower`): the daemon, once it is whole.
+    tower: Arc<std::sync::OnceLock<Arc<dyn tower::Tower>>>,
+    /// `history.jsonl` (elsewhere in tests).
+    history: std::path::PathBuf,
+    /// The launches and closes the phones started.
+    actions: tower::Actions,
 }
 
 /// The connections open now, in all and by address.
@@ -294,8 +306,10 @@ fn body_limit(req: &Request, seg: &[&str]) -> usize {
     let multipart = req.header("content-type").and_then(multipart::boundary).is_some();
     match (req.method.as_str(), seg.get(1..).unwrap_or(&[])) {
         ("POST", ["pair"]) => http::MAX_PAIR_BODY,
-        ("POST", ["voice"] | ["transcribe"] | ["questions", _, "voice"]) if !multipart => http::MAX_VOICE_BODY,
-        ("POST", ["ask"] | ["voice"] | ["transcribe"] | ["questions", _, "voice"] | ["questions", _, "answer"]) if multipart => {
+        ("POST", ["voice"] | ["transcribe"] | ["questions" | "decisions", _, "voice"]) if !multipart => http::MAX_VOICE_BODY,
+        ("POST", ["ask"] | ["voice"] | ["transcribe"] | ["questions" | "decisions", _, "voice"] | ["questions" | "decisions", _, "answer"])
+            if multipart =>
+        {
             http::MAX_BODY
         }
         _ => http::MAX_JSON_BODY,
@@ -460,6 +474,9 @@ impl Lan {
         Lan {
             devices: Arc::new(auth::Store::new(devices_path)),
             identity_dir,
+            tower: Arc::default(),
+            history: crate::history::path(),
+            actions: tower::Actions::new(ctx.hub.clone()),
             ctx,
             running: Arc::new(Mutex::new(None)),
             pairing: Arc::new(Mutex::new(Pairing::default())),
@@ -475,6 +492,40 @@ impl Lan {
     pub fn with_detect(mut self, detect: impl Fn() -> tailscale::Tailscale + Send + Sync + 'static) -> Lan {
         self.detect = Arc::new(detect);
         self
+    }
+
+    /// Another history file (tests).
+    #[cfg(test)]
+    pub fn with_history(mut self, path: std::path::PathBuf) -> Lan {
+        self.history = path;
+        self
+    }
+
+    /// The rest of the tower, for what a phone does as the Mac's windows
+    /// do: given once, when the daemon is whole (it holds this API itself).
+    pub fn attach(&self, tower: Arc<dyn tower::Tower>) {
+        let _ = self.tower.set(tower);
+    }
+
+    fn tower(&self) -> Option<Arc<dyn tower::Tower>> {
+        self.tower.get().cloned()
+    }
+
+    /// Every history entry, oldest first.
+    fn entries(&self) -> Vec<crate::history::Entry> {
+        crate::history::load_from(&self.history)
+    }
+
+    /// The history with each entry's line number (a chat message's id).
+    fn lines(&self) -> Vec<(usize, crate::history::Entry)> {
+        std::fs::read_to_string(&self.history).map(|t| crate::chat::parse(&t)).unwrap_or_default()
+    }
+
+    /// The chat thread as it is now, oldest first.
+    fn chat(&self) -> Vec<Value> {
+        let spaces = self.tower().map(|t| t.remembered()).unwrap_or_default();
+        let acts = self.ctx.shared.with(|s| s.acts.clone());
+        crate::chat::thread_of(&self.lines(), &crate::history::attachments_dir(), &self.ctx.prs.map(), &spaces, &acts)
     }
 
     /// Starts listening: on the LAN address, and the tailnet's while Tailscale
@@ -841,6 +892,7 @@ impl Lan {
                     "voice": self.ctx.shared.get().voice,
                     "phone_is_voice": self.ctx.hub.voice(),
                     "audio_route": device.audio_route,
+                    "features": FEATURES,
                 }),
             ),
             ("GET", ["state"]) => Response::json(200, &self.state(&device)),
@@ -948,8 +1000,15 @@ impl Lan {
                 Response::json(200, &json!({ "tab": tab, "heard": text, "choice": { "options": p.options, "other": p.other } }))
             }
             // The main chat thread, as the panel shows it: newest last, in pages.
+            // With `space`: the conversation with that space's own tower; with `main=1`:
+            // the main one without those; neither: every message, as before.
             ("GET", ["chat"]) => {
-                let all = crate::chat::thread_with(&crate::chat::load(), &crate::history::attachments_dir(), &self.ctx.prs.map());
+                let mut all = self.chat();
+                match (q("space").map(str::trim).filter(|s| !s.is_empty()), q("main") == Some("1")) {
+                    (Some(space), _) => all.retain(|m| crate::chat::in_conversation(m, Some(space))),
+                    (None, true) => all.retain(|m| crate::chat::in_conversation(m, None)),
+                    (None, false) => {}
+                }
                 let (messages, more) = crate::chat::page(&all, q("before"), limit(50).min(200));
                 Response::json(200, &json!({ "messages": messages, "more": more }))
             }
@@ -1016,7 +1075,7 @@ impl Lan {
             ("GET", ["jobs"]) => {
                 let want = q("status").unwrap_or("all");
                 let session = q("session");
-                let rows: Vec<Value> = crate::history::jobs(&crate::history::load())
+                let rows: Vec<Value> = crate::history::jobs(&self.entries())
                     .into_iter()
                     .filter(|j| match want {
                         "open" => j.open(),
@@ -1031,13 +1090,17 @@ impl Lan {
             }
             ("GET", ["history"]) => {
                 let (session, kind) = (q("session"), q("kind"));
+                // A space by its whole name, any case (the Record of one space).
+                let space = q("space").map(str::trim).filter(|s| !s.is_empty());
                 let before = q("before_ms").and_then(|b| b.parse::<u64>().ok()).unwrap_or(u64::MAX);
-                let mut list: Vec<_> = crate::history::load()
+                let mut list: Vec<_> = self
+                    .entries()
                     .into_iter()
                     .rev()
                     .filter(|e| e.at < before)
                     .filter(|e| session.is_none_or(|s| e.session.as_deref() == Some(s)))
                     .filter(|e| kind.is_none_or(|k| k.split(',').any(|k| k == e.kind)))
+                    .filter(|e| space.is_none_or(|s| e.space.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(s))))
                     .take(limit(100))
                     .collect();
                 list.reverse();
@@ -1073,7 +1136,7 @@ impl Lan {
             }
             ("GET", ["screenshots"]) => {
                 let session = q("session");
-                let entries = crate::history::load();
+                let entries = self.entries();
                 let rows: Vec<Value> = crate::screenshots::recent(&entries, usize::MAX)
                     .into_iter()
                     .filter(|e| session.is_none_or(|s| e.session.as_deref() == Some(s)))
@@ -1101,13 +1164,19 @@ impl Lan {
                 return None;
             }
             ("POST", ["ask"]) => {
-                let (text, files) = match ask_body(req) {
+                let (text, space, files) = match ask_body(req) {
                     Ok(x) => x,
                     Err(r) => return Some(r),
                 };
                 if text.is_empty() && files.is_empty() {
                     return Some(Response::error(400, "empty", "send {\"text\": \"...\"}, or multipart text and files"));
                 }
+                // Asked in a space's view: a space the tower knows, by its whole name (before any file is saved).
+                let space = match space.map(|want| self.space_named(&want)) {
+                    Some(Ok(name)) => Some(name),
+                    Some(Err(r)) => return Some(r),
+                    None => None,
+                };
                 let saved = match save_files(&files, &crate::history::attachments_dir(), now_ms()) {
                     Ok(p) => p,
                     Err(r) => return Some(r),
@@ -1115,9 +1184,13 @@ impl Lan {
                 let paths: Vec<String> = saved.iter().map(|f| f.path.clone()).collect();
                 let markers: Vec<String> = saved.iter().map(|f| f.marker.clone()).collect();
                 let text = with_markers(&text, &markers);
-                let mut resp = self.ask(&device, &crate::history::compose(&text, &paths));
+                let mut resp = self.ask(&device, &crate::history::compose(&text, &paths), space.as_deref());
                 if resp.status == 202 {
-                    resp = Response::json(202, &json!({ "sent": text, "attachments": paths }));
+                    let mut sent = json!({ "sent": text, "attachments": paths });
+                    if let Some(space) = &space {
+                        sent["space"] = json!(space);
+                    }
+                    resp = Response::json(202, &sent);
                 }
                 resp
             }
@@ -1138,7 +1211,7 @@ impl Lan {
                     .filter(|n| !n.is_empty())
                     .map(|n| format!(" {n}"))
                     .unwrap_or_default();
-                self.ask(&device, &format!("{verb} what {address} is asking for.{note}"))
+                self.ask(&device, &format!("{verb} what {address} is asking for.{note}"), None)
             }
             ("POST", ["focus"]) => {
                 let body = req.json().unwrap_or_default();
@@ -1165,6 +1238,13 @@ impl Lan {
                         // What was said before the mute isn't fetched after it.
                         if on {
                             self.ctx.hub.drop_clips();
+                        }
+                        // The mute is the voice setting `off`: config.toml says what the mouth does.
+                        // (Tests never write the user's config.)
+                        if !cfg!(test)
+                            && let Err(e) = crate::tell::set_voice(self.ctx.mouth.voice())
+                        {
+                            eprintln!("[phone] keeping the voice setting in config.toml: {e:#}");
                         }
                         Response::json(200, &json!({ "muted": on }))
                     }
@@ -1193,7 +1273,11 @@ impl Lan {
                 self.ctx.hub.drop_device(&device.id);
                 Response::json(200, &json!({ "revoked": device.id }))
             }
-            _ => Response::error(404, "not_found", &format!("no {m} {}", req.path)),
+            // The queue, the missions, their threads, launching, the tell level, the model.
+            _ => match self.quiet(req, device, &seg[1..]) {
+                Some(resp) => resp,
+                None => Response::error(404, "not_found", &format!("no {m} {}", req.path)),
+            },
         };
         Some(resp)
     }
@@ -1212,7 +1296,7 @@ impl Lan {
                 let fp = self.running.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|r| r.fingerprint.clone());
                 Response::json(
                     200,
-                    &json!({ "token": token, "device": { "id": device.id, "name": device.name }, "fingerprint": fp, "api": API }),
+                    &json!({ "token": token, "device": { "id": device.id, "name": device.name }, "fingerprint": fp, "api": API, "features": FEATURES }),
                 )
             }
             Err(PairError::NoCode) => {
@@ -1244,18 +1328,42 @@ impl Lan {
         });
     }
 
-    fn ask(&self, device: &auth::Device, text: &str) -> Response {
-        crate::daemon::timing::start("asked");
+    /// Hands what the phone's user asked to the tower (`space`: asked in
+    /// that space's view, so its own tower gets it when it has one).
+    fn ask(&self, device: &auth::Device, text: &str, space: Option<&str>) -> Response {
+        let Some(tower) = self.tower() else { return starting() };
         let source = format!("phone:{}", device.id);
-        match super::stt::deliver_from(&self.ctx.shared, &self.ctx.mouth, text, self.ctx.ack, heard_on_phone(device), &source) {
+        match tower.ask(text, heard_on_phone(device), &source, space) {
             Ok(()) => Response::json(202, &json!({ "sent": text })),
             Err(e) => Response::error(503, "brain", &crate::brain::spoken_error(&format!("{e:#}"))),
         }
     }
 
+    /// The space a call names, as the tower knows it: its whole name, in
+    /// any case. A name no space has is a 404.
+    fn space_named(&self, want: &str) -> Result<String, Response> {
+        let Some(tower) = self.tower() else { return Err(starting()) };
+        let want = want.trim();
+        tower
+            .spaces()
+            .into_iter()
+            .find(|s| !want.is_empty() && s.trim().eq_ignore_ascii_case(want))
+            .ok_or_else(|| Response::error(404, "no_space", &format!("no space called {want:?}")))
+    }
+
     /// The state with what the brain is doing now (`work`, the panel's working line).
     fn state(&self, device: &auth::Device) -> Value {
         let mut s = self.ctx.shared.json();
+        // The big lists are too much to send with every change, and each has
+        // its own call and event: the decisions (`decisions_count` stays),
+        // the missions, the spaces' threads.
+        if let Some(o) = s.as_object_mut() {
+            o.remove("threads");
+            o.remove("missions");
+            o.remove("decisions");
+            // What the tower opened lately: each is a chat message and an `act` event.
+            o.remove("acts");
+        }
         s["work"] = work_value();
         s["audio_route"] = json!(device.audio_route);
         s
@@ -1291,39 +1399,15 @@ impl Lan {
         if answers.iter().any(|a| a.tab >= set.tabs.len()) {
             return Response::error(400, "bad_tab", "no such tab");
         }
-        // Files for tab N: every tab's checked before any is saved, then attached to that tab's typed answer.
-        let by_tab: Vec<(usize, Vec<multipart::Part>)> = answers
-            .iter()
-            .enumerate()
-            .map(|(i, a)| (i, files.iter().filter(|p| p.name == format!("tab{}", a.tab)).cloned().collect::<Vec<_>>()))
-            .filter(|(_, mine)| !mine.is_empty())
-            .collect();
-        for (_, mine) in &by_tab {
-            if let Err(r) = check_files(mine) {
-                return r;
-            }
-        }
-        for (i, mine) in by_tab {
-            match save_files(&mine, &crate::history::attachments_dir(), now_ms()) {
-                Ok(saved) => answers[i].attachments.extend(saved.into_iter().map(|s| s.path)),
-                Err(r) => return r,
-            }
+        if let Err(r) = attach_tab_files(&mut answers, &files) {
+            return r;
         }
         let submit = body["submit"].as_bool().unwrap_or(true);
         match self.ctx.asks.answer(id, &answers, submit) {
             Ok(set) => Response::json(200, &json!({ "ok": true, "id": set.id, "submitted": submit })),
             Err(e) => {
                 let msg = format!("{e:#}");
-                let code = if msg.starts_with("stopped at") {
-                    "stopped"
-                } else if msg.starts_with("already answered") {
-                    "answered"
-                } else if msg.contains("changed") {
-                    "changed"
-                } else {
-                    "cannot_answer"
-                };
-                Response::error(409, code, &msg)
+                Response::error(409, question_code(&msg), &msg)
             }
         }
     }
@@ -1423,14 +1507,22 @@ impl Lan {
         let state = self.state(device);
         let mut version = state["version"].as_u64().unwrap_or(0);
         let mut work = state["work"].clone();
-        let mut ok = send(w, "hello", &json!({ "api": API, "device": device.id, "voice": voice })) && send(w, "state", &state);
-        let history = crate::history::path();
-        let mut offset = std::fs::metadata(&history).map(|m| m.len()).unwrap_or(0);
+        // What the state says besides its counter: only a change there is a `state` event.
+        let mut said = stateless(&state);
+        // The queue and the missions as last sent: each has its own event, sent when it changes.
+        let (mut decisions, mut count, mut missions) = self.ctx.shared.with(|s| (s.decisions.clone(), s.decisions_count, s.missions.clone()));
+        let mut ok = send(w, "hello", &json!({ "api": API, "device": device.id, "voice": voice, "features": FEATURES }))
+            && send(w, "state", &state)
+            && send(w, "decisions", &decisions_event(&decisions, count))
+            && send(w, "missions", &missions);
+        let history = self.history.clone();
+        let mut tail = Tail::end(&history);
         // The chat's latest messages as last sent: a new or changed one is a `chat` event.
         let mut chat = ChatTail::default();
-        chat.diff(&crate::chat::thread_with(&crate::chat::load(), &crate::history::attachments_dir(), &self.ctx.prs.map()));
+        chat.diff(&self.chat());
         // A PR's chip changes without the history growing.
         let mut prs_version = self.ctx.prs.version();
+        let mut acts_sent = self.ctx.shared.with(|s| s.acts.clone());
         let (mut last_ping, mut last_check, mut last_history) = (Instant::now(), Instant::now(), Instant::now());
         let (mut drained, mut last_unsent) = (Instant::now(), Instant::now());
         while ok && !stop.load(Ordering::SeqCst) {
@@ -1445,23 +1537,45 @@ impl Lan {
             if ok && (v != version || now_work != work) {
                 version = v;
                 work = now_work;
-                ok = send(w, "state", &self.state(device));
+                let state = self.state(device);
+                let now = stateless(&state);
+                if now != said {
+                    said = now;
+                    ok = send(w, "state", &state);
+                }
+                let (d, c, m) = self.ctx.shared.with(|s| (s.decisions.clone(), s.decisions_count, s.missions.clone()));
+                if ok && (d != decisions || c != count) {
+                    (decisions, count) = (d, c);
+                    ok = send(w, "decisions", &decisions_event(&decisions, count));
+                }
+                if ok && m != missions {
+                    missions = m;
+                    ok = send(w, "missions", &missions);
+                }
             }
             if ok && last_history.elapsed() > Duration::from_secs(1) {
                 last_history = Instant::now();
-                let (entries, end) = new_history(&history, offset);
-                offset = end;
+                let (entries, end) = new_history(&history, tail);
+                tail = end;
                 let grew = !entries.is_empty();
-                for e in entries {
+                for (line, e) in entries {
                     if !ok {
                         break;
                     }
                     ok = send(w, "history", &e);
+                    // A message between sessions: its space's thread got it.
+                    if let Some(t) = thread_event(line, &e).filter(|_| ok) {
+                        ok = send(w, "thread", &t);
+                    }
                 }
                 let prs_changed = self.ctx.prs.version() != prs_version;
                 prs_version = self.ctx.prs.version();
-                if grew || prs_changed {
-                    for (op, m) in chat.diff(&crate::chat::thread_with(&crate::chat::load(), &crate::history::attachments_dir(), &self.ctx.prs.map())) {
+                // An act changes without the history growing too (its session was given more work).
+                let acts_now = self.ctx.shared.with(|s| s.acts.clone());
+                let acts_changed = acts_now != acts_sent;
+                acts_sent = acts_now;
+                if grew || prs_changed || acts_changed {
+                    for (op, m) in chat.diff(&self.chat()) {
                         if !ok {
                             break;
                         }
@@ -1500,6 +1614,57 @@ impl Lan {
     }
 }
 
+/// The state without what moves with every change (`version`,
+/// `updated_ms`): two that are equal here say the same to a phone.
+fn stateless(state: &Value) -> Value {
+    let mut s = state.clone();
+    if let Some(o) = s.as_object_mut() {
+        o.remove("version");
+        o.remove("updated_ms");
+    }
+    s
+}
+
+/// The tower isn't whole yet (the daemon is starting): nothing can be asked of it.
+fn starting() -> Response {
+    Response::error(503, "starting", "the tower is still starting: try again in a moment")
+}
+
+/// Why a question set didn't take its answers, as a code: `stopped`
+/// (typing stopped half way), `answered` (answered meanwhile, in the
+/// session or from the tower), `changed` (the dialog asks something else
+/// now), else `cannot_answer`.
+fn question_code(msg: &str) -> &'static str {
+    if msg.starts_with("stopped at") {
+        "stopped"
+    } else if msg.starts_with("already answered") {
+        "answered"
+    } else if msg.contains("changed") {
+        "changed"
+    } else {
+        "cannot_answer"
+    }
+}
+
+/// Files for tab N's typed answer (parts named `tab<N>`): every tab's are
+/// checked before any is saved, then attached to that tab's answer.
+fn attach_tab_files(answers: &mut [crate::questions::Answer], files: &[multipart::Part]) -> Result<(), Response> {
+    let by_tab: Vec<(usize, Vec<multipart::Part>)> = answers
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (i, files.iter().filter(|p| p.name == format!("tab{}", a.tab)).cloned().collect::<Vec<_>>()))
+        .filter(|(_, mine)| !mine.is_empty())
+        .collect();
+    for (_, mine) in &by_tab {
+        check_files(mine)?;
+    }
+    for (i, mine) in by_tab {
+        let saved = save_files(&mine, &crate::history::attachments_dir(), now_ms())?;
+        answers[i].attachments.extend(saved.into_iter().map(|s| s.path));
+    }
+    Ok(())
+}
+
 /// The chat messages a stream has seen (the latest ones), to send only what is new or changed.
 #[derive(Default)]
 struct ChatTail {
@@ -1534,7 +1699,7 @@ fn behavior_change(op: crate::behaviors::Op) -> Response {
     match crate::behaviors::apply(op, "user") {
         Ok((b, c)) => {
             let view = c.view();
-            let _ = crate::protocol::send(&crate::protocol::Request::BehaviorsChanged { by: "user".into(), change: view.clone() });
+            let _ = crate::protocol::send(&crate::protocol::Request::BehaviorsChanged { by: "user".into(), change: view.clone(), from: None });
             Response::json(if adding { 201 } else { 200 }, &json!({ "behavior": b, "change": view }))
         }
         Err(e) => {
@@ -1570,21 +1735,25 @@ fn is_file_part(p: &multipart::Part) -> bool {
     p.filename.is_some() || p.name.starts_with("image") || p.name.starts_with("file")
 }
 
-/// The text and files of `POST /v1/ask`: JSON `{"text"}`, or multipart with
-/// a `text` field and file parts.
-fn ask_body(req: &Request) -> Result<(String, Vec<multipart::Part<'_>>), Response> {
+/// What `POST /v1/ask` carries.
+type Asked<'a> = (String, Option<String>, Vec<multipart::Part<'a>>);
+
+/// The text, the space it was asked in (when one is named) and the files
+/// of `POST /v1/ask`: JSON `{"text", "space"}`, or multipart with a `text`
+/// field, a `space` field and file parts.
+fn ask_body(req: &Request) -> Result<Asked<'_>, Response> {
+    let named = |s: String| Some(s.trim().to_string()).filter(|s| !s.is_empty());
     match req.header("content-type").and_then(multipart::boundary) {
         Some(b) => {
             let parts = multipart::parse(&req.body, &b).map_err(|e| Response::error(400, "bad_multipart", &format!("{e:#}")))?;
-            let text = parts
-                .iter()
-                .find(|p| p.name == "text" && p.filename.is_none())
-                .map(|p| clean_text(&String::from_utf8_lossy(p.data)).trim().to_string());
-            Ok((text.unwrap_or_default(), parts.into_iter().filter(|p| p.name != "text" && is_file_part(p)).collect()))
+            let field = |name: &str| parts.iter().find(|p| p.name == name && p.filename.is_none()).map(|p| clean_text(&String::from_utf8_lossy(p.data)).trim().to_string());
+            let (text, space) = (field("text"), field("space").and_then(named));
+            Ok((text.unwrap_or_default(), space, parts.into_iter().filter(|p| !matches!(p.name.as_str(), "text" | "space") && is_file_part(p)).collect()))
         }
         None => {
             let body = req.json().map_err(|_| Response::error(400, "bad_json", "send {\"text\": \"...\"}"))?;
-            Ok((clean_text(body["text"].as_str().unwrap_or("")).trim().to_string(), vec![]))
+            let space = body["space"].as_str().map(clean_text).and_then(named);
+            Ok((clean_text(body["text"].as_str().unwrap_or("")).trim().to_string(), space, vec![]))
         }
     }
 }
@@ -1745,22 +1914,56 @@ pub fn attachment(root: &std::path::Path, folder: &str, name: &str) -> Response 
     }
 }
 
-/// History lines added since `offset` (whole lines only), and the new offset.
-fn new_history(path: &std::path::Path, offset: u64) -> (Vec<Value>, u64) {
-    use std::io::{Read, Seek, SeekFrom};
-    let Ok(mut f) = std::fs::File::open(path) else { return (vec![], offset) };
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    if len < offset {
-        return (vec![], len);
+/// Where a stream is in the history: the bytes it has read, and how many
+/// lines they were (a line's number is its entry's id, `h<line>`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Tail {
+    offset: u64,
+    lines: usize,
+}
+
+impl Tail {
+    /// The end of the history as it is now.
+    fn end(path: &std::path::Path) -> Tail {
+        let bytes = std::fs::read(path).unwrap_or_default();
+        let end = bytes.iter().rposition(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0);
+        Tail { offset: end as u64, lines: bytes[..end].iter().filter(|b| **b == b'\n').count() }
     }
-    if len == offset || f.seek(SeekFrom::Start(offset)).is_err() {
-        return (vec![], offset);
+}
+
+/// History lines added since `tail` (whole lines only), each with its line
+/// number, and where the stream is then.
+fn new_history(path: &std::path::Path, tail: Tail) -> (Vec<(usize, Value)>, Tail) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else { return (vec![], tail) };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    // Shorter than it was (compacted): from its end as it is now.
+    if len < tail.offset {
+        return (vec![], Tail::end(path));
+    }
+    if len == tail.offset || f.seek(SeekFrom::Start(tail.offset)).is_err() {
+        return (vec![], tail);
     }
     let mut buf = Vec::new();
     let _ = f.take(4 * 1024 * 1024).read_to_end(&mut buf);
-    let Some(last_nl) = buf.iter().rposition(|b| *b == b'\n') else { return (vec![], offset) };
+    let Some(last_nl) = buf.iter().rposition(|b| *b == b'\n') else { return (vec![], tail) };
     let text = String::from_utf8_lossy(&buf[..=last_nl]);
-    (text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect(), offset + last_nl as u64 + 1)
+    let read = text.lines().count();
+    let entries = text.lines().enumerate().filter_map(|(i, l)| serde_json::from_str(l).ok().map(|v| (tail.lines + i + 1, v))).collect();
+    (entries, Tail { offset: tail.offset + last_nl as u64 + 1, lines: tail.lines + read })
+}
+
+/// A message between sessions as the `thread` event carries it: its space,
+/// and the message as `GET /v1/thread` lists it.
+fn thread_event(line: usize, entry: &Value) -> Option<Value> {
+    let e: crate::history::Entry = serde_json::from_value(entry.clone()).ok().filter(|e: &crate::history::Entry| e.kind == "peer")?;
+    Some(json!({ "space": e.space, "message": crate::peers::message(line, &e) }))
+}
+
+/// The `decisions` event: every open decision in queue order, each saying
+/// whether its space is muted, and how many are in the main queue.
+fn decisions_event(list: &[Value], count: usize) -> Value {
+    json!({ "count": count, "decisions": list })
 }
 
 /// `t3`, `vps/t3`, a name: letters, digits, `-`, `_`, one `/`, starting
@@ -1798,7 +2001,7 @@ mod tests {
 
     /// A phone that pins the tower's certificate by its fingerprint, as the app does.
     #[derive(Debug)]
-    struct Pin(String);
+    pub(super) struct Pin(String);
 
     impl rustls::client::danger::ServerCertVerifier for Pin {
         fn verify_server_cert(
@@ -1837,7 +2040,7 @@ mod tests {
     }
 
     /// One HTTPS call: (status, JSON body), or Err when TLS refused.
-    fn call(addr: SocketAddr, pin: &str, method: &str, path: &str, token: Option<&str>, body: &str) -> Result<(u16, Value)> {
+    pub(super) fn call(addr: SocketAddr, pin: &str, method: &str, path: &str, token: Option<&str>, body: &str) -> Result<(u16, Value)> {
         use std::io::Read;
         let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()?
@@ -1864,8 +2067,26 @@ mod tests {
         Ok((status, serde_json::from_str(body).unwrap_or(Value::Null)))
     }
 
+    /// An open connection to the tower, pinned, with `head` sent (an event stream).
+    pub(super) fn open(addr: SocketAddr, pin: &str, head: &str) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Pin(pin.to_string())))
+            .with_no_client_auth();
+        let conn =
+            rustls::ClientConnection::new(Arc::new(cfg), rustls::pki_types::ServerName::try_from("herder-tower").unwrap().to_owned()).unwrap();
+        let tcp = TcpStream::connect(addr).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut s = rustls::StreamOwned::new(conn, tcp);
+        s.write_all(head.as_bytes()).unwrap();
+        s.flush().unwrap();
+        s
+    }
+
     /// One HTTPS call with a binary body and a content type.
-    fn call_raw(addr: SocketAddr, pin: &str, method: &str, path: &str, token: &str, ctype: &str, body: &[u8]) -> Result<(u16, Value)> {
+    pub(super) fn call_raw(addr: SocketAddr, pin: &str, method: &str, path: &str, token: &str, ctype: &str, body: &[u8]) -> Result<(u16, Value)> {
         use std::io::Read;
         let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()?
@@ -1898,7 +2119,7 @@ mod tests {
         let (stt, _rx) = std::sync::mpsc::channel();
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
-        let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs: test_prs() };
+        let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs: test_prs() };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
         let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into() }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
@@ -2003,7 +2224,7 @@ mod tests {
         let (stt, _rx) = std::sync::mpsc::channel();
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
-        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub: hub.clone(), ack: None, stt, asks, prs: test_prs() };
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub: hub.clone(), stt, asks, prs: test_prs() };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
         let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into() }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
@@ -2163,8 +2384,8 @@ mod tests {
     #[test]
     fn reads_ask_bodies_both_ways() {
         let json_req = Request { body: br#"{"text":" hi "}"#.to_vec(), ..Default::default() };
-        let (t, imgs) = ask_body(&json_req).ok().unwrap();
-        assert_eq!((t.as_str(), imgs.len()), ("hi", 0));
+        let (t, space, imgs) = ask_body(&json_req).ok().unwrap();
+        assert_eq!((t.as_str(), space, imgs.len()), ("hi", None, 0));
         let body = multipart::build(
             "BB",
             &[("text", "what's this?")],
@@ -2172,10 +2393,20 @@ mod tests {
         );
         let mut req = Request { body, ..Default::default() };
         req.headers.insert("content-type".into(), "multipart/form-data; boundary=BB".into());
-        let (t, files) = ask_body(&req).ok().unwrap();
-        assert_eq!((t.as_str(), files.len()), ("what's this?", 2));
+        let (t, space, files) = ask_body(&req).ok().unwrap();
+        assert_eq!((t.as_str(), space, files.len()), ("what's this?", None, 2));
         let bad = Request { body: b"nope".to_vec(), ..Default::default() };
         assert_eq!(ask_body(&bad).err().unwrap().status, 400);
+        // Asked in a space's view: the space comes with it, both ways; an empty one is none.
+        let there = Request { body: br#"{"text":"what's left?","space":" B2C support\u001b "}"#.to_vec(), ..Default::default() };
+        assert_eq!(ask_body(&there).ok().unwrap().1.as_deref(), Some("B2C support"));
+        let nowhere = Request { body: br#"{"text":"what's left?","space":"  "}"#.to_vec(), ..Default::default() };
+        assert_eq!(ask_body(&nowhere).ok().unwrap().1, None);
+        let body = multipart::build("BB", &[("text", "and this?"), ("space", "B2C support")], &[("image", "a.png", "image/png", b"\x89PNG\r\n\x1a\n")]);
+        let mut req = Request { body, ..Default::default() };
+        req.headers.insert("content-type".into(), "multipart/form-data; boundary=BB".into());
+        let (t, space, files) = ask_body(&req).ok().unwrap();
+        assert_eq!((t.as_str(), space.as_deref(), files.len()), ("and this?", Some("B2C support"), 1), "the space is a field, never a file");
     }
 
     #[test]
@@ -2204,15 +2435,26 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("history.jsonl");
         std::fs::write(&p, "{\"kind\":\"a\"}\n").unwrap();
-        let (_, off) = new_history(&p, 0);
+        let (first, off) = new_history(&p, Tail::default());
+        assert_eq!((first.len(), first[0].0, off), (1, 1, Tail::end(&p)));
         let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
-        f.write_all(b"{\"kind\":\"b\"}\n{\"kind\":\"c\"").unwrap();
+        f.write_all(b"not json\n{\"kind\":\"b\"}\n{\"kind\":\"c\"").unwrap();
         let (e, off2) = new_history(&p, off);
         assert_eq!(e.len(), 1, "the half-written line waits");
-        assert_eq!(e[0]["kind"], "b");
+        assert_eq!((e[0].0, &e[0].1["kind"]), (3, &json!("b")), "a line that doesn't read keeps its number");
+        assert_eq!(Tail::end(&p), off2, "a stream that starts now starts after the last whole line");
         f.write_all(b"}\n").unwrap();
-        let (e, _) = new_history(&p, off2);
-        assert_eq!(e[0]["kind"], "c");
+        let (e, off3) = new_history(&p, off2);
+        assert_eq!((e[0].0, &e[0].1["kind"]), (4, &json!("c")));
+        // Compacted (shorter than it was): from its end as it is now, nothing sent twice.
+        std::fs::write(&p, "{\"kind\":\"c\"}\n").unwrap();
+        let (e, off4) = new_history(&p, off3);
+        assert_eq!((e.len(), off4), (0, Tail { offset: 13, lines: 1 }));
+        // A message between sessions is a `thread` event too; nothing else is.
+        let peer = json!({ "at": 5, "kind": "peer", "session": "t6", "name": "api", "from": "t5", "from_name": "web", "space": "Shop", "text": "which port?", "status": "delivered", "record": true });
+        let ev = thread_event(7, &peer).unwrap();
+        assert_eq!((ev["space"].as_str(), ev["message"]["id"].as_str(), ev["message"]["from_name"].as_str(), ev["message"]["delivered"].as_bool()), (Some("Shop"), Some("h7"), Some("web"), Some(true)));
+        assert!(thread_event(8, &json!({ "at": 6, "kind": "note", "text": "x" })).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2244,6 +2486,11 @@ mod tests {
         assert_eq!(body_limit(&req("POST", mp), &["v1", "voice"]), http::MAX_BODY);
         assert_eq!(body_limit(&req("POST", mp), &["v1", "ask"]), http::MAX_BODY);
         assert_eq!(body_limit(&req("POST", mp), &["v1", "questions", "q1", "answer"]), http::MAX_BODY);
+        // A decision's answer and its spoken answer take what a question's do.
+        assert_eq!(body_limit(&req("POST", mp), &["v1", "decisions", "d0123456789ab", "answer"]), http::MAX_BODY);
+        assert_eq!(body_limit(&req("POST", None), &["v1", "decisions", "d0123456789ab", "answer"]), http::MAX_JSON_BODY);
+        assert_eq!(body_limit(&req("POST", Some("audio/wav")), &["v1", "decisions", "d0123456789ab", "voice"]), http::MAX_VOICE_BODY);
+        assert_eq!(body_limit(&req("POST", mp), &["v1", "launch"]), http::MAX_JSON_BODY);
         assert_eq!(body_limit(&req("POST", None), &["v1", "ask"]), http::MAX_JSON_BODY);
         assert_eq!(body_limit(&req("PUT", mp), &["v1", "behaviors", "b1"]), http::MAX_JSON_BODY);
     }
@@ -2317,7 +2564,7 @@ mod tests {
     }
 
     /// A PR store of its own for a test (no gh: nothing is looked up).
-    fn test_prs() -> crate::prs::Prs {
+    pub(super) fn test_prs() -> crate::prs::Prs {
         let dir = std::env::temp_dir().join(format!("tower-lan-prs-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
         crate::prs::Prs::at(dir.join("prs.json"), std::path::PathBuf::from("/nonexistent/gh"))
     }
@@ -2336,7 +2583,7 @@ mod tests {
         std::mem::forget(rx);
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
-        let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs };
+        let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
         let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into() }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
@@ -2432,7 +2679,7 @@ mod tests {
         std::mem::forget(rx);
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
-        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs: test_prs() };
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs: test_prs() };
         // "Running", with an address no interface here has (as just after Tailscale stops).
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan")).with_detect(|| ts(true, "100.100.100.100"));
         let addr = lan.start(&crate::config::Lan { port: 0, ..lan_cfg("127.0.0.1", "auto") }).unwrap();
@@ -2467,7 +2714,7 @@ mod tests {
         std::mem::forget(rx);
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
-        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs: test_prs() };
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs: test_prs() };
         let now = Arc::new(Mutex::new(ts(false, "100.100.100.100")));
         let seen = now.clone();
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan")).with_detect(move || seen.lock().unwrap().clone());
@@ -2560,7 +2807,7 @@ mod tests {
         std::mem::forget(rx);
         let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
-        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, ack: None, stt, asks, prs: test_prs() };
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs: test_prs() };
         // 127.0.0.1 is the tailnet here; the LAN is ::1.
         let now = Arc::new(Mutex::new(ts(false, "127.0.0.1")));
         let seen = now.clone();

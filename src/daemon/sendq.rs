@@ -26,6 +26,12 @@
 //! Each delivery is watched (the brain hears when the session stops), written
 //! to the history, and told to the brain (`[queue] delivered to <t> ...`)
 //! through the radar's outbox, so a space out of focus holds it like a watch.
+//! At a quiet level (`tell`) a delivery or a start is only written down: the
+//! brain is told when something is stuck, not when something went in.
+//!
+//! A message one session queues for another (`peers`) rides the same queue
+//! and is no task: not watched, not told to any brain, kept in the history
+//! as `peer`. One that can't be delivered is taken out and its sender told.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -201,6 +207,13 @@ pub struct Item {
     /// to the brain, and dropped (not parked) if its session ends.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quiet: bool,
+    /// A message from another session (not a brain, not the user): who sent
+    /// it. Delivered like any instruction, with the sender's name on it, but
+    /// it is no task: not watched, not in the agenda, not told to the brain;
+    /// kept in the history as `peer`. If it can't be delivered it is taken
+    /// out (not parked) and its sender is told.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<crate::peers::Sender>,
 }
 
 impl Item {
@@ -384,9 +397,10 @@ impl Book {
         item
     }
 
-    /// Instructions waiting for a session (quiet notes aren't work: not counted).
+    /// Instructions waiting for a session (quiet notes and messages from
+    /// other sessions aren't work: not counted).
     fn waiting_for(&self, session: &str) -> usize {
-        self.items.iter().filter(|i| i.session == session && !i.quiet && !matches!(i.state(), ItemState::Parked(_))).count()
+        self.items.iter().filter(|i| i.session == session && !i.quiet && i.from.is_none() && !matches!(i.state(), ItemState::Parked(_))).count()
     }
 
     /// The sessions to look at: those with something waiting, then those
@@ -547,7 +561,13 @@ impl SendQueue {
     /// An instruction for `session`: sent now if it's free (and nothing is
     /// queued before it), else kept until it is. `after`: ids to wait for.
     pub fn add(&self, session: &str, text: &str, after: &[u64]) -> Result<(Added, String, String)> {
-        self.add_with(&Herdr, session, text, after)
+        self.add_with(&Herdr, session, text, after, None)
+    }
+
+    /// A message for `session` from another session (see `Item::from`): the
+    /// same queue, the sender's name on it, and nothing for any brain.
+    pub fn add_from(&self, session: &str, text: &str, after: &[u64], from: &crate::peers::Sender) -> Result<(Added, String, String)> {
+        self.add_with(&Herdr, session, text, after, Some(from))
     }
 
     /// A quiet note for `session` (see `Item::quiet`): it waits its turn like
@@ -588,11 +608,16 @@ impl SendQueue {
         Ok((Added::Queued { id: item.id, position: 1, status: s.status.word().to_string() }, s.address, s.name))
     }
 
-    fn add_with(&self, h: &dyn Sessions, session: &str, text: &str, after: &[u64]) -> Result<(Added, String, String)> {
+    fn add_with(&self, h: &dyn Sessions, session: &str, text: &str, after: &[u64], from: Option<&crate::peers::Sender>) -> Result<(Added, String, String)> {
         let text = hc::clean(text.trim());
         if text.is_empty() {
             bail!("nothing to queue: give the instruction after the session");
         }
+        // A message from another session says who it is from.
+        let text = match from {
+            Some(f) => crate::peers::signed(f, &text),
+            None => text,
+        };
         let s = match h.look(session) {
             Look::Live(s) => s,
             Look::Finished => bail!("{session} has ended: start a session, or queue it for another one"),
@@ -620,7 +645,10 @@ impl SendQueue {
                     bail!("nothing queued or delivered with id {id} to wait for");
                 }
             }
-            let item = b.push(&s, &text, after, now);
+            let pos = b.items.len();
+            let mut item = b.push(&s, &text, after, now);
+            item.from = from.cloned();
+            b.items[pos].from = from.cloned();
             // On disk before the answer: a queued instruction survives anything after this.
             if let Err(e) = self.save(&b) {
                 b.items.retain(|i| i.id != item.id);
@@ -628,8 +656,11 @@ impl SendQueue {
             }
             item
         };
-        let (a, n, x) = (s.address.clone(), s.name.clone(), text.clone());
-        h.record(&a, &format!("Queued for {n}: {x}"), "queued");
+        // A message between sessions is recorded when it arrives, as their thread has it.
+        if from.is_none() {
+            let (a, n, x) = (s.address.clone(), s.name.clone(), text.clone());
+            h.record(&a, &format!("Queued for {n}: {x}"), "queued");
+        }
         // Free now: it goes at once.
         self.work(h, &s.address, Some(&s));
         let b = self.lock();
@@ -745,15 +776,18 @@ impl SendQueue {
                         finished: false,
                     });
                     h.record(&address, &format!("Started {} for: {}", item.name, item.text), "delivered");
-                    h.tell(Note {
-                        session: address.clone(),
-                        name: item.name.clone(),
-                        msg: format!(
-                            "[queue] started {address} ({}) now that what it waited for is done: {}. The tower watches it.",
-                            item.name, item.text
-                        ),
-                        speech: format!("Started {}.", item.name),
-                    });
+                    // A start is for the record unless the tower tells everything.
+                    if !h.level().quiet() {
+                        h.tell(Note {
+                            session: address.clone(),
+                            name: item.name.clone(),
+                            msg: format!(
+                                "[queue] started {address} ({}) now that what it waited for is done: {}. The tower watches it.",
+                                item.name, item.text
+                            ),
+                            speech: format!("Started {}.", item.name),
+                        });
+                    }
                     eprintln!("[queue] started #{} as {address}", item.id);
                 }
                 Err(e) => {
@@ -880,6 +914,10 @@ impl SendQueue {
             (b.items.iter().filter(|i| matches!(i.state(), ItemState::Claimed { .. })).cloned().collect(), std::mem::take(&mut b.notes))
         };
         for n in notes {
+            // What went in or started is for the record unless the tower tells everything.
+            if h.level().quiet() && (n.starts_with("[queue] delivered") || n.starts_with("[queue] started")) {
+                continue;
+            }
             h.tell(Note { session: String::new(), name: String::new(), msg: n, speech: String::new() });
         }
         for item in claimed {
@@ -1095,6 +1133,12 @@ impl SendQueue {
             match b.after_done(&item) {
                 Some(true) => {}
                 Some(false) => return,
+                None if item.from.is_some() => {
+                    // A message between sessions: back to its sender, nobody else.
+                    self.bounce(h, &mut b, &|i| i.id == item.id, "what it waited for was cancelled");
+                    let _ = self.save(&b);
+                    return;
+                }
                 None => {
                     let _ = b.items[pos].apply(ItemEv::Park { why: ParkWhy::AfterCancelled, now_ms: now });
                     b.items[pos].gone_told = true;
@@ -1174,9 +1218,27 @@ impl SendQueue {
             h.record(&s.address, &format!("Told {}: {}", s.name, item.text), "note");
             return;
         }
+        if let Some(from) = &item.from {
+            // A message between sessions, not work: into their thread, and
+            // nothing to watch, no task, no word to any brain.
+            h.peer(crate::peers::Message {
+                at_ms: now,
+                from: from.clone(),
+                to: s.address.clone(),
+                to_name: s.name.clone(),
+                space: None,
+                text: crate::peers::unsigned(from, &item.text).to_string(),
+                delivered: true,
+            });
+            return;
+        }
         let left = b.waiting_for(&s.address);
         h.watch(&s.address, &item.text);
         h.record(&s.address, &format!("Delivered to {}: {}", s.name, item.text), "delivered");
+        // A delivery is for the record unless the tower tells everything.
+        if h.level().quiet() {
+            return;
+        }
         h.tell(Note {
             session: s.address.clone(),
             name: s.name.clone(),
@@ -1196,6 +1258,9 @@ impl SendQueue {
     fn park(&self, h: &dyn Sessions, b: &mut Book, session: &str, why: ParkWhy, name: &str) {
         // A note for a session that's gone is moot: dropped, not parked.
         b.items.retain(|i| !(i.session == session && i.quiet && matches!(i.state(), ItemState::Waiting | ItemState::WaitingFor(_))));
+        // A message from another session: its sender hears it didn't arrive, nobody else.
+        let gone = if why == ParkWhy::Replaced { "its terminal is another session's now" } else { "it has ended" };
+        self.bounce(h, b, &|i| i.session == session && matches!(i.state(), ItemState::Waiting | ItemState::WaitingFor(_)), gone);
         let mut ids = vec![];
         let mut untold = false;
         let now = crate::history::now_ms();
@@ -1222,6 +1287,60 @@ impl SendQueue {
             ),
             speech: format!("{name} {what}; its queued instructions wait for you."),
         });
+    }
+
+    /// Messages between sessions (`which` of them) that can't be delivered:
+    /// out of the queue, kept in the record as not delivered, and each
+    /// sender told once, with one queued note. The user and the brain are
+    /// not told. True when there were any.
+    fn bounce(&self, h: &dyn Sessions, b: &mut Book, which: &dyn Fn(&Item) -> bool, why: &str) -> bool {
+        let (lost, keep): (Vec<Item>, Vec<Item>) = std::mem::take(&mut b.items).into_iter().partition(|i| i.from.is_some() && which(i));
+        b.items = keep;
+        let now = crate::history::now_ms();
+        // One note per sender and receiver, however many messages it lost.
+        let mut told: Vec<(crate::peers::Sender, String, String, Vec<String>)> = vec![];
+        for item in &lost {
+            let Some(from) = item.from.clone() else { continue };
+            let text = crate::peers::unsigned(&from, &item.text).to_string();
+            h.peer(crate::peers::Message {
+                at_ms: now,
+                from: from.clone(),
+                to: item.session.clone(),
+                to_name: item.name.clone(),
+                space: None,
+                text: text.clone(),
+                delivered: false,
+            });
+            eprintln!("[queue] #{} from {} to {} wasn't delivered ({why}): its sender is told", item.id, from.address, item.session);
+            match told.iter_mut().find(|(f, to, ..)| f.address == from.address && *to == item.session) {
+                Some((.., texts)) => texts.push(text),
+                None => told.push((from, item.session.clone(), item.name.clone(), vec![text])),
+            }
+        }
+        for (from, to, to_name, texts) in told {
+            let note = hc::clean(&undelivered_note(super::brains::name_at(&from.address).is_some(), &to_name, &to, why, &texts));
+            if b.items.iter().any(|i| i.session == from.address && i.text == note) {
+                continue;
+            }
+            let s = Session { address: from.address.clone(), name: from.name.clone(), ..Default::default() };
+            let pos = b.items.len();
+            b.push(&s, &note, &[], now);
+            b.items[pos].quiet = true;
+        }
+        !lost.is_empty()
+    }
+}
+
+/// What a sender is told when its messages to `to` weren't delivered. To a
+/// brain (one tower writing to another) it is a `[queue]` note, so its turn
+/// on it is a note turn: the user isn't told of a lost message between
+/// sessions, by a brain's reply no more than by the tower.
+fn undelivered_note(to_brain: bool, to_name: &str, to: &str, why: &str, texts: &[String]) -> String {
+    let tag = if to_brain { "[queue]" } else { "[tower]" };
+    let said: String = texts.first().map(|t| t.chars().take(200).collect()).unwrap_or_default();
+    match texts.len() {
+        0 | 1 => format!("{tag} Your message to {to_name} ({to}) was not delivered: {why}. It said: \"{said}\". Nothing was sent in its place."),
+        n => format!("{tag} Your {n} messages to {to_name} ({to}) were not delivered: {why}. The first said: \"{said}\". Nothing was sent in their place."),
     }
 }
 
@@ -1256,12 +1375,18 @@ trait Sessions: Sync {
     fn record(&self, session: &str, text: &str, kind: &str);
     /// Starts a session (`tower start <args>`); its address.
     fn start(&self, args: &[String]) -> Result<String>;
+    /// A message between sessions arrived, or couldn't: into the history (kind `peer`).
+    fn peer(&self, msg: crate::peers::Message);
+    /// How much the tower tells the user now (see `tell`).
+    fn level(&self) -> crate::tell::Level;
 }
 
 /// How the daemon hears what the queue does: set once at its start.
 pub struct Wiring {
     pub tell: Box<dyn Fn(Note) + Send + Sync>,
     pub watch: Box<dyn Fn(&str, &str) + Send + Sync>,
+    /// A message between sessions was recorded (its history entry): for the state's threads.
+    pub peer: Box<dyn Fn(&crate::history::Entry) + Send + Sync>,
 }
 
 static WIRING: OnceLock<Wiring> = OnceLock::new();
@@ -1338,6 +1463,22 @@ impl Sessions for Herdr {
             None => bail!("tower start said: {}", out.stdout.trim()),
         }
     }
+    fn peer(&self, mut msg: crate::peers::Message) {
+        // Herdr is asked for the receiver's space: on the history's thread, not while the book is held.
+        crate::history::later(move || {
+            if msg.space.is_none() {
+                msg.space = hc::get(&msg.to).as_ref().and_then(crate::spaces::space_of);
+            }
+            let e = msg.entry();
+            crate::history::append(e.clone());
+            if let Some(w) = WIRING.get() {
+                (w.peer)(&e);
+            }
+        });
+    }
+    fn level(&self) -> crate::tell::Level {
+        crate::tell::level()
+    }
 }
 
 fn session_of(t: &Value, asked: &str) -> Session {
@@ -1368,7 +1509,8 @@ pub fn describe(items: &[Item], status_of: impl Fn(&str) -> Option<String>) -> V
             } else {
                 format!(", after {}", i.after.iter().map(|a| format!("#{a}")).collect::<Vec<_>>().join(" "))
             };
-            format!("#{} → {} ({}, {status}{after}), queued {ago}: {}", i.id, i.session, i.name, i.text)
+            let from = i.from.as_ref().map(|f| format!(", from {}", f.address)).unwrap_or_default();
+            format!("#{} → {} ({}, {status}{after}{from}), queued {ago}: {}", i.id, i.session, i.name, i.text)
         })
         .collect()
 }
@@ -1377,7 +1519,6 @@ pub fn describe(items: &[Item], status_of: impl Fn(&str) -> Option<String>) -> V
 mod tests {
     use super::*;
 
-    #[derive(Default)]
     struct Fake {
         sessions: Mutex<BTreeMap<String, (String, Option<u64>, Option<u64>)>>,
         unreachable: Mutex<bool>,
@@ -1385,8 +1526,38 @@ mod tests {
         notes: Mutex<Vec<String>>,
         watched: Mutex<Vec<String>>,
         send_fails: Mutex<bool>,
+        /// What went into the history: (session, text, kind).
+        recorded: Mutex<Vec<(String, String, String)>>,
+        peers: Mutex<Vec<crate::peers::Message>>,
+        level: Mutex<crate::tell::Level>,
+    }
+    /// A tower that tells everything, as it always did: what these tests
+    /// were written for. The quiet levels are set by the tests about them.
+    impl Default for Fake {
+        fn default() -> Fake {
+            Fake::at(crate::tell::Level::Everything)
+        }
     }
     impl Fake {
+        fn at(level: crate::tell::Level) -> Fake {
+            Fake {
+                sessions: Default::default(),
+                unreachable: Default::default(),
+                sent: Default::default(),
+                notes: Default::default(),
+                watched: Default::default(),
+                send_fails: Default::default(),
+                recorded: Default::default(),
+                peers: Default::default(),
+                level: Mutex::new(level),
+            }
+        }
+        fn recorded(&self, kind: &str) -> Vec<String> {
+            self.recorded.lock().unwrap().iter().filter(|(_, _, k)| k == kind).map(|(_, t, _)| t.clone()).collect()
+        }
+        fn peers(&self) -> Vec<crate::peers::Message> {
+            self.peers.lock().unwrap().clone()
+        }
         fn set(&self, s: &str, st: &str) {
             let mut all = self.sessions.lock().unwrap();
             let e = all.entry(s.into()).or_insert((String::new(), Some(100), Some(0)));
@@ -1434,12 +1605,20 @@ mod tests {
         fn watch(&self, session: &str, _: &str) {
             self.watched.lock().unwrap().push(session.into());
         }
-        fn record(&self, _: &str, _: &str, _: &str) {}
+        fn record(&self, session: &str, text: &str, kind: &str) {
+            self.recorded.lock().unwrap().push((session.into(), text.into(), kind.into()));
+        }
         fn start(&self, args: &[String]) -> Result<String> {
             let name = args.iter().skip_while(|a| *a != "--name").nth(1).cloned().unwrap_or_default();
             self.sent.lock().unwrap().push((format!("start:{name}"), args.last().cloned().unwrap_or_default()));
             self.sessions.lock().unwrap().insert(name.clone(), ("working".into(), Some(7), Some(1)));
             Ok(name)
+        }
+        fn peer(&self, msg: crate::peers::Message) {
+            self.peers.lock().unwrap().push(msg);
+        }
+        fn level(&self) -> crate::tell::Level {
+            *self.level.lock().unwrap()
         }
     }
 
@@ -1468,15 +1647,28 @@ mod tests {
     }
 
     #[test]
+    fn a_lost_message_between_towers_is_a_note_not_something_to_tell_the_user() {
+        let texts = vec!["take the release notes from here".to_string()];
+        // A session is told in the tower's own name, as before.
+        let to_session = undelivered_note(false, "api", "t5", "its session has ended", &texts);
+        assert_eq!(to_session, "[tower] Your message to api (t5) was not delivered: its session has ended. It said: \"take the release notes from here\". Nothing was sent in its place.");
+        // A brain's turn on it must be a note turn: what it writes then is neither shown nor said.
+        let to_brain = undelivered_note(true, "tower sandbox", "t12", "its session has ended", &texts);
+        assert!(crate::brain::is_note_prompt(&to_brain) && !crate::brain::is_note_prompt(&to_session), "{to_brain}");
+        let two = undelivered_note(true, "tower sandbox", "t12", "it is gone", &[texts[0].clone(), "and the changelog".into()]);
+        assert!(two.starts_with("[queue] Your 2 messages to tower sandbox (t12) were not delivered: it is gone. The first said:"), "{two}");
+    }
+
+    #[test]
     fn the_ledger_reads_each_id_as_the_queue_knows_it() {
         use crate::agenda::QueueFact;
         let (q, _d) = queue();
         let h = Fake::default();
         h.set("t1", "idle");
         h.set("t2", "working");
-        let (Added::Sent { id: sent }, ..) = q.add_with(&h, "t1", "first", &[]).unwrap() else { panic!("t1 was free") };
-        let (Added::Queued { id: waiting, .. }, ..) = q.add_with(&h, "t2", "second", &[]).unwrap() else { panic!("t2 works") };
-        let (Added::Queued { id: dropped, .. }, ..) = q.add_with(&h, "t2", "third", &[]).unwrap() else { panic!("t2 works") };
+        let (Added::Sent { id: sent }, ..) = q.add_with(&h, "t1", "first", &[], None).unwrap() else { panic!("t1 was free") };
+        let (Added::Queued { id: waiting, .. }, ..) = q.add_with(&h, "t2", "second", &[], None).unwrap() else { panic!("t2 works") };
+        let (Added::Queued { id: dropped, .. }, ..) = q.add_with(&h, "t2", "third", &[], None).unwrap() else { panic!("t2 works") };
         assert!(matches!(q.fact(sent), QueueFact::Delivered { ref session, next_ms: None, .. } if session == "t1"));
         assert_eq!(q.fact(waiting), QueueFact::Waiting { session: "t2".into(), parked: None, start: false });
         q.cancel(dropped).unwrap();
@@ -1486,7 +1678,7 @@ mod tests {
         h.turn("t1");
         settle(&q);
         q.session_round(&h, "t1");
-        let (Added::Sent { .. }, ..) = q.add_with(&h, "t1", "fourth", &[]).unwrap() else { panic!("t1 is free again") };
+        let (Added::Sent { .. }, ..) = q.add_with(&h, "t1", "fourth", &[], None).unwrap() else { panic!("t1 is free again") };
         assert!(matches!(q.fact(sent), QueueFact::Delivered { next_ms: Some(_), .. }));
         // t2 ends: what waits for it is parked, and the ledger hears why.
         h.sessions.lock().unwrap().remove("t2");
@@ -1524,7 +1716,7 @@ mod tests {
         let (q, _d) = queue();
         let f = Fake::default();
         f.set("t5", "idle");
-        let (added, _, _) = q.add_with(&f, "t5", "run the tests", &[]).unwrap();
+        let (added, _, _) = q.add_with(&f, "t5", "run the tests", &[], None).unwrap();
         assert!(matches!(added, Added::Sent { .. }));
         assert_eq!(f.sent(), vec!["run the tests"]);
         assert_eq!(f.watched.lock().unwrap().as_slice(), &["t5".to_string()]);
@@ -1537,8 +1729,8 @@ mod tests {
         let (q, d) = queue();
         let f = Fake::default();
         f.set("t5", "working");
-        assert!(matches!(q.add_with(&f, "t5", "first", &[]).unwrap().0, Added::Queued { position: 1, .. }));
-        assert!(matches!(q.add_with(&f, "t5", "second", &[]).unwrap().0, Added::Queued { position: 2, .. }));
+        assert!(matches!(q.add_with(&f, "t5", "first", &[], None).unwrap().0, Added::Queued { position: 1, .. }));
+        assert!(matches!(q.add_with(&f, "t5", "second", &[], None).unwrap().0, Added::Queued { position: 2, .. }));
         q.tick(&f);
         assert!(f.sent().is_empty(), "nothing goes while it works");
 
@@ -1569,7 +1761,7 @@ mod tests {
         let (q, _d) = queue();
         let f = Fake::default();
         f.set("t5", "blocked");
-        q.add_with(&f, "t5", "after the dialog", &[]).unwrap();
+        q.add_with(&f, "t5", "after the dialog", &[], None).unwrap();
         q.tick(&f);
         assert!(f.sent().is_empty());
 
@@ -1654,7 +1846,7 @@ mod tests {
         let (q, _d) = queue();
         let f = Fake::default();
         f.set("t5", "working");
-        q.add_with(&f, "t5", "deploy the billing fix", &[]).unwrap();
+        q.add_with(&f, "t5", "deploy the billing fix", &[], None).unwrap();
         f.sessions.lock().unwrap().remove("t5");
         q.tick(&f);
         let parked_at = q.items()[0].parked_ms.unwrap();
@@ -1684,8 +1876,8 @@ mod tests {
         let f = Fake::default();
         f.set("t5", "working");
         f.set("t6", "idle");
-        let (Added::Queued { id: a, .. }, _, _) = q.add_with(&f, "t5", "build it", &[]).unwrap() else { panic!() };
-        q.add_with(&f, "t6", "deploy what t5 built", &[a]).unwrap();
+        let (Added::Queued { id: a, .. }, _, _) = q.add_with(&f, "t5", "build it", &[], None).unwrap() else { panic!() };
+        q.add_with(&f, "t6", "deploy what t5 built", &[a], None).unwrap();
         f.sessions.lock().unwrap().remove("t5");
         q.tick(&f);
         let parked_at = q.items().iter().find(|i| i.id == a).unwrap().parked_ms.unwrap();
@@ -1725,7 +1917,7 @@ mod tests {
         let (q, _d) = queue();
         let f = Fake::default();
         f.set("t5", "working");
-        q.add_with(&f, "t5", "deploy the billing fix", &[]).unwrap();
+        q.add_with(&f, "t5", "deploy the billing fix", &[], None).unwrap();
         f.sessions.lock().unwrap().remove("t5");
         q.tick(&f);
         // A new, unrelated session at t5 (and the old one, back, all the same):
@@ -1746,7 +1938,7 @@ mod tests {
         let (q, _d) = queue();
         let f = Fake::default();
         f.set("t5", "working");
-        q.add_with(&f, "t5", "go on", &[]).unwrap();
+        q.add_with(&f, "t5", "go on", &[], None).unwrap();
         f.replace("t5", 555);
         q.tick(&f);
         assert!(f.sent().is_empty());
@@ -1759,7 +1951,7 @@ mod tests {
         let (q, _d) = queue();
         let f = Fake::default();
         f.set("vps/t2", "working");
-        q.add_with(&f, "vps/t2", "run the migrations check", &[]).unwrap();
+        q.add_with(&f, "vps/t2", "run the migrations check", &[], None).unwrap();
         *f.unreachable.lock().unwrap() = true;
         q.tick(&f);
         q.tick(&f);
@@ -1777,14 +1969,14 @@ mod tests {
         let (q, _d) = queue();
         let f = Fake::default();
         f.set("t5", "working");
-        let a = q.add_with(&f, "t5", "add a test", &[]).unwrap().0;
-        let b = q.add_with(&f, "t5", "add a test", &[]).unwrap().0;
+        let a = q.add_with(&f, "t5", "add a test", &[], None).unwrap().0;
+        let b = q.add_with(&f, "t5", "add a test", &[], None).unwrap().0;
         assert_eq!(a, b);
         assert_eq!(q.items().len(), 1);
         f.set("t5", "idle");
         q.tick(&f);
         // A retry just after it went in: "sent", not again.
-        assert!(matches!(q.add_with(&f, "t5", "add a test", &[]).unwrap().0, Added::Sent { .. }));
+        assert!(matches!(q.add_with(&f, "t5", "add a test", &[], None).unwrap().0, Added::Sent { .. }));
         assert_eq!(f.sent().len(), 1);
     }
 
@@ -1793,7 +1985,7 @@ mod tests {
         let (q, d) = queue();
         let f = Fake::default();
         f.set("t5", "working");
-        q.add_with(&f, "t5", "migrate the db", &[]).unwrap();
+        q.add_with(&f, "t5", "migrate the db", &[], None).unwrap();
         // Claimed and typed; the tower stops before it writes that down.
         {
             let mut b = q.lock();
@@ -1810,7 +2002,7 @@ mod tests {
         assert!(q2.items().is_empty());
 
         // Claimed but never typed (the turn count didn't move): typed after the restart.
-        q2.add_with(&f, "t5", "second", &[]).unwrap();
+        q2.add_with(&f, "t5", "second", &[], None).unwrap();
         let _ = f.sent.lock().unwrap().drain(..);
         {
             let mut b = q2.lock();
@@ -1825,7 +2017,7 @@ mod tests {
         let (q, _d) = queue();
         let f = Fake::default();
         f.set("t5", "working");
-        q.add_with(&f, "t5", "try again", &[]).unwrap();
+        q.add_with(&f, "t5", "try again", &[], None).unwrap();
         f.set("t5", "error");
         q.tick(&f);
         q.tick(&f);
@@ -1841,7 +2033,7 @@ mod tests {
         let (q, _d) = queue();
         let f = Fake::default();
         f.set("t5", "");
-        assert!(q.add_with(&f, "t5", "ls", &[]).is_err());
+        assert!(q.add_with(&f, "t5", "ls", &[], None).is_err());
     }
 
     #[test]
@@ -1850,11 +2042,11 @@ mod tests {
         let f = Fake::default();
         f.set("t5", "idle");
         f.set("t6", "idle");
-        let first = match q.add_with(&f, "t5", "fix the api", &[]).unwrap().0 {
+        let first = match q.add_with(&f, "t5", "fix the api", &[], None).unwrap().0 {
             Added::Sent { id } => id,
             other => panic!("{other:?}"),
         };
-        let (added, _, _) = q.add_with(&f, "t6", "update the client for the new api", &[first]).unwrap();
+        let (added, _, _) = q.add_with(&f, "t6", "update the client for the new api", &[first], None).unwrap();
         assert!(matches!(added, Added::Queued { .. }), "t6 waits for t5's turn to finish");
         q.tick(&f);
         assert_eq!(f.sent(), vec!["fix the api"]);
@@ -1874,8 +2066,8 @@ mod tests {
         let f = Fake::default();
         f.set("t5", "working");
         f.set("t6", "idle");
-        let Added::Queued { id: first, .. } = q.add_with(&f, "t5", "a", &[]).unwrap().0 else { panic!() };
-        q.add_with(&f, "t6", "b", &[first]).unwrap();
+        let Added::Queued { id: first, .. } = q.add_with(&f, "t5", "a", &[], None).unwrap().0 else { panic!() };
+        q.add_with(&f, "t6", "b", &[first], None).unwrap();
         q.cancel(first).unwrap();
         q.tick(&f);
         assert!(f.sent().is_empty());
@@ -1905,6 +2097,12 @@ mod tests {
             fn start(&self, args: &[String]) -> Result<String> {
                 self.0.start(args)
             }
+            fn peer(&self, m: crate::peers::Message) {
+                self.0.peer(m)
+            }
+            fn level(&self) -> crate::tell::Level {
+                self.0.level()
+            }
         }
         let (q, _d) = queue();
         let f = Slow(Fake::default());
@@ -1926,7 +2124,7 @@ mod tests {
         thread::scope(|s| {
             s.spawn(|| q2.tick(&f));
             thread::sleep(Duration::from_millis(50));
-            q.add_with(&f.0, "t1", "hello", &[]).unwrap();
+            q.add_with(&f.0, "t1", "hello", &[], None).unwrap();
             assert!(t0.elapsed() < Duration::from_millis(1000), "add waited {:?}", t0.elapsed());
         });
         // The tick looked at the five machines' sessions at once, not one by one.
@@ -1938,7 +2136,7 @@ mod tests {
         let (q, _d) = queue();
         let f = Fake::default();
         f.set("t5", "idle");
-        let Added::Sent { id: api } = q.add_with(&f, "t5", "change the api", &[]).unwrap().0 else { panic!() };
+        let Added::Sent { id: api } = q.add_with(&f, "t5", "change the api", &[], None).unwrap().0 else { panic!() };
         let args: Vec<String> =
             ["--name", "client-update", "--cwd", "/w/client", "update the client"].iter().map(|s| s.to_string()).collect();
         let start = q.add_start("client-update", "update the client", &args, &[api]).unwrap();
@@ -1955,6 +2153,152 @@ mod tests {
         // And something can wait for the started session in turn.
         assert!(q.lock().delivered.iter().any(|d| d.id == start && d.session == "client-update"));
         assert!(q.add_start("x", "y", &args, &[]).is_err(), "nothing to wait for: tower start it");
+    }
+
+    fn orb() -> crate::peers::Sender {
+        crate::peers::Sender { address: "t1".into(), name: "orb rust".into(), space: Some("Shop".into()) }
+    }
+
+    #[test]
+    fn a_message_between_sessions_has_its_senders_name_and_is_nobodys_task() {
+        let (q, _d) = queue();
+        let h = Fake::at(crate::tell::Level::Decisions);
+        h.set("t1", "working");
+        h.set("t2", "working");
+        let (Added::Queued { id, .. }, address, _) = q.add_with(&h, "t2", "which port does the api use?", &[], Some(&orb())).unwrap() else {
+            panic!("t2 works: it waits, like any instruction")
+        };
+        assert_eq!(address, "t2");
+        let item = q.items()[0].clone();
+        assert_eq!((item.id, item.from.as_ref()), (id, Some(&orb())));
+        assert_eq!(item.text, "From Shop › orb rust (t1): which port does the api use?", "the tower puts the sender's name on it");
+        assert_eq!(q.lock().waiting_for("t2"), 0, "not work waiting for it");
+        assert!(h.sent().is_empty(), "never typed into a working session");
+        // The same message again is the same item, as with any instruction.
+        let (Added::Queued { id: again, .. }, ..) = q.add_with(&h, "t2", "which port does the api use?", &[], Some(&orb())).unwrap() else { panic!() };
+        assert_eq!(id, again);
+        // It goes in when the receiver stops, in its turn.
+        h.set("t2", "idle");
+        q.session_round(&h, "t2");
+        assert_eq!(h.sent(), vec!["From Shop › orb rust (t1): which port does the api use?".to_string()]);
+        assert!(q.items().is_empty());
+        // No watch (so no job and no report), no word to any brain, no queue entry: only the thread.
+        assert!(h.watched.lock().unwrap().is_empty(), "not watched");
+        assert!(h.notes().is_empty(), "the brain hears nothing");
+        assert!(h.recorded.lock().unwrap().is_empty(), "no `queue` entry: {:?}", h.recorded.lock().unwrap());
+        let said = h.peers();
+        assert_eq!(said.len(), 1);
+        assert_eq!((said[0].from.address.as_str(), said[0].to.as_str(), said[0].text.as_str(), said[0].delivered), ("t1", "t2", "which port does the api use?", true));
+        let e = said[0].entry();
+        assert_eq!((e.kind.as_str(), e.session.as_deref(), e.from.as_deref(), e.space.as_deref()), ("peer", Some("t2"), Some("t1"), Some("Shop")));
+        // A free receiver has it at once; one that says who it is from keeps its own words.
+        h.set("t3", "idle");
+        let (added, ..) = q.add_with(&h, "t3", "From the orb session: ready when you are", &[], Some(&orb())).unwrap();
+        assert!(matches!(added, Added::Sent { .. }));
+        assert_eq!(h.sent().last().map(String::as_str), Some("From the orb session: ready when you are"));
+        assert!(h.watched.lock().unwrap().is_empty() && h.notes().is_empty());
+        // Kept across a restart with who sent it.
+        h.set("t4", "working");
+        q.add_with(&h, "t4", "later", &[], Some(&orb())).unwrap();
+        let again = SendQueue::at(q.path.clone());
+        assert_eq!(again.items()[0].from.as_ref(), Some(&orb()));
+    }
+
+    #[test]
+    fn a_message_that_cant_be_delivered_tells_its_sender_once_and_nobody_else() {
+        let (q, _d) = queue();
+        let h = Fake::at(crate::tell::Level::Decisions);
+        h.set("t1", "working");
+        h.set("t2", "working");
+        q.add_with(&h, "t2", "which port does the api use?", &[], Some(&orb())).unwrap();
+        q.add_with(&h, "t2", "and which branch?", &[], Some(&orb())).unwrap();
+        // The receiver ends before it could take them.
+        h.sessions.lock().unwrap().remove("t2");
+        q.session_round(&h, "t2");
+        assert!(h.notes().is_empty(), "the brain (and so the user) is not told");
+        let lost = h.peers();
+        assert_eq!(lost.len(), 2, "both are in the record, as not delivered");
+        assert!(lost.iter().all(|m| !m.delivered && m.to == "t2" && m.from.address == "t1"));
+        assert_eq!(lost[0].text, "which port does the api use?");
+        // Out of the queue (not parked), and one note waits for the sender.
+        let items = q.items();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].quiet && items[0].session == "t1" && items[0].parked.is_none(), "{:?}", items[0]);
+        assert!(items[0].text.starts_with("[tower] Your 2 messages to t2-name (t2) were not delivered: it has ended."), "{}", items[0].text);
+        // Looking again changes nothing: told once.
+        q.session_round(&h, "t2");
+        assert_eq!(q.items().len(), 1);
+        assert_eq!(h.peers().len(), 2);
+        // The sender gets it when it is free, as a note: not watched, not told to the brain.
+        h.set("t1", "idle");
+        q.session_round(&h, "t1");
+        assert_eq!(h.sent().len(), 1);
+        assert!(h.sent()[0].contains("were not delivered") && h.sent()[0].contains("which port does the api use?"));
+        assert!(q.items().is_empty() && h.notes().is_empty() && h.watched.lock().unwrap().is_empty());
+        settle(&q);
+        h.turn("t1");
+        q.session_round(&h, "t1");
+        assert_eq!(h.sent().len(), 1, "once");
+    }
+
+    #[test]
+    fn the_brains_own_instruction_beside_a_message_is_still_an_instruction() {
+        let (q, _d) = queue();
+        let h = Fake::at(crate::tell::Level::Decisions);
+        h.set("t1", "idle");
+        h.set("t2", "working");
+        // A message from a session, then work from the brain (no sender), for the same receiver.
+        q.add_with(&h, "t2", "which port?", &[], Some(&orb())).unwrap();
+        let (Added::Queued { id: work, position, .. }, ..) = q.add_with(&h, "t2", "fix the login", &[], None).unwrap() else { panic!() };
+        assert_eq!(position, 2, "in order, behind the message");
+        assert_eq!(q.lock().waiting_for("t2"), 1, "one instruction waits; the message isn't work");
+        assert_eq!(h.recorded("queued"), vec!["Queued for t2-name: fix the login".to_string()]);
+        // The receiver ends: the instruction is parked and the brain hears it, as before; the message goes back to its sender.
+        h.sessions.lock().unwrap().remove("t2");
+        q.session_round(&h, "t2");
+        let notes = h.notes();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("is gone, with 1 instruction(s) queued for it") && notes[0].contains(&format!("#{work}")), "{}", notes[0]);
+        let items = q.items();
+        assert!(items.iter().any(|i| i.id == work && i.parked == Some(ParkWhy::Gone)));
+        assert!(items.iter().any(|i| i.quiet && i.session == "t1" && i.text.contains("Your message to t2-name (t2) was not delivered")));
+        assert_eq!(h.peers().len(), 1);
+    }
+
+    #[test]
+    fn a_delivery_is_written_down_not_told_at_a_quiet_level() {
+        for level in [crate::tell::Level::Decisions, crate::tell::Level::Results] {
+            let (q, _d) = queue();
+            let h = Fake::at(level);
+            h.set("t5", "idle");
+            let (Added::Sent { id: api }, ..) = q.add_with(&h, "t5", "change the api", &[], None).unwrap() else { panic!("t5 was free") };
+            assert_eq!(h.sent(), vec!["change the api"]);
+            assert_eq!(h.watched.lock().unwrap().as_slice(), &["t5".to_string()], "still watched: the brain hears when it stops");
+            assert_eq!(h.recorded("delivered"), vec!["Delivered to t5-name: change the api".to_string()], "in the record");
+            assert!(h.notes().is_empty(), "`[queue] delivered` is not sent to the brain");
+            // A session a dispatch held back starts: written down too.
+            let args: Vec<String> = ["--name", "client-update", "--cwd", "/w/client", "update the client"].iter().map(|s| s.to_string()).collect();
+            q.add_start("client-update", "update the client", &args, &[api]).unwrap();
+            h.turn("t5");
+            h.set("t5", "done");
+            q.tick(&h);
+            q.tick(&h);
+            assert_eq!(h.sent(), vec!["change the api", "update the client"]);
+            assert!(h.notes().is_empty(), "nor `[queue] started`");
+            assert_eq!(h.recorded("delivered").len(), 2);
+            // What is stuck still reaches the brain: a session that ends with work queued for it.
+            h.set("t6", "working");
+            q.add_with(&h, "t6", "deploy it", &[], None).unwrap();
+            h.sessions.lock().unwrap().remove("t6");
+            q.session_round(&h, "t6");
+            assert_eq!(h.notes().len(), 1);
+            assert!(h.notes()[0].starts_with("[queue] t6 (t6-name) is gone"), "{}", h.notes()[0]);
+            // Notes an earlier version left: only what is stuck goes out.
+            q.lock().notes.extend(["[queue] delivered to t5 (x): y".to_string(), "[queue] t9 (z) is gone, with 1 instruction(s) queued for it".to_string()]);
+            q.recover(&h);
+            assert_eq!(h.notes().len(), 2);
+            assert!(h.notes()[1].starts_with("[queue] t9 (z) is gone"));
+        }
     }
 
     #[test]

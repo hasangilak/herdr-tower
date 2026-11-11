@@ -1,9 +1,11 @@
 //! `tower orb`: one orb, floating over everything, in its own window (GPUI,
 //! Zed's UI framework). It shows what the voice control tower is doing by how
-//! it moves; hover for what it heard or said.
+//! it moves, and how many decisions wait for the user as an amber number.
 //!
-//!   click        the panel: type to the tower (with pictures, videos,
-//!                links), and its history of jobs and activity
+//!   hover        a peek at the panel: what needs you, the spaces, the input;
+//!                it goes when the pointer leaves the orb and the panel
+//!   click        the panel, pinned: answer what needs you, type to the tower
+//!                (with pictures, videos, links); Esc or a click closes it
 //!   right-click  show the tower's own terminal
 //!   ⌥-click      mute the tower, or unmute it (the panel's Mute does the same)
 //!   drag         put it anywhere; it stays there next time
@@ -13,9 +15,23 @@
 //!
 //! It reads the state the daemon writes (`~/.local/state/herder-tower/ui/state.json`)
 //! and runs `tower <cmd>`, like the Herdr mod in `mod/tower` it replaces.
+//!
+//! The panel's "Full window" opens the tower's window (`open_full`): the
+//! same queue with a sidebar of the spaces, each space's own view, the
+//! launcher, the record, the screenshots and the settings. Both show one
+//! model (`Tower`): a card answered or picked in one is so in the other.
+//!
+//! `HERDER_TOWER_ORB_PEEK=off`: hovering shows one line (what it heard or
+//! said) instead of the panel. To look at them with test data (`tower orb
+//! --ui-dir`), without the keyboard being taken: `HERDER_TOWER_ORB_PANEL=show`
+//! has the panel up from the start, `HERDER_TOWER_ORB_WINDOW=show` the full
+//! window (`show:<view>` at a view, as `nav::Scope::parse` reads it); either
+//! with `@<x>,<y>` opens at that spot, in screen points.
 
 mod liquid;
 mod mac;
+mod model;
+mod nav;
 mod panel;
 mod render;
 mod shots;
@@ -31,7 +47,7 @@ use anyhow::{Context as _, Result, bail};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
-    AnyWindowHandle, App, AsyncApp, Bounds, Context, DispatchPhase, Entity, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    AnyWindowHandle, App, AsyncApp, Bounds, Context, DispatchPhase, Entity, FontWeight, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     Render, SharedString, Subscription, Task, Window, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
     WindowOptions, canvas, div, font, point, prelude::*, px, rgb, rgba, size,
 };
@@ -73,6 +89,31 @@ struct Tower {
     spaces: crate::spaces::Spaces,
     /// The PRs sessions opened (`prs.json`, beside state.json): the chat's chips.
     prs: std::collections::BTreeMap<String, crate::prs::Pr>,
+    /// The queue as the user left it (the card picked, the receipts showing):
+    /// the same for every view of it.
+    deck: model::Deck,
+    /// What was done to the queue from a window (an answer on its way, a
+    /// merge under way), until the state says so too.
+    acts: panel::Acts,
+    /// Follow and mute as the user just set them, until the state agrees.
+    marks: std::collections::HashMap<String, model::Marks>,
+    /// The spaces the user follows, and those muted (`follow` and `mute` in
+    /// `spaces.json`).
+    follows: Vec<String>,
+    mutes: Vec<String>,
+    /// Where the full window is, and the window while it is open.
+    nav: nav::Nav,
+    full: Option<AnyWindowHandle>,
+    /// The floating panel while it is pinned: the keyboard is its again when
+    /// the full window closes.
+    pinned: Option<AnyWindowHandle>,
+    /// The window of the two that last had the keyboard: what is dictated is
+    /// written there.
+    keyed: Option<AnyWindowHandle>,
+    /// Herdr's spaces as a panel last saw them, so the next one opens with them.
+    live: Vec<crate::spaces::Live>,
+    /// Decisions that are the user's, outside muted spaces, as last read.
+    count: usize,
     alive: bool,
     /// We ran `tower up` and wait for the daemon to say it runs.
     starting: Option<Instant>,
@@ -86,6 +127,17 @@ impl Tower {
             work: None,
             spaces: Default::default(),
             prs: Default::default(),
+            deck: Default::default(),
+            acts: Default::default(),
+            marks: Default::default(),
+            follows: vec![],
+            mutes: vec![],
+            nav: Default::default(),
+            full: None,
+            pinned: None,
+            keyed: None,
+            live: vec![],
+            count: 0,
             alive: false,
             starting: None,
         };
@@ -106,8 +158,34 @@ impl Tower {
         if let Some(dir) = self.file.parent() {
             self.spaces = crate::spaces::load_from(dir);
             self.prs = crate::prs::load_from(dir);
+            (self.follows, self.mutes) = (self.spaces.follow.iter().cloned().collect(), self.spaces.mute.iter().cloned().collect());
         }
         self.check_alive();
+        // The queue as it is now: its count for the orb, and a receipt for
+        // what left it since the last look.
+        if let Some(state) = &self.state {
+            let now = crate::history::now_ms();
+            let all = model::decisions(state, &self.prs, &|_| String::new(), now);
+            model::settle_marks(&mut self.marks, state, &all, &self.follows, &self.mutes);
+            self.count = model::count(&all, &model::muted_spaces(&all, state, &self.mutes, &self.marks));
+            self.deck.sync(&all, now);
+        } else {
+            self.count = 0;
+        }
+    }
+
+    /// A space's switch was set here: it counts at once (a muted space's
+    /// decisions leave the orb's number).
+    fn set_mark(&mut self, space: &str, change: impl FnOnce(&mut model::Marks)) {
+        let mark = self.marks.entry(space.to_string()).or_default();
+        change(mark);
+        if *mark == model::Marks::default() {
+            self.marks.remove(space);
+        }
+        if let Some(state) = &self.state {
+            let all = model::decisions(state, &self.prs, &|_| String::new(), crate::history::now_ms());
+            self.count = model::count(&all, &model::muted_spaces(&all, state, &self.mutes, &self.marks));
+        }
     }
 
     /// Running, by its own word and by its process (a daemon that died
@@ -118,13 +196,6 @@ impl Tower {
         self.alive = says && (pid <= 0 || pid_alive(pid as i32));
         if self.alive {
             self.starting = None;
-        }
-    }
-
-    /// Changes focus, agendas or read marks, for the daemon and the brain too.
-    fn save_spaces(&mut self) {
-        if let Some(dir) = self.file.parent() {
-            crate::spaces::save_to(dir, &self.spaces);
         }
     }
 
@@ -146,7 +217,6 @@ impl Tower {
         self.s("agents").as_array().map(|a| a.iter().filter(|a| a["status"] == "blocked").count()).unwrap_or(0)
     }
 
-    /// The red dot: the brain or any agent is waiting for a person.
     /// Muted (`tower mute`): it says nothing.
     fn muted(&self) -> bool {
         self.alive && self.s("muted").as_bool() == Some(true)
@@ -157,12 +227,26 @@ impl Tower {
         self.s("voice_on_mac").as_bool() == Some(true)
     }
 
-    fn needs_you(&self) -> bool {
-        self.alive && (self.phase() == "blocked" || self.blocked_agents() > 0)
+    /// The orb's amber number: decisions that are the user's, outside muted
+    /// spaces (`model::count`). None while the tower is off.
+    fn yours(&self) -> usize {
+        if self.alive { self.count } else { 0 }
     }
 
-    /// What hovering says: the phase, then the latest line either way.
+    /// What hovering says: the phase, the latest line either way, and how
+    /// many agents wait.
     fn caption(&self) -> String {
+        let mut parts = self.glance();
+        let n = if self.alive { self.blocked_agents() } else { 0 };
+        if n > 0 {
+            parts.push(if n == 1 { "1 agent needs you".into() } else { format!("{n} agents need you") });
+        }
+        parts.join(" · ")
+    }
+
+    /// The phase, then the latest line either way (what it heard or said, or
+    /// what went wrong), and the talk key's permission if it lacks it.
+    fn glance(&self) -> Vec<String> {
         let phase = self.phase();
         let label = if self.starting.is_some() {
             "Starting…".to_string()
@@ -189,12 +273,8 @@ impl Tower {
             if text("talk_key") == "needs-permission" {
                 parts.push("Allow Input Monitoring for Herdr Core to talk with Control".into());
             }
-            let n = self.blocked_agents();
-            if n > 0 {
-                parts.push(if n == 1 { "1 agent needs you".into() } else { format!("{n} agents need you") });
-            }
         }
-        parts.join(" · ")
+        parts
     }
 }
 
@@ -321,6 +401,42 @@ struct Press {
     moved: bool,
 }
 
+/// The panel's window while it is open.
+struct PanelWin {
+    handle: AnyWindowHandle,
+    view: Entity<panel::Panel>,
+    /// Where it is on screen.
+    frame: mac::Rect,
+    /// Since when the pointer has been off the orb and a peek.
+    away: Option<Instant>,
+    /// Shown from the start to be looked at (`show_from_start`): it stays.
+    held: bool,
+}
+
+/// A peek stays while the pointer is this near it (points: the gap to the
+/// orb and a little more), and this long after it leaves (ms).
+const PEEK_REACH: f64 = 12.0;
+const PEEK_LINGER_MS: u64 = 300;
+
+/// Hovering peeks at the panel; `HERDER_TOWER_ORB_PEEK=off` keeps the
+/// one-line caption instead.
+fn peek_enabled() -> bool {
+    std::env::var("HERDER_TOWER_ORB_PEEK").map(|v| v != "off").unwrap_or(true)
+}
+
+/// `HERDER_TOWER_ORB_PANEL=show[@<x>,<y>]`: the panel is up from the start,
+/// as a peek that stays (it takes no keyboard and no pointer is needed), to
+/// look at it with test data (`tower orb --ui-dir`); with a spot, there
+/// (in screen points) instead of beside the orb.
+fn show_from_start() -> Option<Option<(f64, f64)>> {
+    let v = std::env::var("HERDER_TOWER_ORB_PANEL").ok()?;
+    match v.split_once('@') {
+        None if v == "show" => Some(None),
+        Some(("show", at)) => Some(at.split_once(',').and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?)))),
+        _ => None,
+    }
+}
+
 struct Orb {
     tower: Entity<Tower>,
     win: Option<mac::Win>,
@@ -332,8 +448,8 @@ struct Orb {
     press: Option<Press>,
     /// The hover caption's window, and the words it shows.
     caption: Option<(WindowHandle<Caption>, String)>,
-    /// The panel, when it's open.
-    panel: Option<AnyWindowHandle>,
+    /// The panel, when it's open: a peek (hover) or pinned (a click).
+    panel: Option<PanelWin>,
     /// The pointer is over the orb.
     inside: bool,
     hover: Option<Task<()>>,
@@ -393,6 +509,7 @@ impl Orb {
                         this.inside = inside;
                         this.hovered(inside, cx);
                     }
+                    this.watch_peek(x, y, frame, cx);
                 });
                 if alive.is_err() {
                     break;
@@ -425,7 +542,7 @@ impl Orb {
         if on && self.press.is_none() {
             self.hover = Some(cx.spawn(async move |this, cx: &mut AsyncApp| {
                 cx.background_executor().timer(Duration::from_millis(CAPTION_DELAY_MS)).await;
-                let _ = this.update(cx, |this, cx| this.open_caption(cx));
+                let _ = this.update(cx, |this, cx| if peek_enabled() { this.peek(cx) } else { this.open_caption(cx) });
             }));
         } else {
             self.hover = None;
@@ -505,6 +622,10 @@ impl Orb {
         }
         self.hover = None;
         self.close_caption(cx);
+        // A peek belongs where the orb was.
+        if self.peeking(cx) {
+            self.close_panel(false, cx);
+        }
     }
 
     fn mouse_up(&mut self, cx: &mut Context<Self>) {
@@ -522,14 +643,71 @@ impl Orb {
         }
     }
 
-    /// Opens the panel beside the orb (on whichever side has room), or closes it.
-    fn toggle_panel(&mut self, cx: &mut Context<Self>) {
-        if let Some(h) = self.panel.take() {
-            if h.update(cx, |_, window, _| window.remove_window()).is_ok() {
-                mac::give_back_focus();
-                return;
-            }
+    /// Whether the panel is open (one closed from inside, with Esc, is forgotten).
+    fn panel_open(&mut self, cx: &mut App) -> bool {
+        if self.panel.as_ref().is_some_and(|p| p.handle.update(cx, |_, _, _| ()).is_err()) {
+            self.panel = None;
         }
+        self.panel.is_some()
+    }
+
+    /// The panel is open as a peek.
+    fn peeking(&mut self, cx: &mut App) -> bool {
+        self.panel_open(cx) && self.panel.as_ref().is_some_and(|p| p.view.read(cx).is_peek())
+    }
+
+    fn close_panel(&mut self, give_back: bool, cx: &mut App) {
+        if let Some(p) = self.panel.take()
+            && p.handle.update(cx, |_, window, _| window.remove_window()).is_ok()
+            && give_back
+        {
+            mac::give_back_focus();
+        }
+    }
+
+    /// Hovering: the panel as a peek, unless it is open already.
+    fn peek(&mut self, cx: &mut Context<Self>) {
+        if self.press.is_none() && !self.panel_open(cx) {
+            self.open_panel(true, cx);
+        }
+    }
+
+    /// A peek goes once the pointer has left both the orb and the panel. One
+    /// that was clicked is pinned (`Panel::pin`) and stays.
+    fn watch_peek(&mut self, x: f64, y: f64, orb: mac::Rect, cx: &mut Context<Self>) {
+        if !self.peeking(cx) {
+            if let Some(p) = self.panel.as_mut() {
+                p.away = None;
+            }
+            return;
+        }
+        let Some(p) = self.panel.as_mut() else { return };
+        if p.held || orb.contains(x, y) || p.frame.grown(PEEK_REACH).contains(x, y) {
+            p.away = None;
+            return;
+        }
+        if p.away.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(PEEK_LINGER_MS) {
+            self.close_panel(false, cx);
+        }
+    }
+
+    /// A click: pins a peek, closes a pinned panel, else opens it pinned.
+    fn toggle_panel(&mut self, cx: &mut Context<Self>) {
+        if self.peeking(cx) {
+            if let Some(p) = &self.panel {
+                let view = p.view.clone();
+                let _ = p.handle.update(cx, |_, window, cx| view.update(cx, |panel, cx| panel.pin(window, cx)));
+            }
+        } else if self.panel_open(cx) {
+            self.close_panel(true, cx);
+        } else {
+            self.open_panel(false, cx);
+        }
+    }
+
+    /// Opens the panel beside the orb (on whichever side has room). A peek
+    /// shows without taking the keyboard from the app in front.
+    fn open_panel(&mut self, peek: bool, cx: &mut Context<Self>) {
         let Some(win) = self.win else { return };
         self.hover = None;
         self.close_caption(cx);
@@ -541,7 +719,7 @@ impl Orb {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::new(point(px(0.0), px(0.0)), size(px(panel::W), px(panel::H))))),
             titlebar: None,
-            focus: true,
+            focus: !peek,
             show: false,
             // A panel that takes the keyboard without bringing the app forward, like Spotlight.
             kind: WindowKind::PopUp,
@@ -554,16 +732,18 @@ impl Orb {
         };
         let tower = self.tower.clone();
         // Typing goes to the panel: bring the orb's app forward while it's open.
-        cx.activate(true);
+        if !peek {
+            cx.activate(true);
+        }
         match gpui_kit::open_window(options, cx, |window, cx| {
             if let Some(w) = mac::Win::of(window) {
                 w.set_origin(x, y);
                 w.glass(panel::RADIUS as f64);
-                w.make_key();
+                if peek { w.order_front() } else { w.make_key() }
             }
-            cx.new(|cx| panel::Panel::new(tower, window, cx))
+            cx.new(|cx| panel::Panel::new(tower, peek, window, cx))
         }) {
-            Ok((handle, _)) => self.panel = Some(handle),
+            Ok((handle, view)) => self.panel = Some(PanelWin { handle, view, frame: mac::Rect { x, y, w, h }, away: None, held: false }),
             Err(e) => eprintln!("[orb] opening the panel: {e:#}"),
         }
     }
@@ -572,7 +752,7 @@ impl Orb {
 impl Render for Orb {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dark = is_dark(window.appearance());
-        let needs_you = self.tower.read(cx).needs_you();
+        let yours = self.tower.read(cx).yours();
         let muted = self.tower.read(cx).muted();
         let colors = palette(dark);
         let me = cx.entity();
@@ -605,7 +785,7 @@ impl Render for Orb {
                 }),
             )
             // The orb itself is drawn underneath, by `render`.
-            // Muted: a small mark at the bottom left (the red dot keeps the top right).
+            // Muted: a small mark at the bottom left (the count keeps the top right).
             .when(muted, |el| {
                 el.child(
                     div()
@@ -624,17 +804,27 @@ impl Render for Orb {
                         .child("🔇"),
                 )
             })
-            .when(needs_you, |el| {
+            // What is the user's to decide: an amber number, and nothing when there is none.
+            .when(yours > 0, |el| {
                 el.child(
                     div()
                         .absolute()
-                        .top(px(4.0))
-                        .right(px(4.0))
-                        .size(px(8.0))
-                        .rounded(px(4.0))
-                        .bg(colors.blocked)
-                        .border_2()
-                        .border_color(colors.background),
+                        .top(px(0.0))
+                        .right(px(0.0))
+                        .min_w(px(16.0))
+                        .h(px(16.0))
+                        .px(px(4.0))
+                        .rounded(px(8.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(colors.yours)
+                        .text_color(colors.on_yours)
+                        .text_size(px(10.5))
+                        .line_height(px(16.0))
+                        .font_weight(FontWeight::BOLD)
+                        .shadow_sm()
+                        .child(if yours > 9 { "9+".to_string() } else { yours.to_string() }),
                 )
             })
             // A drag keeps going wherever the pointer goes; the window follows it.
@@ -662,13 +852,224 @@ impl Render for Orb {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The full window.
+
+/// `HERDER_TOWER_ORB_WINDOW=show[:<view>][@<x>,<y>]`: the full window is up
+/// from the start (it takes no keyboard), at that view and that spot, to
+/// look at it with test data (`tower orb --ui-dir`). `show:new=<goal>` opens
+/// the launcher with that goal typed in (`from_start_goal`).
+fn window_from_start() -> Option<(nav::Scope, Option<String>, Option<(f64, f64)>)> {
+    let v = std::env::var("HERDER_TOWER_ORB_WINDOW").ok()?;
+    let (word, at) = match v.rsplit_once('@') {
+        Some((w, at)) => (w, at.split_once(',').and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?)))),
+        None => (v.as_str(), None),
+    };
+    let view = match word.split_once(':') {
+        Some(("show", view)) => view,
+        None if word == "show" => "",
+        _ => return None,
+    };
+    let (scope, filter) = nav::Scope::parse(view);
+    Some((scope, filter, at))
+}
+
+/// `HERDER_TOWER_ORB_ANSWER=<decision id>:<n>[:rule]`: a moment after the
+/// start, the full window answers that card with its option `n` (from 0)
+/// as a click on it would, and with `:rule` takes its receipt's "Make it a
+/// rule" two seconds later. For looking at what an answer leaves behind
+/// without the pointer (with `HERDER_TOWER_ORB_WINDOW=show`).
+fn answer_from_start() -> Option<(String, usize, bool)> {
+    let v = std::env::var("HERDER_TOWER_ORB_ANSWER").ok()?;
+    let mut parts = v.split(':');
+    let (id, n) = (parts.next()?.trim().to_string(), parts.next()?.trim().parse().ok()?);
+    (!id.is_empty()).then(|| (id, n, parts.next() == Some("rule")))
+}
+
+/// The goal `HERDER_TOWER_ORB_WINDOW=show:new=<goal>[@<x>,<y>]` names.
+fn from_start_goal() -> Option<String> {
+    let v = std::env::var("HERDER_TOWER_ORB_WINDOW").ok()?;
+    let word = v.rsplit_once('@').map(|(w, _)| w.to_string()).unwrap_or(v);
+    word.strip_prefix("show:new=").map(str::trim).filter(|g| !g.is_empty()).map(String::from)
+}
+
+/// Whether the full window is open (one closed from inside is forgotten).
+fn full_open(tower: &Entity<Tower>, cx: &mut App) -> bool {
+    let Some(h) = tower.read(cx).full else { return false };
+    let open = cx.windows().contains(&h);
+    if !open {
+        tower.update(cx, |t, _| t.full = None);
+    }
+    open
+}
+
+/// Shows the full window at `to` (where it was, with none): opens it beside
+/// `anchor` (the floating panel) or in the middle of the screen, or brings it
+/// forward if it is open. `spot`: exactly there instead. `focus`: it takes
+/// the keyboard, as a click on "Full window" means it to.
+fn open_full(tower: &Entity<Tower>, to: Option<nav::Scope>, anchor: Option<mac::Rect>, spot: Option<(f64, f64)>, focus: bool, cx: &mut App) {
+    if let Some(to) = to {
+        tower.update(cx, |t, cx| {
+            t.nav.go(to);
+            cx.notify();
+        });
+    }
+    if full_open(tower, cx) {
+        // From another window's click: forward, with the keyboard.
+        if let Some(h) = tower.read(cx).full
+            && focus
+        {
+            let _ = h.update(cx, |_, window, _| {
+                if let Some(w) = mac::Win::of(window) {
+                    w.make_key();
+                }
+            });
+        }
+        return;
+    }
+    let (w, h) = (panel::FULL_W as f64, panel::FULL_H as f64);
+    let (at_x, at_y) = anchor.map(|a| (a.x + a.w / 2.0, a.y + a.h / 2.0)).unwrap_or_else(mac::mouse);
+    let Some(screen) = mac::screen_at(at_x, at_y) else {
+        eprintln!("[orb] no screen to open the full window on");
+        return;
+    };
+    // Where the user last put it, if that is still on a screen; else beside the panel.
+    let (x, y) = spot.or_else(saved_window_position).unwrap_or_else(|| nav::place(anchor, screen, w, h));
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(point(px(0.0), px(0.0)), size(px(panel::FULL_W), px(panel::FULL_H))))),
+        titlebar: None,
+        focus,
+        show: false,
+        // As the panel: it takes the keyboard without bringing the app forward.
+        kind: WindowKind::PopUp,
+        is_movable: false,
+        is_resizable: false,
+        is_minimizable: false,
+        window_background: WindowBackgroundAppearance::Blurred,
+        ..Default::default()
+    };
+    if focus {
+        cx.activate(true);
+    }
+    let t = tower.clone();
+    match gpui_kit::open_window(options, cx, |window, cx| {
+        if let Some(w) = mac::Win::of(window) {
+            w.set_origin(x, y);
+            w.glass(panel::RADIUS as f64);
+            if focus { w.make_key() } else { w.order_front() }
+            // (AppKit keeps a window it orders in on the screen: a spot off it is set after.)
+            if spot.is_some() {
+                w.set_origin(x, y);
+            }
+        }
+        cx.new(|cx| panel::Panel::full(t, focus, window, cx))
+    }) {
+        Ok((handle, view)) => {
+            tower.update(cx, |t, cx| {
+                t.full = Some(handle);
+                cx.notify();
+            });
+            // `HERDER_TOWER_ORB_ANSWER`: a card is answered as a click would, once, to look at what follows.
+            static ANSWERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if let Some((id, choice, rule)) = answer_from_start().filter(|_| !focus && !ANSWERED.swap(true, std::sync::atomic::Ordering::SeqCst)) {
+                cx.spawn(async move |cx: &mut AsyncApp| {
+                    cx.background_executor().timer(Duration::from_millis(2500)).await;
+                    let _ = view.update(cx, |p, cx| p.answer_from_start(&id, choice, rule, cx));
+                })
+                .detach();
+            }
+            // It is ordered in before its first frame, from inside the call
+            // that makes it. Looked at again once it has drawn: a window
+            // AppKit didn't order in then (or moved back onto the screen
+            // after) is put right, so it is never left open and unseen.
+            cx.spawn(async move |cx: &mut AsyncApp| {
+                for wait in [80u64, 400] {
+                    cx.background_executor().timer(Duration::from_millis(wait)).await;
+                    let there = handle.update(cx, |_, window, _| {
+                        let Some(w) = mac::Win::of(window) else { return };
+                        if !w.is_visible() {
+                            eprintln!("[orb] the full window wasn't on screen {wait} ms after opening: ordering it in again");
+                            if focus { w.make_key() } else { w.order_front() }
+                        }
+                        if let Some((x, y)) = spot {
+                            let f = w.frame();
+                            if (f.x - x).abs() > 1.0 || (f.y - y).abs() > 1.0 {
+                                w.set_origin(x, y);
+                            }
+                        }
+                    });
+                    // Closed meanwhile: nothing to look at.
+                    if there.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+        Err(e) => eprintln!("[orb] opening the full window: {e:#}"),
+    }
+}
+
+/// Where the full window was last put (beside `orb.json`).
+fn window_position_file() -> PathBuf {
+    config::state_dir().join("window.json")
+}
+
+/// The full window was moved: it opens there next time.
+pub(crate) fn save_window_position(x: f64, y: f64) {
+    let _ = std::fs::create_dir_all(config::state_dir());
+    let _ = std::fs::write(window_position_file(), serde_json::json!({ "x": x, "y": y }).to_string());
+}
+
+/// Where the user last put the full window, wholly on a screen that is there now.
+fn saved_window_position() -> Option<(f64, f64)> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(window_position_file()).ok()?).ok()?;
+    let (x, y) = (v["x"].as_f64()?, v["y"].as_f64()?);
+    Some(nav::keep_on(&mac::screens(), x, y, panel::FULL_W as f64, panel::FULL_H as f64))
+}
+
+/// Closes the full window from another window (the floating panel's button).
+fn close_full(tower: &Entity<Tower>, cx: &mut App) {
+    if let Some(h) = tower.update(cx, |t, cx| {
+        cx.notify();
+        t.full.take()
+    }) {
+        let _ = h.update(cx, |_, window, _| window.remove_window());
+    }
+}
+
+/// "Full window": opens it, or closes it when it is open.
+fn toggle_full(tower: &Entity<Tower>, anchor: Option<mac::Rect>, cx: &mut App) {
+    if full_open(tower, cx) { close_full(tower, cx) } else { open_full(tower, None, anchor, None, true, cx) }
+}
+
+/// The full window closed itself (Esc): a pinned floating panel has the
+/// keyboard again, else the app that had it before.
+fn full_closed(tower: &Entity<Tower>, cx: &mut App) {
+    let pinned = tower.update(cx, |t, cx| {
+        t.full = None;
+        cx.notify();
+        t.pinned
+    });
+    let kept = pinned.is_some_and(|h| {
+        h.update(cx, |_, window, _| {
+            if let Some(w) = mac::Win::of(window) {
+                w.make_key();
+            }
+        })
+        .is_ok()
+    });
+    if !kept {
+        mac::give_back_focus();
+    }
+}
+
 /// Herdr's colours: its dark theme ("graphite"), read from a running Herdr.
 /// The light one ("paper") isn't readable from outside Herdr: these are close.
 struct Palette {
-    /// The red dot.
-    blocked: Hsla,
-    /// The ring around the dot.
-    background: Hsla,
+    /// The count of what needs the user (the panel's amber), and its digits.
+    yours: Hsla,
+    on_yours: Hsla,
     popover: Hsla,
     foreground: Hsla,
     border: Hsla,
@@ -677,16 +1078,16 @@ struct Palette {
 fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
-            blocked: rgb(0xf0705f).into(),
-            background: rgb(0x17191d).into(),
+            yours: rgb(0xffcf70).into(),
+            on_yours: rgb(0x16233a).into(),
             popover: rgb(0x25272b).into(),
             foreground: rgb(0xeeeeef).into(),
             border: rgba(0xffffff18).into(),
         }
     } else {
         Palette {
-            blocked: rgb(0xe0533f).into(),
-            background: rgb(0xffffff).into(),
+            yours: rgb(0xffcf70).into(),
+            on_yours: rgb(0x16233a).into(),
             popover: rgb(0xffffff).into(),
             foreground: rgb(0x1d1e20).into(),
             border: rgba(0x00000018).into(),
@@ -825,7 +1226,26 @@ fn open_orb(tower: Entity<Tower>, cx: &mut App) -> Option<WindowHandle<Orb>> {
         cx.new(|cx| Orb::new(tower, window, cx))
     });
     match r {
-        Ok(h) => Some(h),
+        Ok(h) => {
+            if let Some(spot) = show_from_start() {
+                let _ = h.update(cx, |orb, _, cx| {
+                    orb.open_panel(true, cx);
+                    if let Some(p) = orb.panel.as_mut() {
+                        p.held = true;
+                        // (AppKit keeps a window it orders in on the screen: a spot off it is set after.)
+                        if let Some((x, y)) = spot {
+                            (p.frame.x, p.frame.y) = (x, y);
+                            let _ = p.handle.update(cx, |_, window, _| {
+                                if let Some(w) = mac::Win::of(window) {
+                                    w.set_origin(x, y);
+                                }
+                            });
+                        }
+                    }
+                });
+            }
+            Some(h)
+        }
         Err(e) => {
             eprintln!("[orb] opening the window: {e:#}");
             None
@@ -836,6 +1256,9 @@ fn open_orb(tower: Entity<Tower>, cx: &mut App) -> Option<WindowHandle<Orb>> {
 fn close_orb(h: WindowHandle<Orb>, cx: &mut App) {
     let _ = h.update(cx, |orb, window, cx| {
         orb.close_caption(cx);
+        if orb.peeking(cx) {
+            orb.close_panel(false, cx);
+        }
         window.remove_window();
     });
 }
@@ -855,6 +1278,15 @@ pub fn run(ui_dir: Option<PathBuf>) -> Result<()> {
         mac::accessory_app();
         let tower = cx.new(|_| Tower::new(&ui_dir));
         let orb = Rc::new(RefCell::new(open_orb(tower.clone(), cx)));
+        if let Some((scope, filter, spot)) = window_from_start() {
+            tower.update(cx, |t, _| {
+                t.nav.go(scope);
+                t.nav.rec_filter = filter.or(t.nav.rec_filter.take());
+                t.nav.goal = from_start_goal();
+            });
+            let beside = orb.borrow().as_ref().and_then(|h| h.update(cx, |orb, _, _| orb.panel.as_ref().map(|p| p.frame)).ok().flatten());
+            open_full(&tower, None, beside, spot, false, cx);
+        }
 
         // The daemon rewrites one file whenever something changes.
         let (tx, mut changed) = mpsc::unbounded::<()>();

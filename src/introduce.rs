@@ -51,13 +51,17 @@ impl Member {
         }
     }
 
-    /// What to call it: its name, else its folder's.
+    /// What to call it, as it is called everywhere else (`crate::names`):
+    /// its name within its space (`b2c-sdk` in "B2C" is `sdk`), else the
+    /// project it works on (`eyz/eyz-mediaroom-serverless` is `mediaroom
+    /// serverless`), else its address.
     pub fn label(&self) -> String {
-        if !self.name.is_empty() {
-            return self.name.clone();
+        let space = Some(self.space.trim()).filter(|s| !s.is_empty());
+        let named = crate::names::session_label(space, &self.name);
+        if !named.is_empty() {
+            return named;
         }
-        let f = self.folder.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-        if f.is_empty() { format!("the session at {}", self.address) } else { format!("Claude in {f}") }
+        crate::names::project(&serde_json::json!({ "cwd": self.folder })).unwrap_or_else(|| format!("the session at {}", self.address))
     }
 }
 
@@ -80,14 +84,15 @@ pub fn member_of(listed: &Value, full: Option<&Value>) -> Option<Member> {
         return None;
     }
     let name = crate::hc::name(t).or_else(|| crate::hc::name(listed)).unwrap_or("").to_string();
-    if is_tower(&name) {
+    // The tower's own, and a space's own brain, are never introduced as sessions.
+    if is_tower(&name) || crate::brain::brain_of(t).is_some() || crate::brain::brain_of(listed).is_some() {
         return None;
     }
     let place = listed["labels"]["where"].as_str().or_else(|| listed["where"].as_str()).or_else(|| t["labels"]["where"].as_str())?;
     let space = place.split(" / ").next().map(str::trim).filter(|s| !s.is_empty())?.to_string();
     let folder = t["foreground"]["cwd"].as_str().or_else(|| t["cwd"].as_str()).or_else(|| listed["cwd"].as_str()).unwrap_or("").to_string();
     // The tower's own folder (the brain) is never a member, whatever its name.
-    if Path::new(&folder).starts_with(crate::config::brain_dir()) {
+    if crate::brains::is_brain_folder(&folder) {
         return None;
     }
     Some(Member { address: listed["address"].as_str()?.to_string(), name, folder, space, created_ms: crate::hc::created_ms(t), task: String::new() })
@@ -308,7 +313,8 @@ pub fn compose(space: &str, to: &Member, members: &[Member]) -> String {
         out += &format!("- {} ({}), in {}: {task}\n", m.label(), m.address, tilde(&m.folder));
     }
     out += "Talk to them when you need their help, and ask for changes in their layer instead of editing their repos. \
-        To hand one a message: tower queue <address> \"<complete message>\". To look at one: hc read <address> --lines 60. \
+        To hand one a message: tower queue <address> \"<complete message>\" (the tower adds your name to it, so don't write who it is from; \
+        it waits until that session is free). To look at one: hc read <address> --lines 60. \
         Nothing to answer here: carry on with your work.";
     out
 }
@@ -489,11 +495,16 @@ mod tests {
         b.task = "Add the chat widget's new event to the SDK".into();
         let c = Member { name: String::new(), folder: "/w/eyzflow".into(), ..m("t3", "B2C") };
         let text = compose("B2C", &a, &[a.clone(), b.clone(), c.clone()]);
-        assert!(text.starts_with("[tower] You are b2c-mediaroom (t1) in the Herdr space \"B2C\". 2 other Claude sessions are open"), "{text}");
-        assert!(text.contains("- b2c-sdk (t2), in /w/t2: working on: Add the chat widget's new event to the SDK"), "{text}");
-        assert!(text.contains("- Claude in eyzflow (t3), in /w/eyzflow: no task reported yet"), "{text}");
+        // Each as it is called everywhere else: its name within the space, or the project it works on.
+        assert!(text.starts_with("[tower] You are mediaroom (t1) in the Herdr space \"B2C\". 2 other Claude sessions are open"), "{text}");
+        assert!(text.contains("- sdk (t2), in /w/t2: working on: Add the chat widget's new event to the SDK"), "{text}");
+        assert!(text.contains("- eyzflow (t3), in /w/eyzflow: no task reported yet"), "{text}");
+        assert!(!text.contains("Claude in "), "{text}");
+        let unnamed = Member { name: String::new(), folder: "/Users/me/Work/eyz/eyz-mediaroom-serverless".into(), ..m("t4", "B2C") };
+        assert_eq!((unnamed.label(), Member { name: String::new(), folder: String::new(), ..m("t5", "B2C") }.label()), ("mediaroom serverless".to_string(), "the session at t5".to_string()));
         assert!(!text.contains("(t1),"), "not itself");
         assert!(text.contains("tower queue <address> \"<complete message>\"") && text.contains("hc read <address> --lines 60"));
+        assert!(text.contains("the tower adds your name to it"), "{text}");
         assert!(text.contains("ask for changes in their layer instead of editing their repos"));
         assert!(compose("B2C", &a, &[a.clone(), b]).contains("1 other Claude session is open"));
     }

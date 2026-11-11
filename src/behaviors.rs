@@ -17,8 +17,30 @@ use serde_json::{Value, json};
 pub const CATEGORIES: &[&str] =
     &["Talking", "Sessions", "Spaces and focus", "Accounts", "Releases and safety", "Questions 90/10", "Screenshots", "Browsers", "Misc"];
 
-/// The fixed part of the brain's instructions: read-only.
+/// The fixed part of the brain's instructions: read-only. A line that
+/// starts with `{quiet} ` or `{everything} ` is for those levels only (how
+/// much the tower tells the user: see `tell`); `core_at` gives the text for one.
 pub const CORE: &str = include_str!("../assets/tower-core.md");
+
+const QUIET_LINE: &str = "{quiet}";
+const LOUD_LINE: &str = "{everything}";
+
+/// The core as the brain reads it at `level`: what a note from the tower is
+/// (news to tell, or news for the record) differs.
+pub fn core_at(level: crate::tell::Level) -> String {
+    let mut out: Vec<&str> = vec![];
+    for line in CORE.lines() {
+        let (only, rest) = match (line.strip_prefix(QUIET_LINE), line.strip_prefix(LOUD_LINE)) {
+            (Some(rest), _) => (Some(true), rest),
+            (_, Some(rest)) => (Some(false), rest),
+            _ => (None, line),
+        };
+        if only.is_none_or(|quiet| quiet == level.quiet()) {
+            out.push(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+    }
+    out.join("\n")
+}
 
 const BUILTIN: &[&str] = &[
     include_str!("../assets/behaviors/heard-not-read.md"),
@@ -393,7 +415,12 @@ impl Store {
 
     /// The brain's instructions: the core, then every enabled behavior by category.
     pub fn prompt(&self) -> String {
-        let mut s = format!("{GENERATED}\n\n{}\n\n# Behaviors\n", CORE.trim());
+        self.prompt_at(crate::tell::level())
+    }
+
+    /// The instructions at a level (see `core_at`).
+    pub fn prompt_at(&self, level: crate::tell::Level) -> String {
+        let mut s = format!("{GENERATED}\n\n{}\n\n# Behaviors\n", core_at(level).trim());
         let list = self.list();
         let mut last = String::new();
         for b in list.iter().filter(|b| b.enabled) {
@@ -464,8 +491,11 @@ pub fn caller() -> &'static str {
     if me.is_empty() {
         return "user";
     }
-    let brain = crate::hc::get(&crate::brain::name()).and_then(|t| t["address"].as_str().map(String::from)).unwrap_or_default();
-    if me == brain { "brain" } else { "user" }
+    // The main brain, or a space's own.
+    match crate::hc::get(&me) {
+        Some(t) if crate::brain::brain_of(&t).is_some() => "brain",
+        _ => "user",
+    }
 }
 
 /// What the UIs show: the categories, every behavior, the fixed core, a summary.
@@ -474,7 +504,7 @@ pub fn listing() -> Value {
     json!({
         "categories": CATEGORIES,
         "behaviors": store.list(),
-        "core": { "title": "How the tower works (fixed)", "text": CORE, "read_only": true },
+        "core": { "title": "How the tower works (fixed)", "text": core_at(crate::tell::level()), "read_only": true },
         "summary": store.summary(),
     })
 }
@@ -698,6 +728,70 @@ mod tests {
         assert!(p.contains("ESCALATE (the 10%)"), "the 90/10 lists are a behavior");
         let sum = s.summary();
         assert_eq!(sum["count"], BUILTIN.len() + 1);
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn the_core_says_what_a_note_is_at_each_level() {
+        use crate::tell::Level;
+        let loud = core_at(Level::Everything);
+        let quiet = core_at(Level::Decisions);
+        assert_eq!(quiet, core_at(Level::Results), "one text for both quiet levels");
+        for text in [&loud, &quiet] {
+            assert!(!text.contains(QUIET_LINE) && !text.contains(LOUD_LINE), "the markers never reach the brain");
+            assert!(text.contains("# You are the tower") && text.contains("## Behaviors: how the user wants you to work"));
+            assert!(text.contains("tower tell"), "it can change the level when the user says so");
+        }
+        // Telling everything: a note is news to tell, as it always was.
+        assert!(loud.contains("note: news. Tell the user what happened, briefly"));
+        assert!(loud.contains("Never answer one with silence toward the user unless you fixed it yourself."));
+        assert!(!loud.contains("Notes are for the record") && !loud.contains("tower raise"));
+        // A quiet level: a note is for the record, answered only by acting.
+        assert!(quiet.contains("news for the record, not for the user"));
+        assert!(!quiet.contains("Tell the user what happened") && !quiet.contains("Never answer one with silence toward the user"));
+        for cmd in ["tower job done", "tower agenda verify", "tower raise <t> --why", "tower receipt --agenda <id>", "tower thread"] {
+            assert!(quiet.contains(cmd), "{cmd}");
+        }
+        // What needs the user is a decision, told once, at every level; an idle session isn't one.
+        for text in [&loud, &quiet] {
+            assert!(text.contains("## Decisions: what only the user can decide") && text.contains("tower decisions [--space <space>]"));
+            assert!(text.contains("The user is told of it once") && text.contains("Never tell it again"));
+            assert!(text.contains("An idle session is not a decision"));
+            assert!(text.contains("tower answer <id> --choice <n>") && text.contains("tower dismiss <id>"));
+        }
+        // A quiet level: the tower's own decisions aren't raised again, and a session's message to the brain is a note.
+        assert!(quiet.contains("never raise what the tower put there itself") && quiet.contains("`[watch]`, `[queue]`, `[agenda]`, `[session]` or `[space]` note"));
+        assert!(quiet.contains("Messages that start with `[session]` come from a session that wrote to you"));
+        assert!(!loud.contains("come from a session that wrote to you"), "telling everything, a session's instruction to the brain is handled as it was");
+        assert!(loud.contains("Messages that start with `[session]` come from another tower handing you something"), "one tower writes to another at every level");
+        // Each space has a tower of its own, and the model they all run on is the user's choice: said at every level.
+        for text in [&loud, &quiet] {
+            assert!(text.contains("## Each space has a tower of its own") && text.contains("a terminal named `tower-<space>`"));
+            assert!(text.contains("`tower queue tower-<space> \"<what>\"`") && text.contains("Never start, stop or restart a tower yourself"));
+            assert!(text.contains("tower model <claude-fable-5-2|claude-opus-5-5|claude-sonnet-5-5|claude-haiku-5-5> [--effort <low|medium|high|xhigh|max>]"));
+            assert!(text.contains("in the panel's Settings (\"Tower's model\")") && text.contains("Never type `/model` or `/effort` into a tower"));
+            assert!(text.contains("the message names it"), "a brain reads its own file again, whichever it is");
+        }
+        // A space is a mission with an end: launched in one command, closed only on the user's word.
+        for text in [&loud, &quiet] {
+            assert!(text.contains("## Spaces are missions: a goal and an end") && text.contains("tower launch \"<the goal, in the user's words>\""));
+            assert!(text.contains("it asks nothing, and neither do you"));
+            for cmd in ["tower space goal <space>", "tower space standing <space> on", "tower space close <space>", "tower space report \"<space>\"", "tower missions", "tower setups"] {
+                assert!(text.contains(cmd), "{cmd}");
+            }
+            assert!(text.contains("Closing is the user's word, never yours") && text.contains(".tower-worktrees/<space>/<project>"));
+        }
+        // Its closing report is asked for in a note: written down at a quiet level, also told when the tower tells everything.
+        assert!(quiet.contains("Messages that start with `[space]` come from the tower") && quiet.contains("and write nothing. Don't close the space."));
+        assert!(loud.contains("tell the user in one line that the space is ready to close"));
+        // The built-in behaviors never tell the brain to answer a note with words for the user.
+        let s = store("levels");
+        s.seed().unwrap();
+        let p = s.prompt_at(Level::Decisions);
+        assert!(p.contains("## Notes are for the record") && p.contains("the way \"What to do with a message\" says a note is answered"));
+        assert!(p.contains("one decision per repo and space") && p.contains("tower space mute <space>") && p.contains("answers every session that asks it at once"));
+        assert!(s.prompt_at(Level::Everything).contains("note: news. Tell the user what happened, briefly"));
+        assert!(p.contains("tower space goal <space> \"<its goal>\"") && p.contains("Closing a space (`tower space close`) ends its sessions: only on the user's word."));
         let _ = std::fs::remove_dir_all(&s.dir);
     }
 

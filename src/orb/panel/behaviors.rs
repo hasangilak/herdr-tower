@@ -1,11 +1,11 @@
 //! Behaviors: how the tower works, as rules the user reads and changes (see
-//! `crate::behaviors`). A screen reached from Settings and from the chat's
-//! behavior cards: the categories as sections, each behavior a card (title,
-//! one line, where it came from, a switch), its full text one tap away with
-//! Edit (a preview of what changes before Save), Turn off, Delete and Undo;
-//! Add; a search; the fixed core folded away; the recent changes. The input
-//! at the foot tells the tower what to change, by typing or talking, as the
-//! chat does. Changes go through `behaviors::apply` and the daemon hears of
+//! `crate::behaviors`). A view of the full window, reached from Settings
+//! (W18 in the design): the categories as sections, each behavior a card
+//! (title, one line, where it came from, a switch), its full text one tap
+//! away with Edit (a preview of what changes before Save), Turn off, Delete
+//! and Undo; Add; a search; the fixed core folded away; the recent changes.
+//! The input at the foot tells the tower what to change, by typing or
+//! talking. Changes go through `behaviors::apply` and the daemon hears of
 //! them (`Request::BehaviorsChanged`), as from the terminal or the phone.
 
 use std::time::SystemTime;
@@ -14,7 +14,7 @@ use gpui::{AnyElement, Context, Entity, FontWeight, Hsla, SharedString, Window, 
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 
-use super::{NAVY, PALE, Panel, ROSE, View, ago, glass};
+use super::{NAVY, PALE, Panel, ROSE, ago, glass};
 use crate::behaviors::{Behavior, Change, Op, Patch};
 
 /// Where a behavior came from, in a word.
@@ -119,9 +119,14 @@ pub(super) struct BehaviorsUi {
 }
 
 impl BehaviorsUi {
-    /// Writing one: the editor has the room, not the chat input.
+    /// Writing one: the editor has the room, not the input.
     pub(super) fn editing(&self) -> bool {
         self.edit.is_some()
+    }
+
+    /// How many are on, and how many there are.
+    pub(super) fn counts(&self) -> (usize, usize) {
+        (self.list.iter().filter(|b| b.enabled).count(), self.list.len())
     }
 }
 
@@ -143,17 +148,13 @@ fn read_all() -> (Vec<Behavior>, Vec<String>, String, Vec<Change>) {
 }
 
 impl Panel {
-    /// Opens the screen (from Settings, or a chat card naming `title`).
-    pub(super) fn show_behaviors(&mut self, title: Option<String>, cx: &mut Context<Self>) {
-        self.phone_leave();
-        self.view = View::Behaviors;
+    /// The view opens (from Settings): on the list, read anew.
+    pub(super) fn open_behaviors(&mut self, cx: &mut Context<Self>) {
         self.behaviors.edit = None;
         self.behaviors.confirm_delete = None;
         self.behaviors.open = None;
-        self.behaviors.want = title;
         self.behaviors.stamp = None;
         self.behaviors_tick(cx);
-        cx.notify();
     }
 
     /// Each second while the screen shows: a change from the brain, the
@@ -195,7 +196,7 @@ impl Panel {
         let task = cx.background_executor().spawn(async move {
             let (_, change) = crate::behaviors::apply(op, "user")?;
             let view = change.view();
-            let _ = crate::protocol::send(&crate::protocol::Request::BehaviorsChanged { by: "user".into(), change: view });
+            let _ = crate::protocol::send(&crate::protocol::Request::BehaviorsChanged { by: "user".into(), change: view, from: None });
             anyhow::Ok(change.id)
         });
         cx.spawn(async move |this, cx| {
@@ -268,30 +269,8 @@ impl Panel {
         }
     }
 
-    /// The panel's Settings entry.
-    pub(super) fn behaviors_entry(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let g = glass();
-        let s = self.tower.read(cx).s("behaviors").clone();
-        let line = match (s["enabled"].as_u64(), s["count"].as_u64()) {
-            (Some(on), Some(n)) => format!("{on} of {n} on: how the tower talks, works and decides"),
-            _ => "How the tower talks, works and decides".to_string(),
-        };
-        v_flex()
-            .id("behaviors-entry")
-            .px_3()
-            .py_2()
-            .gap(px(2.0))
-            .rounded(px(14.0))
-            .cursor_pointer()
-            .bg(g.bubble_tower)
-            .hover(|s| s.bg(rgba(0xffffff33)))
-            .child(h_flex().child(div().flex_1().text_sm().font_weight(FontWeight::MEDIUM).child("Behaviors")).child(div().text_sm().child("›")))
-            .child(div().text_xs().text_color(g.muted).child(line))
-            .on_click(cx.listener(|this, _, _, cx| this.show_behaviors(None, cx)))
-            .into_any_element()
-    }
-
-    pub(super) fn behaviors_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// The view's body: the list, one behavior, or the editor.
+    pub(super) fn behaviors_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if self.behaviors.search.is_none() {
             self.behaviors.search = Some(cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 1).placeholder("Search behaviors")));
         }
@@ -302,13 +281,7 @@ impl Panel {
         } else {
             self.behavior_list(cx)
         };
-        div()
-            .id("behaviors")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .child(v_flex().w_full().px_5().pb_3().gap_2().children(items))
-            .into_any_element()
+        vec![v_flex().w_full().gap_2().children(items).into_any_element()]
     }
 
     fn note_line(&self) -> Option<AnyElement> {
@@ -318,43 +291,31 @@ impl Panel {
     fn behavior_list(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let g = glass();
         let mut out: Vec<AnyElement> = vec![];
-        let on = self.behaviors.list.iter().filter(|b| b.enabled).count();
-        out.push(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(link("behaviors-back", "‹ Settings").on_click(cx.listener(|this, _, _, cx| {
-                    this.view = View::Phone;
-                    cx.notify();
-                })))
-                .child(div().flex_1())
-                .when(!self.behaviors.history.is_empty(), |el| {
-                    el.child(link("behaviors-undo", "Undo").on_click(cx.listener(|this, _, _, cx| this.behaviors_apply(Op::Undo, "Undone.", cx))))
-                })
-                .child(pill("behaviors-add", "+ Add", true).on_click(cx.listener(|this, _, window, cx| this.start_edit(None, window, cx))))
-                .into_any_element(),
-        );
-        out.push(
-            v_flex()
-                .gap(px(2.0))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .items_baseline()
-                        .child(div().text_xl().font_weight(FontWeight::MEDIUM).child("Behaviors"))
-                        .child(div().text_sm().text_color(g.muted).child(format!("{on} of {} on", self.behaviors.list.len()))),
-                )
-                .child(div().text_sm().text_color(g.muted).child("How the tower works, as rules you can read and change. Tap one, or tell the tower below."))
-                .into_any_element(),
-        );
+        // The search, with Undo and Add beside it (the view's head says the rest).
+        let tools = h_flex()
+            .flex_none()
+            .gap_2()
+            .items_center()
+            .when(!self.behaviors.history.is_empty(), |el| {
+                el.child(link("behaviors-undo", "Undo").on_click(cx.listener(|this, _, _, cx| this.behaviors_apply(Op::Undo, "Undone.", cx))))
+            })
+            .child(pill("behaviors-add", "+ Add", true).on_click(cx.listener(|this, _, window, cx| this.start_edit(None, window, cx))));
         if let Some(search) = &self.behaviors.search {
             out.push(
-                div()
-                    .px_3()
-                    .py(px(4.0))
-                    .rounded_full()
-                    .bg(g.pill)
-                    .child(Textarea::new(search).appearance(false).bordered(false).small().w_full().text_size(px(14.0)).text_color(g.pill_text))
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px_3()
+                            .py(px(4.0))
+                            .rounded_full()
+                            .bg(g.pill)
+                            .child(Textarea::new(search).appearance(false).bordered(false).small().w_full().text_size(px(14.0)).text_color(g.pill_text)),
+                    )
+                    .child(tools)
                     .into_any_element(),
             );
         }
@@ -693,39 +654,6 @@ impl Panel {
         out
     }
 
-    /// A behavior change in the chat: what changed, and the way to the screen.
-    pub(super) fn behavior_chat_card(&mut self, e: &crate::history::Entry, cx: &mut Context<Self>) -> AnyElement {
-        let g = glass();
-        let diff = e.diff.clone().unwrap_or_default();
-        // "Changed a behavior: Screenshots" -> its title.
-        let title = e.text.split_once(": ").map(|(_, t)| t.to_string());
-        h_flex()
-            .w_full()
-            .justify_center()
-            .child(
-                v_flex()
-                    .id(SharedString::from(format!("behavior-chat-{}", e.at)))
-                    .w(px(super::W * 0.86))
-                    .px_3()
-                    .py_2()
-                    .gap_1()
-                    .rounded(px(14.0))
-                    .cursor_pointer()
-                    .bg(rgba(0xffffff1f))
-                    .hover(|s| s.bg(rgba(0xffffff2e)))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .text_xs()
-                            .child(div().flex_1().min_w_0().text_color(g.text).child(e.text.clone()))
-                            .child(div().flex_none().text_color(g.faint).child(super::clock(e.at))),
-                    )
-                    .children(diff_block(&diff_excerpt(&diff, 1, 8)))
-                    .child(div().text_xs().text_color(g.muted).child("Behaviors ›"))
-                    .on_click(cx.listener(move |this, _, _, cx| this.show_behaviors(title.clone(), cx))),
-            )
-            .into_any_element()
-    }
 }
 
 fn section(title: &str) -> AnyElement {

@@ -91,6 +91,14 @@ pub struct AgentSession {
     pub event_ms: u64,
     #[serde(default)]
     pub started_ms: u64,
+    /// The git worktree the tower gave it for its space, its branch and its
+    /// dev port (`crate::worktrees`; from its terminal's labels).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 /// What an event changed, for the radar and the send queue.
@@ -163,7 +171,16 @@ impl Sessions {
         let s = b.sessions.entry(ev.terminal.clone()).or_default();
         // Another agent session in the same terminal starts over.
         if !ev.session_id.is_empty() && s.session_id != ev.session_id {
-            *s = AgentSession { terminal: ev.terminal.clone(), session_id: ev.session_id.clone(), started_ms: now, ..Default::default() };
+            // Where it works is its terminal's, not the agent session's.
+            *s = AgentSession {
+                terminal: ev.terminal.clone(),
+                session_id: ev.session_id.clone(),
+                started_ms: now,
+                worktree: s.worktree.take(),
+                branch: s.branch.take(),
+                port: s.port.take(),
+                ..Default::default()
+            };
         }
         // An event older than what we have (a spooled one) only fills gaps.
         let stale = now < s.event_ms;
@@ -233,6 +250,18 @@ impl Sessions {
 
     pub fn all(&self) -> Vec<AgentSession> {
         self.lock().sessions.values().cloned().collect()
+    }
+
+    /// The worktree, branch and dev port the tower gave the session in
+    /// `terminal` (a session its hooks haven't told of yet isn't made here).
+    pub fn place(&self, terminal: &str, worktree: Option<&str>, branch: Option<&str>, port: Option<u16>) {
+        let mut b = self.lock();
+        let Some(s) = b.sessions.get_mut(terminal) else { return };
+        let given = (worktree.map(String::from), branch.map(String::from), port);
+        if (s.worktree.clone(), s.branch.clone(), s.port) != given {
+            (s.worktree, s.branch, s.port) = given;
+            self.save(&b);
+        }
     }
 
     /// The terminal is gone (Herdr removed it): its session goes too, so a
@@ -309,6 +338,38 @@ mod tests {
         let p = std::env::temp_dir().join(format!("tower-sessions-{}-{n}.json", std::process::id()));
         let _ = std::fs::remove_file(&p);
         (Sessions::at(p.clone()), p)
+    }
+
+    /// Where a session works (its worktree, its dev port) is its
+    /// terminal's: kept through another agent session in the same terminal,
+    /// in the file, and gone with the terminal.
+    #[test]
+    fn what_the_tower_gave_a_session_is_kept_with_it() {
+        let (r, p) = reg();
+        let t0 = crate::history::now_ms();
+        r.place("t5", Some("/w/.tower-worktrees/shop/app"), Some("shop/app"), Some(3004));
+        assert!(r.get("t5").is_none(), "its hooks haven't told of it yet: nothing is made up");
+        r.apply(&ev("start", "", t0));
+        r.place("t5", Some("/w/.tower-worktrees/shop/app"), Some("shop/app"), Some(3004));
+        let s = r.get("t5").unwrap();
+        assert_eq!((s.worktree.as_deref(), s.branch.as_deref(), s.port), (Some("/w/.tower-worktrees/shop/app"), Some("shop/app"), Some(3004)));
+        // Another agent session in that terminal (`/clear`, a restart): the same place.
+        let mut again = ev("start", "", t0 + 10);
+        again.session_id = "s2".into();
+        r.apply(&again);
+        let s = r.get("t5").unwrap();
+        assert_eq!((s.session_id.as_str(), s.worktree.as_deref(), s.port), ("s2", Some("/w/.tower-worktrees/shop/app"), Some(3004)));
+        // Kept across a restart of the voice, and `tower sessions` carries it.
+        let back = Sessions::at(p.clone());
+        assert_eq!(back.get("t5").unwrap().port, Some(3004));
+        let v = serde_json::to_value(back.get("t5").unwrap()).unwrap();
+        assert_eq!((v["worktree"].as_str(), v["branch"].as_str(), v["port"].as_u64()), (Some("/w/.tower-worktrees/shop/app"), Some("shop/app"), Some(3004)));
+        // One that was given nothing says nothing of it.
+        r.apply(&AgentEvent { terminal: "t6".into(), ..ev("start", "", t0) });
+        assert!(serde_json::to_value(r.get("t6").unwrap()).unwrap().get("worktree").is_none());
+        r.forget("t5");
+        assert!(r.get("t5").is_none());
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

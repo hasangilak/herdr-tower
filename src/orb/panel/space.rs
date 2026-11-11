@@ -1,0 +1,489 @@
+//! One space in the full window (`docs/quiet-tower.md`, "Step 5 and 8"; W5 to
+//! W8 in the design): a mission with its own tower.
+//!
+//! - **The head**: its name, its sessions and that it has a tower of its own;
+//!   its goal and what counts as done, or that it is a standing space; and
+//!   its switches. **Follow**: its results reach the user as they land.
+//!   **Mute**: its decisions stay here, off the orb's count and out of the
+//!   main queue. Each says what it does, in a line, while it is on.
+//! - **The goal** can be changed here (the goal, done when, standing). A
+//!   space with no goal is the user's own: it has no end, and its sessions
+//!   get no worktrees.
+//! - **The closing report**, when its goal is met, with "Close this space"
+//!   (and when it closes by itself). A close the tower refuses, because a
+//!   session there still works, says so and offers "Close anyway".
+//! - **Needs you**: its own queue, the open card answered by the number keys.
+//! - **Requests**, each with how far it is; **Sessions**, each with its
+//!   status, its last words, its worktree, branch and port, a click away
+//!   from its own view; the thread **between its sessions**.
+//! - The input below goes to this space's tower when it has one that runs
+//!   (`cli::ask` with the space: `tower ask --space`), else to the main
+//!   tower with the space named.
+//!
+//! What it sets goes through `tower space …` (`window::run`): a switch shows
+//! at once and goes back, with the command's error, if the tower refuses it.
+
+use gpui::{AnyElement, App, Context, Entity, FontWeight, SharedString, Window, div, prelude::*, px, rgb, rgba};
+use gpui_kit::component::input::{RopeExt as _, TextareaState};
+use gpui_kit::component::{h_flex, v_flex};
+
+use super::home::{CARD, LINE, SOFT, acts_row, bay_label, cstat, empty_box, mbtn, sign, tg};
+use super::launch::field;
+use super::session::last_words;
+use super::window::{bay, eff, lrow, mark_box, named, nm, pg, whead};
+use super::{AMBER, CYAN, Panel, glass};
+use crate::orb::model::{self, Chip, Decision, Member, Mission, Missions};
+use crate::orb::nav::Scope;
+
+/// How many of the thread's messages a space's view shows (the latest).
+const THREAD_ROWS: usize = 5;
+
+/// A space's goal while it is being changed.
+pub(super) struct GoalEdit {
+    space: String,
+    goal: Entity<TextareaState>,
+    done_when: Entity<TextareaState>,
+    standing: bool,
+}
+
+/// A session's mark in its row: a pulse at work, amber while it waits, a tick at rest.
+fn session_mark(status: &str, key: String) -> AnyElement {
+    match status {
+        "working" => sign(Chip::Working, 22.0, key),
+        "blocked" => mark_box(Some(div().size(px(9.0)).rounded_full().bg(rgb(AMBER)).into_any_element())).into_any_element(),
+        _ => sign(Chip::Done, 22.0, key),
+    }
+}
+
+/// A session's status as its row says it.
+pub(super) fn status_word(status: &str) -> &str {
+    match status {
+        "" => "idle",
+        "blocked" => "waits",
+        other => other,
+    }
+}
+
+/// `Closing stops its 2 sessions and removes their worktrees…`, and when
+/// it closes by itself (`closes`: `in 5 h`), if it does.
+fn closing_line(sessions: usize, closes: Option<&str>) -> String {
+    let stops = match sessions {
+        0 => "Closing archives it".to_string(),
+        1 => "Closing stops its session and removes its worktree".to_string(),
+        n => format!("Closing stops its {n} sessions and removes their worktrees"),
+    };
+    let alone = match closes {
+        Some(when) => format!(" Left alone, it closes by itself {when}."),
+        None => String::new(),
+    };
+    format!("{stops} (one with work that isn’t committed or pushed is kept).{alone}")
+}
+
+/// `1 session`, `3 worktrees`.
+fn counted(n: usize, one: &str) -> String {
+    if n == 1 { format!("1 {one}") } else { format!("{n} {one}s") }
+}
+
+/// What `tower space close` printed (its receipt, as JSON) in a few
+/// sentences: what ended, what was removed, what was kept and why.
+pub(super) fn closed_line(name: &str, out: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(out).unwrap_or_default();
+    if !v.is_object() {
+        // Not the receipt: what it said, as it said it.
+        let said = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ");
+        return if said.is_empty() { format!("{name} is closed.") } else { said };
+    }
+    let list = |k: &str| v[k].as_array().cloned().unwrap_or_default();
+    let mut parts = vec![format!("{} is closed.", v["closed"].as_str().unwrap_or(name))];
+    match list("sessions_ended").len() {
+        0 => {}
+        n => parts.push(format!("{} ended.", counted(n, "session"))),
+    }
+    for t in list("sessions_left") {
+        let who = t["name"].as_str().filter(|n| !n.is_empty()).or(t["address"].as_str()).unwrap_or("A session");
+        parts.push(format!("{who} still runs: {}.", t["why"].as_str().unwrap_or("it couldn’t be ended").trim_end_matches('.')));
+    }
+    match list("worktrees_removed").len() {
+        0 => {}
+        n => parts.push(format!("{} removed (the branches stay).", counted(n, "worktree"))),
+    }
+    for w in list("kept_worktrees") {
+        let what = w["branch"].as_str().filter(|b| !b.is_empty()).or(w["path"].as_str()).unwrap_or("one");
+        parts.push(format!("The worktree {what} is kept: {}.", w["why"].as_str().unwrap_or("it has work in it").trim_end_matches('.')));
+    }
+    parts.push(if v["report"].as_str().is_some_and(|r| !r.trim().is_empty()) { "Its closing report is in Record.".into() } else { "It had no closing report.".to_string() });
+    parts.join(" ")
+}
+
+/// The tower refused to close a space because a session there still works
+/// or waits (`--force` would close it anyway).
+pub(super) fn refused_close(error: &str) -> bool {
+    error.contains("--force")
+}
+
+impl Panel {
+    /// A field of the goal's editor has the keyboard: digits are text there.
+    pub(super) fn editing_goal(&self, window: &Window, cx: &App) -> bool {
+        let Some(edit) = self.full.as_ref().and_then(|f| f.edit.as_ref()) else { return false };
+        [&edit.goal, &edit.done_when].iter().any(|f| gpui::Focusable::focus_handle(f.read(cx), cx).is_focused(window))
+    }
+
+    /// Opens the goal's editor on a space, or closes it.
+    fn toggle_goal(&mut self, m: &Mission, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(full) = self.full.as_mut() else { return };
+        if full.edit.take().is_some_and(|e| e.space == m.name) {
+            return cx.notify();
+        }
+        let mut make = |text: &str, hint: &'static str| {
+            let f = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 3).placeholder(hint));
+            let text = text.to_string();
+            f.update(cx, |s, cx| {
+                // What is there, with the caret after it.
+                s.set_value(text, window, cx);
+                let end = s.text().offset_to_position(s.text().len());
+                s.set_cursor_position(end, window, cx);
+            });
+            f
+        };
+        let goal = make(&m.goal, "What it should get done");
+        let done_when = make(&m.done_when, "What counts as done");
+        goal.update(cx, |s, cx| s.focus(window, cx));
+        if let Some(full) = self.full.as_mut() {
+            full.notes.remove(&format!("space:{}", m.name));
+            full.edit = Some(GoalEdit { space: m.name.clone(), goal, done_when, standing: m.standing });
+        }
+        cx.notify();
+    }
+
+    /// Saves what the editor holds: `tower space goal`, then `tower space
+    /// standing` if that changed. The editor closes once both went.
+    fn save_goal(&mut self, was: &Mission, cx: &mut Context<Self>) {
+        let Some(edit) = self.full.as_ref().and_then(|f| f.edit.as_ref()) else { return };
+        let (space, standing) = (edit.space.clone(), edit.standing);
+        let goal = edit.goal.read(cx).value().trim().to_string();
+        let done_when = edit.done_when.read(cx).value().trim().to_string();
+        let place = format!("space:{space}");
+        let mut commands: Vec<Vec<String>> = vec![];
+        if goal != was.goal.trim() || done_when != was.done_when.trim() {
+            let mut args = vec!["space".to_string(), "goal".into(), space.clone(), goal];
+            // (Given whenever it changed: an empty one clears what was there.)
+            if done_when != was.done_when.trim() {
+                args.extend(["--done-when".to_string(), done_when]);
+            }
+            commands.push(args);
+        }
+        if standing != was.standing {
+            commands.push(vec!["space".into(), "standing".into(), space.clone(), if standing { "on" } else { "off" }.into()]);
+        }
+        self.run_all(place, commands, cx);
+    }
+
+    /// Runs the commands one after another for `place`; the first that fails
+    /// stops them (its error shows there), and when all went the editor closes.
+    fn run_all(&mut self, place: String, mut commands: Vec<Vec<String>>, cx: &mut Context<Self>) {
+        if commands.is_empty() {
+            if let Some(full) = self.full.as_mut() {
+                full.edit = None;
+            }
+            return cx.notify();
+        }
+        let first = commands.remove(0);
+        let again = place.clone();
+        self.run(&place, first, cx, move |this, result, cx| {
+            if result.is_ok() {
+                this.run_all(again, commands, cx);
+            }
+        });
+    }
+
+    /// Follow or mute a space, or stop: shown at once, and taken back with
+    /// the command's error if the tower refuses.
+    pub(super) fn set_switch(&mut self, space: &str, follow: bool, on: bool, cx: &mut Context<Self>) {
+        let place = format!("space:{space}");
+        if self.running(&place) {
+            return;
+        }
+        let verb = match (follow, on) {
+            (true, true) => "follow",
+            (true, false) => "unfollow",
+            (false, true) => "mute",
+            (false, false) => "unmute",
+        };
+        let name = space.to_string();
+        self.tower.update(cx, |t, cx| {
+            t.set_mark(&name, |m| if follow { m.follow = Some(on) } else { m.mute = Some(on) });
+            cx.notify();
+        });
+        self.run(&place, vec!["space".into(), verb.into(), space.to_string()], cx, move |this, result, cx| {
+            if result.is_err() {
+                this.tower.update(cx, |t, cx| {
+                    t.set_mark(&name, |m| if follow { m.follow = None } else { m.mute = None });
+                    cx.notify();
+                });
+            }
+        });
+    }
+
+    /// "Close this space": `tower space close` (`force`: though a session
+    /// there still works), then back to every space with what it did.
+    fn close_space(&mut self, space: &str, force: bool, cx: &mut Context<Self>) {
+        let name = space.to_string();
+        let mut args: Vec<String> = vec!["space".into(), "close".into(), space.to_string()];
+        if force {
+            args.push("--force".into());
+        }
+        self.run(&format!("space:{space}"), args, cx, move |this, result, cx| {
+            let Ok(out) = result else { return };
+            let text = closed_line(&name, out);
+            this.tower.update(cx, |t, cx| {
+                t.nav.say(Scope::All, text);
+                cx.notify();
+            });
+        });
+    }
+
+    /// A space's head and body.
+    pub(super) fn space_view(&mut self, name: &str, all: &[Decision], missions: &Missions, cx: &mut Context<Self>) -> (AnyElement, Vec<AnyElement>) {
+        let g = glass();
+        let place = format!("space:{name}");
+        let Some(m) = missions.open.iter().find(|m| m.name == name).cloned() else {
+            // Just launched: Herdr doesn't list it yet.
+            return (whead(name, vec![], None), vec![cstat("Starting: its sessions show here once they are open.", false)]);
+        };
+        let editing = self.full.as_ref().and_then(|f| f.edit.as_ref()).is_some_and(|e| e.space == name);
+        let busy = self.running(&place);
+
+        // The head.
+        // Its sessions, and its own tower when it has one (the daemon says so).
+        let mut sub = vec![div().child(match m.tower_line() { Some(line) => format!("{} · {line}", m.sub()), None => m.sub() }).into_any_element()];
+        if m.standing {
+            sub.push(div().child("A standing space: the tower never closes it and opens no worktrees here.").into_any_element());
+        } else if m.goal.trim().is_empty() {
+            sub.push(div().child("No goal: it has no end, and the tower opens no worktrees here.").into_any_element());
+        } else {
+            sub.push(named("Goal", m.goal.trim()));
+            if !m.done_when.trim().is_empty() {
+                sub.push(named("Done when", m.done_when.trim()));
+            }
+        }
+        let (m1, n1, n2) = (m.clone(), name.to_string(), name.to_string());
+        let (follow, mute) = (m.follow, m.mute);
+        let toggles = h_flex()
+            .gap(px(6.0))
+            .child(tg("space-goal", if m.goal.trim().is_empty() && !m.standing { "Set a goal" } else { "Goal" }, editing).on_click(cx.listener(move |this, _, window, cx| this.toggle_goal(&m1, window, cx))))
+            .child(tg("space-follow", "Follow", follow).on_click(cx.listener(move |this, _, _, cx| this.set_switch(&n1, true, !follow, cx))))
+            .child(tg("space-mute", "Mute", mute).on_click(cx.listener(move |this, _, _, cx| this.set_switch(&n2, false, !mute, cx))))
+            .into_any_element();
+        let head = whead(name, sub, Some(toggles));
+
+        let mut items: Vec<AnyElement> = vec![];
+        // The goal, being changed.
+        if let Some(edit) = self.full.as_ref().and_then(|f| f.edit.as_ref()).filter(|e| e.space == name) {
+            let standing = edit.standing;
+            let was = m.clone();
+            let label = |text: &str| bay_label(text).px(px(0.0));
+            items.push(
+                v_flex()
+                    .w_full()
+                    .p(px(14.0))
+                    .gap(px(12.0))
+                    .rounded(px(18.0))
+                    .bg(rgba(CARD))
+                    .border_1()
+                    .border_color(rgba(LINE))
+                    .child(v_flex().gap(px(7.0)).child(label("Goal")).child(field(&edit.goal)))
+                    .child(v_flex().gap(px(7.0)).child(label("Done when")).child(field(&edit.done_when)))
+                    .child(
+                        h_flex()
+                            .gap(px(10.0))
+                            .items_center()
+                            .child(tg("goal-standing", "Standing", standing).on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(edit) = this.full.as_mut().and_then(|f| f.edit.as_mut()) {
+                                    edit.standing = !edit.standing;
+                                }
+                                cx.notify();
+                            })))
+                            .child(div().min_w_0().text_size(px(13.0)).text_color(g.muted).child("A standing space is yours to keep: the tower never closes it.")),
+                    )
+                    .child(div().text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child(
+                        "With a goal a space is a mission: sessions the tower opens here work in their own worktrees, and it is ready to close once its requests are done.",
+                    ))
+                    .child(
+                        acts_row()
+                            .child(mbtn("goal-save", if busy { "Saving…" } else { "Save" }, true, None).when(busy, |el| el.opacity(0.5)).when(!busy, |el| {
+                                el.on_click(cx.listener(move |this, _, _, cx| this.save_goal(&was, cx)))
+                            }))
+                            .child(mbtn("goal-cancel", "Cancel", false, None).on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(full) = this.full.as_mut() {
+                                    full.edit = None;
+                                }
+                                cx.notify();
+                            }))),
+                    )
+                    .into_any_element(),
+            );
+        }
+        // What the last command for this space said, if it failed.
+        items.extend(self.said(&place));
+        if m.follow {
+            items.push(eff("Following. This space’s results reach you as they land."));
+        }
+        if m.mute {
+            items.push(eff("Muted. Its decisions stay here and leave the orb’s count and the main queue."));
+        }
+        // Its goal is met: the closing report, and the way to close it.
+        if m.ready() {
+            let (n, n2) = (name.to_string(), name.to_string());
+            let report = m.report.trim();
+            let closes = m.closes_in(crate::history::now_ms());
+            // The tower refused: a session there still works or waits.
+            let refused = self.full.as_ref().and_then(|f| f.notes.get(&place)).is_some_and(|(ok, text)| !ok && refused_close(text));
+            items.push(
+                v_flex()
+                    .w_full()
+                    .p(px(14.0))
+                    .gap(px(10.0))
+                    .rounded(px(18.0))
+                    .bg(rgba(CARD))
+                    .border_1()
+                    .border_color(rgba(LINE))
+                    .child(div().text_size(px(15.0)).font_weight(FontWeight::SEMIBOLD).child("Closing report"))
+                    .child(div().text_size(px(13.0)).line_height(px(19.0)).text_color(g.muted).child(if report.is_empty() { "Its goal is met. Its tower hasn’t written the report yet.".to_string() } else { report.to_string() }))
+                    .child(div().text_size(px(13.0)).line_height(px(19.0)).text_color(g.muted).child(closing_line(m.workers().len(), closes.as_deref())))
+                    .child(
+                        acts_row()
+                            .child(mbtn("space-close", if busy { "Closing…" } else { "Close this space" }, true, None).when(busy, |el| el.opacity(0.5)).when(!busy, |el| {
+                                el.on_click(cx.listener(move |this, _, _, cx| this.close_space(&n, false, cx)))
+                            }))
+                            .when(refused && !busy, |el| {
+                                el.child(mbtn("space-close-anyway", "Close anyway", false, None).on_click(cx.listener(move |this, _, _, cx| this.close_space(&n2, true, cx))))
+                            }),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        // What needs the user here (a muted space's decisions show only here).
+        let queue: Vec<Decision> = all.iter().filter(|d| d.live() && d.in_space(name)).cloned().collect();
+        let cards = self.queue_items(&queue, false, &|n| format!("{n} more waiting here"), "Nothing needs you here.", cx);
+        items.push(bay("Needs you", cards));
+
+        if !m.requests.is_empty() {
+            let rows = m.requests.iter().enumerate().map(|(i, r)| {
+                let mark = sign(if r.finished() { Chip::Done } else { Chip::Working }, 22.0, format!("request-{i}"));
+                lrow(mark, nm(&r.title).into_any_element(), Some(pg(&r.progress(), false)), vec![])
+            });
+            items.push(bay("Requests", vec![v_flex().gap(px(2.0)).children(rows).into_any_element()]));
+        }
+
+        let workers: Vec<Member> = m.workers().into_iter().cloned().collect();
+        if workers.is_empty() {
+            items.push(bay("Sessions", vec![empty_box("No session is open here.")]));
+        } else {
+            let mut rows: Vec<AnyElement> = vec![];
+            for (i, s) in workers.iter().enumerate() {
+                let label = if s.name.is_empty() { s.address.clone() } else { s.name.clone() };
+                let mut under: Vec<AnyElement> = vec![];
+                // Its last words: as its hooks heard them, else from the history.
+                if let Some(words) = s.last_words().or_else(|| last_words(&self.entries, &s.address)) {
+                    under.push(div().text_size(px(13.0)).line_height(px(18.0)).text_color(g.muted).line_clamp(2).child(words).into_any_element());
+                }
+                let place = s.place();
+                if !place.is_empty() {
+                    under.push(div().font_family("Menlo").text_size(px(11.5)).line_height(px(17.0)).text_color(g.faint).child(place).into_any_element());
+                }
+                let to = Scope::Session { space: name.to_string(), addr: s.address.clone() };
+                rows.push(
+                    lrow(session_mark(&s.status, format!("session-pulse-{i}")), nm(&label).truncate().into_any_element(), Some(pg(status_word(&s.status), false)), under)
+                        .id(SharedString::from(format!("session-{}", s.address)))
+                        .cursor_pointer()
+                        .hover(|st| st.bg(rgba(SOFT)))
+                        .on_click(cx.listener(move |this, _, _, cx| this.nav_to(to.clone(), cx)))
+                        .into_any_element(),
+                );
+            }
+            items.push(bay("Sessions", vec![v_flex().gap(px(2.0)).children(rows).into_any_element()]));
+        }
+
+        // What its sessions wrote to each other: the latest of it.
+        let thread = model::thread(self.tower.read(cx).state.as_ref().unwrap_or(&serde_json::Value::Null), name);
+        if !thread.is_empty() {
+            let count = thread.len().max(m.thread_count);
+            let label = if count == 1 { "Between sessions · 1 message".to_string() } else { format!("Between sessions · {count} messages") };
+            let from = thread.len().saturating_sub(THREAD_ROWS);
+            let rows = thread[from..].iter().map(|msg| {
+                h_flex()
+                    .gap(px(12.0))
+                    .items_start()
+                    .text_size(px(13.0))
+                    .line_height(px(18.0))
+                    .child(div().w(px(190.0)).flex_none().font_weight(FontWeight::SEMIBOLD).truncate().child(msg.who_in(name)))
+                    .child(div().flex_1().min_w_0().line_clamp(3).text_color(if msg.delivered { g.muted } else { g.faint }).child(if msg.delivered { msg.text.clone() } else { format!("{} (not delivered)", msg.text) }))
+            });
+            items.push(
+                v_flex()
+                    .w_full()
+                    .gap(px(10.0))
+                    .child(
+                        h_flex().items_center().child(bay_label(&label).flex_1()).child(
+                            div()
+                                .id("thread-record")
+                                .px(px(4.0))
+                                .text_size(px(12.0))
+                                .text_color(g.faint)
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(rgb(CYAN)))
+                                .child("All of it in Record ›")
+                                .on_click(cx.listener(|this, _, _, cx| this.nav_to(Scope::Record, cx))),
+                        ),
+                    )
+                    .child(v_flex().w_full().px(px(12.0)).py(px(11.0)).gap(px(7.0)).rounded(px(14.0)).bg(rgba(SOFT)).children(rows))
+                    .into_any_element(),
+            );
+        }
+        (head, items)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_session_row_says_how_it_stands() {
+        assert_eq!((status_word("working"), status_word("blocked"), status_word("done"), status_word("")), ("working", "waits", "done", "idle"));
+        assert!(closing_line(2, None).starts_with("Closing stops its 2 sessions and removes their worktrees"));
+        assert!(closing_line(1, None).starts_with("Closing stops its session and removes its worktree"));
+        assert!(closing_line(0, None).starts_with("Closing archives it"));
+        // It closes by itself only when the tower says when.
+        assert!(closing_line(2, Some("in 5 h")).ends_with("Left alone, it closes by itself in 5 h."));
+        assert!(!closing_line(2, None).contains("by itself"));
+    }
+
+    #[test]
+    fn a_close_says_what_it_did() {
+        // The receipt `tower space close` prints when piped.
+        let out = r#"{
+          "closed": "fix-login",
+          "sessions_ended": [{ "address": "t4", "name": "fix-login-eyzflow" }, { "address": "t5", "name": "fix-login-mediaroom" }],
+          "sessions_left": [],
+          "herdr_space": "closed",
+          "worktrees_removed": ["/w/.tower-worktrees/fix-login/eyzflow"],
+          "kept_worktrees": [{ "path": "/w/.tower-worktrees/fix-login/mediaroom", "branch": "fix-login/mediaroom", "repo": "/w/mediaroom", "why": "it has uncommitted changes" }],
+          "requests_closed": ["a7"],
+          "report": "The redirect is fixed and merged into dev."
+        }"#;
+        assert_eq!(
+            closed_line("fix-login", out),
+            "fix-login is closed. 2 sessions ended. 1 worktree removed (the branches stay). The worktree fix-login/mediaroom is kept: it has uncommitted changes. Its closing report is in Record."
+        );
+        let left = r#"{ "closed": "isa", "sessions_ended": [], "sessions_left": [{ "address": "t9", "name": "clips", "why": "hc kill: no such terminal." }], "worktrees_removed": [], "kept_worktrees": [], "report": "" }"#;
+        assert_eq!(closed_line("isa", left), "isa is closed. clips still runs: hc kill: no such terminal. It had no closing report.");
+        // Words, not a receipt (a terminal's output): as they are.
+        assert_eq!(closed_line("isa", "Closed \"isa\".\nEnded: clips (t9).\n"), "Closed \"isa\". Ended: clips (t9).");
+        assert_eq!(closed_line("isa", ""), "isa is closed.");
+        // A refusal names the way round it.
+        assert!(refused_close("tower space: \"isa\" isn't closed: clips (t9) is working. Wait for them, or close it anyway with --force (their work in progress is cut off)."));
+        assert!(!refused_close("tower space: no space called \"isa\""));
+    }
+}

@@ -36,6 +36,78 @@ struct Seen {
     live: bool,
     /// The Herdr space it's in, for focus (see `spaces`).
     space: Option<String>,
+    /// A brain's terminal (the main one, or a space's own), by its name:
+    /// the tower itself, never an agent to watch, ask about or report on.
+    brain: Option<String>,
+}
+
+impl Seen {
+    /// A terminal's facts from one look at it, on what the radar knew
+    /// (`before`). Herdr describes a terminal in two shapes: whole (`hc get`,
+    /// the snapshot `hc events` begins with: its status with the program
+    /// that reported it, its labels, its foreground program, when it was
+    /// made), and as a row of `hc ls` (its status a word, and no labels, no
+    /// pids, no dates). What this look can't say is kept as it was known,
+    /// never blanked.
+    fn of(t: &Value, machine: Option<&str>, before: Option<&Seen>) -> Seen {
+        let status = hc::status(t);
+        let app = match &t["status"] {
+            Value::Object(_) => hc::agent_app(t).unwrap_or_default(),
+            // A row: an agent reports, and the row doesn't say which program it is.
+            // (Its `agent` does for a terminal here that was never read whole.)
+            Value::String(_) => before
+                .map(|b| b.app.clone())
+                .filter(|a| !a.is_empty())
+                .or_else(|| t["agent"].as_str().filter(|_| machine.is_none()).map(String::from))
+                .unwrap_or_default(),
+            // No status: a plain program now.
+            _ => String::new(),
+        };
+        let labelled = t["labels"].is_object();
+        let name = match (hc::name(t), before) {
+            // A row has no labels, so not the name `tower start --space` gave (`tower.name`).
+            (None, Some(b)) if !labelled => b.name.clone(),
+            _ => match machine {
+                Some(m) => format!("{} on {m}", hc::spoken_name(t)),
+                None => hc::spoken_name(t),
+            },
+        };
+        let space = crate::spaces::space_of(t)
+            .or_else(|| t["where"].as_str().and_then(|w| w.split(" / ").next()).map(str::trim).filter(|s| !s.is_empty()).map(String::from))
+            .or_else(|| before.filter(|_| !labelled).and_then(|b| b.space.clone()));
+        let account = match (machine, t["foreground"].is_object()) {
+            (None, true) => crate::accounts::of_terminal(t),
+            _ => before.and_then(|b| b.account.clone()),
+        };
+        let cwd = t["foreground"]["cwd"].as_str().or_else(|| t["cwd"].as_str()).map(String::from).or_else(|| before.map(|b| b.cwd.clone())).unwrap_or_default();
+        // A brain is known by its name, here only (a look that doesn't give the name keeps what was known).
+        let brain = match (brain::brain_of(t), machine) {
+            (Some(n), None) => Some(n.to_string()),
+            (None, None) if !labelled || t["name"].is_null() => before.and_then(|b| b.brain.clone()),
+            _ => None,
+        };
+        Seen {
+            brain,
+            name,
+            status,
+            created_ms: hc::created_ms(t).or_else(|| before.and_then(|b| b.created_ms)),
+            turn: hc::turn(t).or_else(|| before.and_then(|b| b.turn)),
+            cwd,
+            app,
+            account,
+            live: t["state"].as_str().is_none_or(|s| s == "live"),
+            space,
+        }
+    }
+}
+
+/// Whether a row of `hc ls` says something the radar doesn't know: a
+/// terminal it hasn't seen (or has never read whole), or one whose status,
+/// turn or liveness moved without an event saying so.
+fn row_news(known: Option<&Seen>, row: &Value) -> bool {
+    let Some(s) = known else { return true };
+    let live = row["state"].as_str().is_none_or(|x| x == "live");
+    s.created_ms.is_none() || s.live != live || s.status != hc::status(row) || hc::turn(row).is_some_and(|n| s.turn != Some(n))
 }
 
 /// Terminals the brain asked to hear about, what each was last seen doing,
@@ -105,6 +177,15 @@ impl Watches {
         Ok(address)
     }
 
+    /// A session is being ended on the user's word (`tower undo`): its watch
+    /// goes with it, and nothing is reported about its end.
+    pub fn forget(&self, address: &str) {
+        let mut b = lock(&self.book);
+        if b.watches.remove(address).is_some() {
+            Self::save(&b);
+        }
+    }
+
     /// A note from the send queue for the brain: through the outbox, so it
     /// waits for a brain that's away and a space out of focus holds it.
     pub fn tell(&self, note: super::sendq::Note) {
@@ -162,6 +243,19 @@ impl Watches {
         };
         if self.owe(p) {
             self.kick();
+        }
+    }
+
+    /// A decision the brain raised for the user (`tower raise`): told as a
+    /// session that needs them is (the alert, and said once), held for
+    /// another space in focus as usual. False: the radar isn't up yet.
+    pub fn raise(&self, address: &str, text: &str) -> bool {
+        match self.radar.get() {
+            Some(r) => {
+                r.announce(address, text);
+                true
+            }
+            None => false,
         }
     }
 
@@ -261,16 +355,19 @@ struct Radar {
     alerts: Alerts,
     watches: Watches,
     asks: super::asks::Asks,
+    /// What needs the user, one decision each: told when a session works again or is gone.
+    decisions: super::decisions::Decisions,
     seen: Arc<Mutex<HashMap<String, Seen>>>,
     /// Sessions that stopped to wait for the user (a watch's report said so):
     /// their job stays blocked until they work again or end.
     waiting: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
-pub fn start(shared: Shared, mouth: Mouth, alerts: Alerts, watches: Watches, asks: super::asks::Asks) {
+pub fn start(shared: Shared, mouth: Mouth, alerts: Alerts, watches: Watches, asks: super::asks::Asks, decisions: super::decisions::Decisions) {
     // What was known when the last run ended, before this run's first look updates it.
     let before = watches.snapshot();
-    let radar = Radar { shared, mouth, alerts, watches: watches.clone(), asks, seen: Arc::new(Mutex::new(HashMap::new())), waiting: Arc::default() };
+    let radar =
+        Radar { shared, mouth, alerts, watches: watches.clone(), asks, decisions, seen: Arc::new(Mutex::new(HashMap::new())), waiting: Arc::default() };
     let _ = watches.radar.set(radar.clone());
     let r = radar.clone();
     radar.asks.set_notify(move |address, text| r.announce(address, text));
@@ -418,12 +515,37 @@ impl Radar {
     }
 
     /// Every live terminal here, looked at again (after missed events, and
-    /// every half minute): what changed is told, what's gone is gone.
+    /// every half minute): what changed is told, what's gone is gone. `hc ls`
+    /// gives rows, which say less than an event did (see `Seen::of`): a row
+    /// only shows whether a terminal moved, and one that did (or that the
+    /// radar doesn't know) is read whole, as after an event.
     fn resync_local(&self) {
         match hc::list_on(None) {
             Ok(list) => {
-                for t in &list {
-                    self.observe(t, None, true);
+                for row in &list {
+                    let Some(address) = row["address"].as_str() else { continue };
+                    let known = lock(&self.seen).get(address).cloned();
+                    if !row_news(known.as_ref(), row) {
+                        continue;
+                    }
+                    match hc::lookup(address) {
+                        hc::Lookup::Found(t) => self.observe(&t, None, true),
+                        hc::Lookup::Gone => self.gone(address),
+                        // hc didn't answer: what the row says, on what we knew.
+                        hc::Lookup::Unreachable(e) => {
+                            eprintln!("[radar] {address}: couldn't re-read it ({e}); going by its row");
+                            if let Some(mut t) = self.with_event(address, "", &Value::Null) {
+                                match hc::status_word(row) {
+                                    Some(word) => t["status"]["state"] = word.into(),
+                                    None => t["status"] = Value::Null,
+                                }
+                                if let Some(n) = hc::turn(row) {
+                                    t["turn"] = n.into();
+                                }
+                                self.observe(&t, None, true);
+                            }
+                        }
+                    }
                 }
                 self.drop_missing_local(&list);
                 self.publish();
@@ -484,7 +606,9 @@ impl Radar {
     }
 
     fn name_space(&self, address: &str) -> (String, Option<String>) {
-        lock(&self.seen).get(address).map(|s| (s.name.clone(), s.space.clone())).unwrap_or_else(|| (address.to_string(), None))
+        let known = lock(&self.seen).get(address).map(|s| (s.name.clone(), s.space.clone()));
+        // One the radar hasn't looked at yet (it was opened a moment ago): as Herdr has it.
+        known.or_else(|| hc::get(address).map(|t| (hc::spoken_name(&t), crate::spaces::space_of(&t)))).unwrap_or_else(|| (address.to_string(), None))
     }
 
     /// Reads a terminal again in a moment (a hook ran ahead of Herdr).
@@ -563,44 +687,35 @@ impl Radar {
             Some(m) if !raw.contains('/') => format!("{m}/{raw}"),
             _ => raw.to_string(),
         };
-        let status = hc::status(t);
-        let app = hc::agent_app(t).unwrap_or_default();
-        let mut name = hc::spoken_name(t);
-        if let Some(m) = machine {
-            name = format!("{name} on {m}");
-        }
-        let live = t["state"].as_str().is_none_or(|s| s == "live");
-        let is_brain = machine.is_none() && t["name"].as_str() == Some(brain::NAME);
         let is_voice = machine.is_none() && t["name"].as_str() == Some(brain::VOICE_NAME);
-        let space = crate::spaces::space_of(t);
-        let account = if machine.is_none() { crate::accounts::of_terminal(t) } else { None };
-        let (created_ms, turn) = (hc::created_ms(t), hc::turn(t));
         // Another terminal at an address the radar knew: the old one ended.
+        let created_ms = hc::created_ms(t);
         let replaced = lock(&self.seen).get(&address).is_some_and(|s| matches!((s.created_ms, created_ms), (Some(a), Some(b)) if a != b));
         if replaced {
             eprintln!("[radar] {address} is a new terminal now: the old one ended");
             self.gone(&address);
         }
-        let before = lock(&self.seen).insert(
-            address.clone(),
-            Seen {
-                name: name.clone(),
-                status: status.clone(),
-                created_ms,
-                turn,
-                cwd: t["foreground"]["cwd"].as_str().or_else(|| t["cwd"].as_str()).unwrap_or("").to_string(),
-                app: app.clone(),
-                account,
-                live,
-                space: space.clone(),
-            },
-        );
+        // What this look says, on what the radar knew: a look that says less
+        // (a row of `hc ls`, an event's data) blanks nothing.
+        let seen = {
+            let known = lock(&self.seen);
+            Seen::of(t, machine, known.get(&address))
+        };
+        let (status, app, name, live, space, turn) = (seen.status.clone(), seen.app.clone(), seen.name.clone(), seen.live, seen.space.clone(), seen.turn);
+        let whose = seen.brain.clone();
+        let before = lock(&self.seen).insert(address.clone(), seen);
 
-        if is_brain {
-            self.shared.update(|s| {
-                s.brain = if live { if status == SessionStatus::Starting { "starting".into() } else { status.word().to_string() } } else { "absent".into() };
-                s.brain_app = app.clone();
-            });
+        // A brain (the main one, or a space's own) is the tower itself: what
+        // it does is kept with the brains, and nothing below is about it (no
+        // watch, no question, no decision, no alert).
+        if let Some(brain_name) = whose {
+            super::brains::seen(&brain_name, t);
+            if brain_name == brain::NAME {
+                self.shared.update(|s| {
+                    s.brain = if live { if status == SessionStatus::Starting { "starting".into() } else { status.word().to_string() } } else { "absent".into() };
+                    s.brain_app = app.clone();
+                });
+            }
             return;
         }
         if is_voice || app.is_empty() {
@@ -619,6 +734,14 @@ impl Radar {
         // What it asks, as a question set (this machine's sessions).
         if machine.is_none() {
             self.asks.seen(&address, t, &if live { status.clone() } else { SessionStatus::Exited });
+        }
+        // A decision about it: it waits on that unless it works on something else.
+        if live {
+            self.decisions.session_seen(&address, status != SessionStatus::Working);
+            // Blocked on what the tower couldn't read: over once it isn't blocked.
+            self.decisions.session_blocked(&address, status == SessionStatus::Blocked);
+        } else {
+            self.decisions.session_gone(&address);
         }
         // First sight of a watched session (a machine just reached, a start):
         // how it stood when the watch was set.
@@ -683,12 +806,21 @@ impl Radar {
         if !announce {
             return;
         }
+        // The session by its space and what it works on: as it is written, and as it is said.
+        let named = |line: String| crate::names::notice(&line, space.as_deref(), &name);
+        // A finish nobody watched is written down, not told, unless the tower tells everything.
+        if stopped_working && status.ready() && self.alerts.done && crate::tell::level().quiet() {
+            self.shared.record(&address, &named(format!("{name} finished")).0, "done");
+            return;
+        }
         // What it asks, in a sentence (or just that it needs you).
-        let notice = super::asks::blocked_notice(&name, &t["status"]);
+        let (notice, notice_said) = named(super::asks::blocked_notice(&name, &t["status"]));
+        let (finished, finished_said) = named(format!("{name} finished"));
+        let (error, error_said) = named(format!("{name} hit an error"));
         let news = match status {
             SessionStatus::Blocked if self.alerts.blocked && !handled => Some(notice.clone()),
-            SessionStatus::Done | SessionStatus::Idle if stopped_working && self.alerts.done => Some(format!("{name} finished")),
-            SessionStatus::Error => Some(format!("{name} hit an error")),
+            SessionStatus::Done | SessionStatus::Idle if stopped_working && self.alerts.done => Some(finished.clone()),
+            SessionStatus::Error => Some(error.clone()),
             _ => None,
         };
         let word = status.word();
@@ -699,14 +831,14 @@ impl Radar {
         }
         if status == SessionStatus::Blocked && self.alerts.blocked && !handled {
             self.shared.alert(&address, &notice, "blocked");
-            self.mouth.alert(format!("{notice}."), Some((address.as_str(), word)));
+            self.mouth.needs_you(format!("{notice_said}."), Some((address.as_str(), word)));
         } else if stopped_working && status.ready() && self.alerts.done {
-            self.shared.alert(&address, &format!("{name} finished"), "done");
-            self.mouth.alert(format!("{name} finished."), Some((address.as_str(), word)));
+            self.shared.alert(&address, &finished, "done");
+            self.mouth.alert(format!("{finished_said}."), Some((address.as_str(), word)));
         } else if status == SessionStatus::Error {
-            self.shared.alert(&address, &format!("{name} hit an error"), "error");
+            self.shared.alert(&address, &error, "error");
             if self.alerts.blocked {
-                self.mouth.alert(format!("{name} hit an error."), Some((address.as_str(), word)));
+                self.mouth.needs_you(format!("{error_said}."), Some((address.as_str(), word)));
             }
         }
     }
@@ -715,12 +847,14 @@ impl Radar {
     /// session's notice, held for another space in focus as usual.
     fn announce(&self, address: &str, text: &str) {
         let (name, space) = self.name_space(address);
-        if self.held(address, &name, space.as_deref(), text, "blocked", "alert") {
+        // Its session by its space and what it works on: as it is written, and as it is said.
+        let (text, said) = crate::names::notice(text, space.as_deref(), &name);
+        if self.held(address, &name, space.as_deref(), &text, "blocked", "alert") {
             return;
         }
-        self.shared.alert(address, text, "blocked");
+        self.shared.alert(address, &text, "blocked");
         if self.alerts.blocked {
-            self.mouth.alert(text.to_string(), None);
+            self.mouth.needs_you(said, None);
         }
     }
 
@@ -752,7 +886,7 @@ impl Radar {
             (address.to_string(), name.to_string(), space.to_string(), text.to_string(), status.to_string(), kind.to_string());
         crate::history::later(move || crate::spaces::hold(&k, &a, &n, &sp, &t, Some(&st)));
         if gate == Gate::Urgent {
-            self.mouth.alert(crate::spaces::needs_you_line(space, text), Some((address, status)));
+            self.mouth.needs_you(crate::spaces::needs_you_line(space, text), Some((address, status)));
         }
         eprintln!("[radar] held for {space} (focus: {focus}): {text}");
         true
@@ -765,8 +899,9 @@ impl Radar {
             return;
         }
         let parent = t["parent"].as_str().unwrap_or("");
+        // Started by a brain: the main one, or a space's own.
         let brain = hc::get(brain::NAME).and_then(|b| b["address"].as_str().map(String::from)).unwrap_or_default();
-        if parent.is_empty() || parent != brain {
+        if parent.is_empty() || (parent != brain && !super::brains::is_brain_address(parent)) {
             return;
         }
         let address = address.to_string();
@@ -784,7 +919,8 @@ impl Radar {
     /// question (trusting its folder) holds it: treat that as needing a person.
     fn check_startup(&self, address: &str, t: &Value) {
         let program = t["argv"][0].as_str().unwrap_or("").rsplit('/').next().unwrap_or("").to_string();
-        if !["claude", "codex"].contains(&program.as_str()) || t["name"].as_str() == Some(brain::NAME) || left_alone(t) {
+        // (A brain's own first-run question is the tower's to answer: see `brain::settle`.)
+        if !["claude", "codex"].contains(&program.as_str()) || brain::brain_of(t).is_some() || left_alone(t) {
             return;
         }
         let me = self.clone();
@@ -837,7 +973,10 @@ impl Radar {
     }
 
     fn gone(&self, address: &str) {
+        super::brains::gone(address);
         self.asks.seen(address, &Value::Null, &SessionStatus::Gone);
+        // A decision all of whose sessions are gone is over.
+        self.decisions.session_gone(address);
         super::sessions::registry().forget(address);
         let removed = lock(&self.seen).remove(address);
         if (address == brain::NAME || removed.as_ref().is_some_and(|_| hc::get(brain::NAME).is_none()))
@@ -864,14 +1003,20 @@ impl Radar {
     /// A watched session stopped (`status`): its report goes out, once
     /// (`why` adds how it was found, e.g. while the tower was down).
     fn fire_watch(&self, address: &str, name: &str, space: Option<String>, status: &SessionStatus, why: &str) -> bool {
+        // Asked of the queue and the ledger before the book is held (the queue tells through the book).
+        let has_work = super::asks::has_work(address);
         let fired = self.watches.fire(address, |w| {
             let (t, a) = (address.to_string(), w.note.clone());
             // What it said at the end of its turn (its hook): often all the brain needs.
             let said = super::sessions::registry().said_since(address, w.since_ms).filter(|_| !status.ended());
             // It stopped to wait for the user (to merge, approve, test), or
             // ended its turn on a PR (it waits for their merge): not done.
-            let waits = said.as_deref().filter(|_| status.ready()).and_then(|s| {
+            // (Idle is not blocked: one that only says it is ready, with nothing asked of it, waits for nothing.)
+            // (`on_pr`: it said no more than a PR's link. That is the user's only once GitHub says the PR is open.)
+            let mut on_pr = false;
+            let waits = said.as_deref().filter(|s| status.ready() && (has_work || !crate::questions::ready_only(s))).and_then(|s| {
                 crate::questions::waits_for_user(s).or_else(|| {
+                    on_pr = true;
                     crate::prs::links(s)
                         .first()
                         .map(|(repo, n)| format!("Merge PR #{n} ({repo}), which it opened: the chat shows it with a Merge button"))
@@ -890,10 +1035,7 @@ impl Radar {
             if let Some(said) = said {
                 let said: String = said.chars().take(1200).collect();
                 let ask = match &waits {
-                    Some(r) => format!(
-                        " It is waiting for the user to act: \"{}\". Tell the user plainly what they need to do (with the PR or link if there is one).",
-                        r.replace('"', "'")
-                    ),
+                    Some(r) => wait_ask(crate::tell::level().quiet(), r, !on_pr),
                     None => " Tell me what happened, briefly (read its screen only if that isn't enough).".to_string(),
                 };
                 p.msg = p.msg.replace(
@@ -939,21 +1081,40 @@ impl Radar {
                     p.speech = format!("In {space}, {}", lower_first(&p.speech));
                 }
             }
-            match brain::note(&msg) {
+            // At a quiet level a finish, a delivery or other news is for the
+            // record: the brain acts on it and nobody is told. What needs the
+            // user (blocked, an error) is told at every level.
+            let level = crate::tell::level();
+            // A wait the tower put in front of the user as a decision (told
+            // once, in its own words): the plain "is waiting for you" beside
+            // it is only written down.
+            let decided = beside_decision(level, &p.status, lock(&self.waiting).contains(&p.address));
+            let record = crate::tell::for_record(level, &p.status) || decided;
+            let status_line = |p: &Pending| {
+                if p.kind == "queue" || p.kind == "pr" || p.kind == "agenda" {
+                    return;
+                }
+                let line = format!("{} is {}", crate::names::shown(p.space.as_deref(), &p.name), say_status(&p.status));
+                if record { self.shared.record(&p.address, &line, &p.status) } else { self.shared.alert(&p.address, &line, &p.status) }
+            };
+            // To the brain of its space, when that space has one that can take it; else the main brain.
+            let space = p.space.clone().or_else(|| lock(&self.seen).get(&p.address).and_then(|s| s.space.clone()));
+            match super::brains::note(space.as_deref(), &crate::tell::note_at(level, &msg), record) {
                 Ok(()) => {
-                    if !p.spoken && p.kind != "queue" && p.kind != "pr" && p.kind != "agenda" {
-                        self.shared.alert(&p.address, &format!("{} is {}", p.name, say_status(&p.status)), &p.status);
+                    if !p.spoken {
+                        status_line(p);
                     }
                     true
                 }
                 Err(e) => {
                     if !p.spoken {
                         eprintln!("[radar] the brain can't take it yet ({e:#}): {}", p.msg);
-                        if p.kind != "queue" && p.kind != "pr" && p.kind != "agenda" {
-                            self.shared.alert(&p.address, &format!("{} is {}", p.name, say_status(&p.status)), &p.status);
-                        }
-                        if !p.speech.is_empty() {
-                            self.mouth.alert(p.speech.clone(), Some((p.address.as_str(), p.status.as_str())));
+                        status_line(p);
+                        if !p.speech.is_empty() && !record {
+                            let said = crate::names::notice(&p.speech, p.space.as_deref(), &p.name).1;
+                            let about = Some((p.address.as_str(), p.status.as_str()));
+                            // What needs the user is a decision's sentence; the rest is news.
+                            if crate::tell::needs_you(&p.status) { self.mouth.needs_you(said, about) } else { self.mouth.alert(said, about) }
                         }
                         p.spoken = true;
                     }
@@ -1103,6 +1264,33 @@ fn report(address: &str, name: &str, space: Option<String>, status: &SessionStat
     }
 }
 
+/// What a watch's report asks of the brain when its session waits for the
+/// user (`request`). At a quiet level the tower has made that a decision and
+/// told the user itself: the brain neither tells nor raises it again.
+/// `shown`: the tower has done so. False for a turn that only ended on a
+/// PR's link: its decision comes when GitHub says the PR is open, and when
+/// GitHub can't be asked there is none, so the brain checks and raises it.
+fn wait_ask(quiet: bool, request: &str, shown: bool) -> String {
+    let request = request.replace('"', "'");
+    if quiet && !shown {
+        format!(
+            " It ended its turn on a PR: \"{request}\". The tower puts an open PR in front of the user itself, as a merge decision. Look at `tower decisions` once: if that PR is there, do nothing; if it isn't (GitHub couldn't be asked, or it was taken out before), raise it with `tower raise <its address> --why merge \"<the PR and what the user should do>\"`."
+        )
+    } else if quiet {
+        format!(" It is waiting for the user to act: \"{request}\". The tower has put that in front of the user itself, as a decision, and said it once: don't raise it again.")
+    } else {
+        format!(" It is waiting for the user to act: \"{request}\". Tell the user plainly what they need to do (with the PR or link if there is one).")
+    }
+}
+
+/// A report that a session waits for the user (`blocked`), when its turn
+/// ended waiting for them (`waits`: that is a decision, which the tower
+/// tells them of once): at a quiet level the plain "is waiting for you" is
+/// not said beside it.
+fn beside_decision(level: crate::tell::Level, status: &str, waits: bool) -> bool {
+    level.quiet() && status == "blocked" && waits
+}
+
 /// How a report found at start came about.
 fn down_why(status: &SessionStatus, was: &SessionStatus) -> String {
     let was = if *was == SessionStatus::Starting || was == status { String::new() } else { format!("; it was {was} when last seen") };
@@ -1152,6 +1340,117 @@ fn say_status(status: &str) -> &str {
 mod tests {
     use super::is_test;
     use serde_json::json;
+
+    #[test]
+    fn a_wait_that_is_a_decision_is_not_said_twice() {
+        use crate::tell::Level::*;
+        // The tower tells everything: the plain line and the brain's words, as before.
+        assert!(!super::beside_decision(Everything, "blocked", true));
+        let loud = super::wait_ask(false, "you need to merge \"it\"", true);
+        assert!(loud.contains("Tell the user plainly what they need to do") && loud.contains("you need to merge 'it'"));
+        // A quiet level: the decision says it, once.
+        for level in [Decisions, Results] {
+            assert!(super::beside_decision(level, "blocked", true));
+            assert!(!super::beside_decision(level, "blocked", false), "blocked on a dialog the tower can't read: still told");
+            assert!(!super::beside_decision(level, "error", true));
+        }
+        let quiet = super::wait_ask(true, "you need to merge it", true);
+        assert!(quiet.contains("don't raise it again") && !quiet.contains("Tell the user"));
+        // A turn that only ended on a PR's link: the card comes when GitHub says the PR is open. The
+        // brain is never told it is there before it is; it looks, and raises it when it isn't.
+        let on_pr = super::wait_ask(true, "Merge PR #12 (o/app), which it opened", false);
+        assert!(!on_pr.contains("don't raise it again") && on_pr.contains("tower decisions") && on_pr.contains("--why merge"), "{on_pr}");
+        assert!(super::wait_ask(false, "Merge PR #12 (o/app), which it opened", false).contains("Tell the user plainly"));
+    }
+
+    #[test]
+    fn a_row_of_hc_ls_never_blanks_what_an_event_told() {
+        use super::{Seen, row_news};
+        use crate::hc::SessionStatus;
+        // As `hc get` and the snapshot of `hc events` have a terminal.
+        let whole = json!({
+            "address": "t7", "name": null, "state": "live", "created_ms": 5000, "turn": 3, "cwd": "/w",
+            "foreground": { "argv": ["node"], "cwd": "/w/.tower-worktrees/sandbox/app", "pid": 0 },
+            "labels": { "where": "sandbox / app", "tower.name": "sandbox-app" },
+            "status": { "app": "claude-code", "state": "working" },
+        });
+        let known = Seen { account: Some("orca".into()), ..Seen::of(&whole, None, None) };
+        assert_eq!(known.brain, None, "an agent session is no brain");
+        assert_eq!(
+            (known.app.as_str(), known.space.as_deref(), known.name.as_str(), known.created_ms, known.turn, known.status.clone(), known.live),
+            ("claude-code", Some("sandbox"), "app", Some(5000), Some(3), SessionStatus::Working, true),
+            "its name within its space: the space isn't said twice"
+        );
+        // As `hc ls` has it half a minute later: its status a word, no labels, no pids, no dates.
+        let row = json!({ "address": "t7", "agent": "claude-code", "cwd": "/w/.tower-worktrees/sandbox/app", "state": "live", "status": "working", "turn": 3, "where": "sandbox / app" });
+        assert!(!row_news(Some(&known), &row), "nothing moved: the terminal isn't read again");
+        let after = Seen::of(&row, None, Some(&known));
+        assert_eq!(after.app, "claude-code", "still an agent: it stays in the state's agents");
+        assert_eq!((after.space.as_deref(), after.account.as_deref(), after.name.as_str(), after.created_ms), (Some("sandbox"), Some("orca"), "app", Some(5000)));
+        assert_eq!(after.cwd, "/w/.tower-worktrees/sandbox/app");
+        // It moved without an event: the row says so (and the terminal is read whole), and takes nothing else away.
+        let done = json!({ "address": "t7", "agent": "claude-code", "cwd": "/w", "state": "live", "status": "done", "turn": 4 });
+        assert!(row_news(Some(&known), &done));
+        let after = Seen::of(&done, None, Some(&known));
+        assert_eq!((after.status.clone(), after.turn), (SessionStatus::Done, Some(4)));
+        assert_eq!((after.app.as_str(), after.space.as_deref(), after.account.as_deref(), after.name.as_str()), ("claude-code", Some("sandbox"), Some("orca"), "app"));
+        assert!(row_news(Some(&known), &json!({ "address": "t7", "state": "live", "status": "working", "turn": 4 })), "a turn ended and another began");
+        assert!(row_news(Some(&known), &json!({ "address": "t7", "state": "finished", "status": "working", "turn": 3 })));
+        // One the radar doesn't know, or knows only by a row, is read whole.
+        assert!(row_news(None, &row));
+        let by_row = Seen::of(&row, None, None);
+        assert_eq!((by_row.app.as_str(), by_row.space.as_deref(), by_row.created_ms), ("claude-code", Some("sandbox"), None), "a row alone says this much");
+        assert!(row_news(Some(&by_row), &row));
+        // Its agent ended, a shell is left: no status is news, not a blank.
+        let shell = json!({ "address": "t7", "agent": "zsh", "cwd": "/w", "state": "live", "turn": 4, "where": "sandbox / app" });
+        assert!(row_news(Some(&known), &shell));
+        assert_eq!(Seen::of(&shell, None, Some(&known)).app, "");
+        // A whole look is believed as it is: a label that went is gone.
+        let moved = json!({ "address": "t7", "state": "live", "created_ms": 5000, "turn": 3, "labels": {}, "status": { "app": "codex", "state": "idle" } });
+        let after = Seen::of(&moved, None, Some(&known));
+        assert_eq!((after.space, after.app.as_str(), after.account.as_deref()), (None, "codex", Some("orca")));
+        // An event's data when hc can't be asked again (`with_event`): the same rule.
+        let partial = json!({ "address": "t7", "state": "live", "status": { "state": "blocked", "app": "claude-code" }, "created_ms": 5000, "turn": 3, "name": "sandbox app" });
+        let after = Seen::of(&partial, None, Some(&known));
+        assert_eq!((after.status.clone(), after.space.as_deref(), after.account.as_deref(), after.cwd.as_str()), (SessionStatus::Blocked, Some("sandbox"), Some("orca"), "/w/.tower-worktrees/sandbox/app"));
+        // Another machine's terminals are only ever rows: what one fuller look told (a watched one, by `hc get`) stays.
+        let far = Seen::of(&json!({ "address": "vps/t2", "name": "api", "state": "live", "status": { "app": "codex", "state": "working" }, "labels": {} }), Some("vps"), None);
+        let far_row = json!({ "address": "vps/t2", "name": "api", "agent": "codex", "state": "live", "status": "done", "turn": 1 });
+        let after = Seen::of(&far_row, Some("vps"), Some(&far));
+        assert_eq!((after.name.as_str(), after.app.as_str(), after.status.clone()), ("api on vps", "codex", SessionStatus::Done));
+    }
+
+    #[test]
+    fn a_tower_terminal_is_a_brain_and_never_an_agent_to_watch() {
+        use super::Seen;
+        // A space's own brain, as `hc get` has it: a Claude Code session by every other sign.
+        let whole = json!({
+            "address": "t12", "name": "tower-sandbox", "state": "live", "created_ms": 9000, "turn": 2, "cwd": "/h/brains/sandbox",
+            "argv": ["claude", "-n", "tower-sandbox", "--model", "claude-opus-5-5", "--effort", "high"],
+            "labels": { "tower.space": "Sandbox" }, "status": { "app": "claude-code", "state": "working" },
+        });
+        let s = Seen::of(&whole, None, None);
+        assert_eq!((s.brain.as_deref(), s.app.as_str()), (Some("tower-sandbox"), "claude-code"));
+        // The main brain; and one named by hand counts as one too.
+        assert_eq!(Seen::of(&json!({ "address": "t7", "name": "tower", "state": "live", "status": { "app": "claude-code", "state": "idle" } }), None, None).brain.as_deref(), Some("tower"));
+        assert_eq!(Seen::of(&json!({ "address": "t8", "name": "tower-b2c-tickets", "state": "live", "status": "idle" }), None, None).brain.as_deref(), Some("tower-b2c-tickets"));
+        // The daemon's own terminal, a session whose name only starts alike, and a session of the space are not.
+        for name in ["tower-voice", "towering", "sandbox-app"] {
+            assert_eq!(Seen::of(&json!({ "address": "t9", "name": name, "state": "live", "status": "idle" }), None, None).brain, None, "{name}");
+        }
+        // Its row in `hc ls` half a minute later names it; an event's data when hc can't be asked may not: it stays a brain.
+        let row = json!({ "address": "t12", "name": "tower-sandbox", "agent": "claude-code", "state": "live", "status": "done", "turn": 3 });
+        assert_eq!(Seen::of(&row, None, Some(&s)).brain.as_deref(), Some("tower-sandbox"));
+        let partial = json!({ "address": "t12", "state": "live", "status": { "state": "blocked", "app": "claude-code" }, "created_ms": 9000, "name": "tower sandbox" });
+        assert_eq!(Seen::of(&partial, None, Some(&s)).brain.as_deref(), Some("tower-sandbox"));
+        // Another terminal at that address, read whole and named otherwise, is not one.
+        let other = json!({ "address": "t12", "name": "api", "state": "live", "created_ms": 9500, "labels": {}, "status": { "app": "claude-code", "state": "idle" } });
+        assert_eq!(Seen::of(&other, None, Some(&s)).brain, None);
+        // A terminal called `tower-…` on another machine is that machine's business.
+        assert_eq!(Seen::of(&json!({ "address": "vps/t2", "name": "tower-sandbox", "state": "live", "status": "idle" }), Some("vps"), None).brain, None);
+        // It is left out of the agents the state lists (by its name, as the main brain is).
+        assert!(s.name.starts_with("tower"));
+    }
 
     #[test]
     fn test_sessions_are_known_by_label_or_name() {

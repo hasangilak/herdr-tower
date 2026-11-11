@@ -8,28 +8,20 @@ on every machine added with `hc machine add`. It answers out loud.
   <img src="docs/screenshots/orb.png" width="420" alt="The orb: calm when ready, cyan while it listens, periwinkle while it replies">
 </p>
 
-<table>
-  <tr>
-    <td align="center"><img src="docs/screenshots/chat-shots.png" width="300" alt="The tower's reply with the screenshot a session sent shown under it"><br><sub>Chat: replies, with the screenshots sessions send</sub></td>
-    <td align="center"><img src="docs/screenshots/attachments.png" width="300" alt="An image and a PDF in the input as [Image #1] and [File #2: notes.pdf] tokens"><br><sub>Attach pictures and files as tokens</sub></td>
-  </tr>
-  <tr>
-    <td align="center"><img src="docs/screenshots/accounts.png" width="300" alt="Activity: running jobs with each session's Claude account and its screenshots"><br><sub>Activity: jobs, their Claude accounts and screenshots</sub></td>
-    <td align="center"><img src="docs/screenshots/shots.png" width="300" alt="Activity, Shots: every screenshot with its caption, session and account"><br><sub>Shots: the gallery of visual results</sub></td>
-  </tr>
-  <tr>
-    <td align="center"><img src="docs/screenshots/dictation.png" width="300" alt="Live dictation: what you say appears in the input as you talk"><br><sub>Dictation: your words appear as you talk</sub></td>
-    <td align="center"><img src="docs/screenshots/phone.png" width="300" alt="The Phone view: the phone API on and a pairing QR with its one-time code (blurred)"><br><sub>Phone: pair the Android app with a QR</sub></td>
-  </tr>
-  <tr>
-    <td align="center"><img src="docs/screenshots/work.png" width="300" alt="The working line: Delegating to web, 15s"><br><sub>The brain at work, from its own hooks</sub></td>
-    <td align="center"><img src="docs/screenshots/spaces.png" width="300" alt="Spaces: one focused, the others' news held"><br><sub>Spaces: focus one, hold the rest</sub></td>
-  </tr>
-</table>
-
 <p align="center">
   <img src="docs/screenshots/viewer.png" width="620" alt="A screenshot full size over the screen, with arrows to step through the others"><br><sub>Click a screenshot for the full-size viewer: fit or 100%, ← → through the rest, Esc to close</sub>
 </p>
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/screenshots/attachments.png" width="300" alt="An image and a PDF in the input as [Image #1] and [File #2: notes.pdf] tokens"><br><sub>Attach pictures and files as tokens (pictured in the panel as it was: the input is the same)</sub></td>
+    <td align="center"><img src="docs/screenshots/dictation.png" width="300" alt="Live dictation: what you say appears in the input as you talk"><br><sub>Dictation: your words appear as you talk (pictured in the panel as it was)</sub></td>
+  </tr>
+</table>
+
+The other pictures in `docs/screenshots/` show the panel before the Quiet
+Tower (its Chat, Activity and Spaces tabs, which are gone); what replaced
+them is drawn in [docs/quiet-tower.html](docs/quiet-tower.html).
 
 Everything that listens and speaks runs locally, in one Rust binary:
 
@@ -41,7 +33,7 @@ Everything that listens and speaks runs locally, in one Rust binary:
 | Radar | every terminal's status | `hc events` here, `hc exec --on <machine> hc ls` there |
 | Brain | a Claude Code (or Codex) session named `tower` | drives the others with `hc` |
 | Talk key | Control, anywhere on the Mac | a listen-only CGEventTap in the daemon |
-| Window | `tower orb` ([GPUI](https://gpui.rs), Zed's UI framework) | one floating orb: how it moves says what the tower is doing |
+| Window | `tower orb` ([GPUI](https://gpui.rs), Zed's UI framework) | one floating orb (how it moves says what the tower is doing, its number how many decisions wait), its panel and the full window |
 
 Measured on an M5 Pro: Kokoro makes speech about 8× faster than real time
 (first sentence in ~0.2 s); Whisper turbo transcribes a 4-second request in
@@ -53,9 +45,14 @@ Measured on an M5 Pro: Kokoro makes speech about 8× faster than real time
 tower up            # the orb, the voice (Herdr terminal tower-voice) and the brain (terminal tower)
 tower up --show     # ... and show the brain in a Herdr tab
 tower up --no-orb   # ... without the orb
-tower down          # stop the voice and the brain (the orb stays, faded: click it to start again)
-tower mute on|off|toggle|status   # the tower says nothing, on the Mac or a phone; text and chat go on (kept across restarts)
-tower mac-voice on|off|toggle|status   # play everything it says on this Mac, never on a phone (panel: Settings > Voice; kept in config.toml)
+tower down          # stop the voice and the brains (the orb stays, faded: click it to start again)
+tower model [<model>] [--effort <level>] [--restart]   # what the tower's brains run on (default: claude-opus-5-5 at high effort); a change applies when a brain restarts
+tower mute on|off|toggle|status   # the tower says nothing, on the Mac or a phone; cards and replies still appear (kept across restarts)
+tower mac-voice on|off|toggle|status   # play everything it says on this Mac, never on a phone (full window: Settings > Voice; kept in config.toml)
+tower tell [decisions|results|everything]   # how much it tells you: what you must decide (the default), also a receipt per finished request, or every note as before
+tower tell --voice off|decisions|replies    # what it says out loud: nothing, a decision once and nothing else, or its answers too (the default)
+tower undo [<id>] [--force]         # take back what the tower just opened for you (a session, a launched space); tower acts lists what it opened and what it assumed
+tower decisions [--space <space>]   # what only you can decide, most pressing first; tower answer <id> --choice <n> | --other "…", tower dismiss <id>
 tower orb           # just the orb
 ```
 
@@ -70,12 +67,18 @@ Then:
   pale blue when ready, icy cyan with a breathing halo while it listens to
   you, periwinkle with a halo that throbs on each beat while it replies, lively and
   spinning while it understands, its opening turned up while it thinks, a
-  quicker beat while it speaks, faded when off, breathing in standby, with a
-  red dot when an agent needs you. It reaches for the pointer, gives where you
-  press it and sloshes when dragged. Hover for the last thing heard or said;
-  click for the panel (below); right-click to show the tower's own terminal; drag it
-  anywhere (it comes back there next time). ⌘⇧K, from any app, shows or hides
-  it. It is its own small window (no Dock icon), so it works with Herdr closed.
+  quicker beat while it speaks, faded when off, breathing in standby. An
+  amber number on it says how many decisions wait for you (those of muted
+  spaces left out; no number when there are none; `9+` past nine). It
+  reaches for the pointer, gives where you press it and sloshes when
+  dragged. Hover to peek at the panel (below): it goes when the pointer
+  leaves the orb and the panel. Click to pin it, with the keyboard; Esc or
+  another click closes it. Right-click shows the tower's own terminal,
+  ⌥-click mutes or unmutes the tower; drag it anywhere (it comes back there
+  next time). ⌘⇧K, from any app, shows or hides it. It is its own small
+  window (no Dock icon), so it works with Herdr closed.
+  `HERDER_TOWER_ORB_PEEK=off` keeps hovering to one line (what it last heard
+  or said).
 - ⌘⇧Space also talks and ⌘⇧Esc hushes, from any app (the orb handles them).
 - `tower mode handsfree`: always listening; start with "Tower, ..."; say
   "stop" or "hush" to cut it off. `tower mode ptt` is the default.
@@ -94,63 +97,297 @@ is still in `mod/tower`, but `tower install` no longer puts it in Herdr, and
 takes the keys it added (⌘⇧K, ⌘⇧Space, ⌘⇧Esc) out of Herdr's `keys.json`:
 the orb has them now.
 
-### The panel
+### The quiet tower
 
-Click the orb for a glass chat with the tower (built with
-[GPUI Kit](https://gpui-kit.com) on macOS's own blur): your messages on the
-right, its answers on the left, what the sessions reported in between.
-Type in the pill at the bottom: Enter sends, Shift+Enter starts a new line,
-Esc closes. While you talk (Control or ⌘⇧Space), what you say appears in it as you say it, transcribed every second or so, then the final text, which goes to the brain as any spoken request. If the input already holds a draft (text you typed, an image or file you attached), what you say is added after it instead, and nothing goes until you press Enter, which sends the text and the attachments together.
+The tower does the work and keeps the record. It puts something in front of
+you in two cases: you asked, or the decision is yours. Everything else it
+writes down. The whole design is in
+[docs/quiet-tower.md](docs/quiet-tower.md).
 
-Under the panel's status line, **Active now** shows the sessions working
-or waiting for you right now, one chip each (a soft pulse while working,
-amber when it needs you, its space, account and how long it has run),
-blocked ones first, then the longest running; with a focus, that space's
-first and the others dimmed. It scrolls sideways and says "Nothing running"
-when nothing does. A chip opens the session: what it is doing, its question
-to answer, its live screen, its jobs and screenshots, and **Show in Herdr**
-(a right click on the chip does that directly).
+**How much it tells you** is one setting, `tower tell` (or Settings in the
+full window; `[tell] level` in config.toml):
 
-**Activity** is what is happening now, what finished, and what sessions
-reported. At the top, Active / Done / All, and under it one line of chips
-that scrolls sideways (the trackpad, the wheel, dragging, or ‹ ›): a search,
-All, the focused space (chosen until you choose), then each space followed
-by its sessions; only live sessions and those heard from in the last day,
-the others behind "+ older"; test sessions never. Active is what needs you
-(questions, blocked jobs) and what runs; Done is what finished, by day; All
-adds what sessions reported. Jobs are one-line rows (status, title, session
-and space, account, screenshots, time), a repeated job once; tap one for its
-card with the summary and pictures.
+- `decisions` (the default): only what is yours to decide, and answers to
+  what you ask. Finishes, deliveries, routine answers and the brain's own
+  notes go to the record, unspoken.
+- `results`: also one receipt when a request you made is finished.
+- `everything`: every delivery, finish and note is told and spoken, as the
+  tower did before. (The windows below still show the queue and the reply
+  to what you asked; all of it is in the Record.)
 
-When a session asks something the tower leaves to you (see "who decides" in [docs/questions.md](docs/questions.md)), a card waits at the foot of the chat, and the session's job card says "Asks: …" with a link to it. One question at a time, as the terminal dialog: the tower's three recommendations as large answers (the first marked Recommended, with why; a spinner while they come, and you can answer already), the session's own choices one tap away, and **Other** for your own answer: type it, hold Control and say it, or add files. Several questions end with a review, then Submit; the tower types the answers into the session and the card says how it goes (answering, waiting for the session, or where it stopped). ✕ dismisses it. What the tower answered for you shows as a quiet line ("answered for you: …"). How much it answers by itself is in Settings (the gear): normal, keep moving, or ask me everything.
+**What it says out loud** is a second setting, `tower tell --voice` (or
+Settings > Voice; `[tell] voice` in config.toml): `off` (nothing: the same
+as `tower mute on`), `decisions` (a decision, once, in one sentence, and
+nothing else) or `replies` (the default: it also answers out loud when you
+ask it something). `tower mute off` goes back to whichever of the two it
+was.
+
+**A command gets a receipt, never a question.** Ask for a session or a
+space and the tower takes the defaults, opens it, and keeps what it opened
+and what it assumed (the account, the model, the folder or worktree, the
+space, the name): the reply shows that as a line with chips and an
+**Undo** button. `tower undo` ends what was opened (and removes the
+worktrees made for it, when nothing in them would be lost); it refuses,
+saying why, when a session was given more work since or its worktree holds
+changes, unless `--force`.
+
+**Names you can read.** A session is its space and what it works on:
+`sandbox › mediaroom` where it is written, "the mediaroom session in
+sandbox" where it is said (its own name when it has one, else its project).
+
+Per space, `tower space follow <space>` lets that space's receipts reach
+you as they land, and `tower space mute <space>` keeps its decisions in its
+own view, off the orb's number and out of the main queue (`unfollow`,
+`unmute` undo them).
+
+**A decision** is the one thing shown to you as a card: a question a session
+asks that the tower leaves to you, a turn that ended waiting for you, the
+pull requests of one repo waiting for your merge in one space, something
+the brain raised (`tower raise`), or a task that failed again after the
+tower sent it once more. The same thing from several sessions of a space is
+one decision with all of them waiting, told once. They form **the queue**,
+ordered by sessions waiting × how long they have waited, heaviest first.
+`tower decisions` lists it; `tower answer <id> --choice <n>` or `--other
+"<your words>"` answers one, `tower dismiss <id>` takes one off.
+
+### The floating panel
+
+Hover the orb, or click it: a glass panel, 380 × 640 (built with
+[GPUI Kit](https://gpui-kit.com) on macOS's own blur). It shows what needs
+you and nothing else:
+
+- **The status line**: how many decisions are yours, in amber, and how many
+  spaces have a session at work; under it, faintly, what the tower last
+  heard or said. **Mute** is the tower-wide mute; **Full window** opens the
+  window below, or closes it.
+- **The queue**: one card open, tagged **Next**, the rest as rows under "N
+  more waiting"; a click on a row opens it instead (**Picked**). A card says
+  its space, why it is yours, how many sessions wait and for how long, and
+  what is asked.
+- **The spaces**: each open space as a chip: an amber count of what needs
+  you there (an outline when the space is muted), a pulse while it works, a
+  tick at rest; "+ N quiet" for the rest. A chip opens that space in the
+  full window.
+- **The reply** to what you last asked the tower, above the input, for ten
+  minutes (✕ closes it, a click leads to the record); while the tower works
+  on it, one line of what it is doing. When the tower opened something for
+  it, the reply is its receipt: what was opened, what was assumed as chips
+  (why, on hover), and **Undo**; undone, it says "Closed it. Nothing else
+  changed."
+- **Make it a rule**: after you answer a card, its receipt line stays about
+  eight seconds with "Make it a rule". One tap asks the tower of that space
+  to answer that question that way from now on (a behavior you can read,
+  change or undo). It is never offered for a merge, a permission, a failed
+  task, or anything about a deploy, a delete, production data, secrets or
+  money.
+- **The input**: type in the pill at the bottom: Enter sends, Shift+Enter
+  starts a new line, Esc closes the panel. While you talk (Control or
+  ⌘⇧Space), what you say appears in it as you say it, transcribed every
+  second or so, then the final text, which goes to the brain as any spoken
+  request. If the input already holds a draft (text you typed, an image or
+  file you attached), what you say is added after it instead, and nothing
+  goes until you press Enter, which sends the text and the attachments
+  together.
+
+**Cards.** A question a session asks goes one question at a time, as the
+terminal dialog does: the tower's three recommendations as answers (the
+first its pick, with why; placeholders while they come), the session's own
+options one tap away, and **Other** for your own answer: type it, hold
+Control and say it, or add files. A tap on an answer of a single question
+sends it; several questions end with a review, then Submit. The tower
+types the answers into the session, the card says how that goes, and when
+several sessions asked the same thing they all get the answer. If typing
+stops half way, the card says so and offers the session or another try. A
+merge card lists its pull requests, into dev before into main, each with
+its checks; its button asks about one, "Confirm" merges it (a PR whose
+checks fail takes a third step, from its own row; a draft or a conflict is
+held back). What the brain raised shows its choices as buttons, the
+tower's pick in amber with its reason, and Other; a task that failed twice
+offers "Try again" and "Drop it". An answered card leaves a one-line
+receipt for about two seconds. ✕ dismisses a card.
+
+**Number keys** answer the open card: 1 is its first answer, 2 the next, and
+on a merge or a review they press its buttons. They count while the message
+is empty and no other field has the keyboard (a Persian or Arabic
+keyboard's digits too).
+
+### The full window
+
+"Full window" opens the tower's window, about 960 × 640, the same glass.
+Drag it by its header strip or by the top of its sidebar; it stays on the
+screen, and opens where you left it.
+Both windows show one model: a card answered or picked in one is so in the
+other. A sidebar on the left: **All spaces** with the count of what is
+yours, each open space with its mark and a line (its sessions, "standing",
+"ready to close"), **New space**, the quiet spaces and what closed today
+folded into one line, and **Record**, **Shots** and **Settings** at the
+foot. The pane beside it shows:
+
+- **All spaces**: the queue, beside the open spaces as missions: each
+  one's goal (or what it is asked now), how far its request is ("3 of 5",
+  "ready to close"), its sessions, whether they have their own worktrees,
+  and how many messages they wrote each other.
+- **A space**: its goal and what counts as done (the **Goal** button
+  changes them, or makes it a standing space), **Follow** and **Mute**, its
+  closing report with **Close this space** once it is ready (and when it
+  would close by itself), what needs you there (a muted space's decisions
+  show only here), its requests, its sessions (status, last words, worktree
+  and branch, dev port), and the latest of the thread between its sessions.
+  Its head says when it has a tower of its own; what you type under it
+  goes to that tower, and its reply shows there (with none running: to the
+  main tower, with the space named).
+- **A session** (a click on its row): what it was asked, what it last
+  said, its screen as it is now (read again every couple of seconds), the
+  card that waits on it, and **Show in Herdr**.
+- **New space**: a goal and a saved setup; the tower says what it will do
+  (the name it gives the space, the sessions it opens and on which account,
+  their worktrees) before you press **Launch**. It asks nothing.
+- **Record**: the history, newest first, each row with its time, what it is
+  (You asked, Tower replied, Started, Finished, Needs you, Between
+  sessions, Answered for you, Note, Receipt, Decision raised, Decision
+  answered, Ready to close, Space closed, …), where and who, and its words;
+  chips narrow it to one space, and opened from inside a space it starts
+  there.
+- **Shots**: the gallery of what sessions sent (see Screenshots below).
+- **Settings**: how much it tells you; the tower's model (the model and
+  effort its brains are started on, what the running one uses, and
+  **Restart the tower's brain** when a restart is needed for a change to
+  apply); the voice (Off, Decisions, or Replies and decisions; and, as a
+  switch of its own, always on this Mac); how many questions it answers for you; Follow and Mute per open
+  space; the behaviors; pairing a phone; the Claude accounts; the saved
+  setups.
+
+Screenshots carry a small badge naming the Claude account of the session
+that sent them: the default account (the first `tower accounts` lists)
+outlined, any other filled with a colour picked from its name. A space's
+line says the account when all its sessions share one.
 
 Attachments work as in Claude Code and Codex: paste a screenshot or a file
-copied in Finder, drop files on the panel, or pick them with +. Each becomes a
+copied in Finder, drop files on the window, or pick them with +. Each becomes a
 token where you were typing, `[Image #1]`, `[Video #2]`, `[File #3: name]`;
 delete the token and the file goes with it. The message reaches the brain like
 a spoken request, with the files' paths in token order (copied to
 `~/.local/share/herder-tower/attachments` first, so they stay put).
 
-The jobs button (by the status) shows what the tower handed out, in progress
-and finished, by space or session. It all lives in
-`~/.local/share/herder-tower/history.jsonl` (append-only): `tower watch`
-starts a job, the watch report ends it, the brain adds the outcome
-(`tower job done`) and session summaries (`tower summary`).
-
-Each Claude session, job and history row carries a small badge naming the
-Claude account it runs on (the `account` the radar reports per agent); Codex
-sessions have none. The panel has no list of accounts of its own: it shows
-whatever name the data carries, outlines the default account (the first
-`tower accounts` lists, re-read every 30 s) and fills any other account with a
-colour picked from its name, so a new account needs no change here. A space shows its
-account when all its Claude sessions share one, and "mixed" when they differ.
+What the tower hands out and what comes of it lives in
+`~/.local/share/herder-tower/history.jsonl` (append-only), the file the
+Record shows: `tower watch` starts a job, the watch report ends it, the
+brain adds the outcome (`tower job done`) and session summaries (`tower
+summary`). An entry with `"record": true` was written down, not told.
 
 Things to say: "What's everyone doing?", "Tell the eyzflow session to run
 the tests and fix what fails", "What is Codex on the VPS asking?", "Approve
 it", "Start a Claude session in sooner-app-web and have it look at the login
-bug" (add "on the <name> account" for another account). The brain hands off
-work (`tower start` for new sessions), calls `tower watch`, and tells you when the
-session finishes. When any agent anywhere needs you, the radar says so.
+bug" (add "on the <name> account" for another account), "Open a space for
+the login redirect". The brain hands off work (`tower start` for new
+sessions, `tower launch` for a space), calls `tower watch`, and answers
+what you asked. What a session then needs from you comes as a decision;
+its finish is in the record (or a receipt, at `tower tell results`).
+
+### Spaces are missions
+
+A space with a goal is a mission: it has a goal, what counts as done, and
+an end. `tower space goal <space> "<goal>" [--done-when "<…>"]` sets them
+(or the Goal button in the space's view).
+
+- **open**: it has sessions at work.
+- **quiet**: its last session is gone. What was raised there closes (a PR
+  waiting for your merge stays yours). A day later it is archived: out of
+  the listings, back when a session opens there again.
+- **ready**: every request there is finished and nothing waits for you.
+  The brain writes its closing report (`tower space report`), which the
+  space's view shows with "Close this space".
+- **closed**: `tower space close <space>` (your word, or the button) ends
+  its sessions, removes the worktrees the tower made for it, each only when
+  clean (one with uncommitted or unpushed work is kept and named; branches
+  always stay), and puts its report in the record. It refuses while a
+  session there works or waits for you, unless `--force` ("Close anyway").
+  A ready space whose sessions have all been idle for `[spaces]
+  auto_close_hours` (off by default; say 24 for a day) is closed the same way by itself.
+
+A space with no goal is yours as it always was: never ready, never closed
+by the tower, no worktrees. So is a **standing** space (`tower space
+standing <space> on`), goal or not.
+
+**One sentence opens a space.** `tower launch "Fix the login redirect"`
+names the space from the goal (its first two words that carry meaning:
+`fix-login`, with `-2` if that is taken), takes a setup, makes the Herdr
+space, opens a session per repo of the setup on its account, sets the goal
+and hands it out as the first request. It asks nothing and prints what it
+assumed; `--dry-run` prints the same plan and does nothing. A **setup** is
+a name, a Claude account and the repos that get a session each: `tower
+setup add "<name>" --account <account> --repo <folder> [--repo <folder>…]`,
+`tower setup remove "<name>"`, `tower setups` (kept as `[[setups]]` in
+config.toml; the first is the default).
+
+**Worktrees.** A session the tower opens for a mission (`tower launch`,
+`tower start --space <space>`) works in a git worktree of its repo,
+`<repo>/../.tower-worktrees/<space>/<repo>` on a branch `<space>/<repo>`,
+with the repo's untracked `.env*` files copied over and a dev port of its
+own from `[spaces] port_range` ("3000-3050"). Both are said in its first
+instruction, kept on its terminal's labels and shown in its space's view.
+Not in a space with no goal, a standing space, a folder that is no git
+checkout, on another machine, or with `tower start --no-worktree`;
+`[spaces] worktrees = false` turns it off everywhere.
+
+**Sessions write to each other** without the tower in between: a session
+that runs `tower queue <address> "<message>"` sends a message, not a task
+(the same queue: it waits for a busy receiver and arrives once, with the
+sender's name on it). `tower thread [<space>]` lists what a space's
+sessions wrote, and the space's view shows the latest.
+
+### A tower per space, and the model they run on
+
+Each open space with a live agent session has a tower of its own beside
+the main one: a hidden Herdr terminal named `tower-<space>` (the space's
+name in lower case, dashes for the rest; `tower show tower-<space>` puts
+it in a tab), run in `~/.config/herder-tower/brains/<space>/`. Its
+instructions are the main tower's (the same core and behaviors) and a part
+about its space only: its goal and what counts as done, its sessions, its
+requests, how to read its thread, and the rule that it handles that space
+and hands anything that crosses spaces to the main tower (`tower queue
+tower "…"`).
+
+- The voice starts it with the space's first live session and stops it
+  when the space is closed (`tower space close` ends it first), archived,
+  gone from Herdr, or has had no live session for three minutes. One that
+  dies is started again, each time later (15 s, 30 s, 1 min, … up to 10
+  min). A space's own is only started while the main brain runs.
+- What it gets: the notes about its space's sessions (their finishes,
+  their questions, the queue's and the agenda's news), what those
+  sessions write to "the tower", and what you type in that space's view
+  (`tower ask --space <space> "…"`). Its answer to you shows in that
+  view and is spoken like the main tower's; what it does on a note is
+  written down. The main tower gets everything else, and whatever a
+  space's tower can't take right now (it is starting, or waits on its own
+  screen): nothing is dropped.
+- `[brains] per_space = false` in config.toml keeps one brain for
+  everything. `tower status` lists the brains that run (`brains`), and
+  each space in `tower missions` says whether it has its own (`tower`).
+
+**The model.** Every tower brain (the main one and each space's) is
+started on one model and effort, chosen in the full window's Settings
+("Tower's model") or with `tower model`:
+
+```sh
+tower model                                  # the setting, what each running brain was started with, whether a restart is needed
+tower model claude-fable-5-2 --effort high   # claude-fable-5-2, claude-opus-5-5, claude-sonnet-5-5, claude-haiku-5-5, or any name the program takes
+tower model --effort xhigh                   # low | medium | high | xhigh | max
+tower model claude-sonnet-5-5 --restart      # ... and restart the brains now (each starts a new conversation)
+```
+
+It is kept in config.toml as `[brains] model` and `effort`; with neither
+there, a brain runs on `claude-opus-5-5` at `high` effort. It goes in as
+`claude --model <model> --effort <level>` when a brain starts, for that
+session only: the tower never types `/model` or `/effort` into a brain
+(that would change your account's default) and sets nothing in its
+environment, so a change applies when a brain restarts (`tower model
+--restart`, the button in Settings, `tower restart --brain`). If your
+`claude_args` name `--model` or `--effort` themselves, those win and
+`tower model` says so. With `brain = "codex"` the model comes from
+`codex_model`, `codex_effort` and `codex_args`, and `tower model` only
+reports that. (A config.toml from before this that still has `claude_model`
+or `claude_effort` keeps what those say until `[brains]` says otherwise.)
 
 ### Claude accounts
 
@@ -194,7 +431,7 @@ error that lists the ones it does. Without the mod, sessions start as plain
 
 Every Claude session on this Mac carries its account: `tower agents`,
 `tower spaces`, `tower history` and jobs, and the `agents` in the daemon's
-`state.json` (the orb's panel). It's the account's name as cca has it, or
+`state.json` (which the orb's windows read). It's the account's name as cca has it, or
 `null` for Codex, other machines, and sessions it can't tell. A process's
 account never changes, so it's looked up once per pid and kept in
 `~/.local/state/herder-tower/accounts.json`.
@@ -208,11 +445,11 @@ turn ("Want me to open the PR, or wait?"). The brain recommends three
 answers per question, the best first, and decides by the **90/10 rule**:
 routine questions (naming, which of two reasonable ways, proceed, run the
 tests, edits and commands inside the project, local commits) it answers
-itself, once, with its first recommendation, and the chat shows a quiet
-"answered for you: …" line; the rest (deploys, pushes and merges to shared
+itself, once, with its first recommendation, and the record keeps an
+"Answered for you" line; the rest (deploys, pushes and merges to shared
 branches, deleting, infrastructure, secrets, money, anything outside the
-project or surprising) come to you as a card, and you hear one sentence with
-what is asked and what the tower would pick. Deploys, pushes, deletes,
+project or surprising) come to you as a card in the queue, and you hear one
+sentence with what is asked and what the tower would pick. Deploys, pushes, deletes,
 infrastructure, secrets and money always come to you, whatever the brain
 thinks. Answer with a tap, your own words (typed or spoken, with files), and
 the tower types it into the session for you, checking the screen after every
@@ -227,14 +464,14 @@ how it talks, hands out and watches work, spaces, accounts, releases and
 safety, which questions it answers for you, screenshots, browsers. Each is a
 short rule with a one-line summary, on or off, in
 `~/.config/herder-tower/behaviors/`; the brain's instructions are generated
-from them (plus a fixed core with its tools). Change them in the panel or
-on the phone, with `tower behavior …`, or just say it: "from now on, always
-…", "change the screenshot behavior to …", "turn off …", "undo that".
-Every change is logged and can be undone, and shows in the chat with what
-changed. Details: [docs/behaviors.md](docs/behaviors.md).
+from them (plus a fixed core with its tools). Change them in the full
+window or on the phone, with `tower behavior …`, or just say it: "from now
+on, always …", "change the screenshot behavior to …", "turn off …", "undo
+that". Every change is logged and can be undone, and is kept in the record
+with what changed. Details: [docs/behaviors.md](docs/behaviors.md).
 
-In the panel: Settings (the gear) → **Behaviors**, or tap a behavior change
-in the chat. Each category is a section and each behavior a card: its name,
+In the full window: Settings → **Open behaviors**. Each category is a
+section and each behavior a card: its name,
 its line, where it came from (built in, you, learned) and a switch. Tap one
 for the whole rule, with Edit (Preview shows what changes before Save), Turn
 off, Delete (asked twice) and Undo; **+ Add** writes a new one; the search
@@ -248,22 +485,17 @@ Sessions show visual results in the tower: `tower screenshot shot.png
 --caption "the new login page"` (several images at once; PNG, JPEG, WebP or
 GIF up to 15 MB). The tower keeps a copy for 30 days and records it in its
 history (kind `screenshot`, with the session, its account, its job), so it
-appears in the orb's panel and on the phone. `tower screenshots --last 5`
+appears in the full window and on the phone. `tower screenshots --last 5`
 lists them. The brain asks sessions doing visual work to send one; the
 instruction block for sessions is in
 [docs/session-instructions.md](docs/session-instructions.md).
 
-Screenshots show in the panel's chat as they arrive: one card per go, with
-the picture large enough to read, its caption, the session and its account.
-The tower can also put them with its own message: `[shot:<id>]` or
-`[shots:<session>]` in its reply shows that screenshot (or the session's
-latest ones, up to 4) under the message instead; the marker is never spoken
-or shown.
-
-In the panel, the **Shots** tab is the gallery, newest first: each
-thumbnail with its caption, the session and its account (the same sideways
-filter as Activity narrows it). A job's screenshots also show small on its
-card.
+In the full window, **Shots** is the gallery, newest first: each thumbnail
+with its caption, the session and its account. The Record lists them too
+(those a session sent together are one row). The tower can put screenshots
+with its own message on the phone: `[shot:<id>]` or `[shots:<session>]` in
+its reply shows that screenshot (or the session's latest ones, up to 4)
+under the message there; the marker is never spoken or shown.
 Click one to see it full size over the screen: it fits the screen, a click
 shows it at 100% (scroll to look around), ← and → go through the others,
 and Esc, ✕ or a click outside closes it. Thumbnails are made once, in the
@@ -273,14 +505,19 @@ background, the first time one is shown.
 
 **Tower for Android** ([github.com/hasangilak/herdr-tower-android](https://github.com/hasangilak/herdr-tower-android),
 `git@github.com:hasangilak/herdr-tower-android.git`) is the tower in your
-pocket, over the local network. It mirrors the panel: chat with the tower,
+pocket, over the local network. It has a chat with the tower,
 spaces and their sessions (with their Claude accounts), running and finished
 jobs, history, and the screenshots sessions send (a gallery and a full-size
-viewer), and the same chat thread as the Mac: what you send from either
-shows on both. It acts like the panel: ask (typed or dictated, with pictures
+viewer). It acts like the Mac's windows: ask (typed or dictated, with pictures
 and files attached), answer what sessions ask (the question cards and their
 recommendations), approve or refuse, focus a space, hush, bring a session on
-screen on the Mac, read and change the tower's behaviors. And it can be
+screen on the Mac, read and change the tower's behaviors. The phone API has
+the whole Quiet Tower as well, for the app to build on: the queue of
+decisions (read, answered, dismissed, and an event the app can notify
+from), every space as a mission (its goal, Follow and Mute, closing it),
+the thread between a space's sessions, launching a space from a sentence,
+asking a space's own tower, how much the tower tells you, and the model its
+brains run on. And it can be
 **the tower's voice**: you talk into the phone, the Mac transcribes with its
 own Whisper, and the replies (and the "Okay.") play on the phone in the
 tower's Kokoro voice. Each phone chooses where the replies to what *it*
@@ -290,8 +527,8 @@ silent for them, or on the Mac.
 To connect it:
 
 1. `tower phone enable` (the phone API is off until you do).
-2. Pair: open the panel's **Phone** section and press **Pair a phone** for
-   a QR code, or run `tower phone pair` in a terminal. Scan the QR in the app
+2. Pair: in the full window, Settings → **Pair a phone** shows a QR code;
+   or run `tower phone pair` in a terminal. Scan the QR in the app
    (or type the address and the 8-digit code; the code works once, for 5
    minutes).
 3. `tower phone devices` lists paired phones; `tower phone revoke <id|all>`
@@ -307,33 +544,58 @@ first, then the tailnet's, with the Mac's MagicDNS name), and the app tries
 them in order. Tailscale is found through its CLI (Homebrew's, or the
 standalone app's own) and looked at again every 20 s: start or stop it and
 the tower follows. `[lan] tailscale = "off"` in config.toml keeps it to the
-LAN. `tower phone devices` and the panel's Settings say which addresses it
+LAN. `tower phone devices` and the pairing view say which addresses it
 listens on and whether Tailscale is running or stopped. The API, the
 pairing flow and the security model:
 [docs/mobile-api.md](docs/mobile-api.md).
 
-The panel does the same without a terminal: Settings (the gear at its top
-right) shows whether the phone API is on and where it listens, turns it on or
-off, and **Pair a phone** shows the QR code (and the code to type) with its
-5-minute countdown, opening a fresh one when it runs out. Below it are the
-paired phones, each with Revoke and **Replies: Phone | Mac**: where the
-tower's replies to what that phone sends are heard.
+The full window does the same without a terminal: Settings → **Pair a
+phone** shows whether the phone API is on and where it listens, turns it on
+or off, and shows the QR code (and the code to type) with its 5-minute
+countdown, opening a fresh one when it runs out. Below it are the paired
+phones, each with Revoke and **Replies: Phone | Mac**: where the tower's
+replies to what that phone sends are heard.
+
+What a phone does goes through the same functions as the Mac's windows and
+the CLI: a decision answered on the phone goes where `tower answer` sends
+it, and a goal set there is the one `tower space goal` sets. Launching and
+closing a space answer the phone at once and report as they go. An app
+checks `features` in `GET /v1/hello` for `quiet` before it uses any of it
+(a tower from before answers as it always did). The calls, shapes, errors
+and events are in [docs/mobile-api.md](docs/mobile-api.md) ("The Quiet
+Tower"), with every call run against a tower in
+[docs/mobile-api-quiet-walkthrough.md](docs/mobile-api-quiet-walkthrough.md);
+how it was built is step 11 of [docs/quiet-tower.md](docs/quiet-tower.md).
 
 From a shell (or a Raycast/skhd hotkey outside Herdr):
 
 ```sh
 tower talk | tower hush | tower mode handsfree
 tower ask "what's waiting for me?"   # typed instead of spoken
+tower ask --space sandbox "what's left here?"   # ... asked of that space's own tower (the main one when it has none)
 tower say "hello"                    # speak anything
 tower agents                         # every agent on every machine, with its account (JSON when piped)
 tower accounts                       # the Claude accounts (from cca)
 tower phone pair                     # pair the Android app (tower phone enable first); --json for the payload
 tower phone devices                  # where the phone API listens (LAN, Tailscale), Tailscale running or stopped
-tower screenshot shot.png --caption "…"  # show a visual result in the panel and on the phone
+tower screenshot shot.png --caption "…"  # show a visual result in the full window and on the phone
 tower behavior list                  # how the tower works; add, edit, disable, remove, undo
 tower questions                      # what sessions ask now; tower answer <id> --json '[…]', tower dismiss <id>
 tower policy [normal|keep-moving|ask-everything]   # how much the tower answers for you
-tower start --name n --cwd d "task"  # a new Claude session on an account (--account), watched
+tower start --name n --cwd d "task"  # a new Claude session on an account (--account), watched; with --space of a space that has a goal, in that space's worktree of d (--no-worktree: in d itself)
+tower launch "<goal>" [--setup <name>] [--name <space>] [--dry-run]   # open a space for a goal: a session per repo of a setup, each in its worktree, the goal handed out
+tower setups                         # what `tower launch` opens with; tower setup add "<name>" --account <a> --repo <dir> [--repo <dir>…], tower setup remove "<name>"
+tower missions                       # every open space as a mission: goal, state, what needs you, sessions (worktree, port), requests
+tower spaces [--all]                 # every space: focus, goal, state, unread news, sessions (--all: archived and closed ones too)
+tower space goal <space> "<goal>" [--done-when "<…>"]   # what a space is for and what counts as done
+tower space standing <space> on|off  # a space you keep: never ready, never closed by the tower, no worktrees
+tower space report <space> "<text>"  # its closing report (the brain writes it when the space is ready)
+tower space close <space> [--force]  # end its sessions, remove its clean worktrees, archive it
+tower space follow|unfollow <space>  # its finished requests' receipts reach you as they land
+tower space mute|unmute <space>      # what needs you there stays in its own view, off the orb's number
+tower thread [<space>] [-n 50]       # what the sessions of a space wrote to each other
+tower raise <t> --why <kind> "<the decision>" [--options '[…]']   # put a decision to the user (the brain does this)
+tower receipt [--agenda <id>] "…"    # the one line for a finished request (the brain does this)
 tower history [--jobs open|finished] [--session t3]   # what the tower has done (JSON when piped)
 tower job start|done|failed <t> "…"  # record a job (the brain does this)
 tower summary <t> "…"                # record what a session has done (the brain does this)
@@ -346,7 +608,9 @@ tower agenda show|close|abandon|verify|fail|requeue <id> …   # one request (a3
 tower sessions [<t>]                 # what each agent session's hooks said: prompt, last answer, state
 tower introduce [<space>] [--dry-run]  # the Claude sessions of a space, told who the others are (done by itself as one joins)
 tower hooks install|remove|status    # the hooks that let the tower see every Claude Code and Codex session
-tower status                         # the daemon's state
+tower model [<model>] [--effort <level>] [--restart] [--json]   # the model and effort the tower's brains are started on
+tower restart [--brain]              # stop and start the voice (the brains keep running); --brain: restart the brains too
+tower status                         # the daemon's state (the brains that run are under `brains`)
 tower doctor                         # check the setup
 tower selftest                       # Kokoro speaks, Whisper listens: no mic needed
 ```
@@ -363,7 +627,9 @@ tower up
 `install` puts the binary in `~/.local/bin/tower`, writes
 `~/.config/herder-tower/config.toml` (voice, Whisper model, wake words,
 alerts) and the brain's folder `~/.config/herder-tower/brain/` (its
-instructions and Claude Code hooks), and adds the tower's agent hooks to
+instructions and Claude Code hooks; a space's own brain has the same in
+`~/.config/herder-tower/brains/<space>/`, written when it first starts and
+again by `install`), and adds the tower's agent hooks to
 `~/.claude/settings.json` and `~/.codex/hooks.json`, beside whatever is
 there (each file backed up first as `*.tower-backup`; `tower hooks remove`
 takes them out again). The first `tower up`
@@ -377,7 +643,7 @@ for **Herdr Core**, because the voice runs in a Herdr terminal.
 ```
  you ─ mic ─▶ tower-voice (Rust daemon) ─ hc send "[voice] …" ─▶ tower (Claude Code)
                  ▲  │                                              │  hc ls/read/send/keys
-                 │  └─ state.json ─▶ tower orb (its own window)    ▼
+                 │  └─ state.json ─▶ tower orb (orb, panel, window) ▼
      Stop hook ──┘◀── its answer ──────────────────────────── every agent, every machine
      (tower hook claude)                    radar: hc events / hc exec --on <m> hc ls
 ```
@@ -454,10 +720,89 @@ for **Herdr Core**, because the voice runs in a Herdr terminal.
   terminals, Codex, or sessions in other spaces or on other machines; on the
   first run what is already open is only recorded. `[sessions] introduce =
   false` turns it off; `tower introduce <space> --dry-run` shows it.
+- How much it tells you (`[tell] level` in config.toml, `tower tell`;
+  docs/quiet-tower.md): at `decisions` and `results` a turn of the brain
+  that starts with the tower's own note (`[watch]`, `[queue]`, `[agenda]`)
+  is for the record: what it writes is kept in the history as a `note`,
+  not shown in the chat and not spoken. The brain reaches the user by a
+  command: `tower raise` (a decision that is theirs) or `tower receipt`
+  (one line for a finished request, told at `results` or for a space you
+  follow with `tower space follow`). Deliveries, finishes and routine
+  answers are written down (`"record": true` in the history). At
+  `everything` the tower tells all of it, as it did before.
+- Sessions write to each other without the tower in between: `tower queue`
+  knows the terminal it ran in (`HC_TERMINAL_ID`), and at the quiet levels
+  an instruction from an agent session that isn't the brain is a message:
+  the same queue, the sender's name on it, no agenda task, no watch, no
+  note to the brain, kept in the history as `peer`. `tower thread
+  [<space>]` lists a space's messages. One that can't be delivered goes
+  back to its sender as one note. A session's message to the brain itself
+  goes in as a `[session]` note, so the brain's turn on it is for the
+  record too.
+- What needs you is a decision (`tower decisions`, `decisions` and
+  `decisions_count` in state.json, kept in
+  `~/.local/state/herder-tower/decisions.json`): a question that went to
+  you, a session whose turn ended waiting for you, the PRs of a repo
+  waiting for your merge (one decision per repo and space, into dev before
+  into main), what the brain raised, a task that failed again after the
+  tower sent it once more. The same thing from several sessions of a space
+  is one decision with all of them waiting, told once; they are ordered by
+  sessions waiting × how long. A merge outlives the session that opened
+  its PR: it goes when the PR no longer waits, or with its space. A
+  session that only says it is ready or
+  waiting for instructions, with nothing asked of it, is none. `tower space
+  mute <space>` keeps a space's decisions in its own view (`tower decisions
+  --space <space>`), off the orb's count.
+- A space is a mission with an end (`tower missions`, `missions` in
+  state.json, kept in `spaces.json`; docs/quiet-tower.md): it has a goal
+  and what counts as done (`tower space goal`). It is quiet once its last
+  session is gone (its held news is read, what was raised there closes; a
+  PR waiting for your merge stays yours) and archived a day later; ready
+  when every request there is finished and nothing waits for you (the
+  brain then writes its closing report); closed by `tower space close`
+  (your word: it ends the space's sessions, removes the clean worktrees the
+  tower made, keeps a dirty one and names it), or by itself after `[spaces]
+  auto_close_hours` (off by default; say 24 for a day) ready with every session idle. A
+  standing space (`tower space standing <space> on`) has no end.
+- One sentence opens a space: `tower launch "<goal>"` names it from the
+  goal (its first two words that carry meaning), takes a setup
+  (`[[setups]]` in config.toml: a name, an account, the repos), opens a
+  session per repo and hands the goal out as the first request. It asks
+  nothing and prints what it assumed; `--dry-run` only plans.
+- A worktree per mission: a session the tower opens for a space that has a
+  goal (or that `tower launch` made) and isn't standing works in
+  `<repo>/../.tower-worktrees/<space>/<repo>` on a branch `<space>/<repo>`
+  (the repo's untracked `.env*` files copied over), with a dev port of its
+  own from `[spaces] port_range` ("3000-3050"); both are said in its first
+  instruction and kept on its terminal's labels. A space with no goal gets
+  none. `[spaces] worktrees = false` turns it off, `tower start
+  --no-worktree` for one session.
+- The orb's windows read what the daemon writes and act through the same
+  commands as a terminal: the queue and the missions from `state.json`
+  (`decisions`, `missions`, `threads`, `tell_level`), the record from
+  `history.jsonl`; an answer goes through the daemon's socket as `tower
+  answer` does, and what the full window sets runs `tower tell`, `tower
+  space …`, `tower launch` and `tower ask`. A daemon that doesn't write
+  `decisions` or `missions` yet is read through an adapter (its question
+  sets, `prs.json`, `spaces.json`, Herdr's spaces).
+- A task that failed is sent once more by the tower itself at the quiet
+  levels; `[agenda] retry_failed = false` in config.toml turns that off
+  (the brain then hears of the failure and puts it to you).
 - Codex as the brain: `tower up --brain codex` (it uses Codex's `notify`
   instead of a hook, and runs with `--sandbox danger-full-access
   --ask-for-approval on-request` because `hc` talks to herdr-core over a Unix
   socket).
+- A brain per space: the voice keeps a list of the brain terminals the
+  radar sees (`tower`, and every `tower-<space>`, which it never treats as
+  an agent: no watch, no question card, no decision, not in `agents`). A
+  note goes to the brain of its session's space when that one runs and
+  isn't starting or stuck, else to the main brain; a request goes where it
+  was asked (`tower ask --space`). Each brain's hooks say whose they are
+  (`tower hook claude tower-<space>`), so its answer is kept as its
+  space's and each brain has its own turn (a note turn of one doesn't
+  silence another's answer). What a brain was started with is read off
+  its terminal's command line, which is how `tower model` knows whether a
+  restart is needed.
 - State machines: question cards, queued instructions, jobs and session
   status each have one enum and one transition table
   (docs/state-machines.md); question cards are kept in
@@ -469,7 +814,19 @@ for **Herdr Core**, because the voice runs in a Herdr terminal.
   `HERDER_TOWER_BRAIN` naming a terminal that doesn't exist) handles only
   test sessions, so the two never answer, announce or report the same one.
   Give it a config with `talk_key = "off"`, `[lan] enabled = false` and the
-  alerts off.
+  alerts off. Commands that make or close spaces and worktrees (`tower
+  launch`, `tower start --space`, `tower space close`) can be tried against
+  stand-ins: `HERDER_TOWER_HC`, `HERDER_TOWER_HERDR_APP` and `TOWER_CCA`
+  name the programs to run for `hc`, `herdr-app` and `cca`. A whole tower
+  can run in such a sandbox without a voice: `HERDER_TOWER_VOICE=off tower
+  daemon` opens no speakers, loads neither Kokoro nor Whisper and leaves
+  the microphone and the talk key alone, while its socket, state, queue
+  and radar work as always. The orb's windows can be looked at on that
+  state without taking the keyboard: `tower orb --ui-dir <dir>` with
+  `HERDER_TOWER_ORB_PANEL=show[@x,y]` (the floating panel) and
+  `HERDER_TOWER_ORB_WINDOW=show[:<view>][@x,y]` (the full window at `all`,
+  `space=<name>`, `new[=<goal>]`, `record[=<space>]`, `shots`, `settings`,
+  `behaviors`, `phone` or `session=<space>/<address>`).
 
 ## Limits
 
@@ -481,6 +838,15 @@ for **Herdr Core**, because the voice runs in a Herdr terminal.
   Privacy & Security). Set `talk_key = "right_ctrl"` (or `off`) in
   config.toml if plain Control taps get in your way.
 - Other machines are polled every 15 s, so their alerts lag a little.
+- A space's own tower runs hidden, like the main one, not as a tab of its
+  space: Herdr can't open a tab in a chosen space without showing it, and
+  a tab's terminal has no name to write to. It is tied to its space by a
+  label (`tower.space`) and ends with the space; `tower show tower-<space>`
+  brings it on screen.
+- Restarting a brain (for a new model) starts a new conversation: it reads
+  its instructions again, but not what it was in the middle of.
+- A space whose name is longer than 26 letters gets a shortened terminal
+  name (`tower-…-<4 letters>`), since Herdr's names end at 32.
 - Questions: dialogs on other machines aren't read yet (their plain-text
   questions are); a new Claude Code or Codex version may draw its dialogs
   differently, and then the tower just doesn't offer them as cards.
