@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 use gpui::{AnyElement, App, Context, FontWeight, SharedString, Window, div, prelude::*, px, rgb, rgba};
 use gpui_kit::component::{h_flex, v_flex};
 
-use super::home::{LINE, SOFT, bay_label, cstat, dismiss_mark, mbtn, sign, tg};
+use super::home::{LINE, SOFT, bay_label, cstat, dismiss_mark, mbtn, minimize_mark, sign, tg};
 use super::{CYAN, Panel, cli, glass, launch, record, space};
 use crate::history;
 use crate::orb::model::{self, Decision, Missions};
@@ -505,6 +505,13 @@ impl Panel {
         let side = self.sidebar(&scope, &all, &missions, cx);
         // The window is moved by its header strip (and the sidebar's top).
         let head = self.grip("head-grip", head, cx);
+        // Close, in the window's top right corner: the window goes (the orb opens a new one).
+        let head = h_flex()
+            .w_full()
+            .items_start()
+            .gap(px(10.0))
+            .child(div().flex_1().min_w_0().child(head))
+            .child(div().flex_none().pt(px(23.0)).child(dismiss_mark("close-full").on_click(cx.listener(|this, _, window, cx| this.close(window, cx)))));
         let me = cx.entity().downgrade();
         // Asked for at the Phone card: scrolled there on the next frame (the card is laid out by then).
         let settings = matches!(scope, Scope::Settings | Scope::Phone);
@@ -726,8 +733,8 @@ impl Panel {
                             .child(div().flex_1().text_size(px(19.0)).line_height(px(23.0)).font_weight(FontWeight::SEMIBOLD).child("Tower"))
                             // Back to the floating panel: it opens, this window closes, the orb opens the panel from now on.
                             .child(tg("to-floating", "Floating", false).on_click(cx.listener(|this, _, window, cx| crate::orb::to_floating(&this.tower.clone(), window, cx))))
-                            // Closes the full window (as Esc, or a click on the orb, does); the orb opens it again.
-                            .child(dismiss_mark("close-full").on_click(cx.listener(|this, _, window, cx| this.close(window, cx)))),
+                            // Into the orb, kept as it is (as Esc, or a click on the orb, does); the orb brings it back.
+                            .child(minimize_mark("minimize-full").on_click(cx.listener(|this, _, window, cx| crate::orb::minimize_full(&this.tower.clone(), window, cx)))),
                     )
                     .child(div().text_size(px(12.5)).text_color(g.muted).child(status))
                     .children(hint),

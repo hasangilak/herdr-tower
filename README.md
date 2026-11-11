@@ -220,9 +220,11 @@ panel closes), about 960 × 640 at first, the same glass. Move it by its top
 (the header strip, or "Tower" at the top of its sidebar) and resize it by
 its edges, down to 820 × 520; it opens where you left it, at that size.
 The orb remembers which of the two you use. Once you open the full window
-you are in full mode: a click on the orb closes the full window and the
-next one opens it again, and hovering the orb doesn't bring up the floating
-panel. Esc and the × beside "Tower" close it too. **Floating**, beside
+you are in full mode: a click on the orb minimizes the full window into the
+orb, kept as it is (the same page, what you typed), and the next click
+brings it back; hovering the orb doesn't bring up the floating panel. Esc
+and the – beside "Floating" minimize it too. The × in the window's top
+right corner closes it; the orb then opens a new one. **Floating**, beside
 "Tower", switches back: the full window closes, the floating panel opens,
 and the orb opens the floating panel from then on. The mode is kept in
 `window.json` with the window's spot and size. Both windows show one model:

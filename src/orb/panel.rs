@@ -397,7 +397,12 @@ impl Panel {
     /// keyboard of the two, or it is the only one.
     fn owns_typing(&self, window: &Window, cx: &App) -> bool {
         let me = window.window_handle();
-        self.tower.read(cx).keyed.is_none_or(|h| h == me || !cx.windows().contains(&h))
+        let t = self.tower.read(cx);
+        // A full window minimized into the orb hears nothing (what is said goes to the tower all the same).
+        if t.full_hidden && t.full == Some(me) {
+            return false;
+        }
+        t.keyed.is_none_or(|h| h == me || !cx.windows().contains(&h))
     }
 
     /// Mirrors what you say into the input as you talk: the daemon's
@@ -724,9 +729,10 @@ impl Panel {
         .detach();
     }
 
-    /// Esc: the window goes. The floating panel hands the keyboard back to
-    /// the app that had it; the full window leaves it to a pinned floating
-    /// panel if there is one.
+    /// The window goes (Esc in the floating panel, the full window's close
+    /// button). The floating panel hands the keyboard back to the app that
+    /// had it; the full window leaves it to a pinned floating panel if there
+    /// is one.
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let me = window.window_handle();
         window.remove_window();
@@ -838,7 +844,12 @@ impl Render for Panel {
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| this.number_key(ev, window, cx)))
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if ev.keystroke.key == "escape" {
-                    this.close(window, cx);
+                    // The full window goes into the orb as it is; the floating panel closes.
+                    if this.full.is_some() {
+                        super::minimize_full(&this.tower.clone(), window, cx);
+                    } else {
+                        this.close(window, cx);
+                    }
                 }
             }))
             .drag_over::<ExternalPaths>(|style, _, _, _| style.border_color(rgba(0xffffffcc)).bg(rgba(0x8fb0d84d)))

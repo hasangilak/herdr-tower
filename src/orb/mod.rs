@@ -28,6 +28,8 @@
 //! window (`show:<view>` at a view, as `nav::Scope::parse` reads it); either
 //! with `@<x>,<y>` opens at that spot, in screen points. With `show:phone`,
 //! `HERDER_TOWER_ORB_PAIR=open` opens the Phone card's pairing box too.
+//! `HERDER_TOWER_ORB_MINIMIZE=1` minimizes the full window once, as its
+//! button does, and brings it back with the orb's click.
 
 mod liquid;
 mod mac;
@@ -105,6 +107,9 @@ struct Tower {
     /// Where the full window is, and the window while it is open.
     nav: nav::Nav,
     full: Option<AnyWindowHandle>,
+    /// The full window is minimized into the orb: out of sight, kept as it
+    /// is (its page, what is typed in it), until the orb brings it back.
+    full_hidden: bool,
     /// The floating panel while it is open (a peek or pinned): it closes
     /// when the user opens the full window, which takes its place.
     floating: Option<AnyWindowHandle>,
@@ -143,6 +148,7 @@ impl Tower {
             mutes: vec![],
             nav: Default::default(),
             full: None,
+            full_hidden: false,
             floating: None,
             full_mode: saved_full_mode(),
             orb: None,
@@ -691,7 +697,7 @@ impl Orb {
     /// Hovering: the panel as a peek, unless it is open already.
     fn peek(&mut self, cx: &mut Context<Self>) {
         // In full mode (open or not), the full window has taken the floating panel's place.
-        if self.rest || self.tower.read(cx).full_mode || full_open(&self.tower, cx) {
+        if self.rest || self.tower.read(cx).full_mode || full_shown(&self.tower, cx) {
             return;
         }
         if self.press.is_none() && !self.panel_open(cx) {
@@ -726,13 +732,13 @@ impl Orb {
     fn toggle_panel(&mut self, cx: &mut Context<Self>) {
         // What hovering was about to show is not shown now.
         self.hover = None;
-        if full_open(&self.tower, cx) {
-            close_full(&self.tower, cx);
-            mac::give_back_focus();
+        if full_shown(&self.tower, cx) {
+            hide_full(&self.tower, cx);
             self.rest = true;
             return;
         }
-        if self.tower.read(cx).full_mode {
+        // In full mode, or with the full window minimized into the orb: it comes back.
+        if self.tower.read(cx).full_mode || full_open(&self.tower, cx) {
             open_full(&self.tower, None, None, None, true, true, cx);
             return;
         }
@@ -942,9 +948,49 @@ fn full_open(tower: &Entity<Tower>, cx: &mut App) -> bool {
     let Some(h) = tower.read(cx).full else { return false };
     let open = cx.windows().contains(&h);
     if !open {
-        tower.update(cx, |t, _| t.full = None);
+        tower.update(cx, |t, _| {
+            t.full = None;
+            t.full_hidden = false;
+        });
     }
     open
+}
+
+/// The full window is open and on screen (not minimized into the orb).
+fn full_shown(tower: &Entity<Tower>, cx: &mut App) -> bool {
+    full_open(tower, cx) && !tower.read(cx).full_hidden
+}
+
+/// The orb's click on the full window: it is minimized into the orb, kept as
+/// it is, and the keyboard goes back to the app that had it.
+fn hide_full(tower: &Entity<Tower>, cx: &mut App) {
+    if let Some(h) = tower.read(cx).full {
+        let _ = h.update(cx, |_, window, _| {
+            if let Some(w) = mac::Win::of(window) {
+                w.order_out();
+            }
+        });
+    }
+    tower.update(cx, |t, cx| {
+        t.full_hidden = true;
+        cx.notify();
+    });
+    mac::give_back_focus();
+}
+
+/// "Minimize" (and Esc) in the full window, from its own click: it goes into
+/// the orb as it is, and the orb brings it back. A pinned floating panel has
+/// the keyboard again, else the app that had it before.
+fn minimize_full(tower: &Entity<Tower>, window: &mut Window, cx: &mut App) {
+    if let Some(w) = mac::Win::of(window) {
+        w.order_out();
+    }
+    let pinned = tower.update(cx, |t, cx| {
+        t.full_hidden = true;
+        cx.notify();
+        t.pinned
+    });
+    keyboard_back(pinned, cx);
 }
 
 /// Shows the full window at `to` (where it was, with none): opens it beside
@@ -964,15 +1010,36 @@ fn open_full(tower: &Entity<Tower>, to: Option<nav::Scope>, anchor: Option<mac::
         set_full_mode(tower, true, cx);
     }
     if full_open(tower, cx) {
+        // Minimized into the orb: back as it was.
+        let hidden = tower.update(cx, |t, cx| {
+            cx.notify();
+            std::mem::take(&mut t.full_hidden)
+        });
         // From another window's click: forward, with the keyboard.
         if let Some(h) = tower.read(cx).full
-            && focus
+            && (focus || hidden)
         {
             let _ = h.update(cx, |_, window, _| {
                 if let Some(w) = mac::Win::of(window) {
-                    w.make_key();
+                    if focus { w.make_key() } else { w.order_front() }
                 }
             });
+            if focus {
+                tower.update(cx, |t, _| t.keyed = Some(h));
+            }
+        }
+        // Brought back by the user from the floating panel: it takes the panel's place.
+        if hidden && replace {
+            let floating = tower.update(cx, |t, _| {
+                let f = t.floating.take();
+                t.pinned = t.pinned.filter(|p| Some(*p) != f);
+                f
+            });
+            if let Some(f) = floating {
+                cx.defer(move |cx| {
+                    let _ = f.update(cx, |_, window, _| window.remove_window());
+                });
+            }
         }
         return;
     }
@@ -1043,6 +1110,23 @@ fn open_full(tower: &Entity<Tower>, to: Option<nav::Scope>, anchor: Option<mac::
                         eprintln!("[orb] the floating panel was already gone");
                     }
                 });
+            }
+            // `HERDER_TOWER_ORB_MINIMIZE=1`: once, it is minimized as its button does, then the orb's click brings it back.
+            static MINIMIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if std::env::var("HERDER_TOWER_ORB_MINIMIZE").is_ok_and(|v| v == "1") && !MINIMIZED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let t = tower.clone();
+                cx.spawn(async move |cx: &mut AsyncApp| {
+                    cx.background_executor().timer(Duration::from_millis(3000)).await;
+                    let _ = handle.update(cx, |_, window, cx| minimize_full(&t, window, cx));
+                    eprintln!("[orb] test: minimized");
+                    cx.background_executor().timer(Duration::from_millis(4000)).await;
+                    let orb = cx.update(|cx| t.read(cx).orb);
+                    if let Some(o) = orb {
+                        let _ = o.update(cx, |orb, _, cx| orb.toggle_panel(cx));
+                        eprintln!("[orb] test: the orb's click");
+                    }
+                })
+                .detach();
             }
             // `HERDER_TOWER_ORB_ANSWER`: a card is answered as a click would, once, to look at what follows.
             static ANSWERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1147,6 +1231,7 @@ fn to_floating(tower: &Entity<Tower>, window: &mut Window, cx: &mut App) {
     set_full_mode(tower, false, cx);
     let orb = tower.update(cx, |t, cx| {
         t.full = None;
+        t.full_hidden = false;
         cx.notify();
         t.orb
     });
@@ -1167,15 +1252,16 @@ fn to_floating(tower: &Entity<Tower>, window: &mut Window, cx: &mut App) {
 fn close_full(tower: &Entity<Tower>, cx: &mut App) {
     if let Some(h) = tower.update(cx, |t, cx| {
         cx.notify();
+        t.full_hidden = false;
         t.full.take()
     }) {
         let _ = h.update(cx, |_, window, _| window.remove_window());
     }
 }
 
-/// "Full window": opens it, or closes it when it is open.
+/// "Full window": opens it (or brings it back from the orb), or closes it when it is on screen.
 fn toggle_full(tower: &Entity<Tower>, anchor: Option<mac::Rect>, cx: &mut App) {
-    if full_open(tower, cx) { close_full(tower, cx) } else { open_full(tower, None, anchor, None, true, true, cx) }
+    if full_shown(tower, cx) { close_full(tower, cx) } else { open_full(tower, None, anchor, None, true, true, cx) }
 }
 
 /// The full window closed itself (Esc): a pinned floating panel has the
@@ -1183,9 +1269,16 @@ fn toggle_full(tower: &Entity<Tower>, anchor: Option<mac::Rect>, cx: &mut App) {
 fn full_closed(tower: &Entity<Tower>, cx: &mut App) {
     let pinned = tower.update(cx, |t, cx| {
         t.full = None;
+        t.full_hidden = false;
         cx.notify();
         t.pinned
     });
+    keyboard_back(pinned, cx);
+}
+
+/// The keyboard after the full window went: a pinned floating panel's, else
+/// the app's that had it before.
+fn keyboard_back(pinned: Option<AnyWindowHandle>, cx: &mut App) {
     let kept = pinned.is_some_and(|h| {
         h.update(cx, |_, window, _| {
             if let Some(w) = mac::Win::of(window) {

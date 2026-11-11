@@ -184,8 +184,17 @@ pub(super) fn acts_row() -> gpui::Div {
     h_flex().flex_wrap().gap(px(8.0)).items_center()
 }
 
-/// The little x that takes a card off the queue.
+/// The little x that takes a card off the queue (and closes the full window).
 pub(super) fn dismiss_mark(id: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
+    glyph_mark(id, IconName::Close)
+}
+
+/// The little line that minimizes the full window into the orb.
+pub(super) fn minimize_mark(id: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
+    glyph_mark(id, IconName::Minus)
+}
+
+fn glyph_mark(id: impl Into<SharedString>, icon: IconName) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id.into())
         .flex_none()
@@ -193,8 +202,8 @@ pub(super) fn dismiss_mark(id: impl Into<SharedString>) -> gpui::Stateful<gpui::
         .rounded_full()
         .cursor_pointer()
         .text_color(glass().faint)
-        .hover(|s| s.bg(rgba(SOFT)))
-        .child(Icon::new(IconName::Close).xsmall())
+        .hover(|s| s.bg(rgba(SOFT)).text_color(glass().text))
+        .child(Icon::new(icon).xsmall())
 }
 
 /// A space's mark, `size` points across: an amber count, the same as an
@@ -687,7 +696,7 @@ impl Panel {
         if matches!(phase, "off" | "starting" | "listening" | "armed" | "idle") && !glance.is_empty() {
             glance.remove(0);
         }
-        let (alive, muted, open) = (t.alive, t.muted(), t.full.is_some());
+        let (alive, muted, open) = (t.alive, t.muted(), t.full.is_some() && !t.full_hidden);
         v_flex()
             .px(px(20.0))
             .pt(px(20.0))

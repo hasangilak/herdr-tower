@@ -123,6 +123,14 @@ impl Win {
         }
     }
 
+    /// Out of sight, kept as it is (`make_key` or `order_front` brings it back).
+    pub fn order_out(self) {
+        // SAFETY: as above.
+        unsafe {
+            let _: () = msg_send![self.0, orderOut: nil];
+        }
+    }
+
     pub fn order_front(self) {
         // SAFETY: as above.
         unsafe {
