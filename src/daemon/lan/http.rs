@@ -30,6 +30,8 @@ pub struct Request {
     /// What `Content-Length` says the body is.
     pub content_length: usize,
     pub body: Vec<u8>,
+    /// The tower's address the call came in on (which listener: the LAN's or the tailnet's).
+    pub local: Option<std::net::SocketAddr>,
 }
 
 impl Request {

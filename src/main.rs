@@ -306,14 +306,14 @@ enum Cmd {
         #[arg(long)]
         on: Option<String>,
     },
-    /// The phone API for the Android app (docs/mobile-api.md): enable, disable, pair, devices, route <id> phone|mac, revoke <id|all>.
+    /// The phone API for the Android app (docs/mobile-api.md): enable, disable, pair, devices, network [name "<name>"], rename <id> "<name>", route <id> phone|mac, revoke <id|all>.
     Phone {
-        /// enable | disable | pair | devices | route | revoke
+        /// enable | disable | pair | devices | network | rename | route | revoke
         #[arg(default_value = "devices")]
         action: String,
-        /// revoke: a device id (`tower phone devices`), or `all`. route: a device id.
+        /// revoke: a device id (`tower phone devices`), or `all`. route, rename: a device id. network: `name`.
         id: Option<String>,
-        /// route: `phone` (replies to what it sends are heard on the phone only) or `mac`.
+        /// route: `phone` (replies to what it sends are heard on the phone only) or `mac`. rename, network name: the name.
         value: Option<String>,
         /// pair: print the pairing details as JSON (for the orb).
         #[arg(long)]

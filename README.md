@@ -536,12 +536,15 @@ silent for them, or on the Mac.
 To connect it:
 
 1. `tower phone enable` (the phone API is off until you do).
-2. Pair: in the full window, Settings → **Pair a phone** shows a QR code;
-   or run `tower phone pair` in a terminal. Scan the QR in the app
-   (or type the address and the 8-digit code; the code works once, for 5
-   minutes).
-3. `tower phone devices` lists paired phones; `tower phone revoke <id|all>`
-   forgets one at once.
+2. Pair: in the full window, Settings → Phone → **Pair a phone** shows a
+   QR code right there; or run `tower phone pair` in a terminal. Scan the
+   QR in the app (or type the address and the 8-digit code; the code works
+   once, for 5 minutes). The phone must be on the same Wi-Fi as the Mac, or
+   both on Tailscale; both say which network that is.
+3. `tower phone devices` lists paired phones (the networks each knows, and
+   whether it can reach the tower where the Mac is now); `tower phone
+   rename <id> "<name>"` renames one; `tower phone revoke <id|all>` forgets
+   one at once.
 
 It is HTTPS only, with a certificate the Mac makes for itself and the phone
 pins (its fingerprint is in the QR); it listens only on the Mac's private LAN
@@ -553,19 +556,33 @@ first, then the tailnet's, with the Mac's MagicDNS name), and the app tries
 them in order. Tailscale is found through its CLI (Homebrew's, or the
 standalone app's own) and looked at again every 20 s: start or stop it and
 the tower follows. The LAN address is looked at as often: take the Mac from
-home to the office and the tower listens on the new network within 20 s
-(pair again there: the QR then has the new address). `[lan] tailscale = "off"` in config.toml keeps it to the
+home to the office and the tower listens on the new network within 20 s,
+and a phone connected meanwhile (over Tailscale, say) is sent the new
+address. A phone that wasn't must be paired again there (the QR then has
+the new address), or use Tailscale; pairing again from the same app install
+updates that phone instead of adding another. A network is told by the
+Mac's address range (macOS keeps the Wi-Fi's name from apps), and can be
+named once: `tower phone network name "Office"` (or "Name this network" in
+Settings → Phone), kept under `[lan.networks]` in config.toml. `[lan] tailscale = "off"` in config.toml keeps it to the
 LAN. `tower phone devices` and the pairing view say which addresses it
 listens on and whether Tailscale is running or stopped. The API, the
 pairing flow and the security model:
 [docs/mobile-api.md](docs/mobile-api.md).
 
-The full window does the same without a terminal: Settings → **Pair a
-phone** shows whether the phone API is on and where it listens, turns it on
-or off, and shows the QR code (and the code to type) with its 5-minute
-countdown, opening a fresh one when it runs out. Below it are the paired
-phones, each with Revoke and **Replies: Phone | Mac**: where the tower's
-replies to what that phone sends are heard.
+The full window does the same without a terminal, in Settings' **Phone**
+card: which network the Mac is on and its address (named in place), whether
+Tailscale runs (stopped: "Open Tailscale"), turning the API on or off, and
+**Pair a phone**, which opens the QR code (and the code to type) in place
+with its 5-minute countdown, a fresh one when it runs out, and what the
+network asks of the phone; when a phone pairs, it says "Paired: <phone> on
+<network>" (or "Paired again"). Below are the paired phones, each with how
+it is connected now or when and where it was last seen, the networks it
+knows, whether it can reach the tower here (if not: **Pair it here**),
+Rename, Remove and **Replies: Phone | Mac**: where the tower's replies to
+what that phone sends are heard. When the phones used in the last day can't
+reach the tower on the network the Mac is on, and Tailscale isn't running,
+both windows say once, quietly, "Phone: pair again on this network" under
+their status; it opens that card.
 
 What a phone does goes through the same functions as the Mac's windows and
 the CLI: a decision answered on the phone goes where `tower answer` sends

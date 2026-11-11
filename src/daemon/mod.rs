@@ -607,6 +607,11 @@ impl Daemon {
                         self.lan.route_changed(&arg);
                         Ok(self.lan.info())
                     }
+                    // A network was named in config.toml (`tower phone network name`, Settings), or a device renamed.
+                    "renamed" => {
+                        self.lan.renamed();
+                        Ok(self.lan.info())
+                    }
                     _ => Ok(self.lan.info()),
                 };
                 return match info {

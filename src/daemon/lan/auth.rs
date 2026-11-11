@@ -18,6 +18,8 @@ use anyhow::{Context, Result, bail};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
+use super::network::Known;
+
 /// A pairing code lasts this long.
 pub const CODE_TTL: Duration = Duration::from_secs(5 * 60);
 /// Wrong codes from one address before the code is void for it.
@@ -74,6 +76,14 @@ pub struct Device {
     /// the phone; the Mac stays silent) or `mac`.
     #[serde(default = "phone_route")]
     pub audio_route: String,
+    /// The id the app made once for its install (`POST /v1/pair`'s
+    /// `install_id`): pairing again with it updates this entry instead of
+    /// adding another. None for an older app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_id: Option<String>,
+    /// The networks it was paired on or connected from (see `network`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub networks: Vec<Known>,
 }
 
 fn phone_route() -> String {
@@ -83,6 +93,16 @@ fn phone_route() -> String {
 /// `phone` or `mac`.
 pub fn valid_route(r: &str) -> bool {
     matches!(r, "phone" | "mac")
+}
+
+/// An app's install id: 8 to 64 letters, digits, `-` and `_`.
+pub fn valid_install_id(id: &str) -> bool {
+    (8..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// A device's name as given: no control characters, at most 60 characters, trimmed.
+pub fn clean_name(name: &str) -> String {
+    name.chars().filter(|c| !c.is_control()).take(60).collect::<String>().trim().to_string()
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -144,19 +164,60 @@ impl Devices {
     }
 
     /// Adds a device; returns it and its token (shown to the device once, never kept).
+    #[cfg(test)]
     pub fn add(&mut self, name: &str, now_ms: u64) -> (Device, String) {
+        let (d, token, _) = self.pair(Some(name), None, now_ms);
+        (d, token)
+    }
+
+    /// Pairs a phone: the device with this `install_id` again when there is
+    /// one (the same id and reply route, its name if one is given, a new
+    /// token: the old one stops working), else a new device. Returns it, its
+    /// token (shown once, never kept), and whether it was paired again.
+    pub fn pair(&mut self, name: Option<&str>, install_id: Option<&str>, now_ms: u64) -> (Device, String, bool) {
         let token = new_token();
-        let name: String = name.chars().filter(|c| !c.is_control()).take(60).collect();
+        let name = name.map(clean_name).filter(|n| !n.is_empty());
+        if let Some(id) = install_id
+            && let Some(d) = self.devices.iter_mut().find(|d| d.install_id.as_deref() == Some(id))
+        {
+            d.token_sha256 = sha256_hex(token.as_bytes());
+            if let Some(n) = name {
+                d.name = n;
+            }
+            d.last_seen_ms = now_ms;
+            return (d.clone(), token, true);
+        }
         let d = Device {
             id: format!("d_{}", hex(&random_bytes::<4>())),
-            name: if name.trim().is_empty() { "phone".into() } else { name.trim().to_string() },
+            name: name.unwrap_or_else(|| "phone".into()),
             token_sha256: sha256_hex(token.as_bytes()),
             created_ms: now_ms,
             last_seen_ms: now_ms,
             audio_route: phone_route(),
+            install_id: install_id.map(String::from),
+            networks: vec![],
         };
         self.devices.push(d.clone());
-        (d, token)
+        (d, token, false)
+    }
+
+    /// Renames a device. False: no such device, or the name is empty.
+    pub fn rename(&mut self, id: &str, name: &str) -> bool {
+        let name = clean_name(name);
+        match self.devices.iter_mut().find(|d| d.id == id) {
+            Some(d) if !name.is_empty() => {
+                d.name = name;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Notes that a device knows the tower at `host:port` on a network (see `network::saw`).
+    pub fn saw(&mut self, id: &str, range: &str, name: Option<&str>, host: &str, port: u16, now_ms: u64) {
+        if let Some(d) = self.devices.iter_mut().find(|d| d.id == id) {
+            super::network::saw(&mut d.networks, range, name, host, port, now_ms);
+        }
     }
 
     /// Sets where a device's replies are heard. False: no such device.
@@ -406,6 +467,81 @@ mod tests {
         // A devices.json from before the setting reads as `phone`.
         let old: Devices = serde_json::from_str(r#"{"devices":[{"id":"d_1","name":"P","token_sha256":"x","created_ms":1}]}"#).unwrap();
         assert_eq!(old.devices[0].audio_route, "phone");
+    }
+
+    #[test]
+    fn pairing_again_with_the_same_install_updates_that_device() {
+        let mut d = Devices::default();
+        let (first, old, again) = d.pair(Some("OnePlus"), Some("inst-12345678"), 1);
+        assert!(!again);
+        assert!(d.set_route(&first.id, "mac"));
+        d.saw(&first.id, "192.168.2", Some("Home"), "192.168.2.211", 7843, 1);
+        let (other, _, _) = d.pair(Some("Pixel"), Some("inst-87654321"), 2);
+        // The same phone, at the office: the same entry, a new token, the old one refused.
+        let (back, new, again) = d.pair(Some("OnePlus 12"), Some("inst-12345678"), 3);
+        assert!(again);
+        assert_eq!(d.devices.len(), 2, "no second entry for one phone");
+        assert_eq!((back.id.as_str(), back.name.as_str(), back.audio_route.as_str()), (first.id.as_str(), "OnePlus 12", "mac"), "its id and route are kept, its name given");
+        assert_eq!(back.networks.len(), 1, "what it knew is kept");
+        assert_eq!(back.last_seen_ms, 3);
+        assert!(d.find(&old).is_none(), "the old token stops at once");
+        assert_eq!(d.find(&new).map(|x| x.id.clone()), Some(first.id.clone()));
+        assert_ne!(other.id, first.id);
+        // No name given: the name stays.
+        let (kept, _, _) = d.pair(None, Some("inst-12345678"), 4);
+        assert_eq!(kept.name, "OnePlus 12");
+        // Without an install id (an older app): always a new device, as before.
+        let (x, _, again) = d.pair(Some("OnePlus 12"), None, 5);
+        assert!(!again && x.id != first.id && x.install_id.is_none());
+        assert_eq!(d.devices.len(), 3);
+        // Install ids: 8 to 64 letters, digits, - and _.
+        for ok in ["abcdefgh", "A1b2-C3_d4", &"x".repeat(64)] {
+            assert!(valid_install_id(ok), "{ok}");
+        }
+        for bad in ["short", "", &"x".repeat(65), "has space1", "semi;colon", "ünïcode1"] {
+            assert!(!valid_install_id(bad), "{bad}");
+        }
+        // Renaming.
+        assert!(d.rename(&first.id, "  Work phone\u{1b} "));
+        assert_eq!(d.devices[0].name, "Work phone");
+        assert!(!d.rename(&first.id, "   "), "an empty name is refused");
+        assert!(!d.rename("d_nope", "x"));
+    }
+
+    #[test]
+    fn an_old_devices_file_loads_and_an_older_build_reads_the_new_one() {
+        // As a tower from before install ids and networks wrote it.
+        let old = r#"{"devices":[{"id":"d_1","name":"OnePlus","token_sha256":"ab","created_ms":1,"last_seen_ms":2,"audio_route":"mac"}]}"#;
+        let d: Devices = serde_json::from_str(old).unwrap();
+        assert_eq!((d.devices[0].install_id.clone(), d.devices[0].networks.len(), d.devices[0].audio_route.as_str()), (None, 0, "mac"));
+        // Written back unchanged: no new keys for a device that has none.
+        let text = serde_json::to_string(&d).unwrap();
+        assert!(!text.contains("install_id") && !text.contains("networks"), "{text}");
+        // The new file, read by an older build's `Device` (no install_id, no networks).
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldDevice {
+            id: String,
+            name: String,
+            token_sha256: String,
+            created_ms: u64,
+            #[serde(default)]
+            last_seen_ms: u64,
+            #[serde(default = "phone_route")]
+            audio_route: String,
+        }
+        #[derive(Deserialize)]
+        struct OldDevices {
+            devices: Vec<OldDevice>,
+        }
+        let mut new = Devices::default();
+        let (dev, _, _) = new.pair(Some("OnePlus"), Some("inst-12345678"), 1);
+        new.saw(&dev.id, "10.10.30", Some("Office"), "10.10.30.116", 7843, 1);
+        let text = serde_json::to_string_pretty(&new).unwrap();
+        assert!(text.contains("\"install_id\"") && text.contains("\"networks\""));
+        let read: OldDevices = serde_json::from_str(&text).unwrap();
+        assert_eq!((read.devices[0].id.as_str(), read.devices[0].name.as_str()), (dev.id.as_str(), "OnePlus"));
+        assert_eq!(serde_json::from_str::<Devices>(&text).unwrap(), new, "and it round-trips here");
     }
 
     #[test]

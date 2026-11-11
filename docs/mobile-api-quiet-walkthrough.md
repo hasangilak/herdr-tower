@@ -1161,3 +1161,128 @@ Events of each kind over the whole walk: action 6, chat 7, decisions 8, hello 1,
 - **Names with spaces, slashes and letters outside ASCII** in a path: the
   space here is called `fix-login`. The tests set the goal of `B2C support`
   and of `Q&A / ünï` (`a_space_has_a_goal_its_switches_and_an_end`).
+
+## Appendix: pairing on more than one network
+
+The calls of "Pairing on more than one network" in
+[mobile-api.md](mobile-api.md), made the same way against a sandbox tower
+of their own: its phone API on `bind = "auto"`, port 17963, with this
+Mac's address read from a file (`HERDER_TOWER_LAN_IP_FILE`) so the walk can
+move it, `127.0.0.1` ("Home") and then `::1` (another network), and a
+stand-in Tailscale that reports itself installed and stopped
+(`HERDER_TOWER_TAILSCALE`). The fake phone is `curl`; a pairing code is
+opened on the Mac before each pairing (`tower phone pair --json`). Tokens
+are cut after 8 characters, long lines are wrapped, and what an answer
+above already showed is `…`; nothing else is changed.
+
+```
+on the Mac$ tower phone network name "Home"
+the network 127.0.0.x is called Home now ([lan.networks] in config.toml).
+on the Mac$ tower phone pair
+  …
+  network      Home
+Your phone must be on the same Wi-Fi as this Mac (Home), or both on Tailscale.
+```
+
+**Pairing with an install id**: a new device, `repaired: false`, and where
+the tower is.
+
+```
+$ curl … -X POST /v1/pair -d '{"code":"<code>","name":"OnePlus","install_id":"walk-oneplus-0001"}'
+200 {"token": "htk_q1gA…", "device": {"id": "d_92b42279", "name": "OnePlus"},
+     "fingerprint": "e2c5e4fa3579ca964bb3742e4241f753119e0b266b6ce04919fb1aeb93f9bf1a", "api": 1,
+     "features": ["quiet", "acts", "pairing"], "repaired": false,
+     "hosts": [{"kind": "lan", "host": "127.0.0.1", "port": 17963}],
+     "network": {"range": "127.0.0", "name": "Home", "lan": {"host": "127.0.0.1", "port": 17963}}, "magic_dns": null}
+```
+
+A bad install id is refused before the code is used:
+
+```
+$ curl … -X POST /v1/pair -d '{"code":"<code>","install_id":"no"}'
+400 {"error": {"code": "bad_install_id", "message": "install_id is 8 to 64 letters, digits, - and _"}}
+```
+
+**The same install pairs again** (a fresh code): the same device id, the
+name it gave, a new token, `repaired: true`.
+
+```
+$ curl … -X POST /v1/pair -d '{"code":"<code>","name":"OnePlus 12","install_id":"walk-oneplus-0001"}'
+200 {"token": "htk_yULE…", "device": {"id": "d_92b42279", "name": "OnePlus 12"}, …, "repaired": true, …}
+
+$ curl … /v1/hello -H 'Authorization: Bearer <the first token>'
+401 {"error": {"code": "unauthorized", "message": "unknown or revoked token"}}
+$ curl … /v1/hello -H 'Authorization: Bearer <the new token>'
+200 {"api": 1, "tower": "0.1.0", "device": {"id": "d_92b42279", "name": "OnePlus 12"}, "voice": "af_bella",
+     "phone_is_voice": false, "audio_route": "phone", "features": ["quiet", "acts", "pairing"]}
+```
+
+**Where the tower is**, at any time:
+
+```
+$ curl … /v1/network
+200 {"hosts": [{"kind": "lan", "host": "127.0.0.1", "port": 17963}],
+     "network": {"range": "127.0.0", "name": "Home", "lan": {"host": "127.0.0.1", "port": 17963}}, "magic_dns": null,
+     "tailscale": {"installed": true, "running": false, "state": "stopped", "ip": "100.68.110.33", "dns_name": "sandbox-mac.tail1234.ts.net"}}
+```
+
+**The event stream's `hello`** carries the same:
+
+```
+$ curl -N … /v1/events
+event: hello
+data: {"api":1,"device":"d_92b42279","voice":false,"features":["quiet","acts","pairing"],
+       "hosts":[{"kind":"lan","host":"127.0.0.1","port":17963}],
+       "network":{"range":"127.0.0","name":"Home","lan":{"host":"127.0.0.1","port":17963}},"magic_dns":null}
+```
+
+**This Mac moves to another network** (the file now says `::1`). The tower
+looks every 20 s; 5 s later here, the open stream got the new address:
+
+```
+event: hosts
+data: {"hosts":[{"kind":"lan","host":"::1","port":17963}],
+       "network":{"range":"::1","name":null,"lan":{"host":"::1","port":17963}},"magic_dns":null,
+       "tailscale":{"installed":true,"running":false,"state":"stopped","ip":"100.68.110.33","dns_name":"sandbox-mac.tail1234.ts.net"}}
+```
+
+The state then (`state.json`, as the Mac's windows read it): the phone used
+today knows only Home, Tailscale is stopped, so the windows say the hint.
+
+```
+{"lan": "https://[::1]:17963", "lan_hosts": [{"kind": "lan", "host": "::1", "port": 17963}],
+ "network": {"range": "::1", "name": null, "lan": {"host": "::1", "port": 17963}},
+ "phone_hint": "Phone: pair again on this network"}
+
+$ curl … --resolve 'herder-tower:17963:[::1]' /v1/network
+200 {"hosts": [{"kind": "lan", "host": "::1", "port": 17963}], "network": {"range": "::1", "name": null, "lan": {"host": "::1", "port": 17963}}, "magic_dns": null, "tailscale": {…}}
+```
+
+A second phone pairs here, and the network is named: the hint goes.
+
+```
+$ curl … --resolve 'herder-tower:17963:[::1]' -X POST /v1/pair -d '{"code":"<code>","name":"Pixel 9","install_id":"walk-pixel-0002"}'
+200 {"token": "htk_NPkj…", "device": {"id": "d_ca6e98ba", "name": "Pixel 9"}, …, "repaired": false,
+     "hosts": [{"kind": "lan", "host": "::1", "port": 17963}], "network": {"range": "::1", "name": null, …}, "magic_dns": null}
+on the Mac$ tower phone network name "Office"
+the network ::1 is called Office now ([lan.networks] in config.toml).
+state.json: {"network": {"range": "::1", "name": "Office", "lan": {"host": "::1", "port": 17963}}, "phone_hint": null}
+
+on the Mac$ tower phone devices
+Phone API on at https://[::1]:17963 (0 stream(s), 0 as the voice).
+  listening on Local network ::1:17963
+This Mac is on Office · ::1.
+Tailscale: stopped (100.68.110.33, sandbox-mac.tail1234.ts.net). Phones reach the tower on the local network only; start Tailscale to reach it from anywhere.
+  d_92b42279   OnePlus 12               replies on the phone  Last seen just now, on Home
+               Knows Home
+               Paired on another network: pair it again here, or use Tailscale.
+  d_ca6e98ba   Pixel 9                  replies on the phone  Last seen just now, on the network ::1
+               Knows the network ::1
+               Can reach the tower here.
+```
+
+(Since this run, a network reads by the name it has now: the Pixel's line
+says "Knows Office", and an IPv6 address is written `[::1]:17963`. The
+same calls are in the tests: `cargo test lan`,
+`the_same_phone_pairs_again_in_place` and
+`a_phone_learns_where_the_tower_moved_while_it_is_connected`.)

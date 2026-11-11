@@ -12,6 +12,7 @@ pub mod auth;
 pub mod http;
 pub mod hub;
 pub mod multipart;
+pub mod network;
 mod quiet;
 pub mod tailscale;
 pub mod tls;
@@ -44,7 +45,9 @@ pub const API: u32 = 1;
 /// `features`): an app checks a name here before it uses that part.
 /// `quiet`: the decisions, missions, threads, launch, tell level and model
 /// calls, a request's `space`, and the events that go with them.
-pub const FEATURES: &[&str] = &["quiet", "acts"];
+/// `pairing`: pairing again in place (`install_id`), the networks a phone
+/// knows, `hosts` on the stream (`hello`, the `hosts` event) and `GET /v1/network`.
+pub const FEATURES: &[&str] = &["quiet", "acts", "pairing"];
 const MAX_CONNECTIONS: usize = 32;
 /// Connections open at once from one address.
 const MAX_PER_IP: usize = 8;
@@ -155,6 +158,20 @@ pub struct Lan {
     history: std::path::PathBuf,
     /// The launches and closes the phones started.
     actions: tower::Actions,
+    /// The names the user gave networks (`[lan.networks]`), by range.
+    names: Arc<Mutex<std::collections::BTreeMap<String, String>>>,
+    /// The `hosts` event as last sent to the streams (sent again only when it changes).
+    sent_hosts: Arc<Mutex<Option<Value>>>,
+}
+
+/// Which listener an address of this Mac is: the one listening there, else
+/// the tailnet's for a 100.64/10 address, the LAN's otherwise.
+fn kind_of(listeners: &[Listener], local: SocketAddr) -> Kind {
+    match listeners.iter().find(|l| l.addr == local) {
+        Some(l) => l.kind,
+        None if matches!(local.ip(), IpAddr::V4(v) if tailscale::is_tailnet(v)) => Kind::Tailscale,
+        None => Kind::Lan,
+    }
 }
 
 /// The connections open now, in all and by address.
@@ -321,8 +338,13 @@ fn body_limit(req: &Request, seg: &[&str]) -> usize {
     }
 }
 
-/// This Mac's address on the network its default route uses (no packet is sent).
+/// This Mac's address on the network its default route uses (no packet is
+/// sent). `HERDER_TOWER_LAN_IP_FILE` names a file whose one line stands in
+/// for it, read each time (a sandbox moving "networks"; empty: none).
 pub fn lan_ip() -> Option<IpAddr> {
+    if let Some(f) = std::env::var_os("HERDER_TOWER_LAN_IP_FILE") {
+        return std::fs::read_to_string(f).ok()?.trim().parse().ok();
+    }
     let s = UdpSocket::bind("0.0.0.0:0").ok()?;
     s.connect("192.0.2.1:9").or_else(|_| s.connect("8.8.8.8:53")).ok()?;
     let ip = s.local_addr().ok()?.ip();
@@ -490,6 +512,8 @@ impl Lan {
             // Tests never ask this Mac's Tailscale unless they say so (`with_detect`).
             detect: Arc::new(if cfg!(test) { tailscale::Tailscale::default } else { tailscale::detect as fn() -> tailscale::Tailscale }),
             lan_detect: Arc::new(lan_ip),
+            names: Arc::default(),
+            sent_hosts: Arc::default(),
         }
     }
 
@@ -551,6 +575,7 @@ impl Lan {
         }
         let identity = Identity::load_or_create(&self.identity_dir)?;
         let tls = identity.server_config()?;
+        *self.names.lock().unwrap_or_else(|e| e.into_inner()) = cfg.networks.clone();
         let ts = if tailscale_wanted(cfg)? { (self.detect)() } else { tailscale::Tailscale::default() };
         let auto_bind = cfg.bind.is_empty() || cfg.bind == "auto";
         let auto = if auto_bind { (self.lan_detect)() } else { None };
@@ -584,31 +609,31 @@ impl Lan {
         drop(running);
         eprintln!("[phone] API on {} (certificate {})", addrs.join(", "), tls::grouped(&fingerprint[..16]));
         // Every 20 s: the network this Mac is on (home, the office: the LAN
-        // listener follows it) and Tailscale (the tailnet's follows that).
+        // listener follows it) and Tailscale (the tailnet's follows that),
+        // and the phones in use against both (the hint, `network::hint`).
         let tailnet = tailscale_wanted(cfg).unwrap_or(false);
-        if tailnet || auto_bind {
-            let me = self.clone();
-            thread::Builder::new()
-                .name("lan-follow".into())
-                .spawn(move || {
-                    while !stop.load(Ordering::SeqCst) {
-                        let until = Instant::now() + TAILSCALE_RECHECK;
-                        while Instant::now() < until && !stop.load(Ordering::SeqCst) {
-                            thread::sleep(Duration::from_millis(250));
-                        }
-                        if stop.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        if auto_bind {
-                            me.recheck_lan(&stop);
-                        }
-                        if tailnet {
-                            me.recheck_tailscale(&stop);
-                        }
+        let me = self.clone();
+        thread::Builder::new()
+            .name("lan-follow".into())
+            .spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let until = Instant::now() + TAILSCALE_RECHECK;
+                    while Instant::now() < until && !stop.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(250));
                     }
-                })
-                .ok();
-        }
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if auto_bind {
+                        me.recheck_lan(&stop);
+                    }
+                    if tailnet {
+                        me.recheck_tailscale(&stop);
+                    }
+                    me.refresh();
+                }
+            })
+            .ok();
         Ok(primary)
     }
 
@@ -673,16 +698,108 @@ impl Lan {
         }
     }
 
-    /// Where it listens, into the state (the panel, `state.json`, `GET /v1/state`).
+    /// Where it listens, into the state (the panel, `state.json`, `GET
+    /// /v1/state`): the addresses, the network and whether to say the hint.
+    /// When the addresses or the network changed, every open stream gets a
+    /// `hosts` event, so a phone learns the new address while it can.
     fn publish(&self, r: &Running) {
         let url = format!("https://{}", r.primary());
         let hosts = hosts_value(&r.listeners.iter().map(|l| (l.kind, l.addr)).collect::<Vec<_>>(), &r.tailscale);
         let ts = r.tailscale.view();
+        let here = self.here(r);
+        let hint = network::hint(&self.devices.load().devices, &here, r.tailscale.running, now_ms()).then(|| network::HINT.to_string());
+        let net = here.view();
         self.ctx.shared.update(|s| {
             s.lan = url;
             s.lan_hosts = hosts;
             s.tailscale = Some(ts);
+            s.network = Some(net).filter(|n| !n.is_null());
+            s.phone_hint = hint;
         });
+        let payload = self.network_value(r);
+        let mut sent = self.sent_hosts.lock().unwrap_or_else(|e| e.into_inner());
+        if sent.as_ref() != Some(&payload) {
+            // (Not when it is first published: no stream is open yet, and each gets it in its `hello`.)
+            if sent.is_some() {
+                self.ctx.hub.broadcast("hosts", payload.clone());
+            }
+            *sent = Some(payload);
+        }
+    }
+
+    /// The state and the hint again, as things are now (a phone paired or
+    /// connected, one was revoked, a network was named, time passed).
+    pub fn refresh(&self) {
+        let running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = running.as_ref() {
+            self.publish(r);
+        }
+    }
+
+    /// Where the tower can be reached now (`network::Here`).
+    fn here(&self, r: &Running) -> network::Here {
+        let lan = r.of(Kind::Lan).map(|l| l.addr);
+        let range = lan.map(|a| network::range_of(a.ip()));
+        let name = range.as_ref().and_then(|g| self.names.lock().unwrap_or_else(|e| e.into_inner()).get(g).cloned()).filter(|n| !n.trim().is_empty());
+        network::Here {
+            range,
+            name,
+            lan: lan.map(|a| (a.ip().to_string(), a.port())),
+            tailnet: r.of(Kind::Tailscale).map(|l| (l.addr.ip().to_string(), l.addr.port())),
+        }
+    }
+
+    /// `GET /v1/network`, the `hosts` event, and what `hello` adds: every
+    /// address (as the pairing lists them), the network, the MagicDNS name
+    /// while the tailnet is listened on, and Tailscale.
+    fn network_value(&self, r: &Running) -> Value {
+        let listeners: Vec<(Kind, SocketAddr)> = r.listeners.iter().map(|l| (l.kind, l.addr)).collect();
+        let on_tailnet = r.of(Kind::Tailscale).is_some();
+        json!({
+            "hosts": hosts_value(&listeners, &r.tailscale),
+            "network": self.here(r).view(),
+            "magic_dns": r.tailscale.dns_name.clone().filter(|_| on_tailnet),
+            "tailscale": r.tailscale.view(),
+        })
+    }
+
+    /// `network_value` now (no addresses while the API is off).
+    fn network_now(&self) -> Value {
+        let r = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        match r.as_ref() {
+            Some(r) => self.network_value(r),
+            None => json!({ "hosts": [], "network": null, "magic_dns": null, "tailscale": null }),
+        }
+    }
+
+    /// What a phone knows of the tower at this listener: the network's range
+    /// (`tailnet` for the tailnet's), its name now, the host and port.
+    fn known_of(&self, kind: Kind, addr: SocketAddr) -> (String, Option<String>, String, u16) {
+        let (host, port) = (addr.ip().to_string(), addr.port());
+        match kind {
+            Kind::Tailscale => (network::TAILNET.to_string(), None, host, port),
+            Kind::Lan => {
+                let range = network::range_of(addr.ip());
+                let name = self.names.lock().unwrap_or_else(|e| e.into_inner()).get(&range).cloned().filter(|n| !n.trim().is_empty());
+                (range, name, host, port)
+            }
+        }
+    }
+
+    /// The user named the network (config.toml was written): the names
+    /// again, and the state and the phones told.
+    pub fn renamed(&self) {
+        if let Ok(c) = crate::config::Config::load() {
+            *self.names.lock().unwrap_or_else(|e| e.into_inner()) = c.lan.networks;
+        }
+        self.refresh();
+    }
+
+    /// Names a network (tests: no config.toml).
+    #[cfg(test)]
+    pub fn set_names(&self, names: &[(&str, &str)]) {
+        *self.names.lock().unwrap_or_else(|e| e.into_inner()) = names.iter().map(|(r, n)| (r.to_string(), n.to_string())).collect();
+        self.refresh();
     }
 
     /// Tailscale again: listens on the tailnet once it runs, stops when it
@@ -786,7 +903,10 @@ impl Lan {
                 s.lan.clear();
                 s.lan_hosts.clear();
                 s.phone = None;
+                s.network = None;
+                s.phone_hint = None;
             });
+            *self.sent_hosts.lock().unwrap_or_else(|e| e.into_inner()) = None;
             eprintln!("[phone] API off");
         }
     }
@@ -809,13 +929,33 @@ impl Lan {
         tailscale["mode"] = json!(if mode.trim() == "off" { "off" } else { "auto" });
         tailscale["listening"] = json!(listeners.iter().any(|(k, _)| *k == Kind::Tailscale));
         tailscale["error"] = json!(r.as_ref().and_then(|r| r.tailscale_error.clone()));
+        // The network: the LAN listener's; while off, the one this Mac is on (nothing listens there).
+        let here = match r.as_ref() {
+            Some(r) => self.here(r),
+            None => {
+                let range = (self.lan_detect)().map(network::range_of);
+                let name = range.as_ref().and_then(|g| crate::config::Config::load().ok()?.lan.networks.get(g).cloned());
+                network::Here { range, name, ..Default::default() }
+            }
+        };
+        let connected = self.ctx.hub.connections();
+        let now = now_ms();
         json!({
             "on": r.is_some(),
             "url": r.as_ref().map(|r| format!("https://{}", r.primary())),
             "hosts": hosts_value(&listeners, &ts),
+            "network": here.view(),
             "tailscale": tailscale,
             "fingerprint": r.as_ref().map(|r| r.fingerprint.clone()),
-            "devices": devices.devices.iter().map(|d| json!({ "id": d.id, "name": d.name, "created_ms": d.created_ms, "last_seen_ms": d.last_seen_ms })).collect::<Vec<_>>(),
+            "devices": devices.devices.iter().map(|d| {
+                let via: Vec<&str> = connected.iter().filter(|(id, _)| *id == d.id).map(|(_, v)| v.as_str()).collect();
+                json!({
+                    "id": d.id, "name": d.name, "created_ms": d.created_ms, "last_seen_ms": d.last_seen_ms, "audio_route": d.audio_route,
+                    "networks": d.networks, "reach": network::reach(&d.networks, &here).word(), "connected": via,
+                })
+            }).collect::<Vec<_>>(),
+            "connected": connected.iter().map(|(id, via)| json!({ "device": id, "via": via })).collect::<Vec<_>>(),
+            "phone_hint": network::hint(&devices.devices, &here, ts.running, now).then_some(network::HINT),
             "streams": streams,
             "voice_streams": voice,
             "pairing_expires_in_s": self.pairing.lock().unwrap_or_else(|e| e.into_inner()).expires_in().map(|d| d.as_secs()),
@@ -829,12 +969,16 @@ impl Lan {
         let code = self.pairing.lock().unwrap_or_else(|e| e.into_inner()).open();
         let listeners: Vec<(Kind, SocketAddr)> = r.listeners.iter().map(|l| (l.kind, l.addr)).collect();
         eprintln!("[phone] pairing open for {} s", auth::CODE_TTL.as_secs());
-        Ok(pairing_payload(&code, &listeners, &r.fingerprint, &r.tailscale, auth::CODE_TTL.as_secs()))
+        let mut v = pairing_payload(&code, &listeners, &r.fingerprint, &r.tailscale, auth::CODE_TTL.as_secs());
+        // The network the phone must be on (or both on Tailscale), for the Mac to say so.
+        v["network"] = self.here(r).view();
+        Ok(v)
     }
 
     /// A device was revoked (`tower phone revoke`): its open streams end.
     pub fn revoked(&self, device: &str) {
         self.ctx.hub.drop_device(device);
+        self.refresh();
     }
 
     fn connection(&self, tcp: TcpStream, tls: Arc<rustls::ServerConfig>, stop: &AtomicBool) {
@@ -845,6 +989,7 @@ impl Lan {
         let fd = tcp.as_raw_fd();
         let Ok(conn) = rustls::ServerConnection::new(tls) else { return };
         let mut stream = rustls::StreamOwned::new(conn, Sock { tcp, deadline: Some(Instant::now() + HEAD_DEADLINE) });
+        let local = stream.sock.tcp.local_addr().ok();
         let (mut req, rest) = match http::read_head(&mut stream) {
             Ok(r) => r,
             Err(e) => {
@@ -860,6 +1005,7 @@ impl Lan {
             let _ = http::write_response(&mut stream, &Response::error(429, "too_many_failures", "too many failed logins; wait a minute"));
             return;
         }
+        req.local = local;
         let resp = self.handle(&mut req, rest, peer, &mut stream, fd, stop);
         if let Some(resp) = resp {
             let _ = http::write_response(&mut stream, &resp);
@@ -958,6 +1104,20 @@ impl Lan {
                 }),
             ),
             ("GET", ["state"]) => Response::json(200, &self.state(&device)),
+            // Where the tower can be reached now: every address, the network, the MagicDNS name.
+            ("GET", ["network"]) => Response::json(200, &self.network_now()),
+            // The phone renames itself (as Settings > Phone and `tower phone rename` do).
+            ("PATCH", ["device"]) | ("PUT", ["device"]) => {
+                let name = req.json().unwrap_or_default()["name"].as_str().map(auth::clean_name).unwrap_or_default();
+                if name.is_empty() {
+                    return Some(Response::error(400, "bad_name", "send {\"name\": \"...\"}, not empty"));
+                }
+                match self.devices.update(|d| d.rename(&device.id, &name)) {
+                    Ok(true) => Response::json(200, &json!({ "device": { "id": device.id, "name": name } })),
+                    Ok(false) => Response::error(401, "unauthorized", "this device isn't paired any more"),
+                    Err(e) => Response::error(503, "save", &format!("{e:#}")),
+                }
+            }
             // Where this phone's replies are heard: `phone` (only there) or `mac`.
             ("GET", ["device", "audio"]) => Response::json(200, &json!({ "route": device.audio_route })),
             ("PUT", ["device", "audio"]) | ("POST", ["device", "audio"]) => {
@@ -1222,7 +1382,7 @@ impl Lan {
                 None => Response::error(404, "no_clip", "that clip is gone (they are kept for 15 minutes)"),
             },
             ("GET", ["events"]) => {
-                self.events(&device, q("voice") == Some("1"), stream, fd, stop);
+                self.events(&device, q("voice") == Some("1"), req.local, stream, fd, stop);
                 return None;
             }
             ("POST", ["ask"]) => {
@@ -1344,21 +1504,52 @@ impl Lan {
         Some(resp)
     }
 
+    /// `POST /v1/pair`: the code, the phone's name, and (a newer app) the
+    /// id of its install: the same install pairs again in place.
     fn pair_device(&self, req: &Request, peer: IpAddr) -> Response {
         let body = req.json().unwrap_or_default();
         let code = body["code"].as_str().unwrap_or("");
+        // Checked before the code is taken: a bad id doesn't use it up.
+        let install_id = match body.get("install_id") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) if auth::valid_install_id(id) => Some(id.clone()),
+            Some(_) => return Response::error(400, "bad_install_id", "install_id is 8 to 64 letters, digits, - and _"),
+        };
         let taken = self.pairing.lock().unwrap_or_else(|e| e.into_inner()).take(code, peer);
         match taken {
             Ok(()) => {
-                let (device, token) = match self.devices.update(|d| d.add(body["name"].as_str().unwrap_or("phone"), now_ms())) {
+                // Where it can reach the tower: every address listened on now (the answer lists them too).
+                let (fp, knows, net) = {
+                    let r = self.running.lock().unwrap_or_else(|e| e.into_inner());
+                    match r.as_ref() {
+                        Some(r) => (Some(r.fingerprint.clone()), r.listeners.iter().map(|l| self.known_of(l.kind, l.addr)).collect::<Vec<_>>(), self.network_value(r)),
+                        None => (None, vec![], json!({})),
+                    }
+                };
+                let now = now_ms();
+                let paired = self.devices.update(|d| {
+                    let (dev, token, again) = d.pair(body["name"].as_str(), install_id.as_deref(), now);
+                    for (range, name, host, port) in &knows {
+                        d.saw(&dev.id, range, name.as_deref(), host, *port, now);
+                    }
+                    (dev, token, again)
+                });
+                let (device, token, repaired) = match paired {
                     Ok(x) => x,
                     Err(e) => return Response::error(503, "save", &format!("{e:#}")),
                 };
-                eprintln!("[phone] paired {} ({}) from {peer}", device.name, device.id);
-                let fp = self.running.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|r| r.fingerprint.clone());
+                // Its old token's streams end (the token itself stopped with the new one).
+                if repaired {
+                    self.ctx.hub.drop_device(&device.id);
+                }
+                eprintln!("[phone] {} {} ({}) from {peer}", if repaired { "paired again" } else { "paired" }, device.name, device.id);
+                self.refresh();
                 Response::json(
                     200,
-                    &json!({ "token": token, "device": { "id": device.id, "name": device.name }, "fingerprint": fp, "api": API, "features": FEATURES }),
+                    &json!({
+                        "token": token, "device": { "id": device.id, "name": device.name }, "fingerprint": fp, "api": API, "features": FEATURES,
+                        "repaired": repaired, "hosts": net["hosts"], "network": net["network"], "magic_dns": net["magic_dns"],
+                    }),
                 )
             }
             Err(PairError::NoCode) => {
@@ -1374,6 +1565,25 @@ impl Lan {
                 )
             }
         }
+    }
+
+    /// A stream came in on `local`: how (the LAN or the tailnet), and the
+    /// network that is, kept with the device; the hint looks again.
+    fn connected_on(&self, device: &auth::Device, sid: u64, local: SocketAddr) {
+        let found = {
+            let r = self.running.lock().unwrap_or_else(|e| e.into_inner());
+            r.as_ref().map(|r| {
+                let kind = kind_of(&r.listeners, local);
+                (kind, self.known_of(kind, local))
+            })
+        };
+        let Some((kind, (range, name, host, port))) = found else { return };
+        self.ctx.hub.set_via(sid, kind.word());
+        let now = now_ms();
+        if let Err(e) = self.devices.update(|d| d.saw(&device.id, &range, name.as_deref(), &host, port, now)) {
+            eprintln!("[phone] keeping where {} connected: {e:#}", device.name);
+        }
+        self.refresh();
     }
 
     /// Remembers when a device was last heard from (written at most once a minute).
@@ -1553,11 +1763,15 @@ impl Lan {
     /// `GET /v1/events`: the panel's live feed, and with `voice=1` the tower's voice.
     /// It ends when the phone goes (a write fails, or what was sent isn't
     /// taken for `STREAM_STUCK`), the device is revoked, or the API is turned off.
-    fn events(&self, device: &auth::Device, voice: bool, w: &mut impl Write, fd: Option<RawFd>, stop: &AtomicBool) {
+    fn events(&self, device: &auth::Device, voice: bool, local: Option<SocketAddr>, w: &mut impl Write, fd: Option<RawFd>, stop: &AtomicBool) {
         if http::write_sse_head(w).is_err() {
             return;
         }
         let (sid, rx) = self.ctx.hub.subscribe(&device.id, voice, device.audio_route == "phone");
+        // The address it came in on: the phone knows the tower on that network.
+        if let Some(local) = local {
+            self.connected_on(device, sid, local);
+        }
         if voice {
             self.ctx.shared.update(|s| s.phone = Some(device.name.clone()));
         }
@@ -1573,7 +1787,12 @@ impl Lan {
         let mut said = stateless(&state);
         // The queue and the missions as last sent: each has its own event, sent when it changes.
         let (mut decisions, mut count, mut missions) = self.ctx.shared.with(|s| (s.decisions.clone(), s.decisions_count, s.missions.clone()));
-        let mut ok = send(w, "hello", &json!({ "api": API, "device": device.id, "voice": voice, "features": FEATURES }))
+        let net = self.network_now();
+        let hello = json!({
+            "api": API, "device": device.id, "voice": voice, "features": FEATURES,
+            "hosts": net["hosts"], "network": net["network"], "magic_dns": net["magic_dns"],
+        });
+        let mut ok = send(w, "hello", &hello)
             && send(w, "state", &state)
             && send(w, "decisions", &decisions_event(&decisions, count))
             && send(w, "missions", &missions);
@@ -1661,10 +1880,10 @@ impl Lan {
                     Some(_) => {}
                 }
             }
-            // Revoked from the terminal meanwhile.
+            // Revoked from the terminal meanwhile, or paired again (its token replaced).
             if last_check.elapsed() > Duration::from_secs(5) {
                 last_check = Instant::now();
-                if !self.devices.load().devices.iter().any(|d| d.id == device.id) {
+                if !self.devices.load().devices.iter().any(|d| d.id == device.id && d.token_sha256 == device.token_sha256) {
                     break;
                 }
             }
@@ -2054,7 +2273,7 @@ mod tests {
         for ip in ["8.8.8.8", "172.32.0.1", "100.128.0.1", "2001:db8::1"] {
             assert!(!is_private(ip.parse().unwrap()), "{ip}");
         }
-        let cfg = |bind: &str, allow_public| crate::config::Lan { enabled: true, port: 7843, bind: bind.into(), allow_public, tailscale: "off".into() };
+        let cfg = |bind: &str, allow_public| crate::config::Lan { enabled: true, port: 7843, bind: bind.into(), allow_public, tailscale: "off".into(), networks: Default::default() };
         assert!(choose_ip(&cfg("8.8.8.8", false)).is_err(), "a public address needs allow_public");
         assert!(choose_ip(&cfg("0.0.0.0", false)).is_err(), "every interface needs allow_public");
         assert!(choose_ip(&cfg("nonsense", false)).is_err());
@@ -2183,7 +2402,7 @@ mod tests {
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
         let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs: test_prs() };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
-        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into() }).unwrap();
+        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into(), networks: Default::default() }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
 
         // Nothing without a token.
@@ -2288,7 +2507,7 @@ mod tests {
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
         let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub: hub.clone(), stt, asks, prs: test_prs() };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
-        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into() }).unwrap();
+        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into(), networks: Default::default() }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
         let code = lan.pair().unwrap()["code"].as_str().unwrap().to_string();
         let token =
@@ -2647,7 +2866,7 @@ mod tests {
         let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
         let ctx = Ctx { shared, mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs };
         let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan"));
-        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into() }).unwrap();
+        let addr = lan.start(&crate::config::Lan { enabled: true, port: 0, bind: "127.0.0.1".into(), allow_public: false, tailscale: "off".into(), networks: Default::default() }).unwrap();
         let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
         (lan, dir, addr, fp)
     }
@@ -2664,7 +2883,7 @@ mod tests {
     }
 
     fn lan_cfg(bind: &str, tailscale: &str) -> crate::config::Lan {
-        crate::config::Lan { enabled: true, port: 7843, bind: bind.into(), allow_public: false, tailscale: tailscale.into() }
+        crate::config::Lan { enabled: true, port: 7843, bind: bind.into(), allow_public: false, tailscale: tailscale.into(), networks: Default::default() }
     }
 
     #[test]
@@ -3098,6 +3317,157 @@ mod tests {
             }
         }
         assert!(t.elapsed() < Duration::from_secs(3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reads a stream until `want` has come (or fails the test).
+    fn read_until(s: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>, seen: &mut String, want: &str) {
+        use std::io::Read;
+        let mut buf = [0u8; 4096];
+        while !seen.contains(want) {
+            let n = s.read(&mut buf).unwrap_or_else(|e| panic!("waiting for {want:?}: {e}; got {seen}"));
+            assert!(n > 0, "stream ended before {want:?}: {seen}");
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    }
+
+    /// The data of the last `event: <name>` a stream sent.
+    fn last_event(seen: &str, name: &str) -> Value {
+        let at = seen.rfind(&format!("event: {name}\n")).unwrap_or_else(|| panic!("no {name} event in {seen}"));
+        let line = seen[at..].lines().find(|l| l.starts_with("data: ")).unwrap();
+        serde_json::from_str(&line["data: ".len()..]).unwrap()
+    }
+
+    #[test]
+    fn the_same_phone_pairs_again_in_place() {
+        let (lan, dir, addr, fp) = test_lan("repair");
+        lan.set_names(&[("127.0.0", "Desk")]);
+        let pair = |body: &str| {
+            let code = lan.pair().unwrap()["code"].as_str().unwrap().to_string();
+            call(addr, &fp, "POST", "/v1/pair", None, &body.replace("CODE", &code)).unwrap()
+        };
+        // A bad install id is refused before the code is used: the right call still pairs with it.
+        let code = lan.pair().unwrap()["code"].as_str().unwrap().to_string();
+        let (st, v) = call(addr, &fp, "POST", "/v1/pair", None, &format!(r#"{{"code":"{code}","install_id":"no"}}"#)).unwrap();
+        assert_eq!((st, v["error"]["code"].as_str()), (400, Some("bad_install_id")));
+        let (st, v) = call(addr, &fp, "POST", "/v1/pair", None, &format!(r#"{{"code":"{code}","name":"OnePlus","install_id":"app-1234-abcd"}}"#)).unwrap();
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["repaired"], false);
+        let (id, old) = (v["device"]["id"].as_str().unwrap().to_string(), v["token"].as_str().unwrap().to_string());
+        // The answer says where the tower is, as the stream does.
+        assert_eq!(v["hosts"], json!([{"kind": "lan", "host": "127.0.0.1", "port": addr.port()}]));
+        assert_eq!(v["network"], json!({"range": "127.0.0", "name": "Desk", "lan": {"host": "127.0.0.1", "port": addr.port()}}));
+        assert!(v["features"].as_array().unwrap().contains(&json!("pairing")));
+        assert_eq!(call(addr, &fp, "PUT", "/v1/device/audio", Some(&old), r#"{"route":"mac"}"#).unwrap().0, 200);
+        // Its stream, on the old token.
+        let mut stream = open(addr, &fp, &format!("GET /v1/events HTTP/1.1\r\nAuthorization: Bearer {old}\r\n\r\n"));
+        let mut seen = String::new();
+        read_until(&mut stream, &mut seen, "event: state");
+
+        // Paired again, by the same install: the same device, a new token, the old one refused at once.
+        let (st, v) = pair(r#"{"code":"CODE","name":"OnePlus 12","install_id":"app-1234-abcd"}"#);
+        assert_eq!((st, v["repaired"].as_bool(), v["device"]["id"].as_str()), (200, Some(true), Some(id.as_str())), "{v}");
+        assert_eq!(v["device"]["name"], "OnePlus 12");
+        let new = v["token"].as_str().unwrap().to_string();
+        assert_eq!(call(addr, &fp, "GET", "/v1/hello", Some(&old), "").unwrap().0, 401, "the old token stops at once");
+        let (st, v) = call(addr, &fp, "GET", "/v1/hello", Some(&new), "").unwrap();
+        assert_eq!((st, v["device"]["id"].as_str(), v["audio_route"].as_str()), (200, Some(id.as_str()), Some("mac")), "the same device, its route kept");
+        let d = lan.devices.load();
+        assert_eq!(d.devices.len(), 1, "no second entry");
+        assert_eq!(d.devices[0].networks.len(), 1);
+        assert_eq!((d.devices[0].networks[0].range.as_str(), d.devices[0].networks[0].name.as_deref()), ("127.0.0", Some("Desk")), "the network it was paired on");
+        // The old token's stream ends.
+        let t = Instant::now();
+        let mut buf = [0u8; 4096];
+        loop {
+            use std::io::Read;
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => assert!(t.elapsed() < Duration::from_secs(8), "the old token's stream goes on"),
+            }
+        }
+        // Another install: another device. No install id (an older app): another one too, as before.
+        assert_eq!(pair(r#"{"code":"CODE","name":"Pixel","install_id":"app-9999-zzzz"}"#).1["repaired"], false);
+        assert_eq!(pair(r#"{"code":"CODE","name":"Old app"}"#).1["repaired"], false);
+        assert_eq!(lan.devices.load().devices.len(), 3);
+        // The phone renames itself.
+        let (st, v) = call(addr, &fp, "PATCH", "/v1/device", Some(&new), r#"{"name":"Work phone"}"#).unwrap();
+        assert_eq!((st, v["device"]["name"].as_str()), (200, Some("Work phone")));
+        assert_eq!(call(addr, &fp, "PATCH", "/v1/device", Some(&new), r#"{"name":"  "}"#).unwrap().0, 400);
+        assert_eq!(lan.info()["devices"][0]["name"], "Work phone");
+        lan.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_phone_learns_where_the_tower_moved_while_it_is_connected() {
+        let dir = std::env::temp_dir().join(format!("tower-lan-hosts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hub = Arc::new(Hub::default());
+        let (stt, rx) = std::sync::mpsc::channel();
+        std::mem::forget(rx);
+        let shared = Shared::new(super::super::state::State::new("ptt", "af_bella", "test"));
+        let asks = super::super::asks::Asks::new(shared.clone(), hub.clone(), "normal");
+        let ctx = Ctx { shared: shared.clone(), mouth: Mouth::silent(hub.clone()), hub, stt, asks, prs: test_prs() };
+        let (home, office): (IpAddr, IpAddr) = ("127.0.0.1".parse().unwrap(), "::1".parse().unwrap());
+        let now = Arc::new(Mutex::new(Some(home)));
+        let seen_ip = now.clone();
+        let lan = Lan::with_paths(ctx, dir.join("devices.json"), dir.join("lan")).with_lan_detect(move || *seen_ip.lock().unwrap());
+        let addr = lan.start(&crate::config::Lan { port: 0, ..lan_cfg("auto", "off") }).unwrap();
+        let stop = lan.running.lock().unwrap().as_ref().unwrap().stop.clone();
+        let fp = lan.info()["fingerprint"].as_str().unwrap().to_string();
+        lan.set_names(&[("127.0.0", "Home")]);
+        assert_eq!(shared.get().network, Some(json!({"range": "127.0.0", "name": "Home", "lan": {"host": "127.0.0.1", "port": addr.port()}})));
+        let code = lan.pair().unwrap()["code"].as_str().unwrap().to_string();
+        let token = call(addr, &fp, "POST", "/v1/pair", None, &format!(r#"{{"code":"{code}","name":"OnePlus"}}"#)).unwrap().1["token"].as_str().unwrap().to_string();
+        let first = lan.devices.load().devices[0].networks[0].last_ms;
+
+        // The stream's hello says where the tower is, and connecting is kept as a network the phone knows.
+        let mut s = open(addr, &fp, &format!("GET /v1/events HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"));
+        let mut seen = String::new();
+        read_until(&mut s, &mut seen, "event: state");
+        let hello = last_event(&seen, "hello");
+        assert_eq!(hello["hosts"], json!([{"kind": "lan", "host": "127.0.0.1", "port": addr.port()}]));
+        assert_eq!(hello["network"]["name"], "Home");
+        assert_eq!(hello["magic_dns"], Value::Null);
+        let d = &lan.devices.load().devices[0];
+        assert_eq!((d.networks.len(), d.networks[0].host.as_str()), (1, "127.0.0.1"));
+        assert!(d.networks[0].last_ms >= first);
+        assert_eq!(lan.info()["connected"], json!([{"device": d.id, "via": "lan"}]));
+        assert_eq!(lan.info()["devices"][0]["reach"], "here");
+        assert_eq!(shared.get().phone_hint, None, "the phone knows this network");
+        // GET /v1/network: the same, any time.
+        let (st, v) = call(addr, &fp, "GET", "/v1/network", Some(&token), "").unwrap();
+        assert_eq!((st, &v["hosts"], &v["network"]), (200, &hello["hosts"], &hello["network"]));
+
+        // The Mac moves to the office: the open stream gets the new address before the phone needs it.
+        *now.lock().unwrap() = Some(office);
+        lan.recheck_lan(&stop);
+        read_until(&mut s, &mut seen, "event: hosts");
+        let moved = SocketAddr::new(office, addr.port());
+        let ev = last_event(&seen, "hosts");
+        assert_eq!(ev["hosts"], json!([{"kind": "lan", "host": "::1", "port": addr.port()}]));
+        assert_eq!(ev["network"], json!({"range": "::1", "name": null, "lan": {"host": "::1", "port": addr.port()}}));
+        // The phone in use knows only home, and Tailscale isn't running: the windows say so, once.
+        assert_eq!(shared.get().phone_hint.as_deref(), Some(network::HINT));
+        assert_eq!(lan.info()["devices"][0]["reach"], "elsewhere");
+        // Named: the streams hear it too.
+        lan.set_names(&[("127.0.0", "Home"), ("::1", "Office")]);
+        read_until(&mut s, &mut seen, "\"name\":\"Office\"");
+        assert_eq!(last_event(&seen, "hosts")["network"]["name"], "Office");
+        assert_eq!(call(moved, &fp, "GET", "/v1/network", Some(&token), "").unwrap().1["network"]["name"], "Office");
+        // It connects at the office: the hint goes, and the office is one of its networks.
+        drop(s);
+        let mut s2 = open(moved, &fp, &format!("GET /v1/events HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"));
+        let mut seen2 = String::new();
+        read_until(&mut s2, &mut seen2, "event: state");
+        assert_eq!(shared.get().phone_hint, None);
+        let ranges: Vec<String> = lan.devices.load().devices[0].networks.iter().map(|k| k.range.clone()).collect();
+        assert_eq!(ranges, vec!["127.0.0".to_string(), "::1".to_string()]);
+        assert_eq!(network::knows_line(&lan.devices.load().devices[0].networks), "Office and Home");
+        drop(s2);
+        lan.stop();
+        assert_eq!((shared.get().network, shared.get().phone_hint), (None, None));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

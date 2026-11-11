@@ -4,7 +4,9 @@
 //!
 //! - **The status line**: how many decisions are the user's and how many
 //!   spaces are at work; under it, faintly, what hovering the orb used to
-//!   say (what the tower is doing, what it last heard or said, an error).
+//!   say (what the tower is doing, what it last heard or said, an error),
+//!   and "Phone: pair again on this network" while the tower says it
+//!   (`phone::phone_hint`).
 //! - **The queue** (`crate::orb::model`): one card open, tagged `Next`, or
 //!   `Picked` when it was chosen from behind the first; the rest as rows
 //!   under "N more waiting", and a click on a row opens it. An answer on its
@@ -701,6 +703,7 @@ impl Panel {
             )
             .child(div().text_sm().text_color(g.muted).child(status))
             .when(!glance.is_empty(), |el| el.child(div().text_size(px(12.0)).text_color(g.faint).truncate().child(glance.join(" · "))))
+            .children(self.phone_hint(cx))
             .into_any_element()
     }
 
