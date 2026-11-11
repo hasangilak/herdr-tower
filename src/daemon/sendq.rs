@@ -1426,7 +1426,11 @@ impl Sessions for Herdr {
         }
     }
     fn send(&self, session: &str, text: &str) -> Result<()> {
-        hc::send(session, text)
+        // Written down before it is typed: the prompt its hook reports is the tower's, not the user's.
+        let id = super::typed::note(session, text, "queue");
+        let sent = hc::send(session, text);
+        super::typed::done(id, sent.is_ok());
+        sent
     }
     fn tell(&self, note: Note) {
         match WIRING.get() {

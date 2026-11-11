@@ -442,7 +442,8 @@ pub struct Agenda {
     pub words: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub title: String,
-    /// `user` (a request) or `tower` (the brain handed it out on its own).
+    /// `user` (a request), `tower` (the brain handed it out on its own) or
+    /// `terminal` (the user typed it in a session's own terminal).
     pub origin: String,
     /// When the request it came from was heard (0: none).
     pub request_ms: u64,
@@ -547,6 +548,22 @@ pub struct Reg {
     pub name: String,
     pub text: String,
     pub tag: Tag,
+}
+
+/// The origin of the user's own work typed in a session's terminal (see `Ledger::typed`).
+pub const TERMINAL: &str = "terminal";
+
+/// A request the user typed in a session's own terminal.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Typed {
+    pub session: String,
+    pub name: String,
+    /// When that terminal was made.
+    pub created_ms: Option<u64>,
+    pub space: Option<String>,
+    pub words: String,
+    /// When its prompt hook said it went in.
+    pub at_ms: u64,
 }
 
 /// The user's latest request, as the daemon heard it.
@@ -789,6 +806,7 @@ impl Ledger {
             a.state == AgendaState::Done
                 && a.receipt_ms.is_none()
                 && a.origin != "tower"
+                && a.origin != TERMINAL
                 && a.closed_ms.is_some_and(|c| now.saturating_sub(c) < within)
                 && a.tasks.iter().any(|t| t.session == session)
         })
@@ -823,10 +841,12 @@ impl Ledger {
 
     /// The task `session` is on, or was until `within` ms ago: one handed
     /// out and not through its turn yet (queued, running, blocked), or one
-    /// whose turn just ended. None: nothing was asked of it lately.
+    /// whose turn just ended. None: nothing was asked of it lately (what
+    /// the user typed in its terminal is their own conversation there).
     pub fn at_work_on(&self, session: &str, now: u64, within: u64) -> Option<&Task> {
         self.agendas
             .iter()
+            .filter(|a| a.origin != TERMINAL)
             .flat_map(|a| a.tasks.iter())
             .filter(|t| !session.is_empty() && t.session == session)
             .filter(|t| matches!(t.state, TaskState::Queued | TaskState::Running | TaskState::Blocked) || now.saturating_sub(t.since_ms) < within)
@@ -841,7 +861,7 @@ impl Ledger {
     /// user's to decide, once.
     pub fn failures(&self, retry: bool, now: u64) -> Vec<FailedTask> {
         let mut out = vec![];
-        for t in self.agendas.iter().filter(|a| a.live()).flat_map(|a| a.tasks.iter()).filter(|t| t.state == TaskState::Failed) {
+        for t in self.agendas.iter().filter(|a| a.live() && a.origin != TERMINAL).flat_map(|a| a.tasks.iter()).filter(|t| t.state == TaskState::Failed) {
             if t.retries == 0 {
                 if retry && !t.session.is_empty() && now.saturating_sub(t.since_ms) <= AUTO_RETRY_MS {
                     out.push(FailedTask::Retry {
@@ -910,6 +930,85 @@ impl Ledger {
             .max_by_key(|t| (t.delivered_ms, t.created_at_ms))
     }
 
+    /// `unfinished_on`, of what the tower handed out: the user's own work in
+    /// a session's terminal (origin `terminal`) is theirs, and what the
+    /// tower sends that session is never more of it.
+    fn unfinished_handed(&self, session: &str) -> Option<&Task> {
+        self.agendas
+            .iter()
+            .filter(|a| a.live() && a.origin != TERMINAL)
+            .flat_map(|a| a.tasks.iter())
+            .filter(|t| !session.is_empty() && t.session == session && !t.state.settled())
+            .max_by_key(|t| (t.delivered_ms, t.created_at_ms))
+    }
+
+    /// The user typed `words` into `session`'s own terminal (its prompt hook
+    /// said so, and the tower typed nothing of it): their request, worked
+    /// there. A new agenda of origin `terminal` with one task, already
+    /// running (it went in as the user typed it); while the last one typed
+    /// in that terminal is unfinished, more of the same task instead (the
+    /// user carries on there). The brain is never told of it (`news`), the
+    /// tower never sends it again (`failures`), and its turn's end settles it
+    /// (`step`): the user was there to see it.
+    pub fn typed(&mut self, t: &Typed, now: u64) -> Registered {
+        let words = t.words.trim().to_string();
+        let open = self
+            .agendas
+            .iter()
+            .filter(|a| a.live() && a.origin == TERMINAL)
+            .flat_map(|a| a.tasks.iter())
+            .filter(|k| k.session == t.session && !k.state.settled() && !matches!((k.created_ms, t.created_ms), (Some(a), Some(b)) if a != b))
+            .max_by_key(|k| k.created_at_ms)
+            .map(|k| k.id.clone());
+        if let Some(id) = open {
+            let agenda = self.agenda_of(&id).map(|a| a.id.clone()).unwrap_or_default();
+            if let Some(k) = self.task_mut(&id) {
+                if !words.is_empty() && words != k.instruction && !k.followups.contains(&words) {
+                    k.followups.push(words.clone());
+                }
+                k.state = TaskState::Running;
+                k.since_ms = now;
+                k.delivered_ms = t.at_ms;
+                k.progress_ms = now;
+                k.said.clear();
+                k.question.clear();
+                k.why.clear();
+                k.history.push(Step { at_ms: now, state: TaskState::Running, why: format!("told more in its terminal: {}", clip(&words, 160)) });
+                if k.history.len() > KEEP_STEPS {
+                    let n = k.history.len() - KEEP_STEPS;
+                    k.history.drain(..n);
+                }
+            }
+            if let Some(a) = self.agendas.iter_mut().find(|a| a.id == agenda) {
+                a.settle(now);
+            }
+            return Registered { agenda, task: id, how: "followup" };
+        }
+        let spaces: Vec<String> = t.space.iter().cloned().collect();
+        let agenda = self.open(&words, &title_of(&words), TERMINAL, t.at_ms, &spaces, now);
+        let id = format!("{agenda}.1");
+        if let Some(a) = self.agenda_mut(&agenda) {
+            a.tasks.push(Task {
+                id: id.clone(),
+                title: title_of(&words),
+                instruction: words.clone(),
+                session: t.session.clone(),
+                name: t.name.clone(),
+                created_ms: t.created_ms,
+                space: t.space.clone(),
+                state: TaskState::Running,
+                since_ms: now,
+                created_at_ms: now,
+                delivered_ms: t.at_ms,
+                progress_ms: now,
+                history: vec![Step { at_ms: now, state: TaskState::Running, why: format!("typed in its terminal ({})", t.session) }],
+                ..Default::default()
+            });
+            a.settle(now);
+        }
+        Registered { agenda, task: id, how: "new" }
+    }
+
     /// A task for what the send queue took on. Where it goes:
     /// 1. the same queue id again (a retry): the task it is already;
     /// 2. `tag.agenda`: that agenda (a plan's task with the same plan id there gets the id);
@@ -939,7 +1038,7 @@ impl Ledger {
             return Some(Registered { agenda: a.clone(), task: t, how: "followup" });
         }
         if named.is_none()
-            && let Some(t) = self.unfinished_on(&reg.session)
+            && let Some(t) = self.unfinished_handed(&reg.session)
         {
             let newer_request = recent.is_some_and(|h| h.at_ms > t.since_ms);
             let waits = t.state == TaskState::Blocked
@@ -954,7 +1053,7 @@ impl Ledger {
             Some(a) => a,
             None => match recent {
                 Some(h) => self.open(&h.text, "", "user", h.at_ms, &[], now),
-                None => match self.unfinished_on(&reg.session).and_then(|t| self.agenda_of(&t.id)).map(|a| a.id.clone()) {
+                None => match self.unfinished_handed(&reg.session).and_then(|t| self.agenda_of(&t.id)).map(|a| a.id.clone()) {
                     Some(a) => a,
                     None => self.open(&reg.text, &title_of(&reg.text), "tower", 0, &[], now),
                 },
@@ -1108,6 +1207,7 @@ impl Ledger {
     pub fn step(&mut self, facts: &BTreeMap<String, Facts>, now: u64) -> Vec<Action> {
         let mut actions = vec![];
         for a in self.agendas.iter_mut().filter(|a| a.live()) {
+            let typed = a.origin == TERMINAL;
             for t in a.tasks.iter_mut().filter(|t| t.state.open()) {
                 let Some(f) = facts.get(&t.id) else { continue };
                 notice_progress(t, f, now);
@@ -1116,12 +1216,18 @@ impl Ledger {
                         Assessed::Ev(ev) => {
                             let _ = t.apply(ev, now);
                         }
+                        // What the user typed there is theirs: the tower never types it again.
+                        Assessed::Reprompt if typed => {}
                         Assessed::Reprompt => actions.push(Action::Reprompt {
                             task: t.id.clone(),
                             session: t.session.clone(),
                             text: t.followups.last().cloned().unwrap_or_else(|| t.instruction.clone()),
                         }),
                     }
+                }
+                // Its turn ended, with the user there to see it: done.
+                if typed && t.state == TaskState::DoneClaimed {
+                    let _ = t.apply(TaskEv::Verify { how: "its turn ended; the user worked it in its terminal".into() }, now);
                 }
             }
             a.settle(now);
@@ -1135,6 +1241,11 @@ impl Ledger {
     pub fn news(&mut self, now: u64) -> Vec<Note> {
         let mut out = vec![];
         for a in self.agendas.iter_mut() {
+            // The user's own work in a terminal: the brain hears nothing of it.
+            if a.origin == TERMINAL {
+                a.told_done |= a.state == AgendaState::Done;
+                continue;
+            }
             if a.state == AgendaState::Done && !a.told_done {
                 a.told_done = true;
                 if a.tasks.len() >= 2 {
@@ -2526,5 +2637,65 @@ mod tests {
     fn screens_hash_without_digits() {
         assert_eq!(screen_hash("Working (12s)"), screen_hash("Working (13s)"));
         assert_ne!(screen_hash("Working"), screen_hash("Reading file"));
+    }
+
+    /// What the user typed in a session's own terminal is their request
+    /// there: an agenda of origin `terminal`, running at once; more typed
+    /// while it is unfinished is more of it; what the tower hands that
+    /// session is never part of it; its turn's end settles it; and no brain
+    /// hears a word of it, whatever happens to it.
+    #[test]
+    fn work_typed_in_a_terminal_is_the_users_own_request() {
+        let now = 10_000_000;
+        let mut l = Ledger::default();
+        let typed = |words: &str, at: u64| Typed {
+            session: "t5".into(),
+            name: "api".into(),
+            created_ms: Some(1),
+            space: Some("Shop".into()),
+            words: words.into(),
+            at_ms: at,
+        };
+        let r = l.typed(&typed("add rate limiting to the login endpoint", now), now);
+        assert_eq!(r.how, "new");
+        let a = l.agenda(&r.agenda).unwrap().clone();
+        assert_eq!((a.origin.as_str(), a.words.as_str(), a.spaces.as_slice()), (TERMINAL, "add rate limiting to the login endpoint", &["Shop".to_string()][..]));
+        let t = l.task(&r.task).unwrap().clone();
+        assert_eq!((t.state, t.session.as_str(), t.space.as_deref(), t.queue_ids.len()), (TaskState::Running, "t5", Some("Shop"), 0));
+        // "What's left?" and the space's mission have it.
+        assert_eq!(l.requests_of("Shop", 0).open, 1);
+        assert!(digest_lines(&l, None).iter().any(|line| line.contains("rate limiting")), "{:?}", digest_lines(&l, None));
+        // It is no work the tower handed out (the idle check), and no receipt is owed for it.
+        assert!(l.at_work_on("t5", now, 60_000).is_none());
+        // More typed there while it is open: the same task.
+        let more = l.typed(&typed("also log the rejected ones", now + 60_000), now + 60_000);
+        assert_eq!((more.task.as_str(), more.how), (r.task.as_str(), "followup"));
+        assert_eq!(l.task(&r.task).unwrap().followups, ["also log the rejected ones"]);
+        // The brain hands the same session something: a task of its own, not more of the user's.
+        let reg = Reg { queue_id: 7, session: "t5".into(), name: "api".into(), text: "update the API docs".into(), tag: Tag::default() };
+        let theirs = l.register(&reg, &Heard::default(), now + 70_000).unwrap();
+        assert_ne!(theirs.agenda, r.agenda);
+        assert_eq!(l.agenda(&theirs.agenda).unwrap().origin, "tower");
+        // Its turn ends with a message: done, with what it said (an unclear claim too: the user saw it).
+        let facts = |said: &str, at: u64| {
+            let mut m = BTreeMap::new();
+            m.insert(r.task.clone(), Facts { live: here(SessionStatus::Done), hook: hook_said(said, at), ..Default::default() });
+            m
+        };
+        l.step(&facts("Here is what I changed.", now + 120_000), now + 120_000);
+        let t = l.task(&r.task).unwrap();
+        assert_eq!((t.state, t.said.as_str()), (TaskState::Verified, "Here is what I changed."));
+        assert_eq!(l.agenda(&r.agenda).unwrap().state, AgendaState::Done);
+        assert!(l.receipt_due("t5", now + 121_000, RECEIPT_DUE_MS).is_none(), "the user saw it end there: nothing for the brain to report");
+        // Done, failed, stalled or blocked: no note to any brain, ever; never sent again, never a decision.
+        let next = l.typed(&typed("now deploy it", now + 200_000), now + 200_000);
+        assert_eq!(next.how, "new", "the last one is settled: a new request");
+        l.apply(&next.task, TaskEv::Fail { why: "the deploy key is missing".into() }, now + 210_000).unwrap();
+        let later = now + 210_000 + REMIND_MS + GRACE_BLOCKED_MS;
+        assert!(l.failures(true, now + 211_000).is_empty(), "not sent again by the tower");
+        let notes = l.news(later);
+        assert!(notes.iter().all(|n| !n.msg.contains("rate limiting") && !n.msg.contains("deploy it")), "{notes:?}");
+        // The tower's own task there is still followed as before.
+        assert!(l.unfinished_handed("t5").is_some_and(|t| t.id == theirs.task));
     }
 }

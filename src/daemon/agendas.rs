@@ -168,6 +168,21 @@ impl Agendas {
         Some(r)
     }
 
+    /// The user typed a request in a session's own terminal: an agenda of
+    /// its own (origin `terminal`), or more of the one typed there before.
+    /// Kept, never told to a brain.
+    pub fn typed(&self, t: agenda::Typed) -> agenda::Registered {
+        let r = {
+            let mut l = self.lock();
+            let r = l.typed(&t, now_ms());
+            self.save(&l);
+            r
+        };
+        eprintln!("[agenda] {}: typed in its terminal: {} in {} ({})", t.session, r.task, r.agenda, r.how);
+        self.kick();
+        r
+    }
+
     /// One round: facts for every open task, moves, re-prompts, news.
     fn tick(&self, round: u64) {
         let Some(ctx) = self.ctx.get() else { return };

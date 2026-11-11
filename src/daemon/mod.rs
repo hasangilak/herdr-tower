@@ -21,6 +21,7 @@ pub mod state;
 pub mod stt;
 pub mod timing;
 pub mod tts;
+pub mod typed;
 pub mod watch;
 
 use std::io::{BufRead, BufReader, Write};
@@ -293,6 +294,66 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+impl Daemon {
+    /// A session took a prompt (its hook said so). Whose it is: the tower's
+    /// own (it typed it: the queue, a reply, the task the session was started
+    /// with), another terminal's (`hc send` from a brain or a session), or the
+    /// user's, typed in the session's own terminal (`typed`). The user's
+    /// answers the question that session asked at the end of its turn, if
+    /// one is open (and a reply the tower held for it is not sent); else it
+    /// is new work: their request in that session, in the record (a
+    /// `request` from `terminal:<address>`, in its space, never a chat
+    /// message) and an agenda of its own (origin `terminal`). Nothing of it
+    /// is said, and no brain is told.
+    fn prompted(&self, ev: &sessions::AgentEvent, t: Option<&serde_json::Value>) {
+        let Some(t) = t else { return };
+        // A test session (the tower's own fixtures), or a brain: not the user's work.
+        if watch::left_alone(t) || brain::brain_of(t).is_some() {
+            return;
+        }
+        let given = typed::given_task(t);
+        let whose = typed::whose(&ev.terminal, &ev.text, given.as_deref(), ev.at_ms);
+        if whose != typed::Whose::User {
+            eprintln!("[terminal] {}: a prompt from {whose:?}, not the user's", ev.terminal);
+            self.asks.typed_by_tower(&ev.terminal);
+            return;
+        }
+        let (d, ev, t) = (self.clone(), ev.clone(), t.clone());
+        thread::spawn(move || d.typed_there(&ev, &t));
+    }
+
+    /// What the user typed in a session's own terminal (`prompted`).
+    fn typed_there(&self, ev: &sessions::AgentEvent, t: &serde_json::Value) {
+        let address = ev.terminal.as_str();
+        let words = crate::introduce::task_from_prompt(&ev.text).unwrap_or_else(|| ev.text.trim().to_string());
+        let (name, space) = (crate::hc::spoken_name(t), crate::spaces::space_of(t));
+        eprintln!("[terminal] {address} ({name}): the user typed in its terminal: {}", crate::agenda::clip(&words, 120));
+        if self.asks.typed_there(address, &words, ev.at_ms) {
+            return;
+        }
+        let r = self.agendas.typed(crate::agenda::Typed {
+            session: address.to_string(),
+            name: name.clone(),
+            created_ms: crate::hc::created_ms(t),
+            space: space.clone(),
+            words: words.clone(),
+            at_ms: ev.at_ms,
+        });
+        let entry = crate::history::Entry {
+            kind: "request".into(),
+            text: words,
+            source: Some(format!("terminal:{address}")),
+            session: Some(address.to_string()),
+            name: Some(name).filter(|n| !n.is_empty()),
+            space,
+            agenda: Some(r.agenda),
+            record: true,
+            ..Default::default()
+        };
+        crate::history::later(move || crate::history::append(entry));
+    }
+}
+
 /// A PR its session made was merged (`by`: mac, phone:<device>, github):
 /// the session is queued that it was, so it can carry on, and the brain is
 /// told (as a report on work it handed out: through the focus).
@@ -503,7 +564,8 @@ impl Daemon {
             }
             Request::Agent { event } => {
                 // Only the terminal's own agent speaks for it (not a `claude -p` it runs).
-                let foreground = crate::hc::get(&event.terminal).and_then(|t| t["foreground"]["pid"].as_u64());
+                let terminal = crate::hc::get(&event.terminal);
+                let foreground = terminal.as_ref().and_then(|t| t["foreground"]["pid"].as_u64());
                 if !sessions::from_terminals_agent(&event, foreground) {
                     eprintln!("[sessions] {}: {} from another agent inside it (pid {}): not the terminal's", event.terminal, event.event, event.pid);
                     return Response { ok: true, error: None, state: None };
@@ -512,6 +574,7 @@ impl Daemon {
                 // A prompt beyond its first instruction: the act that opened it is no longer undone lightly.
                 if change == sessions::Change::Prompted {
                     acts::given(&event.terminal, &event.text);
+                    self.prompted(&event, terminal.as_ref());
                 }
                 if change != sessions::Change::Nothing {
                     self.watches.agent(&event, &change);

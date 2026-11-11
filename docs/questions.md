@@ -114,6 +114,16 @@ turn count; a dialog on the way doesn't count). It is typed only while the
 session is idle or done (read again just before; `hc send --if idle` when
 idle), never into a dialog.
 
+When the user replies in the session's own terminal instead (its
+`UserPromptSubmit` hook brings the words, and the tower didn't type them),
+the set closes as answered with those words, and a reply the tower held for
+it is dropped, never typed (the record says "Not sent: you answered it in
+the terminal"). A question at the end of a turn the user typed there goes
+to them as it is: escalated at once (`reason`: "asked at the end of a turn
+you typed in its terminal"), with no `[question-text]` note to the brain,
+and not said. docs/quiet-tower.md, "Answered in the session's own
+terminal", has the whole of it.
+
 ## Waiting for you
 
 A turn can also end handing something to the user without asking a
@@ -260,7 +270,12 @@ key:
    number only moved the cursor; done when the prompt is gone.
 
 On any surprise it stops and says where (`status: failed`, `error`), and
-the user can finish in the terminal. Text is typed with `hc send` without
+the user can finish in the terminal. When they do (or answer it there in
+the first place), the radar sees the session go on: the set closes, its
+decision closes as answered, the record says "Answered in <space ›
+session>: <what the screen shows was chosen>", and no key the tower was
+about to press goes in (the driver's keys stop once the set is closed).
+Text is typed with `hc send` without
 the tower's terminal identity, so it goes in as it is (from a terminal hc
 would wrap it in a note saying who sent it), with `--` before the terminal
 and the text (a reply like "- yes" isn't a flag), and without control

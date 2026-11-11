@@ -321,6 +321,77 @@ after it closed, is a new decision with a new id.
   and stays until it is answered or dismissed.
 - The last 50 that closed are kept (`tower decisions --all`).
 
+### Answered in the session's own terminal
+
+The user often answers in the session itself, not on the card. The tower
+stays in step:
+
+- **A dialog** (a permission, Claude Code's questions, a plan, a Codex
+  approval) that its session stops showing without the tower having typed
+  its answer (the radar sees it no longer blocked, or showing another
+  dialog) was answered there. Its question set closes, and the decision it
+  stood in closes in the same step, `answered` (`Book::answered_in_terminal`;
+  while other sessions still ask the same, only this one leaves it), so the
+  state carries it at once: off the Mac's windows, a `decisions` event to
+  the phone. Nothing is said. A moment later the record gets one line, a
+  `decision` entry with `status: answered` and `source:
+  terminal:<address>`: "<what it asked> -> Answered in <space › session>:
+  <what was chosen>" when the screen shows it (Claude Code's "User
+  answered Claude's questions", a plan approved or rejected, a permission
+  turned down, Codex's "You approved codex to run …";
+  `questions::chosen_on_screen`), else "… -> Answered in its terminal". The
+  decision's `answer` is "in its terminal[: <what was chosen>]".
+- **Nothing more is typed into it**: an answer going in stops at the next
+  key (`Guarded`: the set is closed); an auto-answer the 90/10 rule decided,
+  a recommendation that comes late, the 40-second escalation, a card
+  answered from the phone a moment late: each finds the set over ("already
+  answered") and types nothing. A menu read again is the same dialog only
+  with the same command or plan (`questions::redrawn`), so what was decided
+  for one prompt never goes into the next. A screen read before the answer
+  (a reader a step behind the radar) brings no card back. A dialog still up
+  that the tower can no longer read is not "answered": it closes
+  `Unread`, its decision `stopped`.
+- **A question at the end of a turn** (`question-text`, a wait card): the
+  user's reply typed there comes with the session's `UserPromptSubmit`
+  hook. The set and its decision close as answered, with the user's words
+  ("… -> Answered in Shop › api: Wait, I'll review it first"), whether the
+  hook or the radar (the session working again) is first. A reply the
+  tower held for that session (answered on the card while it was busy) is
+  not typed: the record has a `queue` entry with `status: not-sent`, "Not
+  sent: you answered it in the terminal (the reply was "…")". Never said.
+- **Whose a prompt is** (`daemon::typed`): the tower writes down every
+  text it types into a session (the send queue: instructions, messages
+  between sessions, introductions; a reply to a question) before typing
+  it. A prompt is the tower's when its words are those of a text it typed
+  into that terminal in the last ten minutes that no prompt took yet, or
+  when it comes while the tower types there or within five seconds after
+  (words a session reports differently: wrapped as pasted, a file as
+  `[Image #1]`). The task a session was started with (the last word of its
+  command line), an introduction, and a prompt `hc send` brought from
+  another terminal (`<hc from="…">`: a brain, another session) are not the
+  user's either. Anything else is the user's, typed in that terminal: the
+  same words as something the tower sent long ago too.
+- **New work typed there** (the user's prompt, no question open): their
+  request in that session. A history entry of kind `request` with `source:
+  terminal:<address>`, `session`, `name`, the session's `space`, `agenda`
+  and `record: true` (in the Record as "You typed", in that space's record,
+  never a chat message, never spoken), and an agenda of origin `terminal`
+  with one task, running from the start (`Ledger::typed`). More typed in
+  that terminal while it is unfinished is more of the same task; what the
+  tower hands that session is never part of it. "What's left?" and the
+  space's mission requests count it. Its turn's end settles it (verified,
+  or failed when it says it couldn't; the user saw it end there). No brain
+  hears of it: no `[agenda]` note, no retry or decision when it fails, no
+  receipt owed, no watch. A question at the end of such a turn is the
+  user's card at once (`TYPED_THERE`: no note to the brain, nothing said),
+  and so is a wait.
+- **What the tower had queued** for that session stays queued and goes in
+  when the session is free, as before; only a reply to a question the user
+  just answered there is dropped (above).
+- **A blocked session the tower couldn't read** (`blocked`) closes as
+  answered "in its own terminal" once it is no longer blocked, as before;
+  its record entry now has `source: terminal:<address>`.
+
 ### Idle is not blocked
 
 A turn that ends saying only that the session is ready (it waits for
