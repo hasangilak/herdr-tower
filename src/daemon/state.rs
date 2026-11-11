@@ -138,6 +138,13 @@ pub struct State {
     /// assumed: [{what, value, why}], request: {at, text} or null, state:
     /// "done" | "undone", undo: {possible, why}, closing}`.
     pub acts: Vec<serde_json::Value>,
+    /// The plan that is open (see `crate::plans`, `Plan::view`), or null:
+    /// `{id, form: "page" | "whiteboard", status: "writing" | "ready" |
+    /// "failed", ticket, draft, revision, address, planner: "starting" |
+    /// "working" | "idle" | "blocked" | "gone" | …, blocked, answering,
+    /// dir, plan_md, url, why, thread: [{from: "user" | "planner", text,
+    /// at}], created_ms, ready_ms, updated_ms, closed_ms, launched}`.
+    pub plan: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -209,6 +216,7 @@ impl State {
             brains: vec![],
             brain_model: serde_json::Value::Null,
             acts: vec![],
+            plan: None,
         }
     }
 

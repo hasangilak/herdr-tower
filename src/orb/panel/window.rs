@@ -75,6 +75,8 @@ pub(super) struct FullUi {
     pub model: Option<(Option<String>, Option<String>)>,
     /// Settings' pane, scrolled to its Phone card when `Scope::Phone` is asked for.
     pub settings_scroll: gpui::ScrollHandle,
+    /// New space's pane: a new line in the chat about a plan scrolls it to its end.
+    pub launch_scroll: gpui::ScrollHandle,
     pub phone_anchor: gpui::ScrollAnchor,
     /// Settings was asked for at its Phone card: scrolled there once it is
     /// drawn, and again until this moment (the cards above it grow as what
@@ -108,6 +110,7 @@ impl FullUi {
             space_tower: None,
             model: None,
             settings_scroll: scroll.clone(),
+            launch_scroll: gpui::ScrollHandle::new(),
             phone_anchor: gpui::ScrollAnchor::for_handle(scroll),
             to_phone: None,
             thread_open: HashSet::new(),
@@ -553,6 +556,7 @@ impl Panel {
             }
             f.settings_scroll.clone()
         });
+        let scroll = scroll.or_else(|| self.full.as_ref().filter(|_| matches!(scope, Scope::New)).map(|f| f.launch_scroll.clone()));
         let pane = div()
             .id(SharedString::from(format!("pane-{}", scope_key(&scope))))
             .flex_1()

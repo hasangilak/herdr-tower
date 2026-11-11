@@ -14,6 +14,7 @@ pub mod lan;
 pub mod mic;
 pub mod missions;
 pub mod narrate;
+pub mod plans;
 pub mod queue;
 pub mod sendq;
 pub mod sessions;
@@ -56,6 +57,7 @@ struct Daemon {
     missions: missions::Missions,
     brains: brains::Brains,
     acts: acts::Acts,
+    plans: plans::Plans,
 }
 
 pub fn run() -> Result<()> {
@@ -273,7 +275,10 @@ pub fn run() -> Result<()> {
     missions.start();
     // What the tower opened for the user lately, to show with the reply and to undo.
     let acts = acts::Acts::open(shared.clone(), hub.clone());
-    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks, sendq, prs, agendas, introducer, decisions, missions, brains, acts };
+    // A space's plan before it is launched, and its planner (`tower plan`).
+    let plans = plans::Plans::open(shared.clone(), sendq.clone());
+    plans.start();
+    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks, sendq, prs, agendas, introducer, decisions, missions, brains, acts, plans };
     // The phone API reaches the rest of the tower through the daemon itself
     // (`desk`), so it starts only now that the daemon is whole.
     daemon.lan.attach(std::sync::Arc::new(daemon.clone()));
@@ -646,6 +651,7 @@ impl Daemon {
                 };
             }
             Request::Screenshots => load_screenshots(&self.shared),
+            plan @ Request::Plan { .. } => return self.plans.request(&plan),
             Request::Phone { action, arg } => {
                 let info = match action.as_str() {
                     "on" => {

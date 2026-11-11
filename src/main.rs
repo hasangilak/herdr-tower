@@ -34,6 +34,7 @@ mod names;
 mod orb;
 mod peers;
 mod phone;
+mod plans;
 mod protocol;
 mod projects;
 mod prs;
@@ -293,8 +294,25 @@ enum Cmd {
         /// The Claude account its sessions run on (default: the project's, else the default one).
         #[arg(long)]
         account: Option<String>,
+        /// The plan it was planned with (`tower plan`, `p3`): each session's first instruction
+        /// carries the plan's link and its part of the plan, and the plan is closed.
+        #[arg(long, conflicts_with = "draft")]
+        plan: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    /// A space's plan before it is launched: the tower's planner (a Claude Code terminal of the
+    /// tower's, `tower-planner`) writes the full plan of a draft, publishes it as an Artifact on
+    /// your claude.ai account (an HTML page or a whiteboard) and talks it over with you.
+    /// `tower plan new --form page|whiteboard --draft '<draft JSON>' --ticket-file <file>`,
+    /// `say <id> "<words>" [--as user|planner]` (yours is queued to the planner; the planner's
+    /// is its answer), `draft <id> --json-file <file>` (the planner's revised draft),
+    /// `published <id> --url <link>`, `failed <id> "<why>"`, `show [<id>] [--json]`,
+    /// `close [<id>]` (its planner ends), `list`.
+    Plan {
+        /// new | say | draft | published | failed | show | close | list, its id and flags.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// The projects (setups) `tower launch` opens a space with: a name, a Claude account, what it
     /// is, and the repos that get a session each with what each is in it (`[[setups]]` in
@@ -830,15 +848,16 @@ fn run(cli: Cli) -> Result<()> {
             let space = space.map(|s| spaces::Asked { name: s, new: new_space });
             start(account.as_deref(), &name, cwd, on.as_deref(), space.as_ref(), no_watch, tag, &task.join(" "), no_worktree, !no_act)
         }
-        Cmd::Launch { goal, setup, name, dry_run, draft, adjust, prior, repo, title, done_when, account, json } => {
+        Cmd::Launch { goal, setup, name, dry_run, draft, adjust, prior, repo, title, done_when, account, plan, json } => {
             let goal = goal.join(" ");
             if draft {
                 ticket::cmd(&goal, setup.as_deref(), adjust.as_deref(), prior.as_deref(), json)
             } else {
-                let ask = launch::Ask { setup: setup.as_deref(), name: name.as_deref(), repos: &repo, title: title.as_deref(), done_when: done_when.as_deref(), account: account.as_deref() };
+                let ask = launch::Ask { setup: setup.as_deref(), name: name.as_deref(), repos: &repo, title: title.as_deref(), done_when: done_when.as_deref(), account: account.as_deref(), plan: plan.as_deref() };
                 launch::cmd(&goal, &ask, dry_run, json)
             }
         }
+        Cmd::Plan { args } => plans::cmd(&args),
         Cmd::Setups { json } => setups::cmd_list(json),
         Cmd::Setup { action, name, account, about, repo, was } => match action.as_str() {
             "add" => setups::cmd_add(&name.join(" "), account.as_deref(), about.as_deref(), &repo, was.as_deref()),

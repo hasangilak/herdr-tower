@@ -1070,6 +1070,72 @@ pub fn thread(state: &Value, space: &str) -> Vec<Message> {
         .collect()
 }
 
+/// A line of the chat about a plan (`plan.thread` in the state).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct PlanMsg {
+    /// `user` or `planner`.
+    #[serde(deserialize_with = "or_default")]
+    pub from: String,
+    #[serde(deserialize_with = "or_default")]
+    pub text: String,
+    pub at: u64,
+}
+
+impl PlanMsg {
+    pub fn mine(&self) -> bool {
+        self.from == "user"
+    }
+}
+
+/// The plan that is open, as the state has it (`plan`, see `crate::plans`).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct PlanView {
+    #[serde(deserialize_with = "or_default")]
+    pub id: String,
+    /// `page` or `whiteboard`.
+    #[serde(deserialize_with = "or_default")]
+    pub form: String,
+    /// `writing`, `ready` or `failed`.
+    #[serde(deserialize_with = "or_default")]
+    pub status: String,
+    #[serde(deserialize_with = "or_default")]
+    pub ticket: String,
+    /// The draft as the planner last revised it.
+    pub draft: Value,
+    pub revision: u32,
+    pub address: Option<String>,
+    /// How the planner stands: `starting`, `working`, `idle`, `blocked`, `gone`.
+    #[serde(deserialize_with = "or_default")]
+    pub planner: String,
+    pub blocked: bool,
+    /// The user's last line has no answer yet.
+    pub answering: bool,
+    pub url: Option<String>,
+    #[serde(deserialize_with = "or_default")]
+    pub why: String,
+    #[serde(deserialize_with = "or_default")]
+    pub thread: Vec<PlanMsg>,
+    pub created_ms: u64,
+    pub ready_ms: Option<u64>,
+}
+
+impl PlanView {
+    /// What it is published as, in a word for the window: "page", "whiteboard".
+    pub fn form_word(&self) -> &str {
+        if self.form == "whiteboard" { "whiteboard" } else { "page" }
+    }
+}
+
+/// The open plan, when the state has one (an older tower's has none).
+pub fn plan(state: &Value) -> Option<PlanView> {
+    let v = state.get("plan").filter(|v| v.is_object())?;
+    let mut p: PlanView = serde_json::from_value(v.clone()).ok()?;
+    p.thread.retain(|m| !m.text.trim().is_empty());
+    (!p.id.is_empty() && p.status != "closed").then_some(p)
+}
+
 /// The space called `space` has a tower of its own that runs, as the state's missions say.
 pub fn has_own_tower(state: &Value, space: &str) -> bool {
     state["missions"]["spaces"]
@@ -1993,6 +2059,31 @@ mod tests {
         assert_eq!(own.who_in("fix-login"), "fix login → fix", "a name that is only the space's stays");
         assert_eq!(tell_level(&state), Some("results"));
         assert_eq!((tell_level(&json!({})), tell_level(&json!({ "tell_level": "loud" }))), (None, None));
+    }
+
+    #[test]
+    fn the_open_plan_reads_from_the_state() {
+        let state = json!({ "plan": {
+            "id": "p2", "form": "whiteboard", "status": "ready", "ticket": "EYZFlow Support – Translate messages",
+            "draft": { "space": "msg-translation", "sessions": [{ "repo": "/w/a" }] }, "revision": 1,
+            "address": "t9", "planner": "idle", "blocked": false, "answering": true, "url": "https://claude.ai/artifact/wb", "why": "",
+            "thread": [{ "from": "user", "text": "which session starts first?", "at": 5 }, { "from": "planner", "text": " ", "at": 6 }, { "from": null, "text": "x" }],
+            "created_ms": 1, "ready_ms": 4, "some_newer_field": true,
+        } });
+        let p = plan(&state).unwrap();
+        assert_eq!((p.id.as_str(), p.form_word(), p.status.as_str(), p.url.as_deref(), p.revision, p.answering), ("p2", "whiteboard", "ready", Some("https://claude.ai/artifact/wb"), 1, true));
+        assert_eq!(p.draft["space"], "msg-translation");
+        assert_eq!(p.thread.iter().map(|m| (m.mine(), m.text.as_str())).collect::<Vec<_>>(), [(true, "which session starts first?"), (false, "x")], "an empty line goes");
+        // Blocked on a dialog in its terminal; a page; none; a closed one; a state from before plans.
+        let mut blocked = state.clone();
+        blocked["plan"]["blocked"] = true.into();
+        blocked["plan"]["form"] = "page".into();
+        let p = plan(&blocked).unwrap();
+        assert!(p.blocked && p.form_word() == "page");
+        assert!(plan(&json!({ "plan": null })).is_none() && plan(&json!({})).is_none());
+        let mut closed = state.clone();
+        closed["plan"]["status"] = "closed".into();
+        assert!(plan(&closed).is_none());
     }
 
     #[test]

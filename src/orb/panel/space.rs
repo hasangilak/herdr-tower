@@ -600,7 +600,7 @@ fn msg_is_long(text: &str, width: f32) -> bool {
 }
 
 /// "7:50 PM · 12m ago" today, else the day and the time.
-fn when_said(at: u64) -> String {
+pub(super) fn when_said(at: u64) -> String {
     if at == 0 {
         return String::new();
     }

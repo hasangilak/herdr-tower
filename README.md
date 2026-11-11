@@ -291,6 +291,24 @@ folded into one line, and **Record**, **Shots**, **Projects** and
   dashboard out", "call it msg-translation"); **Start over** drops it.
   Nothing opens before Launch. The whole ticket goes to the sessions as
   their brief; the space's header keeps the title.
+  **Plan as a page** or **Plan as a whiteboard**, under the draft, shows
+  you the plan before anything opens: the tower's planner (a Claude Code
+  terminal of the tower's, `tower-planner`, on your default account and the
+  brains' model) reads the ticket, the draft and the repos, writes the full
+  plan (each session's part and its order, how the repos fit together, the
+  risks, the open questions, how it is tested) and publishes it to your
+  claude.ai account, private, as an HTML page or a Whiteboard ("The tower's
+  brain is writing the plan… (a minute or two)", then **Plan · page ·
+  Open**). Under the card is the chat about it: ask about the plan or
+  change it ("which session starts first?", "leave the dashboard out") in
+  "Ask about the plan or change it…" with **Send**; the planner's answers
+  come in under yours, a change it makes to the draft shows on the card,
+  and a change to the plan republishes the same artifact. A planner that
+  waits on a question in its terminal (a permission to publish) says so,
+  with **Show in Herdr**; one that fails says why, with Plan again.
+  **Launch** then hands each session the plan's link and its own part of
+  the plan; **Start over** ends the plan. The planner never launches,
+  opens a session or edits a repo.
 - **Record**: the history, newest first, each row with its time, what it is
   (You asked, Tower replied, Started, Finished, Needs you, Between
   sessions, Answered for you, Note, Receipt, Decision raised, Decision
@@ -386,6 +404,27 @@ change>" --prior '<the draft's JSON>'` redrafts it. The draft is launched
 as it is with `tower launch "<ticket>" --repo <folder> [--repo …] --name
 <space> --title "<goal>" --done-when "<…>" [--account <a>] [--setup
 <project>]`, which is what New space's Launch runs.
+
+**A draft is planned before it opens.** `tower plan new --form
+page|whiteboard --draft '<the draft's JSON>' --ticket-file <file>` (New
+space's **Plan as a page** / **Plan as a whiteboard**) starts the tower's
+planner: one Claude Code terminal the tower owns (`tower-planner`, hidden,
+on the default account and the `[brains]` model and effort, in
+`~/.local/state/herder-tower/plans/<id>/` with `ticket.md`, `draft.json`,
+`instructions.md` and the `plan.md` it writes). It writes the full plan,
+publishes it as an Artifact on your claude.ai account (an HTML page, or a
+Whiteboard from the account's Whiteboard type: a block per session, arrows
+for what waits for what, a section for the risks and questions), and says
+so (`tower plan published <id> --url <link>`). Then it waits: what you say
+(`tower plan say <id> "…"`) reaches it through the send queue, its answers
+come back the same way, and a change you agree to is a revised draft
+(`tower plan draft <id> --json-file <f>`) and the same artifact
+republished. One plan at a time: a new one, Start over or a launch ends
+its planner. `tower launch … --plan <id>` gives each session the plan's
+link and its own part of `plan.md` (6,000 characters at most), and closes
+the plan. The planner may read anywhere, write only in its folder, and
+run `tower plan`; it may never launch, start or queue anything, or edit a
+repo.
 
 A **project** (a setup, kept as `[[setups]]` in config.toml; the first is
 the default) is a name, a Claude account, a line on what it is, and the
@@ -701,7 +740,11 @@ tower policy [normal|keep-moving|ask-everything]   # how much the tower answers 
 tower start --name n --cwd d "task"  # a new Claude session on an account (--account), watched; with --space of a space that has a goal, in that space's worktree of d (--no-worktree: in d itself)
 tower launch "<goal>" [--setup <name>] [--name <space>] [--dry-run]   # open a space for a goal: a session per repo (named in its first line, or a project's), each in its worktree, the goal handed out
 tower launch "<ticket>" --draft [--adjust "<words>" --prior '<draft>']   # the brain drafts the space from the ticket; nothing opens
-tower launch "<ticket>" --repo <dir> [--repo …] --name <space> --title "<goal>" [--done-when "<…>"] [--account <a>] [--setup <project>]   # launch a draft as it was confirmed
+tower launch "<ticket>" --repo <dir> [--repo …] --name <space> --title "<goal>" [--done-when "<…>"] [--account <a>] [--setup <project>] [--plan <id>]   # launch a draft as it was confirmed (with its plan)
+tower plan new --form page|whiteboard --draft '<draft>' --ticket-file <f>   # the planner writes the draft's plan and publishes it as an artifact
+tower plan say <id> "<words>" [--as user|planner]   # the chat about a plan: yours goes to the planner, the planner's is its answer
+tower plan draft <id> --json-file <f> | published <id> --url <link> | failed <id> "<why>"   # what the planner reports
+tower plan [show [<id>]] [--json] | list | close [<id>]   # the open plan (and its chat); close ends its planner
 tower setups                         # the projects `tower launch` opens with; tower setup add "<name>" --account <a> [--about "<line>"] --repo "<dir>=<role>" [--repo …] [--was "<old>"], tower setup remove "<name>"
 tower missions                       # every open space as a mission: goal, state, what needs you, sessions (worktree, port), requests
 tower spaces [--all]                 # every space: focus, goal, state, unread news, sessions (--all: archived and closed ones too)

@@ -946,8 +946,9 @@ Mission { "name", "goal": "" when none, "done_when": "" when none,
 ## Step 9: one sentence launches a space
 
 The code is `src/launch.rs` (the plan, the launch), `src/ticket.rs` (the
-draft of a ticket), `src/setups.rs` (the projects) and
-`src/orb/panel/launch.rs` / `projects.rs` (New space, Projects).
+draft of a ticket), `src/plans.rs` and `src/daemon/plans.rs` (a draft's
+plan, its planner and the chat about it), `src/setups.rs` (the projects)
+and `src/orb/panel/launch.rs` / `projects.rs` (New space, Projects).
 
 ### Projects
 
@@ -1141,10 +1142,166 @@ the tower will do.
   was: the first project, its plan, Launch.
 - Launch's receipt names the space, whose view opens with what was done
   said at its top; an error stays here.
+- **Or see the plan first**: under the draft's Launch and Start over,
+  **Plan as a page** and **Plan as a whiteboard** (see "The plan, and the
+  chat about it" below). While a plan of this ticket is open, the card is
+  the plan's draft (the planner may revise it), the chat replaces "Adjust
+  it in words…", Launch carries `--plan <id>`, and Start over closes the
+  plan too. A plan of another ticket that is still open (the field was
+  changed, the window reopened) says so at the top, with **Back to it**
+  (its ticket in the field, its draft on the card) and **Close it**.
 - `HERDER_TOWER_ORB_DRAFT=<file>` (with `HERDER_TOWER_ORB_WINDOW=show:new=<ticket>`)
   shows the draft JSON in the file as the card; `reading` shows the
-  launcher reading; `ready` its button before. `HERDER_TOWER_ORB_PROJECT=new|<name>`
+  launcher reading; `ready` its button before. `HERDER_TOWER_ORB_PLAN=<file>`
+  makes the plan in the file (the state's `plan`, as `Plan::view` writes
+  it) the open plan of that ticket. `HERDER_TOWER_ORB_PROJECT=new|<name>`
   (with `show:projects`) opens the Projects form once.
+
+### The plan, and the chat about it
+
+The user wants to see the plan before anything opens, and to talk it
+over. Artifacts can only be published by an interactive Claude Code
+session (a headless `claude -p` has no Artifact tool), so the plan is
+written by one the tower owns: **the planner**.
+
+- **The planner** is a hidden Herdr terminal named `tower-planner`
+  (labels `tower.role=planner`, `tower.plan=<id>`), started by the daemon
+  the way a brain is (`hc run --bg --no-parent --no-notify`; its first-run
+  folder question is the tower's to answer, `brain::settle`): `env
+  HERDER_TOWER_PLAN=<id> [the tower's HERDER_TOWER_HOME/STATE/DATA/BIN when
+  they aren't the usual ones] cca <the default account> -n tower-planner
+  --model <[brains] model> --effort <[brains] effort> [claude_args] "<its
+  first task>"` (plain `claude`, without CLAUDE_CONFIG_DIR, without the
+  accounts mod). It always runs Claude Code, whatever `brain` says.
+- **Its name is a brain's** (`brain::is_brain_name`): never a session of
+  the user's, never watched, never introduced, never in a space's members
+  or the radar's lists, its dialogs never questions or decisions. It is no
+  space's brain (`brains::is_space_brain` and `brains::is_ours` say no: no
+  note or request is routed to it, `tower model --restart` leaves it), and
+  a space called "planner" has the brain `tower-planner-space`.
+- **Its folder** is `<state dir>/plans/<id>/`: `ticket.md`, `draft.json`
+  (the draft, as the planner last revised it), `instructions.md` (also its
+  `CLAUDE.md`), the `plan.md` it writes, and `.claude/settings.json`: it
+  may Read, Glob and Grep anywhere (the draft's repos are its
+  `additionalDirectories`), edit only in its folder (`Edit(./**)`; an edit
+  in a repo of the draft is denied), run `tower plan …` and `tower setups`
+  and read-only `git`/`ls`/`cat`/`rg`, and publish (`Artifact`); it may
+  never run `tower launch|start|queue|dispatch|space|answer|agenda|undo`,
+  `hc`, `herdr-*`, `cca`, or a `git` that changes a repo, nor ask in its
+  terminal (`AskUserQuestion`). Anything else asks, and shows as blocked.
+- **Its first task** (`plans::first_task`, `plans::instructions`): write
+  the full plan of the draft into `plan.md` (each session: what it does
+  and in what order; how the repos fit together: the APIs, data and
+  contracts; the risks; the open questions; how it is tested; each session
+  under `### <its repo>` in a `## Sessions` section), publish it, and say
+  so with `tower plan published <id> --url <link>`. **A page**: one
+  self-contained HTML page Artifact, "Plan · <space>". **A whiteboard**: an
+  Artifact from the account's Whiteboard type
+  (`https://claude.ai/artifact/PLsEyfjXbDUM1iasW7rjLR`): a block per
+  session, arrows for the dependencies, a section for the risks and the
+  open questions. One artifact only. It can't: `tower plan failed <id>
+  "<why>"`.
+- **Then it waits.** What the user says reaches it through the send queue
+  as a quiet note (`sendq::add_note`: after its turn, never a task, never
+  watched): `[plan <id>] The user says: <words>` and how to answer. It
+  answers in a few sentences with `tower plan say <id> "…"` (nobody reads
+  its terminal). A change the user agrees to: a revised draft (`draft.json`,
+  then `tower plan draft <id> --json-file draft.json`), or `plan.md` changed
+  and the same artifact republished (its `url`), then `tower plan published`
+  again.
+- **One plan at a time.** A new plan closes the one that is open; Start
+  over, Close it and a launch close it too. Closing ends its planner (`hc
+  kill`, the terminal removed).
+
+#### The store: `plans.json`
+
+The daemon keeps every plan in `<state dir>/plans.json` (written before it
+answers; the open one and the last 20 closed), and shows the open one in
+`state.json` as `plan` (null when none), which the window follows:
+
+```
+{ "id": "p3", "form": "page" | "whiteboard",
+  "status": "writing" | "ready" | "failed" | "closed",
+  "ticket", "draft": the draft receipt (as last revised), "revision": how many times the planner revised it,
+  "address": the planner's terminal or null, "planner": "starting" | "working" | "idle" | "blocked" | "gone" | …,
+  "blocked": a dialog waits in its terminal, "answering": the user's last line has no answer yet,
+  "dir", "plan_md": its folder and plan.md, "url": the artifact's link or null, "why": why it failed, or that the planner ended,
+  "thread": [ { "from": "user" | "planner", "text", "at" } ],   (oldest first, at most 200)
+  "created_ms", "ready_ms", "updated_ms", "closed_ms", "launched": the space launched with it }
+```
+
+Every two seconds the open plan's planner is looked at (`hc get`): its
+status word becomes `planner`; a terminal that has ended is `gone` (a plan
+not yet published fails: "the planner's terminal ended before it published
+the plan"; a published one stays ready, and says Plan again starts one to
+talk it over).
+
+#### `tower plan`
+
+- `tower plan new --form page|whiteboard --draft '<the draft's JSON>'
+  --ticket-file <file> [--json]`: the draft must be a draft receipt (its
+  `space`, a session with a `repo`); the ticket is read from the file. The
+  answer is the new plan (`writing`, the planner `starting`); the planner
+  starts a moment later.
+- `tower plan say <id> "<words>" [--as user|planner]`: a line of the chat.
+  Whose: `--as`, else the planner's when its environment names that plan
+  (`HERDER_TOWER_PLAN`), else the user's. The user's is queued to the
+  planner (an error when it isn't running); the planner's is its answer.
+- `tower plan draft <id> --json-file <file>`: the planner's revised draft,
+  in the draft's shape or the shape a draft is asked in (`{project,
+  account, repos: [{folder, why}], space, goal, done_when, notes}`),
+  checked as a draft is (`ticket::check`: an unknown folder is left out and
+  said so; none left is an error) and kept as its receipt; it prints what
+  it took.
+- `tower plan published <id> --url <link>` (an `https://` link; again after
+  a republish), `tower plan failed <id> "<why>"`.
+- `tower plan [show [<id>]] [--json]` (the open one when no id; from
+  `plans.json` when the daemon isn't running), `tower plan list`, `tower
+  plan close [<id>]` (`--launched <space>`: what it became).
+- Words after `--` are words (`say <id> -- --json is a word here`).
+
+#### A launch with its plan
+
+`tower launch "<ticket>" --repo … --plan <id>` (New space's Launch with a
+published plan) reads the plan (its link, and `plan.md`), and each
+session's first instruction ends, after its brief, with "The space's plan
+(<link>), as the tower's planner wrote it with the user: follow it, and
+say so when you must leave it." and its part of `plan.md`
+(`plans::part_for`): all of it when it fits in 6,000 characters, else
+without the other sessions' own sections (a heading that names another
+session's repo and not this one's), cut at a line, saying where the rest
+is. The receipt has `plan: {id, url}` (a `--dry-run` reads the plan and
+says it, and opens nothing). Once the sessions are open the plan is closed
+(`launched`: the space) and its planner ends. A plan that isn't
+published yet when Launch is pressed is closed, and the draft launches
+without it.
+
+#### In the window
+
+Under the draft card (`src/orb/panel/launch.rs`), on the state's `plan` of
+this ticket:
+
+- **None**: "Or see the plan first:" **Plan as a page** · **Plan as a
+  whiteboard** (`tower plan new --form … --draft '<the card's draft>'
+  --ticket-file <the ticket, in a temporary file>`), and what it does.
+- **Writing**: "The tower's brain is writing the plan… (a minute or two)"
+  (while the planner starts: "…starting the planner…"), and that it
+  publishes to the user's claude.ai account, private.
+- **Blocked**: "The planner waits on a question in its terminal
+  (publishing the plan may ask for your go-ahead). Answer it there." with
+  **Show in Herdr** (the blocked card's way: `tower show`, the terminal in
+  a tab).
+- **Ready**: **Plan · page · Open** (`open <link>`), a revised draft said
+  ("the card above is the draft as it is now"), and that Launch hands each
+  session its part. A planner that ended: why, and Plan again.
+- **Failed**: "The plan didn't come: <why>." and **Plan again as a page** ·
+  **Plan again as a whiteboard**.
+- **The chat**, under it: "About the plan · N messages", the user's lines
+  (You, amber) and the planner's answers (The planner, cyan) as "Between
+  sessions" shows a message, newest last (the latest 12); "The planner is
+  answering…" while the user's last line waits; and "Ask about the plan or
+  change it…" with **Send** (Enter too: `tower plan say --as user <id> --
+  "<words>"`; the field empties once it went).
 
 ## Step 10: every mission gets its own worktrees
 

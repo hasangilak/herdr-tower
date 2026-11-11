@@ -71,6 +71,9 @@ pub struct Plan {
     pub sessions: Vec<Session>,
     /// What it chose by itself, for the receipt.
     pub assumed: Value,
+    /// The plan it was planned with (`--plan`): each session's first
+    /// instruction carries its link and its part of it.
+    pub plan: Option<crate::plans::PlanBrief>,
 }
 
 /// What a launch is asked beside its goal, each as `tower launch` takes it.
@@ -88,6 +91,8 @@ pub struct Ask<'a> {
     pub done_when: Option<&'a str>,
     /// `--account` (default: the project's, else the default one).
     pub account: Option<&'a str>,
+    /// `--plan`: the plan it was planned with (`tower plan`).
+    pub plan: Option<&'a str>,
 }
 
 /// What a plan is made from: what there is now.
@@ -571,7 +576,7 @@ pub fn plan_with(goal: &str, ask: &Ask, w: &World) -> Result<Plan> {
         "name": space, "name_why": name_why,
         "worktrees": sessions.iter().any(|s| s.worktree.is_some()), "worktrees_why": worktrees_why,
     });
-    Ok(Plan { goal, done_when, ticket, repos_from, space, joins, setup: setup.clone(), account, sessions, assumed })
+    Ok(Plan { goal, done_when, ticket, repos_from, space, joins, setup: setup.clone(), account, sessions, assumed, plan: None })
 }
 
 /// What a session of the plan is asked first: the whole ticket (with its
@@ -585,8 +590,16 @@ pub fn instruction(p: &Plan, me: &Session) -> String {
     let squash = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
     let text = if p.goal.is_empty() || squash(&p.ticket).contains(&squash(p.goal.trim_end_matches('…'))) { p.ticket.clone() } else { format!("{}\n\n{}", p.goal, p.ticket) };
     let done = if p.done_when.is_empty() { String::new() } else { format!(" It is done when: {}.", p.done_when.trim_end_matches('.')) };
+    // The plan it was planned with: its link, and this session's part of it.
+    let plan = match &p.plan {
+        Some(b) => {
+            let others: Vec<String> = p.sessions.iter().filter(|s| s.name != me.name).map(|s| repo_name(&s.folder)).collect();
+            format!("\n\n{}", crate::plans::brief_text(b, &repo_name(&me.folder), &others))
+        }
+        None => String::new(),
+    };
     format!(
-        "{text}\n\nThat is the goal of the space \"{}\".{done} You are its {} session: do the part of it that belongs in this repository.{with} When your part is done, say what you did and what is left.",
+        "{text}\n\nThat is the goal of the space \"{}\".{done} You are its {} session: do the part of it that belongs in this repository.{with} When your part is done, say what you did and what is left.{plan}",
         p.space,
         repo_name(&me.folder)
     )
@@ -624,6 +637,7 @@ pub fn receipt(p: &Plan, started: &[Value], agenda: Option<&str>, dry_run: bool)
         "sessions": sessions,
         "repos_from": p.repos_from,
         "assumed": p.assumed,
+        "plan": p.plan.as_ref().map(|b| json!({ "id": b.id, "url": b.url })),
     })
 }
 
@@ -796,11 +810,24 @@ pub fn world_now() -> Result<World> {
 
 /// What a launch did (or, with `dry_run`, would do): its receipt.
 pub fn launch(goal: &str, ask: &Ask, dry_run: bool) -> Result<Value> {
-    let p = plan_with(goal, ask, &world()?)?;
+    let mut p = plan_with(goal, ask, &world()?)?;
+    if let Some(id) = ask.plan.map(str::trim).filter(|i| !i.is_empty()) {
+        p.plan = Some(crate::plans::brief_of(id)?);
+    }
     if dry_run {
         return Ok(receipt(&p, &[], None, true));
     }
-    open(&p, None, &mut |_| ())
+    let r = open(&p, None, &mut |_| ())?;
+    // Planned and launched: the plan is done, and its planner ends.
+    if let Some(b) = &p.plan
+        && crate::protocol::is_running()
+    {
+        let close = crate::plans::Args { action: "close".into(), id: Some(b.id.clone()), launched: Some(p.space.clone()), ..Default::default() };
+        if let Err(e) = crate::plans::request(&close) {
+            eprintln!("tower: the plan {} stays open: {e:#}", b.id);
+        }
+    }
+    Ok(r)
 }
 
 /// `tower launch "<goal>" [--setup <name>] [--name <space>] [--repo <folder>…]
@@ -1033,7 +1060,7 @@ mod tests {
         let w = World { setups: vec![project, setup("other", "default", &["/w"])], accounts: accounts(&["default", "orca"]), worktrees: true, spaces: vec!["msg".into()], ..Default::default() };
         let ticket = "EYZFlow Support – Enable Automatic Message and Reply Translation\n\nAcceptance criteria:\n- Messages show translated";
         let repos = vec![s(&room)];
-        let ask = Ask { repos: &repos, name: Some("msg-translation"), title: Some("Translate support messages"), done_when: Some("both languages show"), account: None, setup: Some("EYZFlow") };
+        let ask = Ask { repos: &repos, name: Some("msg-translation"), title: Some("Translate support messages"), done_when: Some("both languages show"), account: None, setup: Some("EYZFlow"), plan: None };
         let p = plan_with(ticket, &ask, &w).unwrap();
         // Only the repo asked for, though the project has two; its account and its role come with the project.
         assert_eq!((p.sessions.len(), p.sessions[0].folder.as_str(), p.sessions[0].why.as_str()), (1, s(&room).as_str(), "the media backend"));
@@ -1045,6 +1072,19 @@ mod tests {
         assert!(first.contains("That is the goal of the space \"msg-translation\". It is done when: both languages show. You are its eyz-mediaroom-serverless session"), "{first}");
         let r = receipt(&p, &[], None, true);
         assert_eq!((r["goal"].as_str(), r["done_when"].as_str(), r["sessions"][0]["why"].as_str()), (Some("Translate support messages"), Some("both languages show"), Some("the media backend")));
+        assert!(r["plan"].is_null() && !first.contains("The space's plan"), "no plan: none said");
+        // Planned first (`--plan`): each session's instruction carries the plan's link and its part of it, after its brief.
+        let two = vec![s(&flow), s(&room)];
+        let mut p2 = plan_with(ticket, &Ask { repos: &two, name: Some("msg-translation"), setup: Some("EYZFlow"), ..Default::default() }, &w).unwrap();
+        let md = format!("# Plan\n\n## Sessions\n\n### eyzflow\n\nThe web app's part.\n{}\n### eyz-mediaroom-serverless\n\nThe media backend's part.\n", "More of the web app.\n".repeat(400));
+        p2.plan = Some(crate::plans::PlanBrief { id: "p3".into(), url: Some("https://claude.ai/artifact/plan".into()), md });
+        let room_first = instruction(&p2, &p2.sessions[1]);
+        let (brief, part) = room_first.split_once("\n\nThe space's plan (https://claude.ai/artifact/plan)").expect("the plan follows the brief");
+        assert!(brief.ends_with("say what you did and what is left."), "{brief}");
+        assert!(part.contains("The media backend's part.") && !part.contains("The web app's part."), "its own part only: {part}");
+        assert!(part.chars().count() <= crate::plans::BRIEF_CHARS + 300, "bounded");
+        assert!(instruction(&p2, &p2.sessions[0]).contains("The web app's part."));
+        assert_eq!(receipt(&p2, &[], None, true)["plan"], serde_json::json!({ "id": "p3", "url": "https://claude.ai/artifact/plan" }));
         // No title, no done-when: the ticket's own; an account given wins; no project: none.
         let ask = Ask { repos: &repos, account: Some("default"), ..Default::default() };
         let p = plan_with(ticket, &ask, &w).unwrap();

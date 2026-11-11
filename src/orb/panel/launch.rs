@@ -23,22 +23,39 @@
 //!   was: the first project, its plan, Launch.
 //! - **Launch**'s receipt names the space, whose view opens with what was
 //!   done said at its top (`launched_line`), and an error stays here.
+//! - **Plan it first** (`crate::plans`): under a draft, **Plan as a page**
+//!   and **Plan as a whiteboard** (`tower plan new --form … --draft '<the
+//!   draft>' --ticket-file <the ticket>`) have the tower's planner write the
+//!   full plan and publish it as an Artifact on the user's claude.ai
+//!   account. The state's `plan` (`model::plan`) is followed: "The tower's
+//!   brain is writing the plan…", then "Plan · page · Open" (`open <url>`),
+//!   a planner stuck on a dialog in its terminal with **Show in Herdr**, or
+//!   why it failed with Plan again. Under the card the chat about it: the
+//!   user's lines and the planner's answers, newest last, and "Ask about the
+//!   plan or change it…" with Send (`tower plan say --as user`). While a
+//!   plan is open the card is the plan's draft (the planner revises it),
+//!   the chat replaces "Adjust it in words…", Launch carries `--plan <id>`
+//!   (the sessions get the plan; the plan closes) and Start over closes it.
+//!   A plan of another ticket still open says so, with Back to it and Close.
 //! - `HERDER_TOWER_ORB_DRAFT` (looking at it with test data): a file's draft
 //!   JSON shows as the card for the goal the window opened on; `reading`
 //!   shows the launcher reading a ticket; `ready`, the button before it.
+//!   `HERDER_TOWER_ORB_PLAN=<file>`: the plan in the file (the state's
+//!   `plan`, as `Plan::view` writes it) is the open plan, of that ticket.
 
 use std::time::Duration;
 
-use gpui::{AnyElement, AsyncApp, Context, Entity, FontWeight, SharedString, Subscription, Task, Window, div, prelude::*, px, rgba};
+use gpui::{AnyElement, AsyncApp, Context, Entity, FontWeight, SharedString, Subscription, Task, Window, div, prelude::*, px, rgb, rgba};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 use serde_json::Value;
 
 use super::home::{LINE, SOFT, acts_row, bay_label, cstat, cstat_busy, mbtn, tg};
+use super::space::when_said;
 use super::window::whead;
-use super::{Panel, cli, glass};
+use super::{AMBER, CYAN, Panel, cli, glass};
 use crate::history;
-use crate::orb::model::Missions;
+use crate::orb::model::{self, Missions, PlanView};
 use crate::orb::nav::Scope;
 
 /// A saved project (a setup): the sessions a new space starts with.
@@ -236,12 +253,38 @@ pub(super) fn draft_from(v: &Value) -> Option<Drafted> {
     })
 }
 
-/// What Launch runs for a draft: exactly what its card says, for `ticket`.
-pub(super) fn confirm_args(ticket: &str, d: &Drafted) -> Vec<String> {
+/// What Launch runs for a draft: exactly what its card says, for `ticket`
+/// (and with the plan `plan` it was planned with: its sessions get it).
+pub(super) fn confirm_args(ticket: &str, d: &Drafted, plan: Option<&str>) -> Vec<String> {
     let mut args = vec!["launch".to_string(), ticket.to_string()];
     args.extend(crate::ticket::confirm_flags(&d.raw));
+    if let Some(id) = plan {
+        args.extend(["--plan".to_string(), id.to_string()]);
+    }
     args.push("--json".into());
     args
+}
+
+/// What Plan runs: the planner for this draft, in `form` (`page` or
+/// `whiteboard`), the ticket in `file`.
+pub(super) fn plan_args(form: &str, d: &Drafted, file: &str) -> Vec<String> {
+    ["plan", "new", "--form", form, "--draft", &d.raw.to_string(), "--ticket-file", file, "--json"].map(String::from).to_vec()
+}
+
+/// What Send runs: the user's words about the plan `id`, for its planner.
+pub(super) fn say_args(id: &str, words: &str) -> Vec<String> {
+    ["plan", "say", "--as", "user", id, "--", words].map(String::from).to_vec()
+}
+
+/// What the plan's line says while it is not ready: how it stands, in a
+/// sentence, and whether it is bad news.
+pub(super) fn plan_line(p: &PlanView) -> (String, bool) {
+    match (p.status.as_str(), p.blocked, p.planner.as_str()) {
+        ("failed", _, _) => (format!("The plan didn't come: {}.", p.why.trim_end_matches('.')), true),
+        (_, true, _) => ("The planner waits on a question in its terminal (publishing the plan may ask for your go-ahead). Answer it there.".into(), false),
+        ("writing", _, "starting") => ("The tower's brain is starting the planner…".into(), false),
+        _ => ("The tower's brain is writing the plan… (a minute or two)".into(), false),
+    }
 }
 
 /// What a draft is asked: the ticket, the project picked, and for a
@@ -329,6 +372,17 @@ pub(super) struct LaunchUi {
     draft: Option<(String, Drafted)>,
     /// The words of a redraft went: the field is emptied once it is drawn.
     clear_adjust: bool,
+    /// "Ask about the plan or change it…": the chat with the planner.
+    chat: Entity<TextareaState>,
+    /// What was said in the chat went: the field is emptied once it is drawn.
+    clear_chat: bool,
+    /// `HERDER_TOWER_ORB_PLAN`: the open plan, from a file instead of the state.
+    plan_hook: Option<PlanView>,
+    /// The chat as last drawn (its plan, its lines, whether an answer was
+    /// awaited): a change scrolls the pane to its end.
+    chat_seen: (String, usize, bool),
+    /// Scrolled to the end until then (what is below grows as it is laid out).
+    chat_scroll: Option<std::time::Instant>,
     /// Waits for the typing to pause before the tower is asked again.
     dry_wait: Option<Task<()>>,
     _subs: Vec<Subscription>,
@@ -339,7 +393,13 @@ impl LaunchUi {
         // A whole ticket fits: it grows to 14 lines, then scrolls.
         let goal = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 14).placeholder("Paste the ticket, or say what the space should get done"));
         let adjust = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 3).submit_on_enter(true).placeholder("Adjust it in words…"));
+        let chat = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 4).submit_on_enter(true).placeholder("Ask about the plan or change it…"));
         let subs = vec![
+            cx.subscribe_in(&chat, window, |this, _, ev: &InputEvent, _, cx| {
+                if let InputEvent::PressEnter { shift: false, .. } = ev {
+                    this.plan_say(cx);
+                }
+            }),
             cx.subscribe_in(&goal, window, |this, _, ev: &InputEvent, _, cx| {
                 if matches!(ev, InputEvent::Change) {
                     this.ask_plan(cx);
@@ -352,7 +412,24 @@ impl LaunchUi {
                 }
             }),
         ];
-        Self { goal, adjust, setups: None, picked: None, dry_known: None, draft_known: None, dry: None, draft: None, clear_adjust: false, dry_wait: None, _subs: subs }
+        Self {
+            goal,
+            adjust,
+            setups: None,
+            picked: None,
+            dry_known: None,
+            draft_known: None,
+            dry: None,
+            draft: None,
+            clear_adjust: false,
+            chat,
+            clear_chat: false,
+            plan_hook: None,
+            chat_seen: (String::new(), 0, false),
+            chat_scroll: None,
+            dry_wait: None,
+            _subs: subs,
+        }
     }
 
     /// The saved projects, once the tower was asked.
@@ -405,6 +482,41 @@ pub(super) fn field(state: &Entity<TextareaState>) -> AnyElement {
         .into_any_element()
 }
 
+/// The chat lines shown under a plan (the latest).
+const PLAN_ROWS: usize = 12;
+
+/// A line of the chat about a plan: who said it (the user, the planner),
+/// when, and its words, as "Between sessions" shows a message.
+fn plan_msg_row(m: &model::PlanMsg) -> AnyElement {
+    let g = glass();
+    h_flex()
+        .w_full()
+        .items_start()
+        .gap(px(10.0))
+        .p(px(12.0))
+        .rounded(px(14.0))
+        .bg(rgba(SOFT))
+        .border_1()
+        .border_color(rgba(0xffffff0d))
+        .child(div().w(px(3.0)).flex_none().self_stretch().rounded_full().bg(rgb(if m.mine() { AMBER } else { CYAN })))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(6.0))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_start()
+                        .gap(px(10.0))
+                        .child(div().flex_1().min_w_0().text_size(px(13.0)).line_height(px(18.0)).font_weight(FontWeight::SEMIBOLD).child(if m.mine() { "You" } else { "The planner" }))
+                        .child(div().flex_none().text_size(px(12.0)).line_height(px(18.0)).text_color(g.faint).child(when_said(m.at))),
+                )
+                .child(div().w_full().text_size(px(13.0)).line_height(px(19.0)).text_color(g.text).child(m.text.trim().to_string())),
+        )
+        .into_any_element()
+}
+
 /// `HERDER_TOWER_ORB_DRAFT`: `reading`, `ready`, or a file holding a draft's JSON.
 fn draft_from_start() -> Option<String> {
     std::env::var("HERDER_TOWER_ORB_DRAFT").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
@@ -447,6 +559,23 @@ impl Panel {
     /// `HERDER_TOWER_ORB_DRAFT` (see the top): the launcher as it is while
     /// a ticket is drafted, or with a draft, to look at it with test data.
     fn draft_hook(&mut self, cx: &mut Context<Self>) {
+        // `HERDER_TOWER_ORB_PLAN`: the open plan, of the ticket the window opened on.
+        if let Some(path) = std::env::var("HERDER_TOWER_ORB_PLAN").ok().filter(|p| !p.trim().is_empty())
+            && let Some(full) = self.full.as_mut()
+        {
+            let ticket = full.launch.goal.read(cx).value().trim().to_string();
+            let text = std::fs::read_to_string(path.trim()).unwrap_or_default();
+            match serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| model::plan(&serde_json::json!({ "plan": v }))) {
+                Some(mut p) => {
+                    // (A plan of another ticket keeps its own: the launcher says it is still open.)
+                    if p.ticket.trim().is_empty() {
+                        p.ticket = ticket;
+                    }
+                    full.launch.plan_hook = Some(p);
+                }
+                None => eprintln!("[orb] HERDER_TOWER_ORB_PLAN: no plan in {path}"),
+            }
+        }
         let Some(hook) = draft_from_start() else { return };
         let Some(full) = self.full.as_mut() else { return };
         let ticket = full.launch.goal.read(cx).value().trim().to_string();
@@ -515,9 +644,98 @@ impl Panel {
     fn launch_draft(&mut self, missions: &Missions, cx: &mut Context<Self>) {
         let Some(full) = self.full.as_ref() else { return };
         let ticket = full.launch.goal.read(cx).value().trim().to_string();
-        let Some(d) = full.launch.draft_of(&ticket) else { return };
-        let args = confirm_args(&ticket, d);
+        // Planned: the plan's own draft (the planner may have revised it), and the plan with it.
+        let any = self.plan_for(&ticket, cx);
+        let plan = any.clone().filter(|p| p.status != "failed");
+        let Some(full) = self.full.as_ref() else { return };
+        let d = match plan.as_ref().and_then(|p| draft_from(&p.draft)).or_else(|| full.launch.draft_of(&ticket).cloned()).or_else(|| any.as_ref().and_then(|p| draft_from(&p.draft))) {
+            Some(d) => d,
+            None => return,
+        };
+        let with = plan.as_ref().filter(|p| p.url.is_some()).map(|p| p.id.clone());
+        let args = confirm_args(&ticket, &d, with.as_deref());
+        // A plan that goes without it (not written yet, failed) is closed (`--plan` closes a written one itself).
+        if let Some(p) = any.filter(|p| with.as_deref() != Some(p.id.as_str())) {
+            self.plan_close(&p.id, cx);
+        }
         self.launch_args(&ticket, args, missions, cx);
+    }
+
+    /// The open plan (the state's, or `HERDER_TOWER_ORB_PLAN`'s), whatever ticket it is of.
+    pub(super) fn plan_now(&self, cx: &Context<Self>) -> Option<PlanView> {
+        if let Some(p) = self.full.as_ref().and_then(|f| f.launch.plan_hook.clone()) {
+            return Some(p);
+        }
+        model::plan(self.tower.read(cx).state.as_ref()?)
+    }
+
+    /// The open plan, if it is of `ticket` as it is now.
+    fn plan_for(&self, ticket: &str, cx: &Context<Self>) -> Option<PlanView> {
+        self.plan_now(cx).filter(|p| p.ticket.trim() == ticket.trim())
+    }
+
+    /// Plan as a page / as a whiteboard: the planner for the draft on the
+    /// card (another plan that is open ends).
+    fn plan_new(&mut self, form: &'static str, cx: &mut Context<Self>) {
+        let Some(full) = self.full.as_ref() else { return };
+        let ticket = full.launch.goal.read(cx).value().trim().to_string();
+        let local = full.launch.draft_of(&ticket).cloned();
+        let d = match self.plan_for(&ticket, cx).and_then(|p| draft_from(&p.draft)).or(local) {
+            Some(d) => d,
+            None => return,
+        };
+        // The ticket goes as a file: it can be a long one.
+        let file = std::env::temp_dir().join(format!("tower-plan-ticket-{}.md", history::now_ms()));
+        if let Err(e) = std::fs::write(&file, &ticket) {
+            if let Some(full) = self.full.as_mut() {
+                full.notes.insert("plan".into(), (false, format!("Couldn't hand the ticket over: {e}")));
+            }
+            cx.notify();
+            return;
+        }
+        let args = plan_args(form, &d, &file.to_string_lossy());
+        self.run("plan", args, cx, move |_, _, _| {
+            let _ = std::fs::remove_file(&file);
+        });
+    }
+
+    /// Send: the user's words about the plan, for its planner; its answer comes in the state.
+    fn plan_say(&mut self, cx: &mut Context<Self>) {
+        let Some(full) = self.full.as_ref() else { return };
+        let words = full.launch.chat.read(cx).value().trim().to_string();
+        let ticket = full.launch.goal.read(cx).value().trim().to_string();
+        let Some(p) = self.plan_for(&ticket, cx) else { return };
+        if words.is_empty() || self.running("plan-say") || p.address.is_none() {
+            return;
+        }
+        self.run("plan-say", say_args(&p.id, &words), cx, |this, result, _| {
+            if let (Ok(_), Some(full)) = (result, this.full.as_mut()) {
+                full.launch.clear_chat = true;
+            }
+        });
+    }
+
+    /// The plan ends, and its planner.
+    fn plan_close(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(full) = self.full.as_mut()
+            && full.launch.plan_hook.as_ref().is_some_and(|p| p.id == id)
+        {
+            full.launch.plan_hook = None;
+        }
+        self.run("plan-close", vec!["plan".into(), "close".into(), id.to_string()], cx, |_, _, _| {});
+    }
+
+    /// Back to the plan that is open: its ticket in the field, its draft on the card.
+    fn plan_back(&mut self, p: &PlanView, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(full) = self.full.as_mut() else { return };
+        let ticket = p.ticket.trim().to_string();
+        if let Some(d) = draft_from(&p.draft) {
+            full.launch.draft = Some((ticket.clone(), d));
+        }
+        full.launch.draft_known = Some(true);
+        let goal = full.launch.goal.clone();
+        goal.update(cx, |s, cx| s.set_value(ticket, window, cx));
+        cx.notify();
     }
 
     /// Runs `tower launch` with `args`; its receipt names the space, whose view opens with what it did.
@@ -585,8 +803,16 @@ impl Panel {
 
     /// Start over: the draft is dropped; the ticket stays to change or draft again.
     fn start_over(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A plan of it ends, and its planner.
+        if let Some(full) = self.full.as_ref() {
+            let ticket = full.launch.goal.read(cx).value().trim().to_string();
+            if let Some(p) = self.plan_for(&ticket, cx) {
+                self.plan_close(&p.id, cx);
+            }
+        }
         let Some(full) = self.full.as_mut() else { return };
         full.launch.draft = None;
+        full.notes.remove("plan");
         full.notes.remove("draft");
         full.launch.adjust.update(cx, |s, cx| s.set_value("", window, cx));
         let goal = full.launch.goal.clone();
@@ -648,6 +874,151 @@ impl Panel {
             .into_any_element()
     }
 
+    /// "See the plan first": Plan as a page, Plan as a whiteboard (`again`:
+    /// after one that failed or ended).
+    fn plan_offer(&self, again: bool, can: bool, cx: &mut Context<Self>) -> AnyElement {
+        let g = glass();
+        let starting = self.running("plan");
+        let can = can && !starting;
+        let pill = |id: &'static str, text: &str, form: &'static str| {
+            tg(id, text, false).when(!can, |el| el.opacity(0.5)).when(can, |el| el.on_click(cx.listener(move |this, _, _, cx| this.plan_new(form, cx))))
+        };
+        let (page, board) = if again { ("Plan again as a page", "Plan again as a whiteboard") } else { ("Plan as a page", "Plan as a whiteboard") };
+        v_flex()
+            .gap(px(6.0))
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(div().px(px(4.0)).text_size(px(13.0)).text_color(g.muted).child(if again { "Plan it again:" } else { "Or see the plan first:" }))
+                    .child(pill("plan-page", page, "page"))
+                    .child(pill("plan-board", board, "whiteboard"))
+                    .when(starting, |el| el.child(cstat_busy("Starting the planner…"))),
+            )
+            .when(!again, |el| {
+                el.child(
+                    div()
+                        .px(px(4.0))
+                        .text_size(px(12.0))
+                        .line_height(px(17.0))
+                        .text_color(g.faint)
+                        .child("The tower's brain writes the full plan (each session's part and its order, how the repos fit together, the risks, the open questions, the tests) and publishes it to your claude.ai account, private. Then you can talk it over here. Nothing opens until you launch."),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The plan of the draft on the card: how it stands (writing, waiting on
+    /// its terminal, failed, or "Plan · page · Open"), then the chat about it.
+    fn plan_section(&self, p: &PlanView, chat: &Entity<TextareaState>, can: bool, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let g = glass();
+        let mut items: Vec<AnyElement> = vec![bay_label("The plan").px(px(0.0)).into_any_element()];
+        let boxed = || v_flex().w_full().px(px(14.0)).py(px(12.0)).gap(px(8.0)).rounded(px(14.0)).bg(rgba(SOFT)).border_1().border_color(rgba(LINE));
+        let ready = p.status == "ready" && p.url.is_some();
+        if ready {
+            let url = p.url.clone().unwrap_or_default();
+            let open = div()
+                .id("plan-open")
+                .flex_none()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(CYAN))
+                .cursor_pointer()
+                .hover(|s| s.underline())
+                .child("Open")
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    let url = url.clone();
+                    cx.background_executor().spawn(async move { std::process::Command::new("open").arg(url).status() }).detach();
+                }));
+            let line = h_flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.0))
+                .text_size(px(14.0))
+                .child(div().font_weight(FontWeight::SEMIBOLD).text_color(g.text).child("Plan"))
+                .child(div().text_color(g.faint).child("·"))
+                .child(div().text_color(g.muted).child(p.form_word().to_string()))
+                .child(div().text_color(g.faint).child("·"))
+                .child(open);
+            let revised = match p.revision {
+                0 => None,
+                1 => Some("The planner changed the draft once: the card above is the draft as it is now.".to_string()),
+                n => Some(format!("The planner changed the draft {n} times: the card above is the draft as it is now.")),
+            };
+            items.push(
+                boxed()
+                    .child(line)
+                    .children(revised.map(|r| cstat(r, false)))
+                    .child(div().text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child("Launch hands each session the plan's link and its own part of it."))
+                    .when(p.blocked, |el| el.child(cstat("The planner waits on a question in its terminal. Answer it there.", false)))
+                    .children(p.address.clone().filter(|_| p.blocked).map(|a| {
+                        acts_row().child(mbtn("plan-show", "Show in Herdr", false, None).on_click(cx.listener(move |this, _, _, cx| this.show_in_herdr(&a, cx))))
+                    }))
+                    .when(!p.why.is_empty(), |el| el.child(cstat(p.why.clone(), false)))
+                    .into_any_element(),
+            );
+        } else {
+            let (line, bad) = plan_line(p);
+            let busy_now = !bad && !p.blocked;
+            // Its terminal holds a dialog: there, one tap away.
+            let show = p.address.clone().filter(|_| p.blocked).map(|a| {
+                acts_row().child(mbtn("plan-show", "Show in Herdr", false, None).on_click(cx.listener(move |this, _, _, cx| this.show_in_herdr(&a, cx))))
+            });
+            items.push(
+                boxed()
+                    .child(if busy_now { cstat_busy(line) } else { cstat(line, bad) })
+                    .when(busy_now, |el| {
+                        el.child(div().text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child(format!(
+                            "It reads the repos and the draft, writes the plan, and publishes it as a {} on your claude.ai account (private). Nothing opens.",
+                            p.form_word()
+                        )))
+                    })
+                    .children(show)
+                    .into_any_element(),
+            );
+        }
+        // Failed, or its planner ended: plan it again.
+        if p.status == "failed" || (ready && p.address.is_none()) {
+            items.push(self.plan_offer(true, can, cx));
+        }
+        // The chat: the user's lines and the planner's answers, newest last.
+        let talks = p.address.is_some() && p.status != "failed";
+        if p.thread.is_empty() && !talks {
+            return items;
+        }
+        let n = p.thread.len();
+        let label = match n {
+            0 => "About the plan".to_string(),
+            1 => "About the plan · 1 message".to_string(),
+            n => format!("About the plan · {n} messages"),
+        };
+        items.push(div().pt(px(4.0)).child(bay_label(&label).px(px(0.0))).into_any_element());
+        let from = n.saturating_sub(PLAN_ROWS);
+        if from > 0 {
+            items.push(div().px(px(4.0)).text_size(px(12.0)).text_color(g.faint).child(format!("{from} earlier, in `tower plan show`")).into_any_element());
+        }
+        items.extend(p.thread[from..].iter().map(plan_msg_row));
+        if p.answering {
+            items.push(div().px(px(4.0)).child(cstat_busy(if p.planner == "working" { "The planner is answering…" } else { "With the planner: it answers once its turn is over…" })).into_any_element());
+        }
+        if talks {
+            let typed = !chat.read(cx).value().trim().is_empty();
+            let sending = self.running("plan-say");
+            let ok = typed && !sending;
+            items.push(
+                h_flex()
+                    .w_full()
+                    .gap(px(8.0))
+                    .items_center()
+                    .child(div().flex_1().min_w_0().child(field(chat)))
+                    .child(mbtn("plan-send", if sending { "Sending…" } else { "Send" }, false, None).when(!ok, |el| el.opacity(0.5)).when(ok, |el| el.on_click(cx.listener(|this, _, _, cx| this.plan_say(cx)))))
+                    .into_any_element(),
+            );
+            items.extend(self.said("plan-say"));
+        }
+        items
+    }
+
     /// The launcher's head and body.
     pub(super) fn launch_view(&mut self, missions: &Missions, window: &mut Window, cx: &mut Context<Self>) -> (AnyElement, Vec<AnyElement>) {
         let g = glass();
@@ -658,13 +1029,32 @@ impl Panel {
         {
             full.launch.adjust.update(cx, |s, cx| s.set_value("", window, cx));
         }
+        // What was said to the planner went: the field is emptied.
+        if let Some(full) = self.full.as_mut()
+            && std::mem::take(&mut full.launch.clear_chat)
+        {
+            full.launch.chat.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        let plan_open = self.plan_now(cx);
         let Some(full) = self.full.as_ref() else { return (head, vec![]) };
         let ui = &full.launch;
         let goal = ui.goal.read(cx).value().trim().to_string();
         let taken: Vec<&str> = missions.open.iter().map(|m| m.name.as_str()).chain(missions.quiet.iter().map(String::as_str)).collect();
         let setup = ui.setup().cloned();
         let drafts = ui.drafts() && !ui.names_repos(&goal);
-        let draft = ui.draft_of(&goal).cloned().filter(|_| drafts);
+        // The plan of this ticket, if one is open; one of another ticket is said so below.
+        let planned = plan_open.clone().filter(|p| p.ticket.trim() == goal);
+        let stale = plan_open.filter(|p| p.ticket.trim() != goal);
+        // While its planner can talk, the chat is how the draft changes; the card is the plan's draft.
+        let chatting = planned.as_ref().is_some_and(|p| p.status != "failed");
+        let draft = planned
+            .as_ref()
+            .filter(|_| chatting)
+            .and_then(|p| draft_from(&p.draft))
+            .or_else(|| ui.draft_of(&goal).cloned())
+            .or_else(|| planned.as_ref().and_then(|p| draft_from(&p.draft)))
+            .filter(|_| drafts);
+        let (chat, goal_field) = (ui.chat.clone(), ui.goal.clone());
         let adjust = ui.adjust.clone();
         // The tower's own word on what it will do, if it gave it for this goal and setup.
         let key = (goal.clone(), ui.dry_setup());
@@ -763,6 +1153,16 @@ impl Panel {
         let can = !goal.is_empty() && !busy && !drafting;
         let mut actions: Vec<AnyElement> = vec![];
         match (&draft, drafts) {
+            (Some(_), _) if chatting => {
+                // Planned: Launch hands the sessions the plan; Start over ends it.
+                let m = missions.clone();
+                actions.push(
+                    acts_row()
+                        .child(mbtn("launch", if busy { "Launching…" } else { "Launch" }, true, None).when(!can, |el| el.opacity(0.5)).when(can, |el| el.on_click(cx.listener(move |this, _, _, cx| this.launch_draft(&m, cx)))))
+                        .child(mbtn("start-over", "Start over", false, None).when(busy, |el| el.opacity(0.5)).when(!busy, |el| el.on_click(cx.listener(|this, _, window, cx| this.start_over(window, cx)))))
+                        .into_any_element(),
+                );
+            }
             (Some(_), _) => {
                 // Change it in words, or launch it as it is.
                 let typed = !adjust.read(cx).value().trim().is_empty();
@@ -786,6 +1186,10 @@ impl Panel {
                         .child(mbtn("start-over", "Start over", false, None).when(busy, |el| el.opacity(0.5)).when(!busy, |el| el.on_click(cx.listener(|this, _, window, cx| this.start_over(window, cx)))))
                         .into_any_element(),
                 );
+                // Or see the plan first (a failed one's line, with Plan again, is in the plan's own section).
+                if planned.is_none() {
+                    actions.push(self.plan_offer(false, can, cx));
+                }
             }
             (None, true) => actions.push(
                 acts_row()
@@ -801,14 +1205,63 @@ impl Panel {
                 );
             }
         }
+        // A new line in the chat (or one now awaited): the pane goes to its end, where it is.
+        if let Some(p) = planned.as_ref().filter(|p| !p.thread.is_empty() || p.answering) {
+            let now = (p.id.clone(), p.thread.len(), p.answering);
+            if let Some(full) = self.full.as_mut()
+                && full.launch.chat_seen != now
+            {
+                full.launch.chat_seen = now;
+                full.launch.chat_scroll = Some(std::time::Instant::now() + Duration::from_millis(700));
+            }
+        }
+        if let Some(full) = self.full.as_mut() {
+            match full.launch.chat_scroll {
+                Some(until) if std::time::Instant::now() < until => {
+                    full.launch_scroll.scroll_to_bottom();
+                    window.request_animation_frame();
+                }
+                Some(_) => full.launch.chat_scroll = None,
+                None => {}
+            }
+        }
+        // The plan of this draft and the chat about it, under the card.
+        let plan_items: Vec<AnyElement> = match (&planned, &draft) {
+            (Some(p), Some(_)) => self.plan_section(p, &chat, can, cx),
+            _ => vec![],
+        };
+        // A plan of another ticket is still open: back to it, or close it.
+        let stale_line = stale.map(|p| {
+            let space = p.draft["space"].as_str().unwrap_or("its space").to_string();
+            let (back, close) = (p.clone(), p.id.clone());
+            h_flex()
+                .w_full()
+                .flex_wrap()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(12.0))
+                .py(px(8.0))
+                .rounded(px(12.0))
+                .bg(rgba(SOFT))
+                .text_size(px(13.0))
+                .text_color(g.muted)
+                .child(div().min_w_0().child(format!("A plan of “{space}” is still open ({}, {}).", p.form_word(), p.status)))
+                .child(tg("plan-back", "Back to it", false).on_click(cx.listener(move |this, _, window, cx| this.plan_back(&back, window, cx))))
+                .child(tg("plan-close-stale", "Close it", false).on_click(cx.listener(move |this, _, _, cx| this.plan_close(&close, cx))))
+                .into_any_element()
+        });
         let body = v_flex()
             .w_full()
             .max_w(px(760.0))
             .gap(px(16.0))
-            .child(v_flex().gap(px(7.0)).child(label("Goal")).child(field(&ui.goal)).child(div().px(px(4.0)).text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child(hint)))
+            .children(stale_line)
+            .child(v_flex().gap(px(7.0)).child(label("Goal")).child(field(&goal_field)).child(div().px(px(4.0)).text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child(hint)))
             .child(v_flex().gap(px(7.0)).child(label("Project")).child(projects).children(self.said("setups")))
             .child(v_flex().gap(px(7.0)).child(label(section)).child(middle).children(self.said("draft")))
+            .when(!plan_items.is_empty(), |el| el.child(v_flex().gap(px(10.0)).children(plan_items)))
             .child(v_flex().gap(px(10.0)).children(actions))
+            .children(self.said("plan"))
+            .children(self.said("plan-close"))
             .children(self.said("launch"))
             .into_any_element();
         (head, vec![body])
@@ -952,7 +1405,7 @@ mod tests {
         // Launch runs exactly the card.
         let ticket = "EYZFlow Support – Translate messages\n\nCustomers write in many languages.";
         assert_eq!(
-            confirm_args(ticket, &d),
+            confirm_args(ticket, &d, None),
             [
                 "launch", ticket, "--repo", "/w/eyz/eyz-customer-support", "--repo", "/w/eyz/eyzflow-admin-dashboard", "--name", "support-translation", "--title", "EYZFlow Support – Translate messages",
                 "--done-when", "Messages show translated; replies go out translated", "--account", "default", "--setup", "EYZFlow", "--json",
@@ -970,6 +1423,35 @@ mod tests {
         let picked = Setup { name: "EYZFlow".into(), ..Default::default() };
         assert!(draft_plan(Some(&picked))[0].contains("the repos of EYZFlow"));
         assert!(draft_plan(None)[0].contains("from your projects") && draft_plan(None).last().unwrap().contains("Nothing opens"));
+    }
+
+    #[test]
+    fn a_draft_is_planned_talked_over_and_launched_with_its_plan() {
+        let draft = serde_json::json!({ "space": "msg-translation", "goal": "Translate", "done_when": "", "sessions": [{ "repo": "/w/eyz/eyz-customer-support", "why": "the inbox" }], "assumed": { "account": "default" } });
+        let d = draft_from(&draft).unwrap();
+        // Plan as a page / as a whiteboard: the card's draft, the ticket in its file.
+        let args = plan_args("whiteboard", &d, "/tmp/t.md");
+        assert_eq!(&args[..4], ["plan", "new", "--form", "whiteboard"]);
+        assert_eq!((args[4].as_str(), args[6].as_str(), args[7].as_str(), args[8].as_str()), ("--draft", "--ticket-file", "/tmp/t.md", "--json"));
+        assert_eq!(serde_json::from_str::<Value>(&args[5]).unwrap(), draft);
+        // Send: the user's words, whatever they start with.
+        assert_eq!(say_args("p3", "--json is a word"), ["plan", "say", "--as", "user", "p3", "--", "--json is a word"]);
+        let parsed = crate::plans::parse_args(&say_args("p3", "--json is a word")[1..]).unwrap();
+        assert_eq!((parsed.id.as_deref(), parsed.words.as_str(), parsed.who), (Some("p3"), "--json is a word", Some(crate::plans::Who::User)));
+        // Launch with a published plan: the sessions get it.
+        let launch = confirm_args("T", &d, Some("p3"));
+        assert_eq!(&launch[launch.len() - 3..], ["--plan", "p3", "--json"]);
+        assert!(!confirm_args("T", &d, None).contains(&"--plan".to_string()));
+        // How a plan that isn't ready stands, in a line.
+        let mut p = PlanView { id: "p3".into(), status: "writing".into(), planner: "starting".into(), ..Default::default() };
+        assert_eq!(plan_line(&p), ("The tower's brain is starting the planner…".to_string(), false));
+        p.planner = "working".into();
+        assert_eq!(plan_line(&p).0, "The tower's brain is writing the plan… (a minute or two)");
+        p.blocked = true;
+        assert!(plan_line(&p).0.starts_with("The planner waits on a question in its terminal"));
+        p.status = "failed".into();
+        p.why = "no Artifact tool.".into();
+        assert_eq!(plan_line(&p), ("The plan didn't come: no Artifact tool.".to_string(), true));
     }
 
     #[test]
