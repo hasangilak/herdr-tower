@@ -399,7 +399,9 @@ impl Panel {
         saved.extend(self.said("setups"));
         let setups = card("Projects", saved);
 
-        let grid = |cards: Vec<AnyElement>| div().w_full().grid().grid_cols(2).gap(px(12.0)).children(cards).into_any_element();
+        // Two by two when the pane has room, else one under another.
+        let cols = if self.full.as_ref().map(|f| f.pane_w).unwrap_or(900.0) >= super::window::TWO_COLS_W { 2 } else { 1 };
+        let grid = |cards: Vec<AnyElement>| div().w_full().grid().grid_cols(cols).gap(px(12.0)).children(cards).into_any_element();
         (head, vec![v_flex().w_full().gap(px(12.0)).child(grid(vec![tell, brain, voice, questions, follow, behaviors])).child(phone).child(grid(vec![accounts, setups])).into_any_element()])
     }
 }

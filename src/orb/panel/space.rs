@@ -479,9 +479,10 @@ impl Panel {
         let sp = space.to_string();
         let head = h_flex()
             .w_full()
+            .flex_wrap()
             .items_center()
             .gap(px(10.0))
-            .child(bay_label(&label).flex_1())
+            .child(bay_label(&label).flex_1().min_w(px(200.0)))
             .when(from > 0, |el| {
                 el.child(link("thread-earlier".into(), format!("{from} earlier")).on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(f) = this.full.as_mut() {

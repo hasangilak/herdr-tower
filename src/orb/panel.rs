@@ -51,7 +51,7 @@ pub const H: f32 = 640.0;
 pub const FULL_W: f32 = 960.0;
 pub const FULL_H: f32 = 640.0;
 /// The full window's least size: its sidebar and queue column side by side, and room for the missions.
-pub const FULL_MIN_W: f32 = 820.0;
+pub const FULL_MIN_W: f32 = 960.0;
 pub const FULL_MIN_H: f32 = 520.0;
 /// Their corners (the window is rounded to match, by `mac::Win::glass`).
 pub const RADIUS: f32 = 28.0;

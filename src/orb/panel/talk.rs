@@ -216,6 +216,18 @@ mod tests {
     }
 
     #[test]
+    fn the_conversation_column_leaves_the_pane_room_at_every_width() {
+        use super::super::window::talk_width;
+        let side = 236.0;
+        for w in [960.0_f32, 1000.0, 1150.0, 1400.0, 1728.0, 2400.0] {
+            let t = talk_width(w);
+            assert!((280.0..=460.0).contains(&t), "{w}: {t}");
+            assert!(w - side - t - 36.0 >= 384.0, "{w}: the pane keeps room ({})", w - side - t);
+        }
+        assert!(talk_width(1728.0) > talk_width(1150.0), "it grows with the window");
+    }
+
+    #[test]
     fn a_views_conversation_is_its_requests_and_their_answers_whole() {
         let long = "word ".repeat(300);
         let entries = vec![
