@@ -280,8 +280,8 @@ folded into one line, and **Record**, **Shots**, **Projects** and
 - **A session** (a click on its row): what it was asked, what it last
   said, its screen as it is now (read again every couple of seconds), the
   card that waits on it, and **Show in Herdr**.
-- **New space**: a goal, or a whole ticket pasted as it is, and a
-  **Project** (none picked: the tower's brain picks). A goal whose first
+- **New space**: a goal, or a whole ticket pasted as it is, said in its
+  conversation, and a **Project** (none picked: the tower's brain picks). A goal whose first
   line names the repos ("open sessions in eyzflow and mediaroom: …") shows
   what the tower will do (the name it gives the space, the sessions it
   opens and on which account, their worktrees), and **Launch** is the

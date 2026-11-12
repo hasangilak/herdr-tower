@@ -1162,10 +1162,10 @@ user to confirm or change. Nothing is opened, nothing written.
 The full window's New space (`src/orb/panel/launch.rs`): beside the
 sidebar, **the conversation** that makes the space, in the column a
 space's conversation has (same width, same input with its voice and files
-at its foot); beside that the pane: a goal (a field that grows to 14
-lines, so a whole ticket fits), **Project** (the projects as pills; none
-picked: the brain picks; a second click unpicks), and what the tower will
-do.
+at its foot); beside that the pane: **Project** (the projects as pills;
+none picked: the brain picks; a second click unpicks) and what the tower
+will do. The goal, or the whole ticket, is said in the conversation only:
+the pane has no field of its own for it.
 
 - **The conversation** ("Conversation · the new space"; once drafted,
   "Conversation · <space>, not launched yet"): You (amber) and The tower
@@ -1175,10 +1175,10 @@ do.
   "The planner is answering…", "Launching…"). What is typed or said at its
   foot goes, as its placeholder says:
   - no draft yet ("Paste the ticket, or say what to get done…"): it is the
-    ticket (or, with a ticket in the field, more of it, a paragraph on),
-    put in the Goal field and drafted; a first line that names the repos
-    is asked as a dry run first, and the tower says what Launch will open
-    instead of drafting;
+    ticket (or, with one said already, more of it, a paragraph on), and it
+    is drafted; a first line that names the repos is asked as a dry run
+    first, and the tower says what Launch will open instead of drafting
+    (a note under what the tower will do says so);
   - a draft ("Say what to change…"): it is redrafted with those words
     (`--adjust "<words>" --prior '<the latest draft>'`); the tower answers
     with the new draft and what changed ("Changed: named ns-check (was
@@ -1197,8 +1197,9 @@ do.
   chat) and adds what the launch opened as the tower's last word. The
   space's own conversation then opens with **How this space was created ·
   N messages** (Fold / Show), then "Since it was launched" and the rest.
-  Start over drops the conversation with the draft; one that launched is
-  the space's, and New space starts empty.
+  Start over drops the conversation with the draft and the ticket (the
+  conversation was the only place it showed), and the input waits for the
+  next; one that launched is the space's, and New space starts empty.
 
 - **The first line names repos** (the dry run's `repos_from` is
   `first-line`, asked without `--setup` once the typing pauses): the plan
@@ -1213,9 +1214,9 @@ do.
   and what was left out. Under it, that what to change is said in the
   conversation (the redraft takes the card's place), then **Launch**
   (exactly that draft, `ticket::confirm_flags`) and **Start over** (the
-  draft and its conversation are dropped; the ticket stays). A draft
-  belongs to the ticket as it was: changed, the button is Draft the space
-  again (words in the conversation still redraft from the latest draft).
+  draft, its conversation and the ticket are dropped). A draft belongs to
+  the ticket as it was: changed, the button is Draft the space again
+  (words in the conversation still redraft from the latest draft).
 - A tower whose `launch --help` has no `--draft` gets the launcher as it
   was: the first project, its plan, Launch.
 - **Review its PRs**: a switch under the draft card, and under the plan of
@@ -1231,9 +1232,10 @@ do.
   chat about it" below). While a plan of this ticket is open, the card is
   the plan's draft (the planner may revise it), the conversation goes to
   the planner, Launch carries `--plan <id>`, and Start over closes the
-  plan too. A plan of another ticket that is still open (the field was
-  changed, the window reopened) says so at the top, with **Back to it**
-  (its ticket in the field, its draft on the card) and **Close it**.
+  plan too. A plan of another ticket that is still open (the ticket was
+  added to, the window reopened) says so at the top, with **Back to it**
+  (its ticket is the launcher's again, said first in the conversation with
+  the plan's thread after it, its draft on the card) and **Close it**.
 - `HERDER_TOWER_ORB_DRAFT=<file>` (with `HERDER_TOWER_ORB_WINDOW=show:new=<ticket>`)
   shows the draft JSON in the file as the card; `reading` shows the
   launcher reading; `ready` its button before. `HERDER_TOWER_ORB_PLAN=<file>`
