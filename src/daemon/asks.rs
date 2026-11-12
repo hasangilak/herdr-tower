@@ -337,7 +337,16 @@ pub struct Asks {
     record: Record,
     waits: Waits,
     covers: Covers,
+    /// Answers a set the tower decided to answer itself (`auto_answer`,
+    /// in a thread of its own); tests keep which ones it would have.
+    answers: Auto,
 }
+
+/// How the tower goes on to answer a set it decided to answer itself.
+type Auto = Arc<dyn Fn(&Asks, &str) + Send + Sync>;
+
+/// Why the tower said yes itself to a prompt that only writes Claude's memory.
+pub const MEMORY_YES: &str = "it only writes Claude's own memory or notes (a plain yes, this once)";
 
 impl Asks {
     pub fn new(shared: Shared, hub: Arc<Hub>, policy: &str) -> Asks {
@@ -364,6 +373,10 @@ impl Asks {
             }),
             waits: Waits::default(),
             covers: Arc::new(crate::covered::answers_held),
+            answers: Arc::new(|a: &Asks, id: &str| {
+                let (me, id) = (a.clone(), id.to_string());
+                std::thread::spawn(move || me.auto_answer(&id));
+            }),
         };
         me.set_policy(policy);
         me
@@ -1094,6 +1107,10 @@ impl Asks {
             eprintln!("[questions] {} closed: {:?}", c.id, c.state.phase);
             self.event("closed", None, &c.id);
         }
+        // Claude's own memory or notes: the tower's plain yes, nobody asked.
+        if note && self.memory_rule(&set) {
+            return self.get(&set.id).unwrap_or(set);
+        }
         if note {
             eprintln!("[questions] {} ({}) asks: {} ({} tab(s), id {})", set.session, set.kind, set.title, set.tabs.len(), set.id);
             // The brain recommends answers and decides, quietly.
@@ -1472,13 +1489,38 @@ impl Asks {
             // Answered meanwhile (by the user): nothing to answer or announce.
             eprintln!("[questions] {id}: decided {:?}, but it is {} already", set.state.decision, set.status);
         } else if set.state.decision == Decision::Auto {
-            let me = self.clone();
-            let id = id.to_string();
-            std::thread::spawn(move || me.auto_answer(&id));
+            (self.answers)(self, id);
         } else {
             self.tell_escalated(&set);
         }
         Ok(set)
+    }
+
+    /// A prompt that only writes Claude's own memory or notes
+    /// (`questions::memory_yes`): the tower answers its plain one-time yes
+    /// at once, without the brain and without the user (unless they asked
+    /// to decide everything). Whether it did.
+    fn memory_rule(&self, set: &QuestionSet) -> bool {
+        let Some(yes) = questions::memory_yes(set) else { return false };
+        let decided = {
+            let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if i.policy == "ask-everything" {
+                return false;
+            }
+            let Some(s) = i.sets.iter_mut().find(|s| s.id == set.id) else { return false };
+            let label = s.tabs.first().and_then(|t| t.options.get(yes)).map(|o| o.label.clone()).unwrap_or_default();
+            s.recommendations = Some(vec![questions::TabRecs { tab: 0, options: vec![questions::Rec { label, why: MEMORY_YES.into(), choice: json!(yes) }] }]);
+            if card::apply(s, &Ev::Decide { auto: true }).is_err() {
+                return false;
+            }
+            s.reason = MEMORY_YES.into();
+            s.clone()
+        };
+        eprintln!("[questions] {} ({}): {}; answering {:?}", decided.session, decided.id, MEMORY_YES, decided.tabs[0].options[yes].label);
+        self.publish();
+        self.event("update", Some(&decided), &decided.id);
+        (self.answers)(self, &decided.id);
+        true
     }
 
     /// The tower answers it itself: recommendation 1 for every question, once,
@@ -2722,6 +2764,72 @@ mod tests {
         a.restore_from(Saved::load(&path), &mut |_| Terminal::Live { created_ms: None, status: SessionStatus::Blocked }, &|_| false, 1);
         let s = a.get("q1").unwrap();
         assert_eq!((s.status.as_str(), s.decision.as_deref()), ("open", None));
+    }
+
+    /// A prompt that only writes Claude's own memory (the memory note that
+    /// waited 34 minutes for the user) is answered by the tower at once with
+    /// its plain yes: no brain, no card. With "ask everything" it is the
+    /// user's, as every other.
+    #[test]
+    fn a_prompt_that_only_writes_claudes_memory_is_answered_by_the_tower_at_once() {
+        let home = crate::config::home().to_string_lossy().into_owned();
+        let screen = questions::parse_screen(&fixture("claude-permission-memory-note.txt").replace("{home}", &home)).unwrap();
+        let set = questions::build("t7p", "m5pro herder tower", false, &screen, None, "", "Don't merge or push.");
+        let answering = |a: &mut Asks| {
+            let went = Arc::new(Mutex::new(vec![]));
+            let w = went.clone();
+            a.answers = Arc::new(move |_: &Asks, id: &str| w.lock().unwrap_or_else(|e| e.into_inner()).push(id.to_string()));
+            went
+        };
+        let (mut a, brain) = asks();
+        let went = answering(&mut a);
+        let s = a.upsert(set.clone());
+        assert_eq!((s.state.decision, s.reason.as_str()), (Decision::Auto, MEMORY_YES));
+        let rec = &s.recommendations.as_ref().unwrap()[0].options[0];
+        assert_eq!((rec.label.as_str(), &rec.choice), ("Yes", &json!(0)));
+        assert_eq!(*went.lock().unwrap(), [set.id.clone()], "the tower answers it");
+        assert!(told(&brain, 1).is_empty(), "the brain isn't asked");
+        // On the screen, just before its keys go in: its Yes, never its No.
+        let pick = |i: usize| vec![Answer { tab: 0, choice: json!(i), attachments: vec![] }];
+        assert_eq!(a.recheck(&set, &pick(0)).unwrap(), pick(0));
+        assert!(a.recheck(&set, &pick(1)).is_err());
+        // Asked to decide everything: the user's, through the brain as before.
+        let (mut b, brain) = asks();
+        let went = answering(&mut b);
+        b.set_policy("ask-everything");
+        let s = b.upsert(set.clone());
+        assert_eq!(s.state.decision, Decision::Deciding);
+        assert!(went.lock().unwrap().is_empty());
+        assert_eq!(told(&brain, 1).len(), 1);
+        // Another sensitive file: the brain decides it, as before.
+        let other = questions::build("t7p", "m5pro herder tower", false, &questions::parse_screen(&fixture("claude-permission-memory-note.txt").replace("{home}", &home).replace("/memory/quiet-tower-implementation.md which is", "/settings.json which is")).unwrap(), None, "", "");
+        let (mut c, brain) = asks();
+        let went = answering(&mut c);
+        assert_eq!(c.upsert(other).state.decision, Decision::Deciding);
+        assert!(went.lock().unwrap().is_empty());
+        assert_eq!(told(&brain, 1).len(), 1);
+    }
+
+    /// `cargo test replay_a_captured_prompt_through_the_tower -- --ignored
+    /// --nocapture` with `HERDER_TOWER_REPLAY=<a screen>` (and
+    /// `HERDER_TOWER_REPLAY_CONTEXT=<what the session was asked>`): the
+    /// screen as the radar would hand it to the tower, said: how it is
+    /// decided, and whether the brain or the user would get it. Nothing is typed.
+    #[test]
+    #[ignore]
+    fn replay_a_captured_prompt_through_the_tower() {
+        let screen = std::fs::read_to_string(std::env::var("HERDER_TOWER_REPLAY").expect("HERDER_TOWER_REPLAY=<screen file>")).unwrap();
+        let context = std::env::var("HERDER_TOWER_REPLAY_CONTEXT").ok().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+        let set = questions::build("t7p", "replay", false, &questions::parse_screen(&screen).expect("no dialog on that screen"), None, "", &context);
+        let (mut a, brain) = asks();
+        let went = Arc::new(Mutex::new(vec![]));
+        let w = went.clone();
+        a.answers = Arc::new(move |_: &Asks, id: &str| w.lock().unwrap_or_else(|e| e.into_inner()).push(id.to_string()));
+        let s = a.upsert(set.clone());
+        let pick = s.recommendations.as_ref().and_then(|r| r.first()).and_then(|r| r.options.first()).map(|o| o.label.clone());
+        eprintln!("decision: {:?}, because {:?}; it answers {pick:?}", s.state.decision, s.reason);
+        eprintln!("answered by the tower: {}; the brain asked: {}", !went.lock().unwrap().is_empty(), !told(&brain, 1).is_empty());
+        eprintln!("checked again on the screen, its Yes: {:?}", a.recheck(&set, &[Answer { tab: 0, choice: json!(0), attachments: vec![] }]).map(|_| "goes in"));
     }
 
     #[test]

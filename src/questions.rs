@@ -1728,8 +1728,16 @@ pub fn compose_reply(set: &QuestionSet, answers: &[Answer]) -> Result<String> {
 /// the checks, touches infrastructure, secrets or money. None: the brain may
 /// answer it itself if it's routine. Words are matched whole ("prod" isn't
 /// "prompt", "push" isn't "pushd"); a permission prompt's command is in its
-/// title and detail, so the command itself is checked.
+/// title and detail, so the command itself is checked. A shell command
+/// (`shell_command`) pushes or merges only by a real `git push`, `git
+/// merge`, `gh pr merge` in it (`pushes_or_merges`): not by the words of
+/// what it writes (a heredoc into `cat` or `tee`, `echo` and `printf`),
+/// nor by what the session was asked. A prompt that only writes Claude's
+/// own memory or notes (`memory_yes`) is none of these.
 pub fn must_escalate(set: &QuestionSet) -> Option<&'static str> {
+    if memory_yes(set).is_some() {
+        return None;
+    }
     let mut text = format!("{}\n{}\n{}", set.title, set.detail, set.context);
     for t in &set.tabs {
         text.push('\n');
@@ -1741,8 +1749,15 @@ pub fn must_escalate(set: &QuestionSet) -> Option<&'static str> {
             text.push_str(&o.description);
         }
     }
+    let command = shell_command(set).map(|c| without_data(&c));
+    reason_of(&text, command.as_deref())
+}
+
+/// The 90/10 rule over `text`; `command`: the shell command it asks to run
+/// (its data left out), whose pushes and merges are its git and gh commands.
+fn reason_of(text: &str, command: Option<&str>) -> Option<&'static str> {
     let raw = text.to_lowercase();
-    let flat = norm(&text);
+    let flat = norm(text);
     let ws: Vec<&str> = flat.split(' ').collect();
     let words = format!(" {flat} ");
     // A word, or words in a row ("go live").
@@ -1802,9 +1817,10 @@ pub fn must_escalate(set: &QuestionSet) -> Option<&'static str> {
             "origin",
             "remote",
         ]);
-    if pushes
-        || merges
-        || raw_any(&[
+    let by_words = || {
+        pushes
+            || merges
+            || raw_any(&[
             "git push",
             "push to",
             "push the",
@@ -1817,8 +1833,9 @@ pub fn must_escalate(set: &QuestionSet) -> Option<&'static str> {
             "into master",
             "merge into prod",
             "into prod",
-        ])
-    {
+            ])
+    };
+    if command.map_or_else(by_words, pushes_or_merges) {
         return Some("it pushes or merges to a shared branch");
     }
     // "remove" alone is often routine (an import); with files or data it isn't.
@@ -1929,6 +1946,293 @@ pub fn must_escalate(set: &QuestionSet) -> Option<&'static str> {
         return Some("it spends money");
     }
     None
+}
+
+// ---- what a shell command does, not what it writes ----
+
+/// Where Claude Code says why a prompt is sensitive: the reason, not the command.
+const SENSITIVE: &str = "Claude requested permissions to ";
+
+/// The shell command a prompt asks to run (Claude Code's "Bash command"
+/// prompt, a Codex menu), a line each as the prompt shows it: the title's
+/// (`Allow Bash: <cmd>?`, `Run <cmd>?`) and the detail's, out of the `│`
+/// gutter, up to Claude Code's reason. None for any other prompt.
+pub fn shell_command(set: &QuestionSet) -> Option<String> {
+    let bash = set.kind == "claude-permission" && (set.title.starts_with("Allow Bash") || set.detail.lines().next().is_some_and(|l| l.trim() == "Bash command"));
+    if !bash && set.kind != "codex-menu" {
+        return None;
+    }
+    let title = set.title.strip_prefix("Allow Bash:").or_else(|| set.title.strip_prefix("Run ")).map(|c| c.trim().trim_end_matches('?').to_string());
+    let mut lines: Vec<String> = title.into_iter().collect();
+    for l in set.detail.lines().map(ungutter) {
+        if l.starts_with(SENSITIVE) {
+            break;
+        }
+        if l != "Bash command" {
+            lines.push(l.strip_prefix("$ ").unwrap_or(l).to_string());
+        }
+    }
+    Some(lines.join("\n"))
+}
+
+/// Whether a heredoc's `<<` (at byte `at` of `line`) feeds what is only
+/// written: `cat` or `tee` (file content), or a git message read from it
+/// (`git commit -F -`, `git tag -F -`, `git notes add -F -`). The command is
+/// its first word past assignments (`M=…`) and `sudo`, `env`, `command`, `exec`.
+fn feeds_data(line: &str, at: usize) -> bool {
+    let head = &line[..at];
+    let seg = head.rsplit([';', '|', '&', '(', '{']).next().unwrap_or(head);
+    let words: Vec<&str> = seg
+        .split_whitespace()
+        .skip_while(|w| (w.contains('=') && !w.starts_with(['"', '\'', '-'])) || matches!(*w, "sudo" | "env" | "command" | "exec" | "nohup" | "time" | "then" | "do" | "else"))
+        .collect();
+    let first = words.first().map(|w| w.trim_matches(['"', '\'']).rsplit('/').next().unwrap_or("")).unwrap_or("");
+    match first {
+        "cat" | "tee" => true,
+        "git" => {
+            words.iter().any(|w| matches!(*w, "commit" | "tag" | "notes"))
+                && (words.windows(2).any(|p| matches!(p, ["-F" | "--file", "-"])) || words.iter().any(|w| matches!(*w, "-F-" | "--file=-")))
+        }
+        _ => false,
+    }
+}
+
+/// `command` without what it only writes: the body of each heredoc fed to
+/// `cat` or `tee` (file content) or read as a git message (`feeds_data`),
+/// and the words of each `echo` and `printf`.
+/// A heredoc fed to anything else (`python3 -`, `bash`, a script) is code,
+/// and stays; one whose end isn't shown stays too.
+pub fn without_data(command: &str) -> String {
+    let lines: Vec<&str> = command.lines().collect();
+    let mut kept: Vec<&str> = vec![];
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        kept.push(line);
+        i += 1;
+        // Each heredoc this line opens, in order: (its end word, whether it is data).
+        let mut opens: Vec<(String, bool)> = vec![];
+        let mut from = 0;
+        while let Some(k) = line[from..].find("<<").map(|k| from + k) {
+            let rest = line[k + 2..].trim_start_matches('-').trim_start();
+            if rest.starts_with('<') {
+                from = k + 3;
+                continue;
+            }
+            let tag: String = rest.trim_start_matches(['\'', '"']).chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            if !tag.is_empty() {
+                opens.push((tag, feeds_data(line, k)));
+            }
+            from = k + 2;
+        }
+        for (tag, data) in opens {
+            let Some(end) = lines[i..].iter().position(|l| l.trim() == tag).map(|n| i + n) else { break };
+            if !data {
+                kept.extend(&lines[i..end]);
+            }
+            kept.push(lines[end]);
+            i = end + 1;
+        }
+    }
+    without_echoes(&kept.join("\n"))
+}
+
+/// `text` without the arguments of each `echo` and `printf` (up to the end of
+/// that command: an unquoted `;`, `&`, `|`, `>`, `<`, `)` or line end).
+fn without_echoes(text: &str) -> String {
+    let c: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let (mut i, mut word, mut quote) = (0, String::new(), None::<char>);
+    let mut at_command = true;
+    while i < c.len() {
+        let ch = c[i];
+        match quote {
+            Some(q) => {
+                out.push(ch);
+                if ch == '\\' && q == '"' && i + 1 < c.len() {
+                    out.push(c[i + 1]);
+                    i += 1;
+                } else if ch == q {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            None if ch == '\'' || ch == '"' => {
+                quote = Some(ch);
+                at_command = false;
+                word.clear();
+                out.push(ch);
+                i += 1;
+                continue;
+            }
+            None => {}
+        }
+        if ch.is_whitespace() || ";&|()<>{}".contains(ch) {
+            let w = std::mem::take(&mut word);
+            let name = w.rsplit('/').next().unwrap_or("");
+            if at_command && matches!(name, "echo" | "printf") && ch.is_whitespace() {
+                // Its words, to the end of the command, go.
+                let mut q = None::<char>;
+                while i < c.len() {
+                    let x = c[i];
+                    match q {
+                        Some(qq) => {
+                            if x == '\\' && qq == '"' {
+                                i += 1;
+                            } else if x == qq {
+                                q = None;
+                            }
+                        }
+                        None if x == '\'' || x == '"' => q = Some(x),
+                        None if x == '\\' => i += 1,
+                        None if ";&|<>)\n".contains(x) => break,
+                        None => {}
+                    }
+                    i += 1;
+                }
+                out.push(' ');
+                at_command = false;
+                continue;
+            }
+            // After an assignment or a prefix the next word is the command still.
+            if !w.is_empty() {
+                at_command = at_command && ((w.contains('=') && !w.starts_with('-')) || matches!(name, "sudo" | "env" | "command" | "exec" | "nohup" | "time" | "then" | "do" | "else" | "if" | "while" | "!"));
+            }
+            if ";&|(){}\n".contains(ch) {
+                at_command = true;
+            }
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        word.push(ch);
+        out.push(ch);
+        i += 1;
+    }
+    out
+}
+
+/// A real push or merge in a shell command: `git push`, `git merge` (past
+/// git's own options: `git -C <dir> push`), `git subtree|lfs push`, `gh|glab
+/// pr|mr merge`, `gh repo sync`, a `gh api` call on a `/merge(s)` path; in
+/// any form a word list makes of them (`["git", "push"]` in a script). Words
+/// like "pushed" or "merged" are none.
+pub fn pushes_or_merges(command: &str) -> bool {
+    // (`=` stays in a word: `-c core.editor=true` is one option and its value.)
+    let toks: Vec<&str> = command.split(|c: char| !(c.is_alphanumeric() || "._/~:@+-=".contains(c))).filter(|t| !t.is_empty()).collect();
+    let after_options = |from: usize| -> Vec<&str> {
+        let mut out = vec![];
+        let mut j = from;
+        while j < toks.len() && out.len() < 3 {
+            let t = toks[j];
+            if t.starts_with('-') {
+                // These take the next word.
+                if matches!(t, "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env" | "-R" | "--repo") {
+                    j += 1;
+                }
+            } else {
+                out.push(t);
+            }
+            j += 1;
+        }
+        out
+    };
+    toks.iter().enumerate().any(|(i, t)| match t.rsplit('/').next().unwrap_or(t) {
+        "git" => match after_options(i + 1).as_slice() {
+            ["push" | "merge", ..] => true,
+            ["subtree" | "lfs", "push", ..] => true,
+            _ => false,
+        },
+        "gh" | "glab" => match after_options(i + 1).as_slice() {
+            ["pr" | "mr", "merge", ..] => true,
+            ["repo", "sync", ..] => true,
+            // (`-X PUT` and the like: its path is any word after `api`.)
+            ["api", rest @ ..] => rest.iter().any(|p| p.contains("/merge")),
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
+// ---- Claude's own memory and notes ----
+
+/// What a prompt's sensitive-file reason names: each file it asks to touch
+/// (`… to edit <path> which is a sensitive file`) and each one a path
+/// resolves to (`resolves through a symlink to <path>.`), whitespace out (a
+/// path wraps on screen). Empty when it gives no such reason.
+pub fn sensitive_targets(set: &QuestionSet) -> Vec<String> {
+    let lines: Vec<&str> = set.detail.lines().map(ungutter).collect();
+    let Some(from) = lines.iter().position(|l| l.starts_with(SENSITIVE)) else { return vec![] };
+    let text = lines[from..].join(" ");
+    let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let mut out = vec![];
+    for part in text.split(SENSITIVE).skip(1) {
+        let path = ["edit ", "write to ", "write ", "read ", "access "].iter().find_map(|v| part.strip_prefix(v)).unwrap_or(part);
+        match path.split_once(" which is a sensitive file") {
+            Some((p, rest)) => {
+                out.push(squash(p));
+                for s in rest.split("resolves through a symlink to ").skip(1) {
+                    let p = s.split_once(". ").map(|(p, _)| p).unwrap_or(s).trim();
+                    out.push(squash(p.strip_suffix('.').unwrap_or(p)));
+                }
+            }
+            // A reason this doesn't know: not one to answer by the rule.
+            None => out.push(String::new()),
+        }
+    }
+    out
+}
+
+/// A file of Claude's own memory or notes, under a Claude config folder of
+/// `home` (`~/.claude`, `~/.claude-accounts/<name>`, a profile's
+/// `…/claude-profiles/<id>/home`, as orca keeps them under Application
+/// Support): `projects/<project>/memory/…`, or a project's own `*.md`
+/// notes. `path` without whitespace, as `sensitive_targets` gives it.
+pub fn claude_memory(path: &str, home: &str) -> bool {
+    let home: String = home.trim_end_matches('/').chars().filter(|c| !c.is_whitespace()).collect();
+    let Some(rest) = path.strip_prefix(&home).and_then(|r| r.strip_prefix('/')) else { return false };
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.iter().any(|p| p.is_empty() || *p == "." || *p == "..") {
+        return false;
+    }
+    // The Claude config folder, then what is in it.
+    let inside: &[&str] = match parts.as_slice() {
+        [".claude", r @ ..] => r,
+        [".claude-accounts", _, r @ ..] => r,
+        ["Library", "ApplicationSupport", _, "claude-profiles", _, "home", r @ ..] => r,
+        _ => return false,
+    };
+    match inside {
+        ["projects", _, "memory", _, ..] => true,
+        ["projects", _, note] => note.ends_with(".md"),
+        _ => false,
+    }
+}
+
+/// A permission prompt whose only sensitive target is Claude's own memory
+/// or notes (`claude_memory`, every file its reason names), and whose
+/// command does nothing the 90/10 rule names when what it writes is left
+/// out (`without_data`; the session's task is no part of it): the tower
+/// answers it with its plain one-time yes, never one that stops asking.
+/// That yes (its option's place), or None.
+pub fn memory_yes(set: &QuestionSet) -> Option<usize> {
+    if set.kind != "claude-permission" {
+        return None;
+    }
+    let targets = sensitive_targets(set);
+    let home = crate::config::home().to_string_lossy().into_owned();
+    if targets.is_empty() || !targets.iter().all(|p| claude_memory(p, &home)) {
+        return None;
+    }
+    let command = match shell_command(set) {
+        Some(c) => without_data(&c),
+        None => set.detail.lines().map(ungutter).take_while(|l| !l.starts_with(SENSITIVE)).collect::<Vec<_>>().join("\n"),
+    };
+    if reason_of(&command, shell_command(set).is_some().then_some(command.as_str())).is_some() {
+        return None;
+    }
+    set.tabs.first()?.options.iter().position(plain_yes)
 }
 
 /// A menu option that answers more than this once: it turns on auto mode,
@@ -2656,6 +2960,189 @@ mod tests {
             tabs: vec![Tab { question: question.into(), options: options.iter().map(|o| Opt { label: o.to_string(), ..Default::default() }).collect(), ..Default::default() }],
             ..Default::default()
         }
+    }
+
+    /// What the session was asked when its memory note became a card: the
+    /// user's request, which says not to merge or push.
+    const ASKED: &str = "Give New space the same side conversation column that a space has. Run the tests, build fresh before installing, and report verified vs not verified. Don't merge or push.";
+
+    /// The prompt a session's memory note made, as Claude Code drew it
+    /// (`claude-permission-memory-note.txt`: the home folder as `{home}`),
+    /// read off its screen, for a session that was asked `context`; `edit`
+    /// changes the screen first.
+    fn memory_prompt(context: &str, edit: impl Fn(String) -> String) -> QuestionSet {
+        let home = crate::config::home().to_string_lossy().into_owned();
+        let screen = parse_screen(&edit(fixture("claude-permission-memory-note.txt").replace("{home}", &home))).unwrap();
+        build("t7p", "m5pro herder tower", false, &screen, None, "", context)
+    }
+
+    /// A Bash prompt for `command` (its lines), as the newer Claude Code draws it.
+    fn bash(command: &str, context: &str) -> QuestionSet {
+        let lines: String = command.lines().map(|l| format!(" │ {l}\n")).collect();
+        let screen = parse_screen(&format!("{}\n Bash command\n Do it\n{lines} Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\n Esc to cancel\n", "─".repeat(80))).unwrap();
+        build("t1", "s", false, &screen, None, "", context)
+    }
+
+    /// (1) A shell command pushes or merges only by a real git or gh command:
+    /// not by the words of a note it writes in a heredoc, echoes or prints,
+    /// nor by what the session was asked ("Don't merge or push."). The exact
+    /// command of the memory note that waited 34 minutes as "it pushes or
+    /// merges to a shared branch" is none.
+    #[test]
+    fn a_shell_command_pushes_or_merges_only_by_its_git_and_gh_commands() {
+        // The memory note, aimed at a file that isn't memory: the 90/10 rule alone decides it.
+        let note = memory_prompt(ASKED, |s| s.replace("/memory/quiet-tower-implementation.md", "/notes/x.txt"));
+        assert_eq!(memory_yes(&note), None);
+        let cmd = shell_command(&note).unwrap();
+        assert!(cmd.contains("cat >> \"$M/quiet-tower-implementation.md\" <<'EOF'") && cmd.contains("tail -1 \"$M/MEMORY.md\"") && !cmd.contains("requested permissions"), "{cmd}");
+        let kept = without_data(&cmd);
+        assert!(!kept.contains("NOT merged or pushed"), "the note it appends is what it writes: {kept}");
+        assert!(kept.contains("s=s.replace(old,") && kept.contains("python3 - \"$M/MEMORY.md\" <<'EOF'"), "a heredoc fed to python is code, and stays: {kept}");
+        assert!(!pushes_or_merges(&kept));
+        assert_eq!(must_escalate(&note), None, "no real push or merge in it, whatever its note and its task say");
+        // As it was: its words alone made it a push.
+        let text = format!("{}\n{}\n{}", note.title, note.detail, note.context);
+        assert_eq!(reason_of(&text, None), Some("it pushes or merges to a shared branch"));
+
+        // Real ones, in every shape, still are.
+        for c in [
+            "git push origin main",
+            "cd ~/Work/x && git -C ~/Work/x push --force",
+            "git merge dev",
+            "/usr/bin/git -c core.editor=true merge --no-ff feature",
+            "git subtree push --prefix docs origin gh-pages",
+            "gh pr merge 12 --squash",
+            "gh -R eyzhub/eyzflow pr merge 792",
+            "glab mr merge 3",
+            "gh repo sync",
+            "gh api -X PUT repos/o/r/pulls/12/merge",
+            "python3 -c 'import subprocess; subprocess.run([\"git\", \"push\"])'",
+            "cat > notes.md <<'EOF'\nmerged it\nEOF\ngit push",
+            "python3 - <<'EOF'\nimport subprocess\nsubprocess.run([\"git\", \"merge\", \"dev\"])\nEOF",
+            // A heredoc whose end isn't shown stays (nothing after it is hidden).
+            "cat > notes.md <<'EOF'\nsome note\ngit push origin main",
+        ] {
+            assert!(pushes_or_merges(&without_data(c)), "{c}");
+            assert_eq!(must_escalate(&bash(c, "")), Some("it pushes or merges to a shared branch"), "{c}");
+        }
+        // Words, other git commands, and what is only written are not.
+        for c in [
+            "git status && git log --merges --oneline",
+            "git merge-base main HEAD",
+            "git stash push -m wip",
+            "git commit -m 'merge the fixes into main, then push'",
+            "git commit -F - <<'EOF'\nMerge it into main and git push\nEOF",
+            "echo \"git push origin main later\" >> todo.md",
+            "printf '%s\\n' 'merged into main; pushed' >> notes.md",
+            "tee -a notes.md <<EOF\nran git push origin main\nEOF",
+            "gh pr view 12 --json state",
+            "cargo test 2>&1 | tail -3",
+        ] {
+            assert!(!pushes_or_merges(&without_data(c)), "{c}");
+            assert_eq!(must_escalate(&bash(c, ASKED)), None, "{c}");
+        }
+        // A question in words is read as it was: no command to read instead.
+        let words = QuestionSet { kind: "claude-ask".into(), tabs: vec![Tab { question: "Want me to merge this into main?".into(), ..Default::default() }], ..Default::default() };
+        assert_eq!(must_escalate(&words), Some("it pushes or merges to a shared branch"));
+        // The other rules still read the whole prompt.
+        assert_eq!(must_escalate(&bash("echo hi > /tmp/x", "Deploy the dashboard to production")), Some("it deploys or releases"));
+    }
+
+    /// (2) A permission prompt whose only sensitive target is Claude's own
+    /// memory or notes gets the tower's plain one-time yes; any other, or one
+    /// whose command does more, stays as it was.
+    #[test]
+    fn a_prompt_that_only_writes_claudes_own_memory_gets_its_plain_yes() {
+        let set = memory_prompt(ASKED, |s| s);
+        let home = crate::config::home().to_string_lossy().into_owned();
+        assert_eq!((set.kind.as_str(), set.title.as_str()), ("claude-permission", "Allow this?"));
+        let real = format!("{}/.claude/projects/-Users-me-Work-herder-tower/memory/quiet-tower-implementation.md", home.replace(' ', ""));
+        assert_eq!(sensitive_targets(&set), [real.clone(), real]);
+        assert_eq!(memory_yes(&set), Some(0), "its plain Yes");
+        assert_eq!(must_escalate(&set), None);
+        let recs = vec![TabRecs { tab: 0, options: vec![Rec { label: "Yes".into(), why: "".into(), choice: json!(0) }] }];
+        let picked = QuestionSet { recommendations: Some(recs), ..set.clone() };
+        assert_eq!(decide(&picked, Some("auto"), "routine", "keep-moving").0, "auto");
+        assert_eq!(decide(&picked, Some("auto"), "routine", "ask-everything").0, "escalate", "the user's own policy still wins");
+        // A path wrapped on screen is the same path.
+        let wrapped = memory_prompt(ASKED, |s| s.replace("-Users-me-Work-herder-tower/memory/quiet-tower-implementation.md which is", "-Users-me-Work-herder-\n │ tower/memory/quiet-tower-implementation.md which is"));
+        assert_eq!(memory_yes(&wrapped), Some(0));
+        // Only a plain yes: never one that stops asking.
+        let widening = memory_prompt(ASKED, |s| s.replace("❯ 1. Yes\n   2. No", "❯ 1. Yes, and always allow access to memory/ from this project\n   2. No"));
+        assert_eq!(memory_yes(&widening), None);
+        let both = memory_prompt(ASKED, |s| s.replace("❯ 1. Yes\n   2. No", "❯ 1. Yes, and don't ask again for this session\n   2. Yes\n   3. No"));
+        assert_eq!(memory_yes(&both), Some(1));
+        // Not memory, or not only memory: as before.
+        let settings = memory_prompt(ASKED, |s| s.replace(".claude/projects/-Users-me-Work-herder-tower/memory/quiet-tower-implementation.md", ".claude/settings.json"));
+        assert_eq!(memory_yes(&settings), None);
+        let two = memory_prompt(ASKED, |s| {
+            s.replace(" │ Claude requested permissions to edit\n", " │ Claude requested permissions to edit {home}/.zshrc which is a sensitive file.\n │ Claude requested permissions to edit\n").replace("{home}", &home)
+        });
+        assert_eq!(memory_yes(&two), None, "a second target that isn't memory");
+        let unknown = memory_prompt(ASKED, |s| s.replace("which is\n │ a sensitive file.", "but you\n │ haven't granted it yet."));
+        assert_eq!(memory_yes(&unknown), None, "a reason it doesn't know");
+        // Memory, but the command does more: the 90/10 rule decides it.
+        let pushes = memory_prompt(ASKED, |s| s.replace(" │ tail -1 \"$M/MEMORY.md\"\n", " │ tail -1 \"$M/MEMORY.md\" && git push origin main\n"));
+        assert_eq!((memory_yes(&pushes), must_escalate(&pushes)), (None, Some("it pushes or merges to a shared branch")));
+        let removes = memory_prompt(ASKED, |s| s.replace(" │ tail -1 \"$M/MEMORY.md\"\n", " │ rm -rf ~/Work/eyzflow\n"));
+        assert_eq!((memory_yes(&removes), must_escalate(&removes)), (None, Some("it deletes or overwrites")));
+        // What a note says is no part of it, whatever its words.
+        let wordy = memory_prompt("Deploy it to production and rotate the API token", |s| s.replace("NOT merged or pushed (asked not to).", "rm -rf the old build, deploy to prod, kill 77577."));
+        assert_eq!((memory_yes(&wordy), must_escalate(&wordy)), (Some(0), None));
+        // A dialog that isn't a permission prompt never is.
+        assert_eq!(memory_yes(&QuestionSet { kind: "claude-ask".into(), ..set.clone() }), None);
+    }
+
+    #[test]
+    fn claudes_own_memory_and_notes_are_known_by_their_folder() {
+        let h = "/Users/me";
+        for p in [
+            "/Users/me/.claude/projects/-Users-me-Work-x/memory/MEMORY.md",
+            "/Users/me/.claude/projects/-Users-me-Work-x/memory/notes/deep.md",
+            "/Users/me/.claude/projects/-Users-me-Work-x/notes.md",
+            "/Users/me/.claude-accounts/orca/projects/-Users-me-Work-x/memory/a.md",
+            "/Users/me/Library/ApplicationSupport/orca/claude-profiles/4c1e/home/projects/-Users-me-Work-x/memory/a.md",
+        ] {
+            assert!(claude_memory(p, h), "{p}");
+        }
+        for p in [
+            "/Users/me/.claude/settings.json",
+            "/Users/me/.claude/CLAUDE.md",
+            "/Users/me/.claude/projects/-Users-me-Work-x/25102f63.jsonl",
+            "/Users/me/.claude/projects/-Users-me-Work-x/memory/../../../settings.json",
+            "/Users/me/.claude/projects/-Users-me-Work-x/memory",
+            "/tmp/x/Users/me/.claude/projects/p/memory/a.md",
+            "/Users/other/.claude/projects/p/memory/a.md",
+            "/Users/me/Work/x/.claude/projects/p/memory/a.md",
+            "",
+        ] {
+            assert!(!claude_memory(p, h), "{p}");
+        }
+        // The home folder may have a space; paths come without whitespace.
+        assert!(claude_memory("/Users/MyName/.claude/projects/p/memory/a.md", "/Users/My Name"));
+    }
+
+    /// `cargo test replay_a_captured_prompt -- --ignored --nocapture` with
+    /// `HERDER_TOWER_REPLAY=<a screen>` (and `HERDER_TOWER_REPLAY_CONTEXT=<a
+    /// file with what the session was asked>`): the screen through the
+    /// question reader and the 90/10 rule, said line by line.
+    #[test]
+    #[ignore]
+    fn replay_a_captured_prompt() {
+        let screen = std::fs::read_to_string(std::env::var("HERDER_TOWER_REPLAY").expect("HERDER_TOWER_REPLAY=<screen file>")).unwrap();
+        let context = std::env::var("HERDER_TOWER_REPLAY_CONTEXT").ok().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+        let s = parse_screen(&screen).expect("no dialog on that screen");
+        let set = build("t7p", "replay", false, &s, None, "", &context);
+        let text = format!("{}\n{}\n{}", set.title, set.detail, set.context);
+        eprintln!("kind: {}; title: {}; options: {:?}", set.kind, set.title, set.tabs.first().map(|t| t.options.iter().map(|o| o.label.as_str()).collect::<Vec<_>>()));
+        eprintln!("sensitive targets: {:?}", sensitive_targets(&set));
+        eprintln!("shell command found: {}", shell_command(&set).is_some());
+        eprintln!("as the words alone read it (before): {:?}", reason_of(&text, None));
+        eprintln!("  before, without the session's task: {:?}", reason_of(&format!("{}\n{}", set.title, set.detail), None));
+        eprintln!("git/gh push or merge in it: {:?}", shell_command(&set).map(|c| pushes_or_merges(&without_data(&c))));
+        eprintln!("must_escalate (now): {:?}", must_escalate(&set));
+        eprintln!("memory_yes: {:?}", memory_yes(&set).map(|i| (i, set.tabs[0].options[i].label.clone())));
+        eprintln!("decide with no brain word yet: {:?}", decide(&set, None, "", "keep-moving"));
     }
 
     #[test]

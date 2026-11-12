@@ -232,6 +232,40 @@ infrastructure, secrets or money always escalates. Right before an answer is
 typed for the user the dialog is read again, and the policy, this rule and
 the menu check run on what it shows now; if one fails, it escalates instead.
 
+- **A shell command pushes or merges only by its git and gh commands**
+  (`questions::shell_command`, `without_data`, `pushes_or_merges`): for a
+  Claude Code "Bash command" prompt or a Codex menu, the push/merge part of
+  the rule reads the command itself: a real `git push`, `git merge` (past
+  git's options: `git -C <dir> push`, `git -c k=v merge`), `git subtree|lfs
+  push`, `gh|glab pr|mr merge`, `gh repo sync`, a `gh api` call on a
+  `/merge` path, also as words a script runs (`["git", "push"]` in a Python
+  heredoc). Not what the command only writes (the body of a heredoc fed to
+  `cat` or `tee`, a message read by `git commit -F -`, the words of `echo`
+  and `printf`), not prose like "merged" or "pushed", and not what the
+  session was asked (its task saying "Don't merge or push." made every
+  prompt of that session a push). `git merge-base`, `git log --merges` and
+  `git stash push` are none. A heredoc whose end isn't shown is read whole.
+  Questions in words ("Want me to merge this into main?") are read as before.
+- **Claude's own memory and notes get the plain yes** (`questions::
+  memory_yes`, `Asks::memory_rule`): a permission prompt whose every
+  sensitive-file target ("Claude requested permissions to edit <path> which
+  is a sensitive file", and where it "resolves through a symlink to") is a
+  file of Claude's own memory or notes (`projects/<project>/memory/…` or a
+  project's `*.md` under `~/.claude`, `~/.claude-accounts/<name>`, or a
+  profile's `…/claude-profiles/<id>/home` such as orca's under Application
+  Support), and whose command does nothing this rule names once what it
+  writes is left out (the session's task no part of it), is answered by the
+  tower at once with its plain one-time yes, never an option that stops
+  asking; the brain isn't asked and no card is made. With `ask-everything`
+  it is the user's like every other prompt. Any other target, a second
+  target that isn't memory, a reason it doesn't know, or a command that also
+  pushes, deletes or the like: as before.
+- `cargo test replay_a_captured_prompt -- --ignored --nocapture` with
+  `HERDER_TOWER_REPLAY=<a screen>` (and `HERDER_TOWER_REPLAY_CONTEXT=<what
+  the session was asked>`) reads a captured screen through the question
+  reader and this rule, and `…_through_the_tower` through the daemon's
+  decision (nothing is typed).
+
 The user's policy (`tower policy`, `PUT /v1/questions-policy`, kept in
 config.toml as `question_policy`): `normal`; `keep-moving` (the brain answers
 borderline ones too, never the hard list); `ask-everything` (nothing is
