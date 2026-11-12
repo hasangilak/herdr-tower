@@ -50,7 +50,9 @@
 //! instruction, or made it moot) is not sent: it leaves the queue, the
 //! record says so ("Not sent: you had told it yourself …"), and its task in
 //! the agenda is dropped with that reason. A check that fails, or takes
-//! longer than two minutes, lets the messages go.
+//! longer than two minutes, lets the messages go. A session the user has
+//! been typing in takes the tower's next message three seconds after its
+//! turn ends, not at once: what the user typed while it worked goes in first.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -86,6 +88,11 @@ const SAID_KEEP_MS: u64 = 30 * 60_000;
 const SAID_KEEP: usize = 12;
 /// A check that hasn't answered in this long is over: what it held goes.
 const CHECK_LIMIT_MS: u64 = 120_000;
+/// A session the user has been typing in lately takes the tower's next
+/// message only this long after its turn ended: what the user typed while it
+/// worked (Claude Code sends it the moment that turn ends) comes first, and
+/// is checked against it.
+const SETTLE_MS: u64 = 3_000;
 
 /// Why an instruction won't go on its own. On disk (and on the wire) it is
 /// its word, as before: `gone`, `replaced`, `after-cancelled`, `start-failed`;
@@ -1531,6 +1538,9 @@ impl SendQueue {
                     h.check(c);
                     return;
                 }
+                if b.said.contains_key(&s.address) && s.status_ms.is_some_and(|t| t <= now && now - t < SETTLE_MS) {
+                    return;
+                }
             }
             // Claimed, on disk, before it's typed.
             if let Err(e) = b.items[pos].apply(ItemEv::Claim { now_ms: now, turn: s.turn, busy }) {
@@ -2188,6 +2198,30 @@ mod tests {
         q.add_with(&h, "t5", "PR #9 (a/b) into dev was merged on GitHub.", &[], None).unwrap();
         assert_eq!(h.sent().len(), 1);
         assert!(h.checks.lock().unwrap().is_empty());
+    }
+
+    /// What the user typed while the session worked goes in the moment its
+    /// turn ends: the tower's message waits a moment for it.
+    #[test]
+    fn a_session_the_user_types_in_settles_before_the_towers_message() {
+        let (q, _d) = queue();
+        let h = Fake::default();
+        h.set("t5", "working");
+        let now = crate::history::now_ms();
+        q.user_said_with(&h, "t5", "run the tests", now - 60_000);
+        q.add_with(&h, "t5", "deploy the docs", &[], None).unwrap();
+        // Its turn ends: checked against the user's words first.
+        h.set("t5", "idle");
+        h.since.lock().unwrap().insert("t5".into(), now - 500);
+        q.tick(&h);
+        let c = h.checks.lock().unwrap()[0].clone();
+        q.checked_with(&h, &c, Ok(vec![]));
+        // Not covered, but its turn ended a moment ago: not yet.
+        q.tick(&h);
+        assert!(h.sent().is_empty());
+        h.since.lock().unwrap().insert("t5".into(), now - SETTLE_MS - 10);
+        q.tick(&h);
+        assert_eq!(h.sent(), vec!["deploy the docs".to_string()]);
     }
 
     #[test]
