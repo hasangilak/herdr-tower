@@ -19,6 +19,7 @@ mod brain;
 mod brains;
 mod chat;
 mod config;
+mod covered;
 mod daemon;
 mod decisions;
 mod dispatch;
@@ -34,10 +35,12 @@ mod names;
 mod orb;
 mod peers;
 mod phone;
+mod plans;
 mod protocol;
 mod projects;
 mod prs;
 mod questions;
+mod reviews;
 mod screenshots;
 mod selftest;
 mod setups;
@@ -45,6 +48,7 @@ mod spaces;
 mod split;
 mod tell;
 mod text;
+mod ticket;
 mod worktrees;
 
 use std::io::IsTerminal;
@@ -250,14 +254,18 @@ enum Cmd {
         task: Vec<String>,
     },
     /// Open a space for a goal, in one go: `tower launch "Fix the login redirect"`. It names the
-    /// space from the goal, makes it, opens a session per repo of a setup (`tower setups`) on its
-    /// account, each in its own git worktree with a dev port, sets the goal and hands it out as the
-    /// first request. It asks nothing, and prints what it assumed. `--dry-run`: only the plan.
+    /// space from the goal, makes it, opens a session per repo (those the goal's first line names,
+    /// else a project's: `tower setups`) on its account, each in its own git worktree with a dev
+    /// port, sets the goal (the ticket's title) and hands the whole text out as the first request.
+    /// It asks nothing, and prints what it assumed. `--dry-run`: only the plan. `--draft`: the
+    /// tower's brain reads the ticket and drafts the space (repos, name, goal, done-when) for you
+    /// to confirm; `--repo`, `--title` and `--done-when` launch exactly what was confirmed.
     Launch {
-        /// The goal, in a sentence.
+        /// The goal, in a sentence, or a whole ticket.
         #[arg(required = true)]
         goal: Vec<String>,
-        /// The setup to open it with (default: the only one, else the first).
+        /// The project to open it with (default: the only one, else the first). With
+        /// `--draft`: the project its repos come from. With `--repo`: the project it is for.
         #[arg(long)]
         setup: Option<String>,
         /// The space's name (default: the goal's first two words that carry meaning, made unique).
@@ -266,28 +274,82 @@ enum Cmd {
         /// Print the plan and do nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Have the tower's brain read the ticket and draft the space, and print the draft
+        /// (as `--dry-run` does its plan). Nothing is opened.
+        #[arg(long, conflicts_with_all = ["repo", "title", "done_when", "dry_run"])]
+        draft: bool,
+        /// With `--draft`: what to change about the draft `--prior` holds, in words.
+        #[arg(long, requires = "draft")]
+        adjust: Option<String>,
+        /// With `--draft`: the draft before (its JSON, as `--draft --json` printed it).
+        #[arg(long, requires = "draft")]
+        prior: Option<String>,
+        /// Open a session in this folder (once per repo), and in no other.
+        #[arg(long)]
+        repo: Vec<String>,
+        /// The space's goal, in a line (default: the ticket's title).
+        #[arg(long)]
+        title: Option<String>,
+        /// What counts as done (default: the ticket's acceptance criteria, if it has any).
+        #[arg(long)]
+        done_when: Option<String>,
+        /// The Claude account its sessions run on (default: the project's, else the default one).
+        #[arg(long)]
+        account: Option<String>,
+        /// The plan it was planned with (`tower plan`, `p3`): each session's first instruction
+        /// carries the plan's link and its part of the plan, and the plan is closed.
+        #[arg(long, conflicts_with = "draft")]
+        plan: Option<String>,
+        /// Each PR its sessions open gets a reviewer session, for critical issues only (the default).
+        #[arg(long, conflicts_with_all = ["no_review", "draft"])]
+        review: bool,
+        /// Its PRs get no reviewer.
+        #[arg(long, conflicts_with = "draft")]
+        no_review: bool,
         #[arg(long)]
         json: bool,
     },
-    /// The setups `tower launch` opens a space with: a name, a Claude account, and the repos that
-    /// get a session each (`[[setups]]` in config.toml). The first is the default.
+    /// A space's plan before it is launched: the tower's planner (a Claude Code terminal of the
+    /// tower's, `tower-planner`) writes the full plan of a draft, publishes it as an Artifact on
+    /// your claude.ai account (an HTML page or a whiteboard) and talks it over with you.
+    /// `tower plan new --form page|whiteboard --draft '<draft JSON>' --ticket-file <file>`,
+    /// `say <id> "<words>" [--as user|planner]` (yours is queued to the planner; the planner's
+    /// is its answer), `draft <id> --json-file <file>` (the planner's revised draft),
+    /// `published <id> --url <link>`, `failed <id> "<why>"`, `show [<id>] [--json]`,
+    /// `close [<id>]` (its planner ends), `list`.
+    Plan {
+        /// new | say | draft | published | failed | show | close | list, its id and flags.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// The projects (setups) `tower launch` opens a space with: a name, a Claude account, what it
+    /// is, and the repos that get a session each with what each is in it (`[[setups]]` in
+    /// config.toml). The first is the default.
     Setups {
         #[arg(long)]
         json: bool,
     },
-    /// `tower setup add "<name>" --account <account> --repo <folder> [--repo <folder>…]` (the same
-    /// name again changes it), `tower setup remove "<name>"`.
+    /// `tower setup add "<name>" --account <account> [--about "<what it is>"] --repo
+    /// "<folder>=<its role>" [--repo …]` (the same name again changes it; `--was "<old name>"`
+    /// renames one in its place), `tower setup remove "<name>"`.
     Setup {
         /// add | remove
         action: String,
-        /// The setup's name.
+        /// The project's name.
         name: Vec<String>,
         /// add: the Claude account its sessions run on (`tower accounts`; default: the first).
         #[arg(long)]
         account: Option<String>,
-        /// add: a repo's folder (or a project's name), once per repo.
+        /// add: what the project is, in a line.
+        #[arg(long)]
+        about: Option<String>,
+        /// add: a repo's folder (or a project folder's name), with what it is in the project after
+        /// a `=` (or ` — `): `--repo "~/Work/eyz/eyzflow=the web app"`. Once per repo.
         #[arg(long)]
         repo: Vec<String>,
+        /// add: the project's name before, to rename it in its place.
+        #[arg(long)]
+        was: Option<String>,
     },
     /// Every space as a mission: its goal and state (open, quiet, ready to close), what needs you
     /// there, its sessions (with worktree and port) and its requests. JSON when piped.
@@ -566,8 +628,10 @@ enum Cmd {
     /// `tower space follow|unfollow <space>`: its finished requests' receipts reach you as they land.
     /// `tower space mute|unmute <space>`: what needs you there stays in its own view (`tower decisions
     /// --space <space>`), off the orb's count and out of the main queue.
+    /// `tower space review <space> on|off`: whether the PRs its sessions open get a reviewer session
+    /// (on by default; off ends one that is open there).
     Space {
-        /// goal | agenda | standing | report | close | follow | unfollow | mute | unmute
+        /// goal | agenda | standing | report | close | follow | unfollow | mute | unmute | review
         what: String,
         space: String,
         text: Vec<String>,
@@ -577,6 +641,24 @@ enum Cmd {
         /// close: though a session there still works or waits for you.
         #[arg(long)]
         force: bool,
+    },
+    /// The PRs' reviews: a PR a session opens in a space with review on gets a reviewer session,
+    /// which looks for critical issues only and agrees with the PR's session before you merge.
+    /// `tower review [list]`, `show <pr>` (JSON when piped, or `--json`). The reviewer's `report
+    /// <pr> --critical <n> "<one line>"` and `agree <pr> ["<one line>"]`; the owner's `fixed <pr>
+    /// "<one line>"`. A PR is its key (owner/repo#12), its link, or #12.
+    Review {
+        /// list | show | report | agree | fixed
+        action: Option<String>,
+        /// The PR: owner/repo#12, its link, or #12.
+        pr: Option<String>,
+        /// report: how many critical issues it found (0: none).
+        #[arg(long)]
+        critical: Option<u32>,
+        #[arg(long)]
+        json: bool,
+        /// The one line.
+        text: Vec<String>,
     },
     /// Every Herdr space: focus, goal, state, unread news, sessions (JSON when piped). A space
     /// quiet for a day, or closed, is left out unless `--all`.
@@ -794,10 +876,33 @@ fn run(cli: Cli) -> Result<()> {
             let space = space.map(|s| spaces::Asked { name: s, new: new_space });
             start(account.as_deref(), &name, cwd, on.as_deref(), space.as_ref(), no_watch, tag, &task.join(" "), no_worktree, !no_act)
         }
-        Cmd::Launch { goal, setup, name, dry_run, json } => launch::cmd(&goal.join(" "), setup.as_deref(), name.as_deref(), dry_run, json),
+        Cmd::Launch { goal, setup, name, dry_run, draft, adjust, prior, repo, title, done_when, account, plan, review, no_review, json } => {
+            let goal = goal.join(" ");
+            if draft {
+                ticket::cmd(&goal, setup.as_deref(), adjust.as_deref(), prior.as_deref(), json)
+            } else {
+                let review = match (review, no_review) {
+                    (true, _) => Some(true),
+                    (_, true) => Some(false),
+                    _ => None,
+                };
+                let ask = launch::Ask {
+                    setup: setup.as_deref(),
+                    name: name.as_deref(),
+                    repos: &repo,
+                    title: title.as_deref(),
+                    done_when: done_when.as_deref(),
+                    account: account.as_deref(),
+                    plan: plan.as_deref(),
+                    review,
+                };
+                launch::cmd(&goal, &ask, dry_run, json)
+            }
+        }
+        Cmd::Plan { args } => plans::cmd(&args),
         Cmd::Setups { json } => setups::cmd_list(json),
-        Cmd::Setup { action, name, account, repo } => match action.as_str() {
-            "add" => setups::cmd_add(&name.join(" "), account.as_deref(), &repo),
+        Cmd::Setup { action, name, account, about, repo, was } => match action.as_str() {
+            "add" => setups::cmd_add(&name.join(" "), account.as_deref(), about.as_deref(), &repo, was.as_deref()),
             "remove" | "rm" | "delete" => setups::cmd_remove(&name.join(" ")),
             other => bail!("tower setup {other}: use `tower setup add \"<name>\" --account <account> --repo <folder>` or `tower setup remove \"<name>\"` (`tower setups` lists them)"),
         },
@@ -1011,10 +1116,12 @@ fn run(cli: Cli) -> Result<()> {
             "close" => missions::cmd_close(std::iter::once(space).chain(text).collect::<Vec<_>>().join(" "), force),
             "follow" | "unfollow" => spaces::cmd_follow(std::iter::once(space).chain(text).collect::<Vec<_>>().join(" "), what == "follow"),
             "mute" | "unmute" => spaces::cmd_mute(std::iter::once(space).chain(text).collect::<Vec<_>>().join(" "), what == "mute"),
+            "review" => missions::cmd_review(std::iter::once(space).chain(text).collect()),
             other => bail!(
-                "tower space {other}: use `tower space goal <space> \"<goal>\" [--done-when \"<…>\"]`, `standing <space> on|off`, `report <space> \"<text>\"`, `close <space> [--force]`, or `follow|unfollow|mute|unmute <space>`"
+                "tower space {other}: use `tower space goal <space> \"<goal>\" [--done-when \"<…>\"]`, `standing <space> on|off`, `review <space> on|off`, `report <space> \"<text>\"`, `close <space> [--force]`, or `follow|unfollow|mute|unmute <space>`"
             ),
         },
+        Cmd::Review { action, pr, critical, json, text } => review_cmd(action.as_deref().unwrap_or("list"), pr.as_deref().unwrap_or(""), critical, &text.join(" "), json),
         Cmd::Spaces { all } => spaces::cmd_spaces(all),
         Cmd::Digest { list, skip, space, peek } => spaces::cmd_digest(list, skip, space, peek),
         Cmd::Log { text, session } => {
@@ -1055,6 +1162,80 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `tower review …`: what the daemon keeps of the PRs' reviews (`list` and
+/// `show` read `reviews.json` when it isn't running), and the reviewer's
+/// and the owner's word on one.
+fn review_cmd(action: &str, pr: &str, critical: Option<u32>, text: &str, as_json: bool) -> Result<()> {
+    let action = action.trim().to_lowercase();
+    if !["list", "show", "report", "agree", "fixed"].contains(&action.as_str()) {
+        bail!("tower review {action}: use list, show <pr>, report <pr> --critical <n> \"<one line>\", agree <pr> [\"<one line>\"] or fixed <pr> \"<one line>\"");
+    }
+    if action != "list" && pr.trim().is_empty() {
+        bail!("tower review {action} <pr>: the PR's key (owner/repo#12), its link, or #12");
+    }
+    if action == "report" && critical.is_none() {
+        bail!("tower review report <pr> --critical <n> \"<one line>\" (0 when nothing is critical)");
+    }
+    if action == "fixed" && text.trim().is_empty() {
+        bail!("tower review fixed <pr> \"<one line: what you fixed>\"");
+    }
+    let v = if protocol::is_running() {
+        let r = protocol::send(&Request::Review { action: action.clone(), pr: pr.trim().to_string(), critical, text: text.to_string(), from: peers::caller() })?;
+        if !r.ok {
+            bail!("{}", r.error.unwrap_or_default());
+        }
+        r.state.unwrap_or_default()
+    } else {
+        let book = reviews::Book::load_from(&reviews::path());
+        match action.as_str() {
+            "list" => json!({ "reviews": book.reviews.iter().rev().map(reviews::Review::view).collect::<Vec<_>>() }),
+            "show" => json!({ "review": book.find(pr, None)?.view() }),
+            _ => bail!("the tower's voice isn't running (tower up): a review's word goes to it"),
+        }
+    };
+    if as_json || !std::io::stdout().is_terminal() {
+        print_json(&v);
+        return Ok(());
+    }
+    let read = |r: &Value| serde_json::from_value::<reviews::Review>(r.clone()).unwrap_or_default();
+    match action.as_str() {
+        "list" => {
+            let list = v["reviews"].as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                println!("No reviews yet: a PR a session opens in a space with review on gets one.");
+            }
+            for r in &list {
+                println!("{}", reviews::row(&read(r)));
+            }
+        }
+        "show" => {
+            let r = read(&v["review"]);
+            println!("{}", reviews::row(&r));
+            println!("  {} · owner {} ({}) · reviewer {} ({}) · in {}", r.url, r.owner_name, r.owner, r.reviewer_name, r.reviewer, r.folder);
+            for s in &r.steps {
+                let n = s.critical.map(|n| format!(" {n} critical")).unwrap_or_default();
+                let by = if s.by.is_empty() { String::new() } else { format!(" by {}", s.by) };
+                println!("  {} {}{n}{by}{}", phone::ago(s.at_ms), s.what, if s.text.is_empty() { String::new() } else { format!(": {}", s.text) });
+            }
+        }
+        "report" => {
+            let r = read(&v["review"]);
+            match (r.status, v["noted_owner"] == true, v["decision"].as_str()) {
+                (reviews::Status::Stuck, _, Some(id)) => println!("{}: round {} and no agreement. It is the user's now ({id}); their word comes to you both.", r.short(), r.rounds),
+                (_, true, _) => println!("{}: round {}, {} critical. The tower told its owner who you are and what to do; the comments themselves are yours to send (tower queue {}).", r.short(), r.rounds, r.critical, r.owner),
+                _ if r.critical == 0 => println!("{}: nothing critical. Approve it and agree: tower review agree {}.", r.short(), r.key),
+                _ => println!("{}: round {}, {} critical, kept.", r.short(), r.rounds, r.critical),
+            }
+        }
+        "agree" => println!("{}: agreed. The review is over; its reviewer session ends now.", read(&v["review"]).short()),
+        _ => {
+            let r = read(&v["review"]);
+            println!("{}: kept. Tell the reviewer yourself (tower queue {} \"…\"): it checks again.", r.short(), r.reviewer);
+        }
+    }
+    Ok(())
 }
 
 fn show_history(jobs: Option<&str>, session: Option<&str>, n: usize) -> Result<()> {
@@ -2125,5 +2306,28 @@ pub fn show_terminal(address: &str) -> Result<()> {
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => bail!("herdr-app: {}{}", String::from_utf8_lossy(&o.stdout).trim(), String::from_utf8_lossy(&o.stderr).trim()),
         Err(e) => bail!("herdr-app: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_launch_says_whether_its_prs_get_a_reviewer() {
+        let flags = |args: &[&str]| match Cli::try_parse_from([&["tower", "launch", "Fix the login"], args].concat()).map(|c| c.cmd) {
+            Ok(Cmd::Launch { review, no_review, .. }) => Ok((review, no_review)),
+            Ok(_) => Err("another command".to_string()),
+            Err(e) => Err(e.kind().to_string()),
+        };
+        assert_eq!(flags(&[]), Ok((false, false)), "neither: as the space has it (on)");
+        assert_eq!(flags(&["--review"]), Ok((true, false)));
+        assert_eq!(flags(&["--no-review"]), Ok((false, true)));
+        assert!(flags(&["--review", "--no-review"]).is_err(), "one or the other");
+        assert!(flags(&["--draft", "--no-review"]).is_err(), "a draft opens nothing to review");
+        // The space's own switch, and the reviews' commands.
+        assert!(matches!(Cli::try_parse_from(["tower", "space", "review", "fix-login", "off"]).map(|c| c.cmd), Ok(Cmd::Space { ref what, .. }) if what == "review"));
+        let report = Cli::try_parse_from(["tower", "review", "report", "acme/shop#12", "--critical", "2", "a crash", "on empty carts"]).map(|c| c.cmd);
+        assert!(matches!(report, Ok(Cmd::Review { ref action, ref pr, critical: Some(2), ref text, .. }) if action.as_deref() == Some("report") && pr.as_deref() == Some("acme/shop#12") && text.join(" ") == "a crash on empty carts"));
     }
 }

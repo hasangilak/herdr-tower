@@ -184,6 +184,9 @@ pub struct PrRef {
     pub session: String,
     /// Whether it can be merged now, and what to mind (`prs::Gate::view`).
     pub merge: Value,
+    /// Its review (`crate::reviews::Brief`), when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review: Option<crate::reviews::Brief>,
 }
 
 impl PrRef {
@@ -205,6 +208,7 @@ impl PrRef {
             note: p.checks_line(),
             session: p.session.clone(),
             merge: crate::prs::gate(p).view(),
+            review: p.review.clone(),
         }
     }
 
@@ -1303,7 +1307,8 @@ pub fn act(d: &Decision, body: &Value, submit: bool) -> Result<Act> {
                 }
             };
             let mut to: Vec<Who> = d.sessions.iter().filter(|w| w.waiting).cloned().collect();
-            if to.is_empty() {
+            // A PR's review the two sessions can't agree on (`reviews`): the user's word is for both.
+            if to.is_empty() || d.why == "review" {
                 to = d.sessions.clone();
             }
             Ok(Act::Send { to, text, label })
@@ -1790,6 +1795,29 @@ mod tests {
         // Nobody waits: it goes to all of them.
         b.session_waits("t1", false);
         assert!(matches!(act(b.find(&r.id).unwrap(), &json!({ "choice": 0 }), true).unwrap(), Act::Send { to, .. } if to.len() == 2));
+    }
+
+    #[test]
+    fn a_stuck_review_is_answered_to_its_owner_and_its_reviewer_alike() {
+        let mut b = Book::default();
+        let r = crate::reviews::Review { key: "acme/shop#12".into(), repo: "acme/shop".into(), number: 12, owner: "t1".into(), reviewer: "t2".into(), rounds: 3, critical: 1, line: "totals lose cents".into(), ..Default::default() };
+        let (title, detail, options) = crate::reviews::stuck_decision(&r);
+        let raise = |w: &str| Raise { space: Some("shop".into()), who: who(w), why: "review".into(), text: title.clone(), detail: detail.clone(), options: options.clone() };
+        let first = b.raise(raise("t1"), MIN);
+        let second = b.raise(raise("t2"), MIN);
+        assert_eq!((first.id.clone(), first.fresh, second.fresh), (second.id.clone(), true, false), "one decision about both");
+        let d = b.find(&first.id).unwrap().clone();
+        assert_eq!((d.kind, d.pick().is_none(), d.sessions.len()), (Kind::Choice, true, 2));
+        // The owner works on something meanwhile: the user's word still goes to both.
+        b.session_waits("t1", false);
+        match act(b.find(&first.id).unwrap(), &json!({ "choice": 1 }), true).unwrap() {
+            Act::Send { to, text, label } => {
+                assert_eq!(to.iter().map(|w| w.address.as_str()).collect::<Vec<_>>(), ["t1", "t2"]);
+                assert_eq!(label, "Side with the reviewer");
+                assert!(text.starts_with("About the review of PR #12 (acme/shop): the user sides with the reviewer."), "{text}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

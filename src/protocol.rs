@@ -138,6 +138,23 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<String>,
     },
+    /// A PR's review (`tower review`, see `crate::reviews`): `list` (no
+    /// `pr`) or `show`; the reviewer's `report` (with `critical`) and
+    /// `agree`, the owner's `fixed`, each with its line (`text`); `sweep`
+    /// looks at every review now (a space's review was turned off).
+    /// `from`: the terminal that ran it.
+    Review {
+        #[serde(default)]
+        action: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        pr: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        critical: Option<u32>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+    },
     /// What only the user can decide, in queue order (`tower decisions`).
     /// No `space`: the main queue (muted spaces left out). `space`: that
     /// space's own. `all`: the last ones that closed too.
@@ -255,6 +272,32 @@ pub enum Request {
         #[serde(default)]
         dry_run: bool,
     },
+    /// A space's plan before it is launched (`tower plan`, see
+    /// `crate::plans`): `new` (`form`, `ticket`, `draft`: the planner is
+    /// started), `say` (`id`, `text`, `who`: `user` or `planner`; the
+    /// user's is queued to the planner), `draft` (`id`, `draft`: the
+    /// planner's revision, checked), `published` (`id`, `url`), `failed`
+    /// (`id`, `text`), `show` (`id`, or the open one), `close` (`id`, or
+    /// the open one; `launched`: the space it was launched as), `list`.
+    Plan {
+        action: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        form: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        ticket: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        draft: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        text: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        url: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        who: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launched: Option<String>,
+    },
     /// A screenshot was added (`tower screenshot`): the state's list is re-read.
     Screenshots,
     Status,
@@ -288,10 +331,12 @@ fn wait_for(req: &Request) -> Duration {
         Request::Queue { .. } | Request::Agenda { .. } => Duration::from_secs(90),
         // It asks Herdr about every session first.
         Request::Missions => Duration::from_secs(60),
+        // A report queues a note to the owner; a sweep may end reviewers.
+        Request::Review { .. } => Duration::from_secs(60),
         // An undo ends terminals and takes worktrees away.
         Request::Act { action, .. } if action == "undo" => Duration::from_secs(120),
-        // Ending a brain's terminal, and Herdr's answers on the way.
-        Request::Model { .. } | Request::Brains { .. } => Duration::from_secs(45),
+        // Ending a brain's terminal, and Herdr's answers on the way (a plan's planner too).
+        Request::Model { .. } | Request::Brains { .. } | Request::Plan { .. } => Duration::from_secs(45),
         _ => Duration::from_secs(10),
     }
 }
@@ -367,6 +412,12 @@ mod tests {
         assert!(matches!(serde_json::from_str::<Request>(r#"{"cmd":"decisions"}"#).unwrap(), Request::Decisions { space: None, all: false }));
         assert!(matches!(serde_json::from_str::<Request>(r#"{"cmd":"missions"}"#).unwrap(), Request::Missions));
         assert_eq!(serde_json::to_string(&Request::Missions).unwrap(), r#"{"cmd":"missions"}"#);
+        let report: Request = serde_json::from_str(r#"{"cmd":"review","action":"report","pr":"o/app#12","critical":2,"text":"two","from":"t9"}"#).unwrap();
+        assert!(matches!(report, Request::Review { ref action, critical: Some(2), from: Some(ref f), .. } if action == "report" && f == "t9"));
+        assert_eq!(
+            serde_json::to_string(&Request::Review { action: "list".into(), pr: String::new(), critical: None, text: String::new(), from: None }).unwrap(),
+            r#"{"cmd":"review","action":"list"}"#
+        );
         let own: Request = serde_json::from_str(r#"{"cmd":"decisions","space":"Shop","all":true}"#).unwrap();
         assert!(matches!(own, Request::Decisions { space: Some(ref s), all: true } if s == "Shop"));
         // What the tower opened: recorded by the command that opened it, undone by its id or the latest.
@@ -375,6 +426,13 @@ mod tests {
         let undo: Request = serde_json::from_str(r#"{"cmd":"act","action":"undo","id":"r0123456789ab","force":true}"#).unwrap();
         assert!(matches!(undo, Request::Act { ref action, id: Some(ref i), force: true, act: None, .. } if action == "undo" && crate::acts::is_id(i)));
         assert_eq!(serde_json::to_string(&Request::Act { action: "undo".into(), id: None, force: false, act: None, from: None }).unwrap(), r#"{"cmd":"act","action":"undo","force":false}"#);
+        // A plan: the planner's answer, the user's message; a plan's start carries its draft.
+        let say: Request = serde_json::from_str(r#"{"cmd":"plan","action":"say","id":"p3","text":"which first?","who":"user"}"#).unwrap();
+        assert!(matches!(say, Request::Plan { ref action, ref id, ref who, draft: None, .. } if action == "say" && id == "p3" && who == "user"));
+        let new: Request = serde_json::from_str(r#"{"cmd":"plan","action":"new","form":"page","ticket":"T","draft":{"space":"x"}}"#).unwrap();
+        assert!(matches!(new, Request::Plan { ref form, draft: Some(ref d), .. } if form == "page" && d["space"] == "x"));
+        let show = Request::Plan { action: "show".into(), id: String::new(), form: String::new(), ticket: String::new(), draft: None, text: String::new(), url: String::new(), who: String::new(), launched: None };
+        assert_eq!(serde_json::to_string(&show).unwrap(), r#"{"cmd":"plan","action":"show"}"#);
         // A decision is answered through the request a question set is, with its own body.
         let answer: Request = serde_json::from_str(r#"{"cmd":"answer","target":"d0123456789ab","answers":{"choice":1}}"#).unwrap();
         assert!(matches!(answer, Request::Answer { ref target, ref answers, submit: true } if crate::decisions::is_id(target) && answers["choice"] == 1));

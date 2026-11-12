@@ -30,7 +30,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use super::home::{CARD, LINE, SOFT, acts_row, bay_label, cstat, empty_box, mbtn, sign, tg};
 use super::launch::field;
 use super::session::last_words;
-use super::window::{bay, eff, lrow, mark_box, named, named_short, nm, pg, whead};
+use super::window::{bay, eff, lrow, mark_box, nm, pg, whead};
 use super::{AMBER, CYAN, Panel, glass};
 use crate::orb::model::{self, Chip, Decision, Member, Mission, Missions};
 use crate::orb::nav::Scope;
@@ -113,6 +113,21 @@ pub(super) fn closed_line(name: &str, out: &str) -> String {
     }
     parts.push(if v["report"].as_str().is_some_and(|r| !r.trim().is_empty()) { "Its closing report is in Record.".into() } else { "It had no closing report.".to_string() });
     parts.join(" ")
+}
+
+/// The reviews of a space's open PRs, a line each: "PR #12 · Review: 2
+/// critical, round 2 · fix-login-review-app-12".
+pub(super) fn review_lines(space: &str, prs: &std::collections::BTreeMap<String, crate::prs::Pr>) -> Vec<String> {
+    let mut list: Vec<&crate::prs::Pr> = prs.values().filter(|p| p.open() && p.space.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(space)) && p.review.is_some()).collect();
+    list.sort_by_key(|p| (p.repo.clone(), p.number));
+    list.iter()
+        .filter_map(|p| {
+            let r = p.review.as_ref()?;
+            let line = if r.line.is_empty() { crate::reviews::chip_line(r) } else { r.line.clone() };
+            let who = if r.reviewer_name.is_empty() { String::new() } else { format!(" · {}", r.reviewer_name) };
+            Some(format!("PR #{} ({}) · {line}{who}", p.number, p.repo.rsplit('/').next().unwrap_or(&p.repo)))
+        })
+        .collect()
 }
 
 /// The tower refused to close a space because a session there still works
@@ -225,6 +240,28 @@ impl Panel {
         });
     }
 
+    /// Review its PRs, or stop: `tower space review <space> on|off`, shown at
+    /// once and taken back with the command's error if the tower refuses.
+    pub(super) fn set_review(&mut self, space: &str, on: bool, cx: &mut Context<Self>) {
+        let place = format!("space:{space}");
+        if self.running(&place) {
+            return;
+        }
+        let name = space.to_string();
+        self.tower.update(cx, |t, cx| {
+            t.set_mark(&name, |m| m.review = Some(on));
+            cx.notify();
+        });
+        self.run(&place, vec!["space".into(), "review".into(), space.to_string(), if on { "on" } else { "off" }.into()], cx, move |this, result, cx| {
+            if result.is_err() {
+                this.tower.update(cx, |t, cx| {
+                    t.set_mark(&name, |m| m.review = None);
+                    cx.notify();
+                });
+            }
+        });
+    }
+
     /// "Close this space": `tower space close` (`force`: though a session
     /// there still works), then back to every space with what it did.
     fn close_space(&mut self, space: &str, force: bool, cx: &mut Context<Self>) {
@@ -261,24 +298,24 @@ impl Panel {
             sub.push(div().child("A standing space: the tower never closes it and opens no worktrees here.").into_any_element());
         } else if m.goal.trim().is_empty() {
             sub.push(div().child("No goal: it has no end, and the tower opens no worktrees here.").into_any_element());
-        } else {
-            // Its first two lines; all of it under Goal.
-            sub.push(named_short("Goal", m.goal.trim(), 2));
-            if !m.done_when.trim().is_empty() {
-                sub.push(named("Done when", m.done_when.trim()));
-            }
         }
-        let (m1, n1, n2) = (m.clone(), name.to_string(), name.to_string());
-        let (follow, mute) = (m.follow, m.mute);
+        // The goal and what counts as done: a block of their own under the head (not while it is being changed).
+        let (m1, n1, n2, n3) = (m.clone(), name.to_string(), name.to_string(), name.to_string());
+        let (follow, mute, review) = (m.follow, m.mute, m.review);
         let toggles = h_flex()
             .gap(px(6.0))
             .child(tg("space-goal", if m.goal.trim().is_empty() && !m.standing { "Set a goal" } else { "Goal" }, editing).on_click(cx.listener(move |this, _, window, cx| this.toggle_goal(&m1, window, cx))))
             .child(tg("space-follow", "Follow", follow).on_click(cx.listener(move |this, _, _, cx| this.set_switch(&n1, true, !follow, cx))))
             .child(tg("space-mute", "Mute", mute).on_click(cx.listener(move |this, _, _, cx| this.set_switch(&n2, false, !mute, cx))))
+            .child(tg("space-review", "Review PRs", review).on_click(cx.listener(move |this, _, _, cx| this.set_review(&n3, !review, cx))))
             .into_any_element();
         let head = whead(name, sub, Some(toggles));
 
         let mut items: Vec<AnyElement> = vec![];
+        let editing_goal = self.full.as_ref().and_then(|f| f.edit.as_ref()).is_some_and(|e| e.space == name);
+        if !m.standing && !m.goal.trim().is_empty() && !editing_goal {
+            items.push(goal_block(m.goal.trim(), m.done_when.trim()));
+        }
         // The goal, being changed.
         if let Some(edit) = self.full.as_ref().and_then(|f| f.edit.as_ref()).filter(|e| e.space == name) {
             let standing = edit.standing;
@@ -332,6 +369,12 @@ impl Panel {
         }
         if m.mute {
             items.push(eff("Muted. Its decisions stay here and leave the orb’s count and the main queue."));
+        }
+        // Its PRs' reviews: where each stands; or that its PRs get none.
+        if !m.review {
+            items.push(eff("PR review is off. A PR a session opens here gets no reviewer: you review it yourself."));
+        } else {
+            items.extend(review_lines(name, &self.tower.read(cx).prs).into_iter().map(eff));
         }
         // Its goal is met: the closing report, and the way to close it.
         if m.ready() {
@@ -436,9 +479,10 @@ impl Panel {
         let sp = space.to_string();
         let head = h_flex()
             .w_full()
+            .flex_wrap()
             .items_center()
             .gap(px(10.0))
-            .child(bay_label(&label).flex_1())
+            .child(bay_label(&label).flex_1().min_w(px(200.0)))
             .when(from > 0, |el| {
                 el.child(link("thread-earlier".into(), format!("{from} earlier")).on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(f) = this.full.as_mut() {
@@ -600,7 +644,7 @@ fn msg_is_long(text: &str, width: f32) -> bool {
 }
 
 /// "7:50 PM · 12m ago" today, else the day and the time.
-fn when_said(at: u64) -> String {
+pub(super) fn when_said(at: u64) -> String {
     if at == 0 {
         return String::new();
     }
@@ -613,6 +657,54 @@ fn sender_colour(address: &str) -> u32 {
     const COLOURS: [u32; 5] = [CYAN, AMBER, 0xb9a7ff, 0x8fe3b0, 0xff9fb2];
     let n = address.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
     COLOURS[n as usize % COLOURS.len()]
+}
+
+/// A space's goal, and what counts as done as a list, each its own line
+/// with room around it.
+fn goal_block(goal: &str, done_when: &str) -> AnyElement {
+    let g = glass();
+    let done = done_items(done_when);
+    v_flex()
+        .w_full()
+        .px(px(16.0))
+        .py(px(14.0))
+        .gap(px(10.0))
+        .rounded(px(18.0))
+        .bg(rgba(CARD))
+        .border_1()
+        .border_color(rgba(LINE))
+        .child(bay_label("Goal").px(px(0.0)))
+        .child(div().text_size(px(16.0)).line_height(px(23.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.text).child(goal.to_string()))
+        .when(!done.is_empty(), |el| {
+            el.child(div().pt(px(4.0)).child(bay_label("Done when").px(px(0.0)))).child(v_flex().gap(px(8.0)).children(done.into_iter().map(|d| {
+                h_flex()
+                    .items_start()
+                    .gap(px(10.0))
+                    .text_size(px(13.5))
+                    .line_height(px(20.0))
+                    .child(div().flex_none().text_color(g.faint).child("•"))
+                    .child(div().flex_1().min_w_0().text_color(g.text).child(d))
+            })))
+        })
+        .into_any_element()
+}
+
+/// What counts as done, a condition each: split where the goal joined them
+/// ("; ", or its lines), without list marks.
+fn done_items(done_when: &str) -> Vec<String> {
+    done_when
+        .split(['\n', ';'])
+        .map(|s| s.trim().trim_start_matches(['-', '*', '•']).trim())
+        .map(|s| s.trim_end_matches('…').trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let mut c = s.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -640,6 +732,16 @@ mod tests {
         assert_eq!(said_text("From Shop › web (t7h): the build is green"), "the build is green");
         assert_eq!(said_text("From t7h: fixed (see PR 12). Next is the editor."), "fixed (see PR 12). Next is the editor.");
         assert_eq!(said_text("From the orb session: hello"), "From the orb session: hello", "not a session's signature");
+    }
+
+    #[test]
+    fn done_when_is_a_list_a_condition_each() {
+        assert_eq!(
+            done_items("Incoming support messages have a Translate Message option; the user's message language is detected automatically;  "),
+            ["Incoming support messages have a Translate Message option", "The user's message language is detected automatically"]
+        );
+        assert_eq!(done_items("- one\n- two"), ["One", "Two"]);
+        assert!(done_items("").is_empty());
     }
 
     #[test]

@@ -576,6 +576,14 @@ impl Panel {
             eprintln!("[orb] HERDER_TOWER_ORB_ANSWER: no open card {id}");
             return;
         };
+        // A merge card: its button `choice` (the first asks about a PR; nothing merges before Confirm).
+        if d.kind == Kind::Merge && !d.prs.is_empty() {
+            match self.merge_acts(&d, cx).into_iter().nth(choice) {
+                Some((_, _, act)) => self.merge_act(&d, act, cx),
+                None => eprintln!("[orb] HERDER_TOWER_ORB_ANSWER: {id} has no button {choice}"),
+            }
+            return;
+        }
         let Some(o) = d.options.get(choice) else {
             eprintln!("[orb] HERDER_TOWER_ORB_ANSWER: {id} has no option {choice}");
             return;
@@ -1025,7 +1033,7 @@ impl Panel {
 
     /// A reply's receipt: what the tower opened, what it assumed as chips,
     /// and Undo while that is still possible; once undone, how it closed.
-    fn act_items(&mut self, a: &ActShown, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    pub(super) fn act_items(&mut self, a: &ActShown, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if a.undone {
             let (head, rest) = closing_parts(a.closing.as_deref().unwrap_or("Closed it."));
             return vec![

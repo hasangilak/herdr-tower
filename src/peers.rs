@@ -145,6 +145,10 @@ pub const TO_BRAIN: &str = "[session] ";
 pub fn sender_in(text: &str) -> Option<String> {
     let mut t = text.trim_start();
     t = t.strip_prefix(TO_BRAIN).unwrap_or(t).trim_start();
+    // An agent's own message from another session: `<cross-session-message from="…" from-name="web" …>`.
+    if let Some(name) = cross_session_sender(t) {
+        return Some(name);
+    }
     if t.starts_with("<pasted_content")
         && let Some(end) = t.find('>')
     {
@@ -163,6 +167,24 @@ pub fn sender_in(text: &str) -> Option<String> {
     let close = open + line[open..].find(')')?;
     let inside = line[open + 1..close].trim();
     address_at(inside).filter(|a| a.len() == inside.len())
+}
+
+/// The session an agent's own message between sessions names
+/// (`<cross-session-message from="uds:…" from-name="support-translation-eyzflow" …>`):
+/// its name, else what `from` says. None: it is no such message.
+pub fn cross_session_sender(text: &str) -> Option<String> {
+    let t = text.trim_start();
+    let head = t.get(..22)?;
+    if !head.eq_ignore_ascii_case("<cross-session-message") {
+        return None;
+    }
+    let tag = &t[..t.find('>').unwrap_or(t.len().min(400))];
+    let attr = |name: &str| -> Option<String> {
+        let at = tag.find(&format!("{name}=\""))? + name.len() + 2;
+        let end = tag[at..].find('"')?;
+        Some(tag[at..at + end].to_string()).filter(|v| !v.trim().is_empty())
+    };
+    Some(attr("from-name").or_else(|| attr("from")).unwrap_or_else(|| "another session".into()))
 }
 
 /// A session's address at the start of `s` (`t7h`, `vps/t2`), as a whole
@@ -383,6 +405,15 @@ mod tests {
             "status": { "state": "working", "app": "claude-code" },
             "labels": { "where": format!("{space} / {name}") },
         })
+    }
+
+    #[test]
+    fn an_agents_own_message_between_sessions_is_a_sessions() {
+        let m = "<cross-session-message from=\"uds:/tmp/cc-socks/73772.sock\" from-name=\"support-translation-eyz-mediaroom-serverless\" from-mode=\"prompting\"> Translation is live on prod.";
+        assert_eq!(cross_session_sender(m).as_deref(), Some("support-translation-eyz-mediaroom-serverless"));
+        assert_eq!(sender_in(m).as_deref(), Some("support-translation-eyz-mediaroom-serverless"));
+        assert_eq!(cross_session_sender("<cross-session-message from=\"uds:/tmp/x.sock\">hi").as_deref(), Some("uds:/tmp/x.sock"));
+        assert_eq!(cross_session_sender("please look at the cross-session-message thing"), None);
     }
 
     #[test]

@@ -1,18 +1,26 @@
-//! Setups: what a space is launched with. A setup is a name, the Claude
-//! account its sessions run on, and the repos (folders) that get a session
-//! each; `tower launch` opens a space from one.
+//! Projects (still called setups in config.toml and the commands, for the
+//! files and phones from before): what a space is launched with. A project
+//! is a name, the Claude account its sessions run on, a line on what it is
+//! (`about`), the repos (folders) that get a session each, and a line on
+//! what each repo is in it (`roles`). `tower launch` opens a space from one,
+//! and a ticket's draft (`crate::ticket`) reads them to pick the repos a
+//! ticket needs.
 //!
 //! They are `[[setups]]` tables in config.toml:
 //!
 //! ```toml
 //! [[setups]]
-//! name = "eyzflow + mediaroom on orca"
+//! name = "EYZFlow"
 //! account = "orca"
+//! about = "the video platform agencies run their media on"
 //! repos = ["~/Work/eyz/eyzflow", "~/Work/eyz/eyz-mediaroom-serverless"]
+//! roles = { "~/Work/eyz/eyzflow" = "the web app and its API", "~/Work/eyz/eyz-mediaroom-serverless" = "the media backend" }
 //! ```
 //!
 //! `tower setup add|remove` edits the file's text, so the rest of it (its
-//! comments, its order) stays as the user wrote it.
+//! comments, its order) stays as the user wrote it. A repo is given as
+//! `--repo "<folder>=<its role>"` (or `<folder> — <its role>`), the role
+//! left out when it has none.
 
 use std::io::IsTerminal;
 use std::path::Path;
@@ -53,12 +61,29 @@ fn blocks(lines: &[&str]) -> Vec<(usize, usize, String)> {
 
 fn block(s: &Setup) -> Vec<String> {
     let q = |v: &str| toml::Value::String(v.to_string()).to_string();
-    vec![
-        "[[setups]]".to_string(),
-        format!("name = {}", q(&s.name)),
-        format!("account = {}", q(&s.account)),
-        format!("repos = [{}]", s.repos.iter().map(|r| q(r)).collect::<Vec<_>>().join(", ")),
-    ]
+    let mut out = vec!["[[setups]]".to_string(), format!("name = {}", q(&s.name)), format!("account = {}", q(&s.account))];
+    if !s.about.trim().is_empty() {
+        out.push(format!("about = {}", q(s.about.trim())));
+    }
+    out.push(format!("repos = [{}]", s.repos.iter().map(|r| q(r)).collect::<Vec<_>>().join(", ")));
+    // A role is a repo's: in the order of the repos, none for a repo that isn't one of them.
+    let roles: Vec<String> = s.repos.iter().filter_map(|r| Some(s.role_of(r)).filter(|x| !x.is_empty()).map(|x| format!("{} = {}", q(r), q(x)))).collect();
+    if !roles.is_empty() {
+        out.push(format!("roles = {{ {} }}", roles.join(", ")));
+    }
+    out
+}
+
+/// A repo as `--repo` (or a line of the window's form) gives it: `<folder>=<its
+/// role>`, or `<folder> — <its role>` (an em or en dash, or `-`, with a space
+/// each side); just the folder when it has no role.
+pub fn repo_and_role(given: &str) -> (String, String) {
+    let given = given.trim();
+    let cut = given.split_once('=').or_else(|| [" — ", " – ", " -- ", " - "].iter().find_map(|sep| given.split_once(sep)));
+    match cut {
+        Some((folder, role)) => (folder.trim().to_string(), role.split_whitespace().collect::<Vec<_>>().join(" ")),
+        None => (given.to_string(), String::new()),
+    }
 }
 
 fn same(a: &str, b: &str) -> bool {
@@ -67,10 +92,18 @@ fn same(a: &str, b: &str) -> bool {
 
 /// A config.toml's text with the setup in it: in the place of the one with
 /// that name, else at the end. The rest is kept as it is.
+#[cfg(test)]
 pub fn with_added(text: &str, s: &Setup) -> String {
+    with_added_as(text, s, None)
+}
+
+/// The same, in the place of the one called `was` when it is given (a
+/// project renamed keeps its place, so the first stays the default).
+pub fn with_added_as(text: &str, s: &Setup, was: Option<&str>) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut out: Vec<String> = vec![];
-    match blocks(&lines).into_iter().find(|(_, _, name)| same(name, &s.name)) {
+    let named = |name: &str| was.is_some_and(|w| same(name, w)) || same(name, &s.name);
+    match blocks(&lines).into_iter().find(|(_, _, name)| named(name)) {
         Some((start, end, _)) => {
             // Blank lines that closed the old table stay between it and the next.
             let tail = lines[start..end].iter().rev().take_while(|l| l.trim().is_empty()).count();
@@ -119,8 +152,13 @@ fn write(path: &Path, text: String) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn add_at(path: &Path, s: &Setup) -> Result<()> {
-    write(path, with_added(&std::fs::read_to_string(path).unwrap_or_default(), s))
+    add_as_at(path, s, None)
+}
+
+pub fn add_as_at(path: &Path, s: &Setup, was: Option<&str>) -> Result<()> {
+    write(path, with_added_as(&std::fs::read_to_string(path).unwrap_or_default(), s, was))
 }
 
 pub fn remove_at(path: &Path, name: &str) -> Result<bool> {
@@ -157,11 +195,13 @@ pub fn pick<'a>(setups: &'a [Setup], want: Option<&str>) -> Result<(&'a Setup, S
     }
 }
 
-fn row(s: &Setup) -> serde_json::Value {
-    json!({ "name": s.name, "account": s.account, "repos": s.repos })
+/// A project as `tower setups --json` and `GET /v1/setups` give it.
+pub fn row(s: &Setup) -> serde_json::Value {
+    let roles: serde_json::Map<String, serde_json::Value> = s.repos.iter().filter(|r| !s.role_of(r).is_empty()).map(|r| (r.clone(), json!(s.role_of(r)))).collect();
+    json!({ "name": s.name, "account": s.account, "about": s.about.trim(), "repos": s.repos, "roles": roles })
 }
 
-/// `{"setups": [{"name", "account", "repos": […]}]}`, as `tower setups --json` prints it.
+/// `{"setups": [{"name", "account", "about", "repos": […], "roles": {repo: role}}]}`, as `tower setups --json` prints it.
 pub fn value() -> Result<serde_json::Value> {
     Ok(json!({ "setups": list()?.iter().map(row).collect::<Vec<_>>() }))
 }
@@ -177,7 +217,14 @@ pub fn cmd_list(as_json: bool) -> Result<()> {
         println!("No setups yet: tower setup add \"<name>\" --account <account> --repo <folder> [--repo <folder>…]");
     }
     for (i, s) in list.iter().enumerate() {
-        println!("{} {}  (account {})  {}", if i == 0 { "*" } else { " " }, s.name, if s.account.is_empty() { "-" } else { &s.account }, s.repos.join(", "));
+        let about = if s.about.trim().is_empty() { String::new() } else { format!("  {}", s.about.trim()) };
+        println!("{} {}  (account {}){about}", if i == 0 { "*" } else { " " }, s.name, if s.account.is_empty() { "-" } else { &s.account });
+        for r in &s.repos {
+            match s.role_of(r) {
+                "" => println!("    {r}"),
+                role => println!("    {r} — {role}"),
+            }
+        }
     }
     Ok(())
 }
@@ -202,11 +249,21 @@ fn repo(given: &str, notes: &mut Vec<String>) -> Result<String> {
     }
 }
 
-/// `tower setup add "<name>" --account <a> --repo <dir> [--repo <dir>…]`.
-pub fn cmd_add(name: &str, account: Option<&str>, repos: &[String]) -> Result<()> {
+/// `tower setup add "<name>" --account <a> [--about "<line>"] --repo "<dir>[=<role>]" [--repo …] [--was "<old name>"]`.
+pub fn cmd_add(name: &str, account: Option<&str>, about: Option<&str>, repos: &[String], was: Option<&str>) -> Result<()> {
     let name = name.trim();
     if name.is_empty() || repos.is_empty() {
-        bail!("tower setup add \"<name>\" --account <account> --repo <folder> [--repo <folder>…]");
+        bail!("tower setup add \"<name>\" --account <account> [--about \"<what it is>\"] --repo \"<folder>=<its role>\" [--repo …]");
+    }
+    let was = was.map(str::trim).filter(|w| !w.is_empty() && !same(w, name));
+    let have = list()?;
+    if let Some(w) = was {
+        if !have.iter().any(|s| same(&s.name, w)) {
+            bail!("no project {w:?} to rename");
+        }
+        if have.iter().any(|s| same(&s.name, name)) {
+            bail!("a project called {name:?} is there already");
+        }
     }
     let mut notes = vec![];
     // The account as the claude-accounts mod knows it (the first one when none is given).
@@ -220,24 +277,36 @@ pub fn cmd_add(name: &str, account: Option<&str>, repos: &[String]) -> Result<()
         Err(e) => return Err(e),
     };
     let mut folders: Vec<String> = vec![];
-    for r in repos {
-        let r = repo(r, &mut notes)?;
+    let mut roles = std::collections::BTreeMap::new();
+    for given in repos {
+        let (folder, role) = repo_and_role(given);
+        if folder.is_empty() {
+            continue;
+        }
+        let r = repo(&folder, &mut notes)?;
         if !folders.contains(&r) {
-            folders.push(r);
+            folders.push(r.clone());
+        }
+        if !role.is_empty() {
+            roles.insert(r, role);
         }
     }
-    let setup = Setup { name: name.to_string(), account, repos: folders };
+    if folders.is_empty() {
+        bail!("tower setup add \"<name>\": no repo given (--repo \"<folder>=<its role>\")");
+    }
+    let about = about.map(|a| a.split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+    let setup = Setup { name: name.to_string(), account, about, repos: folders, roles };
     config::Config::write_default_if_missing()?;
-    let replaced = list()?.iter().any(|s| same(&s.name, name));
-    add_at(&config::config_file(), &setup)?;
+    let replaced = was.is_some() || have.iter().any(|s| same(&s.name, name));
+    add_as_at(&config::config_file(), &setup, was)?;
     if std::io::stdout().is_terminal() {
         println!(
-            "{} the setup \"{}\": account {}, {} repo(s): {}.{}",
+            "{} the project \"{}\": account {}, {} repo(s): {}.{}",
             if replaced { "Changed" } else { "Added" },
             setup.name,
             if setup.account.is_empty() { "-" } else { &setup.account },
             setup.repos.len(),
-            setup.repos.join(", "),
+            setup.repos.iter().map(|r| match setup.role_of(r) { "" => r.clone(), role => format!("{r} ({role})") }).collect::<Vec<_>>().join(", "),
             notes.iter().map(|n| format!(" {}{}.", n[..1].to_uppercase(), &n[1..])).collect::<String>()
         );
     } else {
@@ -265,7 +334,58 @@ mod tests {
     use super::*;
 
     fn setup(name: &str, account: &str, repos: &[&str]) -> Setup {
-        Setup { name: name.into(), account: account.into(), repos: repos.iter().map(|r| r.to_string()).collect() }
+        Setup { name: name.into(), account: account.into(), repos: repos.iter().map(|r| r.to_string()).collect(), ..Default::default() }
+    }
+
+    #[test]
+    fn a_project_keeps_what_it_is_and_what_each_repo_is_through_the_file() {
+        let mut p = setup("EYZFlow", "orca", &["~/Work/eyz/eyzflow", "~/Work/eyz/eyz-mediaroom-serverless", "/w/docs"]);
+        p.about = "the video platform \"agencies\" run on".into();
+        p.roles.insert("~/Work/eyz/eyzflow".into(), "the web app and its API".into());
+        p.roles.insert("~/Work/eyz/eyz-mediaroom-serverless".into(), "the media backend: lambdas, S3".into());
+        let text = with_added(CONFIG, &p);
+        assert!(
+            text.ends_with(
+                "[[setups]]\nname = \"EYZFlow\"\naccount = \"orca\"\nabout = 'the video platform \"agencies\" run on'\nrepos = [\"~/Work/eyz/eyzflow\", \"~/Work/eyz/eyz-mediaroom-serverless\", \"/w/docs\"]\nroles = { \"~/Work/eyz/eyzflow\" = \"the web app and its API\", \"~/Work/eyz/eyz-mediaroom-serverless\" = \"the media backend: lambdas, S3\" }\n"
+            ),
+            "{text}"
+        );
+        // It reads back as it was, beside everything else; a repo with no role has none.
+        let cfg: config::Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.setups, std::slice::from_ref(&p));
+        assert_eq!((cfg.setups[0].role_of("~/Work/eyz/eyzflow"), cfg.setups[0].role_of("/w/docs")), ("the web app and its API", ""));
+        // The same folder written another way finds its role.
+        let whole = crate::dispatch::expand("~/Work/eyz/eyzflow/");
+        assert_eq!(cfg.setups[0].role_of(&whole), "the web app and its API");
+        // As the phone and the window read it.
+        let shown = row(&cfg.setups[0]);
+        assert_eq!(shown["about"], "the video platform \"agencies\" run on");
+        assert_eq!(shown["roles"], json!({ "~/Work/eyz/eyzflow": "the web app and its API", "~/Work/eyz/eyz-mediaroom-serverless": "the media backend: lambdas, S3" }));
+        assert_eq!(shown["repos"].as_array().map(|a| a.len()), Some(3));
+        // A table from before has neither, and is written back without them.
+        let old = "[[setups]]\nname = \"web\"\naccount = \"orca\"\nrepos = [\"~/w/web\"]\n";
+        let cfg: config::Config = toml::from_str(old).unwrap();
+        assert_eq!((cfg.setups[0].about.as_str(), cfg.setups[0].roles.len()), ("", 0));
+        assert_eq!(with_added("", &cfg.setups[0]), old);
+        assert_eq!(row(&cfg.setups[0])["roles"], json!({}));
+        // Renamed, it keeps its place (the first stays the default); the other is untouched.
+        let both = with_added(&with_added("", &cfg.setups[0]), &p);
+        let renamed = with_added_as(&both, &setup("website", "orca", &["~/w/web"]), Some("WEB"));
+        let cfg: config::Config = toml::from_str(&renamed).unwrap();
+        assert_eq!(cfg.setups.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["website", "EYZFlow"]);
+    }
+
+    #[test]
+    fn a_repo_is_given_with_its_role() {
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(repo_and_role("~/Work/eyz/eyzflow=the web app"), pair("~/Work/eyz/eyzflow", "the web app"));
+        assert_eq!(repo_and_role(" ~/Work/eyz/eyzflow = the web app,  and its API "), pair("~/Work/eyz/eyzflow", "the web app, and its API"));
+        assert_eq!(repo_and_role("~/Work/eyz/eyz-mediaroom-serverless — the media backend"), pair("~/Work/eyz/eyz-mediaroom-serverless", "the media backend"));
+        assert_eq!(repo_and_role("eyzflow – the app"), pair("eyzflow", "the app"));
+        assert_eq!(repo_and_role("eyzflow - the app - and more"), pair("eyzflow", "the app - and more"));
+        // A dash inside a folder's name is the name's.
+        assert_eq!(repo_and_role("~/Work/eyz/eyz-mediaroom-serverless"), pair("~/Work/eyz/eyz-mediaroom-serverless", ""));
+        assert_eq!(repo_and_role("  "), pair("", ""));
     }
 
     const CONFIG: &str = "# herder-tower settings.\n\nvoice = \"af_bella\"  # the voice\nwake_words = [\n    \"hey tower\",\n    \"tower\",\n]\n\n[tell]\nlevel = \"results\"\n\n[lan]\nenabled = true\nport = 7843\n";

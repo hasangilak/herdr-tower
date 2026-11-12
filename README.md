@@ -226,7 +226,9 @@ types the answers into the session, the card says how that goes, and when
 several sessions asked the same thing they all get the answer. If typing
 stops half way, the card says so and offers the session or another try. A
 merge card lists its pull requests, into dev before into main, each with
-its checks; its button asks about one, "Confirm" merges it (a PR whose
+its checks and where its review stands ("Review: 2 critical, round 2",
+in amber until it is agreed); its button asks about one (a review that
+isn't agreed is said among what to mind, and the merge is still yours), "Confirm" merges it (a PR whose
 checks fail takes a third step, from its own row; a draft or a conflict is
 held back). What the brain raised shows its choices as buttons, the
 tower's pick in amber with its reason, and Other; a task that failed twice
@@ -256,15 +258,16 @@ and the orb opens the floating panel from then on. The mode is kept in
 a card answered or picked in one is so in the other. A sidebar on the left: **All spaces** with the count of what is
 yours, each open space with its mark and a line (its sessions, "standing",
 "ready to close"), **New space**, the quiet spaces and what closed today
-folded into one line, and **Record**, **Shots** and **Settings** at the
-foot. The pane beside it shows:
+folded into one line, and **Record**, **Shots**, **Projects** and
+**Settings** at the foot. The pane beside it shows:
 
 - **All spaces**: the queue, beside the open spaces as missions: each
   one's goal (or what it is asked now), how far its request is ("3 of 5",
   "ready to close"), its sessions, whether they have their own worktrees,
   and how many messages they wrote each other.
 - **A space**: its goal and what counts as done (the **Goal** button
-  changes them, or makes it a standing space), **Follow** and **Mute**, its
+  changes them, or makes it a standing space), **Follow**, **Mute** and
+  **Review PRs** (with a line per open PR on where its review stands), its
   closing report with **Close this space** once it is ready (and when it
   would close by itself), what needs you there (a muted space's decisions
   show only here), its requests, its sessions (status, last words, worktree
@@ -277,9 +280,40 @@ foot. The pane beside it shows:
 - **A session** (a click on its row): what it was asked, what it last
   said, its screen as it is now (read again every couple of seconds), the
   card that waits on it, and **Show in Herdr**.
-- **New space**: a goal and a saved setup; the tower says what it will do
-  (the name it gives the space, the sessions it opens and on which account,
-  their worktrees) before you press **Launch**. It asks nothing.
+- **New space**: a goal, or a whole ticket pasted as it is, and a
+  **Project** (none picked: the tower's brain picks). A goal whose first
+  line names the repos ("open sessions in eyzflow and mediaroom: …") shows
+  what the tower will do (the name it gives the space, the sessions it
+  opens and on which account, their worktrees), and **Launch** is the
+  confirm. Any other goal gets **Draft the space**: the tower's brain reads
+  the ticket ("Reading the ticket…", a few seconds) and shows the draft as
+  a card: the space's name, its goal (the ticket's title), done when (its
+  acceptance criteria), each session's repo and why it is in it, and the
+  project and account, with a **Review its PRs** switch under it (on: each
+  PR its sessions open gets a reviewer; it is under the plan of a goal
+  whose first line names its repos too). **Launch** opens exactly that; **Adjust it in
+  words…** with **Redraft** gets a new draft in its place ("leave the
+  dashboard out", "call it msg-translation"); **Start over** drops it.
+  Nothing opens before Launch. The whole ticket goes to the sessions as
+  their brief; the space's header keeps the title.
+  **Plan as a page** or **Plan as a whiteboard**, under the draft, shows
+  you the plan before anything opens: the tower's planner (a Claude Code
+  terminal of the tower's, `tower-planner`, on your default account and the
+  brains' model) reads the ticket, the draft and the repos, writes the full
+  plan (each session's part and its order, how the repos fit together, the
+  risks, the open questions, how it is tested) and publishes it to your
+  claude.ai account, private, as an HTML page or a Whiteboard ("The tower's
+  brain is writing the plan… (it reads the repos first: about five minutes)", then **Plan · page ·
+  Open**). Under the card is the chat about it: ask about the plan or
+  change it ("which session starts first?", "leave the dashboard out") in
+  "Ask about the plan or change it…" with **Send**; the planner's answers
+  come in under yours, a change it makes to the draft shows on the card,
+  and a change to the plan republishes the same artifact. A planner that
+  waits on a question in its terminal (a permission to publish) says so,
+  with **Show in Herdr**; one that fails says why, with Plan again.
+  **Launch** then hands each session the plan's link and its own part of
+  the plan; **Start over** ends the plan. The planner never launches,
+  opens a session or edits a repo.
 - **Record**: the history, newest first, each row with its time, what it is
   (You asked, Tower replied, Started, Finished, Needs you, Between
   sessions, Answered for you, Note, Receipt, Decision raised, Decision
@@ -287,13 +321,19 @@ foot. The pane beside it shows:
   chips narrow it to one space, and opened from inside a space it starts
   there.
 - **Shots**: the gallery of what sessions sent (see Screenshots below).
+- **Projects**: what the tower knows of your work, a card each: its name,
+  account, what it is, and its repos with what each is for. **+ Add
+  project** and **Edit** open one form (name, an account pick, about, and
+  the repos one per line, `<folder> — <its role>`); **Remove** asks once.
+  It saves through `tower setup add|remove`. The roles are what a draft
+  reads to pick the repos a ticket needs.
 - **Settings**: how much it tells you; the tower's model (the model and
   effort its brains are started on, what the running one uses, and
   **Restart the tower's brain** when a restart is needed for a change to
   apply); the voice (Off, Decisions, or Replies and decisions; and, as a
   switch of its own, always on this Mac); how many questions it answers for you; Follow and Mute per open
-  space; the behaviors; pairing a phone; the Claude accounts; the saved
-  setups.
+  space; the behaviors; pairing a phone; the Claude accounts; the
+  projects, with the way to their page.
 
 Screenshots carry a small badge naming the Claude account of the session
 that sent them: the default account (the first `tower accounts` lists)
@@ -349,14 +389,71 @@ standing <space> on`), goal or not.
 
 **One sentence opens a space.** `tower launch "Fix the login redirect"`
 names the space from the goal (its first two words that carry meaning:
-`fix-login`, with `-2` if that is taken), takes a setup, makes the Herdr
-space, opens a session per repo of the setup on its account, sets the goal
-and hands it out as the first request. It asks nothing and prints what it
-assumed; `--dry-run` prints the same plan and does nothing. A **setup** is
-a name, a Claude account and the repos that get a session each: `tower
-setup add "<name>" --account <account> --repo <folder> [--repo <folder>…]`,
-`tower setup remove "<name>"`, `tower setups` (kept as `[[setups]]` in
-config.toml; the first is the default).
+`fix-login`, with `-2` if that is taken), takes the repos (those its first
+line names, else a project's), makes the Herdr space, opens a session per
+repo on its account, sets the goal and hands the whole text out as the
+first request. The space's goal is the ticket's title (the line after the
+one that asks for sessions, else the first line) and what counts as done
+is its "Acceptance criteria", "Definition of done" or "Done when" section,
+if it has one. It asks nothing and prints what it assumed; `--dry-run`
+prints the same plan and does nothing.
+
+**A ticket drafts its own space.** `tower launch "<ticket>" --draft`
+has the tower's brain read the ticket (one headless `claude -p` on your
+default account, `[brains] model` at low effort, no tools, about 6 s)
+beside your projects and every folder under the roots with a line on
+each, and print the draft: the repos it needs and why, the space's name,
+its goal, done-when, the project and account. Nothing is opened; a folder
+the tower doesn't know is left out and said so. `--adjust "<what to
+change>" --prior '<the draft's JSON>'` redrafts it. The draft is launched
+as it is with `tower launch "<ticket>" --repo <folder> [--repo …] --name
+<space> --title "<goal>" --done-when "<…>" [--account <a>] [--setup
+<project>]`, which is what New space's Launch runs.
+
+**A draft is planned before it opens.** `tower plan new --form
+page|whiteboard --draft '<the draft's JSON>' --ticket-file <file>` (New
+space's **Plan as a page** / **Plan as a whiteboard**) starts the tower's
+planner: one Claude Code terminal the tower owns (`tower-planner`, hidden,
+on the default account and the `[brains]` model and effort, in
+`~/.local/state/herder-tower/plans/<id>/` with `ticket.md`, `draft.json`,
+`instructions.md` and the `plan.md` it writes). It writes the full plan,
+publishes it as an Artifact on your claude.ai account (an HTML page, or a
+Whiteboard from the account's Whiteboard type: a block per session, arrows
+for what waits for what, a section for the risks and questions), and says
+so (`tower plan published <id> --url <link>`). Then it waits: what you say
+(`tower plan say <id> "…"`) reaches it through the send queue, its answers
+come back the same way, and a change you agree to is a revised draft
+(`tower plan draft <id> --json-file <f>`) and the same artifact
+republished. One plan at a time: a new one, Start over or a launch ends
+its planner. `tower launch … --plan <id>` gives each session the plan's
+link and its own part of `plan.md` (6,000 characters at most), and closes
+the plan. The planner may read anywhere, write only in its folder, and
+run `tower plan`; it may never launch, start or queue anything, or edit a
+repo.
+
+A **project** (a setup, kept as `[[setups]]` in config.toml; the first is
+the default) is a name, a Claude account, a line on what it is, and the
+repos that get a session each with a line on what each is in it:
+
+```sh
+tower setup add "EYZFlow" --account default --about "the video platform agencies run on" \
+  --repo "~/Work/eyz/eyzflow=the web app and its API" \
+  --repo "eyz-mediaroom-serverless=the media backend"    # a folder's name is enough
+tower setup add "EYZ" --was "EYZFlow" …                  # renamed in its place
+tower setup remove "EYZFlow"
+tower setups [--json]                                    # {"setups":[{"name","account","about","repos","roles":{repo: role}}]}
+```
+
+```toml
+[[setups]]
+name = "EYZFlow"
+account = "default"
+about = "the video platform agencies run on"
+repos = ["~/Work/eyz/eyzflow", "~/Work/eyz/eyz-mediaroom-serverless"]
+roles = { "~/Work/eyz/eyzflow" = "the web app and its API", "~/Work/eyz/eyz-mediaroom-serverless" = "the media backend" }
+```
+
+A table from before, with no `about` or `roles`, reads as it always did.
 
 **Worktrees.** A session the tower opens for a mission (`tower launch`,
 `tower start --space <space>`) works in a git worktree of its repo,
@@ -373,6 +470,29 @@ that runs `tower queue <address> "<message>"` sends a message, not a task
 (the same queue: it waits for a busy receiver and arrives once, with the
 sender's name on it). `tower thread [<space>]` lists what a space's
 sessions wrote, and the space's view shows the latest.
+
+**Every PR gets a reviewer.** When a session of a space opens a PR (its
+turn prints the link), the tower opens one reviewer session for it: same
+space, repo and account, named `<space>-review-<repo>-<n>`, in a checkout
+of its own detached at the PR's head
+(`.tower-worktrees/<space>/review-<repo>-<n>`, where it may read and comment
+but never push, merge or edit). It looks for **critical issues only**
+(wrong behaviour against the goal, a crash, security, data loss, a build or
+test failure, a contract broken with another repo; never style or nits),
+posts each as a `Critical:` comment on the PR, messages the PR's session
+itself, and reports to the tower (`tower review report`). The tower passes
+nothing between them: it sends the PR's session one short note per round
+(who the reviewer is, and to fix, push, answer the threads and tell it),
+shows the review on the PR's chip and the merge card ("Reviewing…",
+"Review: 2 critical, round 2", "Review: agreed"), and after three rounds
+without agreement puts it to you as one decision ("Side with the owner",
+"Side with the reviewer", "I'll look"), whose answer goes to both. Merging
+stays yours: a review that isn't agreed is said on the merge card, never
+in the way. Agreed, the PR merged or closed, the space closed or its
+review turned off, the reviewer ends; the record stays (`tower review`).
+It is on for every space; New space's **Review its PRs** switch (`tower
+launch --no-review`), the space's own **Review PRs** switch and `tower
+space review <space> off` turn it off.
 
 ### A tower per space, and the model they run on
 
@@ -646,8 +766,14 @@ tower behavior list                  # how the tower works; add, edit, disable, 
 tower questions                      # what sessions ask now; tower answer <id> --json '[…]', tower dismiss <id>
 tower policy [normal|keep-moving|ask-everything]   # how much the tower answers for you
 tower start --name n --cwd d "task"  # a new Claude session on an account (--account), watched; with --space of a space that has a goal, in that space's worktree of d (--no-worktree: in d itself)
-tower launch "<goal>" [--setup <name>] [--name <space>] [--dry-run]   # open a space for a goal: a session per repo of a setup, each in its worktree, the goal handed out
-tower setups                         # what `tower launch` opens with; tower setup add "<name>" --account <a> --repo <dir> [--repo <dir>…], tower setup remove "<name>"
+tower launch "<goal>" [--setup <name>] [--name <space>] [--no-review] [--dry-run]   # open a space for a goal: a session per repo (named in its first line, or a project's), each in its worktree, the goal handed out; its PRs get a reviewer unless --no-review
+tower launch "<ticket>" --draft [--adjust "<words>" --prior '<draft>']   # the brain drafts the space from the ticket; nothing opens
+tower launch "<ticket>" --repo <dir> [--repo …] --name <space> --title "<goal>" [--done-when "<…>"] [--account <a>] [--setup <project>] [--plan <id>] [--review|--no-review]   # launch a draft as it was confirmed (with its plan)
+tower plan new --form page|whiteboard --draft '<draft>' --ticket-file <f>   # the planner writes the draft's plan and publishes it as an artifact
+tower plan say <id> "<words>" [--as user|planner]   # the chat about a plan: yours goes to the planner, the planner's is its answer
+tower plan draft <id> --json-file <f> | published <id> --url <link> | failed <id> "<why>"   # what the planner reports
+tower plan [show [<id>]] [--json] | list | close [<id>]   # the open plan (and its chat); close ends its planner
+tower setups                         # the projects `tower launch` opens with; tower setup add "<name>" --account <a> [--about "<line>"] --repo "<dir>=<role>" [--repo …] [--was "<old>"], tower setup remove "<name>"
 tower missions                       # every open space as a mission: goal, state, what needs you, sessions (worktree, port), requests
 tower spaces [--all]                 # every space: focus, goal, state, unread news, sessions (--all: archived and closed ones too)
 tower space goal <space> "<goal>" [--done-when "<…>"]   # what a space is for and what counts as done
@@ -656,6 +782,10 @@ tower space report <space> "<text>"  # its closing report (the brain writes it w
 tower space close <space> [--force]  # end its sessions, remove its clean worktrees, archive it
 tower space follow|unfollow <space>  # its finished requests' receipts reach you as they land
 tower space mute|unmute <space>      # what needs you there stays in its own view, off the orb's number
+tower space review <space> on|off    # whether the PRs its sessions open get a reviewer session (on by default; off ends one that is open)
+tower review [list] | show <pr> [--json]   # the PRs' reviews: who reviews which PR, its rounds, where it stands (reviews.json)
+tower review report <pr> --critical <n> "…" | agree <pr> ["…"]   # the reviewer's word: a round's critical issues, or agreement (it ends then)
+tower review fixed <pr> "…"          # the PR's own session: it fixed what was critical (optional: the next report is what counts)
 tower thread [<space>] [-n 50]       # what the sessions of a space wrote to each other
 tower raise <t> --why <kind> "<the decision>" [--options '[…]']   # put a decision to the user (the brain does this)
 tower receipt [--agenda <id>] "…"    # the one line for a finished request (the brain does this)
@@ -745,7 +875,11 @@ for **Herdr Core**, because the voice runs in a Herdr terminal.
   types it, and after a restart checks Herdr's turn count: moved means it
   went in, so nothing is typed twice. A session that ends parks what waits
   for it (`retarget` or `cancel`); a machine out of reach is waited for,
-  not given up on.
+  not given up on. What you type in a session's own terminal is checked
+  against what waits for it, and a message your words already cover ("merged
+  on dev" before "PR #787 was merged") is not sent. A space's conversation
+  shows it all in one thread: what you typed in its sessions, what the tower
+  queued, sent or didn't send them, and what still waits.
 - `tower dispatch` takes a plan from the brain (tasks with their project
   folders and what each waits for), sends each to the session in its
   folder (queued behind its work) or starts a named one, in a git worktree
@@ -839,10 +973,15 @@ for **Herdr Core**, because the voice runs in a Herdr terminal.
   auto_close_hours` (off by default; say 24 for a day) ready with every session idle. A
   standing space (`tower space standing <space> on`) has no end.
 - One sentence opens a space: `tower launch "<goal>"` names it from the
-  goal (its first two words that carry meaning), takes a setup
-  (`[[setups]]` in config.toml: a name, an account, the repos), opens a
-  session per repo and hands the goal out as the first request. It asks
-  nothing and prints what it assumed; `--dry-run` only plans.
+  goal (its first two words that carry meaning), takes the repos its first
+  line names or a project's (`[[setups]]` in config.toml: a name, an
+  account, about, the repos and their roles), opens a session per repo,
+  sets the ticket's title as the goal and its acceptance criteria as
+  done-when, and hands the whole text out as the first request. It asks
+  nothing and prints what it assumed; `--dry-run` only plans. A ticket
+  that names no repo is drafted first (`--draft`, `src/ticket.rs`: one
+  headless `claude -p` call) and launched as confirmed (`--repo`,
+  `--title`, `--done-when`).
 - A worktree per mission: a session the tower opens for a space that has a
   goal (or that `tower launch` made) and isn't standing works in
   `<repo>/../.tower-worktrees/<space>/<repo>` on a branch `<space>/<repo>`

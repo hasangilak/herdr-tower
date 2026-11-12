@@ -70,9 +70,17 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
+fn on() -> bool {
+    true
+}
+
+fn is_on(b: &bool) -> bool {
+    *b
+}
+
 /// A space as a mission, as `spaces.json` keeps it (its goal is the space's
 /// agenda there; follow and mute are the spaces' own lists).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Mission {
     /// What counts as done, in the user's words.
@@ -121,6 +129,37 @@ pub struct Mission {
     /// The setup `tower launch` made it with.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub setup: String,
+    /// The PRs its sessions open get a reviewer (`crate::reviews`): on
+    /// unless the user turned it off (`tower space review <space> off`,
+    /// `tower launch --no-review`). Left out of the file while on, so a
+    /// mission from before it reads as on.
+    #[serde(default = "on", skip_serializing_if = "is_on")]
+    pub review: bool,
+}
+
+impl Default for Mission {
+    fn default() -> Mission {
+        Mission {
+            done_when: String::new(),
+            standing: false,
+            state: State::Open,
+            report: String::new(),
+            report_ms: 0,
+            report_asked_ms: 0,
+            born_ms: 0,
+            goal_ms: 0,
+            seen_ms: 0,
+            quiet_since_ms: None,
+            ready_since_ms: None,
+            idle_since_ms: None,
+            wait_until_ms: None,
+            closed_ms: None,
+            archived_ms: None,
+            worktrees: vec![],
+            setup: String::new(),
+            review: true,
+        }
+    }
 }
 
 impl Mission {
@@ -130,7 +169,23 @@ impl Mission {
 
     /// A closed (or archived) space is used again: it starts over as open.
     pub fn reopen(&mut self, now: u64) {
-        *self = Mission { done_when: std::mem::take(&mut self.done_when), standing: self.standing, worktrees: std::mem::take(&mut self.worktrees), setup: std::mem::take(&mut self.setup), ..Mission::born(now) };
+        *self = Mission {
+            done_when: std::mem::take(&mut self.done_when),
+            standing: self.standing,
+            worktrees: std::mem::take(&mut self.worktrees),
+            setup: std::mem::take(&mut self.setup),
+            review: self.review,
+            ..Mission::born(now)
+        };
+    }
+}
+
+/// Whether the PRs of `space` get a reviewer: its mission's switch (on when
+/// it has none yet), off once it is closed or archived.
+pub fn reviews_in(s: &Spaces, space: &str) -> bool {
+    match of(s, space) {
+        Some((_, m)) => m.review && m.state != State::Closed && m.archived_ms.is_none(),
+        None => true,
     }
 }
 
@@ -475,6 +530,7 @@ pub fn view(s: &Spaces, src: &Sources) -> Value {
             "goal": goal,
             "done_when": m.done_when,
             "standing": m.standing,
+            "review": m.review,
             "state": m.state.word(),
             "follow": spaces::followed_in(s, name),
             "mute": spaces::muted_in(s, name),
@@ -543,7 +599,7 @@ pub fn poke() {
 
 fn brief(s: &Spaces, name: &str) -> Value {
     let m = s.missions.get(name).cloned().unwrap_or_default();
-    json!({ "space": name, "goal": goal_of(s, name), "done_when": m.done_when, "standing": m.standing, "state": m.state.word(), "report": m.report })
+    json!({ "space": name, "goal": goal_of(s, name), "done_when": m.done_when, "standing": m.standing, "review": m.review, "state": m.state.word(), "report": m.report })
 }
 
 /// A space's goal and what counts as done, set in `s` (each when given;
@@ -578,6 +634,13 @@ pub fn goal_in(s: &mut Spaces, name: &str, goal: Option<&str>, done_when: Option
 pub fn standing_in(s: &mut Spaces, name: &str, on: bool, now: u64) -> Value {
     s.missions.entry(name.to_string()).or_insert_with(|| Mission::born(now)).standing = on;
     brief(s, name)
+}
+
+/// Turns the review of a space's PRs on or off, in `s`.
+pub fn review_in(s: &mut Spaces, name: &str, on: bool, now: u64) -> Value {
+    let key = of(s, name).map(|(k, _)| k.clone()).unwrap_or_else(|| name.to_string());
+    s.missions.entry(key.clone()).or_insert_with(|| Mission::born(now)).review = on;
+    brief(s, &key)
 }
 
 /// Sets a space's goal ("" clears it) and, when given, what counts as done.
@@ -634,6 +697,43 @@ pub fn cmd_standing(mut words: Vec<String>) -> Result<()> {
         println!("{name} is a standing space: it is never ready to close and never closed by the tower, and sessions opened there work in the repos themselves.");
     } else {
         println!("{name} is a mission with an end again: sessions opened there get worktrees, and it can be ready to close.");
+    }
+    Ok(())
+}
+
+/// Turns the review of a space's PRs on or off. Off ends a reviewer that
+/// is open there (the daemon looks at once). A name no space has yet is
+/// kept as given, for the space that will have it.
+pub fn set_review(space: &str, on: bool) -> Result<Value> {
+    let name = match spaces::pick(space) {
+        Ok(n) => n,
+        Err(_) if !space.trim().is_empty() => space.trim().to_string(),
+        Err(e) => return Err(e),
+    };
+    let now = history::now_ms();
+    let v = spaces::update(|s| review_in(s, &name, on, now));
+    poke();
+    if crate::protocol::is_running() {
+        let _ = crate::protocol::send(&crate::protocol::Request::Review { action: "sweep".into(), pr: String::new(), critical: None, text: String::new(), from: None });
+    }
+    Ok(v)
+}
+
+/// `tower space review <space> on|off`.
+pub fn cmd_review(mut words: Vec<String>) -> Result<()> {
+    let on = match words.pop().map(|w| w.to_lowercase()).as_deref() {
+        Some("on" | "yes" | "true") => true,
+        Some("off" | "no" | "false") => false,
+        _ => bail!("tower space review <space> on|off"),
+    };
+    let v = set_review(&words.join(" "), on)?;
+    let name = v["space"].as_str().unwrap_or("");
+    if !std::io::stdout().is_terminal() {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else if on {
+        println!("{name}: each PR a session opens there gets a reviewer session, which looks for critical issues only and agrees with the PR's session before you merge.");
+    } else {
+        println!("{name}: no reviewer for its PRs (one that is open there now ends).");
     }
     Ok(())
 }
@@ -1090,6 +1190,34 @@ mod tests {
     }
 
     #[test]
+    fn a_spaces_prs_are_reviewed_unless_the_user_turned_it_off() {
+        // A new mission, and one kept before there was the switch: on.
+        assert!(Mission::born(1).review && Mission::default().review);
+        let old: Spaces = serde_json::from_str(r#"{"missions":{"shop":{"state":"open","born_ms":1}}}"#).unwrap();
+        assert!(old.missions["shop"].review && reviews_in(&old, "Shop"), "absent is on");
+        assert!(reviews_in(&Spaces::default(), "never-seen"), "a space the tower doesn't know yet: on");
+        // On is left out of the file; off is kept.
+        assert!(!serde_json::to_string(&Mission::born(1)).unwrap().contains("review"));
+        let mut s = old.clone();
+        let v = review_in(&mut s, "SHOP", false, 2);
+        assert_eq!((v["space"].as_str(), v["review"].as_bool()), (Some("shop"), Some(false)), "its own spelling");
+        assert!(!reviews_in(&s, "shop"));
+        assert!(serde_json::to_string(&s).unwrap().contains("\"review\":false"));
+        // Kept when the space is used again.
+        let m = s.missions.get_mut("shop").unwrap();
+        m.reopen(3);
+        assert!(!m.review);
+        review_in(&mut s, "shop", true, 4);
+        assert!(reviews_in(&s, "shop"));
+        // A closed or archived space's PRs get none.
+        s.missions.get_mut("shop").unwrap().state = State::Closed;
+        assert!(!reviews_in(&s, "shop"));
+        let mut s = old;
+        s.missions.get_mut("shop").unwrap().archived_ms = Some(5);
+        assert!(!reviews_in(&s, "shop"));
+    }
+
+    #[test]
     fn a_space_goes_quiet_with_its_last_session_and_is_archived_a_day_later() {
         let mut s = Spaces::default();
         // First sight of a space with sessions: a mission, open.
@@ -1353,6 +1481,7 @@ mod tests {
                 "goal": "Ship the new checkout",
                 "done_when": "the checkout is live",
                 "standing": false,
+                "review": true,
                 "state": "ready",
                 "follow": true,
                 "mute": false,

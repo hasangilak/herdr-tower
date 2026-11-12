@@ -138,6 +138,18 @@ pub struct State {
     /// assumed: [{what, value, why}], request: {at, text} or null, state:
     /// "done" | "undone", undo: {possible, why}, closing}`.
     pub acts: Vec<serde_json::Value>,
+    /// The plan that is open (see `crate::plans`, `Plan::view`), or null:
+    /// `{id, form: "page" | "whiteboard", status: "writing" | "ready" |
+    /// "failed", ticket, draft, revision, address, planner: "starting" |
+    /// "working" | "idle" | "blocked" | "gone" | …, blocked, answering,
+    /// dir, plan_md, url, why, thread: [{from: "user" | "planner", text,
+    /// at}], created_ms, ready_ms, updated_ms, closed_ms, launched}`.
+    pub plan: Option<serde_json::Value>,
+    /// The PRs' reviews (see `crate::reviews`): every one not over, and
+    /// those over in the last day, the latest first, as `Review::view`
+    /// writes them (`{key, repo, number, url, space, owner, owner_name,
+    /// reviewer, reviewer_name, status, rounds, critical, line, chip, …}`).
+    pub reviews: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -157,6 +169,29 @@ pub struct AgentLine {
     /// Instructions waiting for it in the send queue.
     #[serde(default)]
     pub queued: usize,
+    /// What waits for it in the send queue, in order: the tower's messages,
+    /// its notes, messages from other sessions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting: Vec<WaitingLine>,
+}
+
+/// One message waiting for a session in the send queue.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Default)]
+pub struct WaitingLine {
+    pub id: u64,
+    pub text: String,
+    /// From another session (its name): no message of the tower's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// A note (an introduction), not work.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub note: bool,
+    /// Parked: it won't go on its own (why).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked: Option<String>,
+    /// Held while what the user typed in that session is checked against it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checking: bool,
 }
 
 impl State {
@@ -209,6 +244,8 @@ impl State {
             brains: vec![],
             brain_model: serde_json::Value::Null,
             acts: vec![],
+            plan: None,
+            reviews: vec![],
         }
     }
 

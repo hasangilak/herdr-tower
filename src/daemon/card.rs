@@ -74,6 +74,8 @@ pub enum CloseWhy {
     NothingAsked,
     /// The user dismissed a text question.
     Dismissed,
+    /// What it asked about was settled elsewhere (`what`: "PR #786 was merged on GitHub").
+    Settled { what: String },
 }
 
 impl CloseWhy {
@@ -93,6 +95,7 @@ impl CloseWhy {
             CloseWhy::Unread => format!("{who} shows something the tower can't read now: answer it in the session"),
             CloseWhy::NothingAsked => format!("{id} turned out to ask nothing"),
             CloseWhy::Dismissed => format!("{id} was dismissed"),
+            CloseWhy::Settled { what } => format!("already answered: {what}"),
         }
     }
 }

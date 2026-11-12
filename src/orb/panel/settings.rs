@@ -18,8 +18,8 @@
 //! - **Phone** (`phone`), the width of the pane: where the tower can be
 //!   reached now (the network, Tailscale), pairing a phone in place, and the
 //!   paired phones. `Scope::Phone` opens Settings scrolled to it.
-//! - **Accounts** (the accounts mod's) and the **saved setups** the
-//!   launcher offers (`tower setups`).
+//! - **Accounts** (the accounts mod's) and the **projects** the launcher
+//!   offers (`tower setups`), with the way to their page.
 
 use gpui::{AnyElement, Context, FontWeight, SharedString, div, prelude::*, px, rgba};
 use gpui_kit::component::{h_flex, v_flex};
@@ -385,37 +385,23 @@ impl Panel {
                 Some(list) => format!("{}, read from the accounts mod. A session uses {} unless a setup or your request names another.", listed(list), list[0]),
             })],
         );
+        // The projects New space offers: their names here, the rest on their page.
         let list = self.full.as_ref().and_then(|f| f.launch.setups()).map(|s| s.to_vec());
-        let mut saved: Vec<AnyElement> = match list.as_deref() {
-            None => vec![para("Asking the tower…")],
-            Some([]) => vec![para("None yet. Add one in a terminal: tower setup add \"<name>\" --account <account> --repo <folder>. They are kept in config.toml, as [[setups]].")],
-            Some(list) => list
-                .iter()
-                .enumerate()
-                .map(|(i, s)| {
-                    // What it opens: its repos, on its account; the first is what a launch takes by itself.
-                    let repos = s.repos.iter().map(|r| super::launch::repo_name(r)).collect::<Vec<_>>().join(", ");
-                    let mut about = if s.account.is_empty() { repos } else if repos.is_empty() { format!("on {}", s.account) } else { format!("{repos} on {}", s.account) };
-                    if i == 0 && list.len() > 1 {
-                        about = if about.is_empty() { "the default".into() } else { format!("{about} · the default") };
-                    }
-                    h_flex()
-                        .gap(px(8.0))
-                        .items_start()
-                        .text_size(px(13.0))
-                        .line_height(px(18.0))
-                        .text_color(g.muted)
-                        .child("•")
-                        .child(v_flex().min_w_0().child(div().text_color(g.text).child(s.name.clone())).when(!about.is_empty(), |el| el.child(div().text_size(px(12.0)).text_color(g.faint).child(about))))
-                        .into_any_element()
-                })
-                .chain([para("New space offers these. tower setup add and tower setup remove change them.")])
-                .collect(),
-        };
+        let mut saved: Vec<AnyElement> = vec![para(match list.as_deref() {
+            None => "Asking the tower…".to_string(),
+            Some([]) => "None yet. A project is its repos and a line on what each is for: New space reads them to draft a space from a ticket.".to_string(),
+            Some(list) => {
+                let names: Vec<String> = list.iter().map(|s| s.name.clone()).collect();
+                format!("{}. New space offers them, and reads what each repo is for to draft a space from a ticket.", listed(&names))
+            }
+        })];
+        saved.push(acts_row().child(mbtn("open-projects", "Open projects", false, None).on_click(cx.listener(|this, _, _, cx| this.nav_to(Scope::Projects, cx)))).into_any_element());
         saved.extend(self.said("setups"));
-        let setups = card("Saved setups", saved);
+        let setups = card("Projects", saved);
 
-        let grid = |cards: Vec<AnyElement>| div().w_full().grid().grid_cols(2).gap(px(12.0)).children(cards).into_any_element();
+        // Two by two when the pane has room, else one under another.
+        let cols = if self.full.as_ref().map(|f| f.pane_w).unwrap_or(900.0) >= super::window::TWO_COLS_W { 2 } else { 1 };
+        let grid = |cards: Vec<AnyElement>| div().w_full().grid().grid_cols(cols).gap(px(12.0)).children(cards).into_any_element();
         (head, vec![v_flex().w_full().gap(px(12.0)).child(grid(vec![tell, brain, voice, questions, follow, behaviors])).child(phone).child(grid(vec![accounts, setups])).into_any_element()])
     }
 }

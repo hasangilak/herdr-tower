@@ -24,6 +24,10 @@ fn answered(r: Response) -> Result<Value> {
 
 impl Tower for Daemon {
     fn decisions(&self, space: Option<&str>, all: bool) -> Value {
+        // A PR merged on GitHub leaves the phone's queue as soon as it looks.
+        if let Some(p) = crate::prs::daemon() {
+            p.look_now();
+        }
         // As it stands now: a space may have been muted a moment ago.
         self.decisions.refresh();
         self.decisions.listed(space, all)

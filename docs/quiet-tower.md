@@ -309,6 +309,7 @@ question set behind it (a raise) has that block now too.
 | A question set that is the user's (`decision: escalate`; a "waits for you" card is one) | `permission` for a permission, plan or approval menu; `question` otherwise | `ask:<space>:<what it asks>` | The tower's recommendations, the first one the pick (for a set with several questions, option *i* answers each with its recommendation *i*); with none, a menu's own options and no pick; a wait card has none |
 | The PRs of one repo that wait for a merge in one space (`waiting` and open in `prs.json`) | `merge` | `merge:<space>:<owner/repo>` | One per PR, in order. The pick is the first, when it can be merged, its checks pass and its base is not production |
 | `tower raise` | `raised`; `choice` with `--options` | `raise:<space>:<the line>` | As given, the first one the pick |
+| A PR's review stuck after three rounds ("PR review") | `choice` (`why` `review`), about the owner and the reviewer | `raise:<space>:<its line>` | "Side with the owner", "Side with the reviewer", "I'll look"; no pick |
 | An agenda task that failed again after a retry | `failed` | `failed:<space>:<task id>` | "Try again", "Drop it"; no pick |
 | A session blocked on something the tower can't read (no question set comes of it: a dialog it doesn't know) | `blocked` | `blocked:<space>:<address>` | None. It is answered in the session itself ("Show in Herdr"); it closes by itself, as `answered`, once the session is no longer blocked, and as `stopped` when the session is gone. Told once at a quiet level, as the plain notice was; every time at `everything` |
 
@@ -766,7 +767,8 @@ is under `missions`, by space name:
     "quiet_since_ms": n, "ready_since_ms": n, "idle_since_ms": n,
     "closed_ms": n, "archived_ms": n,
     "worktrees": [ { "repo": "…", "path": "…", "branch": "…" } ],   // made by the tower for it
-    "setup": "name"             // the setup `tower launch` made it with
+    "setup": "name",            // the setup `tower launch` made it with
+    "review": false             // its PRs get no reviewer ("PR review"); left out while on
 } }
 ```
 
@@ -825,6 +827,11 @@ a machine, can't be asked, nothing moves that round.
   before its first session.
 - `tower space report <space> "<text>"`: the closing report (the brain's
   answer to the `[space]` note). Kept with the mission and shown with it.
+- `tower space review <space> on|off`: whether the PRs its sessions open
+  get a reviewer ("PR review"). On unless turned off; a mission from before
+  the switch reads as on. Off ends a reviewer that is open there (the
+  daemon looks at once). A name no space has yet is kept for the space that
+  will have it. Prints `{"space","goal","done_when","standing","review","state","report"}` when piped.
 - `tower space close <space> [--force]` (the user's word only):
   1. refuses while an agent session there is `working` or `blocked`, naming
      them, unless `--force` (a brain doesn't count: it is the one closing);
@@ -887,7 +894,8 @@ missions --json`:
 "missions": { "spaces": [Mission], "quiet": ["name"], "closed_today": ["name"] }
 
 Mission { "name", "goal": "" when none, "done_when": "" when none,
-          "standing": bool, "state": "open" | "ready" | "quiet",
+          "standing": bool, "review": bool,   // its PRs get a reviewer ("PR review")
+          "state": "open" | "ready" | "quiet",
           "follow": bool, "mute": bool,
           "needs": n,            // open decisions in that space, muted or not
           "report": "" when none,
@@ -945,53 +953,118 @@ Mission { "name", "goal": "" when none, "done_when": "" when none,
 
 ## Step 9: one sentence launches a space
 
+The code is `src/launch.rs` (the plan, the launch), `src/ticket.rs` (the
+draft of a ticket), `src/plans.rs` and `src/daemon/plans.rs` (a draft's
+plan, its planner and the chat about it), `src/setups.rs` (the projects)
+and `src/orb/panel/launch.rs` / `projects.rs` (New space, Projects).
+
+### Projects
+
+A project is a `[[setups]]` table (the name stays, for the files and the
+phones from before): a name, the account its sessions run on, a line on
+what it is, its repos, and a line on what each repo is in it.
+
 ```toml
 [[setups]]
-name = "eyzflow + mediaroom on orca"
+name = "EYZFlow"
 account = "orca"
+about = "the video platform agencies run their media and customer support on"
 repos = ["~/Work/eyz/eyzflow", "~/Work/eyz/eyz-mediaroom-serverless"]
+roles = { "~/Work/eyz/eyzflow" = "the web app and its API", "~/Work/eyz/eyz-mediaroom-serverless" = "the media backend" }
 ```
 
-- `tower setups [--json]`: `{"setups":[{"name","account","repos":[…]}]}`.
-  The first is the default.
-- `tower setup add "<name>" --account <account> --repo <folder> [--repo
-  <folder>…]`: the same name again (any case) changes that setup in its
-  place. The account is checked against `cca` (none given: the first); a
-  repo that is no folder is taken as a project's name and matched
-  (`projects::best`), and the answer says which folder it took.
-  `tower setup remove "<name>"`. Both edit config.toml's text, so the rest
-  of the file stays as it is, and refuse a change after which the file
-  wouldn't read.
-- `tower launch "<goal>" [--setup <name>] [--name <space>] [--dry-run]
-  [--json]`:
-  - the space's name is the goal's first two words that carry meaning,
-    lower-cased, joined with a dash: `Fix the login redirect` is
-    `fix-login`. The small words `the a an to for of and in on with my our
-    new some` are passed over (`launch::space_name`); a goal made of them
-    only keeps its first two. It gets `-2`, `-3`, …
-    while a space has it (Herdr's, and those the tower remembers, closed
-    ones too). `--name` is taken as given; a space that has that name
-    already is joined, not made;
-  - the setup is the one named (its whole name, or a part), else the only
-    one, else the first. No setup at all is an error that says how to add
-    one. It never asks;
-  - it sets the goal and makes the mission, opens one agenda for the goal
-    (the request; only while the daemon runs), then runs `tower start
-    --space <space> --new-space --account <the setup's> --agenda <id>` once
-    per repo, so each session is named `<space-slug>-<repo-name>` (shown
-    `<space> › <repo-name>`, said "the <repo-name> session in <space>"),
-    works in the space's worktree of its repo with
-    a dev port (step 10), and has the goal as its first task: the goal,
-    that it is the space's goal and which part is this session's, the
-    other sessions' names, then where it works. The introduction between
-    them is the daemon's, as sessions join;
-  - it prints one receipt:
+`about` and `roles` are optional: a table from before reads as one without
+them, and is written back without them. A role is keyed by the repo as
+`repos` writes it (`~` and a trailing `/` aside, `Setup::role_of`).
+
+- `tower setups [--json]`: `{"setups":[{"name","account","about","repos":[…],
+  "roles":{"<repo>":"<role>"}}]}` (only the repos that have a role). The
+  first is the default.
+- `tower setup add "<name>" --account <account> [--about "<line>"] --repo
+  "<folder>=<its role>" [--repo …] [--was "<old name>"]`: a repo is
+  `<folder>=<role>`, or `<folder> — <role>` (an em or en dash or `-`, a
+  space each side), or the folder alone (`setups::repo_and_role`). The
+  same name again (any case) changes that project in its place; `--was`
+  renames one in its place (so the first stays the default), and refuses a
+  name another project has. The account is checked against `cca` (none
+  given: the first); a repo that is no folder is taken as a project
+  folder's name and matched (`projects::best`), and the answer says which
+  folder it took. `tower setup remove "<name>"`. Both edit config.toml's
+  text, so the rest of the file stays as it is, and refuse a change after
+  which the file wouldn't read.
+- The full window's **Projects** (the sidebar's foot, beside Record and
+  Shots; Settings has a card with the way there) lists them, a card each
+  (name, account, about, each repo with its role and folder), with **+ Add
+  project**, **Edit** (one form: name, an account pick from `tower
+  accounts`, about, the repos one per line as `<folder> — <its role>`) and
+  **Remove** (asked once in the card). It saves through `tower setup
+  add|remove` and reads `tower setups --json` again.
+
+### `tower launch`
+
+`tower launch "<goal>" [--setup <name>] [--name <space>] [--repo <folder>…]
+[--title "<goal>"] [--done-when "<…>"] [--account <a>] [--review|--no-review]
+[--dry-run] [--json]`:
+
+- the repos: those `--repo` gives (each must be a folder; nothing else is
+  opened); else those of the project `--setup` names; else those the
+  goal's first line names (`launch::repos_named`: a word that is a project
+  folder's whole name, or a distinctive part of only one folder's name, at
+  least five letters; the rest of the goal is never read for them). When a
+  saved project has every repo the first line names, its account and roles
+  come with them (only the repos named are opened). With none of these,
+  the only project, else the first. No project at all is an error that
+  says to name the repos in the first line, or how to add one. It never
+  asks. With `--repo` and `--setup`, the project is the one it is for: its
+  name, account and roles, the repos as given;
+- the space's name is the goal's first two words that carry meaning,
+  lower-cased, joined with a dash: `Fix the login redirect` is
+  `fix-login`. The small words `the a an to for of and in on with my our
+  new some` are passed over (`launch::space_name`), and so are the words
+  that only ask for sessions (`open a session at …`) and the repos named;
+  a first line made of those only names it from the ticket's title after
+  it. It gets `-2`, `-3`, … while a space has it (Herdr's, and those the
+  tower remembers, closed ones too). `--name` is taken as given; a space
+  that has that name already is joined, not made;
+- **the space's goal is the ticket's title** (`launch::title_of`): the line
+  after the one that only asks for sessions (what follows that line's
+  colon, else the next line with words), else the first line; heading
+  marks and a `Title:` in front taken off, at most 120 characters.
+  `--title` gives it instead;
+- **what counts as done** (`launch::done_when_of`): the ticket's
+  "Acceptance criteria", "Definition of done" or "Done when" section (a
+  heading, `**…**`, or a line ending in `:`): its bullet lines (`-`, `*`,
+  `•`, `1.`, `- [ ]`; a line under one continues it; a list goes on after
+  an empty line only as a list), or with no bullets its lines up to the
+  next empty one, joined with "; ", at most 400 characters; a heading with
+  words after its colon is those words. `--done-when` gives it instead (""
+  is kept empty);
+- the account: `--account`, else the project's, else the default one;
+- whether its PRs get a reviewer ("PR review"): `--review` or
+  `--no-review`, else as the space has it (on, for a new space). Kept as
+  `missions.<space>.review`, and in the receipt as `"review": bool` (in
+  words: "Each PR its sessions open gets a reviewer session…", or "Its PRs
+  get no reviewer");
+- it sets the goal (`agendas`) and the done-when (`missions.<space>.done_when`,
+  as `tower space goal --done-when` sets it) and makes the mission, opens
+  one agenda (the request) whose words are the whole ticket under the
+  title (only while the daemon runs), then runs `tower start --space
+  <space> --new-space --account <a> --agenda <id>` once per repo, so each
+  session is named `<space-slug>-<repo-name>` (shown `<space> ›
+  <repo-name>`, said "the <repo-name> session in <space>"), works in the
+  space's worktree of its repo with a dev port (step 10), and has the whole
+  ticket as its first task (with the title in front when the ticket doesn't
+  have it), that it is the space's goal, when it is done, which part is
+  this session's, the other sessions' names, then where it works. The
+  introduction between them is the daemon's, as sessions join;
+- it prints one receipt:
 
     ```
-    { "space", "goal", "made": bool (false: it joined a space), "dry_run": bool,
-      "agenda": id or null,
+    { "space", "goal": the title, "done_when", "made": bool (false: it joined a space), "dry_run": bool, "review": bool,
+      "agenda": id or null, "repos_from": "first-line" | "setup" | "repos",
       "sessions": [ { "name", "repo", "address", "account", "worktree", "branch",
-                      "port", "task": agenda task or null, "error": text or null } ],
+                      "port", "task": agenda task or null, "error": text or null,
+                      "why": its role in the project, or how it came in } ],
       "assumed": { "setup", "setup_why", "account", "account_why",
                    "name", "name_why", "worktrees": bool, "worktrees_why" },
       "act": the id of the act kept for it (`tower undo <id>`), when the daemon runs }
@@ -1000,6 +1073,255 @@ repos = ["~/Work/eyz/eyzflow", "~/Work/eyz/eyz-mediaroom-serverless"]
     `--dry-run` prints the same plan (no `address`, `port`, `task`) and
     does nothing: no space, no session, no worktree, no file touched. A
     session that didn't open has its `error`; the others still open.
+
+### A ticket's draft
+
+`tower launch "<ticket>" --draft [--setup <project>] [--adjust "<the
+user's words>" --prior '<the draft before, as --draft --json printed it>']
+[--json]`: the tower's brain reads the ticket and drafts the space, for the
+user to confirm or change. Nothing is opened, nothing written.
+
+- **One headless call** (`ticket::argv`): `cca <the default account> -p
+  --output-format json --model <[brains] model> --effort low
+  --no-session-persistence --strict-mcp-config --settings
+  '{"disableAllHooks":true}' --tools ""` (plain `claude -p …` without the
+  accounts mod), the prompt on its stdin, in the system's temporary folder,
+  in an environment without `CLAUDE_CONFIG_DIR`, `CLAUDECODE`,
+  `CCA_ACCOUNT`, `ANTHROPIC_*`, `HC_*` and `CLAUDE_CODE_*`
+  (`ticket::left_out`), so the account is the one asked for. It is stopped
+  after 90 seconds. It takes about 6 seconds.
+- **The prompt** (`ticket::prompt`): the projects (name, account, about,
+  each repo whole with its role; with `--setup`, that project only, and
+  that the user chose it), every project folder under the roots with one
+  line on it (`ticket::describe`: `package.json`'s description, else the
+  first heading, with the sentence after it when the heading is only a
+  name, or the first sentence of `README.md`, else of `CLAUDE.md`; 6 KB of
+  each at most), the ticket, and for a revision the draft before (in the
+  answer's shape, `ticket::prior_brief`) and the user's words. It asks for
+  one JSON object and nothing else: `{"project", "account", "repos":
+  [{"folder", "why"}], "space", "goal", "done_when", "notes"}`.
+- **Its answer** (`ticket::parse_reply`): `claude`'s `result` (an
+  `is_error`, or a `subtype` other than `success`, is an error with its
+  words), the object in it even inside a code fence or words, or a bare
+  object.
+- **Checked** (`ticket::check`): a folder must be one of the project
+  folders under the roots or a saved project's repo, by its path (`~` made
+  whole, compared as the file system has it) or by a name only one has;
+  any other is left out and named in `dropped`; each once. No repo left is
+  an error that says to draft again or name the repos in the first line.
+  The project must be one by that name (else dropped), and the one
+  `--setup` named wins, with its own account; an account the mod doesn't
+  know is dropped (none: the project's, else the default). The goal is its
+  first line as a title (at most 120 characters; none: the ticket's own
+  title), the done-when one line of at most 400 (none: the ticket's
+  acceptance criteria), the notes one line; the name kebab-case, at most
+  32 characters, made unique among the spaces.
+- **The draft** is the dry run's receipt of exactly that
+  (`launch::plan_with` with `--repo`, `--name`, `--title`, `--done-when`,
+  `--account`, `--setup`), with `"draft": true`, `"repos_from": "draft"`,
+  `project` (or null), `notes`, `dropped`, `took_ms`, each session's `why`
+  (the brain's), and `assumed` saying it was the brain's.
+- A model error or a timeout: `the tower's brain couldn't read the ticket
+  (…): try again, or name the repos in the first line instead ("open
+  sessions in eyzflow and mediaroom")`.
+- **Launched as confirmed** (`ticket::confirm_flags`): `tower launch
+  "<ticket>" --repo <each folder> --name <space> --title "<goal>"
+  --done-when "<…>" [--account <a>] [--setup <project>]`. The terminal's
+  draft (`--draft` on a terminal, without `--json`) ends with that command.
+
+### New space
+
+The full window's New space (`src/orb/panel/launch.rs`): a goal (a field
+that grows to 14 lines, so a whole ticket fits), **Project** (the projects
+as pills; none picked: the brain picks; a second click unpicks), and what
+the tower will do.
+
+- **The first line names repos** (the dry run's `repos_from` is
+  `first-line`, asked without `--setup` once the typing pauses): the plan
+  as before, its bullets from the receipt (with "Done when: …"), and
+  **Launch** is the confirm (`tower launch "<goal>" --json`).
+- **Any other goal**: the bullets say what a draft does, and the button is
+  **Draft the space** (`tower launch "<ticket>" --draft --json`, with
+  `--setup` for a picked project). While it runs: "Reading the ticket…",
+  and that it takes a little while.
+- **The draft** shows as a card in its place: Space, Goal, Done when, the
+  sessions (each repo with its why), Project and account, the brain's note,
+  and what was left out. Under it **Adjust it in words…** with **Redraft**
+  (Enter too: `--adjust "<words>" --prior '<the draft>'`; the new draft
+  takes the card's place, and the field empties), then **Launch** (exactly
+  that draft, `ticket::confirm_flags`) and **Start over** (the draft is
+  dropped; the ticket stays). A draft belongs to the ticket as it was:
+  changed, the button is Draft the space again.
+- A tower whose `launch --help` has no `--draft` gets the launcher as it
+  was: the first project, its plan, Launch.
+- **Review its PRs**: a switch under the draft card, and under the plan of
+  a goal whose first line names its repos, on at first, with a line on
+  what it does ("Each PR its sessions open gets a reviewer session that
+  looks for critical issues only … Merging stays yours."; off: "No
+  reviewer: its PRs come to you as they are."). Launch carries it as
+  `--review` or `--no-review`.
+- Launch's receipt names the space, whose view opens with what was done
+  said at its top; an error stays here.
+- **Or see the plan first**: under the draft's Launch and Start over,
+  **Plan as a page** and **Plan as a whiteboard** (see "The plan, and the
+  chat about it" below). While a plan of this ticket is open, the card is
+  the plan's draft (the planner may revise it), the chat replaces "Adjust
+  it in words…", Launch carries `--plan <id>`, and Start over closes the
+  plan too. A plan of another ticket that is still open (the field was
+  changed, the window reopened) says so at the top, with **Back to it**
+  (its ticket in the field, its draft on the card) and **Close it**.
+- `HERDER_TOWER_ORB_DRAFT=<file>` (with `HERDER_TOWER_ORB_WINDOW=show:new=<ticket>`)
+  shows the draft JSON in the file as the card; `reading` shows the
+  launcher reading; `ready` its button before. `HERDER_TOWER_ORB_PLAN=<file>`
+  makes the plan in the file (the state's `plan`, as `Plan::view` writes
+  it) the open plan of that ticket. `HERDER_TOWER_ORB_PROJECT=new|<name>`
+  (with `show:projects`) opens the Projects form once.
+
+### The plan, and the chat about it
+
+The user wants to see the plan before anything opens, and to talk it
+over. Artifacts can only be published by an interactive Claude Code
+session (a headless `claude -p` has no Artifact tool), so the plan is
+written by one the tower owns: **the planner**.
+
+- **The planner** is a hidden Herdr terminal named `tower-planner`
+  (labels `tower.role=planner`, `tower.plan=<id>`), started by the daemon
+  the way a brain is (`hc run --bg --no-parent --no-notify`; its first-run
+  folder question is the tower's to answer, `brain::settle`): `env
+  HERDER_TOWER_PLAN=<id> [the tower's HERDER_TOWER_HOME/STATE/DATA/BIN when
+  they aren't the usual ones] cca <the default account> -n tower-planner
+  --model <[brains] model> --effort <[brains] effort> [claude_args] "<its
+  first task>"` (plain `claude`, without CLAUDE_CONFIG_DIR, without the
+  accounts mod). It always runs Claude Code, whatever `brain` says.
+- **Its name is a brain's** (`brain::is_brain_name`): never a session of
+  the user's, never watched, never introduced, never in a space's members
+  or the radar's lists, its dialogs never questions or decisions. It is no
+  space's brain (`brains::is_space_brain` and `brains::is_ours` say no: no
+  note or request is routed to it, `tower model --restart` leaves it), and
+  a space called "planner" has the brain `tower-planner-space`.
+- **Its folder** is `<state dir>/plans/<id>/`: `ticket.md`, `draft.json`
+  (the draft, as the planner last revised it), `instructions.md` (also its
+  `CLAUDE.md`), the `plan.md` it writes, and `.claude/settings.json`: it
+  may Read, Glob and Grep anywhere (the draft's repos are its
+  `additionalDirectories`), edit only in its folder (`Edit(./**)`; an edit
+  in a repo of the draft is denied), run `tower plan …` and `tower setups`
+  and read-only `git`/`ls`/`cat`/`rg`, and publish (`Artifact`); it may
+  never run `tower launch|start|queue|dispatch|space|answer|agenda|undo`,
+  `hc`, `herdr-*`, `cca`, or a `git` that changes a repo, nor ask in its
+  terminal (`AskUserQuestion`). Anything else asks, and shows as blocked.
+- **Its first task** (`plans::first_task`, `plans::instructions`): write
+  the full plan of the draft into `plan.md` (each session: what it does
+  and in what order; how the repos fit together: the APIs, data and
+  contracts; the risks; the open questions; how it is tested; each session
+  under `### <its repo>` in a `## Sessions` section), publish it, and say
+  so with `tower plan published <id> --url <link>`. **A page**: one
+  self-contained HTML page Artifact, "Plan · <space>". **A whiteboard**: an
+  Artifact from the account's Whiteboard type
+  (`https://claude.ai/artifact/PLsEyfjXbDUM1iasW7rjLR`): a block per
+  session, arrows for the dependencies, a section for the risks and the
+  open questions. One artifact only. It can't: `tower plan failed <id>
+  "<why>"`.
+- **Then it waits.** What the user says reaches it through the send queue
+  as a quiet note (`sendq::add_note`: after its turn, never a task, never
+  watched): `[plan <id>] The user says: <words>` and how to answer. It
+  answers in a few sentences with `tower plan say <id> "…"` (nobody reads
+  its terminal). A change the user agrees to: a revised draft (`draft.json`,
+  then `tower plan draft <id> --json-file draft.json`), or `plan.md` changed
+  and the same artifact republished (its `url`), then `tower plan published`
+  again.
+- **One plan at a time.** A new plan closes the one that is open; Start
+  over, Close it and a launch close it too. Closing ends its planner (`hc
+  kill`, the terminal removed).
+
+#### The store: `plans.json`
+
+The daemon keeps every plan in `<state dir>/plans.json` (written before it
+answers; the open one and the last 20 closed), and shows the open one in
+`state.json` as `plan` (null when none), which the window follows:
+
+```
+{ "id": "p3", "form": "page" | "whiteboard",
+  "status": "writing" | "ready" | "failed" | "closed",
+  "ticket", "draft": the draft receipt (as last revised), "revision": how many times the planner revised it,
+  "address": the planner's terminal or null, "planner": "starting" | "working" | "idle" | "blocked" | "gone" | …,
+  "blocked": a dialog waits in its terminal, "answering": the user's last line has no answer yet,
+  "dir", "plan_md": its folder and plan.md, "url": the artifact's link or null, "why": why it failed, or that the planner ended,
+  "thread": [ { "from": "user" | "planner", "text", "at" } ],   (oldest first, at most 200)
+  "created_ms", "ready_ms", "updated_ms", "closed_ms", "launched": the space launched with it }
+```
+
+Every two seconds the open plan's planner is looked at (`hc get`): its
+status word becomes `planner`; a terminal that has ended is `gone` (a plan
+not yet published fails: "the planner's terminal ended before it published
+the plan"; a published one stays ready, and says Plan again starts one to
+talk it over).
+
+#### `tower plan`
+
+- `tower plan new --form page|whiteboard --draft '<the draft's JSON>'
+  --ticket-file <file> [--json]`: the draft must be a draft receipt (its
+  `space`, a session with a `repo`); the ticket is read from the file. The
+  answer is the new plan (`writing`, the planner `starting`); the planner
+  starts a moment later.
+- `tower plan say <id> "<words>" [--as user|planner]`: a line of the chat.
+  Whose: `--as`, else the planner's when its environment names that plan
+  (`HERDER_TOWER_PLAN`), else the user's. The user's is queued to the
+  planner (an error when it isn't running); the planner's is its answer.
+- `tower plan draft <id> --json-file <file>`: the planner's revised draft,
+  in the draft's shape or the shape a draft is asked in (`{project,
+  account, repos: [{folder, why}], space, goal, done_when, notes}`),
+  checked as a draft is (`ticket::check`: an unknown folder is left out and
+  said so; none left is an error) and kept as its receipt; it prints what
+  it took.
+- `tower plan published <id> --url <link>` (an `https://` link; again after
+  a republish), `tower plan failed <id> "<why>"`.
+- `tower plan [show [<id>]] [--json]` (the open one when no id; from
+  `plans.json` when the daemon isn't running), `tower plan list`, `tower
+  plan close [<id>]` (`--launched <space>`: what it became).
+- Words after `--` are words (`say <id> -- --json is a word here`).
+
+#### A launch with its plan
+
+`tower launch "<ticket>" --repo … --plan <id>` (New space's Launch with a
+published plan) reads the plan (its link, and `plan.md`), and each
+session's first instruction ends, after its brief, with "The space's plan
+(<link>), as the tower's planner wrote it with the user: follow it, and
+say so when you must leave it." and its part of `plan.md`
+(`plans::part_for`): all of it when it fits in 6,000 characters, else
+without the other sessions' own sections (a heading that names another
+session's repo and not this one's), cut at a line, saying where the rest
+is. The receipt has `plan: {id, url}` (a `--dry-run` reads the plan and
+says it, and opens nothing). Once the sessions are open the plan is closed
+(`launched`: the space) and its planner ends. A plan that isn't
+published yet when Launch is pressed is closed, and the draft launches
+without it.
+
+#### In the window
+
+Under the draft card (`src/orb/panel/launch.rs`), on the state's `plan` of
+this ticket:
+
+- **None**: "Or see the plan first:" **Plan as a page** · **Plan as a
+  whiteboard** (`tower plan new --form … --draft '<the card's draft>'
+  --ticket-file <the ticket, in a temporary file>`), and what it does.
+- **Writing**: "The tower's brain is writing the plan… (it reads the repos first: about five minutes)"
+  (while the planner starts: "…starting the planner…"), and that it
+  publishes to the user's claude.ai account, private.
+- **Blocked**: "The planner waits on a question in its terminal
+  (publishing the plan may ask for your go-ahead). Answer it there." with
+  **Show in Herdr** (the blocked card's way: `tower show`, the terminal in
+  a tab).
+- **Ready**: **Plan · page · Open** (`open <link>`), a revised draft said
+  ("the card above is the draft as it is now"), and that Launch hands each
+  session its part. A planner that ended: why, and Plan again.
+- **Failed**: "The plan didn't come: <why>." and **Plan again as a page** ·
+  **Plan again as a whiteboard**.
+- **The chat**, under it: "About the plan · N messages", the user's lines
+  (You, amber) and the planner's answers (The planner, cyan) as "Between
+  sessions" shows a message, newest last (the latest 12); "The planner is
+  answering…" while the user's last line waits; and "Ask about the plan or
+  change it…" with **Send** (Enter too: `tower plan say --as user <id> --
+  "<words>"`; the field empties once it went).
 
 ## Step 10: every mission gets its own worktrees
 
@@ -1053,6 +1375,208 @@ worktree with the same `worktrees::add`).
   keeps its own worktree (`<project>-<name>`, branch `tower/<name>`), not
   the space's.
 - Closing the space removes its clean worktrees (step 5 and 8).
+
+## PR review: every PR gets a reviewer, and the two agree
+
+The model is `src/reviews.rs`; the daemon runs it in `src/daemon/reviews.rs`
+and keeps it in `reviews.json` (the state folder) across restarts.
+
+### The switch
+
+A space's `review` (`missions.<space>.review`, on unless the user turned
+it off; a mission from before reads as on): `tower space review <space>
+on|off`, the space's **Review PRs** switch, New space's **Review its PRs**
+(`tower launch --review|--no-review`). A closed or archived space's PRs
+get no reviewer. Turning it off ends a reviewer that is open there.
+
+### A PR found
+
+The tower finds a PR when a session's turn prints its link (`prs`). When it
+is new, open, of a session in a space with review on, the tower opens ONE
+reviewer for it (`Book::wants_reviewer`): never for a PR a reviewer opened
+(by the store, or its terminal's label `tower.role=reviewer`), never twice
+for one PR (a review is kept before its reviewer opens, and the record of
+one that is over still counts).
+
+- **Who**: `tower start --no-act --no-watch --no-track --no-worktree --name
+  <name> --cwd <folder> --space <space> [--account <the owner's>] "<its
+  first task>"` (this program, `HERDER_TOWER_BIN` when set), then labelled
+  `tower.role=reviewer` and `tower.review=<key>`. Same space, same account
+  as the PR's session (its **owner**).
+- **Its name**: `<space>-review-<repo>-<n>` in Herdr's name alphabet, cut to
+  48 characters as session names are (the space's part gives way first, the
+  number stays), never `tower-…` (`review-<repo>-<n>-<space>` then), made
+  unique among the live terminals (`reviews::reviewer_name`).
+- **Where**: a git worktree of the owner's repo (the repo the tower gave it
+  a worktree of, else the checkout its folder is in) detached at the PR's
+  head: `<repo>/../.tower-worktrees/<space>/review-<repo>-<n>`. The head
+  commit is the PR's `headRefOid` when the repo has it (the owner pushed it
+  from here), else fetched from the remote that is the PR's repo
+  (`pull/<n>/head`, then its branch), never from another one. When there is
+  no checkout to be had, a folder of its own (`<state>/reviews/<name>/`),
+  where it reads the PR with `gh pr diff`. Either way a
+  `.claude/settings.local.json` there lets it read, comment, `tower review`
+  and `tower queue`, and denies `git push|commit|merge|rebase|reset`, `gh pr
+  merge|close|edit|ready`, Edit and Write: on no branch, it can't push to
+  the owner's.
+- **Its first task** (`reviews::instructions`): the PR (link, title,
+  branches), its owner (name, address), the space's goal and done-when, its
+  folder, and the review: CRITICAL issues only (wrong behaviour against the
+  ticket or goal, a crash, security, data loss or corruption, a build or
+  test failure it introduces, an API or contract break with another repo;
+  nothing about style, naming or nits). Each one a PR review comment opening
+  with `Critical:`, inline where it can (`gh api repos/<repo>/pulls/<n>/comments
+  … commit_id=<head> path line side=RIGHT`, else `gh pr comment`); the list
+  and the links to the owner itself (`tower queue <owner> "…"`); then
+  `tower review report <key> --critical <n> "<one line>"`. None critical:
+  approve at once (`gh pr review --approve`; on a PR of its own account,
+  which GitHub won't approve, `--comment "Approved: …"`), tell the owner,
+  `tower review agree <key>`. Told it's fixed: check again (`gh pr checkout
+  <n> --detach`), then agree or post what is still critical and report
+  again. It never merges, closes, pushes or edits the owner's code, and asks
+  the user nothing.
+- **Introduced**: the introductions (`introduce`) take it as a newcomer;
+  its task there is "reviewing PR #n (<repo>) for critical issues only".
+  Its turns' ends make no PR chip, card or question (`asks`).
+
+### The rounds
+
+The tower passes nothing between the two: they talk directly (`tower
+queue`, a peer message). It keeps the record and escalates.
+
+- `tower review report <pr> --critical <n> "<line>"` (the reviewer): `n` >
+  0 is a **round**. The status is `changes`, and the owner gets ONE quiet
+  note (`sendq::add_note`): "[tower] The reviewer (<name> <address>) left N
+  critical comments on PR #n (<repo>): fix them, push, answer each thread,
+  then tell the reviewer (tower queue <address> "…"). If you like, tell the
+  tower too: tower review fixed <key> "<one line>"." Nothing of the
+  comments themselves. `n` = 0: back to `reviewing`, to agree next.
+- `tower review fixed <pr> "<line>"` (the owner, optional: the next report
+  is what counts): `reviewing` again, the line kept.
+- **Stuck**: the third round with no agreement is `stuck` and ONE decision
+  for the user (raised with its options: kind `choice`, `why` `review`, key
+  `raise:<space>:<line>`, about both sessions): "The reviewer and the owner of PR #n (<repo>) don't
+  agree on: <the last report's line>", with the PR's link, the round and
+  who is who as its detail, and "Side with the owner" (the change stands;
+  the reviewer approves and agrees), "Side with the reviewer" (the owner
+  fixes what is still critical; the reviewer checks again) and "I'll look"
+  (both leave it until the user says more), no pick. The answer's words go
+  to both sessions (step 3). No note to the owner while it waits; a round
+  after the user answered notes the owner again; never a second decision.
+- `tower review agree <pr> ["<line>"]` (the reviewer): `agreed`, over.
+
+### The end
+
+Agreed, the PR merged or closed, the space closed or archived, its review
+turned off, the PR's own session gone (nobody is left to fix it; the PR
+stays the user's to merge), its reviewer's terminal gone, or a reviewer that never opened
+(five minutes on, none under its name): the review is over (`ended` with
+why, unless agreed). Its reviewer session ends (`hc kill`, `hc rm`), its
+checkout is taken away (`git worktree remove --force`: nothing in it is
+anyone's work), and a decision still open about it is settled. The record
+stays. Every 20 seconds the daemon looks at each review not over, and at
+once after `tower space review … off`.
+
+### The store and the commands
+
+`reviews.json`: `{"reviews": [Review]}`, every review not over and the last
+50 over:
+
+```
+Review { "key": "owner/repo#12", "repo", "number", "url", "title", "base", "head", "head_sha",
+         "space", "owner", "owner_name", "owner_created_ms", "reviewer", "reviewer_name", "reviewer_created_ms",
+         "account", "folder", "checkout_of",
+         "status": "reviewing" | "changes" | "agreed" | "stuck" | "ended",
+         "rounds": n, "critical": n, "line": the last word on it, "fixed": the owner's last word,
+         "decision": the stuck decision's id, "created_ms", "updated_ms", "ended_ms",
+         "steps": [ { "at_ms", "what": "opened" | "started" | "report" | "fixed" | "stuck" | "agreed" | "ended",
+                      "by", "critical", "text" } ] }
+```
+
+- `tower review [list]`, `tower review show <pr>` (JSON when piped or with
+  `--json`; from `reviews.json` when the daemon isn't running):
+  `{"reviews": [Review + "chip"]}`, `{"review": Review + "chip"}`. A PR is
+  its key, its link, or `#12` (the caller's own, else the only one open).
+- `tower review report <pr> --critical <n> "<line>"`: `{"review",
+  "noted_owner": bool, "decision": id or null}`; `agree <pr> ["<line>"]`:
+  `{"review", "ends": the reviewer's address}`; `fixed <pr> "<line>"`:
+  `{"review"}`. A review that is over refuses them.
+- The socket: `{"cmd":"review","action":"list"|"show"|"report"|"agree"|"fixed"|"sweep","pr","critical","text","from"}`.
+- History: kind `review` (`id` the PR's key, `status`, `record: true`):
+  opened, each round, fixed, agreed, ended. Never a chat message.
+
+### What shows it
+
+- **The PR** (`prs.json`, the chat's chip, `GET /v1/prs`, the `pr` event)
+  carries `review`: `{status, rounds, critical, reviewer, reviewer_name,
+  line}`, `line` being what the chip says (`reviews::chip_line`):
+  "Reviewing…", "Reviewing the fixes… (after round 1)", "Review: 2 critical,
+  round 2", "Review: stuck after 3 rounds, yours to decide", "Review:
+  agreed", "Review: ended without agreement" ("…, N critical left").
+- **The merge card**: each PR's row has that line (amber until agreed); a
+  merge decision's `prs[]` carry `review`, and a review that isn't agreed
+  is among the merge's `warnings` (`prs::gate`, `reviews::merge_warning`):
+  "The review isn't done: its reviewer is still reading it.", "The review
+  isn't agreed: 2 critical issues open, round 2.", "… the reviewer and the
+  owner disagree after 3 rounds.", "Its review ended without agreement."
+  The merge stays the user's: it never blocks it.
+- **The state** has `reviews`: every review not over and those over in the
+  last day, the latest first (`Review` + `chip`).
+
+## What you type in a session and what the tower queues for it
+
+You talk to a session in two ways: through the tower (a request, a card's
+answer, the brain's instruction, the tower's own word such as "PR #787 was
+merged on GitHub"), and directly, typing in its terminal in Herdr. The two
+are kept in step.
+
+**The tower doesn't repeat you.** What you type in a session's own terminal
+(its hook's prompt, when it is yours: `typed::whose`) goes to the send queue
+(`SendQueue::user_said`), kept half an hour. Every message of the tower's
+waiting for that session (not a note, not a message from another session,
+not a session to start) that was queued after those words, or up to ten
+minutes before them, is checked against them before it goes in
+(`covered::judge`):
+
+- A merge note is covered by a rule: you said "merged" there yourself, and
+  named no PR or this one ("merged on dev" covers "PR #787 (eyzhub/eyzflow)
+  into dev was merged on GitHub.").
+- Anything else, one headless call (the default account, `[brains] model` at
+  low effort, no tools, as a ticket draft is read): your messages, numbered,
+  and the waiting ones, with their ids. It names the ones your words cover:
+  you told the session the same thing, gave the same instruction, or made it
+  moot. Anything that adds what you didn't say is not covered; unsure is not
+  covered. About 3 to 4 seconds.
+
+The check starts the moment you type (the session works on your words
+meanwhile); a message queued a little after your words waits for it before
+it goes. A covered message leaves the queue: the record says `Not sent: you
+had told it yourself ("<your words>"): <the message>`, its task in the agenda
+is dropped with that reason (`QueueFact::Covered`), and the brain hears it
+unless the tower is quiet. A check that fails, or takes longer than two
+minutes, lets the messages go: nothing is lost on a guess. Each message is
+checked against the same words once.
+
+**One thread for it all.** A space's conversation column has, beside its
+requests and answers, what passed between you or the tower and each of its
+sessions, in order (`talk::session_said`):
+
+| Row | From the history |
+|---|---|
+| You → eyzflow · in its terminal | a `request` from `terminal:<address>` |
+| You → eyzflow · answered its question | a `request` from `answer:<address>` |
+| Tower → eyzflow · queued / sent | the queue's `queued`, then `delivered` (one row, its word changed) |
+| Tower → eyzflow · not sent: you had told it yourself | the queue's `not-sent` |
+
+At its end, dashed, is what still waits for the space's sessions: "waiting:
+it goes in when its turn ends", "held: checking it against what you typed
+there", or "parked". A session's own view has the same thread for that
+session alone ("Between you, the tower and eyzflow"), above its screen.
+
+In `state.json`, each agent has `waiting`: what waits for it in the send
+queue, in order, `[{"id", "text", "from"?, "note"?, "parked"?, "checking"?}]`
+(`from`: another session's name; `note`: an introduction; `checking`: held
+for the check of your words).
 
 ## Step 7: a tower per open space
 
@@ -1338,7 +1862,10 @@ where the full window is, `panel/` the views).
   sidebar (All spaces, each open space, New space, the quiet fold,
   Record, Shots, Settings) and a main pane:
   - All spaces: the queue and the missions list.
-  - A space: its goal and done-when, Follow and Mute, its closing report,
+  - A space: its goal and done-when, Follow, Mute and **Review PRs** (`tower
+    space review <space> on|off`; off, a line says its PRs get no
+    reviewer; on, a line per open PR of the space with a review: "PR #12
+    (shop) · Review: 2 critical, round 2 · fix-login-review-shop-12"), its closing report,
     what needs you there, its requests, its sessions (with worktree and
     port), the thread between its sessions (the latest five, "N earlier"
     for the rest the state holds: each with who wrote to whom and when,
@@ -1347,12 +1874,14 @@ where the full window is, `panel/` the views).
     left out, the row names the sender), and an input that goes to that
     space's tower. Its head says "its own tower" when it has one that runs
     (`missions[].tower`; "is starting", "waits on its own screen" when so).
-  - New space: goal, setup, what the tower will do, Launch.
+  - New space: goal, project, what the tower will do (or the draft of a
+    ticket), Launch (step 9).
+  - Projects: each project with its repos and their roles; add, edit, remove.
   - Record: the history, filtered by space (the old Chat and Activity).
   - Shots, Settings (how much it tells you, the tower's model, voice as a
     three-way choice "Off / Decisions / Replies and decisions" with
     "Always on this Mac" as its own switch, questions policy, Follow and
-    Mute, behaviors, phone, accounts, setups), a session's own view.
+    Mute, behaviors, phone, accounts, projects), a session's own view.
 - Number keys answer the open card. Cards are C1 to C6.
 - One model feeds both sizes: answering or picking a card in one shows in
   the other.
@@ -1376,8 +1905,12 @@ where the full window is, `panel/` the views).
 - `spaces.json`: `follow` and `mute` (for a switch set before the state
   says so). The windows never write it.
 - `prs.json`: a merge decision's PRs as the tower knows them (the commit a
-  merge is pinned to, each check by name). A PR that isn't in it is drawn
-  from the decision's own `prs[]` (`title`, `checks`, `merge`).
+  merge is pinned to, each check by name, its `review`). A PR that isn't in
+  it is drawn from the decision's own `prs[]` (`title`, `checks`, `merge`,
+  `review`). Each row of a merge card says where its PR's review stands
+  ("Reviewing…", "Review: 2 critical, round 2", "Review: agreed"; amber
+  until it is agreed), and asked to merge a PR whose review isn't agreed
+  it says so among its warnings: the merge is still the user's.
 - `history.jsonl`: the Record, and the reply to the user's last request
   (an `answer`, or a `receipt` that was told; never an entry with `record:
   true`), with the `act` entries that name that request (`act.request_at`):
@@ -1406,13 +1939,18 @@ question set's `status: failed`, and offers the session or another try.
 - A merge runs in the window's process (`prs::merge`, pinned to the commit
   shown), then tells the daemon (`PrMerged`).
 - What the full window sets runs the `tower` CLI: `tower tell <level>`;
-  `tower space follow|unfollow|mute|unmute <space>`; `tower space goal
+  `tower space follow|unfollow|mute|unmute <space>`; `tower space review
+  <space> on|off`; `tower space goal
   <space> "<goal>" --done-when "<…>"` then `tower space standing <space>
   on|off`; `tower space close <space>` (and `--force` after a refusal),
   whose JSON receipt is said in a sentence; `tower setups --json`; `tower
-  launch "<goal>" --setup "<name>" --dry-run --json` for the preview and
-  the same without `--dry-run` to launch (its receipt names the space,
-  whose view then opens).
+  setup add|remove …` (Projects); `tower launch "<goal>" --dry-run --json`
+  for the preview and the same without `--dry-run` to launch (its receipt
+  names the space, whose view then opens); `tower launch "<ticket>"
+  --draft --json` (and `--adjust … --prior …`) for a draft, and `tower
+  launch "<ticket>" --repo … --name … --title … --done-when … --review|--no-review --json` to
+  launch it (`--review` or `--no-review` on a plain launch too, as the
+  switch stands).
 - The input in a space's view runs `tower ask --space <space> "<text>"`
   (step 7): the daemon hands it to that space's brain, or to the main one
   as `In <space>: <text>` when the space has none that can take it. The
@@ -1441,7 +1979,9 @@ takes the keyboard; a spot off the screen's edge keeps them out of the way.
 `HERDER_TOWER_ORB_ANSWER=<decision id>:<n>[:rule]` has the full window
 answer that card with its option `n` (from 0) two and a half seconds after
 the start, as a click on it would, and with `:rule` take its receipt's
-"Make it a rule": for looking at what an answer leaves behind.
+"Make it a rule": for looking at what an answer leaves behind. On a merge
+card `n` is its button (0 asks about the first PR, which shows what
+merging it does and its warnings; nothing merges before Confirm).
 A whole tower for them to read runs in a sandbox with `HERDER_TOWER_VOICE=off
 tower daemon` (no speakers, no Kokoro, no Whisper, no microphone, no talk
 key; its own `HERDER_TOWER_HOME`, `_STATE`, `_DATA`, and stand-ins named by
@@ -1472,7 +2012,7 @@ section says what was built and how it hangs together.
 | `POST /v1/spaces/{space}/follow` · `/mute` | `{"on": bool}` | `{"space", "follow"\|"mute", "mission"}` |
 | `POST /v1/spaces/{space}/close` | `{"force": bool}` | `202 {"action": Action}`; `409 busy` (with `sessions`) while a session works or is blocked, unless `force` |
 | `GET /v1/thread?space=<name>&limit=50&before=<id>` | | `{"space", "messages": [{"id","at","from","from_name","to","to_name","text","space","delivered"}], "more"}`, newest last |
-| `GET /v1/setups` | | `{"setups": [{"name","account","repos"}]}` |
+| `GET /v1/setups` | | `{"setups": [{"name","account","about","repos","roles"}]}` |
 | `POST /v1/launch` | `{"goal", "setup", "name", "dry_run"}` (`goal` required) | `dry_run`: `200`, the plan (`tower launch --dry-run --json`). Else `202 {"action": Action}` |
 | `GET /v1/actions` · `/v1/actions/{id}` | | `{"actions": [Action]}` · `{"action": Action}` |
 | `GET /v1/tell` · `POST /v1/tell` | `{"level", "voice"}`, each optional | `{"level", "voice"}` · the same with `"was"` and `"voice_was"` for what was set. `400 bad_level`, `400 bad_voice` |

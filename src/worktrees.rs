@@ -198,6 +198,103 @@ pub fn add(repo: &Path, place: &Place) -> Result<()> {
     Ok(())
 }
 
+// ---- a reviewer's checkout (`crate::reviews`) ----
+
+/// The commit `rev` is in `repo` (its objects: a worktree's are its repo's).
+fn has_commit(repo: &Path, rev: &str) -> bool {
+    !rev.is_empty() && git(repo, &["cat-file", "-e", &format!("{rev}^{{commit}}")]).is_ok_and(|o| o.code == 0)
+}
+
+/// A remote of `repo` that is the GitHub repo `slug` (`owner/name`).
+fn remote_for(repo: &Path, slug: &str) -> Option<String> {
+    let out = git(repo, &["remote", "-v"]).ok()?;
+    let want = slug.to_lowercase();
+    out.stdout.lines().find_map(|l| {
+        let mut parts = l.split_whitespace();
+        let (name, url) = (parts.next()?, parts.next()?.to_lowercase());
+        let path = url.trim_end_matches('/').trim_end_matches(".git").to_string();
+        (path.ends_with(&format!("/{want}")) || path.ends_with(&format!(":{want}"))).then(|| name.to_string())
+    })
+}
+
+/// The commit a reviewer's checkout is made at: the PR's head commit when
+/// the repo has it (a session's worktree pushed it from here), else
+/// fetched from the remote that is the PR's repo (its `pull/<n>/head`, then
+/// its branch). Never from a remote that is another repo.
+pub fn pr_commit(repo: &Path, slug: &str, number: u64, head: &str, sha: &str) -> Result<String> {
+    if has_commit(repo, sha) {
+        return Ok(sha.to_string());
+    }
+    let Some(remote) = remote_for(repo, slug) else {
+        bail!("{} has no remote for {slug}, and not the PR's head commit {}", repo.display(), if sha.is_empty() { "(unknown)" } else { sha });
+    };
+    let mut tried = vec![format!("pull/{number}/head")];
+    if !head.is_empty() {
+        tried.push(head.to_string());
+    }
+    for r in &tried {
+        if git(repo, &["fetch", "--quiet", &remote, r]).is_ok_and(|o| o.code == 0) {
+            let out = git(repo, &["rev-parse", "FETCH_HEAD"])?;
+            let got = out.stdout.trim();
+            if out.code == 0 && !got.is_empty() {
+                return Ok(got.to_string());
+            }
+        }
+    }
+    bail!("couldn't fetch PR #{number} from {remote}")
+}
+
+/// A worktree of `repo` at `path`, detached at `rev` (no branch: nothing
+/// it does lands on one); one that is there already moves to `rev`.
+pub fn add_detached(repo: &Path, path: &Path, rev: &str) -> Result<()> {
+    if path.exists() {
+        if toplevel(path).as_deref().map(canon) != Some(canon(path)) {
+            bail!("{} is there already and isn't a git worktree", path.display());
+        }
+        let out = git(path, &["checkout", "--quiet", "--detach", rev])?;
+        if out.code != 0 {
+            bail!("git checkout --detach {rev} in {}: {}", path.display(), out.stderr.trim());
+        }
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+        if let Some(root) = dir.parent().filter(|r| r.file_name().is_some_and(|n| n == DIR)) {
+            let ignore = root.join(".gitignore");
+            if !ignore.exists() {
+                let _ = std::fs::write(ignore, "*\n");
+            }
+        }
+    }
+    let p = path.to_string_lossy();
+    let mut out = git(repo, &["worktree", "add", "--detach", &p, rev])?;
+    if out.code != 0 {
+        let _ = git(repo, &["worktree", "prune"]);
+        out = git(repo, &["worktree", "add", "--detach", &p, rev])?;
+    }
+    if out.code != 0 {
+        bail!("git worktree add --detach in {}: {}", repo.display(), out.stderr.trim());
+    }
+    Ok(())
+}
+
+/// Takes a reviewer's checkout away, whatever is in it: it is a copy of a
+/// PR's head to read, and nothing in it is anyone's work.
+pub fn remove_detached(repo: &Path, path: &Path) -> Result<()> {
+    if !path.exists() {
+        let _ = git(repo, &["worktree", "prune"]);
+        return Ok(());
+    }
+    let out = git(repo, &["worktree", "remove", "--force", &path.to_string_lossy()])?;
+    if out.code != 0 {
+        bail!("git worktree remove in {}: {}", repo.display(), out.stderr.trim());
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
+    Ok(())
+}
+
 /// The repo's untracked top-level `.env*` files.
 fn env_files(repo: &Path) -> Vec<String> {
     let Ok(rd) = std::fs::read_dir(repo) else { return vec![] };

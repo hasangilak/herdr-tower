@@ -46,6 +46,10 @@ fn enabled() -> bool {
 /// or another session typed). None: the last request of the user's it had
 /// stands (`Book::tasks_for`).
 fn task_now(address: &str) -> Option<(String, bool)> {
+    // A PR's reviewer is on that review (`reviews`), whatever it was typed.
+    if let Some(t) = super::reviews::task_of(address) {
+        return Some((t, false));
+    }
     let on = super::agendas::users_task_of(address).and_then(|t| introduce::users_task(&t)).or_else(|| {
         if !super::typed::users_turn(address) {
             return None;

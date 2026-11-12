@@ -10,11 +10,12 @@
 //!   count of what is the user's; each open space with its mark (an amber
 //!   count, an outline when muted, a pulse at work, a tick at rest) and a
 //!   small line (its sessions, "standing", "ready to close"); "New space";
-//!   the quiet spaces folded into one line; Record, Shots and Settings at
-//!   the foot.
+//!   the quiet spaces folded into one line; Record, Shots, Projects and
+//!   Settings at the foot.
 //! - **The main pane** shows what the sidebar picked (`crate::orb::nav`):
 //!   every space (here: the queue beside the missions), one space (`space`),
 //!   the launcher (`launch`), the record (`record`), the screenshots, the
+//!   projects (`projects`), the
 //!   settings (`settings`) with the behaviors and the phone (`Scope::Phone`
 //!   opens Settings at its Phone card), one session (`session`).
 //! - **The input** under the queue goes to the main tower; under a space, to
@@ -33,7 +34,7 @@ use gpui::{AnyElement, App, Context, FontWeight, SharedString, Window, div, prel
 use gpui_kit::component::{h_flex, v_flex};
 
 use super::home::{LINE, SOFT, bay_label, cstat, mbtn, minimize_mark, sign, tg};
-use super::{CYAN, Panel, cli, glass, launch, record, space};
+use super::{CYAN, Panel, cli, glass, launch, projects, record, space};
 use crate::history;
 use crate::orb::model::{self, Decision, Missions};
 use crate::orb::nav::{Scope, Side};
@@ -42,6 +43,19 @@ use crate::orb::nav::{Scope, Side};
 const SIDE_W: f32 = 236.0;
 /// The queue's column beside the missions (of the 688 the pane has).
 const QUEUE_W: f32 = 350.0;
+/// The pane is laid out in two columns from this width (All spaces' queue
+/// beside its missions, Settings' cards two by two), else in one.
+pub(super) const TWO_COLS_W: f32 = 700.0;
+/// The least the pane keeps beside the conversation's column.
+const PANE_MIN_W: f32 = 420.0;
+
+/// The conversation's column, for a window `win_w` wide: about two fifths
+/// of what the sidebar leaves (300 to 460), never so wide the pane gets less
+/// than `PANE_MIN_W`, and never under 280.
+pub(super) fn talk_width(win_w: f32) -> f32 {
+    let room = win_w - SIDE_W;
+    (room * 0.38).clamp(300.0, 460.0).min(room - PANE_MIN_W - 36.0).max(280.0)
+}
 
 /// What the full window keeps of its own.
 pub(super) struct FullUi {
@@ -49,6 +63,8 @@ pub(super) struct FullUi {
     shown: Option<Scope>,
     /// The launcher.
     pub launch: launch::LaunchUi,
+    /// The projects' page: the form while one is added or changed.
+    pub projects: projects::ProjectsUi,
     /// A space's goal while it is being changed.
     pub edit: Option<space::GoalEdit>,
     /// What a command said, by where it shows (`tell`, `space:<name>`,
@@ -72,6 +88,8 @@ pub(super) struct FullUi {
     pub model: Option<(Option<String>, Option<String>)>,
     /// Settings' pane, scrolled to its Phone card when `Scope::Phone` is asked for.
     pub settings_scroll: gpui::ScrollHandle,
+    /// New space's pane: a new line in the chat about a plan scrolls it to its end.
+    pub launch_scroll: gpui::ScrollHandle,
     pub phone_anchor: gpui::ScrollAnchor,
     /// Settings was asked for at its Phone card: scrolled there once it is
     /// drawn, and again until this moment (the cards above it grow as what
@@ -80,6 +98,16 @@ pub(super) struct FullUi {
     /// The thread's messages shown whole (by `space::thread_key`), the
     /// spaces whose earlier messages show too, and the one just copied.
     pub thread_open: HashSet<String>,
+    /// How wide the pane is, in points, as last drawn (the window less the
+    /// sidebar, the conversation's column and the pane's padding): views lay
+    /// out to it (two columns, or one).
+    pub pane_w: f32,
+    /// How wide the conversation's column is (0: none in this view).
+    pub talk_w: f32,
+    /// The conversation column: its scroll, and what it last showed (its
+    /// view, how many messages, the latest's time), to go to its end on a new one.
+    pub chat_scroll: gpui::ScrollHandle,
+    pub chat_seen: Option<(Option<String>, usize, u64)>,
     /// How wide a thread message's text is, in points, as last drawn.
     pub text_w: f32,
     pub thread_earlier: HashSet<String>,
@@ -94,6 +122,7 @@ impl FullUi {
         Self {
             shown: None,
             launch: launch::LaunchUi::new(window, cx),
+            projects: projects::ProjectsUi::default(),
             edit: None,
             notes: HashMap::new(),
             busy: HashSet::new(),
@@ -104,9 +133,14 @@ impl FullUi {
             space_tower: None,
             model: None,
             settings_scroll: scroll.clone(),
+            launch_scroll: gpui::ScrollHandle::new(),
             phone_anchor: gpui::ScrollAnchor::for_handle(scroll),
             to_phone: None,
             thread_open: HashSet::new(),
+            pane_w: 900.0,
+            talk_w: 0.0,
+            chat_scroll: gpui::ScrollHandle::new(),
+            chat_seen: None,
             text_w: 600.0,
             thread_earlier: HashSet::new(),
             copied: None,
@@ -185,12 +219,14 @@ impl Panel {
 pub(super) fn whead(title: &str, sub: Vec<AnyElement>, right: Option<AnyElement>) -> AnyElement {
     h_flex()
         .w_full()
-        .gap(px(16.0))
+        .flex_wrap()
+        .gap_x(px(16.0))
+        .gap_y(px(10.0))
         .items_start()
         .child(
             v_flex()
                 .flex_1()
-                .min_w_0()
+                .min_w(px(240.0))
                 .gap(px(2.0))
                 .child(div().text_size(px(20.0)).line_height(px(24.0)).font_weight(FontWeight::SEMIBOLD).child(title.to_string()))
                 .child(v_flex().gap(px(1.0)).text_size(px(13.0)).line_height(px(18.0)).text_color(glass().muted).children(sub)),
@@ -200,16 +236,6 @@ pub(super) fn whead(title: &str, sub: Vec<AnyElement>, right: Option<AnyElement>
 }
 
 /// `Goal …`, `Done when …`: a word in white, then what it is.
-/// `named`, cut to `lines` lines with an ellipsis (a long goal in a head).
-pub(super) fn named_short(word: &str, text: &str, lines: usize) -> AnyElement {
-    h_flex()
-        .items_start()
-        .gap(px(5.0))
-        .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).text_color(glass().text).child(word.to_string()))
-        .child(div().min_w_0().flex_1().line_clamp(lines).text_ellipsis().child(text.to_string()))
-        .into_any_element()
-}
-
 pub(super) fn named(word: &str, text: &str) -> AnyElement {
     h_flex()
         .items_start()
@@ -293,8 +319,9 @@ impl Panel {
             return "Tell the tower…".into();
         }
         match &self.tower.read(cx).nav.scope {
-            Scope::Space(name) if self.space_tower_of(name, cx) => format!("Tell the {name} tower…"),
-            Scope::Space(name) => format!("Tell the tower about {name}…"),
+            // The conversation column's head says which tower it is; its input is narrow.
+            Scope::Space(_) if self.full.as_ref().is_some_and(|f| f.talk_w < 360.0) => "Write here…".into(),
+            Scope::Space(_) => "Write to the tower…".into(),
             Scope::Behaviors => "Tell the tower what to change…".into(),
             _ => "Tell the tower…".into(),
         }
@@ -383,7 +410,7 @@ impl Panel {
                     self.phone_pair(cx);
                 }
             }
-            Scope::New => self.read_setups(cx),
+            Scope::New | Scope::Projects => self.read_setups(cx),
             Scope::Space(_) => self.learn_space_tower(cx),
             _ => {}
         }
@@ -463,6 +490,7 @@ fn scope_key(scope: &Scope) -> String {
         Scope::New => "new".into(),
         Scope::Record => "record".into(),
         Scope::Shots => "shots".into(),
+        Scope::Projects => "projects".into(),
         Scope::Settings => "settings".into(),
         Scope::Behaviors => "behaviors".into(),
         Scope::Phone => "phone".into(),
@@ -473,10 +501,6 @@ fn scope_key(scope: &Scope) -> String {
 impl Panel {
     /// The whole window: the sidebar, and the pane for the view showing.
     pub(super) fn full_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        if let Some(f) = self.full.as_mut() {
-            // What a thread message's text gets across: the window, less the sidebar, the pane's and the row's padding and its colour bar.
-            f.text_w = f32::from(window.viewport_size().width) - SIDE_W - 36.0 - 24.0 - 13.0 - 2.0;
-        }
         let all = self.decisions(cx);
         let missions = self.missions(&all, cx);
         let (scope, notice, act) = {
@@ -485,6 +509,17 @@ impl Panel {
             let act = t.nav.notice_act().and_then(|id| t.state.as_ref()?["acts"].as_array()?.iter().find(|a| a["id"].as_str() == Some(id)).and_then(super::home::ActShown::of_view));
             (t.nav.scope.clone(), t.nav.notice().map(String::from), act)
         };
+        // The widths, from the window's as it is now: the conversation's
+        // column (All spaces, a space) and what is left for the pane, which
+        // every view lays itself out to (`FullUi::pane_w`).
+        let talk_w = matches!(scope, Scope::All | Scope::Space(_)).then(|| talk_width(f32::from(window.viewport_size().width)));
+        let pane_w = f32::from(window.viewport_size().width) - SIDE_W - talk_w.unwrap_or(0.0) - 36.0;
+        if let Some(f) = self.full.as_mut() {
+            f.pane_w = pane_w;
+            f.talk_w = talk_w.unwrap_or(0.0);
+            // What a thread message's text gets across: the pane, less the row's padding and its colour bar.
+            f.text_w = pane_w - 24.0 - 13.0 - 2.0;
+        }
         let undo = act.map(|a| self.receipt_undo(&a, cx)).unwrap_or_default();
         // The view: its head, its body, whose reply shows above the input
         // (`None`: no reply here), and whether there is an input.
@@ -498,7 +533,7 @@ impl Panel {
                 (h, b, Some(Some(name.clone())), true)
             }
             Scope::New => {
-                let (h, b) = self.launch_view(&missions, cx);
+                let (h, b) = self.launch_view(&missions, window, cx);
                 (h, b, None, false)
             }
             Scope::Record => {
@@ -507,6 +542,10 @@ impl Panel {
             }
             Scope::Shots => {
                 let (h, b) = self.shots_pane(cx);
+                (h, b, None, false)
+            }
+            Scope::Projects => {
+                let (h, b) = self.projects_view(window, cx);
                 (h, b, None, false)
             }
             Scope::Settings | Scope::Phone => {
@@ -523,7 +562,16 @@ impl Panel {
                 (h, b, None, false)
             }
         };
-        let foot = match reply {
+        // A view with a conversation (All spaces, a space): it has a column of
+        // its own beside the sidebar, the whole of it, with the input under it.
+        let talk: Option<Option<String>> = match &scope {
+            Scope::All => Some(None),
+            Scope::Space(name) => Some(Some(name.clone())),
+            _ => None,
+        };
+        let chat = talk.as_ref().zip(talk_w).map(|(space, w)| self.chat_column(space.as_deref(), w, window, cx));
+        let input = input && chat.is_none();
+        let foot = match reply.filter(|_| chat.is_none()) {
             Some(space) => self.foot_items(space.as_deref(), cx),
             None => vec![],
         };
@@ -544,6 +592,7 @@ impl Panel {
             }
             f.settings_scroll.clone()
         });
+        let scroll = scroll.or_else(|| self.full.as_ref().filter(|_| matches!(scope, Scope::New)).map(|f| f.launch_scroll.clone()));
         let pane = div()
             .id(SharedString::from(format!("pane-{}", scope_key(&scope))))
             .flex_1()
@@ -555,6 +604,7 @@ impl Panel {
             .size_full()
             .items_start()
             .child(side)
+            .children(chat)
             .child(
                 v_flex()
                     .flex_1()
@@ -717,7 +767,8 @@ impl Panel {
             let on = here == side;
             div()
                 .id(id)
-                .px(px(8.0))
+                // Four of them across the sidebar: Record, Shots, Projects, Settings.
+                .px(px(5.0))
                 .py(px(5.0))
                 .rounded(px(8.0))
                 .cursor_pointer()
@@ -762,9 +813,10 @@ impl Panel {
             .child(
                 h_flex()
                     .px(px(2.0))
-                    .gap(px(2.0))
+                    .gap(px(1.0))
                     .child(foot("side-record", "Record", Side::Record, Scope::Record))
                     .child(foot("side-shots", "Shots", Side::Shots, Scope::Shots))
+                    .child(foot("side-projects", "Projects", Side::Projects, Scope::Projects))
                     .child(foot("side-settings", "Settings", Side::Settings, Scope::Settings)),
             )
             .into_any_element()
@@ -838,13 +890,15 @@ impl Panel {
                     .into_any_element(),
             );
         }
-        let cols = h_flex()
-            .w_full()
-            .gap(px(22.0))
-            .items_start()
-            .child(v_flex().w(px(QUEUE_W)).flex_none().gap(px(10.0)).child(bay_label("Your queue · most waiting work first")).children(cards))
-            .child(v_flex().flex_1().min_w_0().gap(px(8.0)).child(bay_label("Missions")).child(v_flex().gap(px(2.0)).children(rows)))
-            .into_any_element();
+        let pane_w = self.full.as_ref().map(|f| f.pane_w).unwrap_or(900.0);
+        let queue_col = v_flex().gap(px(10.0)).child(bay_label("Your queue · most waiting work first")).children(cards);
+        let missions_col = v_flex().min_w_0().gap(px(8.0)).child(bay_label("Missions")).child(v_flex().gap(px(2.0)).children(rows));
+        // Side by side when both have room; else the missions under the queue, each the pane's width.
+        let cols = if pane_w >= QUEUE_W + 22.0 + 300.0 {
+            h_flex().w_full().gap(px(22.0)).items_start().child(queue_col.w(px(QUEUE_W)).flex_none()).child(missions_col.flex_1()).into_any_element()
+        } else {
+            v_flex().w_full().gap(px(22.0)).child(queue_col.w_full()).child(missions_col.w_full()).into_any_element()
+        };
         (head, vec![cols])
     }
 
@@ -883,7 +937,7 @@ mod tests {
         assert_eq!(scope_key(&Scope::Space("isa".into())), "space-isa");
         assert_ne!(scope_key(&Scope::Space("isa".into())), scope_key(&Scope::Space("anna".into())));
         assert_ne!(scope_key(&session("t1")), scope_key(&session("t2")));
-        let all = [Scope::All, Scope::New, Scope::Record, Scope::Shots, Scope::Settings, Scope::Behaviors, Scope::Phone];
+        let all = [Scope::All, Scope::New, Scope::Record, Scope::Shots, Scope::Projects, Scope::Settings, Scope::Behaviors, Scope::Phone];
         let keys: HashSet<String> = all.iter().map(scope_key).collect();
         assert_eq!(keys.len(), all.len());
     }

@@ -246,6 +246,17 @@ impl Decisions {
         out
     }
 
+    /// A question set was settled elsewhere (a PR it asked about merged): the
+    /// decision it stood in is answered with `what`.
+    pub fn settled(&self, set: &str, what: &str) {
+        let ids: Vec<String> = lock(&self.book).open.iter().filter(|d| d.sessions.iter().any(|w| w.question_id.as_deref() == Some(set))).map(|d| d.id.clone()).collect();
+        for id in ids {
+            let w = what.to_string();
+            self.change(|b, now| b.answered(&id, &w, now));
+            eprintln!("[decisions] {id}: {what}");
+        }
+    }
+
     /// What a decision was answered with, kept on it (open or closed lately).
     pub fn note_answer(&self, id: &str, with: &str) {
         self.change(|b, _| b.note_answer(id, with));

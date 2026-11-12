@@ -871,6 +871,12 @@ impl Asks {
         if super::watch::left_alone(t) {
             return;
         }
+        // A PR's reviewer (`reviews`): it talks to the PR's owner itself, and
+        // what it can't agree on comes to the user as the review's own
+        // decision. Its turn's end opens no PR, card or question.
+        if super::reviews::is_reviewer(address) || super::reviews::labelled_reviewer(t) {
+            return;
+        }
         let (me, address, t) = (self.clone(), address.to_string(), t.clone());
         let ended_ms = crate::history::now_ms();
         std::thread::spawn(move || {
@@ -1179,6 +1185,31 @@ impl Asks {
             eprintln!("[questions] {} ({}): its session went on without the tower: answered in its terminal", set.id, set.session);
             self.record_there_later(&set.id);
         }
+    }
+
+    /// A PR was merged: the open questions of its space's sessions that are
+    /// about it (they name `#<n>` or its link: "Close release PR #786 into
+    /// main, or leave it open?") are settled, and their decisions with them.
+    pub fn settled_by_merge(&self, pr: &crate::prs::Pr, by: &str) -> Vec<String> {
+        let what = format!("PR #{} was merged{}", pr.number, if by == "github" { " on GitHub" } else { "" });
+        let about: Vec<(String, String)> = {
+            let i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            i.sets
+                .iter()
+                .filter(|s| s.session == pr.session || (pr.space.is_some() && s.space == pr.space))
+                .filter(|s| names_pr(&serde_json::to_string(s).unwrap_or_default(), &pr.repo, pr.number))
+                .map(|s| (s.session.clone(), s.id.clone()))
+                .collect()
+        };
+        for (session, id) in &about {
+            let w = what.clone();
+            self.close_where(session, |s| s.id == *id, move |_| CloseWhy::Settled { what: w.clone() }, true);
+            if let Some(d) = self.decisions.get() {
+                d.settled(id, &what);
+            }
+            eprintln!("[questions] {id} ({session}): {what}: settled");
+        }
+        about.into_iter().map(|(_, id)| id).collect()
     }
 
     fn there(&self, id: &str) -> Option<There> {
@@ -1944,12 +1975,27 @@ pub fn detect(address: &str) -> Option<QuestionSet> {
     Some(set)
 }
 
+/// `text` names PR `number` of `repo`: its link, or `#<number>` as a word
+/// ("#786", not "#7860"); the repo's link names that repo only.
+pub fn names_pr(text: &str, repo: &str, number: u64) -> bool {
+    let n = number.to_string();
+    if text.contains(&format!("github.com/{repo}/pull/{n}")) && !text.contains(&format!("github.com/{repo}/pull/{n}0")) {
+        return true;
+    }
+    let hash = format!("#{n}");
+    text.match_indices(&hash).any(|(i, _)| {
+        let after = text[i + hash.len()..].chars().next();
+        let before = text[..i].chars().next_back();
+        !after.is_some_and(|c| c.is_ascii_digit()) && !before.is_some_and(|c| c.is_alphanumeric())
+    })
+}
+
 /// How a set that is over ended, for the decision it stood in.
 fn ended_as(p: &QuestionSet) -> crate::decisions::State {
     use crate::decisions::State;
     match &p.state.phase {
         Phase::Dismissed | Phase::Closed { why: CloseWhy::Dismissed } => State::Dismissed,
-        Phase::Closed { why: CloseWhy::AnsweredHere | CloseWhy::AnsweredElsewhere | CloseWhy::Unblocked } => State::Answered,
+        Phase::Closed { why: CloseWhy::AnsweredHere | CloseWhy::AnsweredElsewhere | CloseWhy::Unblocked | CloseWhy::Settled { .. } } => State::Answered,
         _ => State::Stopped,
     }
 }
@@ -2075,6 +2121,17 @@ mod tests {
         }
         std::thread::sleep(std::time::Duration::from_millis(30));
         t.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    #[test]
+    fn a_question_names_a_pr_by_its_number_or_its_link() {
+        assert!(names_pr("Close release PR #786 into main, or leave it open?", "eyzhub/eyzflow", 786));
+        assert!(names_pr("see https://github.com/eyzhub/eyzflow/pull/786 first", "eyzhub/eyzflow", 786));
+        assert!(!names_pr("PR #7860 is another one", "eyzhub/eyzflow", 786));
+        assert!(!names_pr("issue a#786", "eyzhub/eyzflow", 786));
+        assert!(!names_pr("https://github.com/eyzhub/other/pull/786", "eyzhub/eyzflow", 786), "another repo's link names another PR");
+        assert!(!names_pr("https://github.com/eyzhub/eyzflow/pull/7860", "eyzhub/eyzflow", 786));
+        assert!(CloseWhy::Settled { what: "PR #786 was merged on GitHub".into() }.late("q1", "web").starts_with("already answered"));
     }
 
     #[test]

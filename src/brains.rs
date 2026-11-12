@@ -68,7 +68,8 @@ const NAME_MAX: usize = 32;
 pub fn name_for(space: &str) -> String {
     let slug = crate::worktrees::slug(space);
     let name = format!("tower-{slug}");
-    if name == brain::VOICE_NAME {
+    // (Nor the planner's: a space called "planner" is `tower-planner-space`.)
+    if name == brain::VOICE_NAME || crate::plans::is_planner(&name) {
         return format!("{name}-space");
     }
     if name.len() <= NAME_MAX {
@@ -90,9 +91,10 @@ pub fn dir_of(name: &str) -> PathBuf {
 }
 
 /// A terminal by this name is a space's own brain: `tower-…`, but neither
-/// the daemon's terminal nor the main brain.
+/// the daemon's terminal, the main brain, nor the planner (`crate::plans`:
+/// a brain of no space, which no note or request is ever routed to).
 pub fn is_space_brain(name: &str) -> bool {
-    name.starts_with("tower-") && name != brain::VOICE_NAME && name != brain::NAME && name != brain::name()
+    name.starts_with("tower-") && name != brain::VOICE_NAME && name != brain::NAME && name != brain::name() && !crate::plans::is_planner(name)
 }
 
 /// A folder is a brain's own (the main one's, or a space's): what runs
@@ -106,7 +108,8 @@ pub fn is_brain_folder(folder: &str) -> bool {
 /// run from anywhere else (named by hand, another tower's) is left to
 /// whoever started it: never routed to, never stopped.
 pub fn is_ours(name: &str, t: &Value) -> bool {
-    !is_space_brain(name) || is_brain_folder(t["cwd"].as_str().unwrap_or(""))
+    // The planner is the tower's, but no brain of a space nor the main one: the plans follow it.
+    !crate::plans::is_planner(name) && (!is_space_brain(name) || is_brain_folder(t["cwd"].as_str().unwrap_or("")))
 }
 
 /// What a space brain's folder says about it (`brain.json`).
@@ -811,6 +814,12 @@ mod tests {
         let at = |cwd: &Path| json!({ "address": "t9", "cwd": cwd.to_string_lossy() });
         assert!(is_ours("tower", &at(Path::new("/anywhere"))) && is_ours("tower-sandbox", &at(&dir_for("Sandbox"))));
         assert!(!is_ours("tower-sandbox", &at(Path::new("/w/sandbox"))) && !is_ours("tower-sandbox", &json!({ "address": "t9" })));
+        // The planner (`crate::plans`) is a brain by its name (no session of the user's), but no
+        // space's brain and not the main one: nothing is routed to it, and no space's brain is called so.
+        assert!(crate::brain::is_brain_name(crate::plans::PLANNER) && !is_space_brain(crate::plans::PLANNER));
+        assert!(!is_ours(crate::plans::PLANNER, &at(&crate::plans::plans_dir().join("p1"))) && !is_ours(crate::plans::PLANNER, &at(&dir_for("planner"))));
+        assert_eq!(name_for("Planner"), "tower-planner-space");
+        assert_eq!(crate::brain::brain_of(&json!({ "address": "t9", "name": crate::plans::PLANNER })), Some(crate::plans::PLANNER), "never introduced, never a member, never asked about");
     }
 
     #[test]

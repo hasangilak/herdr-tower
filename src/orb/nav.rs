@@ -3,9 +3,9 @@
 //! that lights, and the way back from a view that has one.
 //!
 //! - `Scope` is the view: every space, one space, the launcher, the record,
-//!   the screenshots, the settings and what opens from them (behaviors; the
-//!   phone is a card of the settings, which `Phone` opens at), or one
-//!   session of a space.
+//!   the screenshots, the projects, the settings and what opens from them
+//!   (behaviors; the phone is a card of the settings, which `Phone` opens
+//!   at), or one session of a space.
 //! - `Nav` is the scope with what goes with it: the record's space filter
 //!   (opened from inside a space it starts on that space), the quiet fold,
 //!   and a line said once at the top of a view (a space launched, a space
@@ -33,6 +33,8 @@ pub enum Scope {
     New,
     Record,
     Shots,
+    /// The projects New space opens and drafts from: each with its repos and what each is for.
+    Projects,
     Settings,
     /// From Settings.
     Behaviors,
@@ -51,6 +53,7 @@ pub enum Side {
     New,
     Record,
     Shots,
+    Projects,
     Settings,
 }
 
@@ -66,6 +69,7 @@ impl Scope {
             Scope::New => Side::New,
             Scope::Record => Side::Record,
             Scope::Shots => Side::Shots,
+            Scope::Projects => Side::Projects,
             Scope::Settings | Scope::Behaviors | Scope::Phone => Side::Settings,
         }
     }
@@ -95,7 +99,7 @@ impl Scope {
     }
 
     /// A scope by its word, as `HERDER_TOWER_ORB_WINDOW` names it: `all`,
-    /// `new`, `record`, `record=<space>`, `shots`, `settings`, `behaviors`,
+    /// `new`, `record`, `record=<space>`, `shots`, `projects`, `settings`, `behaviors`,
     /// `phone`, `space=<name>`, `session=<address>` or
     /// `session=<space>/<address>`. With it, the record's filter.
     pub fn parse(word: &str) -> (Scope, Option<String>) {
@@ -108,6 +112,7 @@ impl Scope {
             ("record", "") => (Scope::Record, None),
             ("record", space) => (Scope::Record, Some(space.to_string())),
             ("shots", _) => (Scope::Shots, None),
+            ("projects", _) => (Scope::Projects, None),
             ("settings", _) => (Scope::Settings, None),
             ("behaviors", _) => (Scope::Behaviors, None),
             ("phone", _) => (Scope::Phone, None),
@@ -326,7 +331,7 @@ mod tests {
         for s in [Scope::Settings, Scope::Behaviors, Scope::Phone] {
             assert_eq!(s.side(), Side::Settings, "{s:?}");
         }
-        assert_eq!((Scope::Record.side(), Scope::Shots.side()), (Side::Record, Side::Shots));
+        assert_eq!((Scope::Record.side(), Scope::Shots.side(), Scope::Projects.side()), (Side::Record, Side::Shots, Side::Projects));
     }
 
     #[test]
@@ -335,7 +340,7 @@ mod tests {
         assert_eq!(session("isa", "t3").back(), Some(("Back to isa".into(), Scope::Space("isa".into()))));
         assert_eq!(session("", "t3").back(), Some(("Back to All spaces".into(), Scope::All)));
         // The phone is Settings itself, at its card: nothing to go back to.
-        for s in [Scope::All, Scope::Space("isa".into()), Scope::New, Scope::Record, Scope::Shots, Scope::Settings, Scope::Phone] {
+        for s in [Scope::All, Scope::Space("isa".into()), Scope::New, Scope::Record, Scope::Shots, Scope::Projects, Scope::Settings, Scope::Phone] {
             assert_eq!(s.back(), None, "{s:?}");
         }
     }
@@ -343,7 +348,7 @@ mod tests {
     #[test]
     fn number_keys_count_where_a_queue_shows() {
         assert!(Scope::All.answers() && Scope::Space("isa".into()).answers());
-        for s in [Scope::New, Scope::Record, Scope::Shots, Scope::Settings, Scope::Behaviors, Scope::Phone, session("isa", "t3")] {
+        for s in [Scope::New, Scope::Record, Scope::Shots, Scope::Projects, Scope::Settings, Scope::Behaviors, Scope::Phone, session("isa", "t3")] {
             assert!(!s.answers(), "{s:?}");
         }
         // The input talks to a space's tower only in that space's view.
@@ -436,7 +441,7 @@ mod tests {
         assert_eq!(Scope::parse("session=t12"), (session("", "t12"), None));
         assert_eq!(Scope::parse("session=sandbox/t12"), (session("sandbox", "t12"), None));
         assert_eq!(Scope::parse("session=sandbox/vps/t2"), (session("sandbox/vps", "t2"), None));
-        assert_eq!((Scope::parse("shots").0, Scope::parse("settings").0), (Scope::Shots, Scope::Settings));
+        assert_eq!((Scope::parse("shots").0, Scope::parse("settings").0, Scope::parse("projects").0), (Scope::Shots, Scope::Settings, Scope::Projects));
         assert_eq!((Scope::parse("behaviors").0, Scope::parse("phone").0), (Scope::Behaviors, Scope::Phone));
         assert_eq!(Scope::parse("space="), (Scope::All, None));
     }

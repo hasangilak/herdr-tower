@@ -14,7 +14,9 @@ pub mod lan;
 pub mod mic;
 pub mod missions;
 pub mod narrate;
+pub mod plans;
 pub mod queue;
+pub mod reviews;
 pub mod sendq;
 pub mod sessions;
 pub mod state;
@@ -56,6 +58,8 @@ struct Daemon {
     missions: missions::Missions,
     brains: brains::Brains,
     acts: acts::Acts,
+    plans: plans::Plans,
+    reviews: reviews::Reviews,
 }
 
 pub fn run() -> Result<()> {
@@ -130,6 +134,10 @@ pub fn run() -> Result<()> {
         prs.on_change(Box::new(move |op, pr| {
             hub.broadcast("pr", serde_json::json!({ "op": op, "pr": pr.view() }));
             decisions.sync_prs(&all.list());
+            // A PR found in a space with review on gets its reviewer; one that closed ends its review.
+            if let Some(r) = reviews::running() {
+                r.pr_changed(op, pr);
+            }
         }));
     }
     let lan = lan::Lan::new(lan::Ctx {
@@ -246,8 +254,12 @@ pub fn run() -> Result<()> {
     sendq.start();
     {
         // A merge (the user's, or on GitHub one its session waited on): the session and the brain are told.
-        let (sendq, watches) = (sendq.clone(), watches.clone());
-        prs.on_merged(Box::new(move |pr, by| after_merge(&sendq, &watches, pr, by)));
+        let (sendq, watches, asks) = (sendq.clone(), watches.clone(), asks.clone());
+        prs.on_merged(Box::new(move |pr, by| {
+            // Its questions ("merge it, or leave it open?") are settled by the merge.
+            asks.settled_by_merge(pr, by);
+            after_merge(&sendq, &watches, pr, by)
+        }));
         // Open PRs looked at gently.
         let prs = prs.clone();
         thread::Builder::new().name("prs".into()).spawn(move || {
@@ -259,6 +271,13 @@ pub fn run() -> Result<()> {
             }
         })?;
     }
+    // A reviewer for each PR a space's sessions open (where review is on), until both agree.
+    let reviews = reviews::Reviews::open(
+        prs.clone(),
+        shared.clone(),
+        std::sync::Arc::new(reviews::Real { sendq: sendq.clone(), decisions: decisions.clone(), watches: watches.clone() }),
+    );
+    reviews.start();
     // The agenda ledger: what the user asked for, followed until it's done.
     let agendas = agendas::Agendas::open();
     agendas.start(agendas::Ctx { sendq: sendq.clone(), watches: watches.clone(), asks: asks.clone(), shared: shared.clone(), decisions: decisions.clone() });
@@ -273,7 +292,10 @@ pub fn run() -> Result<()> {
     missions.start();
     // What the tower opened for the user lately, to show with the reply and to undo.
     let acts = acts::Acts::open(shared.clone(), hub.clone());
-    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks, sendq, prs, agendas, introducer, decisions, missions, brains, acts };
+    // A space's plan before it is launched, and its planner (`tower plan`).
+    let plans = plans::Plans::open(shared.clone(), sendq.clone());
+    plans.start();
+    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks, sendq, prs, agendas, introducer, decisions, missions, brains, acts, plans, reviews };
     // The phone API reaches the rest of the tower through the daemon itself
     // (`desk`), so it starts only now that the daemon is whole.
     daemon.lan.attach(std::sync::Arc::new(daemon.clone()));
@@ -328,6 +350,8 @@ impl Daemon {
         let words = crate::introduce::task_from_prompt(&ev.text).unwrap_or_else(|| ev.text.trim().to_string());
         let (name, space) = (crate::hc::spoken_name(t), crate::spaces::space_of(t));
         eprintln!("[terminal] {address} ({name}): the user typed in its terminal: {}", crate::agenda::clip(&words, 120));
+        // What the tower has waiting for it may say what the user just did: checked before it goes.
+        self.sendq.user_said(address, &words, ev.at_ms);
         if self.asks.typed_there(address, &words, ev.at_ms) {
             return;
         }
@@ -526,6 +550,12 @@ impl Daemon {
                 };
             }
             Request::Missions => return Response { ok: true, error: None, state: Some(self.missions.now()) },
+            Request::Review { action, pr, critical, text, from } => {
+                return match self.reviews.request(&action, &pr, critical, &text, from.as_deref()) {
+                    Ok(v) => Response { ok: true, error: None, state: Some(v) },
+                    Err(e) => Response::err(format!("{e:#}")),
+                };
+            }
             Request::Raise { session, why, text, options, detail, from } => return self.raise(&session, &why, &text, &detail, options, from.as_deref()),
             Request::Receipt { text, agenda, from } => return self.receipt(&text, agenda.as_deref(), from.as_deref()),
             Request::Model { model, effort, restart } => return self.model(model.as_deref(), effort.as_deref(), restart),
@@ -602,7 +632,8 @@ impl Daemon {
                 return Response { ok: true, error: None, state: Some(serde_json::json!({ "questions": v })) };
             }
             Request::Decisions { space, all } => {
-                // As it stands now: a space may have been muted a moment ago.
+                // As it stands now: a space may have been muted a moment ago, a PR merged on GitHub.
+                self.prs.look_now();
                 self.decisions.refresh();
                 return Response { ok: true, error: None, state: Some(self.decisions.list(space.as_deref(), all)) };
             }
@@ -646,6 +677,7 @@ impl Daemon {
                 };
             }
             Request::Screenshots => load_screenshots(&self.shared),
+            plan @ Request::Plan { .. } => return self.plans.request(&plan),
             Request::Phone { action, arg } => {
                 let info = match action.as_str() {
                     "on" => {

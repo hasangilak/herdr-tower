@@ -290,6 +290,8 @@ pub(super) fn load() -> Vec<Row> {
 impl Panel {
     /// The record's head and body.
     pub(super) fn record_view(&mut self, cx: &mut Context<Self>) -> (AnyElement, Vec<AnyElement>) {
+        // The time, kind and place beside the text need about this much of the pane.
+        let wide = self.full.as_ref().map(|f| f.pane_w).unwrap_or(900.0) >= super::window::TWO_COLS_W;
         let g = glass();
         let filter = self.tower.read(cx).nav.rec_filter.clone();
         let Some(full) = self.full.as_ref() else { return (whead("Record", vec![], None), vec![]) };
@@ -339,22 +341,35 @@ impl Panel {
                 What::Failed | What::Undelivered => pill.border_color(rgb(ROSE)).text_color(rgb(ROSE)),
                 _ => pill.border_color(rgba(LINE)).text_color(g.muted),
             };
-            list = list.child(
+            // Its columns side by side when the pane has room for the text beside them; else the text under them.
+            let row = if wide {
                 h_flex()
                     .w_full()
                     .gap(px(12.0))
                     .items_start()
-                    .px(px(4.0))
-                    .py(px(9.0))
-                    .border_t_1()
-                    .border_color(rgba(LINE))
-                    .text_size(px(13.0))
-                    .line_height(px(18.0))
                     .child(div().w(px(58.0)).flex_none().text_color(g.faint).child(clock(r.at)))
                     .child(div().w(px(118.0)).flex_none().flex().child(pill.child(r.label())))
                     .child(div().w(px(170.0)).flex_none().text_color(g.muted).child(r.place()))
-                    .child(div().flex_1().min_w_0().line_clamp(4).child(r.text.clone())),
-            );
+                    .child(div().flex_1().min_w_0().line_clamp(4).child(r.text.clone()))
+                    .into_any_element()
+            } else {
+                v_flex()
+                    .w_full()
+                    .gap(px(5.0))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(10.0))
+                            .child(div().flex_none().text_color(g.faint).child(clock(r.at)))
+                            .child(div().flex_none().flex().child(pill.child(r.label())))
+                            .child(div().min_w_0().text_color(g.muted).child(r.place())),
+                    )
+                    .child(div().w_full().line_clamp(4).child(r.text.clone()))
+                    .into_any_element()
+            };
+            list = list.child(div().w_full().px(px(4.0)).py(px(9.0)).border_t_1().border_color(rgba(LINE)).text_size(px(13.0)).line_height(px(18.0)).child(row));
         }
         let mut items = vec![chips, list.into_any_element()];
         if mine.len() > SHOWN {

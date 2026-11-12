@@ -51,7 +51,7 @@ pub const H: f32 = 640.0;
 pub const FULL_W: f32 = 960.0;
 pub const FULL_H: f32 = 640.0;
 /// The full window's least size: its sidebar and queue column side by side, and room for the missions.
-pub const FULL_MIN_W: f32 = 820.0;
+pub const FULL_MIN_W: f32 = 960.0;
 pub const FULL_MIN_H: f32 = 520.0;
 /// Their corners (the window is rounded to match, by `mac::Win::glass`).
 pub const RADIUS: f32 = 28.0;
@@ -101,11 +101,13 @@ mod home;
 mod launch;
 mod phone;
 mod prchip;
+mod projects;
 mod questions;
 mod record;
 mod session;
 mod settings;
 mod space;
+mod talk;
 mod viewer;
 mod window;
 
@@ -225,6 +227,8 @@ impl Panel {
         // which would hide the glass.
         Theme::change(ThemeMode::Light, Some(window), cx);
         Theme::update(cx, |t| t.tokens.background = gpui::transparent_black().into());
+        // The queue is looked at: the tower looks at the PRs that wait for a merge again (one merged on GitHub goes).
+        cx.background_executor().spawn(async { cli::tower(&["decisions", "--json"]) }).detach();
         let text = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 6).submit_on_enter(true).placeholder("Tell the tower…"));
         let subs = vec![
             cx.subscribe_in(&text, window, |this, _, ev: &InputEvent, window, cx| match ev {

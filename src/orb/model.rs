@@ -158,6 +158,8 @@ pub struct PrRef {
     pub session: String,
     /// None from a daemon that doesn't say.
     pub merge: Option<MergeGate>,
+    /// Its review (`crate::reviews`), when it has one.
+    pub review: Option<crate::reviews::Brief>,
 }
 
 impl PrRef {
@@ -431,6 +433,7 @@ pub fn adapt(sets: &[QuestionSet], prs: &BTreeMap<String, Pr>, agents: &Value, s
                 note: p.checks_line(),
                 session: p.session.clone(),
                 merge: None,
+                review: p.review.clone(),
             })
             .collect();
         let key = format!("merge:{repo}@{space}");
@@ -591,6 +594,10 @@ pub struct Mission {
     #[serde(deserialize_with = "or_default")]
     pub done_when: String,
     pub standing: bool,
+    /// Its PRs get a reviewer (`crate::reviews`): on unless the user turned
+    /// it off, and on from a daemon that doesn't say.
+    #[serde(default = "yes")]
+    pub review: bool,
     pub state: Phase,
     pub follow: bool,
     pub mute: bool,
@@ -807,6 +814,7 @@ impl Member {
 pub struct Marks {
     pub follow: Option<bool>,
     pub mute: Option<bool>,
+    pub review: Option<bool>,
 }
 
 /// A space's mark: an amber count, the same as an outline when it is muted,
@@ -844,6 +852,7 @@ impl Missions {
             m.follow = m.follow || follows.iter().any(|f| f.eq_ignore_ascii_case(&m.name));
             m.follow = marks.get(&m.name).and_then(|mark| mark.follow).unwrap_or(m.follow);
             m.mute = muted.iter().any(|n| n.eq_ignore_ascii_case(&m.name));
+            m.review = marks.get(&m.name).and_then(|mark| mark.review).unwrap_or(m.review);
         }
     }
 
@@ -931,6 +940,7 @@ pub fn adapt_missions(spaces: &Spaces, live: &[Live], known: &[String], agents: 
             goal: spaces.agendas.get(&l.name).cloned().unwrap_or_default(),
             done_when: kept.map(|m| m.done_when.clone()).unwrap_or_default(),
             standing: kept.is_some_and(|m| m.standing),
+            review: kept.is_none_or(|m| m.review),
             report: kept.map(|m| m.report.clone()).unwrap_or_default(),
             state: if kept.is_some_and(|m| m.state == crate::missions::State::Ready) { Phase::Ready } else { Phase::Open },
             sessions: l
@@ -1068,6 +1078,72 @@ pub fn thread(state: &Value, space: &str) -> Vec<Message> {
         .filter_map(|v| serde_json::from_value::<Message>(v.clone()).ok())
         .filter(|m| !m.text.trim().is_empty())
         .collect()
+}
+
+/// A line of the chat about a plan (`plan.thread` in the state).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct PlanMsg {
+    /// `user` or `planner`.
+    #[serde(deserialize_with = "or_default")]
+    pub from: String,
+    #[serde(deserialize_with = "or_default")]
+    pub text: String,
+    pub at: u64,
+}
+
+impl PlanMsg {
+    pub fn mine(&self) -> bool {
+        self.from == "user"
+    }
+}
+
+/// The plan that is open, as the state has it (`plan`, see `crate::plans`).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct PlanView {
+    #[serde(deserialize_with = "or_default")]
+    pub id: String,
+    /// `page` or `whiteboard`.
+    #[serde(deserialize_with = "or_default")]
+    pub form: String,
+    /// `writing`, `ready` or `failed`.
+    #[serde(deserialize_with = "or_default")]
+    pub status: String,
+    #[serde(deserialize_with = "or_default")]
+    pub ticket: String,
+    /// The draft as the planner last revised it.
+    pub draft: Value,
+    pub revision: u32,
+    pub address: Option<String>,
+    /// How the planner stands: `starting`, `working`, `idle`, `blocked`, `gone`.
+    #[serde(deserialize_with = "or_default")]
+    pub planner: String,
+    pub blocked: bool,
+    /// The user's last line has no answer yet.
+    pub answering: bool,
+    pub url: Option<String>,
+    #[serde(deserialize_with = "or_default")]
+    pub why: String,
+    #[serde(deserialize_with = "or_default")]
+    pub thread: Vec<PlanMsg>,
+    pub created_ms: u64,
+    pub ready_ms: Option<u64>,
+}
+
+impl PlanView {
+    /// What it is published as, in a word for the window: "page", "whiteboard".
+    pub fn form_word(&self) -> &str {
+        if self.form == "whiteboard" { "whiteboard" } else { "page" }
+    }
+}
+
+/// The open plan, when the state has one (an older tower's has none).
+pub fn plan(state: &Value) -> Option<PlanView> {
+    let v = state.get("plan").filter(|v| v.is_object())?;
+    let mut p: PlanView = serde_json::from_value(v.clone()).ok()?;
+    p.thread.retain(|m| !m.text.trim().is_empty());
+    (!p.id.is_empty() && p.status != "closed").then_some(p)
 }
 
 /// The space called `space` has a tower of its own that runs, as the state's missions say.
@@ -1918,14 +1994,14 @@ mod tests {
         let number = |marks: &HashMap<String, Marks>, state: &Value, mutes: &[String]| count(&all, &muted_spaces(&all, state, mutes, marks));
         assert_eq!(number(&marks, &state, &[]), 1, "isa is muted by the state");
         // Muted here: off the count at once.
-        marks.insert("sandbox".into(), Marks { follow: Some(true), mute: Some(true) });
+        marks.insert("sandbox".into(), Marks { follow: Some(true), mute: Some(true), review: None });
         assert_eq!(number(&marks, &state, &[]), 0);
         let mut m = missions(&state, &Spaces::default(), &[], &[], &all);
         m.mark(&[], &muted_spaces(&all, &state, &[], &marks), &marks);
         assert_eq!((m.open[0].follow, m.open[0].mute, m.open[0].chip()), (true, true, Chip::Muted(1)));
         assert!(main_queue(&all, &m.muted()).is_empty());
         // Unmuted here, before the state says so.
-        marks.insert("isa".into(), Marks { follow: None, mute: Some(false) });
+        marks.insert("isa".into(), Marks { follow: None, mute: Some(false), review: None });
         assert_eq!(number(&marks, &state, &[]), 1);
         // The state doesn't agree yet: both stay.
         settle_marks(&mut marks, &state, &all, &[], &[]);
@@ -1933,7 +2009,7 @@ mod tests {
         // It says the same: forgotten, one switch at a time.
         let agreed = json!({ "missions": [{ "name": "sandbox", "state": "open", "mute": true }, { "name": "isa", "state": "open", "follow": true }] });
         settle_marks(&mut marks, &agreed, &all, &[], &[]);
-        assert_eq!(marks.get("sandbox"), Some(&Marks { follow: Some(true), mute: None }));
+        assert_eq!(marks.get("sandbox"), Some(&Marks { follow: Some(true), mute: None, review: None }));
         assert!(!marks.contains_key("isa"));
         // Followed in spaces.json (any case): that settles it too, and marks a mission.
         settle_marks(&mut marks, &agreed, &all, &["SANDBOX".to_string()], &[]);
@@ -1953,7 +2029,7 @@ mod tests {
         assert_eq!(muted, ["landing".to_string(), "Sandbox".to_string()].into(), "spelt as the decisions spell it");
         assert_eq!((ids(&main_queue(&all, &muted)), count(&all, &muted)), (vec!["pr"], 1));
         // Unmuted here: back in the queue before the daemon says so.
-        let mut marks: HashMap<String, Marks> = [("landing".to_string(), Marks { follow: None, mute: Some(false) })].into();
+        let mut marks: HashMap<String, Marks> = [("landing".to_string(), Marks { follow: None, mute: Some(false), review: None })].into();
         assert_eq!(count(&all, &muted_spaces(&all, &json!({}), &["sandbox".to_string()], &marks)), 2);
         // The daemon still says muted: the switch stays; once it doesn't, it is forgotten.
         settle_marks(&mut marks, &json!({}), &all, &[], &[]);
@@ -1961,9 +2037,9 @@ mod tests {
         settle_marks(&mut marks, &json!({}), &all[..2], &[], &[]);
         assert!(marks.is_empty());
         // Muted here, then listed in spaces.json: forgotten too.
-        let mut marks: HashMap<String, Marks> = [("isa".to_string(), Marks { follow: Some(false), mute: Some(true) })].into();
+        let mut marks: HashMap<String, Marks> = [("isa".to_string(), Marks { follow: Some(false), mute: Some(true), review: None })].into();
         settle_marks(&mut marks, &json!({}), &all, &[], &[]);
-        assert_eq!(marks.get("isa"), Some(&Marks { follow: None, mute: Some(true) }), "not followed anywhere: that much is settled");
+        assert_eq!(marks.get("isa"), Some(&Marks { follow: None, mute: Some(true), review: None }), "not followed anywhere: that much is settled");
         settle_marks(&mut marks, &json!({}), &all, &[], &["ISA".to_string()]);
         assert!(marks.is_empty());
     }
@@ -1993,6 +2069,31 @@ mod tests {
         assert_eq!(own.who_in("fix-login"), "fix login → fix", "a name that is only the space's stays");
         assert_eq!(tell_level(&state), Some("results"));
         assert_eq!((tell_level(&json!({})), tell_level(&json!({ "tell_level": "loud" }))), (None, None));
+    }
+
+    #[test]
+    fn the_open_plan_reads_from_the_state() {
+        let state = json!({ "plan": {
+            "id": "p2", "form": "whiteboard", "status": "ready", "ticket": "EYZFlow Support – Translate messages",
+            "draft": { "space": "msg-translation", "sessions": [{ "repo": "/w/a" }] }, "revision": 1,
+            "address": "t9", "planner": "idle", "blocked": false, "answering": true, "url": "https://claude.ai/artifact/wb", "why": "",
+            "thread": [{ "from": "user", "text": "which session starts first?", "at": 5 }, { "from": "planner", "text": " ", "at": 6 }, { "from": null, "text": "x" }],
+            "created_ms": 1, "ready_ms": 4, "some_newer_field": true,
+        } });
+        let p = plan(&state).unwrap();
+        assert_eq!((p.id.as_str(), p.form_word(), p.status.as_str(), p.url.as_deref(), p.revision, p.answering), ("p2", "whiteboard", "ready", Some("https://claude.ai/artifact/wb"), 1, true));
+        assert_eq!(p.draft["space"], "msg-translation");
+        assert_eq!(p.thread.iter().map(|m| (m.mine(), m.text.as_str())).collect::<Vec<_>>(), [(true, "which session starts first?"), (false, "x")], "an empty line goes");
+        // Blocked on a dialog in its terminal; a page; none; a closed one; a state from before plans.
+        let mut blocked = state.clone();
+        blocked["plan"]["blocked"] = true.into();
+        blocked["plan"]["form"] = "page".into();
+        let p = plan(&blocked).unwrap();
+        assert!(p.blocked && p.form_word() == "page");
+        assert!(plan(&json!({ "plan": null })).is_none() && plan(&json!({})).is_none());
+        let mut closed = state.clone();
+        closed["plan"]["status"] = "closed".into();
+        assert!(plan(&closed).is_none());
     }
 
     #[test]

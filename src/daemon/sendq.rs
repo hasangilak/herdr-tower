@@ -41,6 +41,18 @@
 //!
 //! A Claude Code or Codex session in `error` (its turn ended on an API
 //! error) sits at its prompt: it takes an instruction as idle or done would.
+//!
+//! What the user types in a session's own terminal (`user_said`) is checked
+//! against the tower's messages waiting for it (not a note, not a message
+//! between sessions): one queued from ten minutes before those words on
+//! waits until the check is done (`covered::judge`, `Sessions::check`), and
+//! one the user's words already cover (they said it, gave the same
+//! instruction, or made it moot) is not sent: it leaves the queue, the
+//! record says so ("Not sent: you had told it yourself …"), and its task in
+//! the agenda is dropped with that reason. A check that fails, or takes
+//! longer than two minutes, lets the messages go. A session the user has
+//! been typing in takes the tower's next message three seconds after its
+//! turn ends, not at once: what the user typed while it worked goes in first.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -68,6 +80,19 @@ const RETRY_MS: u64 = 10 * 60_000;
 const KEEP_DELIVERED: usize = 300;
 /// A parked instruction nobody retargets or cancels moves to `expired` after this long.
 const PARK_EXPIRE_MS: u64 = 7 * 24 * 3_600_000;
+/// What the user typed in a session is checked against the tower's messages
+/// for it queued after it, or this long before it.
+const SAID_BEFORE_MS: u64 = 10 * 60_000;
+/// The user's own words in a session are kept this long (and at most `SAID_KEEP`).
+const SAID_KEEP_MS: u64 = 30 * 60_000;
+const SAID_KEEP: usize = 12;
+/// A check that hasn't answered in this long is over: what it held goes.
+const CHECK_LIMIT_MS: u64 = 120_000;
+/// A session the user has been typing in lately takes the tower's next
+/// message only this long after its turn ended: what the user typed while it
+/// worked (Claude Code sends it the moment that turn ends) comes first, and
+/// is checked against it.
+const SETTLE_MS: u64 = 3_000;
 
 /// Why an instruction won't go on its own. On disk (and on the wire) it is
 /// its word, as before: `gone`, `replaced`, `after-cancelled`, `start-failed`;
@@ -359,6 +384,26 @@ impl Delivered {
     }
 }
 
+/// What the user typed in a session's own terminal, and when.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Said {
+    pub words: String,
+    pub at_ms: u64,
+}
+
+/// A check of the tower's messages waiting for a session against what the
+/// user typed there themselves: do their words already cover any of them?
+#[derive(Debug, Clone, PartialEq)]
+pub struct Check {
+    pub session: String,
+    /// The session's spoken name.
+    pub name: String,
+    /// The user's words, oldest first.
+    pub said: Vec<Said>,
+    /// The waiting messages: id and text.
+    pub items: Vec<(u64, String)>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Book {
     next_id: u64,
@@ -384,6 +429,19 @@ struct Book {
     /// the queue first saw it so (Herdr's `status_ms` may say longer).
     #[serde(skip)]
     working: BTreeMap<String, (Option<u64>, u64)>,
+    /// Not sent because the user had told the session themselves: id, and
+    /// their words (newest last, at most `KEEP_DELIVERED`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    covered: BTreeMap<u64, String>,
+    /// What the user typed in each session's own terminal lately (oldest first).
+    #[serde(skip)]
+    said: BTreeMap<String, Vec<Said>>,
+    /// Each waiting message: the newest of the user's words it was checked against.
+    #[serde(skip)]
+    checked: BTreeMap<u64, u64>,
+    /// Sessions whose waiting messages are being checked: since when, and which.
+    #[serde(skip)]
+    checking: BTreeMap<String, (u64, Vec<u64>)>,
 }
 
 impl Book {
@@ -434,6 +492,87 @@ impl Book {
     /// other sessions aren't work: not counted).
     fn waiting_for(&self, session: &str) -> usize {
         self.items.iter().filter(|i| i.session == session && !i.quiet && i.from.is_none() && !matches!(i.state(), ItemState::Parked(_))).count()
+    }
+
+    /// A message the user's own words may cover: the tower's (not a note,
+    /// not a message between sessions, not a session to start), waiting.
+    fn checkable(i: &Item) -> bool {
+        !i.quiet && i.from.is_none() && i.start.is_empty() && matches!(i.state(), ItemState::Waiting | ItemState::WaitingFor(_))
+    }
+
+    /// The check `session`'s waiting messages need: each one the user typed
+    /// something in that session for, since it was queued or a little
+    /// before, that it wasn't checked against yet; with all the user's
+    /// words of that time. None: none needs one.
+    fn needs_check(&self, session: &str) -> Option<Check> {
+        let said = self.said.get(session)?;
+        let mut items = vec![];
+        let mut words: Vec<Said> = vec![];
+        for i in self.items.iter().filter(|i| i.session == session && Self::checkable(i)) {
+            let upto = self.checked.get(&i.id).copied().unwrap_or(0);
+            let about: Vec<&Said> = said.iter().filter(|s| s.at_ms + SAID_BEFORE_MS >= i.at_ms).collect();
+            if !about.iter().any(|s| s.at_ms > upto) {
+                continue;
+            }
+            items.push((i.id, i.text.clone()));
+            for s in about {
+                if !words.contains(s) {
+                    words.push(s.clone());
+                }
+            }
+        }
+        if items.is_empty() {
+            return None;
+        }
+        words.sort_by_key(|s| s.at_ms);
+        let name = self.items.iter().find(|i| i.session == session).map(|i| i.name.clone()).unwrap_or_default();
+        Some(Check { session: session.into(), name, said: words, items })
+    }
+
+    /// What waits for each session, in order (sessions to start aside).
+    fn lines(&self) -> BTreeMap<String, Vec<super::state::WaitingLine>> {
+        let mut out: BTreeMap<String, Vec<super::state::WaitingLine>> = BTreeMap::new();
+        for i in self.items.iter().filter(|i| i.start.is_empty()) {
+            let checking = self.checking.get(&i.session).is_some_and(|(_, ids)| ids.contains(&i.id));
+            out.entry(i.session.clone()).or_default().push(super::state::WaitingLine {
+                id: i.id,
+                text: match &i.from {
+                    Some(f) => crate::peers::unsigned(f, &i.text).to_string(),
+                    None => i.text.clone(),
+                },
+                from: i.from.as_ref().map(|f| f.name.clone()),
+                note: i.quiet,
+                parked: i.parked.as_ref().map(|p| p.word().to_string()),
+                checking,
+            });
+        }
+        out
+    }
+
+    /// The check `session` needs, unless one is under way: marked under way.
+    fn start_check(&mut self, session: &str, now: u64) -> Option<Check> {
+        if self.checking.get(session).is_some_and(|(since, _)| now.saturating_sub(*since) < CHECK_LIMIT_MS) {
+            return None;
+        }
+        let c = self.needs_check(session)?;
+        self.checking.insert(session.into(), (now, c.items.iter().map(|(id, _)| *id).collect()));
+        Some(c)
+    }
+
+    /// `id` waits for a check of the user's words under way. One that took
+    /// too long is over: what it held counts as checked, and goes.
+    fn held_by_check(&mut self, session: &str, id: u64, now: u64) -> bool {
+        let Some((since, ids)) = self.checking.get(session).cloned() else { return false };
+        if now.saturating_sub(since) < CHECK_LIMIT_MS {
+            return ids.contains(&id);
+        }
+        eprintln!("[queue] the check of {session}'s waiting messages against the user's words took too long: they go");
+        self.checking.remove(session);
+        let upto = self.said.get(session).and_then(|s| s.iter().map(|s| s.at_ms).max()).unwrap_or(now);
+        for id in ids {
+            self.checked.insert(id, upto);
+        }
+        false
     }
 
     /// The sessions to look at: those with something waiting, then those
@@ -780,6 +919,96 @@ impl SendQueue {
         Ok((Added::Queued { id: item.id, position: position.max(1), status: s.status.word().to_string() }, s.address, s.name))
     }
 
+    /// The user typed `words` in `session`'s own terminal (at `at_ms`): the
+    /// tower's messages waiting for it are checked against them before they
+    /// go in, starting now (the session works on the user's words meanwhile).
+    pub fn user_said(&self, session: &str, words: &str, at_ms: u64) {
+        self.user_said_with(&Herdr, session, words, at_ms)
+    }
+
+    fn user_said_with(&self, h: &dyn Sessions, session: &str, words: &str, at_ms: u64) {
+        let words = words.trim();
+        if words.is_empty() {
+            return;
+        }
+        let now = crate::history::now_ms();
+        let check = {
+            let mut b = self.lock();
+            b.said.retain(|_, l| l.iter().any(|s| now.saturating_sub(s.at_ms) < SAID_KEEP_MS));
+            let list = b.said.entry(session.to_string()).or_default();
+            list.retain(|s| now.saturating_sub(s.at_ms) < SAID_KEEP_MS);
+            list.push(Said { words: words.to_string(), at_ms });
+            if list.len() > SAID_KEEP {
+                let n = list.len() - SAID_KEEP;
+                list.drain(..n);
+            }
+            b.start_check(session, now)
+        };
+        if let Some(c) = check {
+            eprintln!("[queue] {session}: checking {} waiting message(s) against what the user typed there", c.items.len());
+            h.check(c);
+        }
+    }
+
+    /// The check `c` is done: `covered`, each message the user's words cover
+    /// (its id, and the words that cover it); or why it couldn't tell (then
+    /// they all go). One covered leaves the queue, not sent.
+    pub fn checked(&self, c: &Check, covered: Result<Vec<(u64, String)>>) {
+        self.checked_with(&Herdr, c, covered)
+    }
+
+    fn checked_with(&self, h: &dyn Sessions, c: &Check, covered: Result<Vec<(u64, String)>>) {
+        let upto = c.said.iter().map(|s| s.at_ms).max().unwrap_or(0);
+        let covered = covered.unwrap_or_else(|e| {
+            eprintln!("[queue] couldn't check {}'s waiting messages against the user's words ({e:#}): they go", c.session);
+            vec![]
+        });
+        {
+            let mut b = self.lock();
+            if b.checking.get(&c.session).is_some_and(|(_, ids)| c.items.iter().all(|(id, _)| ids.contains(id))) {
+                b.checking.remove(&c.session);
+            }
+            for (id, _) in &c.items {
+                let e = b.checked.entry(*id).or_insert(0);
+                *e = (*e).max(upto);
+            }
+            for (id, words) in covered {
+                // Only one it asked about, still waiting (not going in this moment).
+                if !c.items.iter().any(|(i, _)| *i == id) {
+                    continue;
+                }
+                let Some(pos) = b.items.iter().position(|i| i.id == id && Book::checkable(i)) else { continue };
+                let item = b.items.remove(pos);
+                let quote = crate::agenda::clip(words.trim(), 160);
+                b.checked.remove(&id);
+                b.covered.insert(id, quote.clone());
+                while b.covered.len() > KEEP_DELIVERED {
+                    let Some(first) = b.covered.keys().next().copied() else { break };
+                    b.covered.remove(&first);
+                }
+                eprintln!("[queue] #{id} for {} not sent: what the user typed there covers it", item.session);
+                h.record(&item.session, &format!("Not sent: you had told it yourself (\"{quote}\"): {}", item.text), "not-sent");
+                if !h.level().quiet() {
+                    h.tell(Note {
+                        session: item.session.clone(),
+                        name: item.name.clone(),
+                        msg: format!(
+                            "[queue] #{id} for {} ({}) was not sent: the user had told it themselves in its terminal (\"{quote}\"), which covers it. It said: {}",
+                            item.session, item.name, item.text
+                        ),
+                        speech: String::new(),
+                    });
+                }
+            }
+            let live: HashSet<u64> = b.items.iter().map(|i| i.id).collect();
+            b.checked.retain(|id, _| live.contains(id));
+            if let Err(e) = self.save(&b) {
+                eprintln!("[queue] {e:#}");
+            }
+        }
+        self.kick();
+    }
+
     /// A session started with its first task (`tower start` from a
     /// dispatch): something later instructions can wait for. Returns its id.
     pub fn track(&self, session: &str, text: &str) -> Result<u64> {
@@ -945,6 +1174,9 @@ impl SendQueue {
                 finished: d.finished,
                 next_ms,
             };
+        }
+        if let Some(said) = b.covered.get(&id) {
+            return QueueFact::Covered { said: said.clone() };
         }
         if b.cancelled.contains(&id) {
             return QueueFact::Cancelled;
@@ -1294,6 +1526,22 @@ impl SendQueue {
                 let _ = self.save(&b);
                 return;
             }
+            // The user typed in this session themselves lately: it waits until
+            // their words are checked against it (they may say it already).
+            if !busy && Book::checkable(&item) {
+                if b.held_by_check(&s.address, item.id, now) {
+                    return;
+                }
+                if let Some(c) = b.start_check(&s.address, now) {
+                    drop(b);
+                    eprintln!("[queue] {}: checking {} waiting message(s) against what the user typed there", s.address, c.items.len());
+                    h.check(c);
+                    return;
+                }
+                if b.said.contains_key(&s.address) && s.status_ms.is_some_and(|t| t <= now && now - t < SETTLE_MS) {
+                    return;
+                }
+            }
             // Claimed, on disk, before it's typed.
             if let Err(e) = b.items[pos].apply(ItemEv::Claim { now_ms: now, turn: s.turn, busy }) {
                 eprintln!("[queue] not sending #{}: {e}", item.id);
@@ -1536,6 +1784,9 @@ trait Sessions: Sync {
     fn level(&self) -> crate::tell::Level;
     /// `[queue] busy_deliver_minutes`, as config.toml says now (0: never).
     fn busy_minutes(&self) -> u64;
+    /// Checks what the user typed in a session against what waits for it
+    /// (`covered::judge`), and hands the answer to `SendQueue::checked`.
+    fn check(&self, c: Check);
 }
 
 /// How the daemon hears what the queue does: set once at its start.
@@ -1571,6 +1822,11 @@ pub fn waiting_counts() -> BTreeMap<String, usize> {
         }
     }
     out
+}
+
+/// What waits for each session, in order (sessions to start aside).
+pub fn waiting_lines() -> BTreeMap<String, Vec<super::state::WaitingLine>> {
+    RUNNING.get().map(|q| q.lock().lines()).unwrap_or_default()
 }
 
 pub fn wire(w: Wiring) {
@@ -1651,6 +1907,15 @@ impl Sessions for Herdr {
     fn busy_minutes(&self) -> u64 {
         config::Config::live().queue.busy_deliver_minutes
     }
+    fn check(&self, c: Check) {
+        // A model reads it: never on the queue's own thread.
+        thread::spawn(move || {
+            let covered = crate::covered::judge(&c);
+            if let Some(q) = RUNNING.get() {
+                q.checked(&c, covered);
+            }
+        });
+    }
 }
 
 fn session_of(t: &Value, asked: &str) -> Session {
@@ -1713,6 +1978,8 @@ mod tests {
         minutes: Mutex<u64>,
         /// What was typed in while its session worked.
         busy_sent: Mutex<Vec<String>>,
+        /// The checks of the user's words asked for.
+        checks: Mutex<Vec<Check>>,
     }
     /// A tower that tells everything, as it always did: what these tests
     /// were written for. The quiet levels are set by the tests about them.
@@ -1737,6 +2004,7 @@ mod tests {
                 since: Default::default(),
                 minutes: Mutex::new(10),
                 busy_sent: Default::default(),
+                checks: Default::default(),
             }
         }
         /// `s` runs `app` (`claude-code`, `codex`), its status set at `since_ms`.
@@ -1825,6 +2093,9 @@ mod tests {
         fn busy_minutes(&self) -> u64 {
             *self.minutes.lock().unwrap()
         }
+        fn check(&self, c: Check) {
+            self.checks.lock().unwrap().push(c);
+        }
     }
 
     struct Dir(PathBuf);
@@ -1862,6 +2133,112 @@ mod tests {
         assert!(crate::brain::is_note_prompt(&to_brain) && !crate::brain::is_note_prompt(&to_session), "{to_brain}");
         let two = undelivered_note(true, "tower sandbox", "t12", "it is gone", &[texts[0].clone(), "and the changelog".into()]);
         assert!(two.starts_with("[queue] Your 2 messages to tower sandbox (t12) were not delivered: it is gone. The first said:"), "{two}");
+    }
+
+    /// What the user typed in a session themselves is checked against what
+    /// the tower has waiting for it; what their words cover is not sent.
+    #[test]
+    fn what_the_user_already_told_a_session_is_not_sent_again() {
+        use crate::agenda::QueueFact;
+        let (q, _d) = queue();
+        let h = Fake::default();
+        h.set("t8w", "working");
+        let (Added::Queued { id: note, .. }, ..) = q.add_with(&h, "t8w", "PR #787 (eyzhub/eyzflow) into dev was merged on GitHub.", &[], None).unwrap() else { panic!("it works") };
+        let (Added::Queued { id: other, .. }, ..) = q.add_with(&h, "t8w", "Write the changelog for #787", &[], None).unwrap() else { panic!("it works") };
+        // A message from another session, and a quiet note: never held for the user's words.
+        let peer = crate::peers::Sender { address: "t91".into(), name: "reviewer".into(), space: None };
+        q.add_with(&h, "t8w", "Reviewed #787: nothing critical.", &[], Some(&peer)).unwrap();
+        let now = crate::history::now_ms();
+        q.user_said_with(&h, "t8w", "merged on dev", now);
+        // The check starts at once, while the session works on the user's words.
+        let checks = h.checks.lock().unwrap().clone();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].items.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![note, other]);
+        assert_eq!(checks[0].said, vec![Said { words: "merged on dev".into(), at_ms: now }]);
+        // The turn ends before the check answers: nothing it holds goes in.
+        h.turn("t8w");
+        h.set("t8w", "idle");
+        q.tick(&h);
+        assert!(h.sent().is_empty(), "held for the check: {:?}", h.sent());
+        assert_eq!(h.checks.lock().unwrap().len(), 1, "one check at a time");
+        // It answers: the merge note is covered, the changelog isn't.
+        q.checked_with(&h, &checks[0], Ok(vec![(note, "merged on dev".into())]));
+        assert_eq!(q.fact(note), QueueFact::Covered { said: "merged on dev".into() });
+        assert_eq!(h.recorded("not-sent"), vec!["Not sent: you had told it yourself (\"merged on dev\"): PR #787 (eyzhub/eyzflow) into dev was merged on GitHub.".to_string()]);
+        assert!(h.notes().iter().any(|n| n.starts_with(&format!("[queue] #{note} for t8w (t8w-name) was not sent"))), "{:?}", h.notes());
+        q.tick(&h);
+        assert_eq!(h.sent(), vec!["Write the changelog for #787".to_string()]);
+        // Checked once: the same words don't hold what is left again.
+        assert_eq!(h.checks.lock().unwrap().len(), 1);
+    }
+
+    /// The tower's message queued a little after the user typed the same
+    /// thing (a merge seen on GitHub after the user said "merged"): checked too.
+    #[test]
+    fn a_message_queued_just_after_the_users_words_is_checked_before_it_goes() {
+        let (q, _d) = queue();
+        let h = Fake::default();
+        h.set("t8w", "idle");
+        let now = crate::history::now_ms();
+        q.user_said_with(&h, "t8w", "merged on dev", now - 12_000);
+        assert!(h.checks.lock().unwrap().is_empty(), "nothing waits yet");
+        let (Added::Queued { id, .. }, ..) = q.add_with(&h, "t8w", "PR #787 (eyzhub/eyzflow) into dev was merged on GitHub.", &[], None).unwrap() else { panic!("held for the check") };
+        assert!(h.sent().is_empty());
+        let c = h.checks.lock().unwrap()[0].clone();
+        // Not covered after all (or the check failed): it goes.
+        q.checked_with(&h, &c, Err(anyhow::anyhow!("claude: timed out")));
+        q.tick(&h);
+        assert_eq!(h.sent().len(), 1);
+        assert!(matches!(q.fact(id), crate::agenda::QueueFact::Delivered { .. }));
+        // Words from long before a message are not about it.
+        let (q, _d) = queue();
+        let h = Fake::default();
+        h.set("t5", "idle");
+        q.user_said_with(&h, "t5", "merged on dev", crate::history::now_ms() - SAID_BEFORE_MS - 60_000);
+        q.add_with(&h, "t5", "PR #9 (a/b) into dev was merged on GitHub.", &[], None).unwrap();
+        assert_eq!(h.sent().len(), 1);
+        assert!(h.checks.lock().unwrap().is_empty());
+    }
+
+    /// What the user typed while the session worked goes in the moment its
+    /// turn ends: the tower's message waits a moment for it.
+    #[test]
+    fn a_session_the_user_types_in_settles_before_the_towers_message() {
+        let (q, _d) = queue();
+        let h = Fake::default();
+        h.set("t5", "working");
+        let now = crate::history::now_ms();
+        q.user_said_with(&h, "t5", "run the tests", now - 60_000);
+        q.add_with(&h, "t5", "deploy the docs", &[], None).unwrap();
+        // Its turn ends: checked against the user's words first.
+        h.set("t5", "idle");
+        h.since.lock().unwrap().insert("t5".into(), now - 500);
+        q.tick(&h);
+        let c = h.checks.lock().unwrap()[0].clone();
+        q.checked_with(&h, &c, Ok(vec![]));
+        // Not covered, but its turn ended a moment ago: not yet.
+        q.tick(&h);
+        assert!(h.sent().is_empty());
+        h.since.lock().unwrap().insert("t5".into(), now - SETTLE_MS - 10);
+        q.tick(&h);
+        assert_eq!(h.sent(), vec!["deploy the docs".to_string()]);
+    }
+
+    #[test]
+    fn a_check_that_never_answers_lets_the_messages_go() {
+        let (q, _d) = queue();
+        let h = Fake::default();
+        h.set("t5", "working");
+        q.add_with(&h, "t5", "deploy the docs", &[], None).unwrap();
+        q.user_said_with(&h, "t5", "also fix the footer", crate::history::now_ms());
+        h.set("t5", "idle");
+        q.tick(&h);
+        assert!(h.sent().is_empty());
+        // Two minutes on, no answer: it goes, and isn't checked against those words again.
+        q.lock().checking.get_mut("t5").unwrap().0 -= CHECK_LIMIT_MS;
+        q.tick(&h);
+        assert_eq!(h.sent(), vec!["deploy the docs".to_string()]);
+        assert_eq!(h.checks.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -2310,6 +2687,9 @@ mod tests {
             }
             fn busy_minutes(&self) -> u64 {
                 self.0.busy_minutes()
+            }
+            fn check(&self, c: Check) {
+                self.0.check(c)
             }
         }
         let (q, _d) = queue();

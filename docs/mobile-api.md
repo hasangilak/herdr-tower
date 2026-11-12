@@ -234,7 +234,7 @@ the same tokens, the same limits (the tailnet's address counts as private).
 
    ```json
    200 {"token": "htk_…", "device": {"id": "d_3fa9c2e1", "name": "Pixel 9"}, "fingerprint": "<hex>", "api": 1,
-        "features": ["quiet", "acts", "pairing", "bonjour"], "repaired": false,
+        "features": ["quiet", "acts", "pairing", "bonjour", "reviews"], "repaired": false,
         "hosts": [{"kind": "lan", "host": "10.10.30.116", "port": 7843}],
         "network": {"range": "10.10.30", "name": "Office", "lan": {"host": "10.10.30.116", "port": 7843}}, "magic_dns": null,
         "bonjour": {"type": "_herdr-tower._tcp", "name": "Hassan’s MacBook Pro", "fp": "<hex>"}}
@@ -435,7 +435,7 @@ the Mac's mDNSResponder refused it).
 
 | Call | Returns |
 |---|---|
-| `GET /v1/hello` | `{"api":1,"tower":"0.1.0","device":{"id","name"},"voice":"af_bella","phone_is_voice":bool,"audio_route":"phone"\|"mac","features":["quiet","acts","pairing","bonjour"],"bonjour":{…}\|null}` (`bonjour` as `GET /v1/network`). Use it to check a stored token, and to see what this tower has (`features`: see "Versioning"). |
+| `GET /v1/hello` | `{"api":1,"tower":"0.1.0","device":{"id","name"},"voice":"af_bella","phone_is_voice":bool,"audio_route":"phone"\|"mac","features":["quiet","acts","pairing","bonjour","reviews"],"bonjour":{…}\|null}` (`bonjour` as `GET /v1/network`). Use it to check a stored token, and to see what this tower has (`features`: see "Versioning"). |
 | `GET /v1/state` | The daemon's state (below). Also pushed on the event stream. |
 | `GET /v1/network` | `{"hosts": [Host], "network": {"range", "name", "lan": {"host", "port"} \| null} \| null, "magic_dns": string \| null, "tailscale": {…}, "bonjour": {"type", "name", "fp"} \| null}`: where the tower can be reached now (every address as the pairing lists them, the network, the MagicDNS name while the tailnet is listened on, Tailscale as in the state, and how Bonjour finds it on this network: see "Finding the Mac by Bonjour"). The same as the `hosts` event. |
 | `GET /v1/agents?all=1` | `tower agents --json`: `{"agents":[…],"unreachable":[…]}`; each agent has `address, account, machine, name, spoken, agent, status, doing, title, folder, where`. `all=1` adds plain shells. Slow-ish (asks Herdr, and other machines). |
@@ -473,6 +473,7 @@ are left out when empty (`record` and `held` when false). `kind`:
 | `space` | A space went quiet, is ready to close, or was closed | `space`, `status` (`quiet`, `ready`, `closed`), `record: true` |
 | `screenshot` | A picture a session sent | `id`, `caption`, `path` (fetch it from `/v1/screenshots/{id}`) |
 | `queue`, `pr`, `behavior`, `introduce`, `answered` | The send queue, a PR found, a behavior changed, sessions introduced, a question the tower answered | |
+| `review` | A PR's review moved: its reviewer opened, a round, the owner's fix, agreed, ended | `id` (the PR's key), `session`, `name` (the reviewer, else the owner), `space`, `status`, `record: true` |
 
 **`record: true`** means written down, not told: such an entry was never
 spoken and is not a chat message (the chat leaves it out, and so does a
@@ -502,9 +503,22 @@ The state (`GET /v1/state`, event `state`):
   "tailscale": {"installed": true, "running": true, "state": "running", "ip": "100.68.110.33", "dns_name": "mac.tailnet.ts.net"},
   "phone": "Pixel 9",
   "work": {"word": "Reading", "detail": "eyzflow", "since_ms": 1794158000000, "at_ms": 1794158004000, "done_ms": 0},
-  "screenshots": [{"id": "1794160000000-login.png", "at": 1794160000000, "session": "t22", "name": "Claude in eyzflow", "space": "B2C support", "account": "default", "job": null, "caption": "The new login page", "path": "/Users/…/attachments/screenshots/1794160000000-login.png", "url": "/v1/screenshots/1794160000000-login.png"}]
+  "screenshots": [{"id": "1794160000000-login.png", "at": 1794160000000, "session": "t22", "name": "Claude in eyzflow", "space": "B2C support", "account": "default", "job": null, "caption": "The new login page", "path": "/Users/…/attachments/screenshots/1794160000000-login.png", "url": "/v1/screenshots/1794160000000-login.png"}],
+  "reviews": [{"key": "eyzhub/eyz-mediaroom-serverless#1250", "repo": "eyzhub/eyz-mediaroom-serverless", "number": 1250,
+               "url": "https://github.com/eyzhub/eyz-mediaroom-serverless/pull/1250", "space": "b2c-tickets",
+               "owner": "t58", "owner_name": "b2c tickets mediaroom",
+               "reviewer": "t61", "reviewer_name": "b2c-tickets-review-eyz-mediaroom-serverless-1250",
+               "status": "changes", "rounds": 2, "critical": 2, "line": "the totals still lose cents",
+               "decision": null, "created_ms": 1794238300000, "updated_ms": 1794238900000, "ended_ms": null,
+               "chip": "Review: 2 critical, round 2", "…": "and its steps"}]
 }
 ```
+
+`reviews` (on a tower with the `reviews` feature): the PRs' reviews, every
+one not over and those over in the last day, the latest first (`status`:
+`reviewing`, `changes`, `agreed`, `stuck`, `ended`; `line`: the last word
+on it, a report's, the owner's, the agreement's or why it ended; `chip`:
+what the PR's chip says). The PR itself carries the short form (`review`).
 
 `work` is what the brain is doing right now, as the panel's working line shows
 it ("Delegating to orb-rust · 12s"): `{"word": "Delegating", "detail": "to
@@ -536,7 +550,7 @@ each have their own call and their own event (`GET /v1/decisions`,
 | `PUT /v1/device/audio` | `{"route": "phone"\|"mac"}` | Sets it (kept in the Mac's devices.json, so it survives restarts). `400 bad_route`. Also in `hello` and the state as `audio_route`. |
 | `GET /v1/audio?after=<id>` | | `{"clips": [{"id","kind","text","ms","url","at_ms"}]}`: clips meant for this phone (its own and the voice's) from the last 15 minutes, after clip `after`: what it missed while no stream was open. Empty while the tower is muted. |
 | `POST /v1/hush` | | Stops speaking now, and drops what's queued (the phone gets `hush`). |
-| `GET /v1/queue` | | `{"items": [{"id","session","name","text","at_ms","tries","parked"?,"parked_ms"?,"after"?}]}`: instructions the send queue holds for busy sessions (`tower queue`), oldest first. `parked` says why one won't go on its own (`gone`, `replaced`, `after-cancelled`, `start-failed`), since `parked_ms`; one parked for a week leaves the list (kept aside as expired; `tower queue retarget` still sends it). Each agent in the state also has `folder` and `queued` (how many wait for it). |
+| `GET /v1/queue` | | `{"items": [{"id","session","name","text","at_ms","tries","parked"?,"parked_ms"?,"after"?}]}`: instructions the send queue holds for busy sessions (`tower queue`), oldest first. `parked` says why one won't go on its own (`gone`, `replaced`, `after-cancelled`, `start-failed`), since `parked_ms`; one parked for a week leaves the list (kept aside as expired; `tower queue retarget` still sends it). Each agent in the state also has `folder`, `queued` (how many wait for it) and `waiting`: what waits for it, in order, `[{"id","text","from"?,"note"?,"parked"?,"checking"?}]` (`from`: another session's name; `note`: an introduction; `checking`: held while what the user typed in that session is checked against it). A message the user's own words in that session already cover is not sent (the history has a `queue` entry with status `not-sent`). |
 | `GET /v1/mute` | | `{"muted": bool}`: the tower-wide mute (`tower mute`). The state has it too (`muted`). |
 | `POST /v1/mute` | `{"muted": true}` | Mutes the tower (or unmutes it with `false`): it stops talking now (the phones get `hush`), the clips waiting to be fetched are dropped, and it says nothing on the Mac or any phone until unmuted. Text, chat and questions go on. Kept across restarts. |
 | `POST /v1/mode` | `{"mode": "ptt"\|"handsfree"\|"off"}` | The Mac microphone's mode. |
@@ -701,8 +715,12 @@ Every PR the tower's sessions open is a chip in the chat (a message of
 `role` `pr`), the same on the Mac and every phone, from when it's found
 (a `github.com/…/pull/N` link in what a session says at the end of a turn,
 or what its `gh pr create` printed) until it's merged or closed. The Mac
-asks GitHub about each open one every 30 s while its checks run, every
-90 s otherwise. A PR:
+asks GitHub about each open one every 30 s while its checks run or while it
+waits for the user's merge (however old: it is often merged on GitHub), every
+90 s otherwise, and again at once when the queue is looked at (`GET
+/v1/decisions`, the Mac's windows opening; at most every 15 s). Merged on
+GitHub, its merge decision closes, and so does an open question of its
+space's sessions that names it ("#786" or its link). A PR:
 
 ```json
 {
@@ -725,7 +743,15 @@ asks GitHub about each open one every 30 s while its checks run, every
     "can": true,
     "blocked": null,                 // why not at all: merged, closed, a draft, conflicts
     "needs_override": "1 check failing: CI / lint. Merge anyway only if you know the failure is unrelated.",
-    "warnings": ["It merges into main: that ships to production."]
+    "warnings": ["It merges into main: that ships to production.",
+                 "The review isn't agreed: 2 critical issues open, round 2."]
+  },
+  "review": {                        // its reviewer session's review ("PR review" below); absent when it has none
+    "status": "changes",             // reviewing | changes | agreed | stuck | ended
+    "rounds": 2,                     // reports that found critical issues
+    "critical": 2,                   // critical issues in the last report
+    "reviewer": "t61", "reviewer_name": "b2c-tickets-review-eyz-mediaroom-serverless-1250",
+    "line": "Review: 2 critical, round 2"   // what the chip says
   }
 }
 ```
@@ -739,6 +765,19 @@ and asks once more ("Merge anyway: the failure is unrelated"), and only
 then sends `override: true`. Afterwards the chip changes by itself (`pr`
 event, chat `update`); the Mac tells the session ("The user merged PR #N
 …", queued) and the brain. The brain never merges.
+
+**PR review.** A PR a session opens in a space whose `review` is on (every
+space, unless the user turned it off: "A mission" below) gets a reviewer
+session of the tower's: it looks for critical issues only, comments on the
+PR, talks to the PR's session directly and agrees with it, or after three
+rounds the disagreement is a decision of the user's (kind `choice`, `why`
+`review`, about both sessions; its answer goes to both). The PR's `review`
+says where that stands; show its `line` on the chip (the Mac colours it
+amber until `status` is `agreed`). A review that isn't agreed is among
+`merge.warnings` (and the confirm's `warnings`): it never blocks the
+merge, which stays the user's. The `pr` event carries a change of it. A
+tower that has this says `"reviews"` in `features`; the state has
+`reviews` (below).
 
 Example:
 
@@ -783,7 +822,7 @@ of them run with `curl` against a tower, with what came back.
 | `POST /v1/spaces/{space}/mute` | `{"on": true}` | `200 {"space", "mute": bool, "mission": Mission or null}`. Its decisions leave (or rejoin) the main queue and the count at once. `400 bad_on`, `404 no_space`. |
 | `POST /v1/spaces/{space}/close` | `{"force": false}` (optional) | Closes the space. `202 {"action": Action}`: see "Actions". `409 busy` while a session there works or waits for the user (unless `force`), `409 closing`, `404 no_space`. |
 | `GET /v1/thread?space=<name>&limit=50&before=h120` | | `{"space", "messages": [Message], "more": bool}`: what the sessions of a space wrote to each other, newest last; pages like the chat. |
-| `GET /v1/setups` | | `{"setups": [{"name", "account", "repos": [folder]}]}`: what a space can be launched with. The first is the default. |
+| `GET /v1/setups` | | `{"setups": [{"name", "account", "about", "repos": [folder], "roles": {folder: role}}]}`: the projects a space can be launched with (`about`: what the project is; `roles`: what each repo is in it, only those that have one). The first is the default. |
 | `POST /v1/launch` | `{"goal": "Fix the login redirect", "setup": "eyzflow", "name": "login", "dry_run": false}` (`goal` required) | With `dry_run`: `200`, the plan. Without: `202 {"action": Action}`, see "Actions". `400 empty`, `400 bad_launch`, `404 no_setup`, `409 no_setups`, `409 launching`. |
 | `GET /v1/actions` | | `{"actions": [Action]}`, newest first: the launches and closes the phones started since the tower started (the last 50). |
 | `GET /v1/actions/{id}` | | `{"action": Action}`. `404 no_action`. |
@@ -1021,6 +1060,7 @@ user, and where it stands.
     "goal": "Fix the login redirect",          // "" when it has none
     "done_when": "The redirect lands on the dashboard",   // "" when none
     "standing": false,                         // true: the user keeps it; it is never ready, never closed by the tower
+    "review": true,                            // the PRs its sessions open get a reviewer session (on unless the user turned it off)
     "state": "open",                           // open | ready | quiet
     "follow": false, "mute": false,
     "needs": 1,                                // its open decisions, muted or not
@@ -1073,6 +1113,12 @@ user, and where it stands.
 - `follow`: its results reach the user as they land (a receipt is told
   whatever the tell level). `mute`: what needs the user there stays in the
   space's own queue.
+- `review`: each PR its sessions open gets a reviewer session ("PR
+  review", under "PRs"). On for every space unless the user turned it off
+  (on the Mac: the space's **Review PRs** switch, `tower space review
+  <space> off`, or New space's **Review its PRs**); a tower from before
+  sends no `review`: read that as on. There is no call to set it from a
+  phone yet; a `missions` event carries a change.
 
 `POST /v1/spaces/{space}/goal`, `/follow` and `/mute` answer with the
 space's mission as it is right after the change (`mission`; null for a
@@ -1112,10 +1158,11 @@ in has an empty thread. A new message is a `thread` event:
 does nothing:
 
 ```json
-{"space": "fix-login", "goal": "Fix the login redirect", "made": true, "dry_run": true, "agenda": null,
+{"space": "fix-login", "goal": "Fix the login redirect", "done_when": "", "made": true, "dry_run": true, "agenda": null,
  "sessions": [{"name": "fix-login-eyzflow", "repo": "~/Work/eyz/eyzflow", "address": null, "account": "orca",
                "worktree": "/…/.tower-worktrees/fix-login/eyzflow", "branch": "fix-login/eyzflow",
-               "port": null, "task": null, "error": null}],
+               "port": null, "task": null, "error": null, "why": "the web app and its API"}],
+ "repos_from": "setup",
  "assumed": {"setup": "eyzflow + mediaroom on orca", "setup_why": "the first of 2",
              "account": "orca", "account_why": "the setup's",
              "name": "fix-login", "name_why": "the goal's first two words, small ones left out",
@@ -1125,8 +1172,15 @@ does nothing:
 It never asks: the space's name comes from the goal (or is `name`, taken as
 given: a space that has that name already is joined, `made: false`), the
 setup is the one named by `setup` (its whole name, or a part), else the
-first, and `assumed` says what it chose and why. Show the plan before
-launching ("what the tower will do").
+first, and `assumed` says what it chose and why. `goal` is the space's
+goal: the ticket's title (the line after one that only asks for sessions,
+else the first line, at most 120 characters); the whole text still goes to
+the sessions. `done_when` is its "Acceptance criteria" (or "Definition of
+done", "Done when") section's lines, joined, or "". Each session's `why`
+is its repo's role in the project, or how it came in; `repos_from` is
+`first-line`, `setup` or `repos`. Show the plan before launching ("what
+the tower will do"). (Drafting a space from a ticket, `tower launch
+--draft`, is the Mac's own for now: the phone launches as before.)
 
 Launching for real opens a session per repo of the setup, each in a
 worktree of its own: seconds each, sometimes minutes. Closing a space ends
@@ -1346,7 +1400,7 @@ line of JSON `data`. A comment line `: ping` comes every 10 s.
 
 | `event` | `data` |
 |---|---|
-| `hello` | `{"api":1,"device":"d_…","voice":bool,"features":["quiet","acts","pairing","bonjour"],"hosts":[Host],"network":{…}\|null,"magic_dns":…,"bonjour":{…}\|null}`, first: `hosts`, `network`, `magic_dns` and `bonjour` as `GET /v1/network` |
+| `hello` | `{"api":1,"device":"d_…","voice":bool,"features":["quiet","acts","pairing","bonjour","reviews"],"hosts":[Host],"network":{…}\|null,"magic_dns":…,"bonjour":{…}\|null}`, first: `hosts`, `network`, `magic_dns` and `bonjour` as `GET /v1/network` |
 | `hosts` | `{"hosts": [Host], "network": {…} \| null, "magic_dns": …, "tailscale": {…}, "bonjour": {…} \| null}` (as `GET /v1/network`): the tower's addresses changed (this Mac moved to another network, Tailscale started or stopped, the network was named, Bonjour advertised it under another name or stopped). Merge `hosts` into the stored addresses. |
 | `state` | the whole state, first right after `hello`, then whenever something in it changes (at most 4 a second). A change to the decisions, the missions or a thread alone sends their own event, not this one. |
 | `decisions` | `{"count": n, "decisions": [Decision]}`: every open decision in queue order, each with `muted`; `count` is how many are outside muted spaces (the badge). Right after the first `state`, then whenever the list changes: one opened, closed or changed, or the order moved (the tower orders them again every 30 s). See "Notifying". |
@@ -1513,6 +1567,7 @@ stream's `hello` event). A tower from before there were features sends no
 | `pairing` | Pairing on more than one network: `install_id` and `repaired` on `POST /v1/pair` (and `hosts`, `network`, `magic_dns` in its answer), `GET /v1/network`, `hosts`, `network` and `magic_dns` in the stream's `hello`, the `hosts` event, `PATCH /v1/device`, and `network` and `phone_hint` in the state |
 | `bonjour` | Found by name on the local network: the `_herdr-tower._tcp` advert with the certificate's `fp` in its TXT, and `bonjour` in `GET /v1/network`, `GET /v1/hello`, `POST /v1/pair`'s answer, the stream's `hello` and the `hosts` event (see "Finding the Mac by Bonjour") |
 | `acts` | Acts and what came with them: `GET /v1/acts`, `/v1/acts/{id}`, `POST /v1/acts/{id}/undo`, the chat's `kind: "act"` messages and the `act` event; `rule` in a decision's answer and `POST /v1/decisions/{id}/rule`; `voice` in `/v1/tell` and `tell_voice` in the state |
+| `reviews` | PR review: `review` on a PR (`GET /v1/prs`, the `pr` event, a chat chip's `pr`, a merge decision's `prs[]`), `review` on a mission, `reviews` in the state, and a review that isn't agreed among a merge's `warnings` |
 | `quiet` | Everything under "The Quiet Tower": the `/v1/decisions`, `/v1/missions`, `/v1/spaces/{space}/…`, `/v1/thread`, `/v1/setups`, `/v1/launch`, `/v1/actions`, `/v1/tell` and `/v1/model` calls; `space` on `POST /v1/ask`, on chat messages, and as a filter of `/v1/history` and `/v1/chat`; the `decisions`, `missions`, `thread` and `action` events; `decisions_count`, `tell_level`, `brain_model` and `brains` in the state |
 
 Both ways round:

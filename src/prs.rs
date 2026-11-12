@@ -5,8 +5,9 @@
 //!   prints the link). Tied to the session and its space. Only a PR that is
 //!   open when first looked at becomes a chip.
 //! - **Polled** with `gh pr view --json …` while open (every 30 s while
-//!   checks run, 90 s otherwise, 15 min once it's days old), and once more
-//!   after it closes. Kept in `prs.json` beside `state.json` (the orb watches
+//!   checks run or while it waits for the user's merge, 90 s otherwise, 15
+//!   min once it's days old), again at once when the queue is looked at
+//!   (`look_now`), and once more after it closes. Kept in `prs.json` beside `state.json` (the orb watches
 //!   that folder), across restarts.
 //! - **In the chat**: one history entry (`kind` `pr`, `id` the PR's key) when
 //!   it's found; the chip shows the PR as it is now, so it changes in place
@@ -86,6 +87,10 @@ pub struct Pr {
     /// The last time `gh` couldn't say (kept until it can).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Its review (`crate::reviews`), as the chip and the merge card show
+    /// it; none when its space has review off, or it got no reviewer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review: Option<crate::reviews::Brief>,
 }
 
 impl Pr {
@@ -362,6 +367,10 @@ pub fn gate(pr: &Pr) -> Gate {
     if pr.mergeable == "unknown" && pr.open() {
         g.warnings.push("GitHub hasn't worked out yet whether it merges cleanly.".into());
     }
+    // A review that isn't agreed: said plainly; the merge stays the user's.
+    if let Some(w) = pr.review.as_ref().and_then(crate::reviews::merge_warning) {
+        g.warnings.push(w);
+    }
     g
 }
 
@@ -527,7 +536,10 @@ pub fn next_check(pr: &Pr) -> Option<u64> {
         return Some(pr.closed_ms.unwrap_or(pr.checked_ms) + MIN);
     }
     let age = pr.checked_ms.saturating_sub(pr.found_ms);
-    let every = if age > 3 * 24 * 60 * MIN {
+    // One that waits for the user's merge is often merged on GitHub: looked at every 30 s, however old.
+    let every = if pr.waiting {
+        MIN / 2
+    } else if age > 3 * 24 * 60 * MIN {
         15 * MIN
     } else if pr.checks.state == "pending" || pr.mergeable == "unknown" {
         MIN / 2
@@ -583,6 +595,17 @@ impl Prs {
         &self.gh
     }
 
+    /// Its review as it stands now (`crate::reviews`): the chip, the merge
+    /// card and the phones follow. Nothing when it is the same.
+    pub fn set_review(&self, k: &str, review: Option<crate::reviews::Brief>) {
+        let Some(mut pr) = self.get(k) else { return };
+        if pr.review == review {
+            return;
+        }
+        pr.review = review;
+        self.store(pr, "update", true);
+    }
+
     /// Bumped at every change (the event stream's chat diff looks).
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::SeqCst)
@@ -617,9 +640,18 @@ impl Prs {
     }
 
     /// Stores `pr` as it is now, tells listeners (`op`: open, update, closed).
+    /// Its review stays as `set_review` last put it: a look at GitHub that
+    /// began before the review moved doesn't take it back.
     fn put(&self, pr: Pr, op: &str) {
+        self.store(pr, op, false);
+    }
+
+    fn store(&self, mut pr: Pr, op: &str, review: bool) {
         {
             let mut all = self.lock();
+            if !review && let Some(old) = all.get(&pr.key()) {
+                pr.review = old.review.clone();
+            }
             all.insert(pr.key(), pr.clone());
             self.save(&all);
         }
@@ -689,6 +721,28 @@ impl Prs {
         open
     }
 
+    /// The queue is being looked at (a window opened, a phone asked): the
+    /// PRs that wait for a merge are looked at again now, in the background,
+    /// so one merged on GitHub leaves the queue at once. At most every 15 s.
+    pub fn look_now(&self) {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = crate::history::now_ms();
+        if now.saturating_sub(LAST.load(Ordering::Relaxed)) < 15_000 {
+            return;
+        }
+        LAST.store(now, Ordering::Relaxed);
+        let keys: Vec<String> = self.lock().values().filter(|p| p.open() && p.waiting && !p.settled).map(Pr::key).collect();
+        if keys.is_empty() {
+            return;
+        }
+        let me = self.clone();
+        std::thread::spawn(move || {
+            for k in keys {
+                me.poll(&k);
+            }
+        });
+    }
+
     /// The PRs due a look now.
     pub fn due(&self, now: u64) -> Vec<String> {
         self.lock().values().filter(|p| next_check(p).is_some_and(|t| t <= now)).map(Pr::key).collect()
@@ -727,6 +781,9 @@ impl Prs {
         } else {
             // Only when it was looked at changed: saved, nobody told.
             let mut all = self.lock();
+            if let Some(old) = all.get(&pr.key()) {
+                pr.review = old.review.clone();
+            }
             all.insert(pr.key(), pr.clone());
             self.save(&all);
         }
@@ -915,6 +972,10 @@ pub(crate) mod tests {
         assert_eq!(next_check(&pr), Some(10 * MIN + 3 * MIN / 2), "settled: every 90 s");
         pr.checked_ms = 5 * 24 * 60 * MIN;
         assert_eq!(next_check(&pr), Some(5 * 24 * 60 * MIN + 15 * MIN), "days old: every 15 min");
+        // Waiting for the user's merge: every 30 s however old (it is often merged on GitHub).
+        pr.waiting = true;
+        assert_eq!(next_check(&pr), Some(5 * 24 * 60 * MIN + MIN / 2), "waiting: every 30 s");
+        pr.waiting = false;
         pr.state = "merged".into();
         pr.closed_ms = Some(100 * MIN);
         assert_eq!(next_check(&pr), Some(101 * MIN), "once more after it closed");
@@ -1014,6 +1075,28 @@ esac
         let pr = prs.get("o/app#12").unwrap();
         assert!(pr.settled && next_check(&pr).is_none());
         assert_eq!(*seen.lock().unwrap(), ["open open pending", "update open passing", "closed merged passing"]);
+    }
+
+    #[test]
+    fn a_prs_review_is_kept_through_its_polls_and_said_before_a_merge() {
+        let gh = fake_gh("review");
+        serve(&gh, 12, "OPEN", passing(), "abc");
+        let prs = Prs::at(gh.with_file_name("prs.json"), gh.clone());
+        prs.found(&[("o/app".into(), 12)], "t58", "mediaroom", Some("shop"), true);
+        // A look at GitHub that began before the review moved doesn't take it back.
+        let stale = prs.get("o/app#12").unwrap();
+        let brief = crate::reviews::Brief { status: "changes".into(), rounds: 2, critical: 2, line: "Review: 2 critical, round 2".into(), ..Default::default() };
+        prs.set_review("o/app#12", Some(brief.clone()));
+        prs.put(Pr { title: "renamed".into(), ..stale }, "update");
+        let pr = prs.get("o/app#12").unwrap();
+        assert_eq!((pr.title.as_str(), pr.review.as_ref()), ("renamed", Some(&brief)));
+        serve(&gh, 12, "OPEN", json!([]), "abc");
+        prs.poll("o/app#12");
+        assert_eq!(prs.get("o/app#12").unwrap().review, Some(brief.clone()));
+        // The merge stays the user's: said plainly, not blocked.
+        let g = gate(&prs.get("o/app#12").unwrap());
+        assert!(g.blocked.is_none() && g.warnings.contains(&"The review isn't agreed: 2 critical issues open, round 2.".to_string()), "{g:?}");
+        assert_eq!(prs.get("o/app#12").unwrap().view()["review"]["line"], "Review: 2 critical, round 2");
     }
 
     #[test]
