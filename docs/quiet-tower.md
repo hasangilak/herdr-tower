@@ -1557,6 +1557,16 @@ unless the tower is quiet. A check that fails, or takes longer than two
 minutes, lets the messages go: nothing is lost on a guess. Each message is
 checked against the same words once.
 
+**Your card answer isn't lost to words about something else.** When you
+answer a session's question on a card while it works, the tower holds the
+answer for the end of its turn. If you then type in that session's terminal,
+the held answer is dropped only when your words answer the same question
+(the same answer, or another one): the very words, or the same check as
+above (`covered::answers_held`). A link to keep in mind, or new work,
+leaves the held answer to go as it would; a check that fails keeps it too.
+What you typed is written down either way: as new work, or, when it
+answered the question, as a `request` with status `answer` (no agenda).
+
 **One thread for it all.** A space's conversation column has, beside its
 requests and answers, what passed between you or the tower and each of its
 sessions, in order (`talk::session_said`):
@@ -1564,6 +1574,7 @@ sessions, in order (`talk::session_said`):
 | Row | From the history |
 |---|---|
 | You → eyzflow · in its terminal | a `request` from `terminal:<address>` |
+| You → eyzflow · answered its question, in its terminal | the same, with status `answer` |
 | You → eyzflow · answered its question | a `request` from `answer:<address>` |
 | Tower → eyzflow · queued / sent | the queue's `queued`, then `delivered` (one row, its word changed) |
 | Tower → eyzflow · not sent: you had told it yourself | the queue's `not-sent` |

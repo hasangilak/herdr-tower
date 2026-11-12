@@ -33,6 +33,10 @@ type Note = Arc<dyn Fn(&str) + Send + Sync>;
 type Screen = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 /// Writes a line in the history.
 type Record = Arc<dyn Fn(crate::history::Entry) + Send + Sync>;
+/// Whether what the user typed in a session (its name, their words) answers
+/// what the reply the tower holds for it answers (that reply): then the
+/// reply is moot (`covered::answers_held`; tests give their own).
+type Covers = Arc<dyn Fn(&str, &str, &str) -> Result<bool> + Send + Sync>;
 
 /// A queued reply drops after this long (its question is stale by then).
 const REPLY_TTL_MS: u64 = 30 * 60 * 1000;
@@ -332,6 +336,7 @@ pub struct Asks {
     /// Writes a line in the history (tests keep what it would have been).
     record: Record,
     waits: Waits,
+    covers: Covers,
 }
 
 impl Asks {
@@ -358,6 +363,7 @@ impl Asks {
                 }
             }),
             waits: Waits::default(),
+            covers: Arc::new(crate::covered::answers_held),
         };
         me.set_policy(policy);
         me
@@ -1299,9 +1305,12 @@ impl Asks {
 
     /// The user typed `words` into the session's own terminal (its prompt
     /// hook said so, and nothing the tower typed): a question the session
-    /// asked at the end of its turn is answered with them, and a reply the
-    /// tower held for it is never typed (written down, not said). True when
-    /// it was an answer, not new work.
+    /// asked at the end of its turn is answered with them; and a reply the
+    /// tower held for it (the user's answer on the card, waiting for the
+    /// session's turn to end) is never typed when these words answer the
+    /// same (`covers`: the same answer, or another one), written down, not
+    /// said. Words about something else leave the held reply to go as it
+    /// would. True when it was an answer, not new work.
     pub fn typed_there(&self, address: &str, words: &str, at_ms: u64) -> bool {
         let words = words.trim().to_string();
         let mut answered = false;
@@ -1311,8 +1320,23 @@ impl Asks {
             i.went_on.remove(address);
             i.not_users.remove(address);
         }
-        // The reply the tower held is moot now.
-        let held = self.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.remove(address);
+        // The reply the tower held: moot if these words answer it too.
+        let waiting = self.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.get(address).cloned();
+        let moot = waiting.as_ref().is_some_and(|r| {
+            let same = super::typed::words(&words) == super::typed::words(&r.text);
+            same || (self.covers)(&r.name, &words, &r.text).unwrap_or_else(|e| {
+                eprintln!("[questions] {address}: couldn't tell whether what the user typed answers {} ({e:#}): its reply still goes", r.set);
+                false
+            })
+        });
+        if let Some(r) = waiting.as_ref().filter(|_| !moot) {
+            eprintln!("[questions] {address}: what the user typed there is something else: the waiting reply to {} still goes", r.set);
+        }
+        // Still the same reply (none came or went meanwhile): out.
+        let held = waiting.filter(|_| moot).and_then(|w| {
+            let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if i.replies.get(address).is_some_and(|r| r.set == w.set && r.at_ms == w.at_ms) { i.replies.remove(address) } else { None }
+        });
         if let Some(r) = held {
             self.save();
             eprintln!("[questions] {address}: the waiting reply to {} is not sent: the user answered in the terminal", r.set);
@@ -2085,6 +2109,8 @@ mod tests {
         a.screen = Arc::new(|_: &str| None);
         a.record = Arc::new(|_: crate::history::Entry| ());
         a.waits = Waits { screen_ms: 0, words_ms: 1_500 };
+        // No model: words that open with "no" or "yes" answer the reply the tower holds.
+        a.covers = Arc::new(|_: &str, words: &str, _: &str| Ok(["no", "yes"].iter().any(|w| words.to_lowercase().starts_with(w))));
         (a, told)
     }
 
@@ -3007,6 +3033,32 @@ mod tests {
         assert_eq!((line[0].kind.as_str(), line[0].status.as_deref()), ("queue", Some("not-sent")));
         assert!(line[0].text.starts_with("Not sent: you answered it in the terminal") && line[0].text.contains("Yes, open the PR."), "{}", line[0].text);
         assert!(user.lock().unwrap().is_empty(), "never said");
+    }
+
+    /// Words typed in the terminal about something else (a link to keep in
+    /// mind) are no answer: the reply the user gave on the card still goes.
+    #[test]
+    fn words_about_something_else_leave_the_held_reply_to_go() {
+        let (a, _d, _user, record) = recording(None);
+        let r = Reply { set: "q1".into(), text: "Yes, open the release PR.".into(), at_ms: 1_000, turn: Some(4), last: SessionStatus::Blocked, created_ms: None, name: "eyzflow".into() };
+        a.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.insert("tw-r2".into(), r);
+        assert!(!a.typed_there("tw-r2", "https://claude.ai/artifact/X keep in mind to update this artifact", crate::history::now_ms()), "new work, not an answer");
+        assert!(a.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.contains_key("tw-r2"), "the card's answer still waits");
+        assert!(record.lock().unwrap().is_empty(), "nothing said to be not sent");
+        // A check that fails keeps it too.
+        let (mut b, _d, _user, _record) = recording(None);
+        b.covers = Arc::new(|_: &str, _: &str, _: &str| Err(anyhow::anyhow!("claude: timed out")));
+        let r = Reply { set: "q2".into(), text: "Yes, open the release PR.".into(), at_ms: 1_000, turn: Some(4), last: SessionStatus::Blocked, created_ms: None, name: "eyzflow".into() };
+        b.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.insert("tw-r3".into(), r);
+        assert!(!b.typed_there("tw-r3", "yes do it", crate::history::now_ms()));
+        assert!(b.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.contains_key("tw-r3"));
+        // The very words of the reply need no model.
+        let (mut c, _d, _user, _record) = recording(None);
+        c.covers = Arc::new(|_: &str, _: &str, _: &str| Err(anyhow::anyhow!("not asked")));
+        let r = Reply { set: "q3".into(), text: "Yes, open the release PR.".into(), at_ms: 1_000, turn: Some(4), last: SessionStatus::Blocked, created_ms: None, name: "eyzflow".into() };
+        c.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.insert("tw-r4".into(), r);
+        assert!(c.typed_there("tw-r4", "yes, open the release PR.", crate::history::now_ms()));
+        assert!(!c.inner.lock().unwrap_or_else(|e| e.into_inner()).replies.contains_key("tw-r4"));
     }
 
     /// The question at the end of a turn the user typed in its terminal is

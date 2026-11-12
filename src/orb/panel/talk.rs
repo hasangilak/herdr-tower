@@ -58,6 +58,7 @@ pub(super) fn session_said(e: &Entry) -> Option<Said> {
     let source = e.source.as_deref().unwrap_or("");
     let text = e.text.trim();
     let (you, how, said): (bool, String, String) = match (e.kind.as_str(), e.status.as_deref()) {
+        ("request", Some("answer")) if source.starts_with("terminal:") => (true, "answered its question, in its terminal".into(), text.into()),
         ("request", _) if source.starts_with("terminal:") => (true, "in its terminal".into(), text.into()),
         ("request", _) if source.starts_with("answer:") => (true, "answered its question".into(), text.into()),
         ("queue", Some("queued")) => (false, "queued".into(), after_colon(text).into()),
@@ -441,6 +442,8 @@ mod tests {
         assert_eq!(session_thread(&entries, "t8w", 1).len(), 1);
         // The tower's held reply, not sent because you answered in the terminal.
         assert_eq!(session_said(&of("request", None, Some("terminal:t7p"), "t7p", "<agent-message from='ab4'> [Subagent hand-back] done", 1)), None);
+        let answer = of("request", Some("answer"), Some("terminal:t8w"), "t8w", "no, keep it on dev", 2);
+        assert_eq!(session_said(&answer).map(|x| (x.you, x.with.unwrap().how)), Some((true, "answered its question, in its terminal".to_string())));
         let held = of("queue", Some("not-sent"), None, "t8t", "Not sent: you answered it in the terminal (the reply was \"open it\")", 1);
         assert_eq!(session_said(&held).map(|x| (x.text, x.with.unwrap().how)), Some(("you answered it in the terminal (the reply was \"open it\")".to_string(), "not sent".to_string())));
     }
