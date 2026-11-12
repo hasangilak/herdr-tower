@@ -886,7 +886,11 @@ a machine, can't be asked, nothing moves that round.
   ("clips (t9) is still working. Closing now cuts that work off."), and the
   button is "Close anyway" (`--force`); otherwise "Resolve and close".
   Cancel puts it away. Once done the window goes to All spaces, saying what
-  was ended, removed and kept. A refusal (something started there since
+  was ended, removed and kept. Its own tower (`tower-<space>`) is named in
+  the card too ("Ends its own tower, tower-isa (t13)."): a close ends it
+  first. `HERDER_TOWER_ORB_RESOLVE=<space>[:go]` presses Resolve (and with
+  `:go` its button) a moment after the start, for looking at it without the
+  pointer. A refusal (something started there since
   the card was read) shows in the card, with "Close anyway".
 - **Auto-close.** A ready space whose sessions have all been `idle` or
   `done` for `[spaces] auto_close_hours` (0, the default, is never; say 24 for a day), without a break,

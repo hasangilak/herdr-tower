@@ -926,12 +926,23 @@ fn places_of(name: &str, mission: &Mission, list: &[Target]) -> Vec<Place> {
     places
 }
 
+/// The space's own brain (`tower-<space>`), when it runs: its terminal's
+/// address and name (a close ends it first, `end_brain`).
+fn own_brain(space: &str) -> Option<(String, String)> {
+    let name = crate::brains::name_for(space);
+    let t = hc::get(&name)?;
+    let live = t["state"].as_str().is_none_or(|s| s == "live");
+    (live && crate::brains::is_brain_folder(t["cwd"].as_str().unwrap_or(""))).then(|| (t["address"].as_str().unwrap_or(&name).to_string(), name))
+}
+
 /// What closing (or resolving) the space of exactly that name would do, as
 /// things stand; nothing is changed. `{"space", "goal", "done_when",
-/// "standing", "report", "ends": [{"address", "name", "status", "agent",
-/// "busy"}], "stays": [{"address", "name"}], "busy": [...], "worktrees":
+/// "standing", "report", "tower": {"address", "name"} or null, "ends":
+/// [{"address", "name", "status", "agent", "busy"}], "stays": [{"address",
+/// "name"}], "busy": [...], "worktrees":
 /// [{"path", "branch", "repo", "removed", "why"?}], "herdr_space"}`:
-/// `ends`, every terminal it ends (agents and plain shells; `busy`: an
+/// `tower`, its own brain, which it ends first; `ends`, every terminal of
+/// the space it ends (agents and plain shells; `busy`: an
 /// agent at work or waiting for the user, which a close without force
 /// refuses over); `stays`, the tower's own terminals; a worktree with work
 /// not committed or pushed is kept (`removed` false, and why); `herdr_space`
@@ -969,6 +980,7 @@ pub fn preview(space: &str) -> Result<Value> {
         "done_when": mission.done_when,
         "standing": mission.standing,
         "report": mission.report,
+        "tower": own_brain(&name).map(|(address, name)| json!({ "address": address, "name": name })),
         "ends": ends,
         "stays": list.iter().filter(|t| t.own).map(|t| json!({ "address": t.address, "name": t.name })).collect::<Vec<_>>(),
         "busy": held.iter().map(|t| json!({ "address": t.address, "name": t.name, "status": t.status.to_string() })).collect::<Vec<_>>(),
@@ -1175,8 +1187,11 @@ pub fn preview_text(v: &Value) -> String {
     let name = v["space"].as_str().unwrap_or("");
     let mut out = vec![];
     let ends = list("ends");
+    if let Some(t) = v["tower"].as_object() {
+        out.push(format!("Ends its own tower first: {} ({}).", t["name"].as_str().unwrap_or(""), t["address"].as_str().unwrap_or("")));
+    }
     if ends.is_empty() {
-        out.push(format!("Resolving \"{name}\" ends nothing: no terminal is open there."));
+        out.push(format!("Resolving \"{name}\" ends no terminal of its own: none is open there."));
     } else {
         let each: Vec<String> = ends
             .iter()

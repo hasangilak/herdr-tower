@@ -63,6 +63,9 @@ pub(super) fn resolve_lines(v: &serde_json::Value) -> (Vec<String>, Vec<String>)
         if n.is_empty() || n == a { a.to_string() } else { format!("{n} ({a})") }
     };
     let mut lines = vec![];
+    if v["tower"].is_object() {
+        lines.push(format!("Ends its own tower, {}.", name_of(&v["tower"])));
+    }
     for t in list("ends") {
         let how = match (t["agent"] == true, t["status"].as_str().unwrap_or("")) {
             (false, _) => "an open terminal".to_string(),
@@ -72,7 +75,7 @@ pub(super) fn resolve_lines(v: &serde_json::Value) -> (Vec<String>, Vec<String>)
         };
         lines.push(format!("Ends {}: {how}.", name_of(&t)));
     }
-    if lines.is_empty() {
+    if list("ends").is_empty() {
         lines.push("No session or terminal is open there.".to_string());
     }
     for t in list("stays") {
@@ -383,6 +386,24 @@ impl Panel {
                 cx.notify();
             });
         });
+    }
+
+    /// `HERDER_TOWER_ORB_RESOLVE=<space>` (see `crate::orb`): Resolve is
+    /// pressed for `space` as a click would.
+    pub(crate) fn resolve_from_start(&mut self, space: &str, cx: &mut Context<Self>) {
+        self.ask_resolve(space, cx);
+    }
+
+    /// `HERDER_TOWER_ORB_RESOLVE=<space>:go`: then its card's button, as a
+    /// click would (Close anyway when someone there works or waits).
+    pub(crate) fn resolve_go_from_start(&mut self, space: &str, cx: &mut Context<Self>) {
+        let Some(preview) = self.full.as_ref().and_then(|f| f.resolve.as_ref()).filter(|r| r.space == space).and_then(|r| r.preview.clone()) else {
+            eprintln!("[orb] HERDER_TOWER_ORB_RESOLVE: what resolving {space} would end isn't read yet");
+            return;
+        };
+        let (_, held) = resolve_lines(&preview);
+        eprintln!("[orb] test: resolving {space}{}", if held.is_empty() { "" } else { " (Close anyway)" });
+        self.resolve_space(space, !held.is_empty(), cx);
     }
 
     /// The confirmation of a Resolve for `name`, if one is asked.
@@ -963,6 +984,7 @@ mod tests {
                 { "address": "t11", "name": "docs", "status": "blocked", "agent": true, "busy": true },
                 { "address": "t12", "name": "t12", "status": "done", "agent": true, "busy": false }
             ],
+            "tower": { "address": "t13", "name": "tower-isa" },
             "stays": [{ "address": "t1", "name": "tower" }],
             "busy": [{ "address": "t9", "name": "clips", "status": "working" }, { "address": "t11", "name": "docs", "status": "blocked" }],
             "worktrees": [
@@ -975,6 +997,7 @@ mod tests {
         assert_eq!(
             lines,
             [
+                "Ends its own tower, tower-isa (t13).",
                 "Ends clips (t9): a session at work.",
                 "Ends shell (t10): an open terminal.",
                 "Ends docs (t11): a session waiting for you.",
