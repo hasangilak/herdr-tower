@@ -67,6 +67,8 @@ pub(super) struct FullUi {
     pub projects: projects::ProjectsUi,
     /// A space's goal while it is being changed.
     pub edit: Option<space::GoalEdit>,
+    /// A Resolve waiting for the user's word, with what it would end.
+    pub resolve: Option<space::ResolveAsk>,
     /// What a command said, by where it shows (`tell`, `space:<name>`,
     /// `launch`, …): whether it worked, and the line.
     pub notes: HashMap<String, (bool, String)>,
@@ -124,6 +126,7 @@ impl FullUi {
             launch: launch::LaunchUi::new(window, cx),
             projects: projects::ProjectsUi::default(),
             edit: None,
+            resolve: None,
             notes: HashMap::new(),
             busy: HashSet::new(),
             record: vec![],

@@ -91,6 +91,19 @@ impl Tower for Daemon {
         crate::missions::holding(space)
     }
 
+    fn closing(&self, space: &str) -> Result<Value> {
+        crate::missions::preview(space)
+    }
+
+    fn resolve(&self, space: &str, force: bool) -> Result<Value> {
+        let v = crate::missions::resolve_named(space, force, false)?;
+        if let Some(name) = v["closed"].as_str() {
+            self.decisions.space_over(name, true);
+        }
+        self.missions.now();
+        Ok(v)
+    }
+
     fn close(&self, space: &str, force: bool) -> Result<Value> {
         // The voice itself closes it: nobody else is asked to look.
         let v = crate::missions::close_named(space, force, false)?;

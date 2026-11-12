@@ -12,6 +12,13 @@
 //! - **The closing report**, when its goal is met, with "Close this space"
 //!   (and when it closes by itself). A close the tower refuses, because a
 //!   session there still works, says so and offers "Close anyway".
+//! - **Resolve**, in the head of a space with a goal: the user's word that
+//!   the goal is achieved. It asks first, listing what it would end (`tower
+//!   space resolve --dry-run`): every session and open terminal there, the
+//!   worktrees it removes and those it keeps (work not committed or pushed),
+//!   whether Herdr's space goes. A session at work or waiting for the user
+//!   is named, and the button is "Close anyway". Then `tower space resolve`:
+//!   the goal is marked achieved and the space closed as a close closes it.
 //! - **Needs you**: its own queue, the open card answered by the number keys.
 //! - **Requests**, each with how far it is; **Sessions**, each with its
 //!   status, its last words, its worktree, branch and port, a click away
@@ -37,6 +44,62 @@ use crate::orb::nav::Scope;
 
 /// How many of the thread's messages a space's view shows (the latest).
 const THREAD_ROWS: usize = 5;
+
+/// A Resolve the user asked for, waiting for their word: the space, and
+/// what resolving it would end (`tower space resolve --dry-run`; None while
+/// it is being read).
+pub(super) struct ResolveAsk {
+    space: String,
+    preview: Option<serde_json::Value>,
+}
+
+/// What a preview (`missions::preview`) says, as the confirmation's lines:
+/// each terminal it ends, each that stays, each worktree, Herdr's space; and
+/// who holds it open (at work or waiting for the user), if anyone.
+pub(super) fn resolve_lines(v: &serde_json::Value) -> (Vec<String>, Vec<String>) {
+    let list = |k: &str| v[k].as_array().cloned().unwrap_or_default();
+    let name_of = |t: &serde_json::Value| {
+        let (n, a) = (t["name"].as_str().unwrap_or(""), t["address"].as_str().unwrap_or(""));
+        if n.is_empty() || n == a { a.to_string() } else { format!("{n} ({a})") }
+    };
+    let mut lines = vec![];
+    for t in list("ends") {
+        let how = match (t["agent"] == true, t["status"].as_str().unwrap_or("")) {
+            (false, _) => "an open terminal".to_string(),
+            (true, "working") => "a session at work".to_string(),
+            (true, "blocked") => "a session waiting for you".to_string(),
+            (true, s) => format!("a session, {}", status_word(s)),
+        };
+        lines.push(format!("Ends {}: {how}.", name_of(&t)));
+    }
+    if lines.is_empty() {
+        lines.push("No session or terminal is open there.".to_string());
+    }
+    for t in list("stays") {
+        lines.push(format!("{} stays: it is the tower’s own.", name_of(&t)));
+    }
+    for w in list("worktrees") {
+        let what = w["branch"].as_str().filter(|b| !b.is_empty()).or(w["path"].as_str()).unwrap_or("");
+        if w["removed"] == true {
+            lines.push(format!("Removes the worktree {what} (its branch stays)."));
+        } else {
+            lines.push(format!("Keeps the worktree {what}: {}.", w["why"].as_str().unwrap_or("it has work in it").trim_end_matches('.')));
+        }
+    }
+    match v["herdr_space"].as_str() {
+        Some("closed") => lines.push("Herdr’s space closes.".to_string()),
+        Some("kept") => lines.push("Herdr’s space stays: it holds the tower’s own terminal.".to_string()),
+        _ => {}
+    }
+    let held = list("busy")
+        .iter()
+        .map(|t| {
+            let doing = if t["status"] == "blocked" { "waits for you" } else { "is still working" };
+            format!("{} {doing}", name_of(t))
+        })
+        .collect();
+    (lines, held)
+}
 
 /// A space's goal while it is being changed.
 pub(super) struct GoalEdit {
@@ -94,7 +157,8 @@ pub(super) fn closed_line(name: &str, out: &str) -> String {
         return if said.is_empty() { format!("{name} is closed.") } else { said };
     }
     let list = |k: &str| v[k].as_array().cloned().unwrap_or_default();
-    let mut parts = vec![format!("{} is closed.", v["closed"].as_str().unwrap_or(name))];
+    let closed = v["closed"].as_str().unwrap_or(name);
+    let mut parts = vec![if v["resolved"] == true { format!("{closed} is resolved: its goal is achieved, and it is closed.") } else { format!("{closed} is closed.") }];
     match list("sessions_ended").len() {
         0 => {}
         n => parts.push(format!("{} ended.", counted(n, "session"))),
@@ -280,6 +344,108 @@ impl Panel {
         });
     }
 
+    /// Resolve was pressed: what it would end is read, and asked about.
+    fn ask_resolve(&mut self, space: &str, cx: &mut Context<Self>) {
+        let Some(full) = self.full.as_mut() else { return };
+        if full.resolve.as_ref().is_some_and(|r| r.space == space) {
+            // Pressed again: put away.
+            full.resolve = None;
+            return cx.notify();
+        }
+        full.resolve = Some(ResolveAsk { space: space.to_string(), preview: None });
+        let name = space.to_string();
+        self.run(&format!("resolve:{space}"), vec!["space".into(), "resolve".into(), space.to_string(), "--dry-run".into()], cx, move |this, result, cx| {
+            let Ok(out) = result else { return };
+            let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_default();
+            if let Some(r) = this.full.as_mut().and_then(|f| f.resolve.as_mut()).filter(|r| r.space == name) {
+                r.preview = Some(v);
+            }
+            cx.notify();
+        });
+    }
+
+    /// The user's word: `tower space resolve` (`force`: though a session
+    /// there works or waits), then back to every space with what it did.
+    fn resolve_space(&mut self, space: &str, force: bool, cx: &mut Context<Self>) {
+        let name = space.to_string();
+        let mut args: Vec<String> = vec!["space".into(), "resolve".into(), space.to_string()];
+        if force {
+            args.push("--force".into());
+        }
+        self.run(&format!("space:{space}"), args, cx, move |this, result, cx| {
+            let Ok(out) = result else { return };
+            if let Some(full) = this.full.as_mut() {
+                full.resolve = None;
+            }
+            let text = closed_line(&name, out);
+            this.tower.update(cx, |t, cx| {
+                t.nav.say(Scope::All, text);
+                cx.notify();
+            });
+        });
+    }
+
+    /// The confirmation of a Resolve for `name`, if one is asked.
+    fn resolve_card(&mut self, name: &str, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let g = glass();
+        let preview = self.full.as_ref()?.resolve.as_ref().filter(|r| r.space == name)?.preview.clone();
+        let place = format!("space:{name}");
+        let busy = self.running(&place);
+        // The tower refused (something started there since it was read): say so, and offer it anyway.
+        let refused = self.full.as_ref().and_then(|f| f.notes.get(&place)).is_some_and(|(ok, text)| !ok && refused_close(text));
+        let (lines, held) = preview.as_ref().map(resolve_lines).unwrap_or_default();
+        let force = refused || !held.is_empty();
+        let (n1, n2) = (name.to_string(), name.to_string());
+        let bullet = |text: String| {
+            h_flex()
+                .w_full()
+                .items_start()
+                .gap(px(8.0))
+                .child(div().flex_none().mt(px(8.0)).size(px(4.0)).rounded_full().bg(g.faint))
+                .child(div().flex_1().min_w_0().text_size(px(13.0)).line_height(px(19.0)).text_color(g.text).child(text))
+        };
+        Some(
+            v_flex()
+                .w_full()
+                .p(px(16.0))
+                .gap(px(10.0))
+                .rounded(px(18.0))
+                .bg(rgba(CARD))
+                .border_1()
+                .border_color(rgb(AMBER))
+                .child(div().text_size(px(15.0)).font_weight(FontWeight::SEMIBOLD).child(format!("Resolve {name}?")))
+                .child(div().text_size(px(13.0)).line_height(px(19.0)).text_color(g.muted).child(
+                    "Its goal is marked achieved and the space is closed: what is open there ends, its clean worktrees are removed, its report goes into Record, and it is archived.",
+                ))
+                .when(preview.is_none(), |el| el.child(cstat("Looking at what it would end…", false)))
+                .when(preview.is_some(), |el| el.child(v_flex().gap(px(4.0)).children(lines.into_iter().map(bullet))))
+                .when(!held.is_empty(), |el| {
+                    el.child(div().text_size(px(13.0)).line_height(px(19.0)).text_color(rgb(AMBER)).child(format!(
+                        "{}. Closing now cuts that work off.",
+                        held.join("; ")
+                    )))
+                })
+                .children(self.said(&format!("resolve:{name}")))
+                .children(self.said(&place))
+                .child(
+                    acts_row()
+                        .child(
+                            mbtn("resolve-go", if busy { "Resolving…" } else if force { "Close anyway" } else { "Resolve and close" }, true, None)
+                                .when(busy || preview.is_none(), |el| el.opacity(0.5))
+                                .when(!busy && preview.is_some(), |el| el.on_click(cx.listener(move |this, _, _, cx| this.resolve_space(&n1, force, cx)))),
+                        )
+                        .child(mbtn("resolve-cancel", "Cancel", false, None).on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(full) = this.full.as_mut() {
+                                full.resolve = None;
+                                full.notes.remove(&format!("space:{n2}"));
+                            }
+                            cx.notify();
+                        }))),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// A space's head and body.
     pub(super) fn space_view(&mut self, name: &str, all: &[Decision], missions: &Missions, cx: &mut Context<Self>) -> (AnyElement, Vec<AnyElement>) {
         let g = glass();
@@ -300,18 +466,24 @@ impl Panel {
             sub.push(div().child("No goal: it has no end, and the tower opens no worktrees here.").into_any_element());
         }
         // The goal and what counts as done: a block of their own under the head (not while it is being changed).
-        let (m1, n1, n2, n3) = (m.clone(), name.to_string(), name.to_string(), name.to_string());
+        let (m1, n1, n2, n3, n4) = (m.clone(), name.to_string(), name.to_string(), name.to_string(), name.to_string());
         let (follow, mute, review) = (m.follow, m.mute, m.review);
+        // A space with a goal can be resolved: its goal achieved, the space closed.
+        let resolvable = !m.standing && !m.goal.trim().is_empty();
+        let asking = self.full.as_ref().and_then(|f| f.resolve.as_ref()).is_some_and(|r| r.space == name);
         let toggles = h_flex()
             .gap(px(6.0))
             .child(tg("space-goal", if m.goal.trim().is_empty() && !m.standing { "Set a goal" } else { "Goal" }, editing).on_click(cx.listener(move |this, _, window, cx| this.toggle_goal(&m1, window, cx))))
             .child(tg("space-follow", "Follow", follow).on_click(cx.listener(move |this, _, _, cx| this.set_switch(&n1, true, !follow, cx))))
             .child(tg("space-mute", "Mute", mute).on_click(cx.listener(move |this, _, _, cx| this.set_switch(&n2, false, !mute, cx))))
             .child(tg("space-review", "Review PRs", review).on_click(cx.listener(move |this, _, _, cx| this.set_review(&n3, !review, cx))))
+            .when(resolvable, |el| el.child(tg("space-resolve", "✓ Resolve", asking).on_click(cx.listener(move |this, _, _, cx| this.ask_resolve(&n4, cx)))))
             .into_any_element();
         let head = whead(name, sub, Some(toggles));
 
         let mut items: Vec<AnyElement> = vec![];
+        // Resolve asks first, above everything else here.
+        items.extend(self.resolve_card(name, cx));
         let editing_goal = self.full.as_ref().and_then(|f| f.edit.as_ref()).is_some_and(|e| e.space == name);
         if !m.standing && !m.goal.trim().is_empty() && !editing_goal {
             items.push(goal_block(m.goal.trim(), m.done_when.trim()));
@@ -777,6 +949,45 @@ mod tests {
         // Words, not a receipt (a terminal's output): as they are.
         assert_eq!(closed_line("isa", "Closed \"isa\".\nEnded: clips (t9).\n"), "Closed \"isa\". Ended: clips (t9).");
         assert_eq!(closed_line("isa", ""), "isa is closed.");
+        let resolved = r#"{"closed":"isa","resolved":true,"sessions_ended":[{"address":"t9","name":"clips"},{"address":"t10","name":"shell"}],"sessions_left":[],"worktrees_removed":[],"kept_worktrees":[],"report":"Clips are live."}"#;
+        assert_eq!(closed_line("isa", resolved), "isa is resolved: its goal is achieved, and it is closed. 2 sessions ended. Its closing report is in Record.");
+    }
+
+    #[test]
+    fn resolve_asks_with_everything_it_would_end() {
+        let v = serde_json::json!({
+            "space": "isa",
+            "ends": [
+                { "address": "t9", "name": "clips", "status": "working", "agent": true, "busy": true },
+                { "address": "t10", "name": "shell", "status": "", "agent": false, "busy": false },
+                { "address": "t11", "name": "docs", "status": "blocked", "agent": true, "busy": true },
+                { "address": "t12", "name": "t12", "status": "done", "agent": true, "busy": false }
+            ],
+            "stays": [{ "address": "t1", "name": "tower" }],
+            "busy": [{ "address": "t9", "name": "clips", "status": "working" }, { "address": "t11", "name": "docs", "status": "blocked" }],
+            "worktrees": [
+                { "path": "/w/.tower-worktrees/isa/app", "branch": "isa/app", "removed": true },
+                { "path": "/w/.tower-worktrees/isa/api", "branch": "isa/api", "removed": false, "why": "2 files not committed." }
+            ],
+            "herdr_space": "kept"
+        });
+        let (lines, held) = resolve_lines(&v);
+        assert_eq!(
+            lines,
+            [
+                "Ends clips (t9): a session at work.",
+                "Ends shell (t10): an open terminal.",
+                "Ends docs (t11): a session waiting for you.",
+                "Ends t12: a session, done.",
+                "tower (t1) stays: it is the tower’s own.",
+                "Removes the worktree isa/app (its branch stays).",
+                "Keeps the worktree isa/api: 2 files not committed.",
+                "Herdr’s space stays: it holds the tower’s own terminal.",
+            ]
+        );
+        assert_eq!(held, ["clips (t9) is still working", "docs (t11) waits for you"]);
+        let (lines, held) = resolve_lines(&serde_json::json!({ "ends": [], "herdr_space": "closed" }));
+        assert_eq!((lines, held), (vec!["No session or terminal is open there.".to_string(), "Herdr’s space closes.".to_string()], vec![]));
         // A refusal names the way round it.
         assert!(refused_close("tower space: \"isa\" isn't closed: clips (t9) is working. Wait for them, or close it anyway with --force (their work in progress is cut off)."));
         assert!(!refused_close("tower space: no space called \"isa\""));

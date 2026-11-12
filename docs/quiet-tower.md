@@ -864,6 +864,30 @@ a machine, can't be asked, nothing moves that round.
   [{"path","branch","repo","why"}], "requests_closed": [agenda id],
   "tower_ended": [its own brain's name, when it had one], "report": "…"}`.
   It works with no daemon running.
+- `tower space resolve <space> [--force]` (the user's word only, a space
+  with a goal): its goal is achieved. The same close, refused the same way,
+  but the mission keeps `achieved_ms`, the record's line says `"<name> is
+  resolved: its goal is achieved (<goal>), and it is closed. <report>"`, and
+  the receipt has `"resolved": true` and `"goal"`. A space with no goal is
+  refused (close it instead). `--dry-run` changes nothing and prints what
+  it would do (`missions::preview`): `{"space", "goal", "done_when",
+  "standing", "report", "ends": [{"address","name","status","agent",
+  "busy"}], "stays": [{"address","name"}], "busy": [...], "worktrees":
+  [{"path","branch","repo","removed","why"?}], "herdr_space"}`: `ends` is
+  every terminal it ends, agent sessions and plain shells alike; `stays`,
+  the tower's own; a worktree with work not committed or pushed is kept
+  (`removed` false, and why).
+- **Resolve, in the full window.** The head of a space with a goal (not a
+  standing one) has "✓ Resolve". It asks first, in a card above the
+  space's view: what resolving does, and a line for each terminal it ends
+  ("Ends clips (t9): a session at work.", "…: an open terminal."), each
+  that stays, each worktree it removes or keeps (and why), and whether
+  Herdr's space goes. A session at work or waiting for the user is named
+  ("clips (t9) is still working. Closing now cuts that work off."), and the
+  button is "Close anyway" (`--force`); otherwise "Resolve and close".
+  Cancel puts it away. Once done the window goes to All spaces, saying what
+  was ended, removed and kept. A refusal (something started there since
+  the card was read) shows in the card, with "Close anyway".
 - **Auto-close.** A ready space whose sessions have all been `idle` or
   `done` for `[spaces] auto_close_hours` (0, the default, is never; say 24 for a day), without a break,
   is closed the same way, without `--force` (`idle_since_ms` is when that

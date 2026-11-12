@@ -52,6 +52,10 @@ pub trait Tower: Send + Sync {
     fn holding(&self, space: &str) -> Result<Vec<Value>>;
     /// `tower space close`: its receipt.
     fn close(&self, space: &str, force: bool) -> Result<Value>;
+    /// `tower space resolve`: its goal is achieved; closed as `close` closes it. Its receipt.
+    fn resolve(&self, space: &str, force: bool) -> Result<Value>;
+    /// `tower space resolve --dry-run`: what closing it would end and remove.
+    fn closing(&self, space: &str) -> Result<Value>;
     /// `tower setups`: `{"setups": [{name, account, repos}]}`.
     fn setups(&self) -> Result<Value>;
     /// What `tower launch` would do, as things stand.
