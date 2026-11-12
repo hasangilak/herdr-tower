@@ -101,6 +101,7 @@ pub(super) fn session_thread(entries: &[Entry], addr: &str, max: usize) -> Vec<S
             push_session(&mut out, s);
         }
     }
+    out.sort_by_key(|s| s.at);
     let n = out.len();
     out.split_off(n.saturating_sub(max))
 }
@@ -156,6 +157,8 @@ pub(super) fn conversation(entries: &[Entry], space: Option<&str>, max: usize) -
             out.push(Said { you: false, text: e.text.trim().to_string(), at: e.at, request_at, with: None });
         }
     }
+    // In time order (a line can be written a little after a later one).
+    out.sort_by_key(|s| s.at);
     let n = out.len();
     out.split_off(n.saturating_sub(max))
 }
@@ -440,6 +443,11 @@ mod tests {
         let t = session_thread(&entries, "t8w", 200);
         assert_eq!(t.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(), ["merged on dev", "PR #787 (eyzhub/eyzflow) into dev was merged on GitHub.", "Release #787 to prod", "im logged in"]);
         assert_eq!(session_thread(&entries, "t8w", 1).len(), 1);
+        // A line written after a later one still shows in time order.
+        let late = [entries.clone(), vec![of("request", None, Some("terminal:t8w"), "t8w", "keep this link in mind", 4)]].concat();
+        let t = session_thread(&late, "t8w", 200);
+        assert_eq!(t.iter().map(|x| x.at).collect::<Vec<_>>(), [3, 4, 4, 6, 8]);
+        assert_eq!(conversation(&late, Some("support-translation"), 200).iter().map(|x| x.at).collect::<Vec<_>>(), [1, 2, 3, 4, 4, 6, 8]);
         // The tower's held reply, not sent because you answered in the terminal.
         assert_eq!(session_said(&of("request", None, Some("terminal:t7p"), "t7p", "<agent-message from='ab4'> [Subagent hand-back] done", 1)), None);
         let answer = of("request", Some("answer"), Some("terminal:t8w"), "t8w", "no, keep it on dev", 2);
