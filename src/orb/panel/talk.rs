@@ -11,6 +11,12 @@
 //! it, sent it, or didn't send because you had told it yourself; and, at
 //! its end, what still waits for its sessions in the send queue. A
 //! session's view has the same, for that session alone (`session_thread`).
+//!
+//! A space launched from New space has, at the top of its conversation,
+//! the conversation that made it (`story_of`, the history's `creation`
+//! entries): the ticket, the drafts and the changes asked for, the
+//! planner's answers, and what the launch opened. New space's own column
+//! is that conversation while it is still being had (`launch`).
 
 use gpui::{AnyElement, Context, FontWeight, SharedString, Window, div, prelude::*, px, rgb, rgba};
 use gpui_kit::component::{h_flex, v_flex};
@@ -18,6 +24,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use super::home::{ActShown, LINE, SOFT, bay_label, cstat, cstat_busy};
 use super::{AMBER, CYAN, Panel, glass};
 use crate::history::{self, Entry};
+use crate::launch::Told;
 
 /// The most messages the column shows (Record has the rest).
 const MAX_SAID: usize = 200;
@@ -176,6 +183,29 @@ pub(super) fn conversation(entries: &[Entry], space: Option<&str>, max: usize) -
     out.split_off(n.saturating_sub(max))
 }
 
+/// The conversation that made `space` (New space's, kept by its launch as
+/// `creation` entries), oldest first.
+pub(super) fn story_of(entries: &[Entry], space: &str) -> Vec<Told> {
+    let mut out: Vec<Told> = entries
+        .iter()
+        .filter(|e| e.kind == "creation" && e.space.as_deref() == Some(space) && !e.text.trim().is_empty())
+        .map(|e| Told { who: e.status.clone().unwrap_or_else(|| "tower".into()), text: e.text.trim().to_string(), at: e.at })
+        .collect();
+    out.sort_by_key(|t| t.at);
+    out
+}
+
+/// A message of the conversation that makes (or made) a space: you, the
+/// tower or the planner, when, its words whole.
+pub(super) fn told_row(t: &Told) -> AnyElement {
+    let (bar, bg, head) = match t.who.as_str() {
+        "you" => (rgb(AMBER).into(), rgba(0xffffff24), "You"),
+        "planner" => (faded(CYAN, 0xa0), rgba(SOFT), "The planner"),
+        _ => (rgb(CYAN).into(), rgba(SOFT), "The tower"),
+    };
+    message_row(bar, bg, head.to_string(), if t.at > 0 { when(t.at) } else { String::new() }, None, t.text.clone(), vec![])
+}
+
 /// "7:50 PM" today, else the day and the time.
 fn when(at: u64) -> String {
     let day = super::day_label(at);
@@ -298,9 +328,13 @@ impl Panel {
             }
             said = without_waiting(said, &texts);
         }
+        // How it was created (launched from New space): at its top, under its own label, folded as asked.
+        let story = space.map(|sp| story_of(&self.entries, sp)).unwrap_or_default();
+        let fold_key = space.map(|sp| format!("story-folded:{sp}")).unwrap_or_default();
+        let folded = self.full.as_ref().is_some_and(|f| f.thread_open.contains(&fold_key));
         // A new message: the column goes to its end.
         if let Some(f) = self.full.as_mut() {
-            let key = (space.map(String::from), said.len(), said.last().map(|s| s.at).unwrap_or(0));
+            let key = (space.map(String::from), said.len() + story.len(), said.last().map(|s| s.at).unwrap_or(0));
             if f.chat_seen.as_ref() != Some(&key) {
                 f.chat_seen = Some(key);
                 f.chat_scroll.scroll_to_bottom();
@@ -326,6 +360,45 @@ impl Panel {
         let act_items = act.map(|a| self.act_items(&a, cx)).unwrap_or_default();
         let last_of_latest = latest.and_then(|at| said.iter().rposition(|s| s.with.is_none() && s.request_at == at));
         let mut rows: Vec<AnyElement> = vec![];
+        if !story.is_empty() {
+            let n = story.len();
+            let label = if n == 1 { "How this space was created · 1 message".to_string() } else { format!("How this space was created · {n} messages") };
+            let key = fold_key.clone();
+            rows.push(
+                h_flex()
+                    .w_full()
+                    .px(px(4.0))
+                    .pt(px(2.0))
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(div().flex_1().min_w_0().child(bay_label(&label).px(px(0.0))))
+                    .child(
+                        div()
+                            .id("story-fold")
+                            .flex_none()
+                            .text_size(px(12.0))
+                            .text_color(g.faint)
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(g.text))
+                            .child(if folded { "Show" } else { "Fold" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(f) = this.full.as_mut()
+                                    && !f.thread_open.remove(&key)
+                                {
+                                    f.thread_open.insert(key.clone());
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            );
+            if !folded {
+                rows.extend(story.iter().map(told_row));
+            }
+            if !said.is_empty() || !waits.is_empty() {
+                rows.push(div().px(px(4.0)).pt(px(6.0)).child(bay_label("Since it was launched").px(px(0.0))).into_any_element());
+            }
+        }
         let mut act_items = Some(act_items);
         for (i, s) in said.iter().enumerate() {
             let extra = if Some(i) == last_of_latest { act_items.take().unwrap_or_default() } else { vec![] };
@@ -479,6 +552,29 @@ mod tests {
         assert_eq!(session_said(&answer).map(|x| (x.you, x.with.unwrap().how)), Some((true, "answered its question, in its terminal".to_string())));
         let held = of("queue", Some("not-sent"), None, "t8t", "Not sent: you answered it in the terminal (the reply was \"open it\")", 1);
         assert_eq!(session_said(&held).map(|x| (x.text, x.with.unwrap().how)), Some(("you answered it in the terminal (the reply was \"open it\")".to_string(), "not sent".to_string())));
+    }
+
+    /// A space launched from New space has the conversation that made it,
+    /// its own `creation` entries, oldest first; it is in no other
+    /// conversation, its tower's or the main one.
+    #[test]
+    fn a_launched_space_has_the_conversation_that_made_it() {
+        let made = |who: &str, text: &str, space: &str, at: u64| Entry { kind: "creation".into(), status: Some(who.into()), text: text.into(), space: Some(space.into()), at, record: true, ..Default::default() };
+        let entries = vec![
+            made("tower", "Drafted scratch-check: 1 session (tower-scratch).", "ns-check", 2),
+            made("you", "Throwaway check: open one session in tower-scratch.", "ns-check", 1),
+            made("you", "another space's ticket", "sandbox", 3),
+            made("you", "Name the space ns-check instead.", "ns-check", 4),
+            e("request", "how is it going?", Some("ns-check"), 9),
+            e("answer", "It answered ok.", Some("ns-check"), 10),
+        ];
+        let story = story_of(&entries, "ns-check");
+        assert_eq!(story.iter().map(|t| (t.who.as_str(), t.at)).collect::<Vec<_>>(), [("you", 1), ("tower", 2), ("you", 4)]);
+        assert_eq!(story_of(&entries, "sandbox").len(), 1);
+        assert!(story_of(&entries, "elsewhere").is_empty());
+        // Not in the space's conversation with its tower, nor in the main one.
+        assert_eq!(conversation(&entries, Some("ns-check"), 200).iter().map(|x| x.at).collect::<Vec<_>>(), [9, 10]);
+        assert!(conversation(&entries, None, 200).is_empty());
     }
 
     #[test]

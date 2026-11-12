@@ -936,6 +936,19 @@ fn answer_from_start() -> Option<(String, usize, bool)> {
     (!id.is_empty()).then(|| (id, n, parts.next() == Some("rule")))
 }
 
+/// `HERDER_TOWER_ORB_RESOLVE=<space>[:go]`: a moment after the start, the
+/// full window (showing that space) presses its Resolve as a click would,
+/// and with `:go` its card's button six seconds later. For looking at the
+/// confirmation, and resolving a throwaway space, without the pointer.
+fn resolve_from_start() -> Option<(String, bool)> {
+    let v = std::env::var("HERDER_TOWER_ORB_RESOLVE").ok()?;
+    let (space, go) = match v.rsplit_once(':') {
+        Some((s, "go")) => (s.trim().to_string(), true),
+        _ => (v.trim().to_string(), false),
+    };
+    (!space.is_empty()).then_some((space, go))
+}
+
 /// The goal `HERDER_TOWER_ORB_WINDOW=show:new=<goal>[@<x>,<y>]` names.
 fn from_start_goal() -> Option<String> {
     let v = std::env::var("HERDER_TOWER_ORB_WINDOW").ok()?;
@@ -1131,9 +1144,24 @@ fn open_full(tower: &Entity<Tower>, to: Option<nav::Scope>, anchor: Option<mac::
             // `HERDER_TOWER_ORB_ANSWER`: a card is answered as a click would, once, to look at what follows.
             static ANSWERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if let Some((id, choice, rule)) = answer_from_start().filter(|_| !focus && !ANSWERED.swap(true, std::sync::atomic::Ordering::SeqCst)) {
+                let view = view.clone();
                 cx.spawn(async move |cx: &mut AsyncApp| {
                     cx.background_executor().timer(Duration::from_millis(2500)).await;
                     let _ = view.update(cx, |p, cx| p.answer_from_start(&id, choice, rule, cx));
+                })
+                .detach();
+            }
+            // `HERDER_TOWER_ORB_RESOLVE`: Resolve pressed (and its button), once.
+            static RESOLVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if let Some((space, go)) = resolve_from_start().filter(|_| !focus && !RESOLVED.swap(true, std::sync::atomic::Ordering::SeqCst)) {
+                let view = view.clone();
+                cx.spawn(async move |cx: &mut AsyncApp| {
+                    cx.background_executor().timer(Duration::from_millis(2500)).await;
+                    let _ = view.update(cx, |p, cx| p.resolve_from_start(&space, cx));
+                    if go {
+                        cx.background_executor().timer(Duration::from_millis(6000)).await;
+                        let _ = view.update(cx, |p, cx| p.resolve_go_from_start(&space, cx));
+                    }
                 })
                 .detach();
             }

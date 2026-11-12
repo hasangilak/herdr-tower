@@ -67,6 +67,8 @@ pub(super) struct FullUi {
     pub projects: projects::ProjectsUi,
     /// A space's goal while it is being changed.
     pub edit: Option<space::GoalEdit>,
+    /// A Resolve waiting for the user's word, with what it would end.
+    pub resolve: Option<space::ResolveAsk>,
     /// What a command said, by where it shows (`tell`, `space:<name>`,
     /// `launch`, …): whether it worked, and the line.
     pub notes: HashMap<String, (bool, String)>,
@@ -124,6 +126,7 @@ impl FullUi {
             launch: launch::LaunchUi::new(window, cx),
             projects: projects::ProjectsUi::default(),
             edit: None,
+            resolve: None,
             notes: HashMap::new(),
             busy: HashSet::new(),
             record: vec![],
@@ -314,11 +317,12 @@ impl Panel {
     }
 
     /// Where the input's words go, as its placeholder says.
-    pub(super) fn input_hint(&self, cx: &App) -> String {
+    pub(super) fn input_hint(&self, cx: &Context<Self>) -> String {
         if self.full.is_none() {
             return "Tell the tower…".into();
         }
         match &self.tower.read(cx).nav.scope {
+            Scope::New => self.new_hint(cx),
             // The conversation column's head says which tower it is; its input is narrow.
             Scope::Space(_) if self.full.as_ref().is_some_and(|f| f.talk_w < 360.0) => "Write here…".into(),
             Scope::Space(_) => "Write to the tower…".into(),
@@ -512,7 +516,7 @@ impl Panel {
         // The widths, from the window's as it is now: the conversation's
         // column (All spaces, a space) and what is left for the pane, which
         // every view lays itself out to (`FullUi::pane_w`).
-        let talk_w = matches!(scope, Scope::All | Scope::Space(_)).then(|| talk_width(f32::from(window.viewport_size().width)));
+        let talk_w = matches!(scope, Scope::All | Scope::Space(_) | Scope::New).then(|| talk_width(f32::from(window.viewport_size().width)));
         let pane_w = f32::from(window.viewport_size().width) - SIDE_W - talk_w.unwrap_or(0.0) - 36.0;
         if let Some(f) = self.full.as_mut() {
             f.pane_w = pane_w;
@@ -562,14 +566,18 @@ impl Panel {
                 (h, b, None, false)
             }
         };
-        // A view with a conversation (All spaces, a space): it has a column of
+        // A view with a conversation (All spaces, a space, New space's with
+        // the tower's brain about the space it drafts): it has a column of
         // its own beside the sidebar, the whole of it, with the input under it.
         let talk: Option<Option<String>> = match &scope {
             Scope::All => Some(None),
             Scope::Space(name) => Some(Some(name.clone())),
             _ => None,
         };
-        let chat = talk.as_ref().zip(talk_w).map(|(space, w)| self.chat_column(space.as_deref(), w, window, cx));
+        let chat = match (&scope, talk_w) {
+            (Scope::New, Some(w)) => Some(self.new_chat_column(w, window, cx)),
+            _ => talk.as_ref().zip(talk_w).map(|(space, w)| self.chat_column(space.as_deref(), w, window, cx)),
+        };
         let input = input && chat.is_none();
         let foot = match reply.filter(|_| chat.is_none()) {
             Some(space) => self.foot_items(space.as_deref(), cx),

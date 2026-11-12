@@ -59,7 +59,13 @@ impl Lan {
             ("GET", ["missions"]) => t().map(|t| Response::json(200, &t.missions())),
             ("POST" | "PUT", ["spaces", space, "goal"]) => t().and_then(|t| self.set_goal(t, req, space)),
             ("POST" | "PUT", ["spaces", space, what @ ("follow" | "mute")]) => t().and_then(|t| self.set_switch(t, req, space, what)),
-            ("POST", ["spaces", space, "close"]) => t().and_then(|_| self.close_space(req, device, space)),
+            ("POST", ["spaces", space, "close"]) => t().and_then(|_| self.close_space(req, device, space, false)),
+            ("POST", ["spaces", space, "resolve"]) => t().and_then(|_| self.close_space(req, device, space, true)),
+            // What closing or resolving it would end and remove (nothing changes).
+            ("GET", ["spaces", space, "closing"]) => t().and_then(|t| {
+                let name = self.space_named(space)?;
+                t.closing(&name).map(|v| Response::json(200, &v)).map_err(|e| Response::error(503, "herdr", &format!("{e:#}")))
+            }),
             // What the sessions of a space wrote to each other, newest last, in pages.
             ("GET", ["thread"]) => {
                 let limit = q("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(50).min(200);
@@ -247,13 +253,18 @@ impl Lan {
         Ok(Response::json(200, &json!({ "space": name, what: on, "mission": mission(t, &name) })))
     }
 
-    /// `POST /v1/spaces/{space}/close`: refused while a session there is
-    /// at work or waits for the user, unless `force`. Ending its sessions
-    /// and removing its worktrees takes a while: it is an action.
-    fn close_space(&self, req: &Request, device: &auth::Device, space: &str) -> Answered {
+    /// `POST /v1/spaces/{space}/close`, and `…/resolve` (`resolve`: its goal
+    /// is achieved, then closed the same way; only a space with a goal):
+    /// refused while a session there is at work or waits for the user,
+    /// unless `force`. Ending its sessions and removing its worktrees takes
+    /// a while: it is an action (`close` or `resolve`).
+    fn close_space(&self, req: &Request, device: &auth::Device, space: &str, resolve: bool) -> Answered {
         let Some(tower) = self.tower() else { return Err(starting()) };
         let name = self.space_named(space)?;
         let force = req.json().unwrap_or_default()["force"].as_bool().unwrap_or(false);
+        if resolve && mission(tower.as_ref(), &name)["goal"].as_str().is_none_or(|g| g.trim().is_empty()) {
+            return Err(Response::error(409, "no_goal", &format!("\"{name}\" has no goal to resolve: close it instead")));
+        }
         if !force {
             let held = tower.holding(&name).map_err(|e| Response::error(503, "herdr", &format!("{e:#}")))?;
             if !held.is_empty() {
@@ -276,15 +287,16 @@ impl Lan {
             }
         }
         let by = format!("phone:{}", device.id);
-        let same = |a: &super::tower::Action| a.kind == "close" && a.space.eq_ignore_ascii_case(&name);
+        let same = |a: &super::tower::Action| (a.kind == "close" || a.kind == "resolve") && a.space.eq_ignore_ascii_case(&name);
+        let kind = if resolve { "resolve" } else { "close" };
         let action = self
             .actions
-            .begin("close", &name, Value::Null, &by, same)
+            .begin(kind, &name, Value::Null, &by, same)
             .map_err(|running| under_way("closing", &format!("\"{name}\" is being closed already"), &running.id))?;
-        eprintln!("[phone] {} closes \"{name}\"{} ({})", device.name, if force { " (forced)" } else { "" }, action.id);
+        eprintln!("[phone] {} {} \"{name}\"{} ({})", device.name, if resolve { "resolves" } else { "closes" }, if force { " (forced)" } else { "" }, action.id);
         let (actions, id) = (self.actions.clone(), action.id.clone());
         let spawned = thread::Builder::new().name("lan-close".into()).spawn(move || {
-            let done = tower.close(&name, force).map_err(|e| format!("{e:#}"));
+            let done = if resolve { tower.resolve(&name, force) } else { tower.close(&name, force) }.map_err(|e| format!("{e:#}"));
             if let Err(e) = &done {
                 eprintln!("[phone] \"{name}\" wasn't closed: {e}");
             }
@@ -729,6 +741,20 @@ mod tests {
             Ok(
                 json!({ "closed": space, "sessions_ended": held, "sessions_left": [], "herdr_space": "closed", "worktrees_removed": [], "kept_worktrees": [], "requests_closed": [], "tower_ended": [], "report": "" }),
             )
+        }
+        fn resolve(&self, space: &str, force: bool) -> Result<Value> {
+            let mut v = self.close(space, force)?;
+            spaces::update_in(&self.ui, |s| {
+                if let Some(m) = s.missions.get_mut(space) {
+                    m.achieved_ms = Some(crate::history::now_ms());
+                }
+            });
+            v["resolved"] = true.into();
+            Ok(v)
+        }
+        fn closing(&self, space: &str) -> Result<Value> {
+            let held = self.held.lock().unwrap().clone();
+            Ok(json!({ "space": space, "ends": held, "busy": held, "stays": [], "worktrees": [], "herdr_space": "closed" }))
         }
         fn setups(&self) -> Result<Value> {
             Ok(
@@ -1531,6 +1557,22 @@ mod tests {
         *r.tower.held.lock().unwrap() = vec![];
         let (_, v) = r.post("/v1/spaces/Docs/close", "{}");
         assert_eq!(r.finished(v["action"]["id"].as_str().unwrap())["state"], "done");
+
+        // Resolving: only a space with a goal; what it would end, first; then the same close, its goal achieved.
+        let (st, v) = r.post("/v1/spaces/B2C%20support/resolve", "{}");
+        assert_eq!((st, code(&v)), (409, Some("no_goal")), "{v}");
+        assert_eq!(r.post("/v1/spaces/B2C%20support/goal", r#"{"goal":"Answer every support ticket"}"#).0, 200);
+        *r.tower.held.lock().unwrap() = vec![json!({ "address": "t8", "name": "b2c-api", "status": "blocked" })];
+        let (st, v) = r.get("/v1/spaces/B2C%20support/closing");
+        assert_eq!((st, v["space"].as_str(), v["busy"][0]["address"].as_str()), (200, Some("B2C support"), Some("t8")), "{v}");
+        let (st, v) = r.post("/v1/spaces/B2C%20support/resolve", "{}");
+        assert_eq!((st, code(&v)), (409, Some("busy")), "{v}");
+        let (st, v) = r.post("/v1/spaces/B2C%20support/resolve", r#"{"force":true}"#);
+        assert_eq!((st, v["action"]["kind"].as_str()), (202, Some("resolve")), "{v}");
+        let done = r.finished(v["action"]["id"].as_str().unwrap());
+        assert_eq!((done["state"].as_str(), done["receipt"]["resolved"].as_bool()), (Some("done"), Some(true)), "{done}");
+        assert!(spaces::load_from(&r.tower.ui).missions["B2C support"].achieved_ms.is_some());
+        assert_eq!(r.get("/v1/spaces/Nowhere/closing").0, 404);
         r.end();
     }
 

@@ -864,6 +864,34 @@ a machine, can't be asked, nothing moves that round.
   [{"path","branch","repo","why"}], "requests_closed": [agenda id],
   "tower_ended": [its own brain's name, when it had one], "report": "…"}`.
   It works with no daemon running.
+- `tower space resolve <space> [--force]` (the user's word only, a space
+  with a goal): its goal is achieved. The same close, refused the same way,
+  but the mission keeps `achieved_ms`, the record's line says `"<name> is
+  resolved: its goal is achieved (<goal>), and it is closed. <report>"`, and
+  the receipt has `"resolved": true` and `"goal"`. A space with no goal is
+  refused (close it instead). `--dry-run` changes nothing and prints what
+  it would do (`missions::preview`): `{"space", "goal", "done_when",
+  "standing", "report", "ends": [{"address","name","status","agent",
+  "busy"}], "stays": [{"address","name"}], "busy": [...], "worktrees":
+  [{"path","branch","repo","removed","why"?}], "herdr_space"}`: `ends` is
+  every terminal it ends, agent sessions and plain shells alike; `stays`,
+  the tower's own; a worktree with work not committed or pushed is kept
+  (`removed` false, and why).
+- **Resolve, in the full window.** The head of a space with a goal (not a
+  standing one) has "✓ Resolve". It asks first, in a card above the
+  space's view: what resolving does, and a line for each terminal it ends
+  ("Ends clips (t9): a session at work.", "…: an open terminal."), each
+  that stays, each worktree it removes or keeps (and why), and whether
+  Herdr's space goes. A session at work or waiting for the user is named
+  ("clips (t9) is still working. Closing now cuts that work off."), and the
+  button is "Close anyway" (`--force`); otherwise "Resolve and close".
+  Cancel puts it away. Once done the window goes to All spaces, saying what
+  was ended, removed and kept. Its own tower (`tower-<space>`) is named in
+  the card too ("Ends its own tower, tower-isa (t13)."): a close ends it
+  first. `HERDER_TOWER_ORB_RESOLVE=<space>[:go]` presses Resolve (and with
+  `:go` its button) a moment after the start, for looking at it without the
+  pointer. A refusal (something started there since
+  the card was read) shows in the card, with "Close anyway".
 - **Auto-close.** A ready space whose sessions have all been `idle` or
   `done` for `[spaces] auto_close_hours` (0, the default, is never; say 24 for a day), without a break,
   is closed the same way, without `--force` (`idle_since_ms` is when that
@@ -1131,10 +1159,46 @@ user to confirm or change. Nothing is opened, nothing written.
 
 ### New space
 
-The full window's New space (`src/orb/panel/launch.rs`): a goal (a field
-that grows to 14 lines, so a whole ticket fits), **Project** (the projects
-as pills; none picked: the brain picks; a second click unpicks), and what
-the tower will do.
+The full window's New space (`src/orb/panel/launch.rs`): beside the
+sidebar, **the conversation** that makes the space, in the column a
+space's conversation has (same width, same input with its voice and files
+at its foot); beside that the pane: a goal (a field that grows to 14
+lines, so a whole ticket fits), **Project** (the projects as pills; none
+picked: the brain picks; a second click unpicks), and what the tower will
+do.
+
+- **The conversation** ("Conversation · the new space"; once drafted,
+  "Conversation · <space>, not launched yet"): You (amber) and The tower
+  (cyan) and, for a planned draft, The planner, each with its time, oldest
+  first, scrolled to the newest, and what is under way ("The tower's brain
+  is reading the ticket…", "…redrafting it…", "Starting the planner…",
+  "The planner is answering…", "Launching…"). What is typed or said at its
+  foot goes, as its placeholder says:
+  - no draft yet ("Paste the ticket, or say what to get done…"): it is the
+    ticket (or, with a ticket in the field, more of it, a paragraph on),
+    put in the Goal field and drafted; a first line that names the repos
+    is asked as a dry run first, and the tower says what Launch will open
+    instead of drafting;
+  - a draft ("Say what to change…"): it is redrafted with those words
+    (`--adjust "<words>" --prior '<the latest draft>'`); the tower answers
+    with the new draft and what changed ("Changed: named ns-check (was
+    scratch-check)");
+  - a plan of the draft that can talk ("Ask about the plan or change it…"):
+    to the planner (`tower plan say --as user`), whose answers come in the
+    plan's thread and show here.
+  The pane's **Draft the space**, **Plan as a page / whiteboard** and
+  **Launch** say what they did in it too ("Plan it first, as a page.", "The
+  planner is on it…", "The draft didn't come: …", "The launch didn't go:
+  …"). In a narrow window the placeholders are shorter ("What to change…").
+- **It goes with the space.** Launch hands the conversation (with the
+  plan's thread and when the plan was ready) to `tower launch
+  --story-file <file>`, which keeps it in the history as the new space's
+  `creation` entries (who said it, when; written down, never spoken, in no
+  chat) and adds what the launch opened as the tower's last word. The
+  space's own conversation then opens with **How this space was created ·
+  N messages** (Fold / Show), then "Since it was launched" and the rest.
+  Start over drops the conversation with the draft; one that launched is
+  the space's, and New space starts empty.
 
 - **The first line names repos** (the dry run's `repos_from` is
   `first-line`, asked without `--setup` once the typing pauses): the plan
@@ -1146,12 +1210,12 @@ the tower will do.
   and that it takes a little while.
 - **The draft** shows as a card in its place: Space, Goal, Done when, the
   sessions (each repo with its why), Project and account, the brain's note,
-  and what was left out. Under it **Adjust it in words…** with **Redraft**
-  (Enter too: `--adjust "<words>" --prior '<the draft>'`; the new draft
-  takes the card's place, and the field empties), then **Launch** (exactly
-  that draft, `ticket::confirm_flags`) and **Start over** (the draft is
-  dropped; the ticket stays). A draft belongs to the ticket as it was:
-  changed, the button is Draft the space again.
+  and what was left out. Under it, that what to change is said in the
+  conversation (the redraft takes the card's place), then **Launch**
+  (exactly that draft, `ticket::confirm_flags`) and **Start over** (the
+  draft and its conversation are dropped; the ticket stays). A draft
+  belongs to the ticket as it was: changed, the button is Draft the space
+  again (words in the conversation still redraft from the latest draft).
 - A tower whose `launch --help` has no `--draft` gets the launcher as it
   was: the first project, its plan, Launch.
 - **Review its PRs**: a switch under the draft card, and under the plan of
@@ -1165,8 +1229,8 @@ the tower will do.
 - **Or see the plan first**: under the draft's Launch and Start over,
   **Plan as a page** and **Plan as a whiteboard** (see "The plan, and the
   chat about it" below). While a plan of this ticket is open, the card is
-  the plan's draft (the planner may revise it), the chat replaces "Adjust
-  it in words…", Launch carries `--plan <id>`, and Start over closes the
+  the plan's draft (the planner may revise it), the conversation goes to
+  the planner, Launch carries `--plan <id>`, and Start over closes the
   plan too. A plan of another ticket that is still open (the field was
   changed, the window reopened) says so at the top, with **Back to it**
   (its ticket in the field, its draft on the card) and **Close it**.
@@ -1176,6 +1240,10 @@ the tower will do.
   makes the plan in the file (the state's `plan`, as `Plan::view` writes
   it) the open plan of that ticket. `HERDER_TOWER_ORB_PROJECT=new|<name>`
   (with `show:projects`) opens the Projects form once.
+  `HERDER_TOWER_ORB_TALK=<file>` (with `show:new`) says the file's lines
+  in the conversation one after another, each once the tower is on none
+  (`!wait <s>` waits, `!launch` presses Launch), printing each to the log
+  (`[orb] talk: …`).
 
 ### The plan, and the chat about it
 
@@ -1316,12 +1384,13 @@ this ticket:
   session its part. A planner that ended: why, and Plan again.
 - **Failed**: "The plan didn't come: <why>." and **Plan again as a page** ·
   **Plan again as a whiteboard**.
-- **The chat**, under it: "About the plan · N messages", the user's lines
-  (You, amber) and the planner's answers (The planner, cyan) as "Between
-  sessions" shows a message, newest last (the latest 12); "The planner is
-  answering…" while the user's last line waits; and "Ask about the plan or
-  change it…" with **Send** (Enter too: `tower plan say --as user <id> --
-  "<words>"`; the field empties once it went).
+- **The chat** is New space's conversation (above): the user's lines
+  (You, amber) and the planner's answers (The planner), with "The plan is
+  ready, a page on your claude.ai account: <link>." among them, in time
+  order; "The planner is answering…" while the user's last line waits; its
+  input says "Ask about the plan or change it…" (`tower plan say --as user
+  <id> -- "<words>"`). Under the plan's line in the pane, that it is
+  talked over there.
 
 ## Step 10: every mission gets its own worktrees
 
@@ -1885,8 +1954,10 @@ where the full window is, `panel/` the views).
     left out, the row names the sender), and an input that goes to that
     space's tower. Its head says "its own tower" when it has one that runs
     (`missions[].tower`; "is starting", "waits on its own screen" when so).
-  - New space: goal, project, what the tower will do (or the draft of a
-    ticket), Launch (step 9).
+  - New space: the conversation that makes the space (drafts, changes,
+    the planner), beside goal, project, what the tower will do (or the
+    draft of a ticket), Launch (step 9); launched, the conversation is the
+    space's, at the top of its own.
   - Projects: each project with its repos and their roles; add, edit, remove.
   - Record: the history, filtered by space (the old Chat and Activity).
   - Shots, Settings (how much it tells you, the tower's model, voice as a

@@ -99,6 +99,94 @@ pub struct Ask<'a> {
     /// `--review` (true) or `--no-review` (false): whether the PRs its
     /// sessions open get a reviewer. Neither: as the space has it (on).
     pub review: Option<bool>,
+    /// `--story-file`: the conversation that made it (`Told`), kept as the
+    /// space's own once it is launched (`record_story`).
+    pub story: Option<&'a str>,
+}
+
+/// One message of the conversation that made a space (the full window's
+/// New space): who said it (`you`, `tower`, `planner`), its words, when.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Told {
+    pub who: String,
+    pub text: String,
+    pub at: u64,
+}
+
+/// Keeps `story`, the conversation that made `space`, in the history as
+/// that space's own (`story_entries`). How many messages it kept.
+pub fn record_story(space: &str, story: &[Told], r: &Value) -> usize {
+    let entries = story_entries(space, story, r, crate::history::now_ms());
+    let kept = entries.len().saturating_sub(1);
+    for e in entries {
+        crate::history::append(e);
+    }
+    kept
+}
+
+/// `story` as the history keeps it (`now`: the launch's time): a
+/// `creation` entry of `space` for each message (who said it in `status`:
+/// `you`, `tower` or `planner`; written down, never spoken), at the time it
+/// was said, and what the launch did (`r`, its receipt) as the tower's last
+/// word. None for a story with nothing in it.
+pub fn story_entries(space: &str, story: &[Told], r: &Value, now: u64) -> Vec<crate::history::Entry> {
+    let mut out: Vec<crate::history::Entry> = story
+        .iter()
+        .filter(|t| !t.text.trim().is_empty())
+        .map(|t| {
+            let who = if matches!(t.who.as_str(), "you" | "planner") { t.who.as_str() } else { "tower" };
+            creation(space, who, t.text.trim(), if t.at == 0 || t.at > now { now } else { t.at })
+        })
+        .collect();
+    if !out.is_empty()
+        && let Some(line) = launched_line(r)
+    {
+        out.push(creation(space, "tower", &line, now));
+    }
+    out
+}
+
+fn creation(space: &str, who: &str, text: &str, at: u64) -> crate::history::Entry {
+    crate::history::Entry { kind: "creation".into(), space: Some(space.into()), status: Some(who.into()), text: text.into(), at, record: true, ..Default::default() }
+}
+
+/// What a launch did, from its receipt, in a sentence or two: `Launched
+/// fix-login: 2 sessions on orca (eyzflow, mediaroom), each in its own
+/// worktree.` None when it isn't a receipt.
+pub fn launched_line(receipt: &Value) -> Option<String> {
+    let space = receipt["space"].as_str().filter(|s| !s.is_empty())?;
+    let sessions = receipt["sessions"].as_array()?;
+    let opened: Vec<&Value> = sessions.iter().filter(|s| s["error"].is_null()).collect();
+    let account = receipt["assumed"]["account"].as_str().filter(|x| !x.is_empty());
+    let on = account.map(|x| format!(" on {x}")).unwrap_or_default();
+    let repos = opened.iter().map(|s| repo_name(s["repo"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", ");
+    let own = opened.iter().filter(|s| s["worktree"].as_str().is_some_and(|w| !w.is_empty())).count();
+    let ports: Vec<String> = opened.iter().filter_map(|s| s["port"].as_u64()).map(|p| p.to_string()).collect();
+    let place = match (own, opened.len()) {
+        (0, _) => String::new(),
+        (_, 1) => ", in its own worktree".to_string(),
+        (own, n) if own == n => ", each in its own worktree".to_string(),
+        (own, n) => format!(", {own} of {n} in their own worktree"),
+    };
+    let ports = match ports.as_slice() {
+        [] => String::new(),
+        [one] => format!(" (port {one})"),
+        list => format!(" (ports {})", list.join(", ")),
+    };
+    let head = if receipt["made"] == false { format!("Joined {space}") } else { format!("Launched {space}") };
+    let mut parts = vec![match opened.len() {
+        0 => format!("{head}."),
+        1 => format!("{head}: 1 session{on} ({repos}){place}{ports}."),
+        n => format!("{head}: {n} sessions{on} ({repos}){place}{ports}."),
+    }];
+    for s in sessions.iter().filter(|s| !s["error"].is_null()) {
+        parts.push(format!("{} didn’t open: {}.", repo_name(s["repo"].as_str().unwrap_or("A session")), s["error"].as_str().unwrap_or("").trim_end_matches('.')));
+    }
+    if let Some(setup) = receipt["assumed"]["setup"].as_str().filter(|x| !x.is_empty()) {
+        parts.push(format!("It took the setup “{setup}”."));
+    }
+    Some(parts.join(" "))
 }
 
 /// What a plan is made from: what there is now.
@@ -835,7 +923,22 @@ pub fn launch(goal: &str, ask: &Ask, dry_run: bool) -> Result<Value> {
     if dry_run {
         return Ok(receipt(&p, &[], None, true));
     }
-    let r = open(&p, None, &mut |_| ())?;
+    let mut r = open(&p, None, &mut |_| ())?;
+    // The conversation that made it is the space's own from now on (only once something opened).
+    if let Some(path) = ask.story.map(str::trim).filter(|s| !s.is_empty()) {
+        let opened = r["sessions"].as_array().is_some_and(|a| a.iter().any(|s| s["error"].is_null()));
+        let story: Vec<Told> = match std::fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
+                eprintln!("tower: the story in {path} isn't one ({e}): not kept");
+                vec![]
+            }),
+            Err(e) => {
+                eprintln!("tower: no story in {path}: {e}");
+                vec![]
+            }
+        };
+        r["story"] = json!(if opened { record_story(&p.space, &story, &r) } else { 0 });
+    }
     // Planned and launched: the plan is done, and its planner ends.
     if let Some(b) = &p.plan
         && crate::protocol::is_running()
@@ -1079,7 +1182,7 @@ mod tests {
         let w = World { setups: vec![project, setup("other", "default", &["/w"])], accounts: accounts(&["default", "orca"]), worktrees: true, spaces: vec!["msg".into()], ..Default::default() };
         let ticket = "EYZFlow Support – Enable Automatic Message and Reply Translation\n\nAcceptance criteria:\n- Messages show translated";
         let repos = vec![s(&room)];
-        let ask = Ask { repos: &repos, name: Some("msg-translation"), title: Some("Translate support messages"), done_when: Some("both languages show"), account: None, setup: Some("EYZFlow"), plan: None, review: None };
+        let ask = Ask { repos: &repos, name: Some("msg-translation"), title: Some("Translate support messages"), done_when: Some("both languages show"), account: None, setup: Some("EYZFlow"), plan: None, review: None, story: None };
         let p = plan_with(ticket, &ask, &w).unwrap();
         // Only the repo asked for, though the project has two; its account and its role come with the project.
         assert_eq!((p.sessions.len(), p.sessions[0].folder.as_str(), p.sessions[0].why.as_str()), (1, s(&room).as_str(), "the media backend"));
@@ -1135,5 +1238,40 @@ mod tests {
         let p = plan("open a session at mediaroom: Translate it\n\nDone when: it is translated", None, None, &named).unwrap();
         assert_eq!((p.sessions.len(), p.account.as_deref(), p.goal.as_str(), p.done_when.as_str()), (1, Some("orca"), "Translate it", "it is translated"));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The conversation that made a space is kept as that space's own: a
+    /// `creation` entry per message, who said it, when, written down only;
+    /// and what the launch opened as the tower's last word.
+    #[test]
+    fn the_conversation_that_made_a_space_is_kept_as_its_own() {
+        let receipt = json!({ "space": "ns-check", "made": true, "sessions": [{ "repo": "/w/tower-scratch", "worktree": "/w/.worktrees/ns-check/tower-scratch", "error": null }], "assumed": { "account": "default" } });
+        let story = vec![
+            Told { who: "you".into(), text: " the ticket \n line two ".into(), at: 100 },
+            Told { who: "tower".into(), text: "Drafted scratch-check".into(), at: 200 },
+            Told { who: "planner".into(), text: "One per repo.".into(), at: 250 },
+            Told { who: "you".into(), text: "  ".into(), at: 260 },
+            Told { who: "someone".into(), text: "From later".into(), at: 9_999 },
+        ];
+        let e = story_entries("ns-check", &story, &receipt, 1_000);
+        let rows: Vec<(&str, &str, &str, u64)> = e.iter().map(|e| (e.kind.as_str(), e.status.as_deref().unwrap_or(""), e.text.as_str(), e.at)).collect();
+        assert_eq!(
+            rows,
+            [
+                ("creation", "you", "the ticket \n line two", 100),
+                ("creation", "tower", "Drafted scratch-check", 200),
+                ("creation", "planner", "One per repo.", 250),
+                ("creation", "tower", "From later", 1_000),
+                ("creation", "tower", "Launched ns-check: 1 session on default (tower-scratch), in its own worktree.", 1_000),
+            ]
+        );
+        assert!(e.iter().all(|e| e.record && e.space.as_deref() == Some("ns-check") && !crate::chat::shown(e)), "the space's, written down, never a chat message");
+        assert!(story_entries("ns-check", &[], &receipt, 1_000).is_empty(), "nothing said: nothing kept, not even the launch");
+        // `tower launch --story-file` takes it, and not with a draft or a dry run.
+        use clap::Parser;
+        let parse = |args: &[&str]| crate::Cli::try_parse_from([&["tower", "launch", "Fix the login"], args].concat()).map(|c| c.cmd);
+        assert!(matches!(parse(&["--story-file", "/tmp/s.json"]), Ok(crate::Cmd::Launch { story_file: Some(ref f), .. }) if f == "/tmp/s.json"));
+        assert!(parse(&["--story-file", "/tmp/s.json", "--draft"]).is_err());
+        assert!(parse(&["--story-file", "/tmp/s.json", "--dry-run"]).is_err());
     }
 }

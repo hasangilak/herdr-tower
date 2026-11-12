@@ -699,6 +699,23 @@ impl Panel {
                 return;
             }
         }
+        // In New space it is the conversation that makes the space: the ticket, what to change, words for the planner.
+        if self.full.is_some() && self.tower.read(cx).nav.scope == super::nav::Scope::New {
+            let (text, files) = message_parts(&self.text.read(cx).content());
+            let kept: Vec<String> = files.iter().map(|p| history::keep_attachment(p).display().to_string()).collect();
+            let words = if kept.is_empty() { text } else { format!("{text}\n\nAttached: {}", kept.join(", ")) };
+            match self.launch_say(&words, window, cx) {
+                Ok(()) => {
+                    self.text.update(cx, |s, cx| s.set_value("", window, cx));
+                    self.next = 1;
+                    self.status = None;
+                }
+                Err(why) if why.is_empty() => {}
+                Err(why) => self.status = Some((false, why)),
+            }
+            cx.notify();
+            return;
+        }
         if !self.tower.read(cx).alive {
             self.status = Some((false, "The tower is off. Start it, then send.".into()));
             cx.notify();

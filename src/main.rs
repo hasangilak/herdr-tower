@@ -306,6 +306,12 @@ enum Cmd {
         /// Its PRs get no reviewer.
         #[arg(long, conflicts_with = "draft")]
         no_review: bool,
+        /// The conversation that made the space (the full window's New space: the ticket, the
+        /// drafts, the changes asked for, the planner's answers), as a JSON file of
+        /// `[{"who": "you"|"tower"|"planner", "text": "…", "at": <ms>}]`: once the space is
+        /// launched it is kept in the history as the space's own, how it was created.
+        #[arg(long, conflicts_with_all = ["draft", "dry_run"])]
+        story_file: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -624,23 +630,28 @@ enum Cmd {
     /// on|off`: a space you keep (never ready, never closed by the tower, no worktrees).
     /// `tower space report <space> "<text>"`: its closing report. `tower space close <space>
     /// [--force]`: ends its sessions, removes its clean worktrees, archives it (refused while a
-    /// session there works or waits for you, unless --force).
+    /// session there works or waits for you, unless --force). `tower space resolve <space>
+    /// [--force] [--dry-run]`: its goal is achieved; marked so, then closed the same way
+    /// (`--dry-run`: what it would end and remove).
     /// `tower space follow|unfollow <space>`: its finished requests' receipts reach you as they land.
     /// `tower space mute|unmute <space>`: what needs you there stays in its own view (`tower decisions
     /// --space <space>`), off the orb's count and out of the main queue.
     /// `tower space review <space> on|off`: whether the PRs its sessions open get a reviewer session
     /// (on by default; off ends one that is open there).
     Space {
-        /// goal | agenda | standing | report | close | follow | unfollow | mute | unmute | review
+        /// goal | agenda | standing | report | close | resolve | follow | unfollow | mute | unmute | review
         what: String,
         space: String,
         text: Vec<String>,
         /// goal: what counts as done.
         #[arg(long)]
         done_when: Option<String>,
-        /// close: though a session there still works or waits for you.
+        /// close, resolve: though a session there still works or waits for you.
         #[arg(long)]
         force: bool,
+        /// resolve: say what it would end and remove, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// The PRs' reviews: a PR a session opens in a space with review on gets a reviewer session,
     /// which looks for critical issues only and agrees with the PR's session before you merge.
@@ -876,7 +887,7 @@ fn run(cli: Cli) -> Result<()> {
             let space = space.map(|s| spaces::Asked { name: s, new: new_space });
             start(account.as_deref(), &name, cwd, on.as_deref(), space.as_ref(), no_watch, tag, &task.join(" "), no_worktree, !no_act)
         }
-        Cmd::Launch { goal, setup, name, dry_run, draft, adjust, prior, repo, title, done_when, account, plan, review, no_review, json } => {
+        Cmd::Launch { goal, setup, name, dry_run, draft, adjust, prior, repo, title, done_when, account, plan, review, no_review, story_file, json } => {
             let goal = goal.join(" ");
             if draft {
                 ticket::cmd(&goal, setup.as_deref(), adjust.as_deref(), prior.as_deref(), json)
@@ -895,6 +906,7 @@ fn run(cli: Cli) -> Result<()> {
                     account: account.as_deref(),
                     plan: plan.as_deref(),
                     review,
+                    story: story_file.as_deref(),
                 };
                 launch::cmd(&goal, &ask, dry_run, json)
             }
@@ -1108,17 +1120,18 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Focus { space, clear } => spaces::cmd_focus(Some(space.join(" ")).filter(|s| !s.is_empty()), clear),
-        Cmd::Space { what, space, text, done_when, force } => match what.as_str() {
+        Cmd::Space { what, space, text, done_when, force, dry_run } => match what.as_str() {
             "goal" | "agenda" => missions::cmd_goal(space, text.join(" "), done_when),
             "report" => missions::cmd_report(space, text.join(" ")),
             // The space's name may be several words.
             "standing" => missions::cmd_standing(std::iter::once(space).chain(text).collect()),
             "close" => missions::cmd_close(std::iter::once(space).chain(text).collect::<Vec<_>>().join(" "), force),
+            "resolve" => missions::cmd_resolve(std::iter::once(space).chain(text).collect::<Vec<_>>().join(" "), force, dry_run),
             "follow" | "unfollow" => spaces::cmd_follow(std::iter::once(space).chain(text).collect::<Vec<_>>().join(" "), what == "follow"),
             "mute" | "unmute" => spaces::cmd_mute(std::iter::once(space).chain(text).collect::<Vec<_>>().join(" "), what == "mute"),
             "review" => missions::cmd_review(std::iter::once(space).chain(text).collect()),
             other => bail!(
-                "tower space {other}: use `tower space goal <space> \"<goal>\" [--done-when \"<…>\"]`, `standing <space> on|off`, `review <space> on|off`, `report <space> \"<text>\"`, `close <space> [--force]`, or `follow|unfollow|mute|unmute <space>`"
+                "tower space {other}: use `tower space goal <space> \"<goal>\" [--done-when \"<…>\"]`, `standing <space> on|off`, `review <space> on|off`, `report <space> \"<text>\"`, `close <space> [--force]`, `resolve <space> [--force] [--dry-run]`, or `follow|unfollow|mute|unmute <space>`"
             ),
         },
         Cmd::Review { action, pr, critical, json, text } => review_cmd(action.as_deref().unwrap_or("list"), pr.as_deref().unwrap_or(""), critical, &text.join(" "), json),

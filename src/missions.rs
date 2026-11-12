@@ -16,6 +16,10 @@
 //!   has been ready with every session idle for `[spaces] auto_close_hours`.
 //!   Its sessions are ended, the clean worktrees the tower made for it are
 //!   removed, its report goes into the record, and it is archived.
+//!   `tower space resolve` is the user's word that its goal is achieved: the
+//!   same close, with the goal marked achieved (`achieved_ms`) and the
+//!   record saying so. `--dry-run` (`preview`) says first what either would
+//!   end and remove, and changes nothing.
 //!
 //! A **standing** space is one the user keeps: never ready, never closed by
 //! the tower, and its sessions work in the repos themselves (no worktrees).
@@ -135,6 +139,9 @@ pub struct Mission {
     /// mission from before it reads as on.
     #[serde(default = "on", skip_serializing_if = "is_on")]
     pub review: bool,
+    /// The user said its goal is achieved (`tower space resolve`), when.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub achieved_ms: Option<u64>,
 }
 
 impl Default for Mission {
@@ -158,6 +165,7 @@ impl Default for Mission {
             worktrees: vec![],
             setup: String::new(),
             review: true,
+            achieved_ms: None,
         }
     }
 }
@@ -904,6 +912,83 @@ fn named(space: &str) -> Result<String> {
     }
 }
 
+/// The worktrees made for a space: those it remembers, and those its
+/// sessions (`list`) say they were given in its own folder.
+fn places_of(name: &str, mission: &Mission, list: &[Target]) -> Vec<Place> {
+    let mut places = mission.worktrees.clone();
+    let folder = worktrees::slug(name);
+    for p in list.iter().filter_map(|t| t.given.as_ref()) {
+        let own = std::path::Path::new(&p.path).parent().and_then(|d| d.file_name()).is_some_and(|d| d.to_string_lossy() == folder.as_str());
+        if own && !places.iter().any(|w| w.path == p.path) {
+            places.push(p.clone());
+        }
+    }
+    places
+}
+
+/// The space's own brain (`tower-<space>`), when it runs: its terminal's
+/// address and name (a close ends it first, `end_brain`).
+fn own_brain(space: &str) -> Option<(String, String)> {
+    let name = crate::brains::name_for(space);
+    let t = hc::get(&name)?;
+    let live = t["state"].as_str().is_none_or(|s| s == "live");
+    (live && crate::brains::is_brain_folder(t["cwd"].as_str().unwrap_or(""))).then(|| (t["address"].as_str().unwrap_or(&name).to_string(), name))
+}
+
+/// What closing (or resolving) the space of exactly that name would do, as
+/// things stand; nothing is changed. `{"space", "goal", "done_when",
+/// "standing", "report", "tower": {"address", "name"} or null, "ends":
+/// [{"address", "name", "status", "agent", "busy"}], "stays": [{"address",
+/// "name"}], "busy": [...], "worktrees":
+/// [{"path", "branch", "repo", "removed", "why"?}], "herdr_space"}`:
+/// `tower`, its own brain, which it ends first; `ends`, every terminal of
+/// the space it ends (agents and plain shells; `busy`: an
+/// agent at work or waiting for the user, which a close without force
+/// refuses over); `stays`, the tower's own terminals; a worktree with work
+/// not committed or pushed is kept (`removed` false, and why); `herdr_space`
+/// is `closed` (Herdr's space goes), `kept`, or `not shown`.
+pub fn preview(space: &str) -> Result<Value> {
+    let name = named(space)?;
+    let (window, list) = targets(&name);
+    let s = spaces::load();
+    let mission = of(&s, &name).map(|(_, m)| m.clone()).unwrap_or_default();
+    let worktrees: Vec<Value> = places_of(&name, &mission, &list)
+        .iter()
+        .map(|p| {
+            let (removed, why) = match worktrees::dirty(p) {
+                Ok(None) => (true, None),
+                Ok(Some(why)) => (false, Some(why)),
+                Err(e) => (false, Some(format!("{e:#}"))),
+            };
+            json!({ "path": p.path, "branch": p.branch, "repo": p.repo, "removed": removed, "why": why })
+        })
+        .collect();
+    let held = busy(&list);
+    let ends: Vec<Value> = list
+        .iter()
+        .filter(|t| !t.own)
+        .map(|t| json!({ "address": t.address, "name": t.name, "status": t.status.to_string(), "agent": t.agent, "busy": held.iter().any(|h| h.address == t.address) }))
+        .collect();
+    let herdr_space = match &window {
+        None => "not shown",
+        Some(_) if whole(&list) => "closed",
+        Some(_) => "kept",
+    };
+    Ok(json!({
+        "space": name,
+        "goal": goal_of(&s, &name),
+        "done_when": mission.done_when,
+        "standing": mission.standing,
+        "report": mission.report,
+        "tower": own_brain(&name).map(|(address, name)| json!({ "address": address, "name": name })),
+        "ends": ends,
+        "stays": list.iter().filter(|t| t.own).map(|t| json!({ "address": t.address, "name": t.name })).collect::<Vec<_>>(),
+        "busy": held.iter().map(|t| json!({ "address": t.address, "name": t.name, "status": t.status.to_string() })).collect::<Vec<_>>(),
+        "worktrees": worktrees,
+        "herdr_space": herdr_space,
+    }))
+}
+
 /// `close_named`, for a space by what someone called it (`to_close`).
 pub fn close(space: &str, force: bool, tell_voice: bool) -> Result<Value> {
     let s = spaces::load();
@@ -918,6 +1003,33 @@ pub fn close(space: &str, force: bool, tell_voice: bool) -> Result<Value> {
 /// for the user, unless `force`. `tell_voice`: have the running voice look
 /// at once (not when the voice itself closes it).
 pub fn close_named(space: &str, force: bool, tell_voice: bool) -> Result<Value> {
+    close_as(space, force, tell_voice, false)
+}
+
+/// `resolve_named`, for a space by what someone called it (`to_close`).
+pub fn resolve(space: &str, force: bool, tell_voice: bool) -> Result<Value> {
+    let s = spaces::load();
+    let known = spaces::known(&spaces::live(), &history::load(), &s);
+    let closed: Vec<String> = s.missions.iter().filter(|(_, m)| m.state == State::Closed).map(|(k, _)| k.clone()).collect();
+    resolve_named(&to_close(space, &known, &closed)?, force, tell_voice)
+}
+
+/// The user's word that the goal of the space of exactly that name is
+/// achieved: it is marked so, and the space is closed as `close_named`
+/// closes it (refused the same way while a session there works or waits
+/// for the user, unless `force`). Only a space with a goal: one without has
+/// nothing to achieve (close it instead).
+pub fn resolve_named(space: &str, force: bool, tell_voice: bool) -> Result<Value> {
+    let name = named(space)?;
+    let s = spaces::load();
+    if goal_of(&s, &name).trim().is_empty() {
+        bail!("\"{name}\" has no goal to resolve: close it instead (tower space close)");
+    }
+    close_as(&name, force, tell_voice, true)
+}
+
+/// `close_named`; `resolved`: the user said its goal is achieved.
+fn close_as(space: &str, force: bool, tell_voice: bool, resolved: bool) -> Result<Value> {
     let name = named(space)?;
     let (window, list) = targets(&name);
     let held = busy(&list);
@@ -937,6 +1049,7 @@ pub fn close_named(space: &str, force: bool, tell_voice: bool) -> Result<Value> 
             Err(e) => eprintln!("tower: {id} stays open: {e:#}"),
         }
     }
+    let goal = goal_of(&spaces::load(), &name).trim().to_string();
     let (ended, left, herdr_space) = end_sessions(window.as_ref(), &list);
     // Their programs let go of the worktrees first.
     let until = std::time::Instant::now() + Duration::from_secs(8);
@@ -948,14 +1061,7 @@ pub fn close_named(space: &str, force: bool, tell_voice: bool) -> Result<Value> 
     let before = spaces::load();
     let mission = of(&before, &name).map(|(_, m)| m.clone()).unwrap_or_default();
     // The worktrees made for it: those it remembers, and those its sessions say they were given.
-    let mut places = mission.worktrees.clone();
-    let folder = worktrees::slug(&name);
-    for p in list.iter().filter_map(|t| t.given.as_ref()) {
-        let own = std::path::Path::new(&p.path).parent().and_then(|d| d.file_name()).is_some_and(|d| d.to_string_lossy() == folder.as_str());
-        if own && !places.iter().any(|w| w.path == p.path) {
-            places.push(p.clone());
-        }
-    }
+    let places = places_of(&name, &mission, &list);
     let (mut removed, mut kept) = (vec![], vec![]);
     // Who still runs here, now that its own sessions are over: a session of another space
     // (one renamed in Herdr, one whose name makes the same folder) may work in one of them.
@@ -983,14 +1089,14 @@ pub fn close_named(space: &str, force: bool, tell_voice: bool) -> Result<Value> 
         }
     }
     let report = mission.report.clone();
-    let text = match report.is_empty() {
-        true => format!("{name} is closed. No closing report."),
-        false => format!("{name} is closed. {report}"),
-    };
+    let text = closed_text(&name, resolved.then_some(goal.as_str()), &report);
     history::append(Entry { kind: "space".into(), space: Some(name.clone()), status: Some("closed".into()), text, record: true, ..Default::default() });
     spaces::update(|s| {
         let m = s.missions.entry(name.clone()).or_insert_with(|| Mission::born(now));
         m.state = State::Closed;
+        if resolved {
+            m.achieved_ms = Some(now);
+        }
         (m.closed_ms, m.archived_ms) = (Some(now), Some(now));
         (m.quiet_since_ms, m.idle_since_ms, m.wait_until_ms) = (None, None, None);
         m.worktrees = kept.iter().map(|(p, _)| p.clone()).collect();
@@ -1005,6 +1111,8 @@ pub fn close_named(space: &str, force: bool, tell_voice: bool) -> Result<Value> 
     let who = |t: &Target| json!({ "address": t.address, "name": t.name });
     Ok(json!({
         "closed": name,
+        "resolved": resolved,
+        "goal": goal,
         "sessions_ended": ended.iter().map(who).collect::<Vec<_>>(),
         "sessions_left": left.iter().map(|(t, why)| json!({ "address": t.address, "name": t.name, "why": why })).chain(kept_own.iter().map(|t| json!({ "address": t.address, "name": t.name, "why": "the tower's own terminal" }))).collect::<Vec<_>>(),
         "herdr_space": herdr_space,
@@ -1014,6 +1122,17 @@ pub fn close_named(space: &str, force: bool, tell_voice: bool) -> Result<Value> 
         "tower_ended": brain_ended,
         "report": report,
     }))
+}
+
+/// The record's line for a space that closed: resolved (`goal`: the user
+/// said it is achieved) or closed, with its report.
+fn closed_text(name: &str, goal: Option<&str>, report: &str) -> String {
+    let head = match goal {
+        Some(g) if !g.trim().is_empty() => format!("{name} is resolved: its goal is achieved ({}), and it is closed.", g.trim()),
+        Some(_) => format!("{name} is resolved, and it is closed."),
+        None => format!("{name} is closed."),
+    };
+    if report.trim().is_empty() { format!("{head} No closing report.") } else { format!("{head} {}", report.trim()) }
 }
 
 /// Ends a space's own brain (`tower-<space>`), if it has one: by the voice
@@ -1040,14 +1159,81 @@ fn end_brain(space: &str, ask_voice: bool) -> Vec<String> {
 
 /// `tower space close <space> [--force]`.
 pub fn cmd_close(space: String, force: bool) -> Result<()> {
-    let v = close(&space, force, true)?;
+    print_closed(&close(&space, force, true)?)
+}
+
+/// `tower space resolve <space> [--force] [--dry-run]`: with `--dry-run`,
+/// what it would end and remove (`preview`), nothing changed.
+pub fn cmd_resolve(space: String, force: bool, dry_run: bool) -> Result<()> {
+    if dry_run {
+        let s = spaces::load();
+        let known = spaces::known(&spaces::live(), &history::load(), &s);
+        let closed: Vec<String> = s.missions.iter().filter(|(_, m)| m.state == State::Closed).map(|(k, _)| k.clone()).collect();
+        let v = preview(&to_close(&space, &known, &closed)?)?;
+        if std::io::stdout().is_terminal() {
+            println!("{}", preview_text(&v));
+        } else {
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        return Ok(());
+    }
+    print_closed(&resolve(&space, force, true)?)
+}
+
+/// A preview (`preview`) in a few lines: what ends, what stays, which
+/// worktrees go and which are kept, and what holds it open.
+pub fn preview_text(v: &Value) -> String {
+    let list = |k: &str| v[k].as_array().cloned().unwrap_or_default();
+    let name = v["space"].as_str().unwrap_or("");
+    let mut out = vec![];
+    let ends = list("ends");
+    if let Some(t) = v["tower"].as_object() {
+        out.push(format!("Ends its own tower first: {} ({}).", t["name"].as_str().unwrap_or(""), t["address"].as_str().unwrap_or("")));
+    }
+    if ends.is_empty() {
+        out.push(format!("Resolving \"{name}\" ends no terminal of its own: none is open there."));
+    } else {
+        let each: Vec<String> = ends
+            .iter()
+            .map(|t| {
+                let kind = if t["agent"] == true { t["status"].as_str().filter(|s| !s.is_empty()).unwrap_or("idle").to_string() } else { "a terminal".to_string() };
+                format!("{} ({}, {kind})", t["name"].as_str().unwrap_or(""), t["address"].as_str().unwrap_or(""))
+            })
+            .collect();
+        out.push(format!("Resolving \"{name}\" ends: {}.", each.join(", ")));
+    }
+    for t in list("stays") {
+        out.push(format!("{} ({}) stays: it is the tower's own.", t["name"].as_str().unwrap_or(""), t["address"].as_str().unwrap_or("")));
+    }
+    for w in list("worktrees") {
+        let what = w["branch"].as_str().filter(|b| !b.is_empty()).or(w["path"].as_str()).unwrap_or("");
+        if w["removed"] == true {
+            out.push(format!("Removes the worktree {what} (its branch stays)."));
+        } else {
+            out.push(format!("Keeps the worktree {what}: {}.", w["why"].as_str().unwrap_or("it has work in it").trim_end_matches('.')));
+        }
+    }
+    let busy = list("busy");
+    if !busy.is_empty() {
+        let who: Vec<String> = busy.iter().map(|t| format!("{} is {}", t["name"].as_str().unwrap_or(""), t["status"].as_str().unwrap_or(""))).collect();
+        out.push(format!("Not without --force: {}.", who.join(", ")));
+    }
+    out.join("\n")
+}
+
+/// What a close or a resolve did, for a person (or its JSON, piped).
+fn print_closed(v: &Value) -> Result<()> {
     if !std::io::stdout().is_terminal() {
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
     let list = |k: &str| v[k].as_array().cloned().unwrap_or_default();
     let names = |k: &str| list(k).iter().map(|t| format!("{} ({})", t["name"].as_str().unwrap_or(""), t["address"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", ");
-    println!("Closed \"{}\".", v["closed"].as_str().unwrap_or(""));
+    if v["resolved"] == true {
+        println!("Resolved \"{}\": its goal is achieved, and it is closed.", v["closed"].as_str().unwrap_or(""));
+    } else {
+        println!("Closed \"{}\".", v["closed"].as_str().unwrap_or(""));
+    }
     if !list("sessions_ended").is_empty() {
         println!("Ended: {}.", names("sessions_ended"));
     }
@@ -1145,6 +1331,25 @@ pub fn cmd_missions(as_json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_resolved_space_says_its_goal_is_achieved_in_the_record() {
+        assert_eq!(closed_text("isa", Some("Ship the clips"), "Clips are live."), "isa is resolved: its goal is achieved (Ship the clips), and it is closed. Clips are live.");
+        assert_eq!(closed_text("isa", None, ""), "isa is closed. No closing report.");
+        assert_eq!(closed_text("isa", Some(" "), ""), "isa is resolved, and it is closed. No closing report.");
+    }
+
+    #[test]
+    fn a_preview_reads_as_what_it_would_end() {
+        let v = json!({
+            "space": "isa",
+            "ends": [{ "address": "t9", "name": "clips", "status": "working", "agent": true }, { "address": "t10", "name": "shell", "status": "", "agent": false }],
+            "stays": [],
+            "busy": [{ "address": "t9", "name": "clips", "status": "working" }],
+            "worktrees": [{ "path": "/w/a", "branch": "isa/app", "removed": false, "why": "1 commit not pushed" }],
+        });
+        assert_eq!(preview_text(&v), "Resolving \"isa\" ends: clips (t9, working), shell (t10, a terminal).\nKeeps the worktree isa/app: 1 commit not pushed.\nNot without --force: clips is working.");
+    }
     use crate::agenda::{Ledger, Reg, Tag, TaskEv};
 
     const MIN: u64 = 60_000;

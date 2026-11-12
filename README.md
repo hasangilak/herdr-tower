@@ -408,7 +408,11 @@ the tower doesn't know is left out and said so. `--adjust "<what to
 change>" --prior '<the draft's JSON>'` redrafts it. The draft is launched
 as it is with `tower launch "<ticket>" --repo <folder> [--repo …] --name
 <space> --title "<goal>" --done-when "<…>" [--account <a>] [--setup
-<project>]`, which is what New space's Launch runs.
+<project>]`, which is what New space's Launch runs. In the full window,
+New space has a conversation beside the form, as a space has: say the
+ticket there, then what to change, and the brain drafts and redrafts it
+there; Launch hands that conversation over (`--story-file <file>`), and
+the new space's own conversation opens with how it was created.
 
 **A draft is planned before it opens.** `tower plan new --form
 page|whiteboard --draft '<the draft's JSON>' --ticket-file <file>` (New
