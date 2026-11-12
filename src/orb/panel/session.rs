@@ -183,6 +183,21 @@ impl Panel {
         if let Some(words) = member.as_ref().and_then(|m| m.said.as_deref().map(str::trim).filter(|w| !w.is_empty()).map(String::from)).or_else(|| last_words(&self.entries, addr)) {
             items.push(v_flex().gap(px(6.0)).child(bay_label("Last said")).child(said(words)).into_any_element());
         }
+        // Between you, the tower and it: what you typed in its terminal, what
+        // the tower queued and sent it (or didn't), and what still waits for it.
+        let thread = super::talk::session_thread(&self.entries, addr, 60);
+        let waiting = agent.as_ref().and_then(|a| a["waiting"].as_array().cloned()).unwrap_or_default();
+        let waits = super::talk::waiting_rows(&name, &waiting);
+        if !thread.is_empty() || !waits.is_empty() {
+            items.push(
+                v_flex()
+                    .gap(px(8.0))
+                    .child(bay_label(&format!("Between you, the tower and {name}")))
+                    .children(thread.iter().map(|s| super::talk::said_row(s, "The tower", vec![])))
+                    .children(waits)
+                    .into_any_element(),
+            );
+        }
         items.push(
             v_flex()
                 .gap(px(6.0))

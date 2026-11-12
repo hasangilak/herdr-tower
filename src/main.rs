@@ -19,6 +19,7 @@ mod brain;
 mod brains;
 mod chat;
 mod config;
+mod covered;
 mod daemon;
 mod decisions;
 mod dispatch;

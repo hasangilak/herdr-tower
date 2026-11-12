@@ -619,6 +619,8 @@ pub enum QueueFact {
     /// It went in. `next_ms`: when the next instruction went in to that session (its turn was over by then).
     Delivered { session: String, at_ms: u64, turn_before: Option<u64>, taken: bool, finished: bool, next_ms: Option<u64> },
     Cancelled,
+    /// Not sent: the user had told its session themselves, in its terminal (their words).
+    Covered { said: String },
     /// Parked a week, then put away.
     Expired { why: String },
     /// Not known (never, or long forgotten).
@@ -1763,6 +1765,9 @@ fn assess(t: &Task, f: &Facts, now: u64) -> Vec<Assessed> {
     // Where its current try is, as the send queue says.
     let (session, since, next_ms, taken_q, finished_q, turn_known) = match &f.queue {
         QueueFact::Cancelled => return vec![Assessed::Ev(TaskEv::Abandon { why: "its queued instruction was cancelled".into() })],
+        QueueFact::Covered { said } => {
+            return vec![Assessed::Ev(TaskEv::Abandon { why: format!("not sent: the user had told the session themselves (\"{}\")", clip(said, 120)) })];
+        }
         QueueFact::Expired { why } => return stall(format!("its instruction sat parked a week ({why}) and was put away; it never went in")),
         QueueFact::Waiting { parked: Some(why), session, .. } => return stall(parked_why(why, session)),
         QueueFact::Waiting { .. } | QueueFact::Claimed => {
@@ -2379,6 +2384,19 @@ mod tests {
         assert_eq!(back.task(&ids[1]).unwrap().state, TaskState::Stalled);
         assert!(back.radar_note().unwrap().contains(&format!("{} stalled", ids[1])));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Not sent because the user had told its session themselves: dropped, saying so.
+    #[test]
+    fn an_instruction_the_user_already_gave_is_dropped_with_their_words() {
+        let now = 9_000_000_000;
+        let (mut l, _, ids) = ledger_with(1, now);
+        let mut facts = BTreeMap::new();
+        facts.insert(ids[0].clone(), Facts { queue: QueueFact::Covered { said: "merged on dev".into() }, ..Default::default() });
+        l.step(&facts, now + 1);
+        let t = l.task(&ids[0]).unwrap();
+        assert_eq!(t.state, TaskState::Abandoned);
+        assert_eq!(t.why, "not sent: the user had told the session themselves (\"merged on dev\")");
     }
 
     #[test]

@@ -875,7 +875,11 @@ for **Herdr Core**, because the voice runs in a Herdr terminal.
   types it, and after a restart checks Herdr's turn count: moved means it
   went in, so nothing is typed twice. A session that ends parks what waits
   for it (`retarget` or `cancel`); a machine out of reach is waited for,
-  not given up on.
+  not given up on. What you type in a session's own terminal is checked
+  against what waits for it, and a message your words already cover ("merged
+  on dev" before "PR #787 was merged") is not sent. A space's conversation
+  shows it all in one thread: what you typed in its sessions, what the tower
+  queued, sent or didn't send them, and what still waits.
 - `tower dispatch` takes a plan from the brain (tasks with their project
   folders and what each waits for), sends each to the session in its
   folder (queued behind its work) or starts a named one, in a git worktree

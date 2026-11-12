@@ -1523,6 +1523,61 @@ Review { "key": "owner/repo#12", "repo", "number", "url", "title", "base", "head
 - **The state** has `reviews`: every review not over and those over in the
   last day, the latest first (`Review` + `chip`).
 
+## What you type in a session and what the tower queues for it
+
+You talk to a session in two ways: through the tower (a request, a card's
+answer, the brain's instruction, the tower's own word such as "PR #787 was
+merged on GitHub"), and directly, typing in its terminal in Herdr. The two
+are kept in step.
+
+**The tower doesn't repeat you.** What you type in a session's own terminal
+(its hook's prompt, when it is yours: `typed::whose`) goes to the send queue
+(`SendQueue::user_said`), kept half an hour. Every message of the tower's
+waiting for that session (not a note, not a message from another session,
+not a session to start) that was queued after those words, or up to ten
+minutes before them, is checked against them before it goes in
+(`covered::judge`):
+
+- A merge note is covered by a rule: you said "merged" there yourself, and
+  named no PR or this one ("merged on dev" covers "PR #787 (eyzhub/eyzflow)
+  into dev was merged on GitHub.").
+- Anything else, one headless call (the default account, `[brains] model` at
+  low effort, no tools, as a ticket draft is read): your messages, numbered,
+  and the waiting ones, with their ids. It names the ones your words cover:
+  you told the session the same thing, gave the same instruction, or made it
+  moot. Anything that adds what you didn't say is not covered; unsure is not
+  covered. About 3 to 4 seconds.
+
+The check starts the moment you type (the session works on your words
+meanwhile); a message queued a little after your words waits for it before
+it goes. A covered message leaves the queue: the record says `Not sent: you
+had told it yourself ("<your words>"): <the message>`, its task in the agenda
+is dropped with that reason (`QueueFact::Covered`), and the brain hears it
+unless the tower is quiet. A check that fails, or takes longer than two
+minutes, lets the messages go: nothing is lost on a guess. Each message is
+checked against the same words once.
+
+**One thread for it all.** A space's conversation column has, beside its
+requests and answers, what passed between you or the tower and each of its
+sessions, in order (`talk::session_said`):
+
+| Row | From the history |
+|---|---|
+| You → eyzflow · in its terminal | a `request` from `terminal:<address>` |
+| You → eyzflow · answered its question | a `request` from `answer:<address>` |
+| Tower → eyzflow · queued / sent | the queue's `queued`, then `delivered` (one row, its word changed) |
+| Tower → eyzflow · not sent: you had told it yourself | the queue's `not-sent` |
+
+At its end, dashed, is what still waits for the space's sessions: "waiting:
+it goes in when its turn ends", "held: checking it against what you typed
+there", or "parked". A session's own view has the same thread for that
+session alone ("Between you, the tower and eyzflow"), above its screen.
+
+In `state.json`, each agent has `waiting`: what waits for it in the send
+queue, in order, `[{"id", "text", "from"?, "note"?, "parked"?, "checking"?}]`
+(`from`: another session's name; `note`: an introduction; `checking`: held
+for the check of your words).
+
 ## Step 7: a tower per open space
 
 The model is `src/brains.rs`; the daemon runs it in `src/daemon/brains.rs`.

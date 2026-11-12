@@ -169,6 +169,29 @@ pub struct AgentLine {
     /// Instructions waiting for it in the send queue.
     #[serde(default)]
     pub queued: usize,
+    /// What waits for it in the send queue, in order: the tower's messages,
+    /// its notes, messages from other sessions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting: Vec<WaitingLine>,
+}
+
+/// One message waiting for a session in the send queue.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Default)]
+pub struct WaitingLine {
+    pub id: u64,
+    pub text: String,
+    /// From another session (its name): no message of the tower's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// A note (an introduction), not work.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub note: bool,
+    /// Parked: it won't go on its own (why).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked: Option<String>,
+    /// Held while what the user typed in that session is checked against it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checking: bool,
 }
 
 impl State {

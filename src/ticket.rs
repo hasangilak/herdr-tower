@@ -453,7 +453,7 @@ pub fn argv(cca: Option<&Path>, account: Option<&str>, model: &str) -> Vec<Strin
 }
 
 /// Runs `cmd` with `input` on its stdin, to its end or until `limit`.
-fn run_with_input(mut cmd: Command, input: &str, limit: Duration) -> Result<(i32, String, String)> {
+pub(crate) fn run_with_input(mut cmd: Command, input: &str, limit: Duration) -> Result<(i32, String, String)> {
     let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     let mut stdin = child.stdin.take().context("no stdin")?;
     let input = input.to_string();

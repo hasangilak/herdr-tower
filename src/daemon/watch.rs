@@ -1225,12 +1225,15 @@ impl Radar {
                 question: None,
                 folder: s.cwd.clone(),
                 queued: 0,
+                waiting: vec![],
             })
             .filter(|a| !a.name.starts_with("tower"))
             .collect();
         let waiting = super::sendq::waiting_counts();
+        let mut lines = super::sendq::waiting_lines();
         for a in &mut agents {
             a.queued = waiting.get(&a.address).copied().unwrap_or(0);
+            a.waiting = lines.remove(&a.address).unwrap_or_default();
         }
         agents.sort_by(|a, b| a.address.cmp(&b.address));
         for set in self.asks.list() {

@@ -350,6 +350,8 @@ impl Daemon {
         let words = crate::introduce::task_from_prompt(&ev.text).unwrap_or_else(|| ev.text.trim().to_string());
         let (name, space) = (crate::hc::spoken_name(t), crate::spaces::space_of(t));
         eprintln!("[terminal] {address} ({name}): the user typed in its terminal: {}", crate::agenda::clip(&words, 120));
+        // What the tower has waiting for it may say what the user just did: checked before it goes.
+        self.sendq.user_said(address, &words, ev.at_ms);
         if self.asks.typed_there(address, &words, ev.at_ms) {
             return;
         }
