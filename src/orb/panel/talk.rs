@@ -92,6 +92,19 @@ fn push_session(out: &mut Vec<Said>, s: Said) {
     out.push(s);
 }
 
+/// Leaves out of `said` each "queued" row of the tower's that still waits
+/// (`waiting`: address and text): its waiting row says where it stands.
+pub(super) fn without_waiting(said: Vec<Said>, waiting: &[(String, String)]) -> Vec<Said> {
+    said.into_iter()
+        .filter(|s| !(s.with.as_ref().is_some_and(|w| w.how == "queued" && waiting.iter().any(|(a, t)| *a == w.addr && t.trim() == s.text))))
+        .collect()
+}
+
+/// The (address, text) of each message waiting for `addr` (the agent line's `waiting`).
+pub(super) fn waiting_texts(addr: &str, waiting: &[serde_json::Value]) -> Vec<(String, String)> {
+    waiting.iter().filter_map(|w| Some((addr.to_string(), w["text"].as_str()?.to_string()))).collect()
+}
+
 /// What passed between you or the tower and the session `addr`, oldest
 /// first, at most `max`.
 pub(super) fn session_thread(entries: &[Entry], addr: &str, max: usize) -> Vec<Said> {
@@ -260,7 +273,31 @@ impl Panel {
     /// `width` points wide, its input at the foot.
     pub(super) fn chat_column(&mut self, space: Option<&str>, width: f32, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let g = glass();
-        let said = conversation(&self.entries, space, MAX_SAID);
+        let mut said = conversation(&self.entries, space, MAX_SAID);
+        // What still waits in the send queue for the space's sessions: at the
+        // end; its "queued" rows above are left out (the waiting row says it).
+        let mut waits: Vec<AnyElement> = vec![];
+        if let Some(sp) = space {
+            let agents = self.tower.read(cx).s("agents").as_array().cloned().unwrap_or_default();
+            // Its sessions, as its mission has them (Herdr's own list besides).
+            let all = self.decisions(cx);
+            let mut members: Vec<(String, String)> =
+                self.missions(&all, cx).open.iter().filter(|m| m.name == sp).flat_map(|m| m.sessions.iter().map(|s| (s.address.clone(), s.name.clone()))).collect();
+            for (a, n, _) in self.live.iter().filter(|l| l.name == sp).flat_map(|l| l.sessions.iter()) {
+                if !members.iter().any(|(m, _)| m == a) {
+                    members.push((a.clone(), n.clone()));
+                }
+            }
+            let mut texts = vec![];
+            for (addr, name) in members {
+                let Some(a) = agents.iter().find(|a| a["address"] == addr.as_str()) else { continue };
+                let name = a["name"].as_str().filter(|n| !n.is_empty()).unwrap_or(&name).to_string();
+                let w = a["waiting"].as_array().map(Vec::as_slice).unwrap_or_default();
+                texts.extend(waiting_texts(&addr, w));
+                waits.extend(waiting_rows(&name, w));
+            }
+            said = without_waiting(said, &texts);
+        }
         // A new message: the column goes to its end.
         if let Some(f) = self.full.as_mut() {
             let key = (space.map(String::from), said.len(), said.last().map(|s| s.at).unwrap_or(0));
@@ -294,24 +331,7 @@ impl Panel {
             let extra = if Some(i) == last_of_latest { act_items.take().unwrap_or_default() } else { vec![] };
             rows.push(said_row(s, &who, extra));
         }
-        // What still waits in the send queue for the space's sessions, at the end.
-        if let Some(sp) = space {
-            let agents = self.tower.read(cx).s("agents").as_array().cloned().unwrap_or_default();
-            // Its sessions, as its mission has them (Herdr's own list besides).
-            let all = self.decisions(cx);
-            let mut members: Vec<(String, String)> =
-                self.missions(&all, cx).open.iter().filter(|m| m.name == sp).flat_map(|m| m.sessions.iter().map(|s| (s.address.clone(), s.name.clone()))).collect();
-            for (a, n, _) in self.live.iter().filter(|l| l.name == sp).flat_map(|l| l.sessions.iter()) {
-                if !members.iter().any(|(m, _)| m == a) {
-                    members.push((a.clone(), n.clone()));
-                }
-            }
-            for (addr, name) in members {
-                let Some(a) = agents.iter().find(|a| a["address"] == addr.as_str()) else { continue };
-                let name = a["name"].as_str().filter(|n| !n.is_empty()).unwrap_or(&name).to_string();
-                rows.extend(waiting_rows(&name, a["waiting"].as_array().map(Vec::as_slice).unwrap_or_default()));
-            }
-        }
+        rows.extend(waits);
         if rows.is_empty() {
             rows.push(
                 div()
@@ -443,6 +463,11 @@ mod tests {
         let t = session_thread(&entries, "t8w", 200);
         assert_eq!(t.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(), ["merged on dev", "PR #787 (eyzhub/eyzflow) into dev was merged on GitHub.", "Release #787 to prod", "im logged in"]);
         assert_eq!(session_thread(&entries, "t8w", 1).len(), 1);
+        // A message that still waits shows as waiting, not also as queued.
+        let w = without_waiting(conversation(&entries, Some("support-translation"), 200), &[("t8w".into(), "Release #787 to prod".into()), ("t8w".into(), "never queued".into())]);
+        assert_eq!(w.len(), 6, "a sent one stays");
+        let queued = [entries.clone(), vec![of("queue", Some("queued"), None, "t8w", "Queued for eyzflow: Run the e2e tests", 11)]].concat();
+        assert_eq!(without_waiting(session_thread(&queued, "t8w", 200), &[("t8w".into(), "Run the e2e tests".into())]).len(), 4);
         // A line written after a later one still shows in time order.
         let late = [entries.clone(), vec![of("request", None, Some("terminal:t8w"), "t8w", "keep this link in mind", 4)]].concat();
         let t = session_thread(&late, "t8w", 200);
