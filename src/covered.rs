@@ -44,6 +44,20 @@ pub fn judge(c: &Check) -> Result<Vec<(u64, String)>> {
     Ok(out)
 }
 
+/// Whether `words` the user typed in a session (`name`) answer what `reply`,
+/// their answer on a card that the tower holds for that session, answers:
+/// the same answer, or another one to the same question (then the held
+/// reply is moot). Words about something else don't.
+pub fn answers_held(name: &str, words: &str, reply: &str) -> Result<bool> {
+    let c = Check {
+        session: String::new(),
+        name: name.to_string(),
+        said: vec![Said { words: words.to_string(), at_ms: 0 }],
+        items: vec![(1, format!("(The user's own answer to the session's question, given earlier on a card, waiting to be typed in:) {reply}"))],
+    };
+    Ok(!judge(&c)?.is_empty())
+}
+
 /// The PR a note of the tower's says was merged (its number), if it is one.
 fn merged_note(text: &str) -> Option<u64> {
     let t = text.trim();
@@ -205,5 +219,17 @@ mod live {
         let got = judge(&c).unwrap();
         eprintln!("took {} ms: {got:?}", started.elapsed().as_millis());
         assert_eq!(got.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![1]);
+    }
+
+    /// Real calls: a link to keep in mind is no answer to the question the
+    /// held card answer is for; another answer to it is.
+    #[test]
+    #[ignore]
+    fn live_held_reply() {
+        let reply = "Yes, open the release PR from dev into main with #788 and #790. Do not merge it. After the user merges, watch the production deploy and check it on sandbox case EYZ-1032.";
+        let link = answers_held("eyzflow", "https://claude.ai/artifact/CLUA9bK6zEZ4RLk19P8yda keep in mind to update this artifact", reply).unwrap();
+        let other = answers_held("eyzflow", "no, don't open the release PR yet, I want to test more on dev first", reply).unwrap();
+        eprintln!("link answers it: {link}; another answer: {other}");
+        assert!(!link && other);
     }
 }

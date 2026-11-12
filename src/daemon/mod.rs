@@ -322,8 +322,9 @@ impl Daemon {
     /// with), another terminal's (`hc send` from a brain or a session), or the
     /// user's, typed in the session's own terminal (`typed`). The user's
     /// answers the question that session asked at the end of its turn, if
-    /// one is open (and a reply the tower held for it is not sent); else it
-    /// is new work: their request in that session, in the record (a
+    /// one is open (and a reply the tower held for it is not sent, when the
+    /// words answer the same): written down as a `request` with status
+    /// `answer`, no agenda; else it is new work: their request in that session, in the record (a
     /// `request` from `terminal:<address>`, in its space, never a chat
     /// message) and an agenda of its own (origin `terminal`). Nothing of it
     /// is said, and no brain is told.
@@ -353,6 +354,20 @@ impl Daemon {
         // What the tower has waiting for it may say what the user just did: checked before it goes.
         self.sendq.user_said(address, &words, ev.at_ms);
         if self.asks.typed_there(address, &words, ev.at_ms) {
+            // An answer to its question, not new work: no agenda, but what the
+            // user said there is written down (their conversation with it shows it).
+            let entry = crate::history::Entry {
+                kind: "request".into(),
+                status: Some("answer".into()),
+                text: words,
+                source: Some(format!("terminal:{address}")),
+                session: Some(address.to_string()),
+                name: Some(name).filter(|n| !n.is_empty()),
+                space,
+                record: true,
+                ..Default::default()
+            };
+            crate::history::later(move || crate::history::append(entry));
             return;
         }
         let r = self.agendas.typed(crate::agenda::Typed {
