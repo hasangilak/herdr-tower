@@ -15,10 +15,20 @@
 //!   space, its goal (the ticket's title), done-when, each session's repo
 //!   and why, the project and account. Launch runs exactly that draft
 //!   (`tower launch "<ticket>" --repo … --name … --title … --done-when …`,
-//!   `crate::ticket::confirm_flags`); "Adjust it in words…" and Redraft ask
-//!   for a new draft (`--adjust "<words>" --prior '<the draft>'`), which
-//!   takes the card's place; Start over drops the draft. Nothing opens
-//!   before Launch. A ticket changed after its draft is drafted again.
+//!   `crate::ticket::confirm_flags`); what to change is said in the
+//!   conversation (below) and redrafted (`--adjust "<words>" --prior '<the
+//!   draft>'`), which takes the card's place; Start over drops the draft.
+//!   Nothing opens before Launch. A ticket changed after its draft is
+//!   drafted again.
+//! - **The conversation** (`new_chat_column`, in the column a space's
+//!   conversation has, the panel's input at its foot): what you said (the
+//!   ticket, what to change, that it be planned) and what the tower said
+//!   back (each draft, `draft_said`, and what went wrong), and a planned
+//!   draft's thread with the planner, oldest first (`story_with`). What is
+//!   typed there (`launch_say`) is the ticket before a draft, a change to
+//!   it after, and words for the planner while a plan of it can talk.
+//!   Launch hands it to the new space (`--story-file`), whose conversation
+//!   opens with it (`talk::story_of`).
 //! - A tower whose `launch --help` has no `--draft` gets the launcher as it
 //!   was: the first project, its plan, Launch.
 //! - **Launch**'s receipt names the space, whose view opens with what was
@@ -30,18 +40,19 @@
 //!   account. The state's `plan` (`model::plan`) is followed: "The tower's
 //!   brain is writing the plan…", then "Plan · page · Open" (`open <url>`),
 //!   a planner stuck on a dialog in its terminal with **Show in Herdr**, or
-//!   why it failed with Plan again. Under the card the chat about it: the
-//!   user's lines and the planner's answers, newest last, and "Ask about the
-//!   plan or change it…" with Send (`tower plan say --as user`). While a
-//!   plan is open the card is the plan's draft (the planner revises it),
-//!   the chat replaces "Adjust it in words…", Launch carries `--plan <id>`
-//!   (the sessions get the plan; the plan closes) and Start over closes it.
+//!   why it failed with Plan again. The talk about it is in the
+//!   conversation: the user's lines (`tower plan say --as user`) and the
+//!   planner's answers. While a plan is open the card is the plan's draft
+//!   (the planner revises it), Launch carries `--plan <id>` (the sessions
+//!   get the plan; the plan closes) and Start over closes it.
 //!   A plan of another ticket still open says so, with Back to it and Close.
 //! - `HERDER_TOWER_ORB_DRAFT` (looking at it with test data): a file's draft
 //!   JSON shows as the card for the goal the window opened on; `reading`
 //!   shows the launcher reading a ticket; `ready`, the button before it.
 //!   `HERDER_TOWER_ORB_PLAN=<file>`: the plan in the file (the state's
 //!   `plan`, as `Plan::view` writes it) is the open plan, of that ticket.
+//!   `HERDER_TOWER_ORB_TALK=<file>`: its lines are said in the
+//!   conversation one after another (`talk_from_start`).
 
 use std::time::Duration;
 
@@ -51,10 +62,10 @@ use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 use serde_json::Value;
 
 use super::home::{LINE, SOFT, acts_row, bay_label, cstat, cstat_busy, mbtn, tg};
-use super::space::when_said;
 use super::window::whead;
-use super::{AMBER, CYAN, Panel, cli, glass};
+use super::{CYAN, Panel, cli, glass};
 use crate::history;
+use crate::launch::Told;
 use crate::orb::model::{self, Missions, PlanView};
 use crate::orb::nav::Scope;
 
@@ -333,46 +344,95 @@ pub(super) fn draft_plan(project: Option<&Setup>) -> Vec<String> {
 /// `Launched fix-login: 2 sessions on orca (eyzflow, mediaroom), each in its
 /// own worktree. …`. None when it isn't a receipt.
 pub(super) fn launched_line(receipt: &Value) -> Option<String> {
-    let space = receipt["space"].as_str().filter(|s| !s.is_empty())?;
-    let sessions = receipt["sessions"].as_array()?;
-    let opened: Vec<&Value> = sessions.iter().filter(|s| s["error"].is_null()).collect();
-    let account = receipt["assumed"]["account"].as_str().filter(|x| !x.is_empty());
-    let on = account.map(|x| format!(" on {x}")).unwrap_or_default();
-    let repos = opened.iter().map(|s| repo_name(s["repo"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", ");
-    let own = opened.iter().filter(|s| s["worktree"].as_str().is_some_and(|w| !w.is_empty())).count();
-    let ports: Vec<String> = opened.iter().filter_map(|s| s["port"].as_u64()).map(|p| p.to_string()).collect();
-    let place = match (own, opened.len()) {
-        (0, _) => String::new(),
-        (_, 1) => ", in its own worktree".to_string(),
-        (own, n) if own == n => ", each in its own worktree".to_string(),
-        (own, n) => format!(", {own} of {n} in their own worktree"),
+    crate::launch::launched_line(receipt).map(|l| format!("{l} Nothing was asked. Change the goal from here."))
+}
+
+/// What the tower says in the conversation of a draft (`before`: the draft
+/// it redrafted): the space, its sessions, its goal and done-when, and for a
+/// redraft what changed.
+pub(super) fn draft_said(d: &Drafted, before: Option<&Drafted>) -> String {
+    let repos: Vec<&str> = d.sessions.iter().map(|(r, _)| repo_name(r)).collect();
+    let sessions = match repos.as_slice() {
+        [one] => format!("1 session ({one})"),
+        list => format!("{} sessions ({}), each in its own worktree", list.len(), list.join(", ")),
     };
-    let ports = match ports.as_slice() {
-        [] => String::new(),
-        [one] => format!(" (port {one})"),
-        list => format!(" (ports {})", list.join(", ")),
-    };
-    let head = if receipt["made"] == false { format!("Joined {space}") } else { format!("Launched {space}") };
-    let mut parts = vec![match opened.len() {
-        0 => format!("{head}."),
-        1 => format!("{head}: 1 session{on} ({repos}){place}{ports}."),
-        n => format!("{head}: {n} sessions{on} ({repos}){place}{ports}."),
-    }];
-    for s in sessions.iter().filter(|s| !s["error"].is_null()) {
-        parts.push(format!("{} didn’t open: {}.", repo_name(s["repo"].as_str().unwrap_or("A session")), s["error"].as_str().unwrap_or("").trim_end_matches('.')));
+    let on = d.account.as_ref().map(|a| format!(" on {a}")).unwrap_or_default();
+    let from = d.project.as_ref().map(|p| format!(", from {p}")).unwrap_or_default();
+    let done = if d.done_when.trim().is_empty() { "not said (the ticket has no acceptance criteria)".to_string() } else { d.done_when.trim().to_string() };
+    let mut out = format!(
+        "{} {}: {sessions}{on}{from}. Goal: {}. Done when: {}.",
+        if before.is_some() { "Redrafted" } else { "Drafted" },
+        d.space,
+        d.goal.trim().trim_end_matches('.'),
+        done.trim_end_matches('.')
+    );
+    if !d.dropped.is_empty() {
+        out += &format!(" Left out {}.", d.dropped.join("; ").trim_end_matches('.'));
     }
-    if let Some(setup) = receipt["assumed"]["setup"].as_str().filter(|x| !x.is_empty()) {
-        parts.push(format!("It took the setup “{setup}”."));
+    match before.map(|b| changed(b, d)) {
+        None => out += " Launch it as it is, or say here what to change.",
+        Some(c) if c.is_empty() => out += " Nothing on the card changed.",
+        Some(c) => out += &format!(" Changed: {}.", c.join("; ")),
     }
-    parts.push("Nothing was asked. Change the goal from here.".into());
-    Some(parts.join(" "))
+    out
+}
+
+/// What is different on the card from `b` to `d`, a phrase each.
+fn changed(b: &Drafted, d: &Drafted) -> Vec<String> {
+    let mut out = vec![];
+    if b.space != d.space {
+        out.push(format!("named {} (was {})", d.space, b.space));
+    }
+    if b.goal.trim() != d.goal.trim() {
+        out.push("the goal".into());
+    }
+    if b.done_when.trim() != d.done_when.trim() {
+        out.push("what counts as done".into());
+    }
+    let had: Vec<&str> = b.sessions.iter().map(|(r, _)| r.as_str()).collect();
+    let has: Vec<&str> = d.sessions.iter().map(|(r, _)| r.as_str()).collect();
+    out.extend(has.iter().filter(|r| !had.contains(r)).map(|r| format!("adds {}", repo_name(r))));
+    out.extend(had.iter().filter(|r| !has.contains(r)).map(|r| format!("drops {}", repo_name(r))));
+    if b.project != d.project {
+        out.push(match &d.project {
+            Some(p) => format!("the project is {p}"),
+            None => "no project: the repos alone".into(),
+        });
+    }
+    if b.account != d.account
+        && let Some(a) = &d.account
+    {
+        out.push(format!("on {a}"));
+    }
+    out
+}
+
+/// The conversation that makes the space, as it stands: `story` (what you
+/// said and what the tower said back) and, when the draft is planned, the
+/// plan's thread (you and the planner) and when it was ready; oldest first.
+pub(super) fn story_with(story: &[Told], plan: Option<&PlanView>) -> Vec<Told> {
+    let mut out = story.to_vec();
+    if let Some(p) = plan {
+        out.extend(p.thread.iter().map(|m| Told { who: if m.mine() { "you".into() } else { "planner".into() }, text: m.text.trim().to_string(), at: m.at }));
+        if let (Some(at), Some(url)) = (p.ready_ms, p.url.as_ref()) {
+            out.push(Told { who: "tower".into(), text: format!("The plan is ready, a {} on your claude.ai account: {url}. Talk it over here; Launch hands each session its part.", p.form_word()), at });
+        }
+    }
+    out.sort_by_key(|t| t.at);
+    out
+}
+
+/// `HERDER_TOWER_ORB_TALK=<file>` (looking at it with test data): what to
+/// say in New space's conversation, a line each, one after another once
+/// the tower is on none (`!launch` presses Launch; `!wait <s>` waits).
+fn talk_from_start() -> std::collections::VecDeque<String> {
+    let Some(path) = std::env::var("HERDER_TOWER_ORB_TALK").ok().filter(|p| !p.trim().is_empty()) else { return Default::default() };
+    std::fs::read_to_string(path.trim()).unwrap_or_default().lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
 }
 
 /// The launcher's state.
 pub(super) struct LaunchUi {
     goal: Entity<TextareaState>,
-    /// "Adjust it in words…": what to change about the draft.
-    adjust: Entity<TextareaState>,
     /// The saved projects; `None` until the tower was asked.
     setups: Option<Vec<Setup>>,
     /// The project chosen. With drafts: none until one is (the brain picks);
@@ -382,23 +442,24 @@ pub(super) struct LaunchUi {
     dry_known: Option<bool>,
     /// Whether it has `--draft`: a ticket that names no repo is drafted first.
     draft_known: Option<bool>,
+    /// Whether it has `--story-file`: the conversation goes with the space it launches.
+    story_known: bool,
+    /// The conversation that makes the space, oldest first: what you said
+    /// (the ticket, what to change, that it be planned) and what the tower
+    /// said back (each draft, what went wrong). The planner's side is the
+    /// plan's own thread (`story`). Launch hands it all to the new space
+    /// (`--story-file`); Start over drops it.
+    pub story: Vec<Told>,
+    /// `HERDER_TOWER_ORB_TALK`: what is still to be said in the conversation, a line each.
+    talk_hook: std::collections::VecDeque<String>,
+    /// The hook waits until then before its next line.
+    talk_at: Option<std::time::Instant>,
     /// What the tower said it will do, and for which goal and setup it said so.
     dry: Option<((String, Option<String>), Dry)>,
     /// The draft of a ticket, and the ticket it is of.
     draft: Option<(String, Drafted)>,
-    /// The words of a redraft went: the field is emptied once it is drawn.
-    clear_adjust: bool,
-    /// "Ask about the plan or change it…": the chat with the planner.
-    chat: Entity<TextareaState>,
-    /// What was said in the chat went: the field is emptied once it is drawn.
-    clear_chat: bool,
     /// `HERDER_TOWER_ORB_PLAN`: the open plan, from a file instead of the state.
     plan_hook: Option<PlanView>,
-    /// The chat as last drawn (its plan, its lines, whether an answer was
-    /// awaited): a change scrolls the pane to its end.
-    chat_seen: (String, usize, bool),
-    /// Scrolled to the end until then (what is below grows as it is laid out).
-    chat_scroll: Option<std::time::Instant>,
     /// Waits for the typing to pause before the tower is asked again.
     dry_wait: Option<Task<()>>,
     /// "Review its PRs": each PR its sessions open gets a reviewer
@@ -411,41 +472,26 @@ impl LaunchUi {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Panel>) -> Self {
         // A whole ticket fits: it grows to 14 lines, then scrolls.
         let goal = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 14).placeholder("Paste the ticket, or say what the space should get done"));
-        let adjust = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 3).submit_on_enter(true).placeholder("Adjust it in words…"));
-        let chat = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 4).submit_on_enter(true).placeholder("Ask about the plan or change it…"));
-        let subs = vec![
-            cx.subscribe_in(&chat, window, |this, _, ev: &InputEvent, _, cx| {
-                if let InputEvent::PressEnter { shift: false, .. } = ev {
-                    this.plan_say(cx);
-                }
-            }),
-            cx.subscribe_in(&goal, window, |this, _, ev: &InputEvent, _, cx| {
-                if matches!(ev, InputEvent::Change) {
-                    this.ask_plan(cx);
-                    cx.notify();
-                }
-            }),
-            cx.subscribe_in(&adjust, window, |this, _, ev: &InputEvent, _, cx| {
-                if let InputEvent::PressEnter { shift: false, .. } = ev {
-                    this.redraft(cx);
-                }
-            }),
-        ];
+        let subs = vec![cx.subscribe_in(&goal, window, |this, _, ev: &InputEvent, _, cx| {
+            if matches!(ev, InputEvent::Change) {
+                this.ask_plan(cx);
+                cx.notify();
+            }
+        })];
+        let talk_hook = talk_from_start();
         Self {
             goal,
-            adjust,
             setups: None,
             picked: None,
             dry_known: None,
             draft_known: None,
+            story_known: false,
+            story: vec![],
+            talk_at: (!talk_hook.is_empty()).then(|| std::time::Instant::now() + Duration::from_secs(3)),
+            talk_hook,
             dry: None,
             draft: None,
-            clear_adjust: false,
-            chat,
-            clear_chat: false,
             plan_hook: None,
-            chat_seen: (String::new(), 0, false),
-            chat_scroll: None,
             dry_wait: None,
             review: true,
             _subs: subs,
@@ -502,41 +548,6 @@ pub(super) fn field(state: &Entity<TextareaState>) -> AnyElement {
         .into_any_element()
 }
 
-/// The chat lines shown under a plan (the latest).
-const PLAN_ROWS: usize = 12;
-
-/// A line of the chat about a plan: who said it (the user, the planner),
-/// when, and its words, as "Between sessions" shows a message.
-fn plan_msg_row(m: &model::PlanMsg) -> AnyElement {
-    let g = glass();
-    h_flex()
-        .w_full()
-        .items_start()
-        .gap(px(10.0))
-        .p(px(12.0))
-        .rounded(px(14.0))
-        .bg(rgba(SOFT))
-        .border_1()
-        .border_color(rgba(0xffffff0d))
-        .child(div().w(px(3.0)).flex_none().self_stretch().rounded_full().bg(rgb(if m.mine() { AMBER } else { CYAN })))
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap(px(6.0))
-                .child(
-                    h_flex()
-                        .w_full()
-                        .items_start()
-                        .gap(px(10.0))
-                        .child(div().flex_1().min_w_0().text_size(px(13.0)).line_height(px(18.0)).font_weight(FontWeight::SEMIBOLD).child(if m.mine() { "You" } else { "The planner" }))
-                        .child(div().flex_none().text_size(px(12.0)).line_height(px(18.0)).text_color(g.faint).child(when_said(m.at))),
-                )
-                .child(div().w_full().text_size(px(13.0)).line_height(px(19.0)).text_color(g.text).child(m.text.trim().to_string())),
-        )
-        .into_any_element()
-}
-
 /// `HERDER_TOWER_ORB_DRAFT`: `reading`, `ready`, or a file holding a draft's JSON.
 fn draft_from_start() -> Option<String> {
     std::env::var("HERDER_TOWER_ORB_DRAFT").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
@@ -559,6 +570,7 @@ impl Panel {
                         let text = help.unwrap_or_default();
                         full.launch.dry_known = Some(text.contains("--dry-run"));
                         full.launch.draft_known.get_or_insert(text.contains("--draft"));
+                        full.launch.story_known = text.contains("--story-file");
                     }
                     this.ask_plan(cx);
                 });
@@ -658,6 +670,10 @@ impl Panel {
         }
         args.push(review_flag(full.launch.review).into());
         args.push("--json".into());
+        // Launched as its first line says: the goal is what was said.
+        if full.launch.story.iter().all(|t| t.who != "you") {
+            self.tell("you", &goal);
+        }
         self.launch_args(&goal, args, missions, cx);
     }
 
@@ -715,23 +731,94 @@ impl Panel {
             return;
         }
         let args = plan_args(form, &d, &file.to_string_lossy());
-        self.run("plan", args, cx, move |_, _, _| {
+        self.tell("you", &format!("Plan it first, as a {}.", if form == "whiteboard" { "whiteboard" } else { "page" }));
+        self.run("plan", args, cx, move |this, result, _| {
             let _ = std::fs::remove_file(&file);
+            match result {
+                Ok(_) => this.tell("tower", "The planner is on it: it reads the repos and the draft, writes the plan and publishes it on your claude.ai account, private (about five minutes). Nothing opens."),
+                Err(e) => this.tell("tower", &format!("The planner didn't start: {}.", e.trim().trim_end_matches('.'))),
+            }
         });
     }
 
-    /// Send: the user's words about the plan, for its planner; its answer comes in the state.
-    fn plan_say(&mut self, cx: &mut Context<Self>) {
-        let Some(full) = self.full.as_ref() else { return };
-        let words = full.launch.chat.read(cx).value().trim().to_string();
-        let ticket = full.launch.goal.read(cx).value().trim().to_string();
-        let Some(p) = self.plan_for(&ticket, cx) else { return };
-        if words.is_empty() || self.running("plan-say") || p.address.is_none() {
-            return;
+    /// The user's words about the plan `id`, for its planner; they and its
+    /// answer come in the plan's thread (the state).
+    fn plan_say(&mut self, id: &str, words: &str, cx: &mut Context<Self>) {
+        self.run("plan-say", say_args(id, words), cx, |_, _, _| {});
+    }
+
+    /// A message of the conversation that makes the space: `who` said `text` now.
+    fn tell(&mut self, who: &str, text: &str) {
+        if let Some(full) = self.full.as_mut()
+            && !text.trim().is_empty()
+        {
+            full.launch.story.push(Told { who: who.into(), text: text.trim().to_string(), at: history::now_ms() });
         }
-        self.run("plan-say", say_args(&p.id, &words), cx, |this, result, _| {
-            if let (Ok(_), Some(full)) = (result, this.full.as_mut()) {
-                full.launch.clear_chat = true;
+    }
+
+    /// What was typed (or said) in New space's conversation: to the planner
+    /// while a plan of the draft can talk; a change to the draft while
+    /// there is one (it is redrafted); else the ticket, or more of it, and
+    /// it is drafted (or, for a first line that names the repos, said what
+    /// Launch will do). Why it can't be taken now, else.
+    pub(super) fn launch_say(&mut self, words: &str, window: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
+        let words = words.trim();
+        if words.is_empty() {
+            return Err(String::new());
+        }
+        if self.running("launch") {
+            return Err("It is launching: say it in the new space.".into());
+        }
+        if self.running("draft") {
+            return Err("The tower's brain is still on the last one: say it once its answer is here.".into());
+        }
+        let Some(full) = self.full.as_ref() else { return Err(String::new()) };
+        let ticket = full.launch.goal.read(cx).value().trim().to_string();
+        if let Some(p) = self.plan_for(&ticket, cx).filter(|p| p.status != "failed" && p.address.is_some()) {
+            if self.running("plan-say") {
+                return Err("Still handing your last words to the planner.".into());
+            }
+            self.plan_say(&p.id, words, cx);
+            return Ok(());
+        }
+        let Some(full) = self.full.as_ref() else { return Err(String::new()) };
+        let ui = &full.launch;
+        // A draft (of this ticket, or of one changed since): these words change it.
+        if ui.drafts() && !ticket.is_empty() && !ui.names_repos(&ticket) && ui.draft.is_some() {
+            self.draft(Some(words.to_string()), cx);
+            return Ok(());
+        }
+        // No draft yet: the ticket, or more of it.
+        let goal = if ticket.is_empty() { words.to_string() } else { format!("{ticket}\n\n{words}") };
+        let (field, drafts, dry) = (ui.goal.clone(), ui.drafts(), ui.dry_known == Some(true));
+        field.update(cx, |s, cx| s.set_value(goal.clone(), window, cx));
+        match (drafts, dry) {
+            (true, true) => self.dry_then_draft(goal, cx),
+            (true, false) => self.draft(None, cx),
+            (false, _) => {
+                self.tell("you", &goal);
+                self.tell("tower", "This tower drafts nothing: it opens the repos the first line names. What it will do is beside; Launch when it is right.");
+            }
+        }
+        Ok(())
+    }
+
+    /// The goal said in the conversation: a first line that names the repos
+    /// is launched as it says (the tower says what that will open), any
+    /// other is drafted.
+    fn dry_then_draft(&mut self, goal: String, cx: &mut Context<Self>) {
+        let args = vec!["launch".to_string(), goal.clone(), "--dry-run".into(), "--json".into()];
+        self.run("draft", args, cx, move |this, result, cx| {
+            let dry = result.as_ref().ok().and_then(|out| serde_json::from_str::<Value>(out).ok()).as_ref().and_then(plan_from);
+            match dry.filter(|d| d.first_line && d.error.is_none()) {
+                Some(d) => {
+                    this.tell("you", &goal);
+                    this.tell("tower", &format!("Its first line names the repos, so there is no draft: {}. Launch opens exactly that.", d.lines.join("; ").trim_end_matches('.')));
+                    if let Some(full) = this.full.as_mut() {
+                        full.launch.dry = Some(((goal, None), d));
+                    }
+                }
+                None => this.draft(None, cx),
             }
         });
     }
@@ -760,12 +847,27 @@ impl Panel {
     }
 
     /// Runs `tower launch` with `args`; its receipt names the space, whose view opens with what it did.
-    fn launch_args(&mut self, goal: &str, args: Vec<String>, missions: &Missions, cx: &mut Context<Self>) {
+    fn launch_args(&mut self, goal: &str, mut args: Vec<String>, missions: &Missions, cx: &mut Context<Self>) {
         let before: Vec<String> = missions.open.iter().map(|m| m.name.clone()).chain(missions.quiet.iter().cloned()).collect();
         let taken: Vec<&str> = before.iter().map(String::as_str).collect();
         let expected = args.iter().position(|a| a == "--name").and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| slug(goal, &taken));
+        // The conversation that made it goes with it: the new space keeps it, at its top.
+        let story = self.story_now(cx);
+        let file = std::env::temp_dir().join(format!("tower-launch-story-{}.json", history::now_ms()));
+        let handed = self.full.as_ref().is_some_and(|f| f.launch.story_known)
+            && !story.is_empty()
+            && serde_json::to_string(&story).ok().is_some_and(|text| std::fs::write(&file, text).is_ok());
+        if handed {
+            args.extend(["--story-file".to_string(), file.to_string_lossy().into_owned()]);
+        }
         self.run("launch", args, cx, move |this, result, cx| {
-            let Ok(out) = result else { return };
+            if handed {
+                let _ = std::fs::remove_file(&file);
+            }
+            let out = match result {
+                Ok(out) => out,
+                Err(e) => return this.tell("tower", &format!("The launch didn't go: {}.", e.trim().trim_end_matches('.'))),
+            };
             // Its receipt names the space and says what was opened.
             let receipt: Value = serde_json::from_str(out).unwrap_or_default();
             let space = receipt["space"].as_str().filter(|s| !s.is_empty()).map(String::from).unwrap_or(expected);
@@ -775,6 +877,8 @@ impl Panel {
             });
             if let Some(full) = this.full.as_mut() {
                 (full.launch.dry, full.launch.draft) = (None, None);
+                // It is the new space's now.
+                full.launch.story.clear();
             }
             // What it opened is an act the tower keeps: Undo shows with what it said, as with a reply.
             let act = receipt["act"].as_str().map(String::from);
@@ -794,32 +898,40 @@ impl Panel {
         if ticket.is_empty() {
             return;
         }
-        let before = full.launch.draft_of(&ticket).cloned();
+        // A change is to the latest draft (of this ticket, or of it before it was changed).
+        let before = match &adjust {
+            Some(_) => full.launch.draft.as_ref().map(|(_, d)| d.clone()),
+            None => full.launch.draft_of(&ticket).cloned(),
+        };
         let project = full.launch.setup().map(|s| s.name.clone());
         let args = draft_args(&ticket, project.as_deref(), adjust.as_deref().zip(before.as_ref()));
+        // The conversation: what you said (the ticket once, or what to change).
+        let said = adjust.clone().unwrap_or_else(|| ticket.clone());
+        let again = full.launch.story.iter().rev().find(|t| t.who == "you").is_some_and(|t| adjust.is_none() && t.text == ticket);
+        if !again {
+            self.tell("you", &said);
+        }
         self.run("draft", args, cx, move |this, result, _| {
-            let Ok(out) = result else { return };
-            let Some(full) = this.full.as_mut() else { return };
+            let out = match result {
+                Ok(out) => out,
+                Err(e) => return this.tell("tower", &format!("The draft didn't come: {}.", e.trim().trim_end_matches('.'))),
+            };
             match serde_json::from_str::<Value>(out).ok().as_ref().and_then(draft_from) {
                 Some(d) => {
-                    full.launch.draft = Some((ticket, d));
-                    full.launch.clear_adjust = adjust.is_some();
+                    this.tell("tower", &draft_said(&d, before.as_ref().filter(|_| adjust.is_some())));
+                    if let Some(full) = this.full.as_mut() {
+                        full.launch.draft = Some((ticket, d));
+                    }
                 }
                 None => {
-                    full.notes.insert("draft".into(), (false, "The tower answered no draft. Try again, or name the repos in the first line.".into()));
+                    let why = "The tower answered no draft. Try again, or name the repos in the first line.";
+                    this.tell("tower", why);
+                    if let Some(full) = this.full.as_mut() {
+                        full.notes.insert("draft".into(), (false, why.into()));
+                    }
                 }
             }
         });
-    }
-
-    /// Redraft: the draft again, changed as the words in the field say.
-    fn redraft(&mut self, cx: &mut Context<Self>) {
-        let Some(full) = self.full.as_ref() else { return };
-        let words = full.launch.adjust.read(cx).value().trim().to_string();
-        if words.is_empty() || self.running("draft") {
-            return;
-        }
-        self.draft(Some(words), cx);
     }
 
     /// Start over: the draft is dropped; the ticket stays to change or draft again.
@@ -833,9 +945,10 @@ impl Panel {
         }
         let Some(full) = self.full.as_mut() else { return };
         full.launch.draft = None;
+        // Its conversation goes with it: a new one starts with the next draft.
+        full.launch.story.clear();
         full.notes.remove("plan");
         full.notes.remove("draft");
-        full.launch.adjust.update(cx, |s, cx| s.set_value("", window, cx));
         let goal = full.launch.goal.clone();
         goal.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
@@ -924,7 +1037,7 @@ impl Panel {
                         .text_size(px(12.0))
                         .line_height(px(17.0))
                         .text_color(g.faint)
-                        .child("The tower's brain writes the full plan (each session's part and its order, how the repos fit together, the risks, the open questions, the tests) and publishes it to your claude.ai account, private. Then you can talk it over here. Nothing opens until you launch."),
+                        .child("The tower's brain writes the full plan (each session's part and its order, how the repos fit together, the risks, the open questions, the tests) and publishes it to your claude.ai account, private. Then you talk it over in the conversation. Nothing opens until you launch."),
                 )
             })
             .into_any_element()
@@ -932,7 +1045,7 @@ impl Panel {
 
     /// The plan of the draft on the card: how it stands (writing, waiting on
     /// its terminal, failed, or "Plan · page · Open"), then the chat about it.
-    fn plan_section(&self, p: &PlanView, chat: &Entity<TextareaState>, can: bool, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn plan_section(&self, p: &PlanView, can: bool, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let g = glass();
         let mut items: Vec<AnyElement> = vec![bay_label("The plan").px(px(0.0)).into_any_element()];
         let boxed = || v_flex().w_full().px(px(14.0)).py(px(12.0)).gap(px(8.0)).rounded(px(14.0)).bg(rgba(SOFT)).border_1().border_color(rgba(LINE));
@@ -1002,40 +1115,9 @@ impl Panel {
         if p.status == "failed" || (ready && p.address.is_none()) {
             items.push(self.plan_offer(true, can, cx));
         }
-        // The chat: the user's lines and the planner's answers, newest last.
-        let talks = p.address.is_some() && p.status != "failed";
-        if p.thread.is_empty() && !talks {
-            return items;
-        }
-        let n = p.thread.len();
-        let label = match n {
-            0 => "About the plan".to_string(),
-            1 => "About the plan · 1 message".to_string(),
-            n => format!("About the plan · {n} messages"),
-        };
-        items.push(div().pt(px(4.0)).child(bay_label(&label).px(px(0.0))).into_any_element());
-        let from = n.saturating_sub(PLAN_ROWS);
-        if from > 0 {
-            items.push(div().px(px(4.0)).text_size(px(12.0)).text_color(g.faint).child(format!("{from} earlier, in `tower plan show`")).into_any_element());
-        }
-        items.extend(p.thread[from..].iter().map(plan_msg_row));
-        if p.answering {
-            items.push(div().px(px(4.0)).child(cstat_busy(if p.planner == "working" { "The planner is answering…" } else { "With the planner: it answers once its turn is over…" })).into_any_element());
-        }
-        if talks {
-            let typed = !chat.read(cx).value().trim().is_empty();
-            let sending = self.running("plan-say");
-            let ok = typed && !sending;
-            items.push(
-                h_flex()
-                    .w_full()
-                    .gap(px(8.0))
-                    .items_center()
-                    .child(div().flex_1().min_w_0().child(field(chat)))
-                    .child(mbtn("plan-send", if sending { "Sending…" } else { "Send" }, false, None).when(!ok, |el| el.opacity(0.5)).when(ok, |el| el.on_click(cx.listener(|this, _, _, cx| this.plan_say(cx)))))
-                    .into_any_element(),
-            );
-            items.extend(self.said("plan-say"));
+        // The talk about it is in the conversation beside.
+        if p.address.is_some() && p.status != "failed" {
+            items.push(div().px(px(4.0)).text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child("Talk it over in the conversation: what you say there goes to the planner, and it answers there.").into_any_element());
         }
         items
     }
@@ -1043,19 +1125,8 @@ impl Panel {
     /// The launcher's head and body.
     pub(super) fn launch_view(&mut self, missions: &Missions, window: &mut Window, cx: &mut Context<Self>) -> (AnyElement, Vec<AnyElement>) {
         let g = glass();
-        let head = whead("New space", vec![div().child("Say what it should get done, or paste the ticket. Nothing opens until you launch.").into_any_element()], None);
-        // A redraft's words went: the field is emptied.
-        if let Some(full) = self.full.as_mut()
-            && std::mem::take(&mut full.launch.clear_adjust)
-        {
-            full.launch.adjust.update(cx, |s, cx| s.set_value("", window, cx));
-        }
-        // What was said to the planner went: the field is emptied.
-        if let Some(full) = self.full.as_mut()
-            && std::mem::take(&mut full.launch.clear_chat)
-        {
-            full.launch.chat.update(cx, |s, cx| s.set_value("", window, cx));
-        }
+        let head = whead("New space", vec![div().child("Say in the conversation what it should get done, or paste the ticket here. Nothing opens until you launch.").into_any_element()], None);
+        self.talk_tick(missions, window, cx);
         let plan_open = self.plan_now(cx);
         let Some(full) = self.full.as_ref() else { return (head, vec![]) };
         let ui = &full.launch;
@@ -1075,8 +1146,7 @@ impl Panel {
             .or_else(|| ui.draft_of(&goal).cloned())
             .or_else(|| planned.as_ref().and_then(|p| draft_from(&p.draft)))
             .filter(|_| drafts);
-        let (chat, goal_field) = (ui.chat.clone(), ui.goal.clone());
-        let adjust = ui.adjust.clone();
+        let goal_field = ui.goal.clone();
         // The tower's own word on what it will do, if it gave it for this goal and setup.
         let key = (goal.clone(), ui.dry_setup());
         let dry = ui.dry.as_ref().filter(|(k, _)| *k == key).map(|(_, d)| d.clone()).unwrap_or_default();
@@ -1202,21 +1272,8 @@ impl Panel {
                 );
             }
             (Some(_), _) => {
-                // Change it in words, or launch it as it is.
-                let typed = !adjust.read(cx).value().trim().is_empty();
-                actions.push(
-                    h_flex()
-                        .w_full()
-                        .gap(px(8.0))
-                        .items_center()
-                        .child(div().flex_1().min_w_0().child(field(&adjust)))
-                        .child(
-                            mbtn("redraft", if drafting { "Redrafting…" } else { "Redraft" }, false, None)
-                                .when(!(typed && can), |el| el.opacity(0.5))
-                                .when(typed && can, |el| el.on_click(cx.listener(|this, _, _, cx| this.redraft(cx)))),
-                        )
-                        .into_any_element(),
-                );
+                // Launch it as it is; what to change is said in the conversation.
+                actions.push(note("Say in the conversation what to change: the tower's brain redrafts it there, and the card follows.".into()).into_any_element());
                 let m = missions.clone();
                 actions.push(
                     acts_row()
@@ -1243,29 +1300,9 @@ impl Panel {
                 );
             }
         }
-        // A new line in the chat (or one now awaited): the pane goes to its end, where it is.
-        if let Some(p) = planned.as_ref().filter(|p| !p.thread.is_empty() || p.answering) {
-            let now = (p.id.clone(), p.thread.len(), p.answering);
-            if let Some(full) = self.full.as_mut()
-                && full.launch.chat_seen != now
-            {
-                full.launch.chat_seen = now;
-                full.launch.chat_scroll = Some(std::time::Instant::now() + Duration::from_millis(700));
-            }
-        }
-        if let Some(full) = self.full.as_mut() {
-            match full.launch.chat_scroll {
-                Some(until) if std::time::Instant::now() < until => {
-                    full.launch_scroll.scroll_to_bottom();
-                    window.request_animation_frame();
-                }
-                Some(_) => full.launch.chat_scroll = None,
-                None => {}
-            }
-        }
-        // The plan of this draft and the chat about it, under the card.
+        // The plan of this draft, under the card (the talk about it is in the conversation).
         let plan_items: Vec<AnyElement> = match (&planned, &draft) {
-            (Some(p), Some(_)) => self.plan_section(p, &chat, can, cx),
+            (Some(p), Some(_)) => self.plan_section(p, can, cx),
             _ => vec![],
         };
         // A plan of another ticket is still open: back to it, or close it.
@@ -1303,6 +1340,157 @@ impl Panel {
             .children(self.said("launch"))
             .into_any_element();
         (head, vec![body])
+    }
+}
+
+impl Panel {
+    /// The conversation that makes the space, as it stands now (`story_with`).
+    pub(super) fn story_now(&self, cx: &Context<Self>) -> Vec<Told> {
+        let Some(full) = self.full.as_ref() else { return vec![] };
+        let ticket = full.launch.goal.read(cx).value().trim().to_string();
+        let plan = self.plan_for(&ticket, cx).filter(|_| full.launch.draft.is_some());
+        story_with(&full.launch.story, plan.as_ref())
+    }
+
+    /// Where the input's words go in New space, as its placeholder says.
+    pub(super) fn new_hint(&self, cx: &Context<Self>) -> String {
+        let Some(full) = self.full.as_ref() else { return String::new() };
+        let ticket = full.launch.goal.read(cx).value().trim().to_string();
+        let ui = &full.launch;
+        // The column's input is narrow in a narrow window: the short words.
+        let narrow = full.talk_w < 360.0;
+        let pick = |wide: &str, short: &str| if narrow { short.to_string() } else { wide.to_string() };
+        if self.plan_for(&ticket, cx).is_some_and(|p| p.status != "failed" && p.address.is_some()) {
+            pick("Ask about the plan or change it…", "To the planner…")
+        } else if ui.drafts() && !ticket.is_empty() && !ui.names_repos(&ticket) && ui.draft.is_some() {
+            pick("Say what to change…", "What to change…")
+        } else if ticket.is_empty() {
+            pick("Paste the ticket, or say what to get done…", "The ticket, or the goal…")
+        } else {
+            pick("Add to the ticket, and it is drafted…", "More of the ticket…")
+        }
+    }
+
+    /// New space's conversation, in the column a space's has, `width`
+    /// points wide: what you said and what the tower and the planner said
+    /// back, oldest first, what is under way, and the input at its foot.
+    pub(super) fn new_chat_column(&mut self, width: f32, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let g = glass();
+        let story = self.story_now(cx);
+        let ticket = self.full.as_ref().map(|f| f.launch.goal.read(cx).value().trim().to_string()).unwrap_or_default();
+        let plan = self.plan_for(&ticket, cx);
+        let drafted = self.full.as_ref().and_then(|f| f.launch.draft.as_ref().map(|(_, d)| d.space.clone()));
+        let redrafting = drafted.is_some();
+        // A new message, or one now awaited: the column goes to its end.
+        let waiting = self.running("draft") || self.running("launch") || self.running("plan") || plan.as_ref().is_some_and(|p| p.answering);
+        if let Some(f) = self.full.as_mut() {
+            let key = (Some(String::new()), story.len() + usize::from(waiting), story.last().map(|t| t.at).unwrap_or(0));
+            if f.chat_seen.as_ref() != Some(&key) {
+                f.chat_seen = Some(key);
+                f.chat_scroll.scroll_to_bottom();
+                window.request_animation_frame();
+            }
+        }
+        let mut rows: Vec<AnyElement> = story.iter().map(super::talk::told_row).collect();
+        let busy = |text: String| div().px(px(4.0)).child(cstat_busy(text)).into_any_element();
+        if self.running("draft") {
+            rows.push(busy(if redrafting { "The tower's brain is redrafting it…".into() } else { "The tower's brain is reading the ticket…".into() }));
+        }
+        if self.running("plan") {
+            rows.push(busy("Starting the planner…".into()));
+        }
+        if self.running("plan-say") {
+            rows.push(busy("Handing it to the planner…".into()));
+        }
+        if let Some(p) = &plan {
+            if p.status == "writing" && !p.blocked {
+                rows.push(busy(plan_line(p).0));
+            } else if p.answering {
+                rows.push(busy(if p.planner == "working" { "The planner is answering…".into() } else { "With the planner: it answers once its turn is over…".into() }));
+            }
+        }
+        if self.running("launch") {
+            rows.push(busy("Launching…".into()));
+        }
+        if rows.is_empty() {
+            rows.push(
+                div()
+                    .w_full()
+                    .p(px(14.0))
+                    .rounded(px(14.0))
+                    .border_1()
+                    .border_dashed()
+                    .border_color(rgba(LINE))
+                    .text_size(px(13.0))
+                    .line_height(px(19.0))
+                    .text_color(g.muted)
+                    .child("Say below what the space should get done, or paste the ticket. The tower's brain drafts it here, and you change it in words here too. When you launch it, this conversation goes with the space, at the top of its own: how it was created.")
+                    .into_any_element(),
+            );
+        }
+        let mut status: Vec<AnyElement> = self.said("plan-say").into_iter().map(|e| div().px(px(4.0)).child(e).into_any_element()).collect();
+        if let Some((ok, msg)) = self.status.clone() {
+            status.push(div().px(px(4.0)).child(cstat(msg, !ok)).into_any_element());
+        }
+        let scroll = self.full.as_ref().map(|f| f.chat_scroll.clone());
+        v_flex()
+            .w(px(width))
+            .flex_none()
+            .h_full()
+            .px(px(14.0))
+            .pb(px(16.0))
+            .gap(px(10.0))
+            .border_r_1()
+            .border_color(rgba(LINE))
+            .child(div().pt(px(22.0)).px(px(4.0)).child(bay_label(&match &drafted {
+                Some(name) => format!("Conversation · {name}, not launched yet"),
+                None => "Conversation · the new space".to_string(),
+            })))
+            .child(
+                div()
+                    .id("chat-new-space")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .when_some(scroll, |el, s| el.track_scroll(&s))
+                    .child(v_flex().w_full().gap(px(8.0)).pb(px(4.0)).children(rows)),
+            )
+            .children(status)
+            .child(self.input(window, cx))
+            .into_any_element()
+    }
+
+    /// `HERDER_TOWER_ORB_TALK` (see `talk_from_start`): its next line, once
+    /// the tower is on nothing and the last line was a moment ago.
+    fn talk_tick(&mut self, missions: &Missions, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(full) = self.full.as_ref() else { return };
+        let ui = &full.launch;
+        if ui.talk_hook.is_empty() || ui.draft_known.is_none() || ["draft", "launch", "plan", "plan-say", "setups"].iter().any(|p| self.running(p)) {
+            return;
+        }
+        if ui.talk_at.is_some_and(|t| std::time::Instant::now() < t) {
+            window.request_animation_frame();
+            return;
+        }
+        let Some(full) = self.full.as_mut() else { return };
+        let Some(line) = full.launch.talk_hook.pop_front() else { return };
+        full.launch.talk_at = Some(std::time::Instant::now() + Duration::from_millis(1500));
+        let left = full.launch.talk_hook.len();
+        eprintln!("[orb] talk: {line} ({left} left)");
+        if let Some(secs) = line.strip_prefix("!wait").map(str::trim) {
+            full.launch.talk_at = Some(std::time::Instant::now() + Duration::from_secs(secs.parse().unwrap_or(5)));
+        } else if line == "!launch" {
+            let ticket = full.launch.goal.read(cx).value().trim().to_string();
+            if full.launch.draft_of(&ticket).is_some() || self.plan_for(&ticket, cx).is_some() {
+                self.launch_draft(missions, cx);
+            } else {
+                self.launch(missions, cx);
+            }
+        } else if let Err(why) = self.launch_say(&line, window, cx) {
+            eprintln!("[orb] talk: not taken: {why}");
+        }
+        window.request_animation_frame();
+        cx.notify();
     }
 }
 
@@ -1466,6 +1654,45 @@ mod tests {
         let picked = Setup { name: "EYZFlow".into(), ..Default::default() };
         assert!(draft_plan(Some(&picked))[0].contains("the repos of EYZFlow"));
         assert!(draft_plan(None)[0].contains("from your projects") && draft_plan(None).last().unwrap().contains("Nothing opens"));
+    }
+
+    /// New space's conversation: each draft is said in it (a redraft with
+    /// what changed), and a plan's thread and its being ready join it in time order.
+    #[test]
+    fn the_conversation_says_each_draft_and_takes_in_the_plans_thread() {
+        let first = draft_from(&serde_json::json!({ "space": "scratch-check", "goal": "Check New space.", "done_when": "", "sessions": [{ "repo": "/w/tower-scratch", "why": "the throwaway repo" }], "assumed": { "account": "default" } })).unwrap();
+        assert_eq!(
+            draft_said(&first, None),
+            "Drafted scratch-check: 1 session (tower-scratch) on default. Goal: Check New space. Done when: not said (the ticket has no acceptance criteria). Launch it as it is, or say here what to change."
+        );
+        let mut second = first.clone();
+        second.space = "ns-check".into();
+        second.sessions.push(("/w/eyzflow".into(), "the app".into()));
+        second.project = Some("EYZFlow".into());
+        second.done_when = "it answers ok".into();
+        let said = draft_said(&second, Some(&first));
+        assert!(said.starts_with("Redrafted ns-check: 2 sessions (tower-scratch, eyzflow), each in its own worktree on default, from EYZFlow. Goal: Check New space. Done when: it answers ok."), "{said}");
+        assert!(said.ends_with("Changed: named ns-check (was scratch-check); what counts as done; adds eyzflow; the project is EYZFlow."), "{said}");
+        assert!(draft_said(&first, Some(&first)).ends_with("Nothing on the card changed."));
+        let mut left = first.clone();
+        left.dropped = vec!["/nowhere/x: not a project folder here".into()];
+        assert!(draft_said(&left, None).contains("Left out /nowhere/x: not a project folder here. Launch it"));
+
+        // The plan's thread (you and the planner) and when it was ready, in time order among the rest.
+        let story = vec![Told { who: "you".into(), text: "the ticket".into(), at: 10 }, Told { who: "tower".into(), text: "Drafted…".into(), at: 20 }, Told { who: "you".into(), text: "Plan it first, as a page.".into(), at: 30 }];
+        let p = PlanView {
+            id: "p3".into(),
+            form: "page".into(),
+            status: "ready".into(),
+            url: Some("https://claude.ai/artifact/x".into()),
+            ready_ms: Some(40),
+            thread: vec![model::PlanMsg { from: "user".into(), text: "why two sessions?".into(), at: 50 }, model::PlanMsg { from: "planner".into(), text: "One per repo.".into(), at: 60 }],
+            ..Default::default()
+        };
+        let all = story_with(&story, Some(&p));
+        assert_eq!(all.iter().map(|t| (t.who.as_str(), t.at)).collect::<Vec<_>>(), [("you", 10), ("tower", 20), ("you", 30), ("tower", 40), ("you", 50), ("planner", 60)]);
+        assert!(all[3].text.starts_with("The plan is ready, a page on your claude.ai account: https://claude.ai/artifact/x."));
+        assert_eq!(story_with(&story, None), story);
     }
 
     #[test]

@@ -306,6 +306,12 @@ enum Cmd {
         /// Its PRs get no reviewer.
         #[arg(long, conflicts_with = "draft")]
         no_review: bool,
+        /// The conversation that made the space (the full window's New space: the ticket, the
+        /// drafts, the changes asked for, the planner's answers), as a JSON file of
+        /// `[{"who": "you"|"tower"|"planner", "text": "…", "at": <ms>}]`: once the space is
+        /// launched it is kept in the history as the space's own, how it was created.
+        #[arg(long, conflicts_with_all = ["draft", "dry_run"])]
+        story_file: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -881,7 +887,7 @@ fn run(cli: Cli) -> Result<()> {
             let space = space.map(|s| spaces::Asked { name: s, new: new_space });
             start(account.as_deref(), &name, cwd, on.as_deref(), space.as_ref(), no_watch, tag, &task.join(" "), no_worktree, !no_act)
         }
-        Cmd::Launch { goal, setup, name, dry_run, draft, adjust, prior, repo, title, done_when, account, plan, review, no_review, json } => {
+        Cmd::Launch { goal, setup, name, dry_run, draft, adjust, prior, repo, title, done_when, account, plan, review, no_review, story_file, json } => {
             let goal = goal.join(" ");
             if draft {
                 ticket::cmd(&goal, setup.as_deref(), adjust.as_deref(), prior.as_deref(), json)
@@ -900,6 +906,7 @@ fn run(cli: Cli) -> Result<()> {
                     account: account.as_deref(),
                     plan: plan.as_deref(),
                     review,
+                    story: story_file.as_deref(),
                 };
                 launch::cmd(&goal, &ask, dry_run, json)
             }

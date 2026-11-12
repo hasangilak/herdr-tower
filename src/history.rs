@@ -29,8 +29,11 @@ pub struct Entry {
     /// (the one line for a finished request), `space` (a space went quiet,
     /// is ready to close, or was closed: `status`, and for a close its
     /// report), `act` (what the tower opened for a request, and its undo),
-    /// and others (`queue`, `screenshot`, `pr`, `behavior`, `introduce`,
-    /// `answered`).
+    /// `creation` (a message of the conversation that made a space, in the
+    /// full window's New space, kept as that space's once it launched:
+    /// `status` is who said it, `you`, `tower` or `planner`; always
+    /// `record`), and others (`queue`, `screenshot`, `pr`, `behavior`,
+    /// `introduce`, `answered`).
     pub kind: String,
     /// The session's address (`t3`, `vps/t2`).
     #[serde(skip_serializing_if = "Option::is_none")]
