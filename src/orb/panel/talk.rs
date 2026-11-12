@@ -68,7 +68,8 @@ pub(super) fn session_said(e: &Entry) -> Option<Said> {
         },
         _ => return None,
     };
-    if said.is_empty() {
+    // Empty, or a session's own notice read as typed by an older version (a subagent's hand-back).
+    if said.is_empty() || (you && (said.starts_with("<agent-message ") || said.starts_with("<task-notification>"))) {
         return None;
     }
     Some(Said { you, text: said, at: e.at, request_at: 0, with: Some(With { addr, name, how }) })
@@ -292,7 +293,15 @@ impl Panel {
         // What still waits in the send queue for the space's sessions, at the end.
         if let Some(sp) = space {
             let agents = self.tower.read(cx).s("agents").as_array().cloned().unwrap_or_default();
-            let members: Vec<(String, String)> = self.live.iter().filter(|l| l.name == sp).flat_map(|l| l.sessions.iter().map(|(a, n, _)| (a.clone(), n.clone()))).collect();
+            // Its sessions, as its mission has them (Herdr's own list besides).
+            let all = self.decisions(cx);
+            let mut members: Vec<(String, String)> =
+                self.missions(&all, cx).open.iter().filter(|m| m.name == sp).flat_map(|m| m.sessions.iter().map(|s| (s.address.clone(), s.name.clone()))).collect();
+            for (a, n, _) in self.live.iter().filter(|l| l.name == sp).flat_map(|l| l.sessions.iter()) {
+                if !members.iter().any(|(m, _)| m == a) {
+                    members.push((a.clone(), n.clone()));
+                }
+            }
             for (addr, name) in members {
                 let Some(a) = agents.iter().find(|a| a["address"] == addr.as_str()) else { continue };
                 let name = a["name"].as_str().filter(|n| !n.is_empty()).unwrap_or(&name).to_string();
@@ -431,6 +440,7 @@ mod tests {
         assert_eq!(t.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(), ["merged on dev", "PR #787 (eyzhub/eyzflow) into dev was merged on GitHub.", "Release #787 to prod", "im logged in"]);
         assert_eq!(session_thread(&entries, "t8w", 1).len(), 1);
         // The tower's held reply, not sent because you answered in the terminal.
+        assert_eq!(session_said(&of("request", None, Some("terminal:t7p"), "t7p", "<agent-message from='ab4'> [Subagent hand-back] done", 1)), None);
         let held = of("queue", Some("not-sent"), None, "t8t", "Not sent: you answered it in the terminal (the reply was \"open it\")", 1);
         assert_eq!(session_said(&held).map(|x| (x.text, x.with.unwrap().how)), Some(("you answered it in the terminal (the reply was \"open it\")".to_string(), "not sent".to_string())));
     }

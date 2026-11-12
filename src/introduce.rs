@@ -361,9 +361,9 @@ pub fn task_from_prompt(prompt: &str) -> Option<String> {
 /// What the user asked a session for, from a text it was given: as
 /// `task_from_prompt`, and never a message from another session ("From
 /// t7h: …", "From Shop › web (t7h): …") nor the session's own notice that
-/// background work finished (`<task-notification>`).
+/// background work finished (`<task-notification>`), or its subagent's hand-back (`<agent-message …>`).
 pub fn users_task(text: &str) -> Option<String> {
-    task_from_prompt(text).filter(|t| crate::peers::sender_in(t).is_none() && !signed_by_a_session(t) && !t.starts_with("<task-notification>") && !bare_reply(t))
+    task_from_prompt(text).filter(|t| crate::peers::sender_in(t).is_none() && !signed_by_a_session(t) && !t.starts_with("<task-notification>") && !t.starts_with("<agent-message ") && !bare_reply(t))
 }
 
 /// A message that opens by saying which session wrote it, the way sessions
@@ -651,6 +651,7 @@ mod tests {
         assert_eq!(users_task("From t7h: both corrections are on the page"), None);
         assert_eq!(users_task("<hc from=\"t7p\">From t7p (Mac tower). Installed now</hc>"), None);
         assert_eq!(users_task("<task-notification> <summary>done</summary>"), None);
+        assert_eq!(users_task("<agent-message from='ab445e6ea97138f95'> [Subagent hand-back] done"), None);
         assert_eq!(users_task(&compose("B2C", &m("t1", "B2C"), &[m("t1", "B2C"), m("t2", "B2C")])), None);
         for reply in ["yeah", "Yes.", "ok", "2", "go ahead", "Do it!"] {
             assert_eq!(users_task(reply), None, "{reply} answers a question");

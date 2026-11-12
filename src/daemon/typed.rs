@@ -15,7 +15,8 @@
 //! session's; and so is one that opens the way a message between sessions
 //! does ("From t7h: …", `peers::sender_in`), whoever typed it in. A Claude
 //! Code session's own notice that background work of its own finished
-//! (`<task-notification>`) is that session's, not the user's.
+//! (`<task-notification>`), or a subagent of its own handing its work back
+//! (`<agent-message from=…>`), is that session's, not the user's.
 //!
 //! A message the send queue types into a session that is working (see
 //! `sendq`, `busy_deliver_minutes`) comes back as a prompt only when that
@@ -166,8 +167,9 @@ impl Log {
             t.taken = true;
             return Whose::Tower(t.by.clone());
         }
-        // Claude Code's own word that background work of its session finished.
-        if said.starts_with("<task-notification>") {
+        // Claude Code's own word that background work of its session finished,
+        // or a subagent of its own handing its work back.
+        if said.starts_with("<task-notification>") || said.starts_with("<agent-message ") {
             return Whose::Session;
         }
         // It opens as a message from another session does, whoever typed it in.
@@ -440,6 +442,7 @@ mod tests {
         assert_eq!(l.whose("t7r", from, None, T0), Whose::Terminal("t7p".into()));
         assert_eq!(l.whose("t7r", "From Sandbox › eyzflow (t7h): the plan is on the page", None, T0), Whose::Terminal("t7h".into()));
         assert_eq!(l.whose("t7p", "<task-notification> <summary>Goal check-in: background work still running</summary> </task-notification>", None, T0), Whose::Session);
+        assert_eq!(l.whose("t7p", "<agent-message from='ab445e6ea97138f95'> [Subagent hand-back] The text below is the subagent's report.", None, T0), Whose::Session);
         assert!(!l.users("t7p", T0) && !l.users("t7r", T0));
         // The user's own words, even about a session.
         assert_eq!(l.whose("t7r", "From now on, run the tests before every commit", None, T0), Whose::User);
