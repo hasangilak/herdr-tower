@@ -1,6 +1,8 @@
 //! The launcher (`docs/quiet-tower.md`, "Step 9"; W9 and W10 in the design):
-//! a sentence, or a whole ticket, starts a space. A goal, a project, what
-//! the tower will do, Launch; then the new space's own view opens.
+//! a sentence, or a whole ticket, starts a space. The goal is said in the
+//! conversation (the pane has no field of its own for it); beside it a
+//! project, what the tower will do, Launch; then the new space's own view
+//! opens.
 //!
 //! - **The projects** are the tower's (`tower setups --json`): each a name,
 //!   an account, what it is and its repos with their roles. None picked, the
@@ -17,9 +19,9 @@
 //!   (`tower launch "<ticket>" --repo … --name … --title … --done-when …`,
 //!   `crate::ticket::confirm_flags`); what to change is said in the
 //!   conversation (below) and redrafted (`--adjust "<words>" --prior '<the
-//!   draft>'`), which takes the card's place; Start over drops the draft.
-//!   Nothing opens before Launch. A ticket changed after its draft is
-//!   drafted again.
+//!   draft>'`), which takes the card's place; Start over drops the draft,
+//!   its conversation and the ticket. Nothing opens before Launch. A ticket
+//!   added to after its draft is drafted again.
 //! - **The conversation** (`new_chat_column`, in the column a space's
 //!   conversation has, the panel's input at its foot): what you said (the
 //!   ticket, what to change, that it be planned) and what the tower said
@@ -432,6 +434,8 @@ fn talk_from_start() -> std::collections::VecDeque<String> {
 
 /// The launcher's state.
 pub(super) struct LaunchUi {
+    /// The ticket, as the conversation has said it. It is not drawn: the
+    /// conversation shows it, and what changes it is said there.
     goal: Entity<TextareaState>,
     /// The saved projects; `None` until the tower was asked.
     setups: Option<Vec<Setup>>,
@@ -470,8 +474,7 @@ pub(super) struct LaunchUi {
 
 impl LaunchUi {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Panel>) -> Self {
-        // A whole ticket fits: it grows to 14 lines, then scrolls.
-        let goal = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 14).placeholder("Paste the ticket, or say what the space should get done"));
+        let goal = cx.new(|cx| TextareaState::new(window, cx));
         let subs = vec![cx.subscribe_in(&goal, window, |this, _, ev: &InputEvent, _, cx| {
             if matches!(ev, InputEvent::Change) {
                 this.ask_plan(cx);
@@ -534,7 +537,7 @@ impl LaunchUi {
     }
 }
 
-/// A one-line field on the white pill, as the launcher's goal.
+/// A field on the white pill (a space's goal as it is changed, a project's name, a phone's).
 pub(super) fn field(state: &Entity<TextareaState>) -> AnyElement {
     let g = glass();
     div()
@@ -579,12 +582,14 @@ impl Panel {
         }
     }
 
-    /// Puts `goal` in the launcher's field (the plan follows, as when it is typed).
+    /// `goal` is the launcher's ticket, said in its conversation (the plan
+    /// follows, as when it is said there).
     pub(super) fn launch_with(&mut self, goal: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(full) = self.full.as_ref() {
             let (field, goal) = (full.launch.goal.clone(), goal.to_string());
             field.update(cx, |s, cx| s.set_value(goal, window, cx));
         }
+        self.tell("you", goal);
         self.draft_hook(cx);
     }
 
@@ -833,7 +838,8 @@ impl Panel {
         self.run("plan-close", vec!["plan".into(), "close".into(), id.to_string()], cx, |_, _, _| {});
     }
 
-    /// Back to the plan that is open: its ticket in the field, its draft on the card.
+    /// Back to the plan that is open: its ticket is the launcher's (said
+    /// first in the conversation, the plan's thread after it), its draft on the card.
     fn plan_back(&mut self, p: &PlanView, window: &mut Window, cx: &mut Context<Self>) {
         let Some(full) = self.full.as_mut() else { return };
         let ticket = p.ticket.trim().to_string();
@@ -841,6 +847,7 @@ impl Panel {
             full.launch.draft = Some((ticket.clone(), d));
         }
         full.launch.draft_known = Some(true);
+        full.launch.story = vec![Told { who: "you".into(), text: ticket.clone(), at: p.created_ms }];
         let goal = full.launch.goal.clone();
         goal.update(cx, |s, cx| s.set_value(ticket, window, cx));
         cx.notify();
@@ -934,7 +941,9 @@ impl Panel {
         });
     }
 
-    /// Start over: the draft is dropped; the ticket stays to change or draft again.
+    /// Start over: the draft, its conversation and the ticket are dropped
+    /// (the conversation was the only place the ticket showed), and the
+    /// conversation's input waits for the next one.
     fn start_over(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A plan of it ends, and its planner.
         if let Some(full) = self.full.as_ref() {
@@ -950,7 +959,8 @@ impl Panel {
         full.notes.remove("plan");
         full.notes.remove("draft");
         let goal = full.launch.goal.clone();
-        goal.update(cx, |s, cx| s.focus(window, cx));
+        goal.update(cx, |s, cx| s.set_value("", window, cx));
+        self.text.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
     }
 
@@ -1125,7 +1135,7 @@ impl Panel {
     /// The launcher's head and body.
     pub(super) fn launch_view(&mut self, missions: &Missions, window: &mut Window, cx: &mut Context<Self>) -> (AnyElement, Vec<AnyElement>) {
         let g = glass();
-        let head = whead("New space", vec![div().child("Say in the conversation what it should get done, or paste the ticket here. Nothing opens until you launch.").into_any_element()], None);
+        let head = whead("New space", vec![div().child("Say in the conversation what it should get done, or paste the ticket there. Nothing opens until you launch.").into_any_element()], None);
         self.talk_tick(missions, window, cx);
         let plan_open = self.plan_now(cx);
         let Some(full) = self.full.as_ref() else { return (head, vec![]) };
@@ -1146,7 +1156,6 @@ impl Panel {
             .or_else(|| ui.draft_of(&goal).cloned())
             .or_else(|| planned.as_ref().and_then(|p| draft_from(&p.draft)))
             .filter(|_| drafts);
-        let goal_field = ui.goal.clone();
         // The tower's own word on what it will do, if it gave it for this goal and setup.
         let key = (goal.clone(), ui.dry_setup());
         let dry = ui.dry.as_ref().filter(|(k, _)| *k == key).map(|(_, d)| d.clone()).unwrap_or_default();
@@ -1209,14 +1218,14 @@ impl Panel {
                 h_flex().gap(px(9.0)).items_start().child(div().flex_none().child("•")).child(text)
             }),
         );
-        // How long it is, and what the first line is for.
-        let words = ui.goal.read(cx).value().split_whitespace().count();
-        let count = if words > 0 { format!("{words} word{} · ", if words == 1 { "" } else { "s" }) } else { String::new() };
-        let hint = if ui.drafts() {
-            format!("{count}Paste the ticket as it is: the tower's brain picks the repos it needs, and its title becomes the space's goal. A first line that names the repos (\"open sessions in eyzflow and mediaroom\") skips the draft.")
-        } else {
-            format!("{count}The first line says what to open (\"open sessions in eyzflow and mediaroom\"); the rest can be the whole ticket, and goes to the sessions as it is.")
-        };
+        // What the first line is for (the goal itself is in the conversation), until it names the repos.
+        let first_line = (!ui.names_repos(&goal)).then(|| {
+            if ui.drafts() {
+                "A first line that names the repos (\"open sessions in eyzflow and mediaroom\") skips the draft."
+            } else {
+                "The first line says what to open (\"open sessions in eyzflow and mediaroom\"); the rest can be the whole ticket, and goes to the sessions as it is."
+            }
+        });
 
         // What it will do: the plan; or, for a ticket to draft, the draft (or that it is being read).
         let (section, middle): (&str, AnyElement) = match (&draft, drafting) {
@@ -1237,6 +1246,7 @@ impl Panel {
                         .gap(px(7.0))
                         .child(bullets)
                         .when(!drafts && !dry.assumed.is_empty(), |el| el.child(note(dry.assumed.clone())))
+                        .children(first_line.map(|t| note(t.into())))
                         .into_any_element(),
                 },
             ),
@@ -1330,7 +1340,6 @@ impl Panel {
             .max_w(px(760.0))
             .gap(px(16.0))
             .children(stale_line)
-            .child(v_flex().gap(px(7.0)).child(label("Goal")).child(field(&goal_field)).child(div().px(px(4.0)).text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child(hint)))
             .child(v_flex().gap(px(7.0)).child(label("Project")).child(projects).children(self.said("setups")))
             .child(v_flex().gap(px(7.0)).child(label(section)).child(middle).children(review_row).children(self.said("draft")))
             .when(!plan_items.is_empty(), |el| el.child(v_flex().gap(px(10.0)).children(plan_items)))
