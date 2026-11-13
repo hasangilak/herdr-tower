@@ -93,20 +93,22 @@ pub fn known_of(name: &str, t: &Value, before: Option<&Known>) -> Known {
         status: hc::status(t),
         argv: if argv.is_empty() { before.map(|b| b.argv.clone()).unwrap_or_default() } else { argv },
         created_ms: hc::created_ms(t).or_else(|| before.and_then(|b| b.created_ms)),
+        // Its claude's own (a look with no pid, or while cca starts it: as it was).
+        account: t["state"].as_str().is_none_or(|s| s == "live").then(|| crate::accounts::of_terminal(t)).flatten().or_else(|| before.and_then(|b| b.account.clone())),
     }
 }
 
 /// The spaces' own brains as each mission's `tower`: `{"name", "status",
-/// "address"}` for a space that has one (`status`: `ready`, `working`,
+/// "address", "account"}` for a space that has one (`status`: `ready`, `working`,
 /// `starting`, `blocked`; `off` for one that is due and doesn't run).
 pub fn towers_of(known: &[Known], wanted: &BTreeSet<String>) -> BTreeMap<String, Value> {
     let mut out: BTreeMap<String, Value> = BTreeMap::new();
     for space in wanted {
-        out.insert(space.clone(), json!({ "name": brains::name_for(space), "status": "off", "address": null }));
+        out.insert(space.clone(), json!({ "name": brains::name_for(space), "status": "off", "address": null, "account": null }));
     }
     for k in known.iter().filter(|k| k.live) {
         if let Some(space) = &k.space {
-            out.insert(space.clone(), json!({ "name": k.name, "status": k.word(), "address": k.address }));
+            out.insert(space.clone(), json!({ "name": k.name, "status": k.word(), "address": k.address, "account": k.account }));
         }
     }
     out
@@ -127,7 +129,7 @@ pub fn listed(known: &[Known]) -> Vec<Value> {
     rows.iter()
         .map(|k| {
             let s = brains::started_with(&k.argv);
-            json!({ "name": k.name, "space": k.space, "address": k.address, "status": if k.status == hc::SessionStatus::Starting { "starting" } else { k.status.word() }, "model": s.model, "effort": s.effort })
+            json!({ "name": k.name, "space": k.space, "address": k.address, "status": if k.status == hc::SessionStatus::Starting { "starting" } else { k.status.word() }, "model": s.model, "effort": s.effort, "account": k.account })
         })
         .collect()
 }
@@ -660,14 +662,14 @@ mod tests {
         let known = [k.clone(), fresh.clone(), main.clone(), ended];
         let list = listed(&[fresh.clone(), k.clone(), main.clone()]);
         assert_eq!(list.iter().map(|b| (b["name"].as_str().unwrap(), b["status"].as_str().unwrap(), b["model"].as_str())).collect::<Vec<_>>(), [("tower", "done", Some("sonnet")), ("tower-docs", "starting", None), ("tower-sandbox", "idle", Some("claude-opus-5-5"))]);
-        assert_eq!(list[2], json!({ "name": "tower-sandbox", "space": "Sandbox", "address": "t12", "status": "idle", "model": "claude-opus-5-5", "effort": "high" }));
+        assert_eq!(list[2], json!({ "name": "tower-sandbox", "space": "Sandbox", "address": "t12", "status": "idle", "model": "claude-opus-5-5", "effort": "high", "account": null }));
         let running = running_of(&[k.clone(), main.clone()]);
         assert_eq!(running.iter().map(|r| (r.brain.as_str(), r.space.as_deref())).collect::<Vec<_>>(), [("tower", None), ("tower-sandbox", Some("Sandbox"))]);
         let wanted: BTreeSet<String> = ["Sandbox".to_string(), "Docs".to_string(), "Shop".to_string()].into();
         let towers = towers_of(&known[..3], &wanted);
-        assert_eq!(towers["Sandbox"], json!({ "name": "tower-sandbox", "status": "ready", "address": "t12" }));
+        assert_eq!(towers["Sandbox"], json!({ "name": "tower-sandbox", "status": "ready", "address": "t12", "account": null }));
         assert_eq!(towers["Docs"]["status"], "starting");
-        assert_eq!(towers["Shop"], json!({ "name": "tower-shop", "status": "off", "address": null }), "due one, and it doesn't run (it died, or the main brain is down)");
+        assert_eq!(towers["Shop"], json!({ "name": "tower-shop", "status": "off", "address": null, "account": null }), "due one, and it doesn't run (it died, or the main brain is down)");
         assert_eq!(towers.len(), 3, "the main brain is nobody's own tower");
     }
 

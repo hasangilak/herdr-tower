@@ -24,7 +24,7 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 use super::state::lock;
 use crate::accounts::{Account, Usage};
 use crate::failover::{self, Book, Limit, Moved, Pick, Waiting};
-use crate::hc;
+use crate::{hc, usage};
 
 /// How often the sessions that wait for an account are looked at.
 const TICK: Duration = Duration::from_secs(30);
@@ -100,6 +100,8 @@ pub struct Failover {
     moving: Arc<Mutex<BTreeSet<String>>>,
     /// One look at the waiting at a time.
     busy: Arc<Mutex<()>>,
+    /// Something changed: the accounts' board is looked at again now (`publish_to`).
+    kick: Arc<(Mutex<bool>, Condvar)>,
 }
 
 static RUNNING: OnceLock<Failover> = OnceLock::new();
@@ -126,7 +128,7 @@ impl Failover {
 
     pub fn with(path: PathBuf, decisions: super::decisions::Decisions, hands: Arc<dyn Hands>) -> Failover {
         let book = failover::load_from(&path);
-        Failover { book: Arc::new(Mutex::new(book)), path, decisions, hands, moving: Arc::default(), busy: Arc::default() }
+        Failover { book: Arc::new(Mutex::new(book)), path, decisions, hands, moving: Arc::default(), busy: Arc::default(), kick: Arc::default() }
     }
 
     /// Runs it: the tick that looks at what waits for an account.
@@ -145,6 +147,60 @@ impl Failover {
         if let Err(e) = failover::save_to(&self.path, b) {
             eprintln!("[failover] {}: {e:#}", self.path.display());
         }
+        self.kick();
+    }
+
+    fn set_moving(&self, address: &str, on: bool) {
+        {
+            let mut m = lock(&self.moving);
+            if on {
+                m.insert(address.to_string());
+            } else {
+                m.remove(address);
+            }
+        }
+        self.kick();
+    }
+
+    /// The board is looked at again now, not at the next `usage::LOOK`.
+    fn kick(&self) {
+        let (flag, cv) = &*self.kick;
+        *lock(flag) = true;
+        cv.notify_all();
+    }
+
+    /// Each account's usage and what the tower found of it (`crate::usage`).
+    /// None: the accounts mod didn't answer.
+    pub fn board(&self) -> Option<usage::Board> {
+        let (list, used) = self.hands.accounts().ok()?;
+        let moving: Vec<String> = lock(&self.moving).iter().cloned().collect();
+        let book = lock(&self.book).clone();
+        Some(usage::board(&list, &used, &book, &moving, self.hands.now()))
+    }
+
+    /// Keeps the state's `accounts` current: every `usage::LOOK`, and at
+    /// once when the failover changes something (an account found out, a
+    /// session moving, moved, or waiting). Written only when it changed.
+    pub fn publish_to(&self, shared: super::state::Shared) {
+        let me = self.clone();
+        let _ = thread::Builder::new().name("accounts".into()).spawn(move || {
+            loop {
+                if let Some(b) = me.board() {
+                    let v = serde_json::to_value(&b).unwrap_or_default();
+                    shared.update(|s| {
+                        if s.accounts != v {
+                            s.accounts = v;
+                        }
+                    });
+                }
+                let (flag, cv) = &*me.kick;
+                let mut kicked = lock(flag);
+                if !*kicked {
+                    kicked = cv.wait_timeout(kicked, usage::LOOK).map(|(g, _)| g).unwrap_or_else(|e| e.into_inner().0);
+                }
+                *kicked = false;
+            }
+        });
     }
 
     pub fn holding(&self, address: &str) -> bool {
@@ -203,12 +259,12 @@ impl Failover {
         );
         match pick {
             Pick::To(to) => {
-                lock(&self.moving).insert(address.clone());
+                self.set_moving(&address, true);
                 let me = self.clone();
                 let answer = json!({ "moving": true, "from": from, "to": to });
                 let _ = thread::Builder::new().name("failover-move".into()).spawn(move || {
                     me.carry(&address, &hit, &name, space, &from, &to, &limit, until, &prompt);
-                    lock(&me.moving).remove(&address);
+                    me.set_moving(&address, false);
                     me.hands.released(&address);
                 });
                 answer
@@ -491,11 +547,11 @@ impl Failover {
             }
             match failover::pick(&list, &usage, &book, Some(&own), now) {
                 Pick::To(to) => {
-                    lock(&self.moving).insert(w.address.clone());
+                    self.set_moving(&w.address, true);
                     let hit = Hit { terminal: w.address.clone(), tower: w.tower.clone(), prompt: w.prompt.clone(), ..Default::default() };
                     let until = book.out.get(&own).and_then(|o| failover::out_until(o, now));
                     self.carry(&w.address, &hit, &w.name, w.space.clone(), &own, &to, &w.limit, until, &w.prompt);
-                    lock(&self.moving).remove(&w.address);
+                    self.set_moving(&w.address, false);
                     went.push(w.address.clone());
                 }
                 Pick::AllOut { first: f } => {
@@ -596,7 +652,7 @@ impl Failover {
         };
         let name = hc::name(&t).unwrap_or(&address).to_string();
         let space = crate::spaces::space_of(&t);
-        lock(&self.moving).insert(address.clone());
+        self.set_moving(&address, true);
         let me = self.clone();
         let (a, f, to2) = (address.clone(), from.clone(), to.clone());
         thread::spawn(move || {
@@ -628,7 +684,7 @@ impl Failover {
             });
             me.save(&b);
             drop(b);
-            lock(&me.moving).remove(&a);
+            me.set_moving(&a, false);
             me.hands.released(&a);
         });
         Ok(json!({ "moving": address, "from": from, "to": to }))
@@ -879,6 +935,37 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("{address} never finished moving");
+    }
+
+    #[test]
+    fn the_states_board_follows_the_usage_and_a_move_at_once() {
+        let now = 1_794_590_000_000;
+        let mut usage = BTreeMap::new();
+        usage.insert("default".to_string(), Usage { five_hour: Some(crate::accounts::Window { used: 64.0, resets_ms: Some(now + 3_600_000) }), seven_day: None });
+        let (f, _, _, dir) = setup(Fake { t: Mutex::new(session("t5", "fix-login")), accounts: vec![acc("default"), acc("orca")], usage, now, ..Default::default() });
+        let shared = Shared::new(State::new("ptt", "test", "test"));
+        f.publish_to(shared.clone());
+        // Within 3 s, far less than a `usage::LOOK`: only a kick gets it there that soon.
+        let wait = |what: &str, ok: &dyn Fn(&crate::usage::Board) -> bool| {
+            for _ in 0..300 {
+                if let Some(b) = shared.with(|s| crate::usage::of_state(&json!({ "accounts": s.accounts }))).filter(|b| ok(b)) {
+                    return b;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the board never showed {what}: {}", shared.with(|s| s.accounts.clone()));
+        };
+        let first = wait("the accounts", &|b| b.list.len() == 2);
+        assert_eq!((first.list[0].five_hour.as_ref().map(|w| w.used), first.list[0].out_until_ms, first.starts_on.as_deref()), (Some(64.0), None, Some("default")));
+        assert!(first.moves.is_empty() && first.moving.is_empty());
+        f.limited(hit("t5"));
+        settled(&f, "t5");
+        let after = wait("the move", &|b| !b.moves.is_empty() && b.moving.is_empty());
+        let m = &after.moves[0];
+        assert_eq!((m.address.as_str(), m.from.as_str(), m.to.as_str(), m.how.as_str()), ("t5", "default", "orca", "moved"));
+        assert_eq!((after.list[0].out_why.as_str(), after.starts_on.as_deref()), ("5-hour limit", Some("orca")), "the default is out, so new sessions start on orca");
+        assert!(after.list[0].out_until_ms.is_some_and(|u| u > now));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -58,6 +58,7 @@ mod split;
 mod tell;
 mod text;
 mod unsent;
+mod usage;
 mod ticket;
 mod worktrees;
 
@@ -460,11 +461,19 @@ enum Cmd {
         /// The name as the user said it.
         name: Vec<String>,
     },
-    /// The Claude accounts the claude-accounts mod (`cca`) knows; the first is the default.
+    /// The Claude accounts the claude-accounts mod (`cca`) knows; the first is the default. `--usage`:
+    /// each account's 5-hour and 7-day usage (as cca recorded it) and whether the tower found it out of
+    /// usage, then every tower and session by space with the account it runs on, and those the failover moved.
     Accounts {
         /// Another machine's accounts.
         #[arg(long)]
         on: Option<String>,
+        /// Usage, and who runs on which account.
+        #[arg(long)]
+        usage: bool,
+        /// As JSON (also when not printed to a terminal).
+        #[arg(long)]
+        json: bool,
     },
     /// The phone API for the Android app (docs/mobile-api.md): enable, disable, pair, devices, network [name "<name>"], rename <id> "<name>", route <id> phone|mac, revoke <id|all>.
     Phone {
@@ -1040,7 +1049,8 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Agenda { action, args, all, force, title, space } => agenda_cmd(&action, &args, all, force, title, space),
         Cmd::Introduce { space, dry_run } => introduce_cmd(&space.join(" "), dry_run),
         Cmd::Reopen { action, spaces, dry_run, json } => reopen_cmd(action.as_deref().unwrap_or("list"), &spaces, dry_run, json),
-        Cmd::Accounts { on } => list_accounts(on.as_deref()),
+        Cmd::Accounts { usage: true, json, .. } => accounts_usage(json),
+        Cmd::Accounts { on, .. } => list_accounts(on.as_deref()),
         Cmd::Failover { action, target, to, json } => failover_cmd(action.as_deref().unwrap_or("status"), target.as_deref().unwrap_or(""), to.as_deref().unwrap_or(""), json),
         Cmd::Project { name } => {
             let asked = name.join(" ");
@@ -2717,6 +2727,69 @@ fn list_accounts(on: Option<&str>) -> Result<()> {
         }
     } else {
         print_json(&json!({ "default": list.first().map(|a| &a.name), "accounts": list }));
+    }
+    Ok(())
+}
+
+/// `tower accounts --usage`: the board (`usage::board`, read now from cca
+/// and the failover's book, as the daemon reads it) and every seat in the
+/// state, with its account.
+fn accounts_usage(json_out: bool) -> Result<()> {
+    let now = history::now_ms();
+    let (list, used) = accounts::list_with_usage()?;
+    let mut state: Value = std::fs::read_to_string(config::ui_dir().join("state.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    // Who is moving only the daemon knows: as its board says.
+    let moving = usage::of_state(&state).map(|b| b.moving).unwrap_or_default();
+    let board = usage::board(&list, &used, &failover::load_from(&failover::path()), &moving, now);
+    // A daemon that doesn't say a tower's account: asked of its terminal here.
+    for b in state["brains"].as_array_mut().into_iter().flatten() {
+        if b["account"].as_str().is_none_or(str::is_empty)
+            && let Some(a) = b["address"].as_str().and_then(accounts::of_address)
+        {
+            b["account"] = json!(a);
+        }
+    }
+    let groups = usage::seats(&state, Some(&board));
+    if json_out || !std::io::stdout().is_terminal() {
+        print_json(&json!({ "accounts": board, "groups": groups }));
+        return Ok(());
+    }
+    if board.list.is_empty() {
+        println!("No Claude accounts: the claude-accounts mod (cca) isn't installed.");
+    }
+    for l in &board.list {
+        let mut tags = vec![];
+        if l.default {
+            tags.push("the default".to_string());
+        }
+        if board.starts_on.as_deref() == Some(l.name.as_str()) {
+            tags.push("new sessions start here".to_string());
+        }
+        let tags = if tags.is_empty() { String::new() } else { format!("  ({})", tags.join(", ")) };
+        println!("{}  {}{tags}", l.name, l.email);
+        println!("  {}   {}", usage::window_words("5h", l.five_hour.as_ref(), now), usage::window_words("7d", l.seven_day.as_ref(), now));
+        let out = usage::out_words(l, now);
+        if !out.is_empty() {
+            println!("  {out}");
+        }
+        let (sessions, towers) = usage::on(&groups, &l.name);
+        println!("  runs {sessions} session(s) and {towers} tower(s)");
+    }
+    for g in &groups {
+        println!("\n{}", g.title());
+        for s in &g.seats {
+            let mut line = format!("  {} ({}){}  {}", s.name, s.address, if s.tower { " tower" } else { "" }, s.account.as_deref().unwrap_or("–"));
+            if let Some(m) = &s.moved {
+                line.push_str(&format!("  · {}", usage::moved_words(m, now)));
+            }
+            if s.moving {
+                line.push_str("  · moving now");
+            }
+            if s.waiting {
+                line.push_str("  · waits for an account");
+            }
+            println!("{line}");
+        }
     }
     Ok(())
 }

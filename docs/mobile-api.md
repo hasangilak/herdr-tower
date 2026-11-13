@@ -496,7 +496,7 @@ The state (`GET /v1/state`, event `state`):
   "agents": [{"address": "t22", "name": "Claude in eyzflow", "status": "working", "app": "claude-code", "account": "default"}],
   "error": "", "talk_key": "ctrl", "voice": "af_bella", "stt_model": "…",
   "decisions_count": 2, "tell_level": "decisions",
-  "brains": [{"name": "tower", "space": null, "address": "t7", "status": "idle", "model": "claude-opus-5-5", "effort": "high"}],
+  "brains": [{"name": "tower", "space": null, "address": "t7", "status": "idle", "model": "claude-opus-5-5", "effort": "high", "account": "default"}],
   "brain_model": {"program": "claude", "model": "claude-opus-5-5", "effort": "high", "…": "see \"The brains' model\""},
   "lan": "https://192.168.1.20:7843",
   "lan_hosts": [{"kind": "lan", "host": "192.168.1.20", "port": 7843}, {"kind": "tailscale", "host": "100.68.110.33", "port": 7843, "dns_name": "mac.tailnet.ts.net"}],
@@ -865,6 +865,39 @@ merged into dev, on dev, on prod, closed; and `stage_line`), and each
 release (`Release #n dev → main`, "landed on main 14:20" or "under way",
 "carried #829, #830"). Times are the tower's (`*_ms`); the `lines` and
 `stage_line` already say them in the Mac's local time.
+
+**Accounts and usage** (feature `accounts`). Which Claude account each
+tower and session runs on, how much of each account's usage limit is used,
+and what the account failover moved. The state's `accounts` (null until the
+daemon's first look; it looks every 15 s, and at once when the failover
+acts):
+
+```
+{ "list": [ { "name": "default", "email", "default": true,
+              "five_hour": { "used": 42.0, "resets_ms": 1794603600000 } | null,
+              "seven_day": { "used": 12.0, "resets_ms": … } | null,
+              "out_until_ms": null | 1794603600000, "out_why": "5-hour limit" } ],
+  "starts_on": "default",                     (the account a new session starts on)
+  "moves": [ { "at_ms", "address", "name", "space", "tower", "from", "to",
+               "session_id", "how": "moved" | "failed", "why" } ],   (oldest first, the last week)
+  "moving": ["t12"],                          (being moved now)
+  "waiting": [ { "address", "account", "since_ms", "why" } ] }  (every account out)
+```
+
+`used` is a percent of the window's limit, as the accounts mod (`cca`)
+last recorded it; a window past its reset reads as 0 with no `resets_ms`;
+null: nothing recorded. Who runs where: `account` on each of `agents`, on
+each mission's `sessions[]` (`GET /v1/missions`), and now on each of
+`brains` and each mission's `tower`. A seat was moved by the failover when
+the last of `moves` with its `address` has `how: "moved"` and its `to` is
+the account it runs on now.
+
+What the Android app needs (it doesn't show it yet): the accounts with
+both windows as bars (amber from 80 %, and "out until 15:00 (5-hour
+limit)" while `out_until_ms` is set), and on each space's screen each
+session's and the tower's account, a moved one marked "moved from default
+at 15:02". The Mac's full window has it as its Accounts view and a strip in
+its sidebar.
 
 **Breaking changes** (feature `impact`). A PR carries `impact`: `{things:
 [{kind: function | type | route | field | column | config | event, name,
@@ -1795,6 +1828,7 @@ stream's `hello` event). A tower from before there were features sends no
 | `acts` | Acts and what came with them: `GET /v1/acts`, `/v1/acts/{id}`, `POST /v1/acts/{id}/undo`, the chat's `kind: "act"` messages and the `act` event; `rule` in a decision's answer and `POST /v1/decisions/{id}/rule`; `voice` in `/v1/tell` and `tell_voice` in the state |
 | `reviews` | PR review: `review` on a PR (`GET /v1/prs`, the `pr` event, a chat chip's `pr`, a merge decision's `prs[]`), `review` on a mission, `reviews` in the state, and a review that isn't agreed among a merge's `warnings` |
 | `releases` | Each space's release track: `releases` in the state (by space) and `GET /v1/releases` (`?space=` for one) |
+| `accounts` | Each Claude account's usage and the failover's moves: `accounts` in the state, and `account` on each of the state's `brains` and on a mission's `tower` (see "Accounts and usage") |
 | `impact` | Who outside depends on what a PR changes: `impact` on a PR (wherever `score` is) and `dependents` / `outside` on a predicted one (`plan.prs`), and a breaking change's warning among a merge's `warnings` |
 | `validation` | A predicted PR's `checks` and `edge_cases` (`plan.prs`), and `validation` on a PR (wherever `score` is), with the missing checks among a merge's `warnings` |
 | `scores` | Review scores: `score` and `auto` on a PR (wherever `review` is), a plan's predicted PRs (`plan.prs`), `auto_merge` in the state, `merged_by: "tower"`, and a PR that needs review among a merge's `warnings` |
