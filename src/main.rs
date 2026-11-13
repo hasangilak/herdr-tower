@@ -18,6 +18,7 @@ mod behaviors;
 mod brain;
 mod brains;
 mod chat;
+mod choices;
 mod config;
 mod covered;
 mod daemon;

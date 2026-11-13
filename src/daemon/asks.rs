@@ -14,7 +14,7 @@
 //! A set that is the user's is a decision (`decisions`): the same thing
 //! asked by several sessions of a space is one, told once.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
@@ -37,6 +37,9 @@ type Record = Arc<dyn Fn(crate::history::Entry) + Send + Sync>;
 /// what the reply the tower holds for it answers (that reply): then the
 /// reply is moot (`covered::answers_held`; tests give their own).
 type Covers = Arc<dyn Fn(&str, &str, &str) -> Result<bool> + Send + Sync>;
+/// A card's own buttons, read from what its session said (`crate::choices`):
+/// (its name, its message, what it waits for).
+type Choices = Arc<dyn Fn(&str, &str, &str) -> Result<Vec<questions::Rec>> + Send + Sync>;
 /// Whether a message the tower passed on answers a question: (the session's
 /// name, what it asked, the user's words to the tower, the message).
 type Relays = Arc<dyn Fn(&str, &str, &str, &str) -> Result<bool> + Send + Sync>;
@@ -208,6 +211,8 @@ struct Inner {
     /// stops showing it (answered, gone), so the same dialog asked again is
     /// told again.
     noted: Vec<String>,
+    /// Sets whose buttons were given (`give_buttons`): once each.
+    buttoned: HashSet<String>,
     /// Dialogs the user dismissed (session, id): not shown again while the
     /// session still shows them.
     dismissed: Vec<(String, String)>,
@@ -340,6 +345,8 @@ pub struct Asks {
     record: Record,
     waits: Waits,
     covers: Covers,
+    /// The buttons of a card that is the user's with nothing to tap (`give_buttons`).
+    choices: Choices,
     /// Whether a message a brain passed on answers a session's question (`relayed`).
     relays: Relays,
     /// Answers a set the tower decided to answer itself (`auto_answer`,
@@ -378,6 +385,8 @@ impl Asks {
             }),
             waits: Waits::default(),
             covers: Arc::new(crate::covered::answers_held),
+            // (Tests never ask the model: they give their own, else the generic buttons stay.)
+            choices: if cfg!(test) { Arc::new(|_: &str, _: &str, _: &str| -> Result<Vec<questions::Rec>> { bail!("no model in tests") }) } else { Arc::new(crate::choices::derive) },
             relays: Arc::new(crate::covered::answers_question),
             answers: Arc::new(|a: &Asks, id: &str| {
                 let (me, id) = (a.clone(), id.to_string());
@@ -1113,6 +1122,10 @@ impl Asks {
             eprintln!("[questions] {} closed: {:?}", c.id, c.state.phase);
             self.event("closed", None, &c.id);
         }
+        // The user's with nothing to tap (a wait, a question after their own turn): buttons.
+        if set.kind == "text" && set.state.decision == Decision::Escalated && self.give_buttons(&set.id) {
+            set = self.get(&set.id).unwrap_or(set);
+        }
         // Claude's own memory or notes: the tower's plain yes, nobody asked.
         if note && self.memory_rule(&set) {
             return self.get(&set.id).unwrap_or(set);
@@ -1640,6 +1653,70 @@ impl Asks {
         self.publish();
         self.event("update", Some(&set), id);
         self.tell_escalated(&set);
+        // Read, but with nothing to tap: buttons all the same.
+        self.give_buttons(id);
+    }
+
+    /// A text set that is the user's with nothing to tap (one question, no
+    /// answers: a wait, a question after a turn they typed, one escalated
+    /// without any): the generic buttons at once, then choices of its own
+    /// read from what the session said (`choices`: one headless call, in a
+    /// thread) in their place, while nobody has answered. Once per set.
+    /// Whether it gave them.
+    fn give_buttons(&self, id: &str) -> bool {
+        let set = {
+            let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(k) = i.sets.iter().position(|s| s.id == id) else { return false };
+            let s = &i.sets[k];
+            let has = s.recommendations.as_ref().is_some_and(|r| r.iter().any(|t| !t.options.is_empty()));
+            if s.kind != "text" || s.tabs.len() != 1 || s.state.decision != Decision::Escalated || has || i.buttoned.contains(id) {
+                return false;
+            }
+            i.buttoned.insert(id.to_string());
+            let s = &mut i.sets[k];
+            s.recommendations = Some(vec![questions::TabRecs { tab: 0, options: crate::choices::generic() }]);
+            s.clone()
+        };
+        self.save();
+        self.publish();
+        self.event("update", Some(&set), id);
+        let me = self.clone();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let got = (me.choices)(&set.name, &set.detail, &set.title);
+            let id = set.id.clone();
+            match got {
+                Ok(recs) => {
+                    let now = {
+                        let mut i = me.inner.lock().unwrap_or_else(|e| e.into_inner());
+                        // Still open, nobody answering, and still the generic ones.
+                        i.sets.iter_mut().find(|s| s.id == id && !matches!(s.status.as_str(), "answering" | "queued")).and_then(|s| {
+                            let generic = s.recommendations.as_ref().and_then(|r| r.first()).is_some_and(|t| crate::choices::is_generic(&t.options));
+                            generic.then(|| {
+                                s.recommendations = Some(vec![questions::TabRecs { tab: 0, options: recs.clone() }]);
+                                s.clone()
+                            })
+                        })
+                    };
+                    match now {
+                        Some(s) => {
+                            me.save();
+                            me.publish();
+                            me.event("update", Some(&s), &id);
+                            eprintln!(
+                                "[questions] {id} ({}): its buttons, read from what it said in {} ms: {}",
+                                s.session,
+                                started.elapsed().as_millis(),
+                                recs.iter().map(|r| r.label.as_str()).collect::<Vec<_>>().join(" / ")
+                            );
+                        }
+                        None => eprintln!("[questions] {id}: answered (or over) before its own buttons came; left as it is"),
+                    }
+                }
+                Err(e) => eprintln!("[questions] {id}: no buttons of its own ({e:#}): Go ahead / Not yet stay"),
+            }
+        });
+        true
     }
 
     /// The user's card after all, said to nobody: they are in its dialog already.
@@ -3127,6 +3204,78 @@ mod tests {
         a.relays = Arc::new(|_: &str, _: &str, _: &str, _: &str| Err(anyhow::anyhow!("claude: timed out")));
         assert!(a.relayed("tw-rl2", "go ahead", q2.at_ms + 2000, "go ahead").is_empty());
         assert!(a.get(&q2.id).is_some());
+    }
+
+    /// Waits until the set's buttons are no longer the generic ones (or a second has gone by).
+    fn own_buttons(a: &Asks, id: &str) -> Vec<String> {
+        for _ in 0..200 {
+            let recs = a.get(id).and_then(|s| s.recommendations).and_then(|r| r.first().cloned()).map(|t| t.options).unwrap_or_default();
+            if !crate::choices::is_generic(&recs) {
+                return recs.iter().map(|r| r.label.clone()).collect();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        vec![]
+    }
+
+    /// A turn that ends waiting for the user is a card with buttons: "Go
+    /// ahead" and "Not yet" at once, then two or three of its own, read from
+    /// what the session said, the tower's pick first; each is an option of
+    /// its decision (the phone's buttons) and sends its instruction. A vague
+    /// wait keeps the generic ones; one answered before its own came keeps
+    /// what it had; a question the brain read keeps its own answers.
+    #[test]
+    fn a_card_that_waits_for_the_user_has_buttons_to_answer_it() {
+        let (mut a, d, _user, _record) = recording(None);
+        let message = "Production confirms the number: 22 offers. Both commits (1a235c3a, 8d2d649d) are still local on isa/eyzflow, waiting for your call on a push and PR.";
+        let request = "Both commits are still local on isa/eyzflow, waiting for your call on a push and PR.";
+        let asked = Arc::new(Mutex::new(vec![]));
+        let seen = asked.clone();
+        a.choices = Arc::new(move |name: &str, msg: &str, req: &str| -> Result<Vec<questions::Rec>> {
+            seen.lock().unwrap().push(format!("{name} | {} | {req}", msg.contains("22 offers")));
+            // As the model takes a moment.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            if !req.contains("push") {
+                bail!("nothing specific");
+            }
+            Ok(vec![
+                questions::Rec { label: "Push and open the PR into dev".into(), why: "production confirmed the count".into(), choice: json!({ "other": "Push both commits and open a PR into dev." }) },
+                questions::Rec { label: "Push, no PR yet".into(), why: String::new(), choice: json!({ "other": "Push both commits, but don't open a PR yet." }) },
+                questions::Rec { label: "Not yet".into(), why: String::new(), choice: json!({ "other": "Not yet: keep them local and wait for me." }) },
+            ])
+        });
+        let set = a.waiting("tw-b1", "eyzflow", None, message, request, "", true).unwrap();
+        // At once: never a card with nothing to tap.
+        let now = a.get(&set.id).unwrap();
+        assert_eq!(now.recommendations.as_ref().unwrap()[0].options, crate::choices::generic());
+        // A moment later: its own, read from what it said.
+        assert_eq!(own_buttons(&a, &set.id), ["Push and open the PR into dev", "Push, no PR yet", "Not yet"]);
+        assert_eq!(asked.lock().unwrap().as_slice(), [format!("eyzflow | true | {request}")]);
+        // Its decision offers them, the tower's pick first: the phone shows the same.
+        let id = d.for_question(&set.id)[0].clone();
+        let opts = d.get(&id).unwrap().options;
+        assert_eq!(opts.iter().map(|o| (o.label.as_str(), o.pick)).collect::<Vec<_>>(), [("Push and open the PR into dev", true), ("Push, no PR yet", false), ("Not yet", false)]);
+        assert_eq!(opts[0].why, "production confirmed the count");
+        // A tap sends its instruction (the reply typed into the session).
+        let answers: Vec<questions::Answer> = serde_json::from_value(opts[0].answers.clone()).unwrap();
+        assert_eq!(questions::compose_reply(&a.get(&set.id).unwrap(), &answers).unwrap(), "Push both commits and open a PR into dev.");
+
+        // A vague wait: nothing specific comes, the generic ones stay, and they send plain words.
+        let vague = a.waiting("tw-b2", "api", None, "Done on my side.", "Waits for you.", "", true).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let recs = a.get(&vague.id).unwrap().recommendations.unwrap()[0].options.clone();
+        assert!(crate::choices::is_generic(&recs));
+        let did = d.get(&d.for_question(&vague.id)[0]).unwrap().options;
+        assert_eq!(did.iter().map(|o| o.label.as_str()).collect::<Vec<_>>(), ["Go ahead", "Not yet"]);
+        let go: Vec<questions::Answer> = serde_json::from_value(did[0].answers.clone()).unwrap();
+        assert_eq!(questions::compose_reply(&a.get(&vague.id).unwrap(), &go).unwrap(), "Go ahead with what you proposed.");
+
+        // A question after a turn the user typed: buttons too (generic here: the fake reads only pushes).
+        let typed = a.asked_after(text_q("tw-b3", "web"), true);
+        assert!(a.get(&typed.id).unwrap().recommendations.is_some_and(|r| !r[0].options.is_empty()));
+        // A question the brain still reads (it recommends its own): no buttons from here.
+        let read = a.asked_after(text_q("tw-b4", "docs"), false);
+        assert!(a.get(&read.id).unwrap().recommendations.is_none());
     }
 
     /// The user replies in the terminal to the question a session asked at
