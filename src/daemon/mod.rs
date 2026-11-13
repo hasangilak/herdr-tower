@@ -16,6 +16,7 @@ pub mod missions;
 pub mod narrate;
 pub mod plans;
 pub mod queue;
+pub mod reopen;
 pub mod reviews;
 pub mod sendq;
 pub mod sessions;
@@ -290,6 +291,8 @@ pub fn run() -> Result<()> {
         missions::Missions::new(shared.clone(), decisions.clone(), agendas.clone(), move |note| watches.tell_agenda(note))
     };
     missions.start();
+    // What a restart of the Mac or Herdr closes, kept with the missions' looks and offered back.
+    reopen::Reopen::open(decisions.clone()).start();
     // What the tower opened for the user lately, to show with the reply and to undo.
     let acts = acts::Acts::open(shared.clone(), hub.clone());
     // A space's plan before it is launched, and its planner (`tower plan`).
@@ -596,6 +599,15 @@ impl Daemon {
                 return self.queue(&action, &session, &text, id, &after, tag, from.as_deref());
             }
             Request::Agenda { ledger } => return self.agendas.request(&ledger),
+            Request::Reopen { action, spaces, dry_run } => {
+                return match reopen::get() {
+                    Some(r) => match r.request(&action, &spaces, dry_run) {
+                        Ok(v) => Response { ok: true, error: None, state: Some(v) },
+                        Err(e) => Response::err(format!("{e:#}")),
+                    },
+                    None => Response::err("the tower keeps nothing to reopen yet"),
+                };
+            }
             Request::Introduce { action, space, dry_run } => {
                 if action == "kick" {
                     self.introducer.kick();
@@ -1054,7 +1066,13 @@ impl Daemon {
             Ok(serde_json::json!({ "session": address, "name": name, "queue_id": queue_id, "sent": now }))
         };
         let agenda = |c: &crate::agenda::Cmd| self.agendas.request(c);
-        self.decisions.answer_with(id, body, submit, &decisions::Carry { asks: &self.asks, send: &send, agenda: &agenda })
+        let reopen = |p: &crate::reopen::Pick| -> anyhow::Result<serde_json::Value> {
+            match reopen::get() {
+                Some(r) => r.answer(p),
+                None => anyhow::bail!("the tower keeps nothing to reopen yet"),
+            }
+        };
+        self.decisions.answer_with(id, body, submit, &decisions::Carry { asks: &self.asks, send: &send, agenda: &agenda, reopen: &reopen })
     }
 
     fn answer_decision(&self, id: &str, body: &serde_json::Value, submit: bool) -> Response {

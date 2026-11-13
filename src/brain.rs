@@ -404,8 +404,10 @@ pub fn launch_voice() -> Result<()> {
     }
     if hc::is_live(VOICE_NAME) {
         let _ = hc::run(&["kill", VOICE_NAME]);
-        let _ = hc::run(&["rm", VOICE_NAME]);
     }
+    // One that ended keeps the name until it is removed: after a restart of
+    // the Mac, the last run's voice (ended by the restart) still has it.
+    let _ = hc::run(&["rm", VOICE_NAME]);
     let tower = config::tower_bin().display().to_string();
     let home = config::home().display().to_string();
     let out =
@@ -413,19 +415,27 @@ pub fn launch_voice() -> Result<()> {
     if out.code != 0 {
         bail!("starting the voice: {}{}", out.stderr.trim(), out.stdout.trim());
     }
+    // This run's own terminal, by its address: by the name, a lookup may find the one before.
+    let v: serde_json::Value = serde_json::from_str(out.stdout.trim()).unwrap_or_default();
+    let me = v["address"].as_str().or_else(|| v["terminal"]["address"].as_str()).unwrap_or(VOICE_NAME).to_string();
     // Models load before the socket opens: Whisper and Kokoro take a few seconds.
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(600) {
         if crate::protocol::is_running() {
             return Ok(());
         }
-        if !hc::is_live(VOICE_NAME) {
-            let screen = hc::run(&["read", VOICE_NAME, "--lines", "40"]).map(|o| o.stdout).unwrap_or_default();
+        if hc::get(&me).is_some_and(|t| finished(&t)) {
+            let screen = hc::run(&["read", &me, "--lines", "40"]).map(|o| o.stdout).unwrap_or_default();
             bail!("the voice stopped while starting:\n{}", screen.trim());
         }
         thread::sleep(Duration::from_millis(300));
     }
-    bail!("the voice took more than ten minutes to start (downloading models?); see `hc read {VOICE_NAME}`")
+    bail!("the voice took more than ten minutes to start (downloading models?); see `hc read {me}`")
+}
+
+/// A terminal whose program ended (one still being made isn't that).
+fn finished(t: &serde_json::Value) -> bool {
+    t["state"] == "finished" || t["finished_ms"].as_u64().is_some()
 }
 
 pub fn stop(name: &str) -> bool {

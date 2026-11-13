@@ -155,6 +155,15 @@ pub fn created_ms(t: &Value) -> Option<u64> {
     t["created_ms"].as_u64()
 }
 
+/// When this machine's core started (Unix ms, from its uptime): a later
+/// one than a session was seen under means the core (or the Mac) started
+/// again since, and every program it ran then is gone. None: hc didn't say.
+pub fn core_since_ms() -> Option<u64> {
+    let v = json(&["server", "status"]).ok()?;
+    let up = v["uptime_ms"].as_u64()?;
+    Some(crate::history::now_ms().saturating_sub(up))
+}
+
 /// How many turns the agent in it has taken (Herdr counts them).
 pub fn turn(t: &Value) -> Option<u64> {
     t["turn"].as_u64()

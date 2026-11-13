@@ -418,13 +418,13 @@ pub fn seen_of(row: &Value, full: Option<&Value>, said: Option<String>) -> Optio
     if crate::brain::brain_of(t).is_some() || crate::brain::brain_of(row).is_some() || name == crate::brain::VOICE_NAME {
         return None;
     }
-    if crate::daemon::watch::left_alone(t) {
+    // Whose it is shows in its labels: a row of `hc ls` has none, so a test
+    // daemon (whose sessions are the labelled ones) tells only by the closer look.
+    if (full.is_some() || !crate::daemon::watch::test_daemon()) && crate::daemon::watch::left_alone(t) {
         return None;
     }
     let given = worktrees::given(t);
-    let said = said.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).map(|s| {
-        if s.chars().count() > SAID_CHARS { format!("{}…", s.chars().take(SAID_CHARS).collect::<String>().trim_end()) } else { s }
-    });
+    let said = said.map(|s| clip_said(&s)).filter(|s| !s.is_empty());
     Some(Seen {
         space,
         address: row["address"].as_str()?.to_string(),
@@ -436,6 +436,12 @@ pub fn seen_of(row: &Value, full: Option<&Value>, said: Option<String>) -> Optio
         port: given.port,
         said,
     })
+}
+
+/// A session's last words as a space shows them: trimmed, cut short.
+pub fn clip_said(s: &str) -> String {
+    let s = s.trim();
+    if s.chars().count() > SAID_CHARS { format!("{}…", s.chars().take(SAID_CHARS).collect::<String>().trim_end()) } else { s.to_string() }
 }
 
 /// Every agent session in a space, here and on the other machines, as
@@ -453,7 +459,8 @@ pub fn scan(get: &dyn Fn(&str) -> Option<Value>, said: &dyn Fn(&str) -> Option<S
         let full = get(address);
         out.extend(seen_of(&row, full.as_ref(), said(address)));
     }
-    for m in hc::machines() {
+    // (Another machine's rows carry no labels: a test daemon can't tell its own there.)
+    for m in hc::machines().into_iter().filter(|_| !crate::daemon::watch::test_daemon()) {
         for row in hc::list_on(Some(&m)).ok()? {
             let address = row["address"].as_str().unwrap_or("").to_string();
             out.extend(seen_of(&row, None, said(&address)));

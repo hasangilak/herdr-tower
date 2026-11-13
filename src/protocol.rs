@@ -272,6 +272,17 @@ pub enum Request {
         #[serde(default)]
         dry_run: bool,
     },
+    /// What a restart of the Mac or Herdr closed (`tower reopen`, see
+    /// `crate::reopen`): `list`, `go` (all, or `spaces`; `dry_run`: only
+    /// how), `forget` (all, or `spaces`).
+    Reopen {
+        #[serde(default)]
+        action: String,
+        #[serde(default)]
+        spaces: Vec<String>,
+        #[serde(default)]
+        dry_run: bool,
+    },
     /// A space's plan before it is launched (`tower plan`, see
     /// `crate::plans`): `new` (`form`, `ticket`, `draft`: the planner is
     /// started), `say` (`id`, `text`, `who`: `user` or `planner`; the

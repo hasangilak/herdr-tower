@@ -779,6 +779,18 @@ merge, which stays the user's. The `pr` event carries a change of it. A
 tower that has this says `"reviews"` in `features`; the state has
 `reviews` (below).
 
+**After a restart.** When the Mac or Herdr restarted and closed sessions,
+the tower raises one decision once Herdr's window is back: kind `choice`,
+`why` `reopen`, no `space`, no `sessions` ("3 sessions in 2 spaces closed
+when the Mac or Herdr restarted. Reopen them where they were, with their
+conversations?"; `detail` lists them by space). Its options ("Reopen all",
+"Only <space>", "Forget them") are answered like any choice (`{"choice":
+n}`; `{"other": "<the spaces to reopen>"}` works too), and the Mac carries
+the answer out itself: each session resumes its own conversation where it
+was. The answer's `reopen` says how each one went (`reopened`: `name`,
+`space`, `address`, `how`: `typed`, `tab`, `space` or `failed` with
+`why`). Dismissing it is "not now". It never offers a rule.
+
 Example:
 
 ```

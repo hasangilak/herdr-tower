@@ -38,6 +38,7 @@ mod phone;
 mod plans;
 mod protocol;
 mod projects;
+mod reopen;
 mod prs;
 mod questions;
 mod reviews;
@@ -160,6 +161,21 @@ enum Cmd {
         /// new: the spaces it's about.
         #[arg(long)]
         space: Vec<String>,
+    },
+    /// What a restart of the Mac (or of Herdr) closed, and putting it back: each session resumes its
+    /// own conversation where it was (its own terminal when Herdr kept it as a shell, else a new tab
+    /// of its space, else the space made again). The tower offers it on a card once Herdr is back.
+    /// No action: what is waiting. `go [<space>…]`: reopen them all, or those spaces' (`--dry-run`:
+    /// only say how). `forget [<space>…]`: let them go.
+    Reopen {
+        /// list, go or forget.
+        action: Option<String>,
+        /// The spaces (their names).
+        spaces: Vec<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Introduce the Claude sessions of a Herdr space to each other (the tower does it by itself when
     /// one joins a space with others; `[sessions] introduce = false` turns that off). No space: each
@@ -921,6 +937,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Missions { json } => missions::cmd_missions(json),
         Cmd::Agenda { action, args, all, force, title, space } => agenda_cmd(&action, &args, all, force, title, space),
         Cmd::Introduce { space, dry_run } => introduce_cmd(&space.join(" "), dry_run),
+        Cmd::Reopen { action, spaces, dry_run, json } => reopen_cmd(action.as_deref().unwrap_or("list"), &spaces, dry_run, json),
         Cmd::Accounts { on } => list_accounts(on.as_deref()),
         Cmd::Project { name } => {
             let asked = name.join(" ");
@@ -1961,6 +1978,74 @@ fn agenda_do(cmd: &agenda::Cmd) -> Result<Value> {
             .collect::<Vec<_>>());
     }
     Ok(v)
+}
+
+/// `tower reopen [list|go|forget] [<space>…] [--dry-run]`.
+fn reopen_cmd(action: &str, spaces: &[String], dry_run: bool, json_out: bool) -> Result<()> {
+    if !protocol::is_running() {
+        bail!("the tower's voice isn't running (tower up): it keeps what was open");
+    }
+    let r = protocol::send(&Request::Reopen { action: action.into(), spaces: spaces.to_vec(), dry_run })?;
+    if !r.ok {
+        bail!("{}", r.error.unwrap_or_default());
+    }
+    let v = r.state.unwrap_or_default();
+    if json_out || !std::io::stdout().is_terminal() {
+        print_json(&v);
+        return Ok(());
+    }
+    let s = |v: &Value, k: &str| v[k].as_str().unwrap_or("").to_string();
+    match action {
+        "list" | "ls" | "" => {
+            let lost = v["lost"].as_array().cloned().unwrap_or_default();
+            if lost.is_empty() {
+                println!("Nothing a restart closed is waiting: {} session(s) open now are kept in case one does.", v["open"]);
+            }
+            let mut last = String::new();
+            for k in &lost {
+                if s(k, "space") != last {
+                    last = s(k, "space");
+                    println!("{last}:");
+                }
+                println!("  {} ({}, {}), last seen {}", s(k, "name"), s(k, "app"), s(k, "folder"), phone::ago(k["seen_ms"].as_u64().unwrap_or(0)));
+            }
+            if !lost.is_empty() {
+                println!("tower reopen go [<space>…] puts them back; tower reopen forget lets them go.");
+            }
+            for k in v["reopening"].as_array().into_iter().flatten() {
+                println!("Reopening {} in {} ({}): not seen back yet.", s(k, "name"), s(k, "space"), s(k, "address"));
+            }
+        }
+        _ if v["forgot"].is_number() => println!("{} {} session(s): the tower stops offering them.", if dry_run { "Would forget" } else { "Forgot" }, v["forgot"]),
+        _ if dry_run => {
+            for st in v["steps"].as_array().into_iter().flatten() {
+                let step = &st["step"];
+                let how = match step["how"].as_str().unwrap_or("") {
+                    "typed" => format!("typed into its terminal {}: {}", s(step, "terminal"), s(step, "line")),
+                    "tab" => format!("a new tab \"{}\" in its space, in {}", s(step, "tab"), s(step, "folder")),
+                    "space" => format!("the space made again (in {}), its tab \"{}\"", s(step, "folder"), s(step, "tab")),
+                    _ => format!("not: {}", s(step, "why")),
+                };
+                println!("{} in {}: {how}", s(st, "name"), s(st, "space"));
+            }
+            if v["brain"].is_string() {
+                println!("The tower's own brain isn't running: it would start again.");
+            }
+            println!("(dry run: nothing opened)");
+        }
+        _ => {
+            for d in v["reopened"].as_array().into_iter().flatten() {
+                match s(d, "how").as_str() {
+                    "failed" => println!("{} in {}: not reopened: {}", s(d, "name"), s(d, "space"), s(d, "why")),
+                    how => println!("{} in {}: resumed as {} ({how}).", s(d, "name"), s(d, "space"), s(d, "address")),
+                }
+            }
+            if v["brain"].is_string() {
+                println!("The tower's own brain is starting again.");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `tower introduce [<space>] [--dry-run]`.

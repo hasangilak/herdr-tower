@@ -498,6 +498,20 @@ It is on for every space; New space's **Review its PRs** switch (`tower
 launch --no-review`), the space's own **Review PRs** switch and `tower
 space review <space> off` turn it off.
 
+### After a restart
+
+The tower remembers every open space and its sessions. When the Mac (or
+Herdr) restarts, Herdr keeps each terminal but loses the agent in it. Once
+Herdr's window is back, the tower puts one card in your queue: "7 sessions
+in 3 spaces closed when the Mac or Herdr restarted. Reopen them where they
+were, with their conversations?", with **Reopen all**, **Only <space>**
+and **Forget them**. Reopening resumes each session's own conversation on
+its own account, in the terminal Herdr kept for it (else a new tab, else
+the space made again), with its worktree and port. It also starts the
+tower's own brain if that's down. A session you quit, or a space you
+closed, isn't offered back. `tower reopen` lists what is waiting, `tower
+reopen go [<space>]` puts it back, and `tower reopen forget` lets it go.
+
 ### A tower per space, and the model they run on
 
 Each open space with a live agent session has a tower of its own beside

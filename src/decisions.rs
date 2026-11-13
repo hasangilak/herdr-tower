@@ -10,7 +10,10 @@
 //!   into `main` (`prs::is_prod`), and changes in place as they open, merge
 //!   or their checks move;
 //! - `tower raise` (`raised`, or `choice` when it offers options);
-//! - an agenda task that failed again after it was sent once more (`failed`).
+//! - an agenda task that failed again after it was sent once more (`failed`);
+//! - the sessions a restart of the Mac or Herdr closed, offered back (a
+//!   `choice`, `why` "reopen": see `crate::reopen`); the tower answers it
+//!   itself, nothing is sent to a session.
 //!
 //! **One key per decision.** The same key again (another session asking the
 //! same thing, the same line raised twice, another PR of the repo) updates
@@ -44,6 +47,9 @@ const KEEP_CLOSED: usize = 50;
 const KEY_TEXT: usize = 300;
 /// A decision's `detail` is cut to about this many characters.
 pub const DETAIL: usize = 600;
+/// The card that offers back what a restart closed (`Book::reopen`): its key, and its `why`.
+pub const REOPEN_KEY: &str = "reopen";
+pub const REOPEN_WHY: &str = "reopen";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -390,6 +396,10 @@ pub fn rule_request(space: Option<&str>, title: &str, answer: &str) -> String {
 /// data, secrets or money.
 pub fn rule_for(kind: Kind, why: &str, title: &str, space: Option<&str>, answer: &str) -> Option<String> {
     if !matches!(kind, Kind::Question | Kind::Choice) || answer.trim().is_empty() || title.trim().is_empty() {
+        return None;
+    }
+    // What to put back after a restart is asked each time.
+    if why == REOPEN_WHY {
         return None;
     }
     if always_yours(title) || always_yours(why) || always_yours(answer) {
@@ -989,6 +999,41 @@ impl Book {
         }
     }
 
+    /// The card offering back what a restart closed (`crate::reopen`): one
+    /// at a time, in the main queue, changed in place as what it lists
+    /// changes (sessions brought back by hand leave it). None: nothing is
+    /// left to offer, and an open one stops. What it is now (None: none).
+    pub fn reopen(&mut self, offer: Option<crate::reopen::Offer>, now: u64) -> Option<Raised> {
+        let at = self.open.iter().position(|d| d.key == REOPEN_KEY);
+        let Some(o) = offer else {
+            if let Some(i) = at {
+                let id = self.open[i].id.clone();
+                self.close(&id, State::Stopped, now);
+            }
+            return None;
+        };
+        let options: Vec<Opt> =
+            o.options.into_iter().map(|(label, why, pick, tower)| Opt { label, why, pick: tower, text: pick.code(), ..Default::default() }).collect();
+        if let Some(i) = at {
+            let d = &mut self.open[i];
+            let detail = detail_cut(&o.detail, false);
+            if d.title != o.title || d.detail != detail || d.options != options {
+                (d.title, d.detail, d.options, d.last_ms) = (o.title, detail, options, now);
+            }
+            return Some(Raised { id: d.id.clone(), fresh: false, folded: false, count: d.count, waiting: 0 });
+        }
+        let d = Decision {
+            key: REOPEN_KEY.into(),
+            kind: Kind::Choice,
+            title: o.title,
+            detail: detail_cut(&o.detail, false),
+            why: REOPEN_WHY.into(),
+            options,
+            ..Default::default()
+        };
+        Some(Raised { id: self.add(d, now), fresh: true, folded: false, count: 1, waiting: 0 })
+    }
+
     /// `tower raise`: one decision per space and line. The same line again,
     /// or a raise about something already in front of the user, is that
     /// decision once more (`count`, `last_ms`, its session), never a second one.
@@ -1245,6 +1290,8 @@ pub enum Act {
     Requeue { task: String, text: String },
     /// Its failed task is dropped.
     Abandon { task: String },
+    /// What a restart closed is put back, or let go (`label`: what was chosen).
+    Reopen { pick: crate::reopen::Pick, label: String },
 }
 
 /// What answering `d` with `body` does: `{"choice": n}` (an option's index),
@@ -1293,6 +1340,19 @@ pub fn act(d: &Decision, body: &Value, submit: bool) -> Result<Act> {
             d.id,
             d.sessions.iter().map(|w| w.address.as_str()).collect::<Vec<_>>().join(", ")
         ),
+        // What was lost to a restart: the tower puts it back itself, nothing is sent.
+        Kind::Choice if d.why == REOPEN_WHY => {
+            let (pick, label) = match (choice, other) {
+                (Some(n), _) => {
+                    let o = option(n)?;
+                    let Some(pick) = crate::reopen::Pick::of_code(&o.text) else { bail!("{}: option {n} says nothing to do", d.id) };
+                    (pick, o.label.trim().to_string())
+                }
+                (None, Some(text)) => (crate::reopen::Pick::Words(text.to_string()), text.to_string()),
+                (None, None) => bail!("give {{\"choice\": n}} or {{\"other\": \"the spaces to reopen\"}} (`tower dismiss {}`: not now)", d.id),
+            };
+            Ok(Act::Reopen { pick, label })
+        }
         Kind::Choice | Kind::Raised => {
             let about = clip(d.title.trim().trim_end_matches('.'), 240);
             let (text, label) = match (choice, other) {
