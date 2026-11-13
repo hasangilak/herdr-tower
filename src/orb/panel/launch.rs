@@ -1,6 +1,8 @@
 //! The launcher (`docs/quiet-tower.md`, "Step 9"; W9 and W10 in the design):
-//! a sentence, or a whole ticket, starts a space. A goal, a project, what
-//! the tower will do, Launch; then the new space's own view opens.
+//! a sentence, or a whole ticket, starts a space. The goal is said in the
+//! conversation (the pane has no field of its own for it); beside it a
+//! project, what the tower will do, Launch; then the new space's own view
+//! opens.
 //!
 //! - **The projects** are the tower's (`tower setups --json`): each a name,
 //!   an account, what it is and its repos with their roles. None picked, the
@@ -17,9 +19,9 @@
 //!   (`tower launch "<ticket>" --repo … --name … --title … --done-when …`,
 //!   `crate::ticket::confirm_flags`); what to change is said in the
 //!   conversation (below) and redrafted (`--adjust "<words>" --prior '<the
-//!   draft>'`), which takes the card's place; Start over drops the draft.
-//!   Nothing opens before Launch. A ticket changed after its draft is
-//!   drafted again.
+//!   draft>'`), which takes the card's place; Start over drops the draft,
+//!   its conversation and the ticket. Nothing opens before Launch. A ticket
+//!   added to after its draft is drafted again.
 //! - **The conversation** (`new_chat_column`, in the column a space's
 //!   conversation has, the panel's input at its foot): what you said (the
 //!   ticket, what to change, that it be planned) and what the tower said
@@ -63,7 +65,7 @@ use serde_json::Value;
 
 use super::home::{LINE, SOFT, acts_row, bay_label, cstat, cstat_busy, mbtn, tg};
 use super::window::whead;
-use super::{CYAN, Panel, cli, glass};
+use super::{AMBER, CYAN, Panel, cli, glass};
 use crate::history;
 use crate::launch::Told;
 use crate::orb::model::{self, Missions, PlanView};
@@ -314,6 +316,77 @@ pub(super) fn plan_line(p: &PlanView) -> (String, bool) {
     }
 }
 
+/// One PR the plan predicts, as its list in the window shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct PrRow {
+    /// "PR 1 · eyz-customer-support → dev".
+    pub head: String,
+    pub title: String,
+    pub changes: String,
+    /// Roughly which files, in a line.
+    pub files: String,
+    /// "Needs review" or "Low risk".
+    pub word: &'static str,
+    pub needs_review: bool,
+    /// Why, as the tower scored it.
+    pub reason: String,
+    /// "After PR 1", "Opened: o/r#12".
+    pub notes: Vec<String>,
+}
+
+/// The plan's predicted PRs as rows, in the plan's order.
+pub(super) fn pr_rows(prs: &[crate::prscore::Predicted]) -> Vec<PrRow> {
+    prs.iter()
+        .map(|p| {
+            let files = match p.files.len() {
+                0 => String::new(),
+                n if n <= 3 => p.files.join(", "),
+                n => format!("{} and {} more", p.files[..3].join(", "), n - 3),
+            };
+            let mut notes = vec![];
+            if !p.after.is_empty() {
+                notes.push(format!("After PR {}", p.after.iter().map(u32::to_string).collect::<Vec<_>>().join(", PR ")));
+            }
+            if let Some(k) = &p.pr {
+                notes.push(format!("Opened: {k}"));
+            }
+            PrRow {
+                head: format!("PR {} · {} → {}", p.n, p.repo, p.base),
+                title: p.title.clone(),
+                changes: p.changes.clone(),
+                files,
+                word: p.score.word(),
+                needs_review: p.score.needs_review,
+                reason: p.score.reason().to_string(),
+                notes,
+            }
+        })
+        .collect()
+}
+
+/// The list's heading: how many, and how many need a person.
+pub(super) fn prs_head(prs: &[crate::prscore::Predicted]) -> String {
+    let review = prs.iter().filter(|p| p.score.needs_review).count();
+    let n = prs.len();
+    let many = if n == 1 { "1 pull request".to_string() } else { format!("{n} pull requests") };
+    match review {
+        0 => format!("{many}, all low risk"),
+        r if r == n && n == 1 => format!("{many}, needs review"),
+        r if r == n => format!("{many}, all need review"),
+        r => format!("{many}, {r} need{} review", if r == 1 { "s" } else { "" }),
+    }
+}
+
+/// What happens to them once they open: who merges which.
+pub(super) fn prs_note(prs: &[crate::prscore::Predicted], auto_on: bool) -> String {
+    let low_dev = prs.iter().any(|p| !p.score.needs_review && crate::prscore::is_dev(&p.base));
+    match (low_dev, auto_on) {
+        (false, _) => "Each one comes to you to merge.".into(),
+        (true, true) => "The tower merges the low-risk ones into dev itself, once their checks pass and their reviewer finds nothing. Those that need review, and any merge into main or prod, come to you.".into(),
+        (true, false) => "Each one comes to you to merge: auto-merge of low-risk PRs into dev is off (Settings).".into(),
+    }
+}
+
 /// What a draft is asked: the ticket, the project picked, and for a
 /// redraft the user's words and the draft before.
 pub(super) fn draft_args(ticket: &str, project: Option<&str>, adjust: Option<(&str, &Drafted)>) -> Vec<String> {
@@ -432,6 +505,8 @@ fn talk_from_start() -> std::collections::VecDeque<String> {
 
 /// The launcher's state.
 pub(super) struct LaunchUi {
+    /// The ticket, as the conversation has said it. It is not drawn: the
+    /// conversation shows it, and what changes it is said there.
     goal: Entity<TextareaState>,
     /// The saved projects; `None` until the tower was asked.
     setups: Option<Vec<Setup>>,
@@ -470,8 +545,7 @@ pub(super) struct LaunchUi {
 
 impl LaunchUi {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Panel>) -> Self {
-        // A whole ticket fits: it grows to 14 lines, then scrolls.
-        let goal = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 14).placeholder("Paste the ticket, or say what the space should get done"));
+        let goal = cx.new(|cx| TextareaState::new(window, cx));
         let subs = vec![cx.subscribe_in(&goal, window, |this, _, ev: &InputEvent, _, cx| {
             if matches!(ev, InputEvent::Change) {
                 this.ask_plan(cx);
@@ -534,7 +608,7 @@ impl LaunchUi {
     }
 }
 
-/// A one-line field on the white pill, as the launcher's goal.
+/// A field on the white pill (a space's goal as it is changed, a project's name, a phone's).
 pub(super) fn field(state: &Entity<TextareaState>) -> AnyElement {
     let g = glass();
     div()
@@ -579,12 +653,14 @@ impl Panel {
         }
     }
 
-    /// Puts `goal` in the launcher's field (the plan follows, as when it is typed).
+    /// `goal` is the launcher's ticket, said in its conversation (the plan
+    /// follows, as when it is said there).
     pub(super) fn launch_with(&mut self, goal: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(full) = self.full.as_ref() {
             let (field, goal) = (full.launch.goal.clone(), goal.to_string());
             field.update(cx, |s, cx| s.set_value(goal, window, cx));
         }
+        self.tell("you", goal);
         self.draft_hook(cx);
     }
 
@@ -833,7 +909,8 @@ impl Panel {
         self.run("plan-close", vec!["plan".into(), "close".into(), id.to_string()], cx, |_, _, _| {});
     }
 
-    /// Back to the plan that is open: its ticket in the field, its draft on the card.
+    /// Back to the plan that is open: its ticket is the launcher's (said
+    /// first in the conversation, the plan's thread after it), its draft on the card.
     fn plan_back(&mut self, p: &PlanView, window: &mut Window, cx: &mut Context<Self>) {
         let Some(full) = self.full.as_mut() else { return };
         let ticket = p.ticket.trim().to_string();
@@ -841,6 +918,7 @@ impl Panel {
             full.launch.draft = Some((ticket.clone(), d));
         }
         full.launch.draft_known = Some(true);
+        full.launch.story = vec![Told { who: "you".into(), text: ticket.clone(), at: p.created_ms }];
         let goal = full.launch.goal.clone();
         goal.update(cx, |s, cx| s.set_value(ticket, window, cx));
         cx.notify();
@@ -934,7 +1012,9 @@ impl Panel {
         });
     }
 
-    /// Start over: the draft is dropped; the ticket stays to change or draft again.
+    /// Start over: the draft, its conversation and the ticket are dropped
+    /// (the conversation was the only place the ticket showed), and the
+    /// conversation's input waits for the next one.
     fn start_over(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A plan of it ends, and its planner.
         if let Some(full) = self.full.as_ref() {
@@ -950,7 +1030,8 @@ impl Panel {
         full.notes.remove("plan");
         full.notes.remove("draft");
         let goal = full.launch.goal.clone();
-        goal.update(cx, |s, cx| s.focus(window, cx));
+        goal.update(cx, |s, cx| s.set_value("", window, cx));
+        self.text.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
     }
 
@@ -1111,6 +1192,11 @@ impl Panel {
                     .into_any_element(),
             );
         }
+        // The PRs it predicts, each with its review score.
+        if !p.prs.is_empty() {
+            let auto_on = self.tower.read(cx).s("auto_merge").as_bool().unwrap_or(false);
+            items.push(self.plan_prs(&p.prs, auto_on));
+        }
         // Failed, or its planner ended: plan it again.
         if p.status == "failed" || (ready && p.address.is_none()) {
             items.push(self.plan_offer(true, can, cx));
@@ -1122,10 +1208,50 @@ impl Panel {
         items
     }
 
+    /// The PRs the plan predicts: a row each (its repo and branch, title,
+    /// what it changes, roughly which files) with its review score and why.
+    fn plan_prs(&self, prs: &[crate::prscore::Predicted], auto_on: bool) -> AnyElement {
+        let g = glass();
+        let badge = |word: &'static str, review: bool| {
+            let c = if review { AMBER } else { CYAN };
+            div().flex_none().px(px(8.0)).py(px(1.0)).rounded_full().border_1().border_color(rgb(c)).text_size(px(12.0)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(c)).child(word)
+        };
+        let rows = pr_rows(prs).into_iter().map(|r| {
+            v_flex()
+                .w_full()
+                .px(px(12.0))
+                .py(px(10.0))
+                .gap(px(4.0))
+                .rounded(px(12.0))
+                .bg(rgba(SOFT))
+                .border_1()
+                .border_color(if r.needs_review { rgba(0xffcf7059) } else { rgba(LINE) })
+                .child(
+                    h_flex()
+                        .gap(px(8.0))
+                        .items_center()
+                        .child(div().flex_1().min_w_0().truncate().text_size(px(12.0)).text_color(g.faint).child(r.head))
+                        .child(badge(r.word, r.needs_review)),
+                )
+                .child(div().text_size(px(14.0)).line_height(px(19.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.text).child(r.title))
+                .when(!r.changes.is_empty(), |el| el.child(div().text_size(px(13.0)).line_height(px(18.0)).text_color(g.muted).child(r.changes)))
+                .when(!r.files.is_empty(), |el| el.child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.faint).child(r.files)))
+                .child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(if r.needs_review { rgb(AMBER) } else { rgb(CYAN) }).child(r.reason))
+                .when(!r.notes.is_empty(), |el| el.child(div().text_size(px(12.0)).text_color(g.faint).child(r.notes.join(" · "))))
+        });
+        v_flex()
+            .w_full()
+            .gap(px(8.0))
+            .child(h_flex().gap(px(8.0)).items_center().child(bay_label("Pull requests").px(px(0.0))).child(div().text_size(px(12.0)).text_color(g.faint).child(prs_head(prs))))
+            .children(rows)
+            .child(div().px(px(4.0)).text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child(prs_note(prs, auto_on)))
+            .into_any_element()
+    }
+
     /// The launcher's head and body.
     pub(super) fn launch_view(&mut self, missions: &Missions, window: &mut Window, cx: &mut Context<Self>) -> (AnyElement, Vec<AnyElement>) {
         let g = glass();
-        let head = whead("New space", vec![div().child("Say in the conversation what it should get done, or paste the ticket here. Nothing opens until you launch.").into_any_element()], None);
+        let head = whead("New space", vec![div().child("Say in the conversation what it should get done, or paste the ticket there. Nothing opens until you launch.").into_any_element()], None);
         self.talk_tick(missions, window, cx);
         let plan_open = self.plan_now(cx);
         let Some(full) = self.full.as_ref() else { return (head, vec![]) };
@@ -1146,7 +1272,6 @@ impl Panel {
             .or_else(|| ui.draft_of(&goal).cloned())
             .or_else(|| planned.as_ref().and_then(|p| draft_from(&p.draft)))
             .filter(|_| drafts);
-        let goal_field = ui.goal.clone();
         // The tower's own word on what it will do, if it gave it for this goal and setup.
         let key = (goal.clone(), ui.dry_setup());
         let dry = ui.dry.as_ref().filter(|(k, _)| *k == key).map(|(_, d)| d.clone()).unwrap_or_default();
@@ -1209,14 +1334,14 @@ impl Panel {
                 h_flex().gap(px(9.0)).items_start().child(div().flex_none().child("•")).child(text)
             }),
         );
-        // How long it is, and what the first line is for.
-        let words = ui.goal.read(cx).value().split_whitespace().count();
-        let count = if words > 0 { format!("{words} word{} · ", if words == 1 { "" } else { "s" }) } else { String::new() };
-        let hint = if ui.drafts() {
-            format!("{count}Paste the ticket as it is: the tower's brain picks the repos it needs, and its title becomes the space's goal. A first line that names the repos (\"open sessions in eyzflow and mediaroom\") skips the draft.")
-        } else {
-            format!("{count}The first line says what to open (\"open sessions in eyzflow and mediaroom\"); the rest can be the whole ticket, and goes to the sessions as it is.")
-        };
+        // What the first line is for (the goal itself is in the conversation), until it names the repos.
+        let first_line = (!ui.names_repos(&goal)).then(|| {
+            if ui.drafts() {
+                "A first line that names the repos (\"open sessions in eyzflow and mediaroom\") skips the draft."
+            } else {
+                "The first line says what to open (\"open sessions in eyzflow and mediaroom\"); the rest can be the whole ticket, and goes to the sessions as it is."
+            }
+        });
 
         // What it will do: the plan; or, for a ticket to draft, the draft (or that it is being read).
         let (section, middle): (&str, AnyElement) = match (&draft, drafting) {
@@ -1237,6 +1362,7 @@ impl Panel {
                         .gap(px(7.0))
                         .child(bullets)
                         .when(!drafts && !dry.assumed.is_empty(), |el| el.child(note(dry.assumed.clone())))
+                        .children(first_line.map(|t| note(t.into())))
                         .into_any_element(),
                 },
             ),
@@ -1330,7 +1456,6 @@ impl Panel {
             .max_w(px(760.0))
             .gap(px(16.0))
             .children(stale_line)
-            .child(v_flex().gap(px(7.0)).child(label("Goal")).child(field(&goal_field)).child(div().px(px(4.0)).text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child(hint)))
             .child(v_flex().gap(px(7.0)).child(label("Project")).child(projects).children(self.said("setups")))
             .child(v_flex().gap(px(7.0)).child(label(section)).child(middle).children(review_row).children(self.said("draft")))
             .when(!plan_items.is_empty(), |el| el.child(v_flex().gap(px(10.0)).children(plan_items)))
@@ -1693,6 +1818,29 @@ mod tests {
         assert_eq!(all.iter().map(|t| (t.who.as_str(), t.at)).collect::<Vec<_>>(), [("you", 10), ("tower", 20), ("you", 30), ("tower", 40), ("you", 50), ("planner", 60)]);
         assert!(all[3].text.starts_with("The plan is ready, a page on your claude.ai account: https://claude.ai/artifact/x."));
         assert_eq!(story_with(&story, None), story);
+    }
+
+    #[test]
+    fn the_plan_shows_its_predicted_prs_each_with_its_score() {
+        // The state's plan, as the daemon shows it: a migration PR and a plain UI PR.
+        let repos = ["/w/eyz/eyz-customer-support".to_string(), "/w/eyz/eyzflow-admin-dashboard".to_string()];
+        let prs = crate::prscore::check(&crate::prscore::tests::two_prs(), &repos).unwrap();
+        let state = serde_json::json!({ "plan": { "id": "p3", "form": "page", "status": "ready", "ticket": "t", "url": "https://claude.ai/artifact/x", "prs": prs } });
+        let p = model::plan(&state).unwrap();
+        let rows = pr_rows(&p.prs);
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].head.as_str(), rows[0].word, rows[0].needs_review), ("PR 1 · eyz-customer-support → dev", "Needs review", true));
+        assert_eq!(rows[0].reason, "a database migration (db/migrations/0042_message_translations.sql)");
+        assert_eq!(rows[0].files, "db/migrations/0042_message_translations.sql, src/messages/translate.ts");
+        assert_eq!((rows[1].head.as_str(), rows[1].word, rows[1].needs_review), ("PR 2 · eyzflow-admin-dashboard → dev", "Low risk", false));
+        assert_eq!(rows[1].reason, "no migration, breaking change, secrets, infrastructure or auth");
+        assert_eq!(rows[1].notes, ["After PR 1"]);
+        assert_eq!(prs_head(&p.prs), "2 pull requests, 1 needs review");
+        assert!(prs_note(&p.prs, false).contains("auto-merge of low-risk PRs into dev is off"));
+        assert!(prs_note(&p.prs, true).starts_with("The tower merges the low-risk ones into dev itself"));
+        assert_eq!(prs_note(&p.prs[..1], true), "Each one comes to you to merge.", "only a migration: the user's");
+        // A plan from before had none.
+        assert!(model::plan(&serde_json::json!({ "plan": { "id": "p1", "status": "writing" } })).unwrap().prs.is_empty());
     }
 
     #[test]

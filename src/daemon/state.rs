@@ -104,6 +104,9 @@ pub struct State {
     /// How much the tower tells the user (`tower tell`): `decisions`,
     /// `results` or `everything`.
     pub tell_level: String,
+    /// The tower merges low-risk PRs into dev itself (`[prs]
+    /// auto_merge_low_risk`, `tower automerge`): off unless the user turned it on.
+    pub auto_merge: bool,
     /// What the sessions of each space wrote to each other (see `peers`):
     /// by space, the last 50 each, newest last:
     /// `{at, from, from_name, to, to_name, text, space, delivered}`.
@@ -242,6 +245,7 @@ impl State {
             question_policy: "normal".into(),
             behaviors: serde_json::Value::Null,
             tell_level: crate::tell::Level::default().word().into(),
+            auto_merge: false,
             threads: Default::default(),
             decisions: vec![],
             decisions_count: 0,

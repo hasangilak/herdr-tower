@@ -303,8 +303,9 @@ pub enum Request {
     /// started), `say` (`id`, `text`, `who`: `user` or `planner`; the
     /// user's is queued to the planner), `draft` (`id`, `draft`: the
     /// planner's revision, checked), `published` (`id`, `url`), `failed`
-    /// (`id`, `text`), `show` (`id`, or the open one), `close` (`id`, or
-    /// the open one; `launched`: the space it was launched as), `list`.
+    /// (`id`, `text`), `prs` (`id`, `prs`: the PRs the plan predicts, which
+    /// the tower checks and scores), `show` (`id`, or the open one), `close`
+    /// (`id`, or the open one; `launched`: the space it was launched as), `list`.
     Plan {
         action: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -323,6 +324,9 @@ pub enum Request {
         who: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         launched: Option<String>,
+        /// `prs`: the PRs the plan predicts, as the planner wrote them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prs: Option<serde_json::Value>,
     },
     /// A screenshot was added (`tower screenshot`): the state's list is re-read.
     Screenshots,
@@ -457,7 +461,7 @@ mod tests {
         assert!(matches!(say, Request::Plan { ref action, ref id, ref who, draft: None, .. } if action == "say" && id == "p3" && who == "user"));
         let new: Request = serde_json::from_str(r#"{"cmd":"plan","action":"new","form":"page","ticket":"T","draft":{"space":"x"}}"#).unwrap();
         assert!(matches!(new, Request::Plan { ref form, draft: Some(ref d), .. } if form == "page" && d["space"] == "x"));
-        let show = Request::Plan { action: "show".into(), id: String::new(), form: String::new(), ticket: String::new(), draft: None, text: String::new(), url: String::new(), who: String::new(), launched: None };
+        let show = Request::Plan { action: "show".into(), id: String::new(), form: String::new(), ticket: String::new(), draft: None, text: String::new(), url: String::new(), who: String::new(), launched: None, prs: None };
         assert_eq!(serde_json::to_string(&show).unwrap(), r#"{"cmd":"plan","action":"show"}"#);
         // A decision is answered through the request a question set is, with its own body.
         let answer: Request = serde_json::from_str(r#"{"cmd":"answer","target":"d0123456789ab","answers":{"choice":1}}"#).unwrap();

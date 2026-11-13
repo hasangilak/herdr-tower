@@ -12,6 +12,8 @@
 //!   switch of its own, whether everything it says plays on this Mac
 //!   (`tower mac-voice`).
 //! - **Questions it answers for you**: the policy, as before.
+//! - **Pull requests** (`tower automerge`): whether the tower merges
+//!   low-risk PRs into dev itself (off unless the user switches it on).
 //! - **Follow and Mute**, per open space (the switches each space has at
 //!   its top).
 //! - **Behaviors**: a line, and the way to its view.
@@ -43,6 +45,15 @@ fn tell_line(level: Option<&str>) -> &'static str {
 /// What a voice setting means, in a line (the design's words; `tell::Voice::says`).
 fn voice_line(voice: &str) -> &'static str {
     crate::tell::Voice::parse(voice).unwrap_or_default().says()
+}
+
+/// What the auto-merge switch means, in a line.
+pub(super) fn auto_merge_line(on: bool) -> &'static str {
+    if on {
+        "The tower merges a PR into dev itself when its plan predicted it, it is scored low risk (no migration, no breaking change, nothing on the escalate list, read again on its own files), its checks pass and its reviewer found nothing. Anything that needs review, and every merge into main or prod, still comes to you."
+    } else {
+        "Off: every PR comes to you to merge. On, the tower merges low-risk PRs into dev itself once their checks pass and their reviewer found nothing; anything that needs review, and every merge into main or prod, still comes to you."
+    }
 }
 
 /// What a questions policy means, in a line.
@@ -118,6 +129,23 @@ impl Panel {
                 && let Some(full) = this.full.as_mut()
             {
                 full.tell = None;
+            }
+        });
+    }
+
+    /// `tower automerge on|off`: switched at once, and back if the tower refuses.
+    fn set_auto_merge(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.running("automerge") {
+            return;
+        }
+        if let Some(full) = self.full.as_mut() {
+            full.auto_merge = Some(on);
+        }
+        self.run("automerge", vec!["automerge".into(), if on { "on" } else { "off" }.into()], cx, |this, result, _| {
+            if result.is_err()
+                && let Some(full) = this.full.as_mut()
+            {
+                full.auto_merge = None;
             }
         });
     }
@@ -338,6 +366,27 @@ impl Panel {
             .collect(),
         );
 
+        // Pull requests: whether the tower merges low-risk ones into dev itself.
+        let said_auto = self.tower.read(cx).s("auto_merge").as_bool().unwrap_or(false);
+        if let Some(full) = self.full.as_mut()
+            && full.auto_merge == Some(said_auto)
+        {
+            full.auto_merge = None;
+        }
+        let auto_on = self.full.as_ref().and_then(|f| f.auto_merge).unwrap_or(said_auto);
+        let prs = card(
+            "Pull requests",
+            vec![
+                seg()
+                    .child(tg("automerge", "Merge low-risk PRs into dev myself", auto_on).on_click(cx.listener(move |this, _, _, cx| this.set_auto_merge(!auto_on, cx))))
+                    .into_any_element(),
+                para(auto_merge_line(auto_on)),
+            ]
+            .into_iter()
+            .chain(self.said("automerge"))
+            .collect(),
+        );
+
         // Follow and Mute, per open space.
         let mut marks: Vec<AnyElement> = vec![];
         for (i, m) in missions.open.iter().enumerate() {
@@ -402,7 +451,7 @@ impl Panel {
         // Two by two when the pane has room, else one under another.
         let cols = if self.full.as_ref().map(|f| f.pane_w).unwrap_or(900.0) >= super::window::TWO_COLS_W { 2 } else { 1 };
         let grid = |cards: Vec<AnyElement>| div().w_full().grid().grid_cols(cols).gap(px(12.0)).children(cards).into_any_element();
-        (head, vec![v_flex().w_full().gap(px(12.0)).child(grid(vec![tell, brain, voice, questions, follow, behaviors])).child(phone).child(grid(vec![accounts, setups])).into_any_element()])
+        (head, vec![v_flex().w_full().gap(px(12.0)).child(grid(vec![tell, brain, voice, questions, prs, follow, behaviors])).child(phone).child(grid(vec![accounts, setups])).into_any_element()])
     }
 }
 

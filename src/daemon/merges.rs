@@ -71,6 +71,12 @@ impl Merges {
         }
     }
 
+    /// A running chain has this PR still to merge: the tower's auto-merge
+    /// leaves it alone (`daemon::automerge`).
+    pub fn holds(&self, key: &str) -> bool {
+        lock(&self.chains).iter().any(|c| !c.over() && c.links.iter().any(|l| l.key == key && !l.step.done()))
+    }
+
     fn begin(&self, card: &str, keys: &[String], by: &str) -> Result<Value> {
         if keys.is_empty() {
             bail!("no pull requests to merge");
@@ -303,6 +309,14 @@ print("fake gh: " + " ".join(a), file=sys.stderr); sys.exit(1)
         // Each landed as a merge from the Mac: the store has them merged.
         assert!((1..=3).all(|n| prs.get(&format!("acme/api#{n}")).is_some_and(|p| p.state == "merged")));
         assert_eq!(world.look("acme/api#2").unwrap().merge_state, "clean", "GitHub's merge state is read");
+        // What a running chain still has to merge is its own: the tower's auto-merge leaves it alone.
+        let m = Merges::new(Shared::new(super::super::state::State::new("ptt", "test", "test")), prs.clone(), SendQueue::at(dir.join("queue2.json")));
+        let mut running = Chain::new("m2", "d2", None, "mac", &known, 0);
+        running.links[0].step = Step::Merged;
+        lock(&m.chains).push(running);
+        assert!(!m.holds("acme/api#1") && m.holds("acme/api#2") && m.holds("acme/api#3"));
+        lock(&m.chains)[0].stopped = true;
+        assert!(!m.holds("acme/api#2"), "stopped: not its any more");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

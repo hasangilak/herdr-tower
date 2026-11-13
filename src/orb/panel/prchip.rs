@@ -113,6 +113,13 @@ impl Line {
         Some((line, color))
     }
 
+    /// Whether it needs a human code review, for its row (`crate::prscore`):
+    /// the score's line, amber when a person must read it.
+    fn score(&self) -> Option<(String, u32)> {
+        let s = self.pr.score.as_ref()?;
+        Some((s.line.clone(), if s.needs_review { AMBER } else { CYAN }))
+    }
+
     /// How it stands, for its row: the words and whether they are bad news.
     fn standing(&self) -> (String, u32) {
         let c = &self.pr.checks;
@@ -350,6 +357,7 @@ impl Panel {
         let lines = self.merge_lines(d, cx);
         let run = self.run_of(d, cx);
         let acts = merge_acts(&lines, self.acts(cx).chain.contains(&d.id), run.as_ref());
+        let auto_on = self.tower.read(cx).s("auto_merge").as_bool().unwrap_or(false);
         let running = run.as_ref().filter(|r| !r.over);
         let active = lines.iter().find(|l| l.step != Step::Idle).filter(|_| running.is_none());
         let mut rows = v_flex().gap(px(6.0));
@@ -376,6 +384,8 @@ impl Panel {
                     )
                     .when(!l.pr.title.is_empty(), |el| el.child(div().text_size(px(12.0)).text_color(g.faint).truncate().child(l.pr.title.clone())))
                     .children(l.review().map(|(line, color)| div().text_size(px(12.0)).text_color(rgb(color)).truncate().child(line)))
+                    .children(l.score().map(|(line, color)| div().text_size(px(12.0)).line_height(px(16.0)).text_color(rgb(color)).line_clamp(2).child(line)))
+                    .children(crate::prscore::auto_line(&l.pr, auto_on).map(|line| div().text_size(px(12.0)).text_color(g.faint).truncate().child(line)))
                     // Where the tower's chain has it.
                     .children(running.and_then(|r| r.line(&l.key)).map(|line| {
                         let color = if line.starts_with("back to you") { ROSE } else if line == "merged" { CYAN } else { AMBER };
@@ -451,6 +461,7 @@ fn described(r: &PrRef) -> Pr {
             ..Default::default()
         },
         review: r.review.clone(),
+        score: r.score.clone(),
         ..Default::default()
     }
 }
@@ -591,6 +602,27 @@ mod tests {
         // One the window knows only from its decision keeps its review.
         let r = PrRef { repo: "acme/shop".into(), number: 7, review: Some(brief("stuck", 3, 1)), ..Default::default() };
         assert_eq!(described(&r).review.unwrap().line, "Review: stuck after 3 rounds, yours to decide");
+    }
+
+    #[test]
+    fn a_merge_cards_row_says_whether_the_pr_needs_a_human_review() {
+        let ev = |files: &[&str]| crate::prscore::Evidence { title: "x".into(), files: files.iter().map(|f| f.to_string()).collect(), ..Default::default() };
+        let with = |files: &[&str]| {
+            let mut l = line(12, "dev", "passing", Step::Idle);
+            l.pr.score = Some(crate::prscore::score(&ev(files)));
+            l.gate = gate(&l.pr);
+            l
+        };
+        let m = with(&["db/migrations/0042_orders.sql"]);
+        assert_eq!(m.score(), Some(("Needs review: a database migration (db/migrations/0042_orders.sql)".into(), AMBER)));
+        assert!(m.gate.warnings.contains(&"Needs review: a database migration (db/migrations/0042_orders.sql).".to_string()), "said before the merge too");
+        let ui = with(&["src/Cart.tsx"]);
+        assert_eq!(ui.score(), Some((crate::prscore::LOW_LINE.into(), CYAN)));
+        assert!(ui.gate.warnings.iter().all(|w| !w.contains("review")));
+        assert_eq!(line(12, "dev", "passing", Step::Idle).score(), None, "no score: no line");
+        // One the window knows only from its decision keeps its score.
+        let r = PrRef { repo: "acme/shop".into(), number: 7, score: m.pr.score.clone(), ..Default::default() };
+        assert!(described(&r).score.unwrap().needs_review);
     }
 
     #[test]

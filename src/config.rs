@@ -173,9 +173,25 @@ pub struct Config {
     pub queue: Queue,
     /// The tower's brains (`[brains]`): one per open space, and the model they run on.
     pub brains: Brains,
+    /// The PRs sessions open (`[prs]`): whether the tower merges low-risk ones into dev itself.
+    pub prs: PrsCfg,
     /// What `tower launch` opens (`[[setups]]`, `tower setups`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub setups: Vec<Setup>,
+}
+
+/// `[prs]` in config.toml.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrsCfg {
+    /// The tower merges a PR into dev itself when a plan predicted it, it
+    /// is scored low risk (no migration, no breaking change, nothing on the
+    /// escalate list, read again on its own files), its checks pass and its
+    /// reviewer agreed without finding anything (`crate::prscore::auto_path`,
+    /// `tower automerge`). Off (the default): every PR is the user's to
+    /// merge. Anything that needs review, and every merge into main or
+    /// prod, is the user's either way.
+    pub auto_merge_low_risk: bool,
 }
 
 /// `[brains]` in config.toml: one setting for every tower brain, the main
@@ -401,6 +417,7 @@ impl Default for Config {
             agenda: Agenda::default(),
             queue: Queue::default(),
             brains: Brains::default(),
+            prs: PrsCfg::default(),
             setups: vec![],
         }
     }

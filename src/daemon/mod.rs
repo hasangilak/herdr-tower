@@ -2,6 +2,7 @@
 
 pub mod acts;
 pub mod agendas;
+pub mod automerge;
 pub mod asks;
 pub mod brains;
 pub mod card;
@@ -135,11 +136,13 @@ pub fn run() -> Result<()> {
         let (hub, decisions, all) = (hub.clone(), decisions.clone(), prs.clone());
         prs.on_change(Box::new(move |op, pr| {
             hub.broadcast("pr", serde_json::json!({ "op": op, "pr": pr.view() }));
-            decisions.sync_prs(&all.list());
-            // A PR found in a space with review on gets its reviewer; one that closed ends its review.
+            // A PR found in a space with review on gets its reviewer (first: a PR the
+            // tower will merge itself waits on it, and is no decision meanwhile); one
+            // that closed ends its review.
             if let Some(r) = reviews::running() {
                 r.pr_changed(op, pr);
             }
+            sync_merges(&decisions, &all);
         }));
     }
     let lan = lan::Lan::new(lan::Ctx {
@@ -156,7 +159,7 @@ pub fn run() -> Result<()> {
     watch::start(shared.clone(), mouth.clone(), cfg.alerts.clone(), watches.clone(), asks.clone(), decisions.clone());
     // The cards the last run left are decisions again by now, and so are the
     // PRs that wait: what is open at the start was told before, and isn't again.
-    decisions.sync_prs(&prs.list());
+    sync_merges(&decisions, &prs);
     decisions.told_all();
     decisions.start();
 
@@ -262,13 +265,27 @@ pub fn run() -> Result<()> {
             asks.settled_by_merge(pr, by);
             after_merge(&sendq, &watches, pr, by)
         }));
-        // Open PRs looked at gently.
-        let prs = prs.clone();
+        // Open PRs looked at gently; those the tower may merge itself (`[prs]
+        // auto_merge_low_risk`, off unless the user turns it on) merged.
+        let (prs, decisions, shared) = (prs.clone(), decisions.clone(), shared.clone());
+        let merger = automerge::AutoMerger::new(prs.clone(), auto_merge_on);
         thread::Builder::new().name("prs".into()).spawn(move || {
+            let mut was: Option<bool> = None;
             loop {
                 for k in prs.due(crate::history::now_ms()) {
                     prs.poll(&k);
                 }
+                // The setting turned: in the state for the windows, and the queue as it is now.
+                let on = merger.on();
+                if was != Some(on) {
+                    shared.update(|s| s.auto_merge = on);
+                    if was.is_some() {
+                        eprintln!("[automerge] {}", if on { "on: low-risk PRs into dev are merged by the tower" } else { "off" });
+                        sync_merges(&decisions, &prs);
+                    }
+                    was = Some(on);
+                }
+                merger.tick();
                 thread::sleep(Duration::from_secs(10));
             }
         })?;
@@ -301,6 +318,11 @@ pub fn run() -> Result<()> {
     // A space's plan before it is launched, and its planner (`tower plan`).
     let plans = plans::Plans::open(shared.clone(), sendq.clone());
     plans.start();
+    // A PR found from now on carries its review score: its plan's prediction, and its own files.
+    {
+        let (plans, gh) = (plans.clone(), prs.gh().to_path_buf());
+        prs.on_score(Box::new(move |pr| Some(score_found(&plans, &gh, pr))));
+    }
     let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks, sendq, prs, agendas, introducer, decisions, missions, brains, acts, plans, reviews };
     // The phone API reaches the rest of the tower through the daemon itself
     // (`desk`), so it starts only now that the daemon is whole.
@@ -419,16 +441,46 @@ impl Daemon {
 /// A PR its session made was merged (`by`: mac, phone:<device>, github):
 /// the session is queued that it was, so it can carry on, and the brain is
 /// told (as a report on work it handed out: through the focus).
+/// `[prs] auto_merge_low_risk` as config.toml has it now.
+fn auto_merge_on() -> bool {
+    crate::config::Config::live().prs.auto_merge_low_risk
+}
+
+/// The PRs that wait for the user's merge, as decisions: those the tower
+/// is on its way to merging itself (auto-merge on) wait for nobody.
+fn sync_merges(decisions: &decisions::Decisions, prs: &crate::prs::Prs) {
+    decisions.sync_prs(&crate::prscore::for_the_user(&prs.list(), auto_merge_on()));
+}
+
+/// A PR's review score when it is found: the prediction it is in the plan
+/// its space was launched with (none: no plan predicted it), and its own
+/// title and files at its head (GitHub asked). When GitHub can't say, the
+/// prediction alone, to be read again before any merge.
+fn score_found(plans: &plans::Plans, gh: &std::path::Path, pr: &crate::prs::Pr) -> crate::prscore::Score {
+    let predicted = plans.match_pr(pr);
+    let (files, sha) = match crate::prs::fetch_files(gh, &pr.repo, pr.number) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("[prs] {}: couldn't read its files: {e:#}", pr.key());
+            (vec![], String::new())
+        }
+    };
+    let mut s = crate::prscore::combine(predicted.as_ref().map(|(_, p)| &p.score), &crate::prscore::real_score(&pr.title, &files), &sha);
+    s.planned = predicted.map(|(id, p)| format!("{id}#{}", p.n));
+    s
+}
+
 fn after_merge(sendq: &sendq::SendQueue, watches: &watch::Watches, pr: &crate::prs::Pr, by: &str) {
     let (who, whom) = match by {
         "mac" => ("the user", " from the Mac"),
         b if b.starts_with("phone:") => ("the user", " from their phone"),
+        "tower" => ("the tower", " itself (auto-merge is on: low risk, into dev)"),
         _ => ("someone", " on GitHub"),
     };
-    let note = if who == "the user" {
-        format!("The user merged PR #{} ({}) into {}.", pr.number, pr.repo, pr.base)
-    } else {
-        format!("PR #{} ({}) into {} was merged on GitHub.", pr.number, pr.repo, pr.base)
+    let note = match who {
+        "the user" => format!("The user merged PR #{} ({}) into {}.", pr.number, pr.repo, pr.base),
+        "the tower" => format!("The tower merged PR #{} ({}) into {} itself: {}.", pr.number, pr.repo, pr.base, automerge::MERGED_WHY),
+        _ => format!("PR #{} ({}) into {} was merged on GitHub.", pr.number, pr.repo, pr.base),
     };
     let queued = !pr.session.is_empty()
         && match sendq.add(&pr.session, &note, &[]) {

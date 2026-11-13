@@ -26,6 +26,15 @@
 //! - **The store** (`Book`): every plan, kept by the daemon in
 //!   `<state dir>/plans.json` and shown in `state.json` as `plan` (the open
 //!   one, `Plan::view`). The CLI (`Args`, `cmd`) talks to the daemon.
+//! - **The PRs it predicts** (`crate::prscore`): when the plan changes
+//!   code, the planner lists the pull requests it will open (`tower plan
+//!   prs <id> --json-file prs.json`: one per PR, its repo, its branch, dev
+//!   first, its title, what it changes, roughly which files, and whether it
+//!   is a migration, a breaking change or on the escalate list). The tower
+//!   checks and scores each (needs review, or low risk, and why), keeps
+//!   them with the plan (`Plan::prs`), and prints the scores for the plan's
+//!   page. When a session of the launched space opens a PR, it is matched to
+//!   its prediction (`Book::match_pr`) and carries the score.
 //! - **A launch with a plan** (`tower launch … --plan <id>`): each session's
 //!   first instruction carries the plan's link and its part of `plan.md`
 //!   (`part_for`, at most `BRIEF_CHARS`), and the plan is closed.
@@ -183,6 +192,8 @@ pub struct Plan {
     pub closed_ms: Option<u64>,
     /// The space launched with it.
     pub launched: Option<String>,
+    /// The pull requests it predicts, each with its review score (`tower plan prs`).
+    pub prs: Vec<crate::prscore::Predicted>,
 }
 
 impl Plan {
@@ -223,6 +234,7 @@ impl Plan {
             "updated_ms": self.updated_ms,
             "closed_ms": self.closed_ms,
             "launched": self.launched,
+            "prs": self.prs,
         })
     }
 }
@@ -340,6 +352,40 @@ impl Book {
         p.revision += 1;
         p.updated_ms = now;
         Ok(p.clone())
+    }
+
+    /// The PRs the planner predicts (checked and scored by `prscore::check`).
+    pub fn set_prs(&mut self, id: &str, prs: Vec<crate::prscore::Predicted>, now: u64) -> Result<Plan> {
+        let p = self.open_mut(id)?;
+        // A PR that opened already stays matched to the prediction of the same number.
+        let opened: Vec<(u32, String)> = p.prs.iter().filter_map(|x| Some((x.n, x.pr.clone()?))).collect();
+        p.prs = prs;
+        for (n, k) in opened {
+            if let Some(x) = p.prs.iter_mut().find(|x| x.n == n) {
+                x.pr = Some(k);
+            }
+        }
+        p.updated_ms = now;
+        Ok(p.clone())
+    }
+
+    /// The prediction a real PR is, in the plan its space was launched
+    /// with (the latest): matched once (`prscore::best_match`), and marked
+    /// with the PR's key. (The plan's id, the prediction.)
+    pub fn match_pr(&mut self, space: &str, repo: &str, base: &str, title: &str, key: &str, now: u64) -> Option<(String, crate::prscore::Predicted)> {
+        let space = space.trim();
+        if space.is_empty() {
+            return None;
+        }
+        let p = self.plans.iter_mut().rev().find(|p| p.launched.as_deref().is_some_and(|l| l.trim().eq_ignore_ascii_case(space)) && !p.prs.is_empty())?;
+        // Seen before (the same PR found again): the same prediction.
+        if let Some(x) = p.prs.iter().find(|x| x.pr.as_deref() == Some(key)) {
+            return Some((p.id.clone(), x.clone()));
+        }
+        let i = crate::prscore::best_match(&p.prs, repo, base, title)?;
+        p.prs[i].pr = Some(key.to_string());
+        p.updated_ms = now;
+        Some((p.id.clone(), p.prs[i].clone()))
     }
 
     /// Published (again): its link, and it is ready.
@@ -510,9 +556,21 @@ pub fn instructions(p: &Plan, tower: &str) -> String {
     s += "2. **How the repositories fit together**: the APIs, the data and the contracts between them (endpoints, payloads, events, schemas, settings), and which repository owns each.\n";
     s += "3. **The risks.**\n";
     s += "4. **The open questions** for the user.\n";
-    s += "5. **How it will be tested**: in each repository, and end to end.\n\n";
+    s += "5. **How it will be tested**: in each repository, and end to end.\n";
+    s += "6. **The pull requests** it will open, when it changes code (see 2).\n\n";
     s += "In `plan.md`, put each session under a `### <its repository's folder name>` heading inside a `## Sessions` section (a launched session is handed its own part), and the rest under `##` headings of their own.\n\n";
-    s += "## 2. Publish it\n\n";
+    s += "## 2. The pull requests\n\n";
+    s += "When the plan changes code, say what the future pull requests will look like: one entry per PR. Write them to `prs.json` in this folder:\n\n";
+    s += "```json\n{\"prs\": [{\"repo\": \"<the repository's folder name>\", \"base\": \"dev\", \"title\": \"<the PR's title>\", \"changes\": \"<what it changes, in a sentence or two>\", \"files\": [\"<roughly which files>\"], \"migration\": false, \"breaking\": \"\", \"escalate\": [], \"after\": []}]}\n```\n\n";
+    s += "- `base`: `dev`. The user's release rule: everything goes into dev first; promoting dev to main (or prod) is a release PR of its own, which the user merges.\n";
+    s += "- `migration`: true when it adds or changes a database migration (a schema change, a new table or column, a backfill).\n";
+    s += "- `breaking`: what it breaks, in a few words, when it changes an API, a contract or a schema others rely on, or removes or renames something public (an endpoint, a field, an event, an exported function, a setting); empty when nothing.\n";
+    s += "- `escalate`: anything else on the tower's escalate list it touches, a few words each: secrets or credentials, infrastructure (AWS, servers, DNS, CI, Docker, Terraform), deploys or releases, auth and permissions, deleting or overwriting data, money or billing, new dependencies that matter, security.\n";
+    s += "- `changes` says what it does, plainly; the flags above say what a person must look at. `after`: the numbers (from 1, in the list's order) of the PRs it waits for.\n\n";
+    s += &format!(
+        "Then run `{t} plan prs {id} --json-file prs.json`. The tower checks each PR and gives it a review score: **Needs review** (a migration, a breaking change, or something on the escalate list, from your flags, its files and its words) or **Low risk**, and why. It prints them: put a `## Pull requests` section in `plan.md` and in what you publish, one entry per PR (its repository, into which branch, its title, what it changes, roughly which files) with its score and the reason exactly as the tower printed them. Be honest in the flags: a PR scored low risk may be merged into dev by the tower without a person reading it, when the user has turned that on.\n\n"
+    );
+    s += "## 3. Publish it\n\n";
     match p.form {
         Form::Page => {
             s += &format!(
@@ -527,7 +585,7 @@ pub fn instructions(p: &Plan, tower: &str) -> String {
     }
     s += &format!("Then say so: `{t} plan published {id} --url <the artifact's link>`.\n\n");
     s += &format!("If you can't publish it (no Artifact tool, an error that stays), say why and stop: `{t} plan failed {id} \"<why, in a line>\"`.\n\n");
-    s += "## 3. Then: the chat\n\n";
+    s += "## 4. Then: the chat\n\n";
     s += &format!(
         "After that you wait. What the user says about the plan reaches you as a prompt that begins `[plan {id}] The user says:`. Answer it in a few sentences with `{t} plan say {id} \"<your answer>\"`: that is the only way your answer reaches them (nobody reads this terminal). Never ask anything in this terminal; ask with `plan say`.\n\n"
     );
@@ -537,8 +595,9 @@ pub fn instructions(p: &Plan, tower: &str) -> String {
         "  - **the draft** (which repositories get a session, the space's name, its goal, what counts as done): write the new draft to `draft.json` (the same shape; keep what you don't change; a repository must be a project folder on this Mac, see `{t} setups`) and run `{t} plan draft {id} --json-file draft.json`. It says what it took.\n"
     );
     s += &format!(
-        "  - **the plan**: change `plan.md`, republish the same artifact (your Artifact tool, with its `url`), and run `{t} plan published {id} --url <its link>` again.\n\n"
+        "  - **the plan**: change `plan.md`, republish the same artifact (your Artifact tool, with its `url`), and run `{t} plan published {id} --url <its link>` again.\n"
     );
+    s += &format!("  - **the pull requests**: change `prs.json`, run `{t} plan prs {id} --json-file prs.json` again, and put the new scores in `plan.md` and the artifact.\n\n");
     s += "## Never\n\n";
     s += "- Never launch the space, open or start a session, queue or send anything to a session, or open or close a space: no `tower launch`, `tower start`, `tower queue`, `tower dispatch`, `tower space`, no `hc`. The user launches it from the tower's window.\n";
     s += "- Never edit, commit or push in a repository. Write only in this folder.\n";
@@ -554,8 +613,8 @@ pub fn first_task(p: &Plan, tower: &str) -> String {
         Form::Whiteboard => format!("a Whiteboard Artifact (from the Artifact type {WHITEBOARD_TYPE})"),
     };
     format!(
-        "[plan {}] Read instructions.md in this folder, then ticket.md and draft.json. Write the full plan of the draft into plan.md, publish it as {form}, and say so with `{t} plan published {} --url <its link>`. Then wait for the user's messages.",
-        p.id, p.id
+        "[plan {}] Read instructions.md in this folder, then ticket.md and draft.json. Write the full plan of the draft into plan.md; when it changes code, list its pull requests in prs.json and score them with `{t} plan prs {} --json-file prs.json`; publish it as {form}, and say so with `{t} plan published {} --url <its link>`. Then wait for the user's messages.",
+        p.id, p.id, p.id
     )
 }
 
@@ -747,7 +806,7 @@ pub fn brief_of(id: &str) -> Result<PlanBrief> {
 /// `tower plan <action> …` as given.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Args {
-    /// new | say | draft | published | failed | show | close | list
+    /// new | say | draft | prs | published | failed | show | close | list
     pub action: String,
     pub id: Option<String>,
     /// What `say` and `failed` say.
@@ -757,7 +816,7 @@ pub struct Args {
     pub draft: Option<String>,
     /// `new`: the file the ticket is in.
     pub ticket_file: Option<String>,
-    /// `draft`: the file the revised draft is in.
+    /// `draft`, `prs`: the file the revised draft, or the predicted PRs, are in.
     pub json_file: Option<String>,
     /// `published`: the artifact's link.
     pub url: Option<String>,
@@ -768,7 +827,7 @@ pub struct Args {
     pub json: bool,
 }
 
-const USAGE: &str = "tower plan new --form page|whiteboard --draft '<draft JSON>' --ticket-file <file> | say <id> \"<words>\" [--as user|planner] | draft <id> --json-file <file> | published <id> --url <link> | failed <id> \"<why>\" | show [<id>] [--json] | close [<id>] | list";
+const USAGE: &str = "tower plan new --form page|whiteboard --draft '<draft JSON>' --ticket-file <file> | say <id> \"<words>\" [--as user|planner] | draft <id> --json-file <file> | prs <id> --json-file <file> | published <id> --url <link> | failed <id> \"<why>\" | show [<id>] [--json] | close [<id>] | list";
 
 /// Reads `tower plan …`'s words (after `plan`): the action, its flags, the id, the words.
 pub fn parse_args(raw: &[String]) -> Result<Args> {
@@ -820,8 +879,9 @@ pub fn parse_args(raw: &[String]) -> Result<Args> {
         }
         "say" | "failed" if a.id.is_none() || a.words.is_empty() => bail!("tower plan {} <id> \"<words>\"", a.action),
         "draft" if a.id.is_none() || a.json_file.is_none() => bail!("tower plan draft <id> --json-file <the revised draft>"),
+        "prs" if a.id.is_none() || a.json_file.is_none() => bail!("tower plan prs <id> --json-file <the predicted PRs: {{\"prs\":[{{\"repo\",\"base\",\"title\",\"changes\",\"files\",\"migration\",\"breaking\",\"escalate\",\"after\"}}]}}>"),
         "published" if a.id.is_none() || a.url.is_none() => bail!("tower plan published <id> --url <the artifact's link>"),
-        "say" | "failed" | "draft" | "published" | "show" | "close" | "list" => {}
+        "say" | "failed" | "draft" | "prs" | "published" | "show" | "close" | "list" => {}
         other => bail!("tower plan {other}: {USAGE}"),
     }
     if !a.words.is_empty() && !matches!(a.action.as_str(), "say" | "failed") {
@@ -849,6 +909,7 @@ pub fn request(a: &Args) -> Result<Value> {
         url: a.url.clone().unwrap_or_default(),
         who: a.who.map(|w| w.word().to_string()).unwrap_or_default(),
         launched: a.launched.clone(),
+        prs: None,
     })?;
     if !r.ok {
         bail!("{}", r.error.unwrap_or_else(|| "the tower said no".into()));
@@ -869,6 +930,13 @@ pub fn said(v: &Value) -> String {
     }
     if let Some(w) = v["why"].as_str().filter(|w| !w.is_empty()) {
         out += &format!("\n  {w}");
+    }
+    let prs: Vec<crate::prscore::Predicted> = serde_json::from_value(v["prs"].clone()).unwrap_or_default();
+    if !prs.is_empty() {
+        out += "\n  Pull requests:";
+        for line in crate::prscore::said(&prs).lines() {
+            out += &format!("\n    {line}");
+        }
     }
     for m in v["thread"].as_array().into_iter().flatten() {
         out += &format!("\n  {}: {}", if m["from"] == "user" { "You" } else { "Planner" }, m["text"].as_str().unwrap_or(""));
@@ -898,6 +966,7 @@ pub fn cmd(raw: &[String]) -> Result<()> {
                 url: String::new(),
                 who: String::new(),
                 launched: None,
+                prs: None,
             })?;
             if !r.ok {
                 bail!("{}", r.error.unwrap_or_default());
@@ -926,6 +995,7 @@ pub fn cmd(raw: &[String]) -> Result<()> {
                 url: String::new(),
                 who: String::new(),
                 launched: None,
+                prs: None,
             })?;
             if !sent.ok {
                 bail!("{}", sent.error.unwrap_or_default());
@@ -937,6 +1007,40 @@ pub fn cmd(raw: &[String]) -> Result<()> {
             }
             let mut v = sent.state.unwrap_or_default();
             v["took"] = json!(crate::ticket::said(&r));
+            v
+        }
+        "prs" => {
+            let id = a.id.clone().unwrap_or_default();
+            let file = a.json_file.clone().unwrap_or_default();
+            let text = std::fs::read_to_string(&file).map_err(|e| anyhow::anyhow!("--json-file {file}: {e}"))?;
+            let v: Value = serde_json::from_str(text.trim()).map_err(|e| anyhow::anyhow!("--json-file {file}: not JSON ({e})"))?;
+            // Checked here first, to say what's wrong before the daemon is asked.
+            let plan = show(Some(&id))?;
+            crate::prscore::check(&v, &repos_of(&plan["draft"]))?;
+            let sent = crate::protocol::send(&crate::protocol::Request::Plan {
+                action: "prs".into(),
+                id,
+                form: String::new(),
+                ticket: String::new(),
+                draft: None,
+                text: String::new(),
+                url: String::new(),
+                who: String::new(),
+                launched: None,
+                prs: Some(v),
+            })?;
+            if !sent.ok {
+                bail!("{}", sent.error.unwrap_or_default());
+            }
+            let v = sent.state.unwrap_or_default();
+            // The scores, for the planner to put in the plan as they are.
+            if !(a.json || !std::io::stdout().is_terminal()) {
+                let prs: Vec<crate::prscore::Predicted> = serde_json::from_value(v["prs"].clone()).unwrap_or_default();
+                println!("{}", crate::prscore::said(&prs));
+                return Ok(());
+            }
+            let mut v = v;
+            v["took"] = json!(crate::prscore::said(&serde_json::from_value::<Vec<crate::prscore::Predicted>>(v["prs"].clone()).unwrap_or_default()));
             v
         }
         "show" => show(a.id.as_deref())?,
@@ -1068,6 +1172,74 @@ mod tests {
         let v = back.get("p1").unwrap().view();
         assert_eq!((v["form"].as_str(), v["status"].as_str(), v["url"].as_str(), v["plan_md"].as_str()), (Some("whiteboard"), Some("closed"), Some("https://claude.ai/artifact/wb"), Some("/s/p1/plan.md")));
         assert_eq!(v["thread"][0]["from"], "user");
+    }
+
+    #[test]
+    fn a_plan_with_a_migration_pr_and_a_ui_pr_scores_both_and_the_real_prs_carry_them() {
+        let mut b = Book::default();
+        let (p, _) = b.add(Form::Page, "Translate support messages", draft(), |id| PathBuf::from(format!("/s/{id}")), 1);
+        let prs = crate::prscore::check(&crate::prscore::tests::two_prs(), &repos_of(&p.draft)).unwrap();
+        let p = b.set_prs(&p.id, prs, 2).unwrap();
+        // Both predictions, each with its score and why, as the state shows them.
+        let v = p.view();
+        assert_eq!(v["prs"].as_array().unwrap().len(), 2);
+        assert_eq!((v["prs"][0]["repo"].as_str(), v["prs"][0]["base"].as_str()), (Some("eyz-customer-support"), Some("dev")));
+        assert_eq!((v["prs"][0]["score"]["needs_review"].as_bool(), v["prs"][0]["score"]["flags"][0].as_str()), (Some(true), Some("migration")));
+        assert_eq!(v["prs"][0]["score"]["line"], "Needs review: a database migration (db/migrations/0042_message_translations.sql)");
+        assert_eq!((v["prs"][1]["repo"].as_str(), v["prs"][1]["score"]["needs_review"].as_bool()), (Some("eyzflow-admin-dashboard"), Some(false)));
+        assert_eq!(v["prs"][1]["score"]["line"], crate::prscore::LOW_LINE);
+        let text = said(&v);
+        assert!(text.contains("Pull requests:\n    PR 1 · eyz-customer-support → dev: Store each message's translation\n      Needs review: a database migration"), "{text}");
+        assert!(text.contains("PR 2 · eyzflow-admin-dashboard → dev: Show translated messages in the inbox\n      Low risk"), "{text}");
+        // Launched as its space: a PR a session opens there is matched to its prediction, once.
+        b.close(&p.id, Some("msg-translation"), 3).unwrap();
+        let (id, ui) = b.match_pr("Msg-Translation", "eyzhub/eyzflow-admin-dashboard", "dev", "feat: translated messages in the inbox", "eyzhub/eyzflow-admin-dashboard#7", 4).unwrap();
+        assert_eq!((id.as_str(), ui.n, ui.score.needs_review), ("p1", 2, false));
+        assert_eq!(b.get("p1").unwrap().prs[1].pr.as_deref(), Some("eyzhub/eyzflow-admin-dashboard#7"));
+        let again = b.match_pr("msg-translation", "eyzhub/eyzflow-admin-dashboard", "dev", "anything", "eyzhub/eyzflow-admin-dashboard#7", 5).unwrap();
+        assert_eq!(again.1.n, 2, "the same PR found again: the same prediction");
+        let (_, migration) = b.match_pr("msg-translation", "eyzhub/eyz-customer-support", "dev", "Store translations", "eyzhub/eyz-customer-support#3", 6).unwrap();
+        assert!(migration.score.needs_review);
+        assert!(b.match_pr("msg-translation", "eyzhub/eyz-customer-support", "dev", "one more", "eyzhub/eyz-customer-support#4", 7).is_none(), "every prediction of that repo is taken");
+        assert!(b.match_pr("another-space", "eyzhub/eyzflow-admin-dashboard", "dev", "x", "eyzhub/eyzflow-admin-dashboard#9", 8).is_none());
+        assert!(b.match_pr("", "eyzhub/eyzflow-admin-dashboard", "dev", "x", "eyzhub/eyzflow-admin-dashboard#9", 8).is_none(), "no space: no plan");
+        // A plan revised while open keeps the PRs that opened with their predictions.
+        let (q, _) = b.add(Form::Page, "t", draft(), |id| PathBuf::from(id), 9);
+        let prs = crate::prscore::check(&crate::prscore::tests::two_prs(), &repos_of(&q.draft)).unwrap();
+        b.set_prs(&q.id, prs.clone(), 10).unwrap();
+        b.plans.iter_mut().find(|x| x.id == q.id).unwrap().prs[0].pr = Some("o/r#1".into());
+        let q = b.set_prs(&q.id, prs, 11).unwrap();
+        assert_eq!(q.prs[0].pr.as_deref(), Some("o/r#1"));
+        // The CLI reads it.
+        let a = parse_args(&words(&["prs", "p3", "--json-file", "prs.json"])).unwrap();
+        assert_eq!((a.action.as_str(), a.id.as_deref(), a.json_file.as_deref()), ("prs", Some("p3"), Some("prs.json")));
+        assert!(parse_args(&words(&["prs", "p3"])).is_err(), "prs needs its file");
+    }
+
+    #[test]
+    fn the_planner_is_told_to_predict_the_prs_dev_first_and_flag_what_needs_review() {
+        let mut b = Book::default();
+        let (p, _) = b.add(Form::Page, "The ticket", draft(), |id| PathBuf::from(format!("/s/{id}")), 1);
+        let text = instructions(&p, "/bin/tower");
+        for part in [
+            "## 2. The pull requests",
+            "one entry per PR",
+            "/bin/tower plan prs p1 --json-file prs.json",
+            "everything goes into dev first",
+            "`migration`: true",
+            "`breaking`: what it breaks",
+            "`escalate`: anything else on the tower's escalate list",
+            "**Needs review**",
+            "**Low risk**",
+            "## Pull requests",
+            "its score and the reason exactly as the tower printed them",
+            "## 3. Publish it",
+            "## 4. Then: the chat",
+            "**the pull requests**: change `prs.json`",
+        ] {
+            assert!(text.contains(part), "{part}: {text}");
+        }
+        assert!(first_task(&p, "/bin/tower").contains("/bin/tower plan prs p1 --json-file prs.json"));
     }
 
     #[test]
