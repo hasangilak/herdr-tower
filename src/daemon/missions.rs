@@ -137,6 +137,10 @@ impl Missions {
             lock(&self.full).retain(|a, _| list.iter().any(|x| &x.address == a));
         }
         let seen = sessions.clone();
+        // What is open, kept in case a restart closes it, and offered back when one did (`crate::reopen`).
+        if let (Some(r), Some(list)) = (super::reopen::get(), &seen) {
+            r.look(list, &get);
+        }
         let view = self.settle(sessions, &crate::config::ui_dir(), now, auto_close_hours);
         // The spaces' own brains follow: started with a space's first session, stopped with its last.
         // (Not while Herdr can't be asked: nothing is known of who is there.)

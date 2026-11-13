@@ -485,6 +485,8 @@ pub struct Carry<'a> {
     pub send: &'a dyn Fn(&str, &str) -> Result<Value>,
     /// A `tower agenda` command, by the daemon's ledger.
     pub agenda: &'a dyn Fn(&crate::agenda::Cmd) -> crate::protocol::Response,
+    /// Puts back (or lets go) what a restart closed: what was done.
+    pub reopen: &'a dyn Fn(&crate::reopen::Pick) -> Result<Value>,
 }
 
 /// Whether the answer just given can be made a rule, and the request that
@@ -624,7 +626,40 @@ impl Decisions {
                 self.answered(id, "dropped");
                 Ok(json!({ "ok": true, "id": id, "state": "answered", "task": task, "abandoned": r.state }))
             }
+            Act::Reopen { pick, label } => {
+                let done = match (with.reopen)(&pick) {
+                    Ok(v) => v,
+                    Err(e) => return Err(Refused::Failed(format!("{e:#}"))),
+                };
+                self.answered(id, &label);
+                Ok(json!({ "ok": true, "id": id, "state": "answered", "answer": label, "reopen": done }))
+            }
         }
+    }
+
+    /// The card offering back what a restart closed, as it should stand
+    /// now (None: nothing left, an open one stops). Its id, and whether
+    /// the user is told now (the first time, as a raise is).
+    pub fn offer_reopen(&self, offer: Option<crate::reopen::Offer>) -> Option<(String, bool)> {
+        let had = lock(&self.book).open.iter().find(|d| d.key == decisions::REOPEN_KEY).map(|d| (d.title.clone(), d.detail.clone(), d.options.clone()));
+        let same = match (&had, &offer) {
+            (None, None) => return None,
+            (Some((title, detail, options)), Some(o)) => {
+                *title == o.title && *detail == decisions::detail_cut(&o.detail, false) && options.iter().map(|x| &x.label).eq(o.options.iter().map(|x| &x.0))
+            }
+            _ => false,
+        };
+        let raised = if same {
+            lock(&self.book).open.iter().find(|d| d.key == decisions::REOPEN_KEY).map(|d| Raised { id: d.id.clone(), fresh: false, folded: false, count: d.count, waiting: 0 })
+        } else {
+            self.change(|b, now| b.reopen(offer, now))
+        };
+        let raised = raised?;
+        if raised.fresh {
+            eprintln!("[decisions] {} (reopen) for the user: what the restart closed", raised.id);
+        }
+        let told = raised.fresh && self.tells(std::slice::from_ref(&raised.id), true);
+        Some((raised.id, told))
     }
 
     /// `tower dismiss <decision>`: out of the queue, with nothing sent. A

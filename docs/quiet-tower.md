@@ -311,6 +311,7 @@ question set behind it (a raise) has that block now too.
 | `tower raise` | `raised`; `choice` with `--options` | `raise:<space>:<the line>` | As given, the first one the pick |
 | A PR's review stuck after three rounds ("PR review") | `choice` (`why` `review`), about the owner and the reviewer | `raise:<space>:<its line>` | "Side with the owner", "Side with the reviewer", "I'll look"; no pick |
 | An agenda task that failed again after a retry | `failed` | `failed:<space>:<task id>` | "Try again", "Drop it"; no pick |
+| Sessions a restart of the Mac or Herdr closed ("After a restart") | `choice` (`why` `reopen`), in no space and naming no session | `reopen` (one at a time) | "Reopen all" (the pick; "Reopen it" for one), "Only <space>" for each space when there are several (up to three), "Forget them". The tower carries the answer out itself: nothing is sent to a session, and it is never made a rule |
 | A session blocked on something the tower can't read (no question set comes of it: a dialog it doesn't know) | `blocked` | `blocked:<space>:<address>` | None. It is answered in the session itself ("Show in Herdr"); it closes by itself, as `answered`, once the session is no longer blocked, and as `stopped` when the session is gone. Told once at a quiet level, as the plain notice was; every time at `everything` |
 
 - Text in a key is normalised: lowercased, every run of punctuation and
@@ -978,6 +979,69 @@ Mission { "name", "goal": "" when none, "done_when": "" when none,
   does `threads` and `decisions`: `GET /v1/missions` (step 11) serves it
   (the daemon's own look, as `{"cmd":"missions"}` answers it), and a change
   is a `missions` event.
+
+### After a restart: what was open comes back
+
+The tower keeps what is open, so that a restart of the Mac (or of Herdr's
+core) doesn't lose it: `open.json` in the state folder (`crate::reopen`,
+`daemon::reopen`).
+
+- **Kept**: with every look of the missions (every 20 s), each live agent
+  session of a space: its space and tab, its folder, its account, its
+  program (`claude-code`, `codex`), its conversation (the session id its
+  hooks gave, on its terminal as `tower.session`), the flags of its command
+  line a resume keeps (`--model`, `--effort`, `--permission-mode`,
+  `--add-dir`, `--settings`, `--dangerously-skip-permissions`; never its
+  task), and the tower's `tower.*` labels on its terminal (its worktree,
+  branch, port, name). Not the tower's own brains, planner and reviewers
+  (the tower starts those itself), nor another machine's sessions.
+- **Lost or ended.** Herdr's core says when it started (`hc server status`,
+  its uptime). A kept session missing from a look, last seen under an
+  older core, was lost to the restart: it is kept to be offered back, for a
+  week. Missing under the same core, it ended while everything stayed up
+  (the user quit it, the space was closed or resolved): it is forgotten
+  once it has been gone 3 minutes. A shutdown takes the daemon down well
+  before that, so what it sees ending on the way down stays lost, not ended.
+- **The first look** of a tower that has no `open.json` yet takes, as lost,
+  the sessions its hooks told of before this core started whose terminal
+  Herdr kept as a shell at its prompt, still labelled with that
+  conversation, in a space that isn't closed or archived.
+- **The offer**: once Herdr's window answers (`herdr-app ls`), one card in
+  the main queue (see the table above). It is raised once per start of the
+  core, changes in place as sessions come back by hand, and stops when none
+  is left. Dismissed, it isn't raised again until the next restart; `tower
+  reopen` still lists what is waiting. When the tower's own brain isn't
+  running either, the card says so, and reopening starts it again (a
+  space's own brain waits for the main one).
+- **Putting it back**: each session resumes its own conversation where it
+  was: `cca <account> -n <name> <flags> --resume <id>` (its account when it
+  was known, else the default one; plain `claude` without accounts), or
+  `codex resume <id>`.
+  - Its own terminal, when Herdr kept it as a shell at its prompt in the
+    same space and still tied to that conversation: `cd <folder> && <the
+    command>` is typed into it.
+  - Else a new tab of its space (`tab.new`, its tab's name, its folder),
+    with its `tower.*` labels set again.
+  - Else its space is made again (`space.new`, the folder Herdr had for
+    it), and the space's next sessions are its tabs.
+  - Not when its folder is gone (a removed worktree) or its conversation's
+    file is: that one is said, the rest go on. One the tower put back that
+    isn't seen again within 2 minutes (its resume failed) is lost again.
+  - The window is left on the space it showed. Each space gets one line in
+    the record (kind `space`, status `reopened`).
+
+```
+tower reopen                      # what a restart closed and is waiting
+tower reopen go [<space>…]        # put them back (all, or those spaces')
+tower reopen go --dry-run         # how each one would go back
+tower reopen forget [<space>…]    # let them go
+```
+
+`{"cmd":"reopen","action":"list|go|forget","spaces":[…],"dry_run":false}`
+on the socket. A test daemon (`HERDER_TOWER_TEST=1`) keeps only its test
+sessions, starts no brain, and may be told another start of the core
+(`HERDER_TOWER_CORE_SINCE=<file>` holding Unix ms), to try a restart
+without making one.
 
 ## Step 9: one sentence launches a space
 

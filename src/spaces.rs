@@ -461,9 +461,14 @@ pub struct Window {
 
 /// Herdr's spaces with their ids, from `herdr-app ls` (empty when Herdr isn't open).
 pub fn windows() -> Vec<Window> {
-    let Ok(out) = std::process::Command::new(config::herdr_app_bin()).arg("ls").stdin(std::process::Stdio::null()).output() else { return vec![] };
-    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
-    windows_from(&v)
+    windows_open().unwrap_or_default()
+}
+
+/// `windows`, or None when Herdr's window doesn't answer (not open yet).
+pub fn windows_open() -> Option<Vec<Window>> {
+    let out = std::process::Command::new(config::herdr_app_bin()).arg("ls").stdin(std::process::Stdio::null()).output().ok()?;
+    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+    v["spaces"].is_array().then(|| windows_from(&v))
 }
 
 pub fn windows_from(v: &Value) -> Vec<Window> {
