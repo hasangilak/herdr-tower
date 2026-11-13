@@ -57,6 +57,10 @@ impl AutoMerger {
             if auto_path(&pr, on) != Path::Ready {
                 continue;
             }
+            // The user's "Merge all N" has it: that chain merges it, not this.
+            if super::merges::get().is_some_and(|m| m.holds(&k)) {
+                continue;
+            }
             match self.merge(&pr) {
                 Ok(()) => merged.push(k),
                 Err(why) => eprintln!("[automerge] {k}: not merged: {why}"),

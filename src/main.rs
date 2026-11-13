@@ -30,6 +30,7 @@ mod hooks;
 mod install;
 mod introduce;
 mod launch;
+mod merges;
 mod missions;
 mod names;
 mod orb;

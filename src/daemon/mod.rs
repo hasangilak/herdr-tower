@@ -12,6 +12,7 @@ mod desk;
 pub mod hotkey;
 pub mod introduce;
 pub mod lan;
+pub mod merges;
 pub mod mic;
 pub mod missions;
 pub mod narrate;
@@ -310,6 +311,8 @@ pub fn run() -> Result<()> {
     missions.start();
     // What a restart of the Mac or Herdr closes, kept with the missions' looks and offered back.
     reopen::Reopen::open(decisions.clone()).start();
+    // "Merge all N": a merge card's PRs, merged in order by the tower.
+    merges::Merges::new(shared.clone(), prs.clone(), sendq.clone()).start();
     // What the tower opened for the user lately, to show with the reply and to undo.
     let acts = acts::Acts::open(shared.clone(), hub.clone());
     // A space's plan before it is launched, and its planner (`tower plan`).
@@ -668,6 +671,15 @@ impl Daemon {
                 return self.queue(&action, &session, &text, id, &after, tag, from.as_deref());
             }
             Request::Agenda { ledger } => return self.agendas.request(&ledger),
+            Request::MergeChain { action, id, card, prs, by } => {
+                return match merges::get() {
+                    Some(m) => match m.request(&action, &id, &card, &prs, if by.is_empty() { "mac" } else { &by }) {
+                        Ok(v) => Response { ok: true, error: None, state: Some(v) },
+                        Err(e) => Response::err(format!("{e:#}")),
+                    },
+                    None => Response::err("the tower isn't ready to merge yet"),
+                };
+            }
             Request::Reopen { action, spaces, dry_run } => {
                 return match reopen::get() {
                     Some(r) => match r.request(&action, &spaces, dry_run) {

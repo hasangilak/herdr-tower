@@ -12,11 +12,17 @@
 //! `--admin`), then tells the daemon (`PrMerged`), which checks with GitHub
 //! and tells the session and the brain.
 //!
-//! The card's one button begins with the first PR that can be merged
-//! cleanly, and after each merge the next one asks; a PR whose checks fail
-//! is held back, and merged only from its own row, with the extra step. Its
-//! number keys do what its buttons do (`merge_acts`). Where each merge
-//! stands is kept with the tower's state (`Acts`), so both windows show it.
+//! The card's one button begins with the PRs that can be merged cleanly.
+//! For one, it asks and merges it here. For several ("Merge all 3"), the
+//! one confirmation is for the whole chain: the daemon merges them in order
+//! by itself (`crate::merges`), waiting for GitHub between them and having
+//! a PR that fell behind or conflicts fixed by its session; each row says
+//! where its PR stands, "Stop" ends it, and only what can't be fixed comes
+//! back to the card, saying why. A PR whose checks fail is held back, and
+//! merged only from its own row, with the extra step. Its number keys do
+//! what its buttons do (`merge_acts`). Where each merge stands is kept with
+//! the tower's state (`Acts`, and the daemon's `merges`), so both windows
+//! show it.
 
 use gpui::{AnyElement, Context, FontWeight, SharedString, div, prelude::*, px, rgb, rgba};
 use gpui_kit::component::{h_flex, v_flex};
@@ -139,16 +145,57 @@ pub(super) enum MergeAct {
     Override(String),
     /// Merge it (`true`: although checks fail).
     Go(String, bool),
+    /// Merge these, in order, by the tower (the whole chain, confirmed once).
+    GoAll(Vec<String>),
+    /// Stop the tower's chain (its id): nothing more is merged.
+    Stop(String),
     Cancel(String),
+}
+
+/// A "Merge all N" the daemon runs for a card (its `merges` in the state).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct Run {
+    pub id: String,
+    pub over: bool,
+    /// Each PR's key and where it stands (`crate::merges::Step::line`).
+    pub links: Vec<(String, String)>,
+    /// It stopped at a PR that came back to the user: why.
+    pub back: Option<String>,
+}
+
+impl Run {
+    /// The card's chain as the daemon's state has it: the one running, else
+    /// the last one that came back to the user.
+    pub fn of(state: &serde_json::Value, card: &str) -> Option<Run> {
+        let all: Vec<&serde_json::Value> = state["merges"].as_array().into_iter().flatten().filter(|c| c["card"] == card).collect();
+        let pick = all.iter().rev().find(|c| c["over"] != true).or_else(|| all.iter().rev().find(|c| c["links"].as_array().is_some_and(|l| l.iter().any(|x| x["step"]["step"] == "back"))))?;
+        let links: Vec<(String, String)> = pick["links"].as_array().into_iter().flatten().map(|l| (l["key"].as_str().unwrap_or("").to_string(), l["line"].as_str().unwrap_or("").to_string())).collect();
+        let back = pick["links"].as_array().into_iter().flatten().find(|l| l["step"]["step"] == "back").map(|l| format!("#{} {}", l["number"], l["line"].as_str().unwrap_or("")));
+        Some(Run { id: pick["id"].as_str().unwrap_or("").to_string(), over: pick["over"] == true, links, back })
+    }
+
+    fn line(&self, key: &str) -> Option<&str> {
+        self.links.iter().find(|(k, _)| k == key).map(|(_, l)| l.as_str())
+    }
 }
 
 /// A merge card's buttons as it stands, key 1 first: (label, the main one,
 /// what it does). At rest it is one button, named for the PRs it will merge
 /// ("Merge both, dev first"): those that can go cleanly.
-pub(super) fn merge_acts(lines: &[Line]) -> Vec<(String, bool, MergeAct)> {
+/// `chained`: the card's own button began it (several PRs: confirmed as a
+/// whole chain); `run`: the tower's chain for this card, while it merges.
+pub(super) fn merge_acts(lines: &[Line], chained: bool, run: Option<&Run>) -> Vec<(String, bool, MergeAct)> {
     let cancel = |k: &str| ("Cancel".to_string(), false, MergeAct::Cancel(k.to_string()));
+    if let Some(r) = run.filter(|r| !r.over) {
+        return vec![("Stop merging".into(), false, MergeAct::Stop(r.id.clone()))];
+    }
+    let clean: Vec<&Line> = lines.iter().filter(|l| l.clean()).collect();
     if let Some(l) = lines.iter().find(|l| l.step != Step::Idle) {
         let k = l.key.clone();
+        if chained && l.step == Step::Confirm && clean.len() > 1 && l.clean() {
+            let label = if clean.len() == 2 { "Confirm: merge both in order".to_string() } else { format!("Confirm: merge all {} in order", clean.len()) };
+            return vec![(label, true, MergeAct::GoAll(clean.iter().map(|l| l.key.clone()).collect())), cancel(&l.key)];
+        }
         return match (&l.step, &l.gate.needs_override) {
             (Step::Merging, _) => vec![],
             (Step::Failed(_), _) => vec![("Try again".into(), true, MergeAct::Ask(k)), cancel(&l.key)],
@@ -157,10 +204,9 @@ pub(super) fn merge_acts(lines: &[Line]) -> Vec<(String, bool, MergeAct)> {
             (_, None) => vec![(format!("Confirm: merge #{}", l.pr.number), true, MergeAct::Go(k, false)), cancel(&l.key)],
         };
     }
-    if let Some(l) = lines.iter().find(|l| l.clean()) {
-        let clean: Vec<PrRef> =
-            lines.iter().filter(|l| l.clean()).map(|l| PrRef { repo: l.pr.repo.clone(), number: l.pr.number, base: l.pr.base.clone(), ..Default::default() }).collect();
-        return vec![(model::merge_label(&clean), true, MergeAct::Start(l.key.clone()))];
+    if let Some(l) = clean.first() {
+        let refs: Vec<PrRef> = clean.iter().map(|l| PrRef { repo: l.pr.repo.clone(), number: l.pr.number, base: l.pr.base.clone(), ..Default::default() }).collect();
+        return vec![(model::merge_label(&refs), true, MergeAct::Start(l.key.clone()))];
     }
     // Nothing merges cleanly: the first that can at all, with its extra step.
     match lines.iter().find(|l| l.gate.blocked.is_none()) {
@@ -214,7 +260,8 @@ impl Panel {
 
     /// The card's buttons as it stands (the number keys follow them).
     pub(super) fn merge_acts(&self, d: &Decision, cx: &gpui::App) -> Vec<(String, bool, MergeAct)> {
-        merge_acts(&self.merge_lines(d, cx))
+        let (chained, run) = (self.acts(cx).chain.contains(&d.id), self.run_of(d, cx));
+        merge_acts(&self.merge_lines(d, cx), chained, run.as_ref())
     }
 
     pub(super) fn merge_act(&mut self, d: &Decision, act: MergeAct, cx: &mut Context<Self>) {
@@ -230,12 +277,55 @@ impl Panel {
                 a.steps.remove(&k);
                 a.chain.remove(&card);
             }),
+            MergeAct::GoAll(keys) => self.merge_chain(&card, keys, cx),
+            MergeAct::Stop(id) => {
+                let req = crate::protocol::Request::MergeChain { action: "stop".into(), id, card: card.clone(), prs: vec![], by: String::new() };
+                cx.background_executor().spawn(async move { drop(crate::protocol::send(&req)) }).detach();
+            }
             MergeAct::Go(k, anyway) => match self.tower.read(cx).prs.get(&k).cloned() {
                 Some(pr) => self.merge_pr(&k, &pr.repo, pr.number, &pr.head_sha, anyway, cx),
                 None => self.act(cx, |a| drop(a.steps.insert(k, Step::Failed("the tower hasn't looked at this pull request yet".into())))),
             },
         }
         cx.notify();
+    }
+
+    /// The tower's chain for this card, as the daemon's state has it.
+    pub(super) fn run_of(&self, d: &Decision, cx: &gpui::App) -> Option<Run> {
+        self.tower.read(cx).state.as_ref().and_then(|s| Run::of(s, &d.id))
+    }
+
+    /// "Merge all N", confirmed: the daemon merges them in order from now on.
+    fn merge_chain(&mut self, card: &str, keys: Vec<String>, cx: &mut Context<Self>) {
+        let first = keys.first().cloned().unwrap_or_default();
+        self.act(cx, |a| {
+            for k in &keys {
+                a.steps.remove(k);
+            }
+            a.steps.insert(first.clone(), Step::Merging);
+        });
+        let req = crate::protocol::Request::MergeChain { action: "start".into(), id: String::new(), card: card.to_string(), prs: keys.clone(), by: "mac".into() };
+        let task = cx.background_executor().spawn(async move { crate::protocol::send(&req) });
+        let card = card.to_string();
+        cx.spawn(async move |this, cx| {
+            let r = task.await;
+            let _ = this.update(cx, |this, cx| {
+                let failed = match r {
+                    Ok(r) if r.ok => None,
+                    Ok(r) => Some(r.error.unwrap_or_else(|| "the tower said no".into())),
+                    Err(e) => Some(format!("the tower isn't running ({e:#})")),
+                };
+                this.act(cx, |a| {
+                    a.chain.remove(&card);
+                    match failed {
+                        Some(e) => drop(a.steps.insert(first.clone(), Step::Failed(e))),
+                        None => drop(a.steps.remove(&first)),
+                    }
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// A PR was merged from here: its receipt, and if the card's own button
@@ -265,9 +355,11 @@ impl Panel {
     pub(super) fn merge_card(&mut self, d: &Decision, tag: &str, now_ms: u64, cx: &mut Context<Self>) -> AnyElement {
         let g = glass();
         let lines = self.merge_lines(d, cx);
-        let acts = merge_acts(&lines);
+        let run = self.run_of(d, cx);
+        let acts = merge_acts(&lines, self.acts(cx).chain.contains(&d.id), run.as_ref());
         let auto_on = self.tower.read(cx).s("auto_merge").as_bool().unwrap_or(false);
-        let active = lines.iter().find(|l| l.step != Step::Idle);
+        let running = run.as_ref().filter(|r| !r.over);
+        let active = lines.iter().find(|l| l.step != Step::Idle).filter(|_| running.is_none());
         let mut rows = v_flex().gap(px(6.0));
         for l in &lines {
             let (word, color) = l.standing();
@@ -294,6 +386,11 @@ impl Panel {
                     .children(l.review().map(|(line, color)| div().text_size(px(12.0)).text_color(rgb(color)).truncate().child(line)))
                     .children(l.score().map(|(line, color)| div().text_size(px(12.0)).line_height(px(16.0)).text_color(rgb(color)).line_clamp(2).child(line)))
                     .children(crate::prscore::auto_line(&l.pr, auto_on).map(|line| div().text_size(px(12.0)).text_color(g.faint).truncate().child(line)))
+                    // Where the tower's chain has it.
+                    .children(running.and_then(|r| r.line(&l.key)).map(|line| {
+                        let color = if line.starts_with("back to you") { ROSE } else if line == "merged" { CYAN } else { AMBER };
+                        div().text_size(px(12.0)).text_color(rgb(color)).child(line.to_string())
+                    }))
                     .when(can_ask, |el| {
                         el.cursor_pointer().hover(|s| s.bg(rgba(LINE))).on_click(cx.listener(move |this, _, _, cx| this.merge_act(&d2, MergeAct::Ask(key.clone()), cx)))
                     }),
@@ -301,6 +398,13 @@ impl Panel {
         }
         // The second step: what merging this one does, and what the others do meanwhile.
         let mut said: Vec<AnyElement> = vec![];
+        if let Some(r) = running {
+            let now = r.links.iter().find(|(k, l)| l != "merged" && !l.starts_with("passed over") && lines.iter().any(|x| &x.key == k)).or(r.links.last());
+            let words = now.map(|(k, l)| format!("Merging in order: #{}: {l}.", k.rsplit('#').next().unwrap_or(""))).unwrap_or_else(|| "Merging in order…".into());
+            said.push(cstat_busy(words));
+        } else if let Some(why) = run.as_ref().and_then(|r| r.back.clone()).filter(|_| active.is_none()) {
+            said.push(cstat(format!("Merging in order stopped: {why}."), true));
+        }
         if let Some(l) = active {
             match &l.step {
                 Step::Merging => said.push(cstat_busy(format!("Merging #{}…", l.pr.number))),
@@ -395,43 +499,79 @@ mod tests {
         let both = "Merge both, dev first";
         // At rest: the one button, named for what it merges; it begins with the first clean PR.
         let idle = [line(1273, "dev", "passing", Step::Idle), line(1277, "main", "passing", Step::Idle)];
-        assert_eq!(merge_acts(&idle), [(both.to_string(), true, MergeAct::Start("acme/shop#1273".into()))]);
+        assert_eq!(merge_acts(&idle, false, None), [(both.to_string(), true, MergeAct::Start("acme/shop#1273".into()))]);
         // Asked: the second step names the PR; Cancel is key 2.
         let asked = [line(1273, "dev", "passing", Step::Confirm), line(1277, "main", "passing", Step::Idle)];
-        let acts = merge_acts(&asked);
+        let acts = merge_acts(&asked, false, None);
         assert_eq!(labels(&acts), ["Confirm: merge #1273", "Cancel"]);
         assert_eq!(acts[0].2, MergeAct::Go("acme/shop#1273".into(), false));
         assert_eq!(acts[1].2, MergeAct::Cancel("acme/shop#1273".into()));
         assert_eq!(others_line(&asked[0], &asked).as_deref(), Some("#1277 is next."));
         // While it merges there is nothing to press.
-        assert!(merge_acts(&[line(1273, "dev", "passing", Step::Merging)]).is_empty());
+        assert!(merge_acts(&[line(1273, "dev", "passing", Step::Merging)], false, None).is_empty());
         // It didn't go: another try, or leave it.
         let failed = [line(1273, "dev", "passing", Step::Failed("a review is required".into()))];
-        assert_eq!(labels(&merge_acts(&failed)), ["Try again", "Cancel"]);
+        assert_eq!(labels(&merge_acts(&failed, false, None)), ["Try again", "Cancel"]);
+    }
+
+    /// "Merge all 3" is confirmed once, for the whole chain, which the tower
+    /// then merges in order; while it does, the card can only stop it, and
+    /// each row says where its PR stands.
+    #[test]
+    fn merge_all_is_confirmed_once_and_the_tower_merges_the_chain() {
+        let k = |n: u64| format!("acme/shop#{n}");
+        let idle = [line(1374, "dev", "none", Step::Idle), line(1375, "dev", "none", Step::Idle), line(1376, "dev", "passing", Step::Idle)];
+        assert_eq!(merge_acts(&idle, false, None), [("Merge all 3".to_string(), true, MergeAct::Start(k(1374)))]);
+        let asked = [line(1374, "dev", "none", Step::Confirm), line(1375, "dev", "none", Step::Idle), line(1376, "dev", "passing", Step::Idle)];
+        let acts = merge_acts(&asked, true, None);
+        assert_eq!(labels(&acts), ["Confirm: merge all 3 in order", "Cancel"]);
+        assert_eq!(acts[0].2, MergeAct::GoAll(vec![k(1374), k(1375), k(1376)]));
+        // One that fails its checks isn't in the chain (it stays for its own row).
+        let mixed = [line(1374, "dev", "none", Step::Confirm), line(1375, "dev", "failing", Step::Idle), line(1376, "dev", "passing", Step::Idle)];
+        assert_eq!(merge_acts(&mixed, true, None)[0], ("Confirm: merge both in order".to_string(), true, MergeAct::GoAll(vec![k(1374), k(1376)])));
+        // A single PR keeps its own confirmation, merged here.
+        assert_eq!(labels(&merge_acts(&[line(1374, "dev", "none", Step::Confirm)], true, None)), ["Confirm: merge #1374", "Cancel"]);
+
+        // The daemon's chain, as the state carries it.
+        let state = serde_json::json!({ "merges": [
+            { "id": "m1", "card": "d9", "over": false, "links": [
+                { "key": k(1374), "number": 1374, "step": { "step": "merged" }, "line": "merged" },
+                { "key": k(1375), "number": 1375, "step": { "step": "waiting", "why": "GitHub is working out whether it merges cleanly" }, "line": "GitHub is working out whether it merges cleanly" },
+                { "key": k(1376), "number": 1376, "step": { "step": "queued" }, "line": "next" } ] },
+            { "id": "m0", "card": "d8", "over": true, "links": [
+                { "key": k(9), "number": 9, "step": { "step": "back", "why": "its checks fail" }, "line": "back to you: 1 check failing: test after its session's fix" } ] } ] });
+        let run = Run::of(&state, "d9").unwrap();
+        assert_eq!((run.id.as_str(), run.over, run.line(&k(1375))), ("m1", false, Some("GitHub is working out whether it merges cleanly")));
+        assert_eq!(merge_acts(&idle[1..], false, Some(&run)), [("Stop merging".to_string(), false, MergeAct::Stop("m1".into()))]);
+        // One that came back: said on its card, whose button is the usual one again.
+        let back = Run::of(&state, "d8").unwrap();
+        assert_eq!(back.back.as_deref(), Some("#9 back to you: 1 check failing: test after its session's fix"));
+        assert_eq!(labels(&merge_acts(&[line(9, "dev", "passing", Step::Idle)], false, Some(&back))), ["Merge #9"]);
+        assert!(Run::of(&state, "d7").is_none());
     }
 
     #[test]
     fn a_failing_check_holds_its_pull_request_back() {
         // The button skips the failing one (and is named for the other alone); it says so while the other is asked about.
         let mixed = [line(1273, "dev", "failing", Step::Idle), line(1277, "main", "passing", Step::Idle)];
-        assert_eq!(merge_acts(&mixed), [("Merge #1277".to_string(), true, MergeAct::Start("acme/shop#1277".into()))]);
+        assert_eq!(merge_acts(&mixed, false, None), [("Merge #1277".to_string(), true, MergeAct::Start("acme/shop#1277".into()))]);
         let asked = [line(1273, "dev", "passing", Step::Confirm), line(1277, "main", "failing", Step::Idle), line(1280, "main", "pending", Step::Idle)];
         assert_eq!(others_line(&asked[0], &asked).as_deref(), Some("#1277 is held back: its checks fail. #1280 waits for its checks."));
         // From its own row it takes two more steps, the second explicit.
         let own = [line(1277, "main", "failing", Step::Confirm)];
-        let acts = merge_acts(&own);
+        let acts = merge_acts(&own, false, None);
         assert_eq!((labels(&acts), &acts[0].2), (vec!["Checks fail: continue…", "Cancel"], &MergeAct::Override("acme/shop#1277".into())));
         let sure = [line(1277, "main", "failing", Step::Override)];
-        assert_eq!(merge_acts(&sure)[0].2, MergeAct::Go("acme/shop#1277".into(), true));
+        assert_eq!(merge_acts(&sure, false, None)[0].2, MergeAct::Go("acme/shop#1277".into(), true));
         // Only failing ones left: no one-button merge, a way to look at the first.
         let only = [line(1277, "main", "failing", Step::Idle)];
-        assert_eq!(merge_acts(&only), [("Review #1277: its checks fail".to_string(), false, MergeAct::Ask("acme/shop#1277".into()))]);
+        assert_eq!(merge_acts(&only, false, None), [("Review #1277: its checks fail".to_string(), false, MergeAct::Ask("acme/shop#1277".into()))]);
         assert_eq!(only[0].standing(), ("1 check fails".to_string(), ROSE));
         // A draft or a conflict can't be merged at all.
         let mut draft = line(9, "dev", "passing", Step::Idle);
         draft.pr.draft = true;
         draft.gate = gate(&draft.pr);
-        assert!(merge_acts(&[draft.clone()]).is_empty());
+        assert!(merge_acts(&[draft.clone()], false, None).is_empty());
         assert_eq!(draft.standing().0, "a draft");
         assert_eq!(others_line(&only[0], &[only[0].clone(), draft]).as_deref(), Some("#9 can't be merged yet."));
     }
@@ -456,7 +596,7 @@ mod tests {
         // Not agreed: said plainly when it is asked about, and still the user's to merge.
         let open = [with(Some(brief("changes", 2, 2)))];
         assert!(open[0].gate.warnings.iter().any(|w| w == "The review isn't agreed: 2 critical issues open, round 2."));
-        assert_eq!(merge_acts(&open), [("Merge #12".to_string(), true, MergeAct::Start("acme/shop#12".into()))]);
+        assert_eq!(merge_acts(&open, false, None), [("Merge #12".to_string(), true, MergeAct::Start("acme/shop#12".into()))]);
         let agreed = with(Some(brief("agreed", 2, 0)));
         assert!(agreed.gate.warnings.iter().all(|w| !w.contains("review")));
         // One the window knows only from its decision keeps its review.

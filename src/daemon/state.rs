@@ -119,6 +119,11 @@ pub struct State {
     pub decisions: Vec<serde_json::Value>,
     /// The open decisions outside muted spaces: the orb's number.
     pub decisions_count: usize,
+    /// "Merge all N" chains the tower is merging, and those that ended
+    /// lately (`crate::merges::Chain`: `{id, card, space, by, links: [{key,
+    /// number, base, step: {step, why}}], started_ms, stopped}`, with `over`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merges: Vec<serde_json::Value>,
     /// Every space as a mission (see `crate::missions`): `{"spaces":
     /// [Mission], "quiet": [name], "closed_today": [name]}`, the open ones
     /// first (those that need the user, then those at work, then the rest;
@@ -244,6 +249,7 @@ impl State {
             threads: Default::default(),
             decisions: vec![],
             decisions_count: 0,
+            merges: vec![],
             missions: serde_json::json!({ "spaces": [], "quiet": [], "closed_today": [] }),
             brains: vec![],
             brain_model: serde_json::Value::Null,

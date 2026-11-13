@@ -272,6 +272,21 @@ pub enum Request {
         #[serde(default)]
         dry_run: bool,
     },
+    /// "Merge all N" on a merge card (see `crate::merges`): `start` merges
+    /// `prs` (keys, in order) of the merge decision `card` one after the
+    /// other, by itself, as `by` (`mac`, `phone:<device>`) confirmed them;
+    /// `stop` (`id`, or the card's running one) merges nothing more; `list`.
+    MergeChain {
+        action: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        card: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        prs: Vec<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        by: String,
+    },
     /// What a restart of the Mac or Herdr closed (`tower reopen`, see
     /// `crate::reopen`): `list`, `go` (all, or `spaces`; `dry_run`: only
     /// how), `forget` (all, or `spaces`).

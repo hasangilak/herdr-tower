@@ -1553,6 +1553,49 @@ worktree with the same `worktrees::add`).
   the space's.
 - Closing the space removes its clean worktrees (step 5 and 8).
 
+## Merge all: the tower merges the chain
+
+A merge card's button names the PRs that can go cleanly ("Merge all 3").
+For one PR it asks, and "Confirm" merges it from the window, as before.
+For several, the one confirmation ("Confirm: merge all 3 in order") is
+for the whole chain, and the daemon merges it (`crate::merges`,
+`daemon::merges`; `{"cmd":"merge_chain","action":"start","card":…,"prs":[keys],"by":"mac"}`),
+each chain on a thread of its own with a look every 15 s:
+
+- **In order, one at a time.** The next PR starts only once GitHub says
+  the one before is merged.
+- **Waits are not failures.** Right after a merge GitHub works out again
+  whether the next one merges cleanly (`mergeable` / `mergeStateStatus`
+  UNKNOWN): waited for, up to 15 minutes. Checks running: up to 45.
+- **Fixed by its session.** A PR that fell behind its base (`BEHIND`: the
+  repo wants branches up to date) or now conflicts with it (`DIRTY`), or
+  whose checks fail, gets one request through the send queue to its
+  session: bring the branch up to date (merge the base in, resolve the
+  conflicts, run the tests), push, and leave the merge to the tower. One
+  that only fell behind and has no session left is brought up to date on
+  GitHub (`gh pr update-branch`). Its push is waited for (up to an hour),
+  then GitHub and its checks, then it is merged at its new head. The rest
+  of the chain is never put back to the user for it.
+- **Back to the user, once.** Only what can't be fixed: checks that still
+  fail after its fix, conflicts still there after it, a draft, a rule of
+  GitHub's that blocks it (a required review), a merge GitHub refuses three
+  times, or a wait that ran out. The chain stops there; the PRs after it
+  stay on the card, which says why ("Merging in order stopped: #1376 back
+  to you: …"), and a line goes into the record (kind `merge`, status
+  `back`).
+- Each merge is the repo's own method, pinned to the head commit looked
+  at, never `--admin`; one that lands is reported as a merge from the Mac
+  (`Prs::report_merged`): its chip moves, its session and the brain are told.
+- While it runs, each row of the card says where its PR stands ("GitHub is
+  working out whether it merges cleanly", "its session is bringing its
+  branch up to date with dev", "merged"), and the card's one button is
+  **Stop merging** (`"action":"stop"`: nothing more is merged). The state
+  carries every chain as `merges` (`{id, card, space, by, links: [{key,
+  number, base, step: {step, why}, line}], over, stopped}`), the ones that
+  ended for an hour.
+- A daemon restart ends a running chain (what merged stays merged); the
+  card's button starts it again with what is left.
+
 ## PR review: every PR gets a reviewer, and the two agree
 
 The model is `src/reviews.rs`; the daemon runs it in `src/daemon/reviews.rs`

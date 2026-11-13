@@ -230,7 +230,10 @@ its checks and where its review stands ("Review: 2 critical, round 2",
 in amber until it is agreed); its button asks about one (a review that
 isn't agreed is said among what to mind, and the merge is still yours), "Confirm" merges it (a PR whose
 checks fail takes a third step, from its own row; a draft or a conflict is
-held back). What the brain raised shows its choices as buttons, the
+held back). "Merge all 3" is confirmed once for the whole chain, and the
+tower merges the PRs in order by itself: it waits for GitHub between
+them, has a PR that fell behind or conflicts fixed by its session, and
+only hands one back to you (once, saying why) when it can't be fixed. What the brain raised shows its choices as buttons, the
 tower's pick in amber with its reason, and Other; a task that failed twice
 offers "Try again" and "Drop it". An answered card leaves a one-line
 receipt for about two seconds. ✕ dismisses a card.
