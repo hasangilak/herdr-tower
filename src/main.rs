@@ -47,6 +47,7 @@ mod reviews;
 mod screenshots;
 mod selftest;
 mod setups;
+mod space_drafts;
 mod spaces;
 mod split;
 mod tell;
