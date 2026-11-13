@@ -2383,13 +2383,29 @@ takes the keyboard; a spot off the screen's edge keeps them out of the way.
 `HERDER_TOWER_ORB_ANSWER=<decision id>:<n>[:rule]` has the full window
 answer that card with its option `n` (from 0) two and a half seconds after
 the start, as a click on it would, and with `:rule` take its receipt's
-"Make it a rule": for looking at what an answer leaves behind. On a merge
+"Make it a rule": for looking at what an answer leaves behind.
+`HERDER_TOWER_ORB_KEYS=<card id>:<keys>` opens that card's field for its own
+words and types `keys` into it as key presses, through the window's own key
+handling (the window needn't be in front): text runs, and `{enter}`,
+`{shift-enter}` or another key in braces; what the field holds and whether
+the answer went is logged after each run. On a merge
 card `n` is its button (0 asks about the first PR, which shows what
 merging it does and its warnings; nothing merges before Confirm).
 A whole tower for them to read runs in a sandbox with `HERDER_TOWER_VOICE=off
 tower daemon` (no speakers, no Kokoro, no Whisper, no microphone, no talk
 key; its own `HERDER_TOWER_HOME`, `_STATE`, `_DATA`, and stand-ins named by
 `HERDER_TOWER_HC`, `HERDER_TOWER_HERDR_APP`, `TOWER_CCA`, `HERDER_TOWER_GH`).
+
+### Enter sends
+
+Every text box of the floating panel and the full window takes Enter as
+its card's or form's own button, and Shift+Enter as a new line: "Tell the
+tower" (the conversation columns and New space's conversation are the
+same box), a card's own words ("Answer"; on a question card its Answer,
+Next or Review, not while its answer goes in), the space's goal editor
+(Save), a behavior's editor (Save), a project's form (Save, a repo per
+line with Shift+Enter) and the phone's name. Search behaviors takes no
+new line.
 
 ## Step 11: the phone
 
