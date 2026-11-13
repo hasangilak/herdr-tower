@@ -115,7 +115,7 @@ pub(super) struct GoalEdit {
 }
 
 /// A session's mark in its row: a pulse at work, amber while it waits, a tick at rest.
-fn session_mark(status: &str, key: String) -> AnyElement {
+pub(super) fn session_mark(status: &str, key: String) -> AnyElement {
     match status {
         "working" => sign(Chip::Working, 22.0, key),
         "blocked" => mark_box(Some(div().size(px(9.0)).rounded_full().bg(rgb(AMBER)).into_any_element())).into_any_element(),
@@ -743,10 +743,30 @@ impl Panel {
         }
 
         let workers: Vec<Member> = m.workers().into_iter().cloned().collect();
+        // Each one's Claude account, and what the account failover did with it (`accounts`).
+        let (board, groups) = self.usage_now(cx);
+        let now = crate::history::now_ms();
+        let here = groups.into_iter().find(|g| g.space.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(name)));
+        let seat = |addr: &str| here.as_ref().and_then(|g| g.seats.iter().find(|s| s.address == addr));
+        // Its own tower first, with its account.
+        let tower_row = here.as_ref().and_then(|g| g.seats.iter().find(|s| s.tower)).map(|t| {
+            let label = if t.name.is_empty() { t.address.clone() } else { t.name.clone() };
+            lrow(
+                super::accounts::tower_mark(&g),
+                nm(&label).truncate().into_any_element(),
+                Some(pg("this space's tower", false)),
+                vec![super::accounts::seat_line(t, board.as_ref(), now)],
+            )
+            .into_any_element()
+        });
         if workers.is_empty() {
-            items.push(bay("Sessions", vec![empty_box("No session is open here.")]));
+            let mut list = vec![];
+            list.extend(tower_row);
+            list.push(empty_box("No session is open here."));
+            items.push(bay("Sessions", list));
         } else {
             let mut rows: Vec<AnyElement> = vec![];
+            rows.extend(tower_row);
             for (i, s) in workers.iter().enumerate() {
                 let label = if s.name.is_empty() { s.address.clone() } else { s.name.clone() };
                 let mut under: Vec<AnyElement> = vec![];
@@ -757,6 +777,9 @@ impl Panel {
                 let place = s.place();
                 if !place.is_empty() {
                     under.push(div().font_family("Menlo").text_size(px(11.5)).line_height(px(17.0)).text_color(g.faint).child(place).into_any_element());
+                }
+                if let Some(seat) = seat(&s.address) {
+                    under.push(super::accounts::seat_line(seat, board.as_ref(), now));
                 }
                 let to = Scope::Session { space: name.to_string(), addr: s.address.clone() };
                 rows.push(

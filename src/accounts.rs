@@ -36,7 +36,7 @@ pub struct Account {
 
 /// One usage window of an account, as the mod last recorded it (its
 /// status-line tap writes what Claude Code reports).
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Window {
     /// Percent used.
     pub used: f64,

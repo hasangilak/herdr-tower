@@ -10,8 +10,9 @@
 //!   count of what is the user's; each open space with its mark (an amber
 //!   count, an outline when muted, a pulse at work, a tick at rest) and a
 //!   small line (its sessions, "standing", "ready to close"); "New space";
-//!   the quiet spaces folded into one line; Record, Shots, Projects and
-//!   Settings at the foot.
+//!   the quiet spaces folded into one line; each Claude account's usage
+//!   (`accounts`: a click opens the Accounts view); Record, Shots, Projects
+//!   and Settings at the foot.
 //! - **The main pane** shows what the sidebar picked (`crate::orb::nav`):
 //!   every space (here: the queue beside the missions), one space (`space`),
 //!   the launcher (`launch`), the record (`record`), the screenshots, the
@@ -534,6 +535,7 @@ fn scope_key(scope: &Scope) -> String {
         Scope::Behaviors => "behaviors".into(),
         Scope::Phone => "phone".into(),
         Scope::Session { addr, .. } => format!("session-{addr}"),
+        Scope::Accounts => "accounts".into(),
     }
 }
 
@@ -598,6 +600,10 @@ impl Panel {
             }
             Scope::Session { space, addr } => {
                 let (h, b) = self.session_pane(space, addr, &all, &missions, cx);
+                (h, b, None, false)
+            }
+            Scope::Accounts => {
+                let (h, b) = self.accounts_view(cx);
                 (h, b, None, false)
             }
         };
@@ -818,6 +824,8 @@ impl Panel {
             }
         }
         let hint = self.phone_hint(cx);
+        // Each Claude account's usage, live; a click shows who runs on which.
+        let accounts = self.accounts_strip(here == Side::Accounts, cx);
         let foot = |id: &'static str, text: &'static str, side: Side, to: Scope| {
             let on = here == side;
             div()
@@ -865,6 +873,7 @@ impl Panel {
                     .children(hint),
             )
             .child(div().id("side-list").flex_1().min_h_0().overflow_y_scroll().child(list))
+            .children(accounts)
             .child(
                 h_flex()
                     .px(px(2.0))
@@ -996,7 +1005,7 @@ mod tests {
         assert_eq!(scope_key(&Scope::Space("isa".into())), "space-isa");
         assert_ne!(scope_key(&Scope::Space("isa".into())), scope_key(&Scope::Space("anna".into())));
         assert_ne!(scope_key(&session("t1")), scope_key(&session("t2")));
-        let all = [Scope::All, Scope::New, Scope::Record, Scope::Shots, Scope::Projects, Scope::Settings, Scope::Behaviors, Scope::Phone];
+        let all = [Scope::All, Scope::New, Scope::Record, Scope::Shots, Scope::Projects, Scope::Settings, Scope::Behaviors, Scope::Phone, Scope::Accounts];
         let keys: HashSet<String> = all.iter().map(scope_key).collect();
         assert_eq!(keys.len(), all.len());
     }

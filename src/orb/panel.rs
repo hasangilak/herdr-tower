@@ -94,6 +94,7 @@ const NAVY: u32 = 0x16233a;
 /// them is a status colour): mint, orchid, peach, lime, lilac, coral, sand, aqua.
 const ACCOUNT_HUES: [u32; 8] = [0x6eeaa8, 0xf0a6ff, 0xffb98a, 0xc8f06e, 0xc9b3ff, 0xff9fb2, 0xe8d9a0, 0x7fe8e0];
 
+mod accounts;
 mod behaviors;
 mod cli;
 mod gallery;

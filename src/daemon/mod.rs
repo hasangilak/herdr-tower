@@ -328,6 +328,8 @@ pub fn run() -> Result<()> {
     // A session or a tower at its Claude account's usage limit, moved to the next account with usage.
     let failover = failover::Failover::open(decisions.clone(), sendq.clone());
     failover.start();
+    // Each account's usage, and who the failover moved: in the state, for the windows and the phone.
+    failover.publish_to(shared.clone());
     // "Merge all N": a merge card's PRs, merged in order by the tower.
     merges::Merges::new(shared.clone(), prs.clone(), sendq.clone()).start();
     // What the tower opened for the user lately, to show with the reply and to undo.

@@ -726,6 +726,8 @@ pub struct Known {
     pub argv: Vec<String>,
     /// When its terminal was made.
     pub created_ms: Option<u64>,
+    /// The Claude account it runs on (`crate::accounts`), when known.
+    pub account: Option<String>,
 }
 
 impl Known {

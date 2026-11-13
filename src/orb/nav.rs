@@ -43,6 +43,8 @@ pub enum Scope {
     Phone,
     /// One session, from its space (`space` is empty when it has none).
     Session { space: String, addr: String },
+    /// The Claude accounts: each one's usage, and who runs on which.
+    Accounts,
 }
 
 /// The row of the sidebar a scope lights.
@@ -55,6 +57,7 @@ pub enum Side {
     Shots,
     Projects,
     Settings,
+    Accounts,
 }
 
 impl Scope {
@@ -71,6 +74,7 @@ impl Scope {
             Scope::Shots => Side::Shots,
             Scope::Projects => Side::Projects,
             Scope::Settings | Scope::Behaviors | Scope::Phone => Side::Settings,
+            Scope::Accounts => Side::Accounts,
         }
     }
 
@@ -100,7 +104,7 @@ impl Scope {
 
     /// A scope by its word, as `HERDER_TOWER_ORB_WINDOW` names it: `all`,
     /// `new`, `record`, `record=<space>`, `shots`, `projects`, `settings`, `behaviors`,
-    /// `phone`, `space=<name>`, `session=<address>` or
+    /// `phone`, `accounts`, `space=<name>`, `session=<address>` or
     /// `session=<space>/<address>`. With it, the record's filter.
     pub fn parse(word: &str) -> (Scope, Option<String>) {
         let (key, value) = match word.split_once('=') {
@@ -116,6 +120,7 @@ impl Scope {
             ("settings", _) => (Scope::Settings, None),
             ("behaviors", _) => (Scope::Behaviors, None),
             ("phone", _) => (Scope::Phone, None),
+            ("accounts", _) => (Scope::Accounts, None),
             ("space", name) if !name.is_empty() => (Scope::Space(name.to_string()), None),
             ("session", at) if !at.is_empty() => {
                 let (space, addr) = at.rsplit_once('/').unwrap_or(("", at));

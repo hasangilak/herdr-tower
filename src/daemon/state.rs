@@ -167,6 +167,14 @@ pub struct State {
     /// writes them (`{key, repo, number, url, space, owner, owner_name,
     /// reviewer, reviewer_name, status, rounds, critical, line, chip, …}`).
     pub reviews: Vec<serde_json::Value>,
+    /// Each Claude account's usage and what the tower found of its limit
+    /// (`crate::usage::Board`): `{list: [{name, email, default, five_hour:
+    /// {used, resets_ms} | null, seven_day, out_until_ms, out_why}],
+    /// starts_on, moves: [failover::Moved], moving: [address], waiting:
+    /// [{address, account, since_ms, why}]}`; null until the first look.
+    /// Who runs on which account is in `agents`, the missions' sessions and
+    /// `brains` (each with its `account`).
+    pub accounts: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -267,6 +275,7 @@ impl State {
             acts: vec![],
             plan: None,
             reviews: vec![],
+            accounts: serde_json::Value::Null,
         }
     }
 
