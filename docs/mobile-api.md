@@ -798,6 +798,23 @@ cases under each predicted PR. A PR whose planned checks haven't all
 passed is never merged by the tower, and the missing ones are among the
 merge's `warnings`.
 
+**Breaking changes** (feature `impact`). A PR carries `impact`: `{things:
+[{kind: function | type | route | field | column | config | event, name,
+change: removed | renamed | signature | unread, renamed_to, file}],
+dependents: [{repo, file, line, uses, within, text}], searched: [repo
+names], reports: [{verdict: breaks | clean, text, by, at_ms}], sha,
+checked_ms}`: what it changes that others can use, who uses it (the
+function each use is in: `within`), and what the reviewer found running
+the dependents' tests. When anything uses what it changes, or a report says
+it breaks, the PR is a breaking change: its `score` says "Needs review: a
+breaking change (…)", its merge `warnings` carry "Breaking change: renames
+formatTotal to formatAmount, used by shop-web src/cart/Total.tsx:4 in
+renderTotal", and the tower never merges it. Show that warning on the
+PR's chip and its merge-card row, in rose; when nothing breaks, show
+"Nothing outside depends on what it changes (…; searched N repos)"
+quietly. A predicted PR has `dependents: [{what, used_by, breaks}]` and
+`outside` (how the planner checked, or that nothing depends on it).
+
 Show "Waiting for you" when `waiting` and `state` is `open`. The Merge
 button: disabled with `merge.blocked` as the reason when it's set. Tapping
 it calls `…/confirm` and shows the answer (repo, number, `base`, the
@@ -1624,6 +1641,7 @@ stream's `hello` event). A tower from before there were features sends no
 | `bonjour` | Found by name on the local network: the `_herdr-tower._tcp` advert with the certificate's `fp` in its TXT, and `bonjour` in `GET /v1/network`, `GET /v1/hello`, `POST /v1/pair`'s answer, the stream's `hello` and the `hosts` event (see "Finding the Mac by Bonjour") |
 | `acts` | Acts and what came with them: `GET /v1/acts`, `/v1/acts/{id}`, `POST /v1/acts/{id}/undo`, the chat's `kind: "act"` messages and the `act` event; `rule` in a decision's answer and `POST /v1/decisions/{id}/rule`; `voice` in `/v1/tell` and `tell_voice` in the state |
 | `reviews` | PR review: `review` on a PR (`GET /v1/prs`, the `pr` event, a chat chip's `pr`, a merge decision's `prs[]`), `review` on a mission, `reviews` in the state, and a review that isn't agreed among a merge's `warnings` |
+| `impact` | Who outside depends on what a PR changes: `impact` on a PR (wherever `score` is) and `dependents` / `outside` on a predicted one (`plan.prs`), and a breaking change's warning among a merge's `warnings` |
 | `validation` | A predicted PR's `checks` and `edge_cases` (`plan.prs`), and `validation` on a PR (wherever `score` is), with the missing checks among a merge's `warnings` |
 | `scores` | Review scores: `score` and `auto` on a PR (wherever `review` is), a plan's predicted PRs (`plan.prs`), `auto_merge` in the state, `merged_by: "tower"`, and a PR that needs review among a merge's `warnings` |
 | `quiet` | Everything under "The Quiet Tower": the `/v1/decisions`, `/v1/missions`, `/v1/spaces/{space}/…`, `/v1/thread`, `/v1/setups`, `/v1/launch`, `/v1/actions`, `/v1/tell` and `/v1/model` calls; `space` on `POST /v1/ask`, on chat messages, and as a filter of `/v1/history` and `/v1/chat`; the `decisions`, `missions`, `thread` and `action` events; `decisions_count`, `tell_level`, `brain_model` and `brains` in the state |

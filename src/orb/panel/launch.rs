@@ -350,6 +350,10 @@ pub(super) struct PrRow {
     pub checks: Vec<(String, String, String, String)>,
     /// The edge cases: (the case, the checks that cover it).
     pub edge_cases: Vec<(String, String)>,
+    /// What outside uses what it changes: (what, used by, it breaks).
+    pub dependents: Vec<(String, String, bool)>,
+    /// How the planner checked; that nothing outside depends on it, when nothing does.
+    pub outside: String,
 }
 
 /// The plan's predicted PRs as rows, in the plan's order.
@@ -379,6 +383,8 @@ pub(super) fn pr_rows(prs: &[crate::prscore::Predicted]) -> Vec<PrRow> {
                 notes,
                 checks: p.checks.iter().map(|c| (c.id.clone(), c.what.clone(), c.how.clone(), c.evidence.clone())).collect(),
                 edge_cases: p.edge_cases.iter().map(|e| (e.case.clone(), e.checks.join(", "))).collect(),
+                dependents: p.dependents.iter().map(|d| (d.what.clone(), d.used_by.clone(), d.breaks)).collect(),
+                outside: p.outside.clone(),
             }
         })
         .collect()
@@ -1684,6 +1690,27 @@ impl Panel {
                                 )
                         }))
                 })
+                // Who outside depends on what it changes: what breaks, first and plainly.
+                .children(r.dependents.iter().filter(|d| d.2).map(|(what, by, _)| {
+                    h_flex()
+                        .mt(px(3.0))
+                        .px(px(8.0))
+                        .py(px(5.0))
+                        .gap(px(6.0))
+                        .items_start()
+                        .rounded(px(8.0))
+                        .bg(rgba(0xff8f8f26))
+                        .border_1()
+                        .border_color(rgba(0xff8f8f66))
+                        .child(div().flex_none().text_size(px(12.0)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(0xff8f8f)).child("⚠ Breaks"))
+                        .child(div().min_w_0().text_size(px(12.0)).line_height(px(16.0)).text_color(rgb(0xff8f8f)).child(format!("{what}, used by {by}")))
+                }))
+                .children(r.dependents.iter().filter(|d| !d.2).map(|(what, by, _)| {
+                    div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.faint).child(format!("Depends on it, still works: {what}, used by {by}"))
+                }))
+                .when(r.dependents.is_empty() && !r.outside.is_empty(), |el| {
+                    el.child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.faint).child(format!("Nothing outside depends on it: {}", r.outside)))
+                })
                 .when(!r.edge_cases.is_empty(), |el| {
                     el.child(div().pt(px(4.0)).text_size(px(11.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.faint).child(format!("EDGE CASES · {}", r.edge_cases.len())))
                         .children(r.edge_cases.iter().map(|(case, by)| {
@@ -2508,6 +2535,9 @@ mod tests {
         assert_eq!(rows[0].edge_cases[2], ("Rolling back after rows exist".to_string(), "c1".to_string()));
         assert_eq!(rows[1].checks[1].3, "two screenshots: translated and original");
         assert_eq!(rows[1].edge_cases.len(), 2);
+        // Who depends on it: a dependent it doesn't break; or that nothing does, and how it was checked.
+        assert_eq!(rows[0].dependents, [("GET /v1/messages and its response".to_string(), "eyzflow-admin-dashboard src/inbox/api.ts loadMessages".to_string(), false)]);
+        assert!(rows[1].dependents.is_empty() && rows[1].outside.starts_with("rg over ~/Work for MessageRow"));
         assert_eq!(prs_head(&p.prs), "2 pull requests, 1 needs review");
         assert!(prs_note(&p.prs, false).contains("auto-merge of low-risk PRs into dev is off"));
         assert!(prs_note(&p.prs, true).starts_with("The tower merges the low-risk ones into dev itself"));

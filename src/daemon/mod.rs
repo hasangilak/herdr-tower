@@ -268,7 +268,7 @@ pub fn run() -> Result<()> {
         // Open PRs looked at gently; those the tower may merge itself (`[prs]
         // auto_merge_low_risk`, off unless the user turns it on) merged.
         let (prs, decisions, shared) = (prs.clone(), decisions.clone(), shared.clone());
-        let merger = automerge::AutoMerger::new(prs.clone(), auto_merge_on);
+        let merger = automerge::AutoMerger::new(prs.clone(), auto_merge_on).with_roots(crate::impact::roots);
         thread::Builder::new().name("prs".into()).spawn(move || {
             let mut was: Option<bool> = None;
             loop {
@@ -321,10 +321,7 @@ pub fn run() -> Result<()> {
     // A PR found from now on carries its review score: its plan's prediction, and its own files.
     {
         let (plans, gh) = (plans.clone(), prs.gh().to_path_buf());
-        prs.on_score(Box::new(move |pr| {
-            let (score, validation) = score_found(&plans, &gh, pr);
-            (Some(score), validation)
-        }));
+        prs.on_score(Box::new(move |pr| score_found(&plans, &gh, pr, &crate::impact::roots())));
         // A session that finished its turn on a PR without reporting its planned checks: told once, quietly.
         let sendq = sendq.clone();
         prs.on_unreported(Box::new(move |pr, missing| {
@@ -460,6 +457,35 @@ impl Daemon {
 /// `#12` (the caller's own); one the tower doesn't know yet is looked up on
 /// GitHub now as the caller's, as its turn's end would.
 fn validate(prs: &crate::prs::Prs, pr: &str, check: &str, status: &str, evidence: &str, from: Option<&str>) -> anyhow::Result<serde_json::Value> {
+    let key = pr_key(prs, pr, from)?;
+    let pr = if check.trim().is_empty() {
+        prs.get(&key).ok_or_else(|| anyhow::anyhow!("no PR {key}"))?
+    } else {
+        let p = prs.report_check(&key, check, status, evidence, from.unwrap_or(""))?;
+        eprintln!("[prs] {key}: check {check} {status} (by {})", from.unwrap_or("?"));
+        p
+    };
+    Ok(serde_json::json!({ "pr": pr.key(), "validation": pr.validation, "line": pr.validation.as_ref().map(|v| v.line()) }))
+}
+
+/// `tower impact`: who depends on a PR's changes (with no verdict), or a
+/// break found, or none, by compiling, type-checking or running the dependents' tests.
+fn impact_report(prs: &crate::prs::Prs, pr: &str, verdict: &str, text: &str, from: Option<&str>) -> anyhow::Result<serde_json::Value> {
+    let key = pr_key(prs, pr, from)?;
+    let pr = if verdict.trim().is_empty() {
+        prs.get(&key).ok_or_else(|| anyhow::anyhow!("no PR {key}"))?
+    } else {
+        let p = prs.report_impact(&key, verdict, text, from.unwrap_or(""))?;
+        eprintln!("[prs] {key}: impact {verdict} (by {}): {text}", from.unwrap_or("?"));
+        p
+    };
+    Ok(serde_json::json!({ "pr": pr.key(), "impact": pr.impact, "line": pr.impact.as_ref().map(|i| i.line()), "breaks": pr.impact.as_ref().is_some_and(|i| i.breaks()) }))
+}
+
+/// A PR as a session names it (its key, its link, or `#12`: the caller's
+/// own), as its key; one the tower doesn't know yet is looked up on GitHub
+/// now as the caller's, as its turn's end would.
+fn pr_key(prs: &crate::prs::Prs, pr: &str, from: Option<&str>) -> anyhow::Result<String> {
     let Some((repo, n)) = crate::reviews::pr_of(pr) else { anyhow::bail!("give the PR: its key (owner/repo#12), its link, or #12") };
     let key = match repo {
         Some(r) => crate::prs::key(&r, n),
@@ -480,14 +506,7 @@ fn validate(prs: &crate::prs::Prs, pr: &str, check: &str, status: &str, evidence
             anyhow::bail!("{key} isn't an open PR GitHub knows");
         }
     }
-    let pr = if check.trim().is_empty() {
-        prs.get(&key).ok_or_else(|| anyhow::anyhow!("no PR {key}"))?
-    } else {
-        let p = prs.report_check(&key, check, status, evidence, from.unwrap_or(""))?;
-        eprintln!("[prs] {key}: check {check} {status} (by {})", from.unwrap_or("?"));
-        p
-    };
-    Ok(serde_json::json!({ "pr": pr.key(), "validation": pr.validation, "line": pr.validation.as_ref().map(|v| v.line()) }))
+    Ok(key)
 }
 
 /// `[prs] auto_merge_low_risk` as config.toml has it now.
@@ -506,7 +525,10 @@ fn sync_merges(decisions: &decisions::Decisions, prs: &crate::prs::Prs) {
 /// title and files at its head (GitHub asked). When GitHub can't say, the
 /// prediction alone, to be read again before any merge. With it, the
 /// validation the plan gives it (its checks, none reported yet, and its edge cases).
-fn score_found(plans: &plans::Plans, gh: &std::path::Path, pr: &crate::prs::Pr) -> (crate::prscore::Score, Option<crate::prscore::Validation>) {
+/// And who outside depends on what it changes (`crate::impact`: its diff,
+/// and every checkout under `roots`), which makes it a breaking change
+/// when anything uses what it removes or changes.
+fn score_found(plans: &plans::Plans, gh: &std::path::Path, pr: &crate::prs::Pr, roots: &[std::path::PathBuf]) -> crate::prscore::Scored {
     let predicted = plans.match_pr(pr);
     let (files, sha) = match crate::prs::fetch_files(gh, &pr.repo, pr.number) {
         Ok(x) => x,
@@ -515,10 +537,24 @@ fn score_found(plans: &plans::Plans, gh: &std::path::Path, pr: &crate::prs::Pr) 
             (vec![], String::new())
         }
     };
-    let mut s = crate::prscore::combine(predicted.as_ref().map(|(_, p)| &p.score), &crate::prscore::real_score(&pr.title, &files), &sha);
+    let impact = match crate::impact::of_pr(gh, &pr.repo, pr.number, &sha, roots) {
+        Ok(i) => {
+            eprintln!("[prs] {}: {}", pr.key(), i.line());
+            Some(i)
+        }
+        Err(e) => {
+            eprintln!("[prs] {}: couldn't read its diff: {e:#}", pr.key());
+            None
+        }
+    };
+    let mut real = crate::prscore::real_score(&pr.title, &files);
+    if let Some(i) = &impact {
+        real = crate::prscore::union(&real, &i.score());
+    }
+    let mut s = crate::prscore::combine(predicted.as_ref().map(|(_, p)| &p.score), &real, &sha);
     let validation = predicted.as_ref().map(|(_, p)| p.validation());
     s.planned = predicted.map(|(id, p)| format!("{id}#{}", p.n));
-    (s, validation)
+    crate::prscore::Scored { score: Some(s), validation, impact }
 }
 
 fn after_merge(sendq: &sendq::SendQueue, watches: &watch::Watches, pr: &crate::prs::Pr, by: &str) {
@@ -693,6 +729,12 @@ impl Daemon {
             Request::Missions => return Response { ok: true, error: None, state: Some(self.missions.now()) },
             Request::Review { action, pr, critical, text, from } => {
                 return match self.reviews.request(&action, &pr, critical, &text, from.as_deref()) {
+                    Ok(v) => Response { ok: true, error: None, state: Some(v) },
+                    Err(e) => Response::err(format!("{e:#}")),
+                };
+            }
+            Request::Impact { pr, verdict, text, from } => {
+                return match impact_report(&self.prs, &pr, &verdict, &text, from.as_deref()) {
                     Ok(v) => Response { ok: true, error: None, state: Some(v) },
                     Err(e) => Response::err(format!("{e:#}")),
                 };

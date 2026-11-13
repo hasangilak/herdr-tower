@@ -1902,6 +1902,47 @@ release, so it is part of every PR from the plan on (`prscore::Validation`):
   `prs[]` carry `validation`, its option says what is missing and is never
   the tower's pick, and the missing checks are among the merge's warnings.
 
+### Breaking changes: who depends on what it changes
+
+A PR check also establishes whether the change breaks other people's
+functionality (`src/impact.rs`):
+
+- **What it changes** that others can use, read from its diff (`gh pr
+  diff`): public functions, types and constants it removes, renames or
+  whose parameters it changes (`export` in JS/TS, `pub` in Rust, a capital
+  in Go, a module-level name in Python, what isn't `private` in
+  Kotlin/Java/Swift); API routes it no longer has; fields of what an API
+  sends or takes (in API-like files: `api/`, `routes/`, `handlers/`,
+  `serverless`, `schema`, `types`, `dto`, …; distinctive keys only); DB
+  columns a migration drops or renames; config keys it stops reading;
+  events it stops sending.
+- **Who uses it**: every git checkout under `[prs] impact_roots` (default
+  `~/Work`; a worktree is its repo's), searched with `git grep` (whole
+  words; a route by its fixed part): the PR's own repo outside the files
+  the PR changes, and every other repo (the dashboard that calls a
+  serverless API, the SDK, the mobile app). Docs, lockfiles and built
+  files don't count; nor does a definition of the same name. Each use is
+  named: repo, file, line, and the function it is in.
+- **The reviewer** (when the space has one) is told to check them: compile
+  or type-check them, run their tests against the change, search for what
+  the tower missed, and report: `tower impact <pr> breaks "<what breaks,
+  who uses it>"` or `tower impact <pr> clean "<what it ran>"`. `tower
+  impact <pr>` lists what the tower found.
+- **A breaking change** (anything found, or a break reported) makes the PR
+  "Needs review: a breaking change (renames formatTotal to formatAmount,
+  used by shop-web src/cart/Total.tsx:4 in renderTotal)", with the warning
+  "Breaking change: …" on its merge card row (rose), among its merge
+  warnings, in its merge decision (`prs[].impact`) and for the phone; the
+  tower never merges it. Nothing found: "Nothing outside depends on what it
+  changes (…; searched N repos)". A push is read again before any merge.
+- **In the plan**: each predicted PR says who outside depends on what it
+  changes (`dependents`: what, used by whom, `breaks`) or how the planner
+  checked that nothing does (`outside`); a dependent it breaks makes it a
+  breaking change in the plan already, shown under its row ("⚠ Breaks").
+
+The search is by name: a same-named thing that isn't the same one is a
+false alarm, which sends the PR to the user; never the other way.
+
 ### Merging without asking
 
 `[prs] auto_merge_low_risk` (off by default; `tower automerge on|off|status`,
@@ -1911,6 +1952,8 @@ only when all of these hold:
 
 - a plan predicted it (`score.planned`), and it is scored low risk, read on
   its own files at its head commit;
+- who depends on what it changes was checked at its head commit, and
+  nothing breaks (no breaking change);
 - every check its plan lists for it passed, with its evidence: one not
   reported yet is waited for (no decision meanwhile), one failed or not run
   makes it the user's, and a planned PR with no checks is the user's;

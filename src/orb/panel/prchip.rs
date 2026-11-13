@@ -120,6 +120,29 @@ impl Line {
         Some((s.line.clone(), if s.needs_review { AMBER } else { CYAN }))
     }
 
+    /// Who outside depends on what it changes, for its row: a breaking
+    /// change, what breaks and who uses it (rose, bad news first), or that
+    /// nothing outside depends on it (quiet).
+    fn impact(&self) -> Option<(String, bool)> {
+        let i = self.pr.impact.as_ref()?;
+        Some((i.line(), i.breaks()))
+    }
+
+    /// What breaks, each on a line of its own (the warning box's).
+    fn breaking(&self) -> Vec<String> {
+        self.pr.impact.as_ref().map(crate::impact::Impact::breaking).unwrap_or_default()
+    }
+
+    /// The score's line, unless the breaking-change warning already says all
+    /// of it (its only reason is the break).
+    fn score_shown(&self) -> Option<(String, u32)> {
+        let only_break = self.pr.score.as_ref().is_some_and(|s| s.flags == ["breaking"]);
+        if only_break && !self.breaking().is_empty() {
+            return None;
+        }
+        self.score()
+    }
+
     /// Its plan's checks, for its row: all passed (cyan), or which are
     /// missing and how they stand (amber, or rose when one failed).
     fn validation(&self) -> Option<(String, u32)> {
@@ -396,8 +419,24 @@ impl Panel {
                     )
                     .when(!l.pr.title.is_empty(), |el| el.child(div().text_size(px(12.0)).text_color(g.faint).truncate().child(l.pr.title.clone())))
                     .children(l.review().map(|(line, color)| div().text_size(px(12.0)).text_color(rgb(color)).truncate().child(line)))
-                    .children(l.score().map(|(line, color)| div().text_size(px(12.0)).line_height(px(16.0)).text_color(rgb(color)).line_clamp(2).child(line)))
+                    .when(!l.breaking().is_empty(), |el| {
+                        el.child(
+                            v_flex()
+                                .mt(px(3.0))
+                                .px(px(9.0))
+                                .py(px(6.0))
+                                .gap(px(3.0))
+                                .rounded(px(8.0))
+                                .bg(rgba(0xff8f8f26))
+                                .border_1()
+                                .border_color(rgba(0xff8f8f66))
+                                .child(div().text_size(px(12.0)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(ROSE)).child("⚠ Breaking change: needs your review"))
+                                .children(l.breaking().into_iter().map(|b| div().text_size(px(12.0)).line_height(px(16.0)).text_color(rgb(ROSE)).child(format!("• {b}")))),
+                        )
+                    })
+                    .children(l.score_shown().map(|(line, color)| div().text_size(px(12.0)).line_height(px(16.0)).text_color(rgb(color)).line_clamp(2).child(line)))
                     .children(l.validation().map(|(line, color)| div().text_size(px(12.0)).line_height(px(16.0)).text_color(rgb(color)).line_clamp(3).child(line)))
+                    .children(l.impact().filter(|(_, breaks)| !*breaks).map(|(line, _)| div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.faint).line_clamp(2).child(line)))
                     .children(crate::prscore::auto_line(&l.pr, auto_on).map(|line| div().text_size(px(12.0)).text_color(g.faint).truncate().child(line)))
                     // Where the tower's chain has it.
                     .children(running.and_then(|r| r.line(&l.key)).map(|line| {
@@ -476,6 +515,7 @@ fn described(r: &PrRef) -> Pr {
         review: r.review.clone(),
         score: r.score.clone(),
         validation: r.validation.clone(),
+        impact: r.impact.clone(),
         ..Default::default()
     }
 }
@@ -616,6 +656,40 @@ mod tests {
         // One the window knows only from its decision keeps its review.
         let r = PrRef { repo: "acme/shop".into(), number: 7, review: Some(brief("stuck", 3, 1)), ..Default::default() };
         assert_eq!(described(&r).review.unwrap().line, "Review: stuck after 3 rounds, yours to decide");
+    }
+
+    #[test]
+    fn a_merge_cards_row_warns_of_a_breaking_change_naming_what_breaks_and_who_uses_it() {
+        use crate::impact::{Dependent, Impact, Thing};
+        let mut l = line(61, "dev", "passing", Step::Idle);
+        l.pr.impact = Some(Impact {
+            things: vec![Thing { kind: "function".into(), name: "formatTotal".into(), change: "renamed".into(), renamed_to: Some("formatAmount".into()), file: "src/money.ts".into() }],
+            dependents: vec![Dependent { repo: "shop-web".into(), file: "src/cart/Total.tsx".into(), line: 4, uses: "formatTotal".into(), within: "renderTotal".into(), text: "formatTotal(cents)".into() }],
+            searched: vec!["shop-api".into(), "shop-web".into()],
+            ..Default::default()
+        });
+        l.gate = gate(&l.pr);
+        let (line_text, breaks) = l.impact().unwrap();
+        assert!(breaks);
+        assert_eq!(l.breaking(), ["renames formatTotal to formatAmount, used by shop-web src/cart/Total.tsx:4 in renderTotal"]);
+        // Its score says no more than the warning: not shown twice; one with other reasons is.
+        l.pr.score = Some(crate::prscore::union(&crate::prscore::Score::default(), &l.pr.impact.as_ref().unwrap().score()));
+        assert_eq!(l.score_shown(), None);
+        let mut both = l.pr.score.clone().unwrap();
+        both = crate::prscore::union(&both, &crate::prscore::score(&crate::prscore::Evidence { files: vec!["db/migrations/1.sql".into()], ..Default::default() }));
+        l.pr.score = Some(both);
+        assert!(l.score_shown().is_some());
+        assert_eq!(line_text, "Breaking change: renames formatTotal to formatAmount, used by shop-web src/cart/Total.tsx:4 in renderTotal");
+        assert!(l.gate.warnings.contains(&"Breaking change: renames formatTotal to formatAmount, used by shop-web src/cart/Total.tsx:4 in renderTotal.".to_string()), "{:?}", l.gate.warnings);
+        // Nothing outside depends on it: said quietly, no warning.
+        let mut quiet = line(62, "dev", "passing", Step::Idle);
+        quiet.pr.impact = Some(Impact { searched: vec!["shop-api".into(), "shop-web".into()], ..Default::default() });
+        quiet.gate = gate(&quiet.pr);
+        assert_eq!(quiet.impact(), Some(("Nothing outside depends on what it changes (no name others can use changes; searched 2 repos)".into(), false)));
+        assert!(quiet.gate.warnings.iter().all(|w| !w.contains("Breaking")));
+        // One the window knows only from its decision keeps it.
+        let r = PrRef { repo: "acme/shop".into(), number: 61, impact: l.pr.impact.clone(), ..Default::default() };
+        assert!(described(&r).impact.unwrap().breaks());
     }
 
     #[test]

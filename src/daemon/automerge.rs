@@ -32,11 +32,19 @@ pub struct AutoMerger {
     prs: Prs,
     /// The setting as it is now (`[prs] auto_merge_low_risk`).
     on: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Where a PR's dependents are looked for (`crate::impact::roots`).
+    roots: Arc<dyn Fn() -> Vec<std::path::PathBuf> + Send + Sync>,
 }
 
 impl AutoMerger {
     pub fn new(prs: Prs, on: impl Fn() -> bool + Send + Sync + 'static) -> AutoMerger {
-        AutoMerger { prs, on: Arc::new(on) }
+        AutoMerger { prs, on: Arc::new(on), roots: Arc::new(Vec::new) }
+    }
+
+    /// Where its dependents are looked for (the daemon's: `[prs] impact_roots`).
+    pub fn with_roots(mut self, roots: impl Fn() -> Vec<std::path::PathBuf> + Send + Sync + 'static) -> AutoMerger {
+        self.roots = Arc::new(roots);
+        self
     }
 
     pub fn on(&self) -> bool {
@@ -50,7 +58,8 @@ impl AutoMerger {
         let mut merged = vec![];
         for pr in self.prs.list().into_iter().filter(Pr::open) {
             let k = pr.key();
-            if pr.score.as_ref().is_some_and(|s| s.sha != pr.head_sha) && !pr.head_sha.is_empty() {
+            let stale = pr.score.as_ref().is_some_and(|s| s.sha != pr.head_sha) || pr.impact.as_ref().is_some_and(|i| i.sha != pr.head_sha);
+            if stale && !pr.head_sha.is_empty() {
                 self.rescore(&pr);
             }
             let Some(pr) = self.prs.get(&k) else { continue };
@@ -80,7 +89,20 @@ impl AutoMerger {
                 return None;
             }
         };
-        let s = prscore::combine(pr.score.as_ref(), &prscore::real_score(&pr.title, &files), &sha);
+        // Who depends on what it changes, at that commit (the reports given before stay).
+        let mut real = prscore::real_score(&pr.title, &files);
+        match crate::impact::of_pr(self.prs.gh(), &pr.repo, pr.number, &sha, &(self.roots)()) {
+            Ok(mut i) => {
+                i.reports = pr.impact.as_ref().map(|o| o.reports.clone()).unwrap_or_default();
+                real = prscore::union(&real, &i.score());
+                self.prs.set_impact(&k, Some(i));
+            }
+            Err(e) => {
+                eprintln!("[automerge] {k}: couldn't read its diff: {e:#}");
+                return None;
+            }
+        }
+        let s = prscore::combine(pr.score.as_ref(), &real, &sha);
         if pr.score.as_ref().is_some_and(|old| !old.needs_review) && s.needs_review {
             eprintln!("[automerge] {k}: at {sha} it {}", s.line.to_lowercase());
         }
@@ -160,10 +182,12 @@ mod tests {
         let pred = prscore::score(predicted);
         let gh2 = gh.to_path_buf();
         prs.on_score(Box::new(move |pr| {
-            let Ok((files, sha)) = crate::prs::fetch_files(&gh2, &pr.repo, pr.number) else { return (None, None) };
+            let Ok((files, sha)) = crate::prs::fetch_files(&gh2, &pr.repo, pr.number) else { return Default::default() };
             let mut s = prscore::combine(Some(&pred), &prscore::real_score(&pr.title, &files), &sha);
             s.planned = planned.then(|| "p1#1".to_string());
-            (Some(s), planned.then(planned_checks))
+            // Nothing outside depends on it (no repos searched here).
+            let impact = crate::impact::Impact { sha, ..Default::default() };
+            prscore::Scored { score: Some(s), validation: planned.then(planned_checks), impact: Some(impact) }
         }));
         prs.found(&[("o/app".into(), n)], "t7", "web", Some("shop"), true);
         prs.set_review(&crate::prs::key("o/app", n), Some(crate::reviews::Brief { status: "agreed".into(), ..Default::default() }));
@@ -254,7 +278,7 @@ mod tests {
         // A new commit with a migration, seen by the poll (head s2), not yet read.
         serve(&gh, 31, "dev", &["src/Cart.tsx", "prisma/migrations/2/migration.sql"], "s2");
         prs.poll("o/app#31");
-        assert_eq!(prscore::auto_path(&prs.get("o/app#31").unwrap(), true), Path::Waits("its files read at its head commit".into()));
+        assert_eq!(prscore::auto_path(&prs.get("o/app#31").unwrap(), true), Path::Waits("its dependents checked at its head commit".into()));
         let m = AutoMerger::new(prs.clone(), || true);
         assert!(m.tick().is_empty());
         let pr = prs.get("o/app#31").unwrap();
@@ -288,7 +312,7 @@ mod tests {
             let (files, sha) = crate::prs::fetch_files(&gh2, &pr.repo, pr.number).unwrap();
             let mut s = prscore::combine(Some(&prscore::score(&ui())), &prscore::real_score(&pr.title, &files), &sha);
             s.planned = Some("p1#2".into());
-            (Some(s), Some(planned_checks()))
+            prscore::Scored { score: Some(s), validation: Some(planned_checks()), impact: Some(crate::impact::Impact { sha, ..Default::default() }) }
         }));
         let told = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let t2 = told.clone();
@@ -358,5 +382,125 @@ mod tests {
         assert!(validate(&prs, "#99", "c1", "passed", "x", Some("t7")).unwrap_err().to_string().contains("no open PR #99"));
         assert!(validate(&prs, "o/app#77", "c1", "passed", "x", None).unwrap_err().to_string().contains("run this from the session that opened it"));
         assert!(!calls(&gh).contains("pr merge"));
+    }
+
+    /// A store with one PR scored as the daemon scores it: its plan's
+    /// prediction (low risk), its own files, and who depends on what its
+    /// diff changes in the repos under `root`; its checks passed, its reviewer agreed.
+    fn found_with_diff(gh: &std::path::Path, n: u64, diff: &str, root: &std::path::Path) -> Prs {
+        std::fs::write(gh.with_file_name(format!("diff-{n}.patch")), diff).unwrap();
+        let prs = Prs::at(gh.with_file_name(format!("prs-{n}.json")), gh.to_path_buf());
+        let (gh2, roots) = (gh.to_path_buf(), vec![root.to_path_buf()]);
+        prs.on_score(Box::new(move |pr| {
+            let (files, sha) = crate::prs::fetch_files(&gh2, &pr.repo, pr.number).unwrap();
+            let impact = crate::impact::of_pr(&gh2, &pr.repo, pr.number, &sha, &roots).unwrap();
+            let real = prscore::union(&prscore::real_score(&pr.title, &files), &impact.score());
+            let mut s = prscore::combine(Some(&prscore::score(&ui())), &real, &sha);
+            s.planned = Some("p1#1".into());
+            prscore::Scored { score: Some(s), validation: Some(planned_checks()), impact: Some(impact) }
+        }));
+        prs.found(&[("o/shop-api".into(), n)], "t7", "api", Some("shop"), true);
+        let k = crate::prs::key("o/shop-api", n);
+        pass_all(&prs, &k);
+        prs.set_review(&k, Some(crate::reviews::Brief { status: "agreed".into(), ..Default::default() }));
+        prs
+    }
+
+    fn serve_api(gh: &std::path::Path, n: u64, files: &[&str], sha: &str) {
+        serve(gh, n, "dev", files, sha);
+        let f = gh.with_file_name(format!("pr-{n}.json"));
+        let text = std::fs::read_to_string(&f).unwrap().replace("o/app/pull", "o/shop-api/pull");
+        std::fs::write(f, text).unwrap();
+    }
+
+    #[test]
+    fn a_pr_that_breaks_another_repos_code_is_flagged_and_never_merged_by_the_tower() {
+        let root = crate::impact::tests::scratch("auto-breaking");
+        let gh = fake_gh("auto-breaking");
+        serve_api(&gh, 61, &["src/money.ts", "src/api/messages.ts"], "b1");
+        let prs = found_with_diff(&gh, 61, crate::impact::tests::BREAKING, &root);
+        let k = "o/shop-api#61";
+        let pr = prs.get(k).unwrap();
+        // Its score: a breaking change, naming what breaks and who uses it.
+        let s = pr.score.clone().unwrap();
+        assert!(s.needs_review && s.flags.contains(&"breaking".to_string()), "{s:?}");
+        assert!(s.line.contains("renames formatTotal to formatAmount, used by shop-web src/cart/Total.tsx:4 in renderTotal"), "{}", s.line);
+        let i = pr.impact.clone().unwrap();
+        assert!(i.dependents.iter().any(|d| d.said() == "shop-web src/cart/Total.tsx:4 in renderTotal"), "{:?}", i.dependents);
+        assert!(i.dependents.iter().any(|d| d.said() == "shop-web src/inbox/api.ts:3 in loadMessages"), "{:?}", i.dependents);
+        // The warning on the card, and before a merge; never the tower's merge, never its pick.
+        assert!(crate::prs::gate(&pr).warnings.iter().any(|w| w.starts_with("Breaking change: renames formatTotal to formatAmount")), "{:?}", crate::prs::gate(&pr).warnings);
+        assert!(matches!(prscore::auto_path(&pr, true), Path::Yours(w) if w.contains("a breaking change")));
+        let m = AutoMerger::new(prs.clone(), || true).with_roots({
+            let root = root.clone();
+            move || vec![root.clone()]
+        });
+        assert!(m.tick().is_empty());
+        assert!(!calls(&gh).contains("pr merge"));
+        let mut b = crate::decisions::Book::default();
+        let id = b.sync_merges(&prscore::for_the_user(&prs.list(), true), 1).fresh[0].clone();
+        let d = b.find(&id).unwrap();
+        assert!(d.pick().is_none());
+        assert_eq!(d.view(false)["prs"][0]["impact"]["dependents"][0]["repo"], "shop-api");
+    }
+
+    #[test]
+    fn a_purely_internal_change_breaks_nothing_and_still_merges_by_itself() {
+        let root = crate::impact::tests::scratch("auto-internal");
+        let gh = fake_gh("auto-internal");
+        serve_api(&gh, 62, &["src/util.ts"], "i1");
+        let prs = found_with_diff(&gh, 62, crate::impact::tests::INTERNAL, &root);
+        let k = "o/shop-api#62";
+        let pr = prs.get(k).unwrap();
+        assert!(!pr.score.as_ref().unwrap().needs_review, "{:?}", pr.score);
+        assert_eq!(pr.impact.as_ref().unwrap().line(), "Nothing outside depends on what it changes (no name others can use changes; searched 3 repos)");
+        assert_eq!(prscore::auto_path(&pr, true), Path::Ready);
+        // A push that renames something others use is read before the merge, and stops it.
+        std::fs::write(gh.with_file_name("diff-62.patch"), crate::impact::tests::BREAKING).unwrap();
+        serve_api(&gh, 62, &["src/util.ts", "src/money.ts"], "i2");
+        prs.poll(k);
+        let m = AutoMerger::new(prs.clone(), || true).with_roots({
+            let root = root.clone();
+            move || vec![root.clone()]
+        });
+        assert!(m.tick().is_empty(), "the push breaks shop-web: not merged");
+        let pr = prs.get(k).unwrap();
+        assert!(pr.impact.as_ref().unwrap().breaks() && pr.impact.as_ref().unwrap().sha == "i2");
+        assert!(!calls(&gh).contains("pr merge"));
+        // Back to the internal change: merged by the tower.
+        std::fs::write(gh.with_file_name("diff-62.patch"), crate::impact::tests::INTERNAL).unwrap();
+        serve_api(&gh, 62, &["src/util.ts"], "i3");
+        prs.poll(k);
+        // (Its score keeps what it once found: the user's now, as a once-breaking PR should be.)
+        assert!(m.tick().is_empty());
+        assert!(matches!(prscore::auto_path(&prs.get(k).unwrap(), true), Path::Yours(_)));
+    }
+
+    #[test]
+    fn the_reviewer_reports_a_break_it_found_by_running_the_dependents_tests() {
+        let root = crate::impact::tests::scratch("impact-report");
+        let gh = fake_gh("impact-report");
+        serve_api(&gh, 63, &["src/util.ts"], "r1");
+        let prs = found_with_diff(&gh, 63, crate::impact::tests::INTERNAL, &root);
+        let report = super::super::impact_report;
+        let k = "o/shop-api#63";
+        assert_eq!(prscore::auto_path(&prs.get(k).unwrap(), true), Path::Ready);
+        // Shown; a clean run noted; then a break the search couldn't see: a breaking change, never merged by the tower.
+        let v = report(&prs, "#63", "", "", Some("t7")).unwrap();
+        assert_eq!((v["breaks"].as_bool(), v["impact"]["searched"].as_array().map(Vec::len)), (Some(false), Some(3)));
+        report(&prs, k, "clean", "tsc --noEmit in shop-web: no errors", Some("t9")).unwrap();
+        assert!(prs.get(k).unwrap().impact.unwrap().line().ends_with("checked: tsc --noEmit in shop-web: no errors)"));
+        let v = report(&prs, k, "breaks", "the mobile app's sync reads clean() (shop-mobile src/sync.kt syncAll): its tests fail", Some("t9")).unwrap();
+        assert_eq!(v["breaks"], true);
+        let pr = prs.get(k).unwrap();
+        let s = pr.score.clone().unwrap();
+        assert!(s.needs_review && s.line == "Needs review: a breaking change (the mobile app's sync reads clean() (shop-mobile src/sync.kt syncAll): its tests fail)", "{s:?}");
+        assert_eq!(s.planned.as_deref(), Some("p1#1"), "still its plan's");
+        assert!(matches!(prscore::auto_path(&pr, true), Path::Yours(w) if w.starts_with("Needs review: a breaking change (the mobile app's sync reads clean()")));
+        assert!(crate::prs::gate(&pr).warnings.iter().any(|w| w.starts_with("Breaking change: the mobile app's sync")));
+        let m = AutoMerger::new(prs.clone(), || true);
+        assert!(m.tick().is_empty());
+        assert!(!calls(&gh).contains("pr merge"));
+        assert!(report(&prs, k, "breaks", " ", Some("t9")).is_err());
     }
 }
