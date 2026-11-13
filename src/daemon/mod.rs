@@ -18,6 +18,7 @@ pub mod missions;
 pub mod narrate;
 pub mod plans;
 pub mod queue;
+pub mod releases;
 pub mod reopen;
 pub mod reviews;
 pub mod sendq;
@@ -315,6 +316,8 @@ pub fn run() -> Result<()> {
     merges::Merges::new(shared.clone(), prs.clone(), sendq.clone()).start();
     // What the tower opened for the user lately, to show with the reply and to undo.
     let acts = acts::Acts::open(shared.clone(), hub.clone());
+    // Where each space's changes stand: open, on dev, on prod (from GitHub, never from what sessions say).
+    releases::Releases::new(prs.clone(), shared.clone(), prs.gh().to_path_buf()).start();
     // A space's plan before it is launched, and its planner (`tower plan`).
     let plans = plans::Plans::open(shared.clone(), sendq.clone());
     plans.start();

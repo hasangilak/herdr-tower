@@ -1158,6 +1158,15 @@ pub fn plan(state: &Value) -> Option<PlanView> {
     (!p.id.is_empty() && p.status != "closed").then_some(p)
 }
 
+/// The release track of the space called `space`, as the state has it
+/// (`releases`, worked out by the daemon from GitHub); none without one.
+pub fn release_track(state: &Value, space: &str) -> Option<crate::releases::Track> {
+    let all = state.get("releases")?.as_object()?;
+    let v = all.iter().find(|(k, _)| k.eq_ignore_ascii_case(space)).map(|(_, v)| v)?;
+    let t: crate::releases::Track = serde_json::from_value(v.clone()).ok()?;
+    (!t.repos.is_empty()).then_some(t)
+}
+
 /// The space called `space` has a tower of its own that runs, as the state's missions say.
 pub fn has_own_tower(state: &Value, space: &str) -> bool {
     state["missions"]["spaces"]
@@ -2127,5 +2136,23 @@ mod tests {
         assert_eq!(count(&list, &HashSet::new()), 2, "both on the orb's number");
         assert_eq!((list[0].badge(), list[0].reason()), ("In its terminal".to_string(), None));
         assert!(rule_offer(&list[0], "yes").is_none() && rule_offer(&list[1], "yes").is_none());
+    }
+
+    #[test]
+    fn the_window_reads_a_spaces_track_from_the_state() {
+        use crate::releases::tests::{LocalGit, MIN, pr, rel, scratch};
+        use crate::releases::{track, when};
+        let (dir, [m829, r1, m830, _]) = scratch();
+        let now = 1_794_560_000_000 + 120 * MIN;
+        let prs = vec![pr(829, "dev", "merged", &m829, Some(now - 90 * MIN)), pr(830, "dev", "merged", &m830, Some(now - 60 * MIN))];
+        let t = track("checkout", &prs, &[rel(840, &r1, "merged", Some(now - 80 * MIN))], &std::collections::BTreeMap::new(), &LocalGit(dir), now);
+        let state = serde_json::json!({ "releases": { "checkout": t.view(now) } });
+        // By any case of its name; a space without PRs has none.
+        let back = release_track(&state, "Checkout").unwrap();
+        assert_eq!(back, t, "the view reads back as the track");
+        assert_eq!(back.repos[0].lines(now), ["On main since ".to_string() + &when(now - 80 * MIN, now) + ": #829", "On dev, not on main: #830".into()]);
+        assert_eq!(back.summary(now), format!("prod {} · 1 on dev", when(now - 80 * MIN, now)));
+        assert!(release_track(&state, "elsewhere").is_none());
+        assert!(release_track(&serde_json::json!({}), "checkout").is_none(), "an older daemon's state");
     }
 }

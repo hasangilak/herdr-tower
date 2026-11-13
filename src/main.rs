@@ -41,6 +41,7 @@ mod phone;
 mod plans;
 mod protocol;
 mod projects;
+mod releases;
 mod reopen;
 mod prs;
 mod prscore;
@@ -223,6 +224,15 @@ enum Cmd {
         /// on, off or status (default).
         #[arg(default_value = "status")]
         action: String,
+    },
+    /// Where each space's changes stand, repo by repo: each PR open, merged into dev, on dev
+    /// (deployed) or on prod, with when, and each release to prod with what it carried. From
+    /// GitHub, never from what sessions say. `tower releases [<space>]` (JSON when piped).
+    Releases {
+        /// A space (a part of its name is enough).
+        space: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// Who outside depends on what a PR changes (callers in other repos, readers of an API field,
     /// …), as the tower found it: `tower impact <pr>`. The reviewer or the PR's session reports
@@ -893,6 +903,7 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Automerge { action } => automerge_cmd(&action),
+        Cmd::Releases { space, json } => releases_cmd(space.as_deref(), json),
         Cmd::Impact { pr, verdict, text, json } => impact_cmd(&pr, verdict.as_deref(), &text.join(" "), json),
         Cmd::Validate { pr, check, status, evidence, json } => validate_cmd(&pr, check.as_deref(), status.as_deref(), evidence.as_deref(), json),
         Cmd::MacVoice { action } => {
@@ -1360,6 +1371,35 @@ fn show_history(jobs: Option<&str>, session: Option<&str>, n: usize) -> Result<(
 
 /// `tower tell [decisions|results|everything] [--voice off|decisions|replies]`:
 /// how much it tells and what it says out loud, or set them.
+/// `tower releases [<space>]`: the release tracks as the daemon last worked them out.
+fn releases_cmd(space: Option<&str>, as_json: bool) -> Result<()> {
+    let state: serde_json::Value = std::fs::read_to_string(config::ui_dir().join("state.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let all = state["releases"].as_object().cloned().unwrap_or_default();
+    let want = space.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+    let picked: Vec<(&String, &serde_json::Value)> = all.iter().filter(|(k, _)| want.as_deref().is_none_or(|w| k.to_lowercase().contains(w))).collect();
+    if as_json || !std::io::stdout().is_terminal() {
+        print_json(&serde_json::json!(picked.iter().map(|(k, v)| ((*k).clone(), (*v).clone())).collect::<serde_json::Map<_, _>>()));
+        return Ok(());
+    }
+    if picked.is_empty() {
+        println!("{}", if want.is_some() { "No release track for that space: it has no PR the tower tracks." } else { "No space has PRs the tower tracks." });
+    }
+    for (name, t) in picked {
+        let summary = t["summary"].as_str().unwrap_or("");
+        println!("{name}{}", if summary.is_empty() { String::new() } else { format!(": {summary}") });
+        for r in t["repos"].as_array().into_iter().flatten() {
+            println!("  {}", r["repo"].as_str().unwrap_or(""));
+            for l in r["lines"].as_array().into_iter().flatten().filter_map(|l| l.as_str()) {
+                println!("    {l}");
+            }
+            for c in r["changes"].as_array().into_iter().flatten() {
+                println!("    #{} {}: {}", c["number"], c["title"].as_str().unwrap_or(""), c["stage_line"].as_str().unwrap_or(""));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `tower impact <pr> [breaks|clean "<words>"]`.
 fn impact_cmd(pr: &str, verdict: Option<&str>, text: &str, as_json: bool) -> Result<()> {
     let verdict = verdict.unwrap_or("").trim();

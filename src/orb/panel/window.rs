@@ -711,10 +711,18 @@ impl Panel {
         if !missions.open.is_empty() {
             list = list.child(bay_label("Open spaces").px(px(8.0)).pt(px(10.0)).pb(px(3.0)));
         }
+        let now = crate::history::now_ms();
         for (i, m) in missions.open.iter().enumerate() {
             let name = m.name.clone();
+            // Where its changes stand: "prod 14:20 · 1 on dev".
+            let released = self.tower.read(cx).state.as_ref().and_then(|s| model::release_track(s, &m.name)).map(|t| t.summary(now)).filter(|s| !s.is_empty());
+            let line = match released {
+                Some(r) if m.side_line().is_empty() => r,
+                Some(r) => format!("{} · {r}", m.side_line()),
+                None => m.side_line(),
+            };
             list = list.child(
-                item(SharedString::from(format!("side-space-{i}")), sign(m.chip(), 22.0, format!("side-pulse-{i}")), &m.name, m.side_line(), here == Side::Space(m.name.clone()))
+                item(SharedString::from(format!("side-space-{i}")), sign(m.chip(), 22.0, format!("side-pulse-{i}")), &m.name, line, here == Side::Space(m.name.clone()))
                     .on_click(cx.listener(move |this, _, _, cx| this.nav_to(Scope::Space(name.clone()), cx))),
             );
         }

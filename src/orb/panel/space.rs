@@ -202,6 +202,103 @@ pub(super) fn review_lines(space: &str, prs: &std::collections::BTreeMap<String,
         .collect()
 }
 
+/// The colour of a change's stage: on prod (cyan), on dev (amber), open or closed (quiet).
+fn stage_color(stage: &str) -> Option<u32> {
+    match stage {
+        "released" => Some(CYAN),
+        "merged" | "deployed" => Some(AMBER),
+        _ => None,
+    }
+}
+
+/// A change's stage in a word or two, for its chip.
+fn stage_word(stage: &str, dev: &str, prod: &str) -> String {
+    match stage {
+        "open" => "open".into(),
+        "merged" => format!("merged into {dev}"),
+        "deployed" => format!("on {dev}"),
+        "released" => format!("on {prod}"),
+        _ => "closed".into(),
+    }
+}
+
+/// A space's release track (`crate::releases`): per repo, what is on prod
+/// and since when, what is on dev and not on prod, each change with its
+/// stage, and each release to prod with what it carried.
+fn release_card(t: &crate::releases::Track, now: u64) -> AnyElement {
+    let g = glass();
+    let mut card = v_flex().w_full().p(px(14.0)).gap(px(12.0)).rounded(px(18.0)).bg(rgba(CARD)).border_1().border_color(rgba(LINE)).child(
+        h_flex()
+            .gap(px(8.0))
+            .items_center()
+            .child(div().text_size(px(15.0)).font_weight(FontWeight::SEMIBOLD).child("Release track"))
+            .child(div().text_size(px(12.0)).text_color(g.faint).child(format!("from GitHub, {}", crate::releases::when(t.checked_ms, now)))),
+    );
+    for r in &t.repos {
+        let mut repo = v_flex().gap(px(6.0)).child(
+            h_flex()
+                .gap(px(8.0))
+                .items_center()
+                .child(div().text_size(px(13.0)).font_weight(FontWeight::SEMIBOLD).child(r.repo.clone()))
+                .child(div().text_size(px(12.0)).text_color(g.faint).child(format!("{} → {}", r.dev, r.prod))),
+        );
+        // What is where, plainly: on prod (cyan), on dev only (amber), the rest quiet; a skip of dev in rose.
+        for l in r.lines(now) {
+            let color = match () {
+                _ if l.starts_with(&format!("On {} since", r.prod)) => rgb(CYAN),
+                _ if l.starts_with(&format!("On {},", r.dev)) => rgb(AMBER),
+                _ if l.contains("against the dev-then-prod rule") => rgb(0xff8f8f),
+                _ => g.muted.into(),
+            };
+            repo = repo.child(div().text_size(px(14.0)).line_height(px(19.0)).font_weight(FontWeight::MEDIUM).text_color(color).child(l));
+        }
+        // Each change, newest stage first: its number, title, and stage with when.
+        let mut changes = v_flex().gap(px(3.0)).pt(px(2.0));
+        for c in &r.changes {
+            let chip_color = stage_color(&c.stage).map(rgb).unwrap_or(g.faint.into());
+            changes = changes.child(
+                h_flex()
+                    .gap(px(8.0))
+                    .items_center()
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .rounded(px(10.0))
+                    .bg(rgba(SOFT))
+                    .text_size(px(13.0))
+                    .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).child(format!("#{}", c.number)))
+                    .child(div().flex_1().min_w_0().truncate().text_color(g.muted).child(c.title.clone()))
+                    .child(div().flex_none().px(px(8.0)).py(px(1.0)).rounded_full().border_1().border_color(chip_color).text_size(px(12.0)).text_color(chip_color).child(stage_word(&c.stage, &r.dev, &r.prod)))
+                    .child(div().flex_none().w(px(210.0)).text_size(px(12.0)).text_color(g.faint).truncate().child(c.detail(now))),
+            );
+        }
+        repo = repo.child(changes);
+        // Each release to prod: the release PR, when it landed, what it carried.
+        if !r.releases.is_empty() {
+            repo = repo.child(div().pt(px(4.0)).text_size(px(11.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.faint).child("RELEASES"));
+            for rel in &r.releases {
+                let carried = if rel.carried.is_empty() { "nothing of this space yet".to_string() } else { rel.carried.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(", ") };
+                let landed = match (rel.state.as_str(), rel.merged_ms) {
+                    ("merged", Some(at)) => format!("landed on {} {}", rel.base, crate::releases::when(at, now)),
+                    ("merged", None) => format!("landed on {}", rel.base),
+                    _ => "under way".to_string(),
+                };
+                repo = repo.child(
+                    h_flex()
+                        .gap(px(8.0))
+                        .items_center()
+                        .text_size(px(13.0))
+                        .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).child(format!("Release #{}", rel.number)))
+                        .child(div().flex_none().text_color(g.faint).child(format!("{} → {}", rel.head, rel.base)))
+                        .child(div().flex_none().text_color(if rel.state == "merged" { rgb(CYAN) } else { rgb(AMBER) }).child(landed))
+                        .child(div().min_w_0().truncate().text_color(g.muted).child(format!("carried {carried}"))),
+                );
+            }
+        }
+        card = card.child(repo);
+    }
+    card.into_any_element()
+}
+
 /// The tower refused to close a space because a session there still works
 /// or waits (`--force` would close it anyway).
 pub(super) fn refused_close(error: &str) -> bool {
@@ -588,6 +685,10 @@ impl Panel {
             items.push(eff("PR review is off. A PR a session opens here gets no reviewer: you review it yourself."));
         } else {
             items.extend(review_lines(name, &self.tower.read(cx).prs).into_iter().map(eff));
+        }
+        // Where its changes stand, repo by repo: on prod, on dev, open; and its releases.
+        if let Some(t) = self.tower.read(cx).state.as_ref().and_then(|s| model::release_track(s, name)) {
+            items.push(release_card(&t, crate::history::now_ms()));
         }
         // Its goal is met: the closing report, and the way to close it.
         if m.ready() {

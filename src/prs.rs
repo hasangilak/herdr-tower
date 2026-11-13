@@ -85,6 +85,12 @@ pub struct Pr {
     pub checked_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub closed_ms: Option<u64>,
+    /// When GitHub says it merged (unix ms), and the commit it merged as
+    /// (what a release carries, `crate::releases`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_ms: Option<u64>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub merge_commit: String,
     /// Who merged it: `mac`, `phone:<device>`, `tower` (low risk, into dev:
     /// `crate::prscore::auto_path`), or `github` (seen merged).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -239,7 +245,7 @@ fn creates_pr(input: &Value) -> bool {
 // ---- what GitHub says ----
 
 /// The fields asked of `gh pr view`.
-pub const FIELDS: &str = "number,title,url,state,isDraft,mergeable,mergeStateStatus,statusCheckRollup,baseRefName,headRefName,headRefOid,mergedAt,closedAt";
+pub const FIELDS: &str = "number,title,url,state,isDraft,mergeable,mergeStateStatus,statusCheckRollup,baseRefName,headRefName,headRefOid,mergedAt,closedAt,mergeCommit";
 
 /// The PR as `gh pr view --json FIELDS` gives it, onto `pr` (keeping who
 /// made it and what the tower knows).
@@ -268,6 +274,12 @@ pub fn apply_gh(pr: &mut Pr, v: &Value) {
     }
     .into();
     pr.merge_state = s("mergeStateStatus").to_lowercase();
+    if let Some(at) = v["mergedAt"].as_str().and_then(crate::releases::ms_of_iso) {
+        pr.merged_ms = Some(at);
+    }
+    if let Some(c) = v["mergeCommit"]["oid"].as_str().filter(|c| !c.is_empty()) {
+        pr.merge_commit = c.to_string();
+    }
     pr.checks = rollup(&v["statusCheckRollup"]);
 }
 
@@ -901,6 +913,12 @@ impl Prs {
                 me.poll(&k);
             }
         });
+    }
+
+    /// A PR as it is, straight into the store (tests).
+    #[cfg(test)]
+    pub fn insert_for_test(&self, pr: Pr) {
+        self.put(pr, "open");
     }
 
     /// The PRs due a look now.
