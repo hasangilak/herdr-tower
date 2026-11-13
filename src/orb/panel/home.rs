@@ -491,7 +491,7 @@ impl Panel {
 
     /// The same, in the user's own words (`tower answer <id> --other "…"`):
     /// what the card's "Other" field holds, with the files dropped on it.
-    fn answer_words(&mut self, id: &str, cx: &mut Context<Self>) {
+    pub(super) fn answer_words(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(field) = self.asks.other_of_card(id) else { return };
         let (text, files) = super::message_parts(&field.read(cx).content());
         if text.is_empty() && files.is_empty() {
@@ -566,6 +566,24 @@ impl Panel {
         let Some(o) = d.options.get(n) else { return false };
         self.answer_plain(&d.id, n, &o.label, cx);
         true
+    }
+
+    /// `HERDER_TOWER_ORB_KEYS` (see `crate::orb`): the card's field for its
+    /// own words, opened as a click on it does, with the keyboard.
+    pub(crate) fn keys_open(&mut self, id: &str, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        if !self.decisions(cx).iter().any(|d| d.id == id) && !self.open_sets(cx).iter().any(|s| s.id == id) {
+            eprintln!("[orb] HERDER_TOWER_ORB_KEYS: no open card {id}");
+            return;
+        }
+        self.open_other(id, 0, "Your answer: type it, or talk (Control)", window, cx);
+        eprintln!("[orb] HERDER_TOWER_ORB_KEYS: {id}: its field is open");
+    }
+
+    /// `HERDER_TOWER_ORB_KEYS`: what the card's field holds now, and whether its answer went.
+    pub(crate) fn keys_report(&mut self, id: &str, after: &str, cx: &mut Context<Self>) {
+        let field = self.asks.other_of_card(id).map(|f| f.read(cx).value().to_string());
+        let sent = self.tower.read(cx).acts.sent.contains(id);
+        eprintln!("[orb] HERDER_TOWER_ORB_KEYS: {id} after {after}: field {:?}, answer sent: {sent}", field.as_deref().unwrap_or("(closed)"));
     }
 
     /// `HERDER_TOWER_ORB_ANSWER` (see `crate::orb`): answers the card `id`

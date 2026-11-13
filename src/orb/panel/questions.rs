@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui::{AnyElement, App, Context, Entity, FontWeight, SharedString, Window, div, prelude::*, px, rgb, rgba};
-use gpui_kit::component::input::{InputContent, Textarea, TextareaState};
+use gpui_kit::component::input::{InputContent, InputEvent, Textarea, TextareaState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
 use serde_json::{Value, json};
@@ -337,11 +337,19 @@ impl Panel {
     pub(super) fn open_other(&mut self, id: &str, tab: usize, hint: &'static str, window: &mut Window, cx: &mut Context<Self>) {
         self.keep_other(cx);
         let content = self.asks.cards.get(id).and_then(|c| c.others.get(tab).cloned().flatten()).unwrap_or_else(|| InputContent::new(""));
-        let field = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 5).placeholder(hint));
+        // Enter answers, as the card's own button does; Shift+Enter is a new line.
+        let field = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 5).submit_on_enter(true).placeholder(hint));
         field.update(cx, |s, cx| {
             s.set_value(content, window, cx);
             s.focus(window, cx);
         });
+        let (id2, tab2) = (id.to_string(), tab);
+        cx.subscribe_in(&field, window, move |this, _, ev: &InputEvent, _, cx| {
+            if let InputEvent::PressEnter { shift: false, .. } = ev {
+                this.other_entered(&id2, tab2, cx);
+            }
+        })
+        .detach();
         let card = self.asks.cards.entry(id.to_string()).or_default();
         card.choices.resize(card.choices.len().max(tab + 1), Choice::None);
         if !matches!(card.choices[tab], Choice::Opts(_)) {
@@ -349,6 +357,20 @@ impl Panel {
         }
         self.asks.other = Some((id.to_string(), tab, field));
         cx.notify();
+    }
+
+    /// Enter in a card's typed answer: what the card's own button does.
+    /// A question's: Answer (one question), else Next or Review, never
+    /// while its answer goes in. A decision's own words: Answer.
+    fn other_entered(&mut self, id: &str, tab: usize, cx: &mut Context<Self>) {
+        if let Some(set) = self.open_sets(cx).into_iter().find(|s| s.id == id) {
+            let sending = self.asks.cards.get(id).is_some_and(|c| c.sending);
+            if !sending && !matches!(set.status.as_str(), "answering" | "queued") {
+                self.commit(&set, tab, cx);
+            }
+            return;
+        }
+        self.answer_words(id, cx);
     }
 
     /// Keeps the open field's answer with its question.

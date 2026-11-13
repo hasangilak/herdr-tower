@@ -16,7 +16,7 @@
 //!   the form opens once, empty or on that project, when the page shows it.
 
 use gpui::{AnyElement, Context, Entity, FontWeight, SharedString, Window, div, prelude::*, px, rgba};
-use gpui_kit::component::input::TextareaState;
+use gpui_kit::component::input::{InputEvent, TextareaState};
 use gpui_kit::component::{h_flex, v_flex};
 
 use super::home::{LINE, SOFT, acts_row, bay_label, empty_box, mbtn, tg};
@@ -87,9 +87,18 @@ impl Panel {
     /// Add (`which` none) or Edit: the form opens with what the project has.
     fn project_form(&mut self, which: Option<Setup>, window: &mut Window, cx: &mut Context<Self>) {
         let make = |text: &str, lines: (usize, usize), hint: &'static str, window: &mut Window, cx: &mut Context<Self>| {
-            let f = cx.new(|cx| TextareaState::new(window, cx).auto_grow(lines.0, lines.1).placeholder(hint));
+            // Enter saves, as Save does; Shift+Enter is a new line (a repo per line).
+            let f = cx.new(|cx| TextareaState::new(window, cx).auto_grow(lines.0, lines.1).submit_on_enter(true).placeholder(hint));
             let text = text.to_string();
             f.update(cx, |s, cx| s.set_value(text, window, cx));
+            cx.subscribe_in(&f, window, |this, _, ev: &InputEvent, _, cx| {
+                if let InputEvent::PressEnter { shift: false, .. } = ev
+                    && !this.running("project-form")
+                {
+                    this.project_save(cx);
+                }
+            })
+            .detach();
             f
         };
         let s = which.clone().unwrap_or_default();

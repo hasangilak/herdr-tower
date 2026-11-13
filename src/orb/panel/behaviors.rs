@@ -11,7 +11,7 @@
 use std::time::SystemTime;
 
 use gpui::{AnyElement, Context, Entity, FontWeight, Hsla, SharedString, Window, div, prelude::*, px, rgb, rgba};
-use gpui_kit::component::input::{Textarea, TextareaState};
+use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 
 use super::{NAVY, PALE, Panel, ROSE, ago, glass};
@@ -227,9 +227,18 @@ impl Panel {
 
     fn start_edit(&mut self, b: Option<Behavior>, window: &mut Window, cx: &mut Context<Self>) {
         let field = |text: &str, lines: usize, hint: &str, window: &mut Window, cx: &mut Context<Self>| {
-            let f = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, lines).placeholder(hint.to_string()));
+            // Enter saves, as Save does; Shift+Enter is a new line.
+            let f = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, lines).submit_on_enter(true).placeholder(hint.to_string()));
             let text = text.to_string();
             f.update(cx, |s, cx| s.set_value(text, window, cx));
+            cx.subscribe_in(&f, window, |this, _, ev: &InputEvent, _, cx| {
+                if let InputEvent::PressEnter { shift: false, .. } = ev
+                    && !this.behaviors.busy
+                {
+                    this.save_edit(cx);
+                }
+            })
+            .detach();
             f
         };
         let b = b.unwrap_or_else(|| Behavior { category: "Misc".into(), ..Default::default() });
@@ -272,7 +281,8 @@ impl Panel {
     /// The view's body: the list, one behavior, or the editor.
     pub(super) fn behaviors_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if self.behaviors.search.is_none() {
-            self.behaviors.search = Some(cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 1).placeholder("Search behaviors")));
+            // One line: Enter adds none (the list follows what is typed).
+            self.behaviors.search = Some(cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 1).submit_on_enter(true).placeholder("Search behaviors")));
         }
         let items = if self.behaviors.edit.is_some() {
             self.behavior_editor(cx)

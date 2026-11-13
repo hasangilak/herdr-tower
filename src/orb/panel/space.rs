@@ -31,7 +31,7 @@
 //! at once and goes back, with the command's error, if the tower refuses it.
 
 use gpui::{AnyElement, App, Context, Entity, FontWeight, SharedString, Window, div, prelude::*, px, rgb, rgba};
-use gpui_kit::component::input::{RopeExt as _, TextareaState};
+use gpui_kit::component::input::{InputEvent, RopeExt as _, TextareaState};
 use gpui_kit::component::{h_flex, v_flex};
 
 use super::home::{CARD, LINE, SOFT, acts_row, bay_label, cstat, empty_box, mbtn, sign, tg};
@@ -107,6 +107,8 @@ pub(super) fn resolve_lines(v: &serde_json::Value) -> (Vec<String>, Vec<String>)
 /// A space's goal while it is being changed.
 pub(super) struct GoalEdit {
     space: String,
+    /// The space as it was when the editor opened (what Save compares with).
+    was: Mission,
     goal: Entity<TextareaState>,
     done_when: Entity<TextareaState>,
     standing: bool,
@@ -221,7 +223,8 @@ impl Panel {
         }
         let mut make = |text: &str, hint: &'static str| {
             // A long goal (a pasted ticket) is all there to read and change: up to 14 lines, then it scrolls.
-            let f = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 14).placeholder(hint));
+            // Enter saves, as Save does; Shift+Enter is a new line.
+            let f = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 14).submit_on_enter(true).placeholder(hint));
             let text = text.to_string();
             f.update(cx, |s, cx| {
                 // What is there, with the caret after it.
@@ -229,6 +232,12 @@ impl Panel {
                 let end = s.text().offset_to_position(s.text().len());
                 s.set_cursor_position(end, window, cx);
             });
+            cx.subscribe_in(&f, window, |this, _, ev: &InputEvent, _, cx| {
+                if let InputEvent::PressEnter { shift: false, .. } = ev {
+                    this.goal_entered(cx);
+                }
+            })
+            .detach();
             f
         };
         let goal = make(&m.goal, "What it should get done");
@@ -236,9 +245,17 @@ impl Panel {
         goal.update(cx, |s, cx| s.focus(window, cx));
         if let Some(full) = self.full.as_mut() {
             full.notes.remove(&format!("space:{}", m.name));
-            full.edit = Some(GoalEdit { space: m.name.clone(), goal, done_when, standing: m.standing });
+            full.edit = Some(GoalEdit { space: m.name.clone(), was: m.clone(), goal, done_when, standing: m.standing });
         }
         cx.notify();
+    }
+
+    /// Enter in the goal's editor: Save, unless a save is under way.
+    fn goal_entered(&mut self, cx: &mut Context<Self>) {
+        let Some(was) = self.full.as_ref().and_then(|f| f.edit.as_ref()).map(|e| e.was.clone()) else { return };
+        if !self.running(&format!("space:{}", was.name)) {
+            self.save_goal(&was, cx);
+        }
     }
 
     /// Saves what the editor holds: `tower space goal`, then `tower space

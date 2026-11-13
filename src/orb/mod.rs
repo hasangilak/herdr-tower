@@ -936,6 +936,43 @@ fn answer_from_start() -> Option<(String, usize, bool)> {
     (!id.is_empty()).then(|| (id, n, parts.next() == Some("rule")))
 }
 
+/// `HERDER_TOWER_ORB_KEYS=<card id>:<keys>`: a moment after the start, the
+/// full window opens that card's field for its own words and types `keys`
+/// into it as key presses (through the window's own key handling, as the
+/// user's would go; the window needn't be in front): text runs, and
+/// `{enter}`, `{shift-enter}` or another key in braces. What the field
+/// holds, and whether the card is still open, is said after each run. For
+/// checking what Enter and Shift+Enter do there without the keyboard.
+/// What `HERDER_TOWER_ORB_KEYS` types: each run (what it is, for the log) and its key presses.
+type KeySteps = Vec<(String, Vec<gpui::Keystroke>)>;
+
+fn keys_from_start() -> Option<(String, KeySteps)> {
+    let v = std::env::var("HERDER_TOWER_ORB_KEYS").ok()?;
+    let (id, rest) = v.split_once(':')?;
+    let key = |name: &str| gpui::Keystroke::parse(Box::leak(name.to_string().into_boxed_str())).ok();
+    let mut steps: KeySteps = vec![];
+    let mut text = String::new();
+    let mut chars = rest.chars().peekable();
+    let flush = |text: &mut String, steps: &mut KeySteps| {
+        if !text.is_empty() {
+            let keys = text.chars().filter_map(|c| if c == ' ' { key("space") } else { key(&c.to_string()) }).collect();
+            steps.push((format!("typing \"{text}\""), keys));
+            text.clear();
+        }
+    };
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            flush(&mut text, &mut steps);
+            let name: String = chars.by_ref().take_while(|c| *c != '}').collect();
+            steps.push((format!("{{{name}}}"), key(&name).into_iter().collect()));
+        } else {
+            text.push(c);
+        }
+    }
+    flush(&mut text, &mut steps);
+    (!id.trim().is_empty()).then(|| (id.trim().to_string(), steps))
+}
+
 /// `HERDER_TOWER_ORB_RESOLVE=<space>[:go]`: a moment after the start, the
 /// full window (showing that space) presses its Resolve as a click would,
 /// and with `:go` its card's button six seconds later. For looking at the
@@ -1148,6 +1185,26 @@ fn open_full(tower: &Entity<Tower>, to: Option<nav::Scope>, anchor: Option<mac::
                 cx.spawn(async move |cx: &mut AsyncApp| {
                     cx.background_executor().timer(Duration::from_millis(2500)).await;
                     let _ = view.update(cx, |p, cx| p.answer_from_start(&id, choice, rule, cx));
+                })
+                .detach();
+            }
+            // `HERDER_TOWER_ORB_KEYS`: a card's own words typed with real keystrokes, once.
+            static KEYED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if let Some((id, steps)) = keys_from_start().filter(|_| !focus && !KEYED.swap(true, std::sync::atomic::Ordering::SeqCst)) {
+                let view = view.clone();
+                cx.spawn(async move |cx: &mut AsyncApp| {
+                    cx.background_executor().timer(Duration::from_millis(2500)).await;
+                    let _ = handle.update(cx, |_, window, cx| view.update(cx, |p, cx| p.keys_open(&id, window, cx)));
+                    for (label, keys) in steps {
+                        cx.background_executor().timer(Duration::from_millis(300)).await;
+                        let _ = handle.update(cx, |_, window, cx| {
+                            for k in keys {
+                                window.dispatch_keystroke(k, cx);
+                            }
+                        });
+                        cx.background_executor().timer(Duration::from_millis(300)).await;
+                        let _ = view.update(cx, |p, cx| p.keys_report(&id, &label, cx));
+                    }
                 })
                 .detach();
             }
