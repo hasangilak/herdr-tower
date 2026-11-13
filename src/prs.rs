@@ -761,7 +761,10 @@ impl Prs {
         }
         let f = File { prs: all.values().cloned().collect() };
         // Written beside the watched folder, then moved in: the orb wakes once.
-        let tmp = self.path.parent().and_then(Path::parent).unwrap_or(Path::new(".")).join(format!(".prs.json.{}", std::process::id()));
+        // Its own name each time: stores in one process (the tests') never move each other's in.
+        static WRITES: AtomicU64 = AtomicU64::new(0);
+        let n = WRITES.fetch_add(1, Ordering::Relaxed);
+        let tmp = self.path.parent().and_then(Path::parent).unwrap_or(Path::new(".")).join(format!(".prs.json.{}.{n}", std::process::id()));
         if std::fs::write(&tmp, serde_json::to_vec_pretty(&f).unwrap_or_default()).is_ok() {
             let _ = std::fs::rename(&tmp, &self.path);
         }
