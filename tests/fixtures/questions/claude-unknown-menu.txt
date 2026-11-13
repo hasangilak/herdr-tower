@@ -1,0 +1,11 @@
+⏺ Starting the database tools.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ New MCP server found in .mcp.json: shop-db
+ Use this MCP server?
+
+ ❯ 1. Use this and all future MCP servers in this project
+   2. Use this MCP server
+   3. Continue without using this MCP server
+
+ Enter to confirm · Esc to cancel

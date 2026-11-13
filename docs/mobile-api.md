@@ -1058,7 +1058,7 @@ of one repo waiting for a merge in one space are one decision.
 | `raised` | Raised by the tower, in a line | None | `{"other": "text"}` |
 | `failed` | A task that failed again after one retry | "Try again", "Drop it"; no pick | `{"choice": 0}` (again), `{"choice": 1}` (drop), `{"other": "what to do instead"}` (again, with those words) |
 | `merge` | The PRs of one repo that wait for a merge in one space | One per PR, in order; the pick is the first when it can be merged, its checks pass and its base is not production | Not here: see "A merge" |
-| `blocked` | A session blocked on something the tower can't read (a dialog it doesn't know): no question set comes of it, but the user still has to act | None | Not here: it is answered in the session itself. Offer "Show on Mac" (`POST /v1/sessions/{address}/show`, the address from `sessions`). Answering returns `400 bad_answer`. It closes by itself (`answered`) once the session is no longer blocked |
+| `blocked` | A session blocked on something the tower can't read (no menu on its screen: a dialog with options, even one it doesn't know by its question, is a question set and comes as a `permission` decision with its options): no question set comes of it, but the user still has to act | None | Not here: it is answered in the session itself. Offer "Show on Mac" (`POST /v1/sessions/{address}/show`, the address from `sessions`). Answering returns `400 bad_answer`. It closes by itself (`answered`) once the session is no longer blocked |
 
 - A `kind` the app doesn't know (a newer tower's) is still the user's: show it as a plain card with its `title` and `sessions` and count it; never leave it out.
 - `id` is stable for the life of the decision. The same thing needing the

@@ -1,0 +1,22 @@
+⏺ The numbers are in. I'll note them in this project's memory.
+
+  Editing ~/Library/Application Support/orca/claude-profiles/4c1e9b2a-0000-4000-8000-000000000001/home/projects/-Users-me-Work-shop/m
+  emory/search-notes.md
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Edit file
+ …t/orca/claude-profiles/4c1e9b2a-0000-4000-8000-000000000001/home/projects/-Users-me-Work-shop/memory/search-not
+ This will modify {home}/.claude/projects/-Users-me-Work-shop/memory/search-notes.md (outside working
+ directory) via a symlink
+
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ 12    - The search box sends one request per keystroke.
+ 13 +  - 11-13: 4,600 requests over 7 days; the merge of the fix waits for review, then we push to prod.
+ 14
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to make this edit to search-notes.md?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
