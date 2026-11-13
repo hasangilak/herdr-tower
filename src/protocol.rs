@@ -282,6 +282,21 @@ pub enum Request {
     },
     /// The user dismissed a question set, or a decision (`d…`).
     Dismiss { id: String },
+    /// A decision put on hold (`reason`: the user's words, may be empty),
+    /// or let go from hold (`unhold`; `reason`: what brought it back). `by`:
+    /// who (`mac`, `phone:<device>`); none: the caller's terminal (`from`)
+    /// says (a brain's name), else `cli`.
+    Hold {
+        id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unhold: bool,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        by: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+    },
     /// The user merged a PR (`pr`: `owner/repo#n`; `by`: `mac` or
     /// `phone:<device>`), from its chip. Only a report: the daemon asks
     /// GitHub, and only a merge it sees moves the chip and tells the session

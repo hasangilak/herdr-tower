@@ -550,6 +550,23 @@ enum Cmd {
     },
     /// Dismiss a question set, or a decision (it shows no more; nothing is sent).
     Dismiss { id: String },
+    /// Put a decision on hold (`tower decisions` has its id): it stays listed, under On hold with
+    /// your words, but is not counted, not said and not reminded until it is updated (new commits
+    /// or checks on its PRs, its session raises it again), what it waits for looks done (a PR
+    /// `--reason` names merges), or `tower unhold`. `--reason`: the user's words, "wait for the
+    /// ingest filters, then we go for prod".
+    Hold {
+        id: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// Let a decision go from hold: it waits for you again, counted, and is said once.
+    /// `--why`: what brought it back ("the ingest filters are merged").
+    Unhold {
+        id: String,
+        #[arg(long, default_value = "")]
+        why: String,
+    },
     /// How session questions are handled: normal (the tower answers routine
     /// ones, the user decides the rest), keep-moving, or ask-everything.
     Policy { policy: Option<String> },
@@ -1080,6 +1097,8 @@ fn run(cli: Cli) -> Result<()> {
             println!("Dismissed {id}.");
             Ok(())
         }
+        Cmd::Hold { id, reason } => hold_cmd(&id, &reason, false),
+        Cmd::Unhold { id, why } => hold_cmd(&id, &why, true),
         Cmd::Policy { policy } => {
             let Some(p) = policy else {
                 let now = protocol::send(&Request::Status).ok().and_then(|r| r.state).and_then(|s| s["question_policy"].as_str().map(String::from));
@@ -1537,6 +1556,27 @@ fn queue_id(s: &str) -> Result<u64> {
 }
 
 /// `tower decisions`: what only the user can decide, in queue order.
+/// `tower hold` and `tower unhold`.
+fn hold_cmd(id: &str, words: &str, unhold: bool) -> Result<()> {
+    let r = protocol::send(&Request::Hold { id: id.trim().into(), reason: words.trim().into(), unhold, by: String::new(), from: peers::caller() })?;
+    if !r.ok {
+        bail!("{}", r.error.unwrap_or_default());
+    }
+    let v = r.state.unwrap_or_default();
+    let title = v["title"].as_str().unwrap_or("");
+    if unhold {
+        println!("{id} waits for you again: {title}. It is counted and said once.");
+    } else {
+        let reason = v["hold"]["reason"].as_str().filter(|r| !r.is_empty()).map(|r| format!(" (\"{r}\")")).unwrap_or_default();
+        let until: Vec<&str> = v["hold"]["until_prs"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        println!(
+            "{id} is on hold{reason}: {title}. Not counted or said until it is updated{}, or `tower unhold {id}`.",
+            if until.is_empty() { String::new() } else { format!(" or {} merges", until.join(" or ")) }
+        );
+    }
+    Ok(())
+}
+
 fn decisions_cmd(space: Option<String>, as_json: bool, all: bool) -> Result<()> {
     let r = protocol::send(&Request::Decisions { space, all })?;
     if !r.ok {
@@ -1562,7 +1602,16 @@ fn decisions_cmd(space: Option<String>, as_json: bool, all: bool) -> Result<()> 
         }
     }
     if !list.is_empty() {
-        println!("(tower answer <id> --choice <n> | --other \"<words>\"; tower dismiss <id>; a merge is its PR's Merge button)");
+        println!("(tower answer <id> --choice <n> | --other \"<words>\"; tower dismiss <id>; tower hold <id> --reason \"<words>\"; a merge is its PR's Merge button)");
+    }
+    let held = rows("on_hold");
+    if !held.is_empty() {
+        println!("On hold (not counted, not said):");
+        for d in &held {
+            let reason = d.hold.as_ref().map(|h| if h.reason.is_empty() { "no reason given".to_string() } else { format!("\"{}\"", h.reason) }).unwrap_or_default();
+            println!("{}  {:<10} {}  {}  [{reason}]", d.id, d.kind.word(), phone::ago(d.hold.as_ref().map(|h| h.since_ms).unwrap_or(d.last_ms)), d.title);
+        }
+        println!("(tower unhold <id>: it waits for you again)");
     }
     let closed = rows("closed");
     if !closed.is_empty() {

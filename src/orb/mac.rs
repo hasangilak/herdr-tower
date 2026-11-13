@@ -115,8 +115,12 @@ impl Win {
         }
     }
 
-    /// On screen and taking the keyboard (a panel does without activating the app).
+    /// On screen and taking the keyboard (a panel does without activating
+    /// the app). A ghost's never does (`ghost`): it is only put on screen.
     pub fn make_key(self) {
+        if ghost() {
+            return self.order_front();
+        }
         // SAFETY: as above.
         unsafe {
             let _: () = msg_send![self.0, makeKeyAndOrderFront: nil];
@@ -134,9 +138,20 @@ impl Win {
     pub fn order_front(self) {
         // SAFETY: as above.
         unsafe {
+            if ghost() {
+                let _: () = msg_send![self.0, setIgnoresMouseEvents: YES];
+            }
             let _: () = msg_send![self.0, orderFrontRegardless];
         }
     }
+}
+
+/// `HERDER_TOWER_ORB_GHOST=1`: a window to look at beside the real tower
+/// (a test's): every click goes through its windows and none takes the
+/// keyboard, so a strip of one left on screen can't catch what the user
+/// clicks or types. The test hooks dispatch their own events, which still work.
+pub fn ghost() -> bool {
+    std::env::var_os("HERDER_TOWER_ORB_GHOST").is_some()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

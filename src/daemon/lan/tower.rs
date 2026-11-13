@@ -34,6 +34,8 @@ pub trait Tower: Send + Sync {
     fn answer(&self, id: &str, body: &Value, submit: bool) -> Result<Value, Refused>;
     /// `tower dismiss <decision>`.
     fn dismiss(&self, id: &str) -> Result<Value, Refused>;
+    /// `tower hold <decision>` (`words`: the user's), or `tower unhold` (`unhold`; `words`: why).
+    fn hold(&self, id: &str, words: &str, unhold: bool, by: &str) -> Result<Value, Refused>;
     /// Every space as a mission, as the state has it (`tower missions`).
     fn missions(&self) -> Value;
     /// Every space the tower knows: Herdr's, the history's, those it keeps.

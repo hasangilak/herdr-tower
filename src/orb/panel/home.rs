@@ -439,6 +439,10 @@ impl Panel {
             if acts.dismissed.contains(&d.id) || d.question_id.as_ref().is_some_and(|q| acts.dismissed.contains(q)) {
                 return false;
             }
+            // Put on hold here a moment ago: out of the queue already.
+            if self.hold.holding(&d.id) {
+                return false;
+            }
             if d.kind == Kind::Merge && d.prs.iter().any(|p| acts.merged.contains(&p.key())) {
                 d.prs.retain(|p| !acts.merged.contains(&p.key()));
                 if d.prs.is_empty() {
@@ -570,7 +574,12 @@ impl Panel {
 
     /// `HERDER_TOWER_ORB_KEYS` (see `crate::orb`): the card's field for its
     /// own words, opened as a click on it does, with the keyboard.
+    /// `hold-<id>`: its Hold's field instead, as a click on Hold opens it.
     pub(crate) fn keys_open(&mut self, id: &str, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        if let Some(held) = id.strip_prefix("hold-") {
+            self.keys_hold(held, window, cx);
+            return;
+        }
         if !self.decisions(cx).iter().any(|d| d.id == id) && !self.open_sets(cx).iter().any(|s| s.id == id) {
             eprintln!("[orb] HERDER_TOWER_ORB_KEYS: no open card {id}");
             return;
@@ -581,6 +590,11 @@ impl Panel {
 
     /// `HERDER_TOWER_ORB_KEYS`: what the card's field holds now, and whether its answer went.
     pub(crate) fn keys_report(&mut self, id: &str, after: &str, cx: &mut Context<Self>) {
+        if let Some(held) = id.strip_prefix("hold-") {
+            let (field, on_hold) = self.hold_report(held, cx);
+            eprintln!("[orb] HERDER_TOWER_ORB_KEYS: {id} after {after}: field {:?}, on hold: {on_hold}", field.as_deref().unwrap_or("(closed)"));
+            return;
+        }
         let field = self.asks.other_of_card(id).map(|f| f.read(cx).value().to_string());
         let sent = self.tower.read(cx).acts.sent.contains(id);
         eprintln!("[orb] HERDER_TOWER_ORB_KEYS: {id} after {after}: field {:?}, answer sent: {sent}", field.as_deref().unwrap_or("(closed)"));
@@ -1142,14 +1156,22 @@ impl Panel {
     }
 
     /// The open card, by what the decision is.
+    /// Back from hold: why, above it; its Hold open: the field under it.
     fn decision_card(&mut self, d: &Decision, tag: &str, now: u64, cx: &mut Context<Self>) -> AnyElement {
-        if d.kind == Kind::Merge && !d.prs.is_empty() {
-            return self.merge_card(d, tag, now, cx);
+        let card = if d.kind == Kind::Merge && !d.prs.is_empty() {
+            self.merge_card(d, tag, now, cx)
+        } else {
+            match self.set_of(d, cx) {
+                Some(set) => self.ask_card(d, &set, tag, now, cx),
+                None => self.plain_card(d, tag, now, cx),
+            }
+        };
+        let back = Panel::back_line(d);
+        let strip = self.hold_strip(d, cx);
+        if back.is_none() && strip.is_none() {
+            return card;
         }
-        match self.set_of(d, cx) {
-            Some(set) => self.ask_card(d, &set, tag, now, cx),
-            None => self.plain_card(d, tag, now, cx),
-        }
+        v_flex().w_full().gap(px(8.0)).children(back.map(|b| div().px(px(4.0)).child(b))).child(card).children(strip).into_any_element()
     }
 
     /// A decision with no dialog behind it (raised by the tower, a task that
@@ -1209,6 +1231,7 @@ impl Panel {
                     .gap_2()
                     .items_start()
                     .child(meta_row(Some(tag), &d.space, &d.badge(), format!("{} · {}", d.stake(), d.waited(now))).flex_1().min_w_0())
+                    .child(self.hold_mark(d, cx))
                     .child(dismiss_mark(format!("dismiss-{id}")).on_click(cx.listener(move |this, _, _, cx| this.dismiss_card(&d2, cx)))),
             )
             .child(card_title(&d.title))
@@ -1241,6 +1264,7 @@ impl Panel {
                     .gap_2()
                     .items_start()
                     .child(meta_row(Some(tag), &d.space, &d.badge(), format!("{} · {}", d.stake(), d.waited(now))).flex_1().min_w_0())
+                    .child(self.hold_mark(d, cx))
                     .child(dismiss_mark(format!("dismiss-{id}")).on_click(cx.listener(move |this, _, _, cx| this.dismiss_card(&d2, cx)))),
             )
             .child(card_title(&d.title))

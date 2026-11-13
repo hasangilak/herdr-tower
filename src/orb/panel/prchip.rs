@@ -482,7 +482,13 @@ impl Panel {
             buttons = buttons.child(mbtn(format!("merge-{}-{i}", d.id), label, *primary, Some(i)).on_click(cx.listener(move |this, _, _, cx| this.merge_act(&d2, act.clone(), cx))));
         }
         card_box(true)
-            .child(meta_row(Some(tag), &d.space, &d.badge(), format!("{} · {}", d.stake(), d.waited(now_ms))))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_start()
+                    .child(meta_row(Some(tag), &d.space, &d.badge(), format!("{} · {}", d.stake(), d.waited(now_ms))).flex_1().min_w_0())
+                    .child(self.hold_mark(d, cx)),
+            )
             .child(card_title(&d.title))
             .child(rows)
             .children(said)

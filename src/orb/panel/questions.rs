@@ -623,6 +623,7 @@ impl Panel {
                 .gap_2()
                 .items_start()
                 .child(meta_row(Some(&tag), &d.space, &d.badge(), rest).flex_1().min_w_0())
+                .child(self.hold_mark(d, cx))
                 .child(dismiss_mark(format!("dismiss-{id}")).on_click(cx.listener(move |this, _, _, cx| this.dismiss_card(&d2, cx))))
                 .into_any_element(),
         ];
