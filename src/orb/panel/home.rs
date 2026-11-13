@@ -504,6 +504,8 @@ impl Panel {
         let kept: Vec<String> = files.iter().map(|p| history::keep_attachment(p).display().to_string()).collect();
         let said = text.lines().next().unwrap_or("").to_string();
         self.asks.close_other();
+        // It went: what was typed for it is not kept.
+        crate::unsent::clear(&crate::unsent::Key::others_of(id));
         // Words with files are for this once; plain words can be a rule.
         let answer = if kept.is_empty() { text.trim().to_string() } else { String::new() };
         self.answer_decision(id, json!({ "other": history::compose(&text, &kept) }), &format!("“{said}”"), &answer, cx);
@@ -1183,6 +1185,9 @@ impl Panel {
         }
         let g = glass();
         let id = d.id.clone();
+        // What was typed for it before (a restart, a window closed since).
+        self.hydrate_card(&id);
+        let kept = self.other_kept(&id);
         let mut acts = acts_row();
         for (i, o) in d.options.iter().enumerate() {
             let (id2, label) = (d.id.clone(), o.label.clone());
@@ -1206,8 +1211,14 @@ impl Panel {
                     .bg(g.pill)
                     .cursor_pointer()
                     .text_size(px(13.0))
-                    .text_color(g.pill_muted)
-                    .child(if d.options.is_empty() { "Answer in your own words…" } else { "Other… in your own words" })
+                    .text_color(if kept.is_some() { g.pill_text } else { g.pill_muted })
+                    .truncate()
+                    // Words typed and not sent: they show, and come back into the field.
+                    .child(match kept.clone() {
+                        Some(words) => words,
+                        None if d.options.is_empty() => "Answer in your own words…".to_string(),
+                        None => "Other… in your own words".to_string(),
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| this.open_other(&id2, 0, "Your answer: type it, or talk (Control)", window, cx)))
                     .into_any_element()
             }

@@ -109,6 +109,7 @@ mod session;
 mod settings;
 mod space;
 mod talk;
+mod typed;
 mod viewer;
 mod window;
 
@@ -210,6 +211,9 @@ pub struct Panel {
     parting: Option<String>,
     /// The daemon was told the input holds a draft (see `draft`).
     holding: bool,
+    /// Which input the message field is now (`typed::input_key`): what it
+    /// holds is kept under it, and it showed that input's own text.
+    draft_key: String,
     /// Herdr's spaces and their sessions (`herdr-app ls`), refreshed while the panel is open.
     live: Vec<crate::spaces::Live>,
     /// They were read at least once by this window.
@@ -240,6 +244,8 @@ impl Panel {
                     if this.text.read(cx).value().is_empty() {
                         this.next = 1;
                     }
+                    // Kept as its input's draft, as it stands.
+                    this.keep_draft(cx);
                     if this.status.as_ref().is_some_and(|(ok, _)| !ok) {
                         this.status = None;
                     }
@@ -262,6 +268,14 @@ impl Panel {
             }),
             // The window of the two that has the keyboard is the one dictation writes in.
             cx.observe_window_activation(window, |this, window, cx| {
+                // A test's window must never have the keyboard (`mac::ghost`): said if it ever does.
+                if window.is_window_active() && super::mac::ghost() {
+                    eprintln!("[orb] a ghost window took the keyboard: giving it back");
+                    if let Some(w) = super::mac::Win::of(window) {
+                        w.resign_key();
+                    }
+                    return;
+                }
                 if window.is_window_active() {
                     let me = window.window_handle();
                     this.tower.update(cx, |t, _| t.keyed = Some(me));
@@ -362,6 +376,7 @@ impl Panel {
             forgot: false,
             parting: None,
             holding: false,
+            draft_key: String::new(),
             live,
             live_read: false,
             hold: Default::default(),
@@ -533,7 +548,7 @@ impl Panel {
 
     /// Sets the input and puts the caret at `at` (and the input scrolling
     /// with it), unless the input isn't focused: then it isn't taken.
-    fn set_content(&mut self, field: &Entity<TextareaState>, content: InputContent, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn set_content(&mut self, field: &Entity<TextareaState>, content: InputContent, at: usize, window: &mut Window, cx: &mut Context<Self>) {
         let focused = gpui::Focusable::focus_handle(field.read(cx), cx).is_focused(window);
         field.update(cx, |s, cx| s.set_value(content, window, cx));
         if !focused {
@@ -710,6 +725,8 @@ impl Panel {
             let words = if kept.is_empty() { text } else { format!("{text}\n\nAttached: {}", kept.join(", ")) };
             match self.launch_say(&words, window, cx) {
                 Ok(()) => {
+                    // (Set from here, the field says no Change: its draft goes by name.)
+                    crate::unsent::put(&self.draft_key, None);
                     self.text.update(cx, |s, cx| s.set_value("", window, cx));
                     self.next = 1;
                     self.status = None;
@@ -728,6 +745,8 @@ impl Panel {
         let (text, files) = message_parts(&self.text.read(cx).content());
         // In a space's view it goes to that space's tower.
         let space = self.full.as_ref().and_then(|_| self.tower.read(cx).nav.scope.space().map(String::from));
+        // The input it was sent from: its draft goes once it went, whatever view shows then.
+        let sent_from = self.draft_key.clone();
         self.sending = true;
         self.status = None;
         cx.notify();
@@ -741,9 +760,14 @@ impl Panel {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
                 match result {
+                    // Sent: its draft goes (set from here, the field says no
+                    // Change), and its input is empty if it still shows.
                     Ok(()) => {
-                        this.text.update(cx, |s, cx| s.set_value("", window, cx));
-                        this.next = 1;
+                        crate::unsent::put(&sent_from, None);
+                        if this.draft_key == sent_from {
+                            this.text.update(cx, |s, cx| s.set_value("", window, cx));
+                            this.next = 1;
+                        }
                         this.status = None;
                     }
                     Err(e) => this.status = Some((false, if e.is_empty() { "Couldn't send.".into() } else { e })),
@@ -837,6 +861,8 @@ impl Drop for Panel {
 
 impl Render for Panel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The message field is the input of the view showing: its own kept text.
+        self.follow_draft(window, cx);
         self.sync_hold(window, cx);
         let g = glass();
         // The input says where it goes: the tower, a space's own, or a change to the behaviors.

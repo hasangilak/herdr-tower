@@ -2616,6 +2616,34 @@ Next or Review, not while its answer goes in), the space's goal editor
 line with Shift+Enter) and the phone's name. Search behaviors takes no
 new line.
 
+### What is typed and not sent is kept
+
+Each input keeps its own unsent text (`crate::unsent`, in
+`<data>/drafts.json`, `~/.local/share/herder-tower/drafts.json`), across a
+restart of the tower or the orb, a window closed and opened again, and
+switching views. It goes once it is sent (or emptied); one left alone for
+30 days is let go. The inputs, by key:
+
+- `main`: "Tell the tower" in the floating panel and in All spaces (both go
+  to the main tower);
+- `space:<name>`: a space's conversation; `session:<address>`: a
+  session's view; `behaviors`: the behaviors' input;
+- `new:<draft id>`: a new space in draft in New space, once something was
+  said in it (it is kept then); `new:fresh` before that, since a window
+  opened again starts the fresh one under another id. What was typed for
+  a draft and not said goes to the new space's own conversation when it
+  is launched, and goes with a draft that is deleted;
+- `other:<card>:<question>`: a card's "Other" field (its closed pill shows
+  the kept words; a question's tab with words has "Other" chosen again).
+  All of a card's go once its answer went.
+
+The message field is one box: it shows the text of the view showing
+(`typed::input_key`, swapped in as the view or the new space in draft
+changes, the caret at its end) and writes what it holds on each change.
+Files dropped on it are kept with their places (`[Image #1]` comes back as
+a token). A take the voice writes into an empty field, and a take's words
+on their way, are not kept.
+
 ### Answers paired with their questions
 
 A question and its answer are paired in the history (`Entry::reply_to`:

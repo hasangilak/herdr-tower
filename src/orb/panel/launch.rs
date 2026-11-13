@@ -636,6 +636,14 @@ pub(super) struct LaunchUi {
 }
 
 impl LaunchUi {
+    /// Whose input the open new space in draft is (`crate::unsent::Key::new_space`):
+    /// its own id once something was said in it (it is kept then); before,
+    /// `fresh`, the one not started yet, which a window opened again starts
+    /// under another id.
+    pub(super) fn draft_id(&self) -> &str {
+        if self.book.get(&self.id).is_some() { &self.id } else { "fresh" }
+    }
+
     /// The launcher on the drafts kept in `<data>/new-spaces.json`, open on
     /// the one that was open last (else a new one).
     pub(super) fn new() -> Self {
@@ -945,6 +953,8 @@ impl Panel {
     /// one gone, the one changed last of the others opens (else a new one).
     pub(super) fn delete_draft(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.keep_drafts();
+        // What was typed for it and not said goes with it.
+        crate::unsent::put(&crate::unsent::Key::new_space(id), None);
         let Some(full) = self.full.as_ref() else { return };
         let open = full.launch.id == id;
         let ticket = if open { full.launch.ticket() } else { full.launch.book.get(id).map(|d| d.ticket.trim().to_string()).unwrap_or_default() };
@@ -1366,6 +1376,14 @@ impl Panel {
             if let Some(full) = this.full.as_mut() {
                 // It is the new space's now (its conversation too): its draft leaves the list.
                 full.launch.book.remove(&id);
+                // What was typed for it and not said yet goes on in the new space's own chat.
+                let (from, to) = (crate::unsent::Key::new_space(&id), crate::unsent::Key::space(&space));
+                if let Some(d) = crate::unsent::get(&from) {
+                    if crate::unsent::get(&to).is_none() {
+                        crate::unsent::put(&to, Some(d));
+                    }
+                    crate::unsent::put(&from, None);
+                }
                 if full.launch.id == id {
                     full.launch.load(&SpaceDraft::fresh(history::now_ms()));
                 }
