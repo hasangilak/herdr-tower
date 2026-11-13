@@ -34,6 +34,36 @@ pub struct Account {
     pub email: String,
 }
 
+/// One usage window of an account, as the mod last recorded it (its
+/// status-line tap writes what Claude Code reports).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Window {
+    /// Percent used.
+    pub used: f64,
+    /// When it resets (Unix ms), when known.
+    pub resets_ms: Option<u64>,
+}
+
+/// An account's usage: its 5-hour and 7-day windows (None: not recorded).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Usage {
+    pub five_hour: Option<Window>,
+    pub seven_day: Option<Window>,
+}
+
+impl Usage {
+    /// Until when the account has no usage left: a window at 100% that
+    /// hasn't reset yet (the later of two). None: it has some.
+    pub fn spent_until(&self, now_ms: u64) -> Option<u64> {
+        [&self.five_hour, &self.seven_day]
+            .into_iter()
+            .flatten()
+            .filter(|w| w.used >= 100.0 && w.resets_ms.is_none_or(|r| r > now_ms))
+            .map(|w| w.resets_ms.unwrap_or(now_ms + crate::failover::UNKNOWN_OUT_MS))
+            .max()
+    }
+}
+
 /// What `cca --porcelain [pid]` printed.
 #[derive(Debug, Default, PartialEq)]
 pub struct Porcelain {
@@ -43,6 +73,8 @@ pub struct Porcelain {
     pub selected: Option<String>,
     /// `A`: every account, in cca's order.
     pub accounts: Vec<Account>,
+    /// `U`: each account's usage, by its name (only those the mod recorded).
+    pub usage: std::collections::BTreeMap<String, Usage>,
 }
 
 pub fn parse(text: &str) -> Porcelain {
@@ -55,10 +87,35 @@ pub fn parse(text: &str) -> Porcelain {
             ["A", name, rest @ ..] if !name.is_empty() => {
                 p.accounts.push(Account { name: name.to_string(), email: rest.first().unwrap_or(&"").to_string() })
             }
+            // `U <name> <5h used> <5h resets> <7d used> <7d resets>` (resets in Unix seconds, either may be empty).
+            ["U", name, rest @ ..] if !name.is_empty() => {
+                let window = |used: Option<&&str>, resets: Option<&&str>| {
+                    let used = used.and_then(|u| u.trim().parse::<f64>().ok())?;
+                    let resets_ms = resets.and_then(|r| r.trim().parse::<f64>().ok()).filter(|r| *r > 0.0).map(|r| (r * 1000.0) as u64);
+                    Some(Window { used, resets_ms })
+                };
+                let u = Usage { five_hour: window(rest.first(), rest.get(1)), seven_day: window(rest.get(2), rest.get(3)) };
+                p.usage.insert(name.to_string(), u);
+            }
             _ => {}
         }
     }
     p
+}
+
+/// Every account the mod knows, with what it recorded of their usage.
+/// Empty when the mod isn't installed.
+pub fn list_with_usage() -> Result<(Vec<Account>, std::collections::BTreeMap<String, Usage>)> {
+    let Some(cca) = cca_bin() else { return Ok((vec![], Default::default())) };
+    let p = porcelain(&cca, None)?;
+    Ok((p.accounts, p.usage))
+}
+
+/// The account a new session starts on when none is asked for: the first
+/// listed (the default) unless the tower found it out of usage (see
+/// `failover`), then the next one listed that has some. All out: the first.
+pub fn default_of(list: &[Account]) -> Option<String> {
+    crate::failover::first_available(list, crate::history::now_ms()).or_else(|| list.first().map(|a| a.name.clone()))
 }
 
 /// The `cca` script: on PATH, else where the mod installs it.
@@ -93,12 +150,14 @@ pub fn list() -> Result<Vec<Account>> {
     Ok(porcelain(&cca, None)?.accounts)
 }
 
-/// The account to use: `want` when the mod knows it, the first one listed
-/// when nothing is asked for. `None`: no accounts (no mod), nothing asked.
+/// The account to use: `want` when the mod knows it, the default when
+/// nothing is asked for (the first listed, or the next one with usage left
+/// while that one is out: `default_of`). `None`: no accounts (no mod),
+/// nothing asked.
 pub fn resolve(want: Option<&str>, list: &[Account]) -> Result<Option<String>> {
     let want = want.map(str::trim).filter(|w| !w.is_empty());
     match want {
-        None => Ok(list.first().map(|a| a.name.clone())),
+        None => Ok(default_of(list)),
         Some(w) => {
             if let Some(a) = list.iter().find(|a| a.name == w).or_else(|| list.iter().find(|a| a.name.eq_ignore_ascii_case(w))) {
                 return Ok(Some(a.name.clone()));
@@ -292,6 +351,15 @@ mod tests {
         assert_eq!(p.accounts[1].email, "ai@example.com");
         assert_eq!(p.accounts[2].email, "");
         assert_eq!(parse(""), Porcelain::default());
+        // `U`: what the mod recorded of each account's usage (resets in seconds).
+        assert_eq!(p.usage["default"].five_hour, Some(Window { used: 12.0, resets_ms: None }));
+        assert_eq!(p.usage["default"].seven_day, Some(Window { used: 40.0, resets_ms: None }));
+        let spent = parse("A\twork\tw@x\nU\twork\t100\t1794600000\t55.5\t\n");
+        let u = &spent.usage["work"];
+        assert_eq!(u.five_hour, Some(Window { used: 100.0, resets_ms: Some(1_794_600_000_000) }));
+        assert_eq!(u.spent_until(1_794_599_000_000), Some(1_794_600_000_000), "at 100% until its reset");
+        assert_eq!(u.spent_until(1_794_600_000_001), None, "reset already");
+        assert_eq!(Usage::default().spent_until(1), None);
     }
 
     #[test]

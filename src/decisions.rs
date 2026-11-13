@@ -13,7 +13,10 @@
 //! - an agenda task that failed again after it was sent once more (`failed`);
 //! - the sessions a restart of the Mac or Herdr closed, offered back (a
 //!   `choice`, `why` "reopen": see `crate::reopen`); the tower answers it
-//!   itself, nothing is sent to a session.
+//!   itself, nothing is sent to a session;
+//! - every Claude account out of usage, with sessions waiting for one (a
+//!   `choice`, `why` "accounts": see `crate::failover`), answered by the
+//!   tower itself too.
 //!
 //! **One key per decision.** The same key again (another session asking the
 //! same thing, the same line raised twice, another PR of the repo) updates
@@ -50,6 +53,9 @@ pub const DETAIL: usize = 600;
 /// The card that offers back what a restart closed (`Book::reopen`): its key, and its `why`.
 pub const REOPEN_KEY: &str = "reopen";
 pub const REOPEN_WHY: &str = "reopen";
+/// The card saying every Claude account is out of usage (`Book::accounts_out`): its key, and its `why`.
+pub const ACCOUNTS_KEY: &str = "accounts-out";
+pub const ACCOUNTS_WHY: &str = "accounts";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -514,8 +520,8 @@ pub fn rule_for(kind: Kind, why: &str, title: &str, space: Option<&str>, answer:
     if !matches!(kind, Kind::Question | Kind::Choice) || answer.trim().is_empty() || title.trim().is_empty() {
         return None;
     }
-    // What to put back after a restart is asked each time.
-    if why == REOPEN_WHY {
+    // What to put back after a restart, and waiting for an account's reset, are asked each time.
+    if why == REOPEN_WHY || why == ACCOUNTS_WHY {
         return None;
     }
     if always_yours(title) || always_yours(why) || always_yours(answer) {
@@ -1156,6 +1162,40 @@ impl Book {
         Some(Raised { id: self.add(d, now), fresh: true, folded: false, count: 1, waiting: 0 })
     }
 
+    /// The card saying every Claude account is out of usage
+    /// (`crate::failover::card`): one at a time, in the main queue, changed
+    /// in place as what waits changes. None: nothing waits, and an open one
+    /// stops. What it is now (None: none).
+    pub fn accounts_out(&mut self, card: Option<crate::failover::Card>, now: u64) -> Option<Raised> {
+        let at = self.open.iter().position(|d| d.key == ACCOUNTS_KEY);
+        let Some(c) = card else {
+            if let Some(i) = at {
+                let id = self.open[i].id.clone();
+                self.close(&id, State::Stopped, now);
+            }
+            return None;
+        };
+        let options: Vec<Opt> = c.options.into_iter().map(|(label, why, code, tower)| Opt { label, why, pick: tower, text: code, ..Default::default() }).collect();
+        if let Some(i) = at {
+            let d = &mut self.open[i];
+            let detail = detail_cut(&c.detail, false);
+            if d.title != c.title || d.detail != detail || d.options != options {
+                (d.title, d.detail, d.options, d.last_ms) = (c.title, detail, options, now);
+            }
+            return Some(Raised { id: d.id.clone(), fresh: false, folded: false, count: d.count, waiting: 0 });
+        }
+        let d = Decision {
+            key: ACCOUNTS_KEY.into(),
+            kind: Kind::Choice,
+            title: c.title,
+            detail: detail_cut(&c.detail, false),
+            why: ACCOUNTS_WHY.into(),
+            options,
+            ..Default::default()
+        };
+        Some(Raised { id: self.add(d, now), fresh: true, folded: false, count: 1, waiting: 0 })
+    }
+
     /// `tower raise`: one decision per space and line. The same line again,
     /// or a raise about something already in front of the user, is that
     /// decision once more (`count`, `last_ms`, its session), never a second one.
@@ -1516,6 +1556,8 @@ pub enum Act {
     Abandon { task: String },
     /// What a restart closed is put back, or let go (`label`: what was chosen).
     Reopen { pick: crate::reopen::Pick, label: String },
+    /// The sessions waiting for an account go on at the reset (`wait`), or are let go.
+    Accounts { wait: bool, label: String },
 }
 
 /// What answering `d` with `body` does: `{"choice": n}` (an option's index),
@@ -1576,6 +1618,23 @@ pub fn act(d: &Decision, body: &Value, submit: bool) -> Result<Act> {
                 (None, None) => bail!("give {{\"choice\": n}} or {{\"other\": \"the spaces to reopen\"}} (`tower dismiss {}`: not now)", d.id),
             };
             Ok(Act::Reopen { pick, label })
+        }
+        // Every account out: the tower goes on at the reset, or lets them go; nothing is sent.
+        Kind::Choice if d.why == ACCOUNTS_WHY => {
+            let (wait, label) = match (choice, other) {
+                (Some(n), _) => {
+                    let o = option(n)?;
+                    let Some(wait) = crate::failover::of_code(&o.text) else { bail!("{}: option {n} says nothing to do", d.id) };
+                    (wait, o.label.trim().to_string())
+                }
+                (None, Some(text)) => {
+                    let l = text.to_lowercase();
+                    let stop = ["stop", "leave", "no", "don't", "forget"].iter().any(|w| l.split(|c: char| !c.is_alphanumeric() && c != '\'').any(|x| x == *w));
+                    (!stop, text.to_string())
+                }
+                (None, None) => bail!("give {{\"choice\": n}} or {{\"other\": \"wait\" or \"leave them stopped\"}}"),
+            };
+            Ok(Act::Accounts { wait, label })
         }
         Kind::Choice | Kind::Raised => {
             let about = clip(d.title.trim().trim_end_matches('.'), 240);
@@ -2561,5 +2620,33 @@ mod tests {
         let answers = vec![crate::questions::Answer { tab: 0, choice: json!({"other": "merged"}), attachments: vec![] }];
         let (take, _) = takers(&d, &json!({ "answers": [], "shown": sets[1].id }), &answers, &sets).unwrap();
         assert_eq!(take.len(), 2, "an answer that means the same goes to every session that asks it, as before");
+    }
+
+    #[test]
+    fn every_account_out_is_one_card_the_tower_answers_itself() {
+        let mut b = Book::default();
+        let card = |title: &str| crate::failover::Card {
+            title: title.into(),
+            detail: "default: out until 15:00".into(),
+            options: vec![
+                ("Go on at 15:00".into(), "".into(), crate::failover::WAIT.into(), true),
+                ("Leave them stopped".into(), "".into(), crate::failover::STOP.into(), false),
+            ],
+        };
+        let r = b.accounts_out(Some(card("Every Claude account is out of usage: fix-login waits.")), 1).unwrap();
+        assert!(r.fresh);
+        // More waiting: the same card, changed in place.
+        let again = b.accounts_out(Some(card("Every Claude account is out of usage: 2 sessions wait.")), 2).unwrap();
+        assert_eq!((again.id.as_str(), again.fresh), (r.id.as_str(), false));
+        let d = b.open.iter().find(|d| d.id == r.id).unwrap().clone();
+        assert_eq!((d.kind, d.why.as_str(), d.title.as_str()), (Kind::Choice, ACCOUNTS_WHY, "Every Claude account is out of usage: 2 sessions wait."));
+        assert!(matches!(act(&d, &json!({ "choice": 0 }), true).unwrap(), Act::Accounts { wait: true, .. }));
+        assert!(matches!(act(&d, &json!({ "choice": 1 }), true).unwrap(), Act::Accounts { wait: false, .. }));
+        assert!(matches!(act(&d, &json!({ "other": "leave them, I'll do it" }), true).unwrap(), Act::Accounts { wait: false, .. }));
+        assert!(matches!(act(&d, &json!({ "other": "wait for it" }), true).unwrap(), Act::Accounts { wait: true, .. }));
+        assert_eq!(rule_for(Kind::Choice, ACCOUNTS_WHY, &d.title, None, "Go on at 15:00"), None, "never made a rule");
+        // Nothing waits any more: it stops.
+        assert_eq!(b.accounts_out(None, 3), None);
+        assert!(!b.open.iter().any(|d| d.key == ACCOUNTS_KEY));
     }
 }

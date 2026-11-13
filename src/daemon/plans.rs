@@ -371,7 +371,7 @@ fn run_planner(p: &Plan) -> Result<String> {
     let cfg = config::Config::live();
     let tower = config::tower_bin().display().to_string();
     plans::write_folder(p, &tower)?;
-    let account = crate::accounts::list().unwrap_or_default().first().map(|a| a.name.clone());
+    let account = crate::accounts::default_of(&crate::accounts::list().unwrap_or_default());
     let cca = crate::accounts::cca_bin().map(|c| c.to_string_lossy().into_owned());
     let argv = plans::argv(p, &cfg, cca.as_deref().filter(|_| account.is_some()), account.as_deref(), &tower, &plans::tower_env())?;
     let labels = [format!("{}=planner", plans::LABEL_ROLE), format!("{}={}", plans::LABEL_PLAN, p.id)];

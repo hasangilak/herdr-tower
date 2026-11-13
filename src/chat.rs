@@ -35,7 +35,7 @@ pub fn shown(e: &Entry) -> bool {
     !e.held
         && !e.record
         && match e.kind.as_str() {
-            "request" | "answer" | "watch" | "alert" | "summary" | "answered" | "behavior" | "receipt" | "act" | "reply" => true,
+            "request" | "answer" | "watch" | "alert" | "summary" | "answered" | "behavior" | "receipt" | "act" | "reply" | "account" => true,
             "screenshot" => e.path.is_some(),
             // A PR a session opened: its chip.
             "pr" => e.id.is_some(),
@@ -274,7 +274,7 @@ pub fn thread_of(
         let (role, text, source) = match e.kind.as_str() {
             "request" => ("user", e.text.clone(), e.source.clone().unwrap_or_else(|| "mac".into())),
             // A receipt is the tower's reply to the request it closes.
-            "answer" | "receipt" => ("tower", e.text.clone(), "tower".into()),
+            "answer" | "receipt" | "account" => ("tower", e.text.clone(), "tower".into()),
             // A session's reply to what started its turn.
             "reply" => ("session", e.text.clone(), "session".into()),
             _ => ("event", event_text(e), "tower".into()),
@@ -357,7 +357,7 @@ pub fn in_conversation(m: &Value, space: Option<&str>) -> bool {
     let own = m["space"].as_str().filter(|s| !s.is_empty());
     let kind = m["kind"].as_str().unwrap_or("");
     match space {
-        Some(s) => matches!(kind, "request" | "answer" | "receipt" | "act" | "reply") && own.is_some_and(|o| o.eq_ignore_ascii_case(s.trim())),
+        Some(s) => matches!(kind, "request" | "answer" | "receipt" | "act" | "reply" | "account") && own.is_some_and(|o| o.eq_ignore_ascii_case(s.trim())),
         // (A session's reply is its space's.)
         None => !(matches!(kind, "request" | "answer" | "act" | "reply") && own.is_some()),
     }

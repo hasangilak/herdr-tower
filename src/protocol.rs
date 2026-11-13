@@ -243,6 +243,22 @@ pub enum Request {
     Agent {
         event: crate::daemon::sessions::AgentEvent,
     },
+    /// A tower's own turn ended on an error (`tower hook claude-failed`): at
+    /// its account's usage limit, the tower moves it to another account
+    /// (see `crate::failover`). The answer says whether it does (`moving`).
+    Limited {
+        hit: crate::daemon::failover::Hit,
+    },
+    /// `tower failover`: `status` (what is out, what moved, what waits),
+    /// `move` (`target`: a session, `account`: where, or the next one with
+    /// usage), `clear` (forget what is out and what waits).
+    Failover {
+        action: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        target: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        account: String,
+    },
     /// What the agent sessions' hooks said (`tower sessions`).
     Sessions,
     /// The phone API: `on`, `off`, `pair`, `revoked` (arg: device id), `status`.

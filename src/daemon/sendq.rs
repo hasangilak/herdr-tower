@@ -821,10 +821,17 @@ impl SendQueue {
     /// A quiet note for `session` (see `Item::quiet`): it waits its turn like
     /// an instruction, so a working session is never interrupted.
     pub fn add_note(&self, session: &str, text: &str) -> Result<(Added, String, String)> {
-        self.add_note_with(&Herdr, session, text)
+        self.add_note_with(&Herdr, session, text, false)
     }
 
-    fn add_note_with(&self, h: &dyn Sessions, session: &str, text: &str) -> Result<(Added, String, String)> {
+    /// `add_note`, ahead of everything that waits for `session`: what a
+    /// session moved to another account was doing goes back in first
+    /// (`daemon::failover`), and what was queued for it follows.
+    pub fn add_note_first(&self, session: &str, text: &str) -> Result<(Added, String, String)> {
+        self.add_note_with(&Herdr, session, text, true)
+    }
+
+    fn add_note_with(&self, h: &dyn Sessions, session: &str, text: &str, first: bool) -> Result<(Added, String, String)> {
         let text = hc::clean(text.trim());
         let s = match h.look(session) {
             Look::Live(s) => s,
@@ -842,6 +849,10 @@ impl SendQueue {
             let mut item = b.push(&s, &text, &[], now);
             item.quiet = true;
             b.items[pos].quiet = true;
+            if first && let Some(at) = b.items.iter().position(|i| i.session == s.address && i.id != item.id) {
+                let it = b.items.remove(pos);
+                b.items.insert(at, it);
+            }
             if let Err(e) = self.save(&b) {
                 b.items.retain(|i| i.id != item.id);
                 return Err(e);
@@ -1373,6 +1384,10 @@ impl SendQueue {
 
     /// `add`'s immediate try: the same round, for one session, now.
     fn work(&self, h: &dyn Sessions, session: &str, known: Option<&Session>) {
+        // Moving to another Claude account, or waiting for one: it waits (see `session_round`).
+        if super::failover::holds(known.map(|s| s.address.as_str()).unwrap_or(session)) {
+            return;
+        }
         if !self.busy.lock().unwrap_or_else(|e| e.into_inner()).insert(session.to_string()) {
             // The worker is on it this very moment.
             return;
@@ -1385,6 +1400,10 @@ impl SendQueue {
     }
 
     fn session_round(&self, h: &dyn Sessions, session: &str) {
+        // Moving to another Claude account, or waiting for one: what waits for it stays until it runs again.
+        if super::failover::holds(session) {
+            return;
+        }
         let now = crate::history::now_ms();
         match h.look(session) {
             Look::Live(s) => {
@@ -2273,10 +2292,10 @@ mod tests {
         let (q, _d) = queue();
         let h = Fake::default();
         h.set("t1", "working");
-        let (Added::Queued { id, .. }, ..) = q.add_note_with(&h, "t1", "the others in this space").unwrap() else { panic!("t1 works") };
+        let (Added::Queued { id, .. }, ..) = q.add_note_with(&h, "t1", "the others in this space", false).unwrap() else { panic!("t1 works") };
         assert!(h.sent().is_empty(), "never typed into a working session");
         // The same note again: the same item.
-        let (Added::Queued { id: again, .. }, ..) = q.add_note_with(&h, "t1", "the others in this space").unwrap() else { panic!() };
+        let (Added::Queued { id: again, .. }, ..) = q.add_note_with(&h, "t1", "the others in this space", false).unwrap() else { panic!() };
         assert_eq!(id, again);
         assert!(q.items()[0].quiet);
         h.set("t1", "idle");
@@ -2286,11 +2305,26 @@ mod tests {
         assert!(h.notes().is_empty(), "nor told to the brain");
         // One for a session that ends is dropped, not parked.
         h.set("t2", "working");
-        q.add_note_with(&h, "t2", "hello").unwrap();
+        q.add_note_with(&h, "t2", "hello", false).unwrap();
         h.sessions.lock().unwrap().remove("t2");
         q.session_round(&h, "t2");
         assert!(q.items().is_empty());
         assert!(h.notes().is_empty());
+    }
+
+    #[test]
+    fn a_note_put_first_goes_in_before_what_waited() {
+        let (q, _d) = queue();
+        let h = Fake::default();
+        h.set("t1", "working");
+        q.add_with(&h, "t1", "then write the docs", &[], None).unwrap();
+        q.add_note_with(&h, "t2", "elsewhere", false).ok();
+        q.add_note_with(&h, "t1", "carry on with the login fix", true).unwrap();
+        let mine: Vec<String> = q.items().iter().filter(|i| i.session == "t1").map(|i| i.text.clone()).collect();
+        assert_eq!(mine, ["carry on with the login fix", "then write the docs"]);
+        h.set("t1", "idle");
+        q.session_round(&h, "t1");
+        assert_eq!(h.sent(), vec!["carry on with the login fix".to_string()], "the note first; the instruction after its turn");
     }
 
     #[test]

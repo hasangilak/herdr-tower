@@ -76,8 +76,38 @@ pub fn claude_failed(brain: Option<&str>) {
     let _ = std::io::stdin().read_to_string(&mut input);
     let v: Value = serde_json::from_str(&input).unwrap_or_default();
     let prompt = v["transcript_path"].as_str().and_then(last_prompt);
-    unanswered(prompt.as_deref(), &who, "failed", &failure_words(&v));
+    // At its account's usage limit, the tower moves it to another account and
+    // its request goes on there: it isn't left unanswered.
+    if !moving(&v, &who, prompt.as_deref()) {
+        unanswered(prompt.as_deref(), &who, "failed", &failure_words(&v));
+    }
     let _ = protocol::send(&Request::Say { text: String::new(), interrupt: false, kind: "answer".into(), from: None, brain: who.name() });
+}
+
+/// A brain's failed turn that ended on its account's usage limit, handed to
+/// the daemon (`Request::Limited`): whether it moves the brain to another
+/// account, or has it wait for one.
+fn moving(v: &Value, who: &Who, prompt: Option<&str>) -> bool {
+    let error = v["error"].as_str().unwrap_or("");
+    let text = [v["last_assistant_message"].as_str(), v["error_details"].as_str()].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+    if crate::failover::limit_of(error, &text, crate::history::now_ms()).is_none() {
+        return false;
+    }
+    let terminal = std::env::var("HC_TERMINAL_ID").unwrap_or_default();
+    if terminal.is_empty() {
+        return false;
+    }
+    let hit = crate::daemon::failover::Hit {
+        terminal,
+        session_id: v["session_id"].as_str().unwrap_or("").into(),
+        transcript: v["transcript_path"].as_str().unwrap_or("").into(),
+        cwd: v["cwd"].as_str().unwrap_or("").into(),
+        error: error.into(),
+        text,
+        tower: Some(who.brain.clone().unwrap_or_else(crate::brain::name)),
+        prompt: prompt.unwrap_or("").into(),
+    };
+    protocol::send(&Request::Limited { hit }).ok().filter(|r| r.ok).and_then(|r| r.state).is_some_and(|s| s["moving"] == true || s["waiting"] == true)
 }
 
 /// What a StopFailure's input says went wrong, as the chat says it.
@@ -261,6 +291,7 @@ pub fn agent_event(app: &str, terminal: &str, v: &Value) -> Option<crate::daemon
         cwd: v["cwd"].as_str().unwrap_or("").into(),
         text: text.unwrap_or_default(),
         at_ms: crate::history::now_ms(),
+        error: if event == "stop-failed" { v["error"].as_str().unwrap_or("").to_string() } else { String::new() },
         pid: agent_pid(),
     })
 }
@@ -567,6 +598,16 @@ mod tests {
             .unwrap();
         assert_eq!(e.text, "permission to use Bash: npm test");
         assert!(agent_event("claude", "t5", &json!({"hook_event_name":"PreToolUse"})).is_none());
+        // A failed turn keeps its error type: the daemon reads a usage limit off it and the message.
+        let e = agent_event(
+            "claude",
+            "t5",
+            &json!({"hook_event_name":"StopFailure","error":"rate_limit","last_assistant_message":"You've hit your 5-hour limit · resets 3pm","session_id":"s1"}),
+        )
+        .unwrap();
+        assert_eq!((e.event.as_str(), e.error.as_str(), e.text.as_str()), ("stop-failed", "rate_limit", "You've hit your 5-hour limit · resets 3pm"));
+        assert!(crate::failover::limit_of(&e.error, &e.text, e.at_ms).is_some());
+        assert_eq!(agent_event("claude", "t5", &json!({"hook_event_name":"Stop","error":"x"})).unwrap().error, "", "only a failed turn has one");
     }
 
     #[test]

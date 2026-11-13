@@ -9,6 +9,7 @@ pub mod card;
 mod book;
 pub mod decisions;
 mod desk;
+pub mod failover;
 pub mod goals;
 pub mod hotkey;
 pub mod introduce;
@@ -65,6 +66,7 @@ struct Daemon {
     acts: acts::Acts,
     plans: plans::Plans,
     reviews: reviews::Reviews,
+    failover: failover::Failover,
 }
 
 pub fn run() -> Result<()> {
@@ -323,6 +325,9 @@ pub fn run() -> Result<()> {
     missions.start();
     // What a restart of the Mac or Herdr closes, kept with the missions' looks and offered back.
     reopen::Reopen::open(decisions.clone()).start();
+    // A session or a tower at its Claude account's usage limit, moved to the next account with usage.
+    let failover = failover::Failover::open(decisions.clone(), sendq.clone());
+    failover.start();
     // "Merge all N": a merge card's PRs, merged in order by the tower.
     merges::Merges::new(shared.clone(), prs.clone(), sendq.clone()).start();
     // What the tower opened for the user lately, to show with the reply and to undo.
@@ -348,7 +353,7 @@ pub fn run() -> Result<()> {
             }
         }));
     }
-    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks, sendq, prs, agendas, introducer, decisions, missions, brains, acts, plans, reviews };
+    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks, sendq, prs, agendas, introducer, decisions, missions, brains, acts, plans, reviews, failover };
     // The phone API reaches the rest of the tower through the daemon itself
     // (`desk`), so it starts only now that the daemon is whole.
     daemon.lan.attach(std::sync::Arc::new(daemon.clone()));
@@ -851,7 +856,7 @@ impl Daemon {
                     Err(e) => Response::err(format!("{e:#}")),
                 };
             }
-            Request::Agent { event } => {
+            Request::Agent { mut event } => {
                 // Only the terminal's own agent speaks for it (not a `claude -p` it runs).
                 let terminal = crate::hc::get(&event.terminal);
                 let foreground = terminal.as_ref().and_then(|t| t["foreground"]["pid"].as_u64());
@@ -859,7 +864,24 @@ impl Daemon {
                     eprintln!("[sessions] {}: {} from another agent inside it (pid {}): not the terminal's", event.terminal, event.event, event.pid);
                     return Response { ok: true, error: None, state: None };
                 }
+                // A turn that failed on its account's usage limit is no failure: the session moves on.
+                if event.event == "stop-failed" && crate::failover::limit_of(&event.error, &event.text, crate::history::now_ms()).is_some() {
+                    event.event = "limited".into();
+                }
                 let change = sessions::registry().apply(&event);
+                if let sessions::Change::Limited(text) = &change {
+                    let hit = failover::Hit {
+                        terminal: event.terminal.clone(),
+                        session_id: event.session_id.clone(),
+                        transcript: event.transcript.clone(),
+                        cwd: event.cwd.clone(),
+                        error: event.error.clone(),
+                        text: text.clone(),
+                        ..Default::default()
+                    };
+                    let v = self.failover.limited(hit);
+                    eprintln!("[failover] {}: {v}", event.terminal);
+                }
                 // A prompt beyond its first instruction: the act that opened it is no longer undone lightly.
                 if change == sessions::Change::Prompted {
                     acts::given(&event.terminal, &event.text);
@@ -884,6 +906,22 @@ impl Daemon {
                     }
                 }
                 return Response { ok: true, error: None, state: None };
+            }
+            Request::Limited { hit } => {
+                let v = self.failover.limited(hit);
+                return Response { ok: true, error: None, state: Some(v) };
+            }
+            Request::Failover { action, target, account } => {
+                let v = match action.as_str() {
+                    "" | "status" | "list" => Ok(self.failover.status()),
+                    "move" => self.failover.move_by_hand(target.trim(), Some(account.trim()).filter(|a| !a.is_empty())),
+                    "clear" => Ok(self.failover.clear()),
+                    other => Err(anyhow::anyhow!("tower failover {other}: use status, move or clear")),
+                };
+                return match v {
+                    Ok(v) => Response { ok: true, error: None, state: Some(v) },
+                    Err(e) => Response::err(format!("{e:#}")),
+                };
             }
             Request::Sessions => {
                 let all = sessions::registry().all();
@@ -1316,7 +1354,13 @@ impl Daemon {
                 None => anyhow::bail!("the tower keeps nothing to reopen yet"),
             }
         };
-        self.decisions.answer_with(id, body, submit, &decisions::Carry { asks: &self.asks, send: &send, agenda: &agenda, reopen: &reopen })
+        let accounts = |wait: bool| -> anyhow::Result<serde_json::Value> {
+            match failover::get() {
+                Some(f) => f.answer(wait),
+                None => anyhow::bail!("the tower isn't moving sessions between accounts"),
+            }
+        };
+        self.decisions.answer_with(id, body, submit, &decisions::Carry { asks: &self.asks, send: &send, agenda: &agenda, reopen: &reopen, accounts: &accounts })
     }
 
     fn answer_decision(&self, id: &str, body: &serde_json::Value, submit: bool) -> Response {

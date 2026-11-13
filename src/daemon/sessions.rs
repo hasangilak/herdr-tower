@@ -26,7 +26,9 @@ use crate::hc::SessionStatus;
 pub struct AgentEvent {
     /// `claude-code` or `codex`.
     pub app: String,
-    /// `start`, `prompt`, `permission`, `notify`, `stop`, `stop-failed`, `end`.
+    /// `start`, `prompt`, `permission`, `notify`, `stop`, `stop-failed`,
+    /// `limited` (a failed turn that ended on the account's usage limit:
+    /// see `crate::failover`), `end`.
     pub event: String,
     /// The Herdr terminal it runs in (`HC_TERMINAL_ID`), when in Herdr.
     #[serde(default)]
@@ -43,6 +45,10 @@ pub struct AgentEvent {
     pub text: String,
     #[serde(default)]
     pub at_ms: u64,
+    /// A failed turn's error type, as Claude Code's StopFailure says it
+    /// (`rate_limit`, `billing_error`, …).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
     /// The agent process that ran the hook (0: not known). Only the
     /// terminal's own agent (Herdr's foreground process) speaks for it: a
     /// `claude -p` run inside a session inherits its terminal, but isn't it.
@@ -112,6 +118,9 @@ pub enum Change {
     Waiting,
     /// Its turn ended; what it said.
     Stopped(String),
+    /// Its turn ended on its account's usage limit (the message): no
+    /// answer, no failure; the tower moves it to another account.
+    Limited(String),
     /// The agent ended (the terminal may stay, as a shell).
     Ended,
     Nothing,
@@ -233,6 +242,11 @@ impl Sessions {
                 }
                 Change::Stopped(text)
             }
+            // What it said before stays its last words: the limit's message is none.
+            "limited" => {
+                s.state = SessionStatus::Done;
+                Change::Limited(text)
+            }
             "end" => {
                 s.state = SessionStatus::Exited;
                 Change::Ended
@@ -343,6 +357,18 @@ mod tests {
     /// Where a session works (its worktree, its dev port) is its
     /// terminal's: kept through another agent session in the same terminal,
     /// in the file, and gone with the terminal.
+    #[test]
+    fn a_turn_at_the_usage_limit_is_no_answer_and_no_failure() {
+        let (r, _) = reg();
+        let t0 = crate::history::now_ms();
+        r.apply(&ev("prompt", "fix the login bug", t0));
+        r.apply(&ev("stop", "Looked at the login form.", t0 + 10));
+        let change = r.apply(&ev("limited", "You've hit your 5-hour limit · resets 3pm", t0 + 20));
+        assert_eq!(change, Change::Limited("You've hit your 5-hour limit · resets 3pm".into()));
+        let s = r.get("t5").unwrap();
+        assert_eq!((s.event.as_str(), s.said.as_str(), s.state), ("limited", "Looked at the login form.", SessionStatus::Done), "its last words stay its own");
+    }
+
     #[test]
     fn what_the_tower_gave_a_session_is_kept_with_it() {
         let (r, p) = reg();

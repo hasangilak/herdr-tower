@@ -492,7 +492,7 @@ pub(crate) fn run_with_input(mut cmd: Command, input: &str, limit: Duration) -> 
 fn ask_brain(prompt: &str, w: &World) -> Result<String> {
     let cfg = crate::config::Config::load()?;
     let cca = crate::accounts::cca_bin();
-    let account = w.accounts.first().map(|a| a.name.clone());
+    let account = crate::accounts::default_of(&w.accounts);
     let argv = argv(cca.as_deref().filter(|_| account.is_some()), account.as_deref(), &cfg.brains.model);
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]).current_dir(std::env::temp_dir());

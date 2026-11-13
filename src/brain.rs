@@ -84,7 +84,7 @@ pub fn launch(cfg: &Config, which: &str) -> Result<String> {
     let tower = config::tower_bin().display().to_string();
     // Its model and effort are the brains' setting (`tower model`); every
     // step the brain takes is silence for the user.
-    let argv = crate::brains::argv(which, NAME, &dir, &tower, cfg)?;
+    let argv = on_available_account(crate::brains::argv(which, NAME, &dir, &tower, cfg)?);
     let address = run(NAME, &dir, &argv, &[])?;
     settle(&address);
     Ok(address)
@@ -102,8 +102,25 @@ pub fn launch_space(space: &str, mission: &serde_json::Value, cfg: &Config) -> R
     let (dir, _) = crate::brains::write_space_files(space, mission)?;
     let dir = dir.display().to_string();
     let tower = config::tower_bin().display().to_string();
-    let argv = crate::brains::argv(&cfg.brain, &name, &dir, &tower, cfg)?;
+    let argv = on_available_account(crate::brains::argv(&cfg.brain, &name, &dir, &tower, cfg)?);
     run(&name, &dir, &argv, &[format!("{}={space}", crate::brains::LABEL_SPACE)])
+}
+
+/// A brain runs plain `claude`, on the default account, unless the tower
+/// found that one out of usage (`crate::failover`): then on the first
+/// account listed that has some (`cca <account> …`).
+fn on_available_account(argv: Vec<String>) -> Vec<String> {
+    if argv.first().map(String::as_str) != Some("claude") {
+        return argv;
+    }
+    let (Ok(list), Some(cca)) = (crate::accounts::list(), crate::accounts::cca_bin()) else { return argv };
+    match (list.first(), crate::failover::first_available(&list, crate::history::now_ms())) {
+        (Some(first), Some(other)) if first.name != other => {
+            eprintln!("[brains] the {} account is out of usage: a brain starts on {other}", first.name);
+            [cca.to_string_lossy().into_owned(), other].into_iter().chain(argv.into_iter().skip(1)).collect()
+        }
+        _ => argv,
+    }
 }
 
 /// Gets past a first-run folder trust question, which is ours to answer:

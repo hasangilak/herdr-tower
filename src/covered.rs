@@ -169,7 +169,7 @@ fn parse_reply(out: &str, said: &[Said], items: &[(u64, String)]) -> Result<Vec<
 pub(crate) fn ask(prompt: &str) -> Result<String> {
     let cfg = crate::config::Config::load()?;
     let cca = crate::accounts::cca_bin();
-    let account = crate::accounts::list().ok().and_then(|l| l.first().map(|a| a.name.clone()));
+    let account = crate::accounts::list().ok().and_then(|l| crate::accounts::default_of(&l));
     let argv = crate::ticket::argv(cca.as_deref().filter(|_| account.is_some()), account.as_deref(), &cfg.brains.model);
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]).current_dir(std::env::temp_dir());
