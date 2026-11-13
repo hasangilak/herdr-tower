@@ -5,8 +5,10 @@
 //! session with the account it runs on.
 //!
 //! - **The strip** (the sidebar, over its foot): a line per account, its
-//!   badge, its 5-hour window as a bar with its percent, and under it when
-//!   that window resets and the 7-day percent. Amber from `NEAR`, and "out
+//!   badge, and the window nearest its limit as a bar with its percent
+//!   (`usage::Line::fullest`: the 5-hour one unless the 7-day one is fuller
+//!   or the only one Claude Code reports), and under it which window that
+//!   is, when it resets and the other's percent. Amber from `NEAR`, and "out
 //!   until 15:00" once the tower found it out. A click opens the view.
 //! - **The view**: a card per account (both windows, with when each
 //!   resets; out until when, and why; the default; where a new session
@@ -115,13 +117,22 @@ impl Panel {
         let board = board.filter(|b| !b.list.is_empty())?;
         let now = crate::history::now_ms();
         let rows = board.list.iter().map(|l| {
-            let five = l.five_hour.as_ref();
+            // The window nearest its limit is the bar; the line under says which, when it resets, and the other.
+            let full = l.fullest();
             let under = if let Some(until) = l.out_until_ms {
                 div().text_color(rgb(AMBER)).child(format!("out until {}", crate::failover::when(until, now)))
             } else {
-                let reset = five.and_then(|w| w.resets_ms).map(|r| format!("5h ↻{}", crate::failover::when(r, now)));
-                let seven = l.seven_day.as_ref().map(|w| format!("7d {}", usage::pct(w.used)));
-                let words: Vec<String> = [reset.or_else(|| five.map(|_| "5h".into())), seven].into_iter().flatten().collect();
+                let mut words: Vec<String> = vec![];
+                if let Some((label, w)) = full {
+                    words.push(match w.resets_ms {
+                        Some(r) => format!("{label} ↻{}", crate::failover::when(r, now)),
+                        None => label.to_string(),
+                    });
+                    let other = if label == "5h" { ("7d", l.seven_day.as_ref()) } else { ("5h", l.five_hour.as_ref()) };
+                    if let (o, Some(w)) = other {
+                        words.push(format!("{o} {}", usage::pct(w.used)));
+                    }
+                }
                 div().text_color(g.faint).child(if words.is_empty() { "no usage recorded yet".to_string() } else { words.join(" · ") })
             };
             v_flex()
@@ -131,8 +142,8 @@ impl Panel {
                         .gap(px(8.0))
                         .items_center()
                         .child(div().w(px(64.0)).flex_none().child(badge(&l.name, l.default, &g)))
-                        .child(div().flex_1().min_w_0().child(bar(five.map(|w| w.used).unwrap_or(0.0), 5.0)))
-                        .child(div().w(px(34.0)).flex_none().flex().justify_end().child(pct_el(five, 12.0, &g))),
+                        .child(div().flex_1().min_w_0().child(bar(full.map(|(_, w)| w.used).unwrap_or(0.0), 5.0)))
+                        .child(div().w(px(34.0)).flex_none().flex().justify_end().child(pct_el(full.map(|(_, w)| w), 12.0, &g))),
                 )
                 .child(div().pl(px(72.0)).text_size(px(11.0)).line_height(px(14.0)).truncate().child(under))
         });
@@ -168,9 +179,15 @@ impl Panel {
         if board.starts_on.as_deref() == Some(l.name.as_str()) && board.list.len() > 1 {
             tags.push(pill("new sessions start here").into_any_element());
         }
-        // A window: its bar and percent, and when it resets under the bar.
+        let recorded = l.five_hour.is_some() || l.seven_day.is_some();
+        // A window: its bar and percent, and when it resets under the bar (or,
+        // while the other one is recorded, that Claude Code doesn't report this one now).
         let window = |label: &str, w: Option<&Window>| {
-            let reset = w.and_then(|w| w.resets_ms).map(|r| format!("resets {}", crate::failover::when(r, now)));
+            let reset = match w {
+                Some(w) => w.resets_ms.map(|r| format!("resets {}", crate::failover::when(r, now))),
+                None if recorded => Some("not reported by Claude Code now".to_string()),
+                None => None,
+            };
             v_flex()
                 .gap(px(2.0))
                 .child(
@@ -191,7 +208,6 @@ impl Panel {
             (0, t) => format!("Runs {}.", plural(t, "tower", "towers")),
             (s, t) => format!("Runs {} and {}.", plural(s, "session", "sessions"), plural(t, "tower", "towers")),
         };
-        let recorded = l.five_hour.is_some() || l.seven_day.is_some();
         v_flex()
             .w_full()
             .p(px(14.0))
