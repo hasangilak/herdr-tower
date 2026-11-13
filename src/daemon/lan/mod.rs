@@ -54,7 +54,9 @@ pub const API: u32 = 1;
 /// fingerprint in its TXT), and `bonjour` where `hosts` is.
 /// `scores`: a PR's review score (`score`) and the tower's own merge of it
 /// (`auto`), a plan's predicted PRs (`prs`), and `auto_merge` in the state.
-pub const FEATURES: &[&str] = &["quiet", "acts", "pairing", "bonjour", "reviews", "scores"];
+/// `validation`: a predicted PR's `checks` and `edge_cases`, and a PR's
+/// `validation` (each check passed, failed, not run or not reported yet).
+pub const FEATURES: &[&str] = &["quiet", "acts", "pairing", "bonjour", "reviews", "scores", "validation"];
 const MAX_CONNECTIONS: usize = 32;
 /// Connections open at once from one address.
 const MAX_PER_IP: usize = 8;

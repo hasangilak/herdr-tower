@@ -556,30 +556,33 @@ pub fn instructions(p: &Plan, tower: &str) -> String {
     s += "2. **How the repositories fit together**: the APIs, the data and the contracts between them (endpoints, payloads, events, schemas, settings), and which repository owns each.\n";
     s += "3. **The risks.**\n";
     s += "4. **The open questions** for the user.\n";
-    s += "5. **How it will be tested**: in each repository, and end to end.\n";
-    s += "6. **The pull requests** it will open, when it changes code (see 2).\n\n";
-    s += "In `plan.md`, put each session under a `### <its repository's folder name>` heading inside a `## Sessions` section (a launched session is handed its own part), and the rest under `##` headings of their own.\n\n";
+    s += "5. **How it will be validated, for sure**: for each session (each task) and each pull request, the exact tests to add or run (the test file and the test's name), the commands, and the live checks (run it, open it, check the deployed state on dev), and the evidence each produces (test output, screenshots, logs); then the edge cases to cover, each tied to the check that covers it. This is what gives the user the confidence to merge and release: make it concrete enough that someone else could run every check and see its evidence.\n";
+    s += "6. **The pull requests** it will open, when it changes code, each with its validation and edge cases (see 2).\n\n";
+    s += "In `plan.md`, put each session under a `### <its repository's folder name>` heading inside a `## Sessions` section (a launched session is handed its own part), with a `#### Validation` (each check: what it shows, how, the evidence) and a `#### Edge cases` (each case, and the check that covers it) inside it, and the rest under `##` headings of their own.\n\n";
     s += "## 2. The pull requests\n\n";
     s += "When the plan changes code, say what the future pull requests will look like: one entry per PR. Write them to `prs.json` in this folder:\n\n";
-    s += "```json\n{\"prs\": [{\"repo\": \"<the repository's folder name>\", \"base\": \"dev\", \"title\": \"<the PR's title>\", \"changes\": \"<what it changes, in a sentence or two>\", \"files\": [\"<roughly which files>\"], \"migration\": false, \"breaking\": \"\", \"escalate\": [], \"after\": []}]}\n```\n\n";
+    s += "```json\n{\"prs\": [{\"repo\": \"<the repository's folder name>\", \"base\": \"dev\", \"title\": \"<the PR's title>\", \"changes\": \"<what it changes, in a sentence or two>\", \"files\": [\"<roughly which files>\"], \"migration\": false, \"breaking\": \"\", \"escalate\": [], \"after\": [],\n  \"checks\": [{\"id\": \"c1\", \"what\": \"<what it shows, concretely>\", \"how\": \"<the exact test to add or run, the command, or the live step>\", \"evidence\": \"<what it produces: test output, a screenshot, a log, the deployed state>\"}],\n  \"edge_cases\": [{\"case\": \"<the edge case>\", \"checks\": [\"c1\"]}]}]}\n```\n\n";
     s += "- `base`: `dev`. The user's release rule: everything goes into dev first; promoting dev to main (or prod) is a release PR of its own, which the user merges.\n";
     s += "- `migration`: true when it adds or changes a database migration (a schema change, a new table or column, a backfill).\n";
     s += "- `breaking`: what it breaks, in a few words, when it changes an API, a contract or a schema others rely on, or removes or renames something public (an endpoint, a field, an event, an exported function, a setting); empty when nothing.\n";
     s += "- `escalate`: anything else on the tower's escalate list it touches, a few words each: secrets or credentials, infrastructure (AWS, servers, DNS, CI, Docker, Terraform), deploys or releases, auth and permissions, deleting or overwriting data, money or billing, new dependencies that matter, security.\n";
-    s += "- `changes` says what it does, plainly; the flags above say what a person must look at. `after`: the numbers (from 1, in the list's order) of the PRs it waits for.\n\n";
+    s += "- `changes` says what it does, plainly; the flags above say what a person must look at. `after`: the numbers (from 1, in the list's order) of the PRs it waits for.\n";
+    s += "- `checks` (at least one): how its implementation is validated, for sure. Each says `what` it shows, `how` (the exact test to add or run, with its file and name; the command; or the live step: run it, open it, check the deployed state on dev) and the `evidence` it produces (test output, a screenshot, a log). Give every check its own id (`c1`, `c2`, …). A migration gets a check that it applies and rolls back; a breaking change one for each side of the contract; a UI change a live check with a screenshot.\n";
+    s += "- `edge_cases` (at least one): the edge cases to cover (empty input, the first and the last, failure and retry, permissions, concurrency, old data, a slow or missing service, …), each with the `checks` that cover it.\n";
+    s += "- The session that opens the PR reports each check with its evidence (`tower validate`); a PR whose planned checks have not all passed is never merged without the user, whatever its score.\n\n";
     s += &format!(
-        "Then run `{t} plan prs {id} --json-file prs.json`. The tower checks each PR and gives it a review score: **Needs review** (a migration, a breaking change, or something on the escalate list, from your flags, its files and its words) or **Low risk**, and why. It prints them: put a `## Pull requests` section in `plan.md` and in what you publish, one entry per PR (its repository, into which branch, its title, what it changes, roughly which files) with its score and the reason exactly as the tower printed them. Be honest in the flags: a PR scored low risk may be merged into dev by the tower without a person reading it, when the user has turned that on.\n\n"
+        "Then run `{t} plan prs {id} --json-file prs.json`. The tower checks each PR and gives it a review score: **Needs review** (a migration, a breaking change, or something on the escalate list, from your flags, its files and its words) or **Low risk**, and why. It refuses a PR without checks, or with an edge case no check covers. It prints them: put a `## Pull requests` section in `plan.md` and in what you publish, one entry per PR (its repository, into which branch, its title, what it changes, roughly which files) with its score and the reason exactly as the tower printed them, then its validation (each check: what, how, the evidence) and its edge cases (each with the checks that cover it), shown as plainly as the score. Be honest in the flags: a PR scored low risk may be merged into dev by the tower without a person reading it, when the user has turned that on.\n\n"
     );
     s += "## 3. Publish it\n\n";
     match p.form {
         Form::Page => {
             s += &format!(
-                "Publish it with your Artifact tool as an **HTML page** Artifact: one self-contained page titled \"Plan · {space}\", with the sessions in order (one card each), how the repositories fit together, the risks, the open questions and the tests. It is private to the user's account. Publish one artifact only; every change later republishes this same one (its `url`).\n\n"
+                "Publish it with your Artifact tool as an **HTML page** Artifact: one self-contained page titled \"Plan · {space}\", with the sessions in order (one card each), how the repositories fit together, the risks, the open questions, and the pull requests, each with its score, its validation (every check: what, how, the evidence) and its edge cases, as plainly as the score. It is private to the user's account. Publish one artifact only; every change later republishes this same one (its `url`).\n\n"
             );
         }
         Form::Whiteboard => {
             s += &format!(
-                "Publish it with your Artifact tool as a **Whiteboard** Artifact, made from the account's Artifact type `{WHITEBOARD_TYPE}` (publish with that `type_url` and the title \"Plan · {space}\", then fill it as the type's instructions say): a block per session (its repository, what it does, its place in the order), arrows for the dependencies between them (who waits for whom, who calls whom), and a section for the risks and the open questions. It is private to the user's account. Make one whiteboard only; every change later updates this same one (its `url`).\n\n"
+                "Publish it with your Artifact tool as a **Whiteboard** Artifact, made from the account's Artifact type `{WHITEBOARD_TYPE}` (publish with that `type_url` and the title \"Plan · {space}\", then fill it as the type's instructions say): a block per session (its repository, what it does, its place in the order), arrows for the dependencies between them (who waits for whom, who calls whom), a section for the risks and the open questions, and a block per pull request with its score, its checks and its edge cases. It is private to the user's account. Make one whiteboard only; every change later updates this same one (its `url`).\n\n"
             );
         }
     }
@@ -706,6 +709,8 @@ pub struct PlanBrief {
     pub url: Option<String>,
     /// `plan.md` as the planner left it.
     pub md: String,
+    /// The PRs it predicts, with their checks and edge cases.
+    pub prs: Vec<crate::prscore::Predicted>,
 }
 
 /// A markdown heading's level and words, if the line is one.
@@ -777,6 +782,27 @@ pub fn brief_text(b: &PlanBrief, mine: &str, others: &[String]) -> String {
             None => "\n\n(The plan goes on past this.)".to_string(),
         };
     }
+    s += &checks_text(&b.prs, mine);
+    s
+}
+
+/// What a launched session is told of the PRs the plan predicts for its
+/// repo: each one's checks and edge cases, and how to report each check.
+pub fn checks_text(prs: &[crate::prscore::Predicted], mine: &str) -> String {
+    let own: Vec<&crate::prscore::Predicted> = prs.iter().filter(|p| !mine.is_empty() && p.repo.eq_ignore_ascii_case(mine) && !p.checks.is_empty()).collect();
+    if own.is_empty() {
+        return String::new();
+    }
+    let mut s = "\n\nThe PRs the plan predicts for you, and how each is validated. Run every check; once the PR is open, report each one with its evidence: `tower validate <the PR's link> <check> passed|failed|not-run --evidence \"<the test output, a screenshot's path, a log, or why it wasn't run>\"`. Report them before you finish your turn on the PR: what isn't reported then counts as not run, and a PR whose planned checks haven't all passed is never merged without the user.".to_string();
+    for p in own {
+        s += &format!("\n\nPR {} into {}: {}", p.n, p.base, p.title);
+        for c in &p.checks {
+            s += &format!("\n- {}: {} (how: {}; evidence: {})", c.id, c.what, c.how, c.evidence);
+        }
+        for e in &p.edge_cases {
+            s += &format!("\n- edge case: {} (covered by {})", e.case, e.checks.join(", "));
+        }
+    }
     s
 }
 
@@ -797,7 +823,8 @@ pub fn brief_of(id: &str) -> Result<PlanBrief> {
     if md.trim().is_empty() && url.is_none() {
         bail!("--plan {id}: the plan isn't written yet (no plan.md, no link)");
     }
-    Ok(PlanBrief { id: id.to_string(), url, md })
+    let prs = serde_json::from_value(v["prs"].clone()).unwrap_or_default();
+    Ok(PlanBrief { id: id.to_string(), url, md, prs })
 }
 
 // ---------------------------------------------------------------------------
@@ -1217,6 +1244,20 @@ mod tests {
     }
 
     #[test]
+    fn a_launched_session_is_told_its_prs_checks_and_how_to_report_them() {
+        let prs = crate::prscore::check(&crate::prscore::tests::two_prs(), &repos_of(&draft())).unwrap();
+        let b = PlanBrief { id: "p1".into(), url: Some("https://claude.ai/artifact/x".into()), md: "# Plan\n\nShort.".into(), prs };
+        let text = brief_text(&b, "eyzflow-admin-dashboard", &["eyz-customer-support".into()]);
+        assert!(text.contains("tower validate <the PR's link> <check> passed|failed|not-run --evidence"), "{text}");
+        assert!(text.contains("what isn't reported then counts as not run"), "{text}");
+        assert!(text.contains("PR 2 into dev: Show translated messages in the inbox\n- c1: Each message shows its translation"), "{text}");
+        assert!(text.contains("- edge case: A very long message wraps, nothing is cut (covered by c2)"), "{text}");
+        assert!(!text.contains("Store each message's translation"), "only its own PRs: {text}");
+        // A session whose repo has no predicted PR is told nothing of checks.
+        assert!(!brief_text(&b, "other-repo", &[]).contains("tower validate"));
+    }
+
+    #[test]
     fn the_planner_is_told_to_predict_the_prs_dev_first_and_flag_what_needs_review() {
         let mut b = Book::default();
         let (p, _) = b.add(Form::Page, "The ticket", draft(), |id| PathBuf::from(format!("/s/{id}")), 1);
@@ -1236,6 +1277,17 @@ mod tests {
             "## 3. Publish it",
             "## 4. Then: the chat",
             "**the pull requests**: change `prs.json`",
+            "How it will be validated, for sure",
+            "the exact tests to add or run",
+            "the live checks (run it, open it, check the deployed state on dev)",
+            "#### Validation",
+            "#### Edge cases",
+            "`checks` (at least one)",
+            "`edge_cases` (at least one)",
+            "each with the `checks` that cover it",
+            "It refuses a PR without checks",
+            "then its validation (each check: what, how, the evidence) and its edge cases",
+            "never merged without the user, whatever its score",
         ] {
             assert!(text.contains(part), "{part}: {text}");
         }
@@ -1302,7 +1354,7 @@ mod tests {
         assert!(text.contains("/bin/tower plan draft p1 --json-file draft.json"), "{text}");
         assert!(text.contains("/bin/tower plan failed p1"), "{text}");
         assert!(text.contains("the same artifact") && text.contains("Never launch the space") && text.contains("Never edit, commit or push"), "{text}");
-        for part in ["what it does, and in what order", "APIs, the data and the contracts", "risks", "open questions", "How it will be tested", "### <its repository's folder name>"] {
+        for part in ["what it does, and in what order", "APIs, the data and the contracts", "risks", "open questions", "How it will be validated, for sure", "### <its repository's folder name>"] {
             assert!(text.contains(part), "{part}: {text}");
         }
         let (board, _) = b.add(Form::Whiteboard, "The ticket", draft(), |id| PathBuf::from(format!("/s/{id}")), 2);
@@ -1365,7 +1417,7 @@ mod tests {
         let both = format!("{}\n### eyz-customer-support and eyzflow-admin-dashboard\n\nThe contract.\n", "x\n".repeat(200));
         assert!(part_for(&both, "eyz-customer-support", &["eyzflow-admin-dashboard".into()], 1_000).0.contains("The contract."));
         // In the instruction: the link, and what is cut is said.
-        let b = PlanBrief { id: "p1".into(), url: Some("https://claude.ai/artifact/x".into()), md: long.clone() };
+        let b = PlanBrief { id: "p1".into(), url: Some("https://claude.ai/artifact/x".into()), md: long.clone(), ..Default::default() };
         let text = brief_text(&b, "eyz-customer-support", &["eyzflow-admin-dashboard".into()]);
         assert!(text.starts_with("The space's plan (https://claude.ai/artifact/x)") && text.contains("Build the translate endpoint"), "{text}");
         let short = PlanBrief { md: "One line.".into(), ..b.clone() };

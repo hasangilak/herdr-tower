@@ -782,8 +782,21 @@ finding anything, is merged by the tower (`merged_by: "tower"`, `auto`)
 and is no merge decision while it is on its way. Anything that needs
 review, and every merge into main or prod, stays the user's. The open plan
 (`plan` in the state) lists its predicted PRs in `prs`: `{n, repo, base,
-title, changes, files, migration, breaking, escalate, after, score, pr}`
-(`pr`: the real PR's key once it opened).
+title, changes, files, migration, breaking, escalate, after, checks,
+edge_cases, score, pr}` (`pr`: the real PR's key once it opened).
+
+**Validation** (feature `validation`). Each predicted PR has `checks`
+(`[{id, what, how, evidence, status}]`: what it shows, the exact test,
+command or live step, the evidence it produces) and `edge_cases`
+(`[{case, checks: [ids]}]`). A PR a plan predicted carries `validation`:
+`{checks: [{id, what, how, evidence, status: planned | passed | failed |
+not_run, proof, by, at_ms}], edge_cases}` (`proof`: the evidence its
+session gave), on the PR wherever `score` is and in a merge decision's
+`prs[]`. Show under each PR's row how many planned checks passed and which
+are missing (amber; rose when one failed), and the plan's checks and edge
+cases under each predicted PR. A PR whose planned checks haven't all
+passed is never merged by the tower, and the missing ones are among the
+merge's `warnings`.
 
 Show "Waiting for you" when `waiting` and `state` is `open`. The Merge
 button: disabled with `merge.blocked` as the reason when it's set. Tapping
@@ -1611,6 +1624,7 @@ stream's `hello` event). A tower from before there were features sends no
 | `bonjour` | Found by name on the local network: the `_herdr-tower._tcp` advert with the certificate's `fp` in its TXT, and `bonjour` in `GET /v1/network`, `GET /v1/hello`, `POST /v1/pair`'s answer, the stream's `hello` and the `hosts` event (see "Finding the Mac by Bonjour") |
 | `acts` | Acts and what came with them: `GET /v1/acts`, `/v1/acts/{id}`, `POST /v1/acts/{id}/undo`, the chat's `kind: "act"` messages and the `act` event; `rule` in a decision's answer and `POST /v1/decisions/{id}/rule`; `voice` in `/v1/tell` and `tell_voice` in the state |
 | `reviews` | PR review: `review` on a PR (`GET /v1/prs`, the `pr` event, a chat chip's `pr`, a merge decision's `prs[]`), `review` on a mission, `reviews` in the state, and a review that isn't agreed among a merge's `warnings` |
+| `validation` | A predicted PR's `checks` and `edge_cases` (`plan.prs`), and `validation` on a PR (wherever `score` is), with the missing checks among a merge's `warnings` |
 | `scores` | Review scores: `score` and `auto` on a PR (wherever `review` is), a plan's predicted PRs (`plan.prs`), `auto_merge` in the state, `merged_by: "tower"`, and a PR that needs review among a merge's `warnings` |
 | `quiet` | Everything under "The Quiet Tower": the `/v1/decisions`, `/v1/missions`, `/v1/spaces/{space}/…`, `/v1/thread`, `/v1/setups`, `/v1/launch`, `/v1/actions`, `/v1/tell` and `/v1/model` calls; `space` on `POST /v1/ask`, on chat messages, and as a filter of `/v1/history` and `/v1/chat`; the `decisions`, `missions`, `thread` and `action` events; `decisions_count`, `tell_level`, `brain_model` and `brains` in the state |
 

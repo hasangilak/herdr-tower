@@ -120,6 +120,18 @@ impl Line {
         Some((s.line.clone(), if s.needs_review { AMBER } else { CYAN }))
     }
 
+    /// Its plan's checks, for its row: all passed (cyan), or which are
+    /// missing and how they stand (amber, or rose when one failed).
+    fn validation(&self) -> Option<(String, u32)> {
+        let v = self.pr.validation.as_ref().filter(|v| !v.checks.is_empty())?;
+        let color = match () {
+            _ if v.all_passed() => CYAN,
+            _ if v.checks.iter().any(|c| c.status == crate::prscore::FAILED) => ROSE,
+            _ => AMBER,
+        };
+        Some((v.line(), color))
+    }
+
     /// How it stands, for its row: the words and whether they are bad news.
     fn standing(&self) -> (String, u32) {
         let c = &self.pr.checks;
@@ -385,6 +397,7 @@ impl Panel {
                     .when(!l.pr.title.is_empty(), |el| el.child(div().text_size(px(12.0)).text_color(g.faint).truncate().child(l.pr.title.clone())))
                     .children(l.review().map(|(line, color)| div().text_size(px(12.0)).text_color(rgb(color)).truncate().child(line)))
                     .children(l.score().map(|(line, color)| div().text_size(px(12.0)).line_height(px(16.0)).text_color(rgb(color)).line_clamp(2).child(line)))
+                    .children(l.validation().map(|(line, color)| div().text_size(px(12.0)).line_height(px(16.0)).text_color(rgb(color)).line_clamp(3).child(line)))
                     .children(crate::prscore::auto_line(&l.pr, auto_on).map(|line| div().text_size(px(12.0)).text_color(g.faint).truncate().child(line)))
                     // Where the tower's chain has it.
                     .children(running.and_then(|r| r.line(&l.key)).map(|line| {
@@ -462,6 +475,7 @@ fn described(r: &PrRef) -> Pr {
         },
         review: r.review.clone(),
         score: r.score.clone(),
+        validation: r.validation.clone(),
         ..Default::default()
     }
 }
@@ -602,6 +616,29 @@ mod tests {
         // One the window knows only from its decision keeps its review.
         let r = PrRef { repo: "acme/shop".into(), number: 7, review: Some(brief("stuck", 3, 1)), ..Default::default() };
         assert_eq!(described(&r).review.unwrap().line, "Review: stuck after 3 rounds, yours to decide");
+    }
+
+    #[test]
+    fn a_merge_cards_row_says_which_planned_checks_are_missing() {
+        use crate::prscore::{Check, EdgeCase, Validation};
+        let check = |id: &str, status: &str| Check { id: id.into(), what: format!("Check {id}"), how: "npm test".into(), evidence: "test output".into(), status: status.into(), ..Default::default() };
+        let with = |checks: Vec<Check>| {
+            let mut l = line(12, "dev", "passing", Step::Idle);
+            l.pr.validation = Some(Validation { checks, edge_cases: vec![EdgeCase { case: "empty".into(), checks: vec!["c1".into()] }] });
+            l.gate = gate(&l.pr);
+            l
+        };
+        let all = with(vec![check("c1", "passed"), check("c2", "passed")]);
+        assert_eq!(all.validation(), Some(("Both planned checks passed".into(), CYAN)));
+        assert!(all.gate.warnings.iter().all(|w| !w.contains("Planned checks")));
+        let missing = with(vec![check("c1", "passed"), check("c2", "not_run")]);
+        assert_eq!(missing.validation(), Some(("Checks missing: c2 Check c2 (not run) (1 of 2 passed)".into(), AMBER)));
+        assert!(missing.gate.warnings.contains(&"Planned checks not all passed: c2 Check c2 (not run).".to_string()));
+        assert_eq!(with(vec![check("c1", "failed")]).validation().unwrap().1, ROSE, "a failed check is bad news");
+        assert_eq!(line(12, "dev", "passing", Step::Idle).validation(), None, "no plan: no line");
+        // One the window knows only from its decision keeps its checks.
+        let r = PrRef { repo: "acme/shop".into(), number: 7, validation: missing.pr.validation.clone(), ..Default::default() };
+        assert_eq!(described(&r).validation.unwrap().missing().len(), 1);
     }
 
     #[test]

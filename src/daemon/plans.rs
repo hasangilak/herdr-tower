@@ -319,8 +319,12 @@ mod tests {
         let mut predicted = ask("prs", "p1");
         if let Request::Plan { prs, .. } = &mut predicted {
             *prs = Some(json!({ "prs": [
-                { "repo": "eyz-customer-support", "title": "Translations table", "files": ["db/migrations/0042_translations.sql"], "migration": true },
-                { "repo": "/w/eyz/eyz-customer-support", "title": "Translate button styling", "files": ["src/ui/Button.tsx"] },
+                { "repo": "eyz-customer-support", "title": "Translations table", "files": ["db/migrations/0042_translations.sql"], "migration": true,
+                  "checks": [{ "what": "It applies and rolls back", "how": "npm run db:migrate && npm run db:rollback", "evidence": "the output" }],
+                  "edge_cases": [{ "case": "Rows exist on rollback", "checks": ["c1"] }] },
+                { "repo": "/w/eyz/eyz-customer-support", "title": "Translate button styling", "files": ["src/ui/Button.tsx"],
+                  "checks": [{ "what": "The button looks as designed", "how": "open it on dev", "evidence": "a screenshot" }],
+                  "edge_cases": [{ "case": "A narrow screen", "check": "c1" }] },
             ]}));
         }
         let r = plans.request(&predicted);

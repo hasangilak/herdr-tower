@@ -22,9 +22,17 @@
 //!   repo, the closest title), and scored again on its own title and files
 //!   at its head commit (`combine`): what the real PR shows that the plan
 //!   didn't (a migration in a "UI" PR) makes it need review.
+//! - **Its validation** (`Validation`): every predicted PR lists how its
+//!   implementation is validated for sure (`Check`: what it shows, the
+//!   exact test, command or live step, and the evidence it produces) and
+//!   the edge cases to cover, each tied to the checks that cover it
+//!   (`EdgeCase`). The real PR carries them; its session reports each check
+//!   (`tower validate`: passed, failed or not run, with its evidence), and
+//!   what it hasn't reported when it finishes its turn on the PR is marked
+//!   not run (`Validation::finished`).
 //! - **Auto-merge** (`auto_path`), behind `[prs] auto_merge_low_risk` (off
 //!   unless the user turns it on): a PR into dev that a plan predicted, is
-//!   scored low risk, whose checks pass and whose reviewer agreed without
+//!   scored low risk, whose planned checks all passed, whose CI checks pass and whose reviewer agreed without
 //!   finding anything, is merged by the tower itself (`daemon::automerge`).
 //!   Anything that needs review, every merge into main or prod, a PR no plan
 //!   predicted, and one the tower couldn't merge stay the user's.
@@ -99,6 +107,10 @@ pub struct Predicted {
     pub escalate: Vec<String>,
     /// The PRs of the plan (by `n`) it waits for.
     pub after: Vec<u32>,
+    /// How its implementation is validated, for sure (at least one).
+    pub checks: Vec<Check>,
+    /// The edge cases to cover, each tied to the checks that cover it (at least one).
+    pub edge_cases: Vec<EdgeCase>,
     /// The tower's score of it.
     pub score: Score,
     /// The real PR, once it opened (`owner/name#12`).
@@ -107,6 +119,11 @@ pub struct Predicted {
 }
 
 impl Predicted {
+    /// What the real PR carries: its checks, none reported yet, and its edge cases.
+    pub fn validation(&self) -> Validation {
+        Validation { checks: self.checks.iter().map(|c| Check { status: PLANNED.into(), proof: String::new(), by: String::new(), at_ms: None, ..c.clone() }).collect(), edge_cases: self.edge_cases.clone() }
+    }
+
     /// What it is scored on: everything the plan says of it.
     pub fn evidence(&self) -> Evidence {
         Evidence {
@@ -129,6 +146,162 @@ pub struct Evidence {
     pub migration: bool,
     pub breaking: String,
     pub escalate: Vec<String>,
+}
+
+// ---- how it is validated ----
+
+/// A check not reported yet.
+pub const PLANNED: &str = "planned";
+pub const PASSED: &str = "passed";
+pub const FAILED: &str = "failed";
+pub const NOT_RUN: &str = "not_run";
+
+/// One planned check of a PR: how its implementation is validated, for sure.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Check {
+    /// `c1`, `c2`, … within its PR.
+    pub id: String,
+    /// What it shows, concretely ("the migration creates the table and rolls back").
+    pub what: String,
+    /// How: the exact test to add or run, the command, or the live step
+    /// ("cargo test translations::", "open /inbox on dev and toggle a message").
+    pub how: String,
+    /// The evidence it produces: test output, a screenshot, a log, the deployed state.
+    pub evidence: String,
+    /// `planned` (not reported yet), `passed`, `failed`, `not_run`.
+    pub status: String,
+    /// The evidence given with the result: a path, a link, an excerpt of the output, why it wasn't run.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub proof: String,
+    /// Who reported it (the session's address); empty when the tower marked it.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_ms: Option<u64>,
+}
+
+impl Check {
+    pub fn passed(&self) -> bool {
+        self.status == PASSED
+    }
+
+    /// Its status in words: "passed", "failed", "not run", "not reported yet".
+    pub fn status_word(&self) -> &'static str {
+        match self.status.as_str() {
+            PASSED => "passed",
+            FAILED => "failed",
+            NOT_RUN => "not run",
+            _ => "not reported yet",
+        }
+    }
+
+    /// "c2 Shows translated messages on dev", its words cut to a line.
+    pub fn short(&self) -> String {
+        let what: String = self.what.chars().take(60).collect();
+        let cut = if self.what.chars().count() > 60 { "…" } else { "" };
+        format!("{} {}{cut}", self.id, what.trim_end())
+    }
+}
+
+/// An edge case to cover, and the checks that cover it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EdgeCase {
+    pub case: String,
+    /// The ids of the checks that cover it.
+    pub checks: Vec<String>,
+}
+
+/// A PR's planned validation, and where each check stands.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Validation {
+    pub checks: Vec<Check>,
+    pub edge_cases: Vec<EdgeCase>,
+}
+
+impl Validation {
+    /// The checks that haven't passed (failed, not run, not reported yet).
+    pub fn missing(&self) -> Vec<&Check> {
+        self.checks.iter().filter(|c| !c.passed()).collect()
+    }
+
+    /// Every planned check passed (and there is one).
+    pub fn all_passed(&self) -> bool {
+        !self.checks.is_empty() && self.checks.iter().all(Check::passed)
+    }
+
+    /// A check failed or wasn't run (not only not reported yet).
+    pub fn any_bad(&self) -> bool {
+        self.checks.iter().any(|c| c.status == FAILED || c.status == NOT_RUN)
+    }
+
+    /// The missing ones in a line: "c2 Shows it on dev (failed), c3 Rolls back (not run)".
+    pub fn missing_line(&self) -> String {
+        self.missing().iter().map(|c| format!("{} ({})", c.short(), c.status_word())).collect::<Vec<_>>().join(", ")
+    }
+
+    /// What its card says: "All 3 planned checks passed", or how many
+    /// passed and which are missing, and why.
+    pub fn line(&self) -> String {
+        let n = self.checks.len();
+        let passed = n - self.missing().len();
+        match () {
+            _ if n == 0 => "No planned checks".to_string(),
+            _ if passed == n => format!("{}planned check{} passed", if n == 1 { "The " } else if n == 2 { "Both " } else { "All " }, if n == 1 { "" } else { "s" }),
+            _ => format!("Checks missing: {} ({passed} of {n} passed)", self.missing_line()),
+        }
+    }
+
+    /// Its session reports a check (`status`: passed, failed, not-run).
+    pub fn report(&mut self, id: &str, status: &str, proof: &str, by: &str, now: u64) -> Result<Check> {
+        let status = match status.trim().to_lowercase().replace('-', "_").as_str() {
+            "passed" | "pass" | "ok" => PASSED,
+            "failed" | "fail" => FAILED,
+            "not_run" | "notrun" | "skipped" => NOT_RUN,
+            other => bail!("a check is passed, failed or not-run, not {other:?}"),
+        };
+        let proof = proof.trim();
+        if proof.is_empty() {
+            bail!("give its evidence: --evidence \"<the test output, a screenshot's path, a log, or why it wasn't run>\"");
+        }
+        let ids: Vec<String> = self.checks.iter().map(|c| c.id.clone()).collect();
+        let Some(c) = self.checks.iter_mut().find(|c| c.id.eq_ignore_ascii_case(id.trim())) else {
+            bail!("no planned check {id:?}: its checks are {}", ids.join(", "));
+        };
+        c.status = status.to_string();
+        c.proof = proof.chars().take(2_000).collect();
+        c.by = by.to_string();
+        c.at_ms = Some(now);
+        Ok(c.clone())
+    }
+
+    /// Its session finished its turn on the PR: what it didn't report is
+    /// not run. The checks it marked so.
+    pub fn finished(&mut self, now: u64) -> Vec<Check> {
+        let mut marked = vec![];
+        for c in self.checks.iter_mut().filter(|c| c.status == PLANNED) {
+            c.status = NOT_RUN.into();
+            c.proof = "not reported when its session finished its turn on the PR".into();
+            c.at_ms = Some(now);
+            marked.push(c.clone());
+        }
+        marked
+    }
+}
+
+/// What a session is told when it finished its turn on a PR without
+/// reporting some of its planned checks.
+pub fn unreported_note(pr: &Pr, missing: &[Check], tower: &str) -> String {
+    let each: Vec<String> = missing.iter().map(|c| format!("{} {} (how: {}; evidence: {})", c.id, c.what, c.how, c.evidence)).collect();
+    format!(
+        "[tower] PR #{} ({}) has planned checks you didn't report when your turn ended: {}. Run each, then report it: {tower} validate {} <check> passed --evidence \"<the test output, a screenshot's path, a log>\" (or failed / not-run, with why). Until every planned check passed, the PR is never merged without the user.",
+        pr.number,
+        pr.repo,
+        each.join("; "),
+        pr.key()
+    )
 }
 
 // ---- the kinds of risk ----
@@ -561,6 +734,7 @@ pub fn check(v: &Value, repos: &[String]) -> Result<Vec<Predicted>> {
             Value::String(t) => t.trim().to_string(),
             _ => String::new(),
         };
+        let (checks, edge_cases) = validation_of(x, n, name)?;
         let mut p = Predicted {
             n,
             repo: name.to_string(),
@@ -572,6 +746,8 @@ pub fn check(v: &Value, repos: &[String]) -> Result<Vec<Predicted>> {
             breaking,
             escalate: strings(&x["escalate"]),
             after: x["after"].as_array().into_iter().flatten().filter_map(Value::as_u64).map(|a| a as u32).filter(|a| *a != n).collect(),
+            checks,
+            edge_cases,
             ..Default::default()
         };
         p.score = score(&p.evidence());
@@ -585,12 +761,69 @@ pub fn check(v: &Value, repos: &[String]) -> Result<Vec<Predicted>> {
     Ok(out)
 }
 
+/// A predicted PR's checks and edge cases, as the planner wrote them: each
+/// check says what it shows, how (the exact test, command or live step)
+/// and its evidence; each edge case names the checks that cover it.
+fn validation_of(x: &Value, n: u32, name: &str) -> Result<(Vec<Check>, Vec<EdgeCase>)> {
+    let pr = format!("PR {n} ({name})");
+    let list = x["checks"].as_array().filter(|a| !a.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!("{pr} has no checks: say how it is validated for sure, \"checks\": [{{\"id\": \"c1\", \"what\": \"<what it shows>\", \"how\": \"<the exact test, command or live step>\", \"evidence\": \"<test output, a screenshot, a log>\"}}]")
+    })?;
+    let mut checks: Vec<Check> = vec![];
+    for (i, c) in list.iter().enumerate() {
+        let s = |k: &str| c[k].as_str().unwrap_or("").trim().to_string();
+        let id = match s("id") {
+            id if id.is_empty() => format!("c{}", i + 1),
+            id => id,
+        };
+        if checks.iter().any(|x| x.id.eq_ignore_ascii_case(&id)) {
+            bail!("{pr}: two checks are {id}");
+        }
+        for (k, says) in [("what", "what it shows"), ("how", "the exact test, command or live step"), ("evidence", "the evidence it produces (test output, a screenshot, a log)")] {
+            if s(k).is_empty() {
+                bail!("{pr}, check {id}: no \"{k}\" ({says})");
+            }
+        }
+        checks.push(Check { id, what: s("what"), how: s("how"), evidence: s("evidence"), status: PLANNED.into(), ..Default::default() });
+    }
+    let list = x["edge_cases"].as_array().filter(|a| !a.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!("{pr} has no edge cases: \"edge_cases\": [{{\"case\": \"<the edge case>\", \"checks\": [\"<the checks that cover it>\"]}}]")
+    })?;
+    let mut edges: Vec<EdgeCase> = vec![];
+    for e in list {
+        let case = e["case"].as_str().or(e.as_str()).unwrap_or("").trim().to_string();
+        if case.is_empty() {
+            bail!("{pr}: an edge case with no \"case\"");
+        }
+        let mut by = strings(&e["checks"]);
+        by.extend(strings(&e["check"]));
+        if by.is_empty() {
+            bail!("{pr}, edge case \"{case}\": name the check that covers it (\"checks\": [\"c1\"])");
+        }
+        let mut ids = vec![];
+        for b in by {
+            let Some(c) = checks.iter().find(|c| c.id.eq_ignore_ascii_case(&b)) else {
+                bail!("{pr}, edge case \"{case}\": no check {b} (its checks are {})", checks.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(", "));
+            };
+            ids.push(c.id.clone());
+        }
+        edges.push(EdgeCase { case, checks: ids });
+    }
+    Ok((checks, edges))
+}
+
 /// The predicted PRs in a few lines, as `tower plan prs` prints them for
 /// the planner (to put in the plan as they are) and `tower plan show` says.
 pub fn said(prs: &[Predicted]) -> String {
     prs.iter()
         .map(|p| {
             let mut s = format!("PR {} · {} → {}: {}\n  {}", p.n, p.repo, p.base, p.title, p.score.line);
+            for c in &p.checks {
+                s += &format!("\n  check {}: {} (how: {}; evidence: {})", c.id, c.what, c.how, c.evidence);
+            }
+            for e in &p.edge_cases {
+                s += &format!("\n  edge case: {} (covered by {})", e.case, e.checks.join(", "));
+            }
             if !p.after.is_empty() {
                 s += &format!("\n  after PR {}", p.after.iter().map(u32::to_string).collect::<Vec<_>>().join(", PR "));
             }
@@ -661,8 +894,9 @@ pub enum Path {
 }
 
 /// Whether the tower merges `pr` itself (`on`: `[prs] auto_merge_low_risk`):
-/// only a PR into dev that a plan predicted, scored low risk, open and no
-/// draft, clean, whose checks pass and whose reviewer agreed without
+/// only a PR into dev that a plan predicted, scored low risk, every planned
+/// check passed (one not reported yet is waited for; one failed or not run
+/// makes it the user's), open and no draft, clean, whose CI checks pass and whose reviewer agreed without
 /// finding anything critical, and that the tower hasn't failed to merge at
 /// this commit.
 pub fn auto_path(pr: &Pr, on: bool) -> Path {
@@ -689,6 +923,16 @@ pub fn auto_path(pr: &Pr, on: bool) -> Path {
         } else {
             format!("it merges into {}, not dev", if pr.base.is_empty() { "?" } else { &pr.base })
         });
+    }
+    // Its planned checks, all passed with their evidence: else never low risk enough.
+    match &pr.validation {
+        None => return yours("its plan lists no checks for it"),
+        Some(v) if v.checks.is_empty() => return yours("its plan lists no checks for it"),
+        Some(v) if v.any_bad() => return Path::Yours(format!("planned checks missing: {}", v.missing_line())),
+        Some(v) if !v.all_passed() => {
+            return Path::Waits(format!("its planned checks ({})", v.missing().iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(", ")));
+        }
+        Some(_) => {}
     }
     if pr.draft {
         return yours("it's a draft");
@@ -830,9 +1074,27 @@ pub(crate) mod tests {
     pub(crate) fn two_prs() -> Value {
         json!({ "prs": [
             { "repo": "eyz-customer-support", "title": "Store each message's translation", "changes": "A translations table and the endpoint that fills it.",
-              "files": ["db/migrations/0042_message_translations.sql", "src/messages/translate.ts"], "migration": true },
+              "files": ["db/migrations/0042_message_translations.sql", "src/messages/translate.ts"], "migration": true,
+              "checks": [
+                { "id": "c1", "what": "The migration creates message_translations and rolls back cleanly", "how": "npm run db:migrate, then npm run db:rollback, on a scratch database", "evidence": "the migrate and rollback output" },
+                { "id": "c2", "what": "The endpoint stores one translation per message and language", "how": "add src/messages/translate.test.ts and run npm test -- translate", "evidence": "test output" },
+                { "id": "c3", "what": "On dev, translating a real message stores its row", "how": "after the deploy to dev, call the endpoint for one message and query the table", "evidence": "the response and the row, in a log" },
+              ],
+              "edge_cases": [
+                { "case": "A message already translated: no second row", "checks": ["c2"] },
+                { "case": "An unsupported language is refused", "checks": ["c2"] },
+                { "case": "Rolling back after rows exist", "checks": ["c1"] },
+              ] },
             { "repo": "eyzflow-admin-dashboard", "title": "Show translated messages in the inbox", "changes": "The inbox shows each message's translation under it, with a toggle.",
-              "files": ["src/inbox/MessageRow.tsx", "src/inbox/TranslationToggle.tsx"], "after": [1] },
+              "files": ["src/inbox/MessageRow.tsx", "src/inbox/TranslationToggle.tsx"], "after": [1],
+              "checks": [
+                { "id": "c1", "what": "Each message shows its translation, and the toggle shows the original", "how": "add src/inbox/MessageRow.test.tsx and run npm test -- MessageRow", "evidence": "test output" },
+                { "id": "c2", "what": "On dev, the inbox shows translated messages to a German-speaking agent", "how": "open the inbox on dev as that agent and toggle one message", "evidence": "two screenshots: translated and original" },
+              ],
+              "edge_cases": [
+                { "case": "A message with no translation yet shows the original, no empty line", "checks": ["c1"] },
+                { "case": "A very long message wraps, nothing is cut", "checks": ["c2"] },
+              ] },
         ]})
     }
 
@@ -846,7 +1108,9 @@ pub(crate) mod tests {
         assert!(!prs[1].score.needs_review, "{:?}", prs[1].score);
         assert_eq!((prs[1].after.as_slice(), prs[1].files.len()), ([1].as_slice(), 2));
         // The list alone reads too; a whole path is its folder's name.
-        let bare = json!([{ "repo": "/w/eyz/eyzflow-admin-dashboard/", "title": "x", "base": "main", "files": "a.tsx, b.tsx" }]);
+        let ok_checks = json!([{ "what": "w", "how": "h", "evidence": "e" }]);
+        let ok_edges = json!([{ "case": "c", "check": "c1" }]);
+        let bare = json!([{ "repo": "/w/eyz/eyzflow-admin-dashboard/", "title": "x", "base": "main", "files": "a.tsx, b.tsx", "checks": ok_checks, "edge_cases": ok_edges }]);
         let p = check(&bare, &draft_repos()).unwrap();
         assert_eq!((p[0].repo.as_str(), p[0].base.as_str(), p[0].files.len()), ("eyzflow-admin-dashboard", "main", 2));
         // What can't be.
@@ -854,7 +1118,26 @@ pub(crate) mod tests {
         assert!(check(&json!({"prs":[{"repo":"eyz-customer-support"}]}), &draft_repos()).unwrap_err().to_string().contains("no title"));
         assert!(check(&json!({"prs":[{"repo":"eyz-customer-support","title":"x","after":[4]}]}), &draft_repos()).is_err());
         assert!(check(&json!({"nope":1}), &draft_repos()).is_err());
+        // Each PR's validation: its checks (ids given or numbered), its edge cases tied to them, none reported yet.
+        assert_eq!(prs[0].checks.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["c1", "c2", "c3"]);
+        assert_eq!((prs[0].checks[0].how.as_str(), prs[0].checks[0].status.as_str()), ("npm run db:migrate, then npm run db:rollback, on a scratch database", PLANNED));
+        assert_eq!(prs[0].edge_cases[2], EdgeCase { case: "Rolling back after rows exist".into(), checks: vec!["c1".into()] });
+        assert_eq!((prs[1].checks.len(), prs[1].edge_cases.len()), (2, 2));
+        assert_eq!(p[0].checks[0].id, "c1", "numbered when not given");
+        let v = prs[1].validation();
+        assert_eq!((v.all_passed(), v.missing().len(), v.line().as_str()), (false, 2, "Checks missing: c1 Each message shows its translation, and the toggle shows the… (not reported yet), c2 On dev, the inbox shows translated messages to a German-spea… (not reported yet) (0 of 2 passed)"));
+        // What the planner must give: checks with what, how and evidence; edge cases each covered by a check.
+        let one = |checks: Value, edges: Value| check(&json!([{ "repo": "eyz-customer-support", "title": "x", "checks": checks, "edge_cases": edges }]), &draft_repos());
+        assert!(one(json!([]), ok_edges.clone()).unwrap_err().to_string().contains("has no checks: say how it is validated for sure"));
+        assert!(one(json!([{ "what": "w", "evidence": "e" }]), ok_edges.clone()).unwrap_err().to_string().contains("check c1: no \"how\""));
+        assert!(one(json!([{ "what": "w", "how": "h" }]), ok_edges.clone()).unwrap_err().to_string().contains("no \"evidence\""));
+        assert!(one(ok_checks.clone(), json!([])).unwrap_err().to_string().contains("has no edge cases"));
+        assert!(one(ok_checks.clone(), json!([{ "case": "c" }])).unwrap_err().to_string().contains("name the check that covers it"));
+        assert!(one(ok_checks.clone(), json!([{ "case": "c", "checks": ["c7"] }])).unwrap_err().to_string().contains("no check c7 (its checks are c1)"));
+        assert!(one(json!([{ "id": "a", "what": "w", "how": "h", "evidence": "e" }, { "id": "A", "what": "w", "how": "h", "evidence": "e" }]), ok_edges.clone()).unwrap_err().to_string().contains("two checks are"));
         let said = said(&prs);
+        assert!(said.contains("\n  check c1: The migration creates message_translations and rolls back cleanly (how: npm run db:migrate"), "{said}");
+        assert!(said.contains("\n  edge case: Rolling back after rows exist (covered by c1)"), "{said}");
         assert!(said.contains("PR 1 · eyz-customer-support → dev: Store each message's translation\n  Needs review: a database migration"), "{said}");
         assert!(said.contains("PR 2 · eyzflow-admin-dashboard → dev: Show translated messages in the inbox\n  Low risk:") && said.contains("after PR 1"), "{said}");
     }
@@ -894,6 +1177,10 @@ pub(crate) mod tests {
             checks: crate::prs::Checks { state: "passing".into(), passed: 1, total: 1, ..Default::default() },
             review: Some(crate::reviews::Brief { status: "agreed".into(), ..Default::default() }),
             score: Some(Score { line: LOW_LINE.into(), planned: Some("p1#2".into()), sha: "abc".into(), ..Default::default() }),
+            validation: Some(Validation {
+                checks: vec![Check { id: "c1".into(), what: "It works".into(), how: "npm test".into(), evidence: "test output".into(), status: PASSED.into(), ..Default::default() }],
+                edge_cases: vec![EdgeCase { case: "empty".into(), checks: vec!["c1".into()] }],
+            }),
             ..Default::default()
         }
     }
