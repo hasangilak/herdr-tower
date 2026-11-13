@@ -594,6 +594,39 @@ impl OwnTower {
     }
 }
 
+/// One version of a space's goal (`missions::GoalChange`): what it became,
+/// when, and what made it so (`by`: `you`, `request`, `launch`, `tower`, "").
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoalStep {
+    #[serde(deserialize_with = "or_default")]
+    pub goal: String,
+    #[serde(deserialize_with = "or_default")]
+    pub done_when: String,
+    pub at_ms: u64,
+    #[serde(deserialize_with = "or_default")]
+    pub by: String,
+    /// For `request`: the user's words that changed it.
+    #[serde(deserialize_with = "or_default")]
+    pub request: String,
+    /// For `request`: what it added, in a phrase.
+    #[serde(deserialize_with = "or_default")]
+    pub why: String,
+}
+
+impl GoalStep {
+    /// Who set it, for the Goal card: "by your request", "by you", "at launch", "by the tower".
+    pub fn by_words(&self) -> &'static str {
+        match self.by.as_str() {
+            "request" => "updated by your request",
+            "you" => "set by you",
+            "launch" => "set at launch",
+            "tower" => "set by the tower",
+            _ => "set",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Mission {
@@ -602,6 +635,10 @@ pub struct Mission {
     pub goal: String,
     #[serde(deserialize_with = "or_default")]
     pub done_when: String,
+    /// How the goal came to be, oldest first: the last is the goal now
+    /// (empty from a tower that doesn't keep it, or a goal set before it did).
+    #[serde(deserialize_with = "or_default")]
+    pub goal_history: Vec<GoalStep>,
     pub standing: bool,
     /// Its PRs get a reviewer (`crate::reviews`): on unless the user turned
     /// it off, and on from a daemon that doesn't say.

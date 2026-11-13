@@ -273,12 +273,16 @@ pub fn ask(space: Option<&str>, text: &str, shared: &Shared, source: &str) -> Re
         match brain::ask_as(&to, text, &radar_of(shared, &own), source) {
             Ok(()) => {
                 eprintln!("[brains] asked of {} ({own})", to.name);
+                // A request there: it may add to what the space is for.
+                super::goals::heard(&own, text, crate::history::now_ms(), "its tower");
                 return Ok(());
             }
             Err(e) => eprintln!("[brains] {} can't take the request ({e:#}): to the main brain", to.name),
         }
     }
-    brain::ask(&in_space(&name, text), &super::stt::radar(shared), source)
+    brain::ask(&in_space(&name, text), &super::stt::radar(shared), source)?;
+    super::goals::heard(&name, text, crate::history::now_ms(), "the main tower");
+    Ok(())
 }
 
 /// Tells every brain that runs (but `except`, by its terminal's address)

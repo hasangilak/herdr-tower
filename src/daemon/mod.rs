@@ -9,6 +9,7 @@ pub mod card;
 mod book;
 pub mod decisions;
 mod desk;
+pub mod goals;
 pub mod hotkey;
 pub mod introduce;
 pub mod lan;
@@ -299,6 +300,8 @@ pub fn run() -> Result<()> {
     reviews.start();
     // The agenda ledger: what the user asked for, followed until it's done.
     let agendas = agendas::Agendas::open();
+    // A space's goal follows the user's requests there.
+    goals::start();
     agendas.start(agendas::Ctx { sendq: sendq.clone(), watches: watches.clone(), asks: asks.clone(), shared: shared.clone(), decisions: decisions.clone() });
     // Claude sessions in one space are told who the others are, as they join.
     let introducer = introduce::Introducer::new(sendq.clone());

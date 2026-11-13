@@ -39,7 +39,7 @@ use super::launch::field;
 use super::session::last_words;
 use super::window::{bay, eff, lrow, mark_box, nm, pg, whead};
 use super::{AMBER, CYAN, Panel, glass};
-use crate::orb::model::{self, Chip, Decision, Member, Mission, Missions};
+use crate::orb::model::{self, Chip, Decision, GoalStep, Member, Mission, Missions};
 use crate::orb::nav::Scope;
 
 /// How many of the thread's messages a space's view shows (the latest).
@@ -268,7 +268,8 @@ impl Panel {
         let place = format!("space:{space}");
         let mut commands: Vec<Vec<String>> = vec![];
         if goal != was.goal.trim() || done_when != was.done_when.trim() {
-            let mut args = vec!["space".to_string(), "goal".into(), space.clone(), goal];
+            // By hand: it wins over what the tower would make of a request meanwhile.
+            let mut args = vec!["space".to_string(), "goal".into(), space.clone(), goal, "--by".into(), "you".into()];
             // (Given whenever it changed: an empty one clears what was there.)
             if done_when != was.done_when.trim() {
                 args.extend(["--done-when".to_string(), done_when]);
@@ -527,7 +528,7 @@ impl Panel {
         items.extend(self.resolve_card(name, cx));
         let editing_goal = self.full.as_ref().and_then(|f| f.edit.as_ref()).is_some_and(|e| e.space == name);
         if !m.standing && !m.goal.trim().is_empty() && !editing_goal {
-            items.push(goal_block(m.goal.trim(), m.done_when.trim()));
+            items.push(self.goal_card(&m, cx));
         }
         // The goal, being changed.
         if let Some(edit) = self.full.as_ref().and_then(|f| f.edit.as_ref()).filter(|e| e.space == name) {
@@ -872,34 +873,103 @@ fn sender_colour(address: &str) -> u32 {
     COLOURS[n as usize % COLOURS.len()]
 }
 
-/// A space's goal, and what counts as done as a list, each its own line
-/// with room around it.
-fn goal_block(goal: &str, done_when: &str) -> AnyElement {
-    let g = glass();
-    let done = done_items(done_when);
-    v_flex()
-        .w_full()
-        .px(px(16.0))
-        .py(px(14.0))
-        .gap(px(10.0))
-        .rounded(px(18.0))
-        .bg(rgba(CARD))
-        .border_1()
-        .border_color(rgba(LINE))
-        .child(bay_label("Goal").px(px(0.0)))
-        .child(div().text_size(px(16.0)).line_height(px(23.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.text).child(goal.to_string()))
-        .when(!done.is_empty(), |el| {
-            el.child(div().pt(px(4.0)).child(bay_label("Done when").px(px(0.0)))).child(v_flex().gap(px(8.0)).children(done.into_iter().map(|d| {
+/// How the goal now came to be, and the versions before it (newest first):
+/// the history's last version is the goal now when it says the same.
+pub(super) fn goal_versions<'a>(goal: &str, done_when: &str, history: &'a [GoalStep]) -> (Option<&'a GoalStep>, Vec<&'a GoalStep>) {
+    match history.split_last() {
+        Some((last, before)) if last.goal.trim() == goal.trim() && last.done_when.trim() == done_when.trim() => (Some(last), before.iter().rev().collect()),
+        _ => (None, history.iter().rev().collect()),
+    }
+}
+
+/// `HERDER_TOWER_ORB_GOALS=open` (looking at it with test data): every Goal
+/// card shows its earlier versions.
+fn goals_open_from_start() -> bool {
+    std::env::var("HERDER_TOWER_ORB_GOALS").is_ok_and(|v| v.trim() == "open")
+}
+
+/// The head of the Goal card: "updated by your request at 3:55 PM" (none
+/// when how it was set isn't known).
+pub(super) fn goal_said(now: Option<&GoalStep>) -> Option<String> {
+    let s = now.filter(|s| s.at_ms > 0)?;
+    Some(format!("{} at {}", s.by_words(), super::talk::when(s.at_ms)))
+}
+
+impl Panel {
+    /// A space's Goal card: who last set the goal and when ("updated by
+    /// your request at 3:55 PM"), the goal, what counts as done as a list,
+    /// the request that changed it; and its earlier versions, folded.
+    fn goal_card(&self, m: &Mission, cx: &mut Context<Self>) -> AnyElement {
+        let g = glass();
+        let (now, earlier) = goal_versions(&m.goal, &m.done_when, &m.goal_history);
+        let open = self.full.as_ref().is_some_and(|f| f.goals_open.contains(&m.name)) || goals_open_from_start();
+        let name = m.name.clone();
+        let quote = |text: &str| format!("“{}”", crate::launch::clip_words(text.trim(), 220));
+        let version = |s: &GoalStep| {
+            v_flex()
+                .gap(px(3.0))
+                .pl(px(12.0))
+                .border_l_2()
+                .border_color(rgba(LINE))
+                .child(div().text_size(px(12.0)).text_color(g.faint).child(format!("{} · {}", super::talk::when(s.at_ms), s.by_words())))
+                .child(div().text_size(px(13.5)).line_height(px(19.0)).text_color(g.muted).child(s.goal.clone()))
+                .when(!s.done_when.trim().is_empty(), |el| el.child(div().text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child(format!("Done when: {}", s.done_when.trim()))))
+                .when(s.by == "request" && !s.request.trim().is_empty(), |el| {
+                    el.child(div().text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child(format!("Your request: {}", quote(&s.request))))
+                })
+        };
+        let done = done_items(m.done_when.trim());
+        let n = earlier.len();
+        v_flex()
+            .w_full()
+            .px(px(16.0))
+            .py(px(14.0))
+            .gap(px(10.0))
+            .rounded(px(18.0))
+            .bg(rgba(CARD))
+            .border_1()
+            .border_color(rgba(LINE))
+            .child(
                 h_flex()
-                    .items_start()
-                    .gap(px(10.0))
-                    .text_size(px(13.5))
-                    .line_height(px(20.0))
-                    .child(div().flex_none().text_color(g.faint).child("•"))
-                    .child(div().flex_1().min_w_0().text_color(g.text).child(d))
-            })))
-        })
-        .into_any_element()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(bay_label("Goal").px(px(0.0)))
+                    .children(goal_said(now).map(|said| div().text_size(px(12.0)).text_color(g.faint).child(said))),
+            )
+            .child(div().text_size(px(16.0)).line_height(px(23.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.text).child(m.goal.trim().to_string()))
+            .children(now.filter(|s| s.by == "request" && !s.request.trim().is_empty()).map(|s| {
+                let why = if s.why.trim().is_empty() { String::new() } else { format!(" ({})", s.why.trim().trim_end_matches('.')) };
+                div().text_size(px(12.5)).line_height(px(18.0)).text_color(g.muted).child(format!("Your request: {}{why}", quote(&s.request)))
+            }))
+            .when(!done.is_empty(), |el| {
+                el.child(div().pt(px(4.0)).child(bay_label("Done when").px(px(0.0)))).child(v_flex().gap(px(8.0)).children(done.into_iter().map(|d| {
+                    h_flex()
+                        .items_start()
+                        .gap(px(10.0))
+                        .text_size(px(13.5))
+                        .line_height(px(20.0))
+                        .child(div().flex_none().text_color(g.faint).child("•"))
+                        .child(div().flex_1().min_w_0().text_color(g.text).child(d))
+                })))
+            })
+            .when(n > 0, |el| {
+                el.child(
+                    h_flex().pt(px(2.0)).child(
+                        tg("goal-earlier", &format!("{} earlier version{}", n, if n == 1 { "" } else { "s" }), open).on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(full) = this.full.as_mut()
+                                && !full.goals_open.remove(&name)
+                            {
+                                full.goals_open.insert(name.clone());
+                            }
+                            cx.notify();
+                        })),
+                    ),
+                )
+                .when(open, |el| el.child(v_flex().gap(px(10.0)).children(earlier.into_iter().map(version))))
+            })
+            .into_any_element()
+    }
 }
 
 /// What counts as done, a condition each: split where the goal joined them
@@ -923,6 +993,20 @@ fn done_items(done_when: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_goal_card_says_how_the_goal_came_to_be_and_folds_the_versions_before() {
+        let step = |goal: &str, by: &str, at_ms: u64| GoalStep { goal: goal.into(), by: by.into(), at_ms, ..Default::default() };
+        let h = vec![step("Export cases as PDF", "launch", 1), step("Export cases as PDF and CSV", "request", 2)];
+        let (now, earlier) = goal_versions("Export cases as PDF and CSV", "", &h);
+        assert_eq!(now.map(|s| s.by.as_str()), Some("request"));
+        assert_eq!(earlier.iter().map(|s| s.goal.as_str()).collect::<Vec<_>>(), ["Export cases as PDF"]);
+        assert!(goal_said(now).unwrap().starts_with("updated by your request at "));
+        // A goal the history doesn't end with (set by an older tower): every version is an earlier one.
+        let (now, earlier) = goal_versions("Something else", "", &h);
+        assert!(now.is_none() && earlier.len() == 2 && goal_said(now).is_none());
+        assert_eq!(step("x", "you", 1).by_words(), "set by you");
+    }
 
     #[test]
     fn a_message_is_long_when_it_wraps_past_four_lines_at_the_window_width() {

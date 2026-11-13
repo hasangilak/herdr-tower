@@ -65,7 +65,8 @@ impl Tower for Daemon {
         let now = crate::history::now_ms();
         // One writer at a time: the missions' own look keeps the same file.
         Ok(spaces::update(|s| {
-            let v = crate::missions::goal_in(s, &name, goal, done_when, now);
+            // The user's own edit, on the phone: by hand.
+            let v = crate::missions::goal_by(s, &name, goal, done_when, &crate::missions::Change::by("you"), now);
             match standing {
                 Some(on) => crate::missions::standing_in(s, &name, on, now),
                 None => v,

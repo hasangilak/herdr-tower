@@ -207,7 +207,7 @@ pub(super) fn told_row(t: &Told) -> AnyElement {
 }
 
 /// "7:50 PM" today, else the day and the time.
-fn when(at: u64) -> String {
+pub(super) fn when(at: u64) -> String {
     let day = super::day_label(at);
     if day == "Today" { super::clock(at) } else { format!("{day}, {}", super::clock(at)) }
 }

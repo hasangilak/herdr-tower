@@ -845,6 +845,7 @@ pub fn open(p: &Plan, by: Option<&str>, each: &mut dyn FnMut(&Value)) -> Result<
     // The space is a mission from now on, with its goal: its sessions get worktrees.
     // Its goal is the title, and what counts as done is set as `tower space goal --done-when` sets it.
     crate::spaces::update(|s| {
+        let was = s.agendas.get(&p.space).cloned().unwrap_or_default();
         s.agendas.insert(p.space.clone(), p.goal.clone());
         let m = s.missions.entry(p.space.clone()).or_insert_with(|| crate::missions::Mission::born(now));
         if m.state == crate::missions::State::Closed || m.archived_ms.is_some() {
@@ -852,8 +853,14 @@ pub fn open(p: &Plan, by: Option<&str>, each: &mut dyn FnMut(&Value)) -> Result<
         }
         (m.born_ms, m.goal_ms) = (now, now);
         m.setup = p.setup.name.clone();
+        let was_done = m.done_when.clone();
         if !p.done_when.is_empty() {
             m.done_when = p.done_when.clone();
+        }
+        // The first version of its goal (a space joined again keeps how its goal came to be).
+        if was.trim() != p.goal.trim() || was_done != m.done_when || m.goals.is_empty() {
+            let done = m.done_when.clone();
+            m.record_goal((&was, &was_done), &p.goal, &done, &crate::missions::Change::by("launch"), now);
         }
         // Whether its PRs get a reviewer: as asked, else as it was (on for a new space).
         m.review = p.review;

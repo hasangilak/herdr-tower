@@ -1132,6 +1132,11 @@ user, and where it stands.
     "name": "fix-login",
     "goal": "Fix the login redirect",          // "" when it has none
     "done_when": "The redirect lands on the dashboard",   // "" when none
+    "goal_history": [                          // how the goal came to be, oldest first: the last is the goal now
+      {"goal": "Fix the login redirect", "done_when": "", "at_ms": 1794368700000, "by": "launch"},
+      {"goal": "Fix the login redirect and the logout link", "done_when": "The redirect lands on the dashboard; logout returns to /login",
+       "at_ms": 1794372100000, "by": "request", "request": "the logout link is broken too, fix that in this space", "why": "adds the logout link"}
+    ],
     "standing": false,                         // true: the user keeps it; it is never ready, never closed by the tower
     "review": true,                            // the PRs its sessions open get a reviewer session (on unless the user turned it off)
     "state": "open",                           // open | ready | quiet
@@ -1198,6 +1203,39 @@ space's mission as it is right after the change (`mission`; null for a
 space that is closed). A space gets a goal by its launch, by this call, or
 on the Mac (`tower space goal`); `standing: true` keeps a space the tower
 would otherwise close when its work is done.
+
+**A goal follows the user's requests.** When the user asks for something
+in a space (of its tower or of the main one about it, from the Mac, the
+voice or `POST /v1/ask` with `space`; or work the tower hands out into it
+for a request of theirs) that adds to or changes what the space is for, the
+tower rewrites its `goal` and `done_when` (a short rewrite that keeps what
+the space was first for, with the new scope) a few seconds later; a
+request that is only a step toward the goal leaves it. Only a space with a
+goal, not standing, not closed. Each version is in `goal_history`:
+
+- `by`: `request` (the tower, after the request in `request`, the user's
+  words; `why` says in a phrase what it added), `you` (the user, by hand:
+  this call or the Mac's Goal card), `launch` (the space was made with it),
+  `tower` (the tower's brain, on the user's word), `""` (it was the goal
+  before the tower kept versions). `at_ms`: when it became the goal.
+- The last version is the goal now when its `goal` and `done_when` are the
+  space's; otherwise how the goal now was set isn't known. At most 20 are
+  kept: the first and the latest. Empty from a tower that doesn't keep it.
+- A goal set by this call is the user's own (`by: "you"`) and wins: an
+  update the tower was weighing when it changed is dropped.
+- A ready space whose goal grows is `open` again, and only what is
+  finished after the change makes it ready.
+- A change is a `missions` event like any other.
+
+**What the Android app needs for it**: show the goal on the space's Goal
+card with how it was set, from the last version: "Goal, updated by your
+request at 15:55" (`by: "request"`, with "Your request: “…”" and its
+`why` under the goal), "Goal, set by you at …", "Goal, set at launch";
+nothing more for `""` or a history that doesn't end with the goal now.
+Under it, "N earlier versions", folded, newest first, each with its time,
+who set it, the goal, its done-when and (for a request) the request. The
+app's own goal edit stays `POST /v1/spaces/{space}/goal`; nothing else to
+send. A tower without this sends no `goal_history`: show the goal as before.
 
 ### A space's thread
 

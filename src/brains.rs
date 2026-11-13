@@ -175,6 +175,11 @@ pub fn space_section(space: &str, name: &str, dir: &Path, mission: &Value) -> St
             if !word("done_when").is_empty() {
                 s += &format!("- Done when: {}\n", word("done_when"));
             }
+            // How it came to be, when a request of the user's changed it.
+            if let Some(last) = mission["goal_history"].as_array().and_then(|h| h.last()).filter(|c| c["by"] == "request") {
+                s += &format!("- The goal was updated after the user's request \"{}\".\n", crate::launch::clip_words(last["request"].as_str().unwrap_or("").trim(), 200));
+            }
+            s += "- This goal follows the user's requests here: when one adds to what the space is for, the tower updates the goal and its done-when by itself (and this file); one that is a step toward it leaves it. Don't rewrite the goal for that yourself. The user's own edit wins.\n";
         }
     }
     if mission["standing"] == true && !word("goal").is_empty() {

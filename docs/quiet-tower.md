@@ -810,9 +810,61 @@ is under `missions`, by space name:
     "closed_ms": n, "archived_ms": n,
     "worktrees": [ { "repo": "…", "path": "…", "branch": "…" } ],   // made by the tower for it
     "setup": "name",            // the setup `tower launch` made it with
-    "review": false             // its PRs get no reviewer ("PR review"); left out while on
+    "review": false,            // its PRs get no reviewer ("PR review"); left out while on
+    "goals": [                  // how its goal came to be, oldest first; left out while empty
+      { "goal": "…", "done_when": "…", "at_ms": n,
+        "by": "launch" | "you" | "request" | "tower" | "",
+        "request": "…", "why": "…" }   // for `request`: the user's words, and what it added
+    ]
 } }
 ```
+
+### A goal follows the user's requests
+
+`src/goals.rs`, run by `src/daemon/goals.rs`. A space's goal is made for
+what it was first for; the user asks for more while working there, and the
+goal follows:
+
+- **Heard**: what the user asks about a space (of its own tower, or of the
+  main one: `daemon::brains::ask`, once a brain took it), and what the tower
+  hands out into a space for a request of theirs (`tower dispatch`, `queue`,
+  `start`: an agenda of origin `user` whose task is in that space,
+  `daemon::agendas::register`). The same words in the same space are
+  weighed once (6 hours); a bare reply or two words are not
+  (`goals::worth_weighing`). One heard before the goal was last set other
+  than by a request (the launch's own ticket, a goal set by hand after it)
+  is in the goal already.
+- **Which spaces**: one with a goal, not standing, not closed.
+- **Weighed** one at a time on a thread of the daemon's, by one headless
+  call (as `covered` does it: the default account, `[brains] model` at low
+  effort, no tools, nothing kept, 60 s at most) with the space, its goal,
+  done-when, how the goal came to be and the request (`goals::prompt`). It
+  answers `{"changes": false, "why"}` for a step toward the goal (a fix, a
+  test, a review comment, a question, go on, commit; unsure: no change) or
+  `{"changes": true, "goal", "done_when", "why"}`: one short line that keeps
+  what the space was first for and adds the new scope, and the conditions
+  as they were plus the new ones. Checked: one line of at most 200
+  characters, a done-when of at most 600; the same goal is no change.
+- **Applied** (`missions::goal_from_request`) only when the goal and
+  done-when are still the ones weighed: an edit by hand meanwhile wins. The
+  version goes into `goals` with `by: "request"`, the request and why;
+  `goal_ms` moves (only what is finished after it makes the space ready); a
+  ready space is open again and its report, of the goal before, goes. The
+  space's own tower's instructions say the goal and the request that
+  changed it.
+- **By hand**: the Goal card's Save runs `tower space goal … --by you`; the
+  phone's `POST /v1/spaces/{space}/goal` is the user's too. A launch is the
+  first version (`by: "launch"`); `tower space goal` without `--by` is the
+  brain's (`by: "tower"`). Clearing a goal clears its history. A goal set
+  before the tower kept versions goes in first (`by: ""`) when it changes.
+- `tower space goal-request <space> "<words>" [--dry-run]` weighs words as
+  such a request by hand.
+- **The Goal card** (a space's view): "Goal · updated by your request at
+  3:55 PM" (or set by you, set at launch), the goal, "Your request: “…”
+  (what it added)", what counts as done, and **N earlier versions**,
+  folded, newest first: each its time, who set it, the goal, its done-when
+  and the request. `HERDER_TOWER_ORB_GOALS=open` (looking at it with test
+  data) shows every card's earlier versions.
 
 `follow` and `mute` stay the spaces' own lists. Fields that don't apply
 are left out. A spaces file from before missions loads as it is. Every
@@ -2576,7 +2628,7 @@ the daemon is one):
 | `/v1/decisions`, `/v1/decisions/{id}` | `{"cmd":"decisions"}` (`Decisions::listed`: a space by its whole name, where the CLI's `--space` takes a part) |
 | `…/answer`, `DELETE` | `{"cmd":"answer"}`, `{"cmd":"dismiss"}` with a decision's id: `Decisions::answer_with` and `dismiss_with` (`src/daemon/decisions.rs`), carried out with the daemon's question sets, send queue and agenda ledger. They return `Refused` (unknown, closed, a merge, a bad answer, its questions' own errors, failed): the socket prints it as a sentence, the phone gives each its status and code |
 | `/v1/missions` | `{"cmd":"missions"}` (`Missions::now`: it looks first) |
-| `…/goal` | `tower space goal` and `tower space standing`: `missions::goal_in`, `standing_in`, under `spaces::update` |
+| `…/goal` | `tower space goal --by you` and `tower space standing`: `missions::goal_by`, `standing_in`, under `spaces::update` |
 | `…/follow`, `…/mute` | `tower space follow\|mute`: `spaces::set_follow` / `set_mute` under `spaces::update`; a mute republishes the queue; the missions are looked at again for the answer |
 | `…/close` | `tower space close`: `missions::holding` for the refusal, `missions::close(space, force, false)` (the voice closes it itself), then its decisions and the missions follow |
 | `/v1/setups`, `/v1/launch` | `tower setups`, `tower launch`: `setups::value`, `launch::planned`, `launch::open` (which now reports after each session) |
