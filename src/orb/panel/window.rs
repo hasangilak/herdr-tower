@@ -125,7 +125,7 @@ impl FullUi {
         let scroll = gpui::ScrollHandle::new();
         Self {
             shown: None,
-            launch: launch::LaunchUi::new(window, cx),
+            launch: launch::LaunchUi::new(),
             projects: projects::ProjectsUi::default(),
             edit: None,
             resolve: None,
@@ -430,6 +430,8 @@ impl Panel {
             return;
         }
         self.follow_nav(cx);
+        // What changed in a new space in draft is kept, whatever view shows.
+        self.drafts_tick(cx);
         match self.tower.read(cx).nav.scope {
             Scope::Phone | Scope::Settings => self.phone_tick(cx),
             Scope::Behaviors => self.behaviors_tick(cx),
@@ -448,6 +450,19 @@ impl Panel {
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut Self, &Result<String, String>, &mut Context<Self>) + 'static,
     ) {
+        self.run_or(place, args, cx, then, |_| {});
+    }
+
+    /// The same; `gone` gets what it printed instead if the window closed
+    /// before it was done (for what must not be lost with it).
+    pub(super) fn run_or(
+        &mut self,
+        place: &str,
+        args: Vec<String>,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &Result<String, String>, &mut Context<Self>) + 'static,
+        gone: impl FnOnce(&Result<String, String>) + 'static,
+    ) {
         let Some(full) = self.full.as_mut() else { return };
         if !full.busy.insert(place.to_string()) {
             return;
@@ -457,7 +472,7 @@ impl Panel {
         let task = cx.background_executor().spawn(async move { cli::tower(&args) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
-            let _ = this.update(cx, |this, cx| {
+            let here = this.update(cx, |this, cx| {
                 if let Some(full) = this.full.as_mut() {
                     full.busy.remove(&place);
                     if let Err(e) = &result {
@@ -467,6 +482,9 @@ impl Panel {
                 then(this, &result, cx);
                 cx.notify();
             });
+            if here.is_err() {
+                gone(&result);
+            }
         })
         .detach();
         cx.notify();
@@ -716,8 +734,12 @@ impl Panel {
                 .into_any_element(),
         ))
         .into_any_element();
-        list = list
-            .child(item("side-new".into(), plus, "New space", "from one sentence".into(), here == Side::New).on_click(cx.listener(|this, _, _, cx| this.nav_to(Scope::New, cx))));
+        // How many new spaces wait in draft, once there are some.
+        let new_sub = match self.full.as_ref().map(|f| f.launch.drafts_kept()).unwrap_or(0) {
+            0 => "from one sentence".to_string(),
+            n => format!("{n} in draft"),
+        };
+        list = list.child(item("side-new".into(), plus, "New space", new_sub, here == Side::New).on_click(cx.listener(|this, _, _, cx| this.nav_to(Scope::New, cx))));
         // The quiet spaces take one line together, and what closed today with them.
         let (quiet, closed) = (missions.quiet.len(), missions.closed_today.len());
         if quiet + closed > 0 {

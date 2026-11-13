@@ -31,6 +31,14 @@
 //!   it after, and words for the planner while a plan of it can talk.
 //!   Launch hands it to the new space (`--story-file`), whose conversation
 //!   opens with it (`talk::story_of`).
+//! - **Several new spaces in draft** (`crate::space_drafts`): what the
+//!   launcher holds is the open one; the others wait in the list above it
+//!   (`drafts_strip`: open one, + New draft, × to delete), all kept in
+//!   `<data>/new-spaces.json` as they change, so they outlast the window
+//!   and the tower. A draft's commands run as `draft:<id>`, `launch:<id>`,
+//!   and their answer is that draft's wherever the user is by then
+//!   (`tell_in`, `drafted_in`; after the window closed, written to the
+//!   file: `told_on_disk`). A launch takes its draft out of the list.
 //! - A tower whose `launch --help` has no `--draft` gets the launcher as it
 //!   was: the first project, its plan, Launch.
 //! - **Launch**'s receipt names the space, whose view opens with what was
@@ -54,20 +62,22 @@
 //!   `HERDER_TOWER_ORB_PLAN=<file>`: the plan in the file (the state's
 //!   `plan`, as `Plan::view` writes it) is the open plan, of that ticket.
 //!   `HERDER_TOWER_ORB_TALK=<file>`: its lines are said in the
-//!   conversation one after another (`talk_from_start`).
+//!   conversation one after another (`talk_from_start`; `!new`, `!open
+//!   <n>`, `!delete <n>`, `!reopen [<s>]` for the drafts).
 
 use std::time::Duration;
 
-use gpui::{AnyElement, AsyncApp, Context, Entity, FontWeight, SharedString, Subscription, Task, Window, div, prelude::*, px, rgb, rgba};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui::{AnyElement, AsyncApp, Context, Entity, FontWeight, SharedString, Task, Window, div, prelude::*, px, rgb, rgba};
+use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 use serde_json::Value;
 
-use super::home::{LINE, SOFT, acts_row, bay_label, cstat, cstat_busy, mbtn, tg};
+use super::home::{LINE, SOFT, acts_row, bay_label, cstat, cstat_busy, dismiss_mark, mbtn, tg};
 use super::window::whead;
-use super::{AMBER, CYAN, Panel, cli, glass};
+use super::{AMBER, CYAN, NAVY, PALE, Panel, cli, glass};
 use crate::history;
 use crate::launch::Told;
+use crate::space_drafts::{self, Drafting, SpaceDraft};
 use crate::orb::model::{self, Missions, PlanView};
 use crate::orb::nav::Scope;
 
@@ -162,6 +172,8 @@ pub(super) struct Dry {
     pub error: Option<String>,
     /// Its repos are those the goal's first line names: Launch is the confirm, no draft.
     pub first_line: bool,
+    /// The space it names.
+    pub space: String,
 }
 
 /// A folder as the user writes it: `~/Work/eyz/eyzflow`.
@@ -223,7 +235,7 @@ pub(super) fn plan_from(receipt: &Value) -> Option<Dry> {
         Some(from) => from == "first-line",
         None => matches!(a["setup_why"].as_str(), Some("the repos its first line names" | "the one that has the repos the goal names")),
     };
-    Some(Dry { lines, assumed, error: None, first_line })
+    Some(Dry { lines, assumed, error: None, first_line, space: space.to_string() })
 }
 
 /// A draft the tower's brain made of a ticket (`tower launch "<ticket>"
@@ -450,6 +462,43 @@ pub(super) fn draft_said(d: &Drafted, before: Option<&Drafted>) -> String {
     out
 }
 
+/// What the brain's answer to a draft (`tower launch … --draft --json`)
+/// adds to its conversation (`before`: the draft a redraft changed), and
+/// its draft if one came. The line says why when none did.
+pub(super) fn draft_answer(result: &Result<String, String>, before: Option<&Drafted>) -> (String, Option<Drafted>) {
+    let out = match result {
+        Ok(out) => out,
+        Err(e) => return (format!("The draft didn't come: {}.", e.trim().trim_end_matches('.')), None),
+    };
+    match serde_json::from_str::<Value>(out).ok().as_ref().and_then(draft_from) {
+        Some(d) => (draft_said(&d, before), Some(d)),
+        None => (NO_DRAFT.to_string(), None),
+    }
+}
+
+/// The tower answered, but with no draft.
+const NO_DRAFT: &str = "The tower answered no draft. Try again, or name the repos in the first line.";
+
+/// What the tower says of a goal whose first line names its repos (`d`, its dry run).
+fn first_line_said(d: &Dry) -> String {
+    format!("Its first line names the repos, so there is no draft: {}. Launch opens exactly that.", d.lines.join("; ").trim_end_matches('.'))
+}
+
+/// A line the tower said in the draft `id`, kept in `file`: an answer
+/// that came after the window that asked had closed (and, with
+/// `drafted`, the brain's draft of `ticket`).
+fn told_on_disk(file: &std::path::Path, id: &str, said: &[(&str, &str)], drafted: Option<(String, &Drafted)>) {
+    space_drafts::update_at(file, |b| {
+        let Some(k) = b.get_mut(id) else { return };
+        let at = history::now_ms();
+        k.story.extend(said.iter().filter(|(_, t)| !t.trim().is_empty()).map(|(who, text)| Told { who: who.to_string(), text: text.trim().to_string(), at }));
+        if let Some((of, d)) = drafted {
+            k.drafted = Some(Drafting { of, raw: d.raw.clone() });
+        }
+        k.updated_ms = at;
+    });
+}
+
 /// What is different on the card from `b` to `d`, a phrase each.
 fn changed(b: &Drafted, d: &Drafted) -> Vec<String> {
     let mut out = vec![];
@@ -497,17 +546,49 @@ pub(super) fn story_with(story: &[Told], plan: Option<&PlanView>) -> Vec<Told> {
 
 /// `HERDER_TOWER_ORB_TALK=<file>` (looking at it with test data): what to
 /// say in New space's conversation, a line each, one after another once
-/// the tower is on none (`!launch` presses Launch; `!wait <s>` waits).
+/// the tower is on none (`!launch` presses Launch; `!wait <s>` waits;
+/// `!new` starts another draft; `!open <n>`, `!delete <n>` the n-th in the
+/// list, from 1; `!reopen [<s>]` closes the window and opens it again).
 fn talk_from_start() -> std::collections::VecDeque<String> {
     let Some(path) = std::env::var("HERDER_TOWER_ORB_TALK").ok().filter(|p| !p.trim().is_empty()) else { return Default::default() };
     std::fs::read_to_string(path.trim()).unwrap_or_default().lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
 }
 
-/// The launcher's state.
+/// Its lines still to be said, once for the whole run: a window opened
+/// again goes on where the last one was (`!reopen`).
+fn talk_lines() -> &'static std::sync::Mutex<std::collections::VecDeque<String>> {
+    static LINES: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<String>>> = std::sync::OnceLock::new();
+    LINES.get_or_init(|| std::sync::Mutex::new(talk_from_start()))
+}
+
+/// How many lines it has still to say.
+fn talk_left() -> usize {
+    talk_lines().lock().map(|l| l.len()).unwrap_or(0)
+}
+
+/// The launcher's state: the new space in draft that is open in it, and
+/// every other one kept (`crate::space_drafts`).
 pub(super) struct LaunchUi {
     /// The ticket, as the conversation has said it. It is not drawn: the
     /// conversation shows it, and what changes it is said there.
-    goal: Entity<TextareaState>,
+    goal: String,
+    /// Which new space in draft is open here, and when it was started.
+    id: String,
+    created_ms: u64,
+    /// Every new space in draft, as last kept: the open one is among them
+    /// once something was said in it; the others wait to be opened again.
+    book: space_drafts::Book,
+    /// Where the book is kept, and what was last written there (it is
+    /// written again only when it changed).
+    book_file: std::path::PathBuf,
+    written: String,
+    /// When the file was as `written` says (another writer since: an
+    /// answer that came after an earlier window closed).
+    seen_at: Option<std::time::SystemTime>,
+    /// A draft whose Delete waits for the user's word.
+    deleting: Option<String>,
+    /// The space the tower said a first line that names its repos makes.
+    named: Option<String>,
     /// The saved projects; `None` until the tower was asked.
     setups: Option<Vec<Setup>>,
     /// The project chosen. With drafts: none until one is (the brain picks);
@@ -525,9 +606,7 @@ pub(super) struct LaunchUi {
     /// plan's own thread (`story`). Launch hands it all to the new space
     /// (`--story-file`); Start over drops it.
     pub story: Vec<Told>,
-    /// `HERDER_TOWER_ORB_TALK`: what is still to be said in the conversation, a line each.
-    talk_hook: std::collections::VecDeque<String>,
-    /// The hook waits until then before its next line.
+    /// `HERDER_TOWER_ORB_TALK` (its lines are `talk_lines`): it waits until then before its next line.
     talk_at: Option<std::time::Instant>,
     /// What the tower said it will do, and for which goal and setup it said so.
     dry: Option<((String, Option<String>), Dry)>,
@@ -540,36 +619,171 @@ pub(super) struct LaunchUi {
     /// "Review its PRs": each PR its sessions open gets a reviewer
     /// (`--review`, on by default; off is `--no-review`).
     review: bool,
-    _subs: Vec<Subscription>,
 }
 
 impl LaunchUi {
-    pub(super) fn new(window: &mut Window, cx: &mut Context<Panel>) -> Self {
-        let goal = cx.new(|cx| TextareaState::new(window, cx));
-        let subs = vec![cx.subscribe_in(&goal, window, |this, _, ev: &InputEvent, _, cx| {
-            if matches!(ev, InputEvent::Change) {
-                this.ask_plan(cx);
-                cx.notify();
-            }
-        })];
-        let talk_hook = talk_from_start();
-        Self {
-            goal,
+    /// The launcher on the drafts kept in `<data>/new-spaces.json`, open on
+    /// the one that was open last (else a new one).
+    pub(super) fn new() -> Self {
+        Self::at(space_drafts::path())
+    }
+
+    /// The same, on the drafts kept in `file`.
+    pub(super) fn at(file: std::path::PathBuf) -> Self {
+        let book = space_drafts::load_from(&file);
+        let written = space_drafts::to_text(&book);
+        let mut ui = Self {
+            goal: String::new(),
+            id: String::new(),
+            created_ms: 0,
+            seen_at: space_drafts::written_at(&file),
+            book_file: file,
+            written,
+            deleting: None,
+            named: None,
             setups: None,
             picked: None,
             dry_known: None,
             draft_known: None,
             story_known: false,
             story: vec![],
-            talk_at: (!talk_hook.is_empty()).then(|| std::time::Instant::now() + Duration::from_secs(3)),
-            talk_hook,
+            talk_at: (talk_left() > 0).then(|| std::time::Instant::now() + Duration::from_secs(3)),
             dry: None,
             draft: None,
             plan_hook: None,
             dry_wait: None,
             review: true,
-            _subs: subs,
+            book: space_drafts::Book::default(),
+        };
+        let open = book.opened().cloned().unwrap_or_else(|| SpaceDraft::fresh(history::now_ms()));
+        ui.book = book;
+        ui.load(&open);
+        ui
+    }
+
+    /// The ticket of the open draft.
+    fn ticket(&self) -> String {
+        self.goal.trim().to_string()
+    }
+
+    /// `d` is the open draft now: its ticket, conversation, brain's draft,
+    /// project and switch (what the tower said it would do is asked again).
+    fn load(&mut self, d: &SpaceDraft) {
+        self.id = d.id.clone();
+        self.created_ms = d.created_ms;
+        self.goal = d.ticket.clone();
+        self.story = d.story.clone();
+        self.draft = d.drafted.as_ref().and_then(|x| draft_from(&x.raw).map(|dd| (x.of.clone(), dd)));
+        self.picked = d.picked.clone();
+        self.review = d.review;
+        self.named = d.named.clone();
+        self.dry = None;
+        self.dry_wait = None;
+        self.deleting = None;
+        self.book.open = Some(d.id.clone());
+    }
+
+    /// The open draft as it stands.
+    fn snapshot(&self) -> SpaceDraft {
+        SpaceDraft {
+            id: self.id.clone(),
+            ticket: self.ticket(),
+            story: self.story.clone(),
+            drafted: self.draft.as_ref().map(|(of, d)| Drafting { of: of.clone(), raw: d.raw.clone() }),
+            picked: self.picked.clone(),
+            review: self.review,
+            named: self.named.clone(),
+            created_ms: self.created_ms,
+            updated_ms: 0,
         }
+    }
+
+    /// The open draft goes into the book as it stands, and the book to its
+    /// file when it changed (what another wrote there since is taken first:
+    /// `take_there`).
+    fn keep(&mut self) {
+        if self.changed_there() {
+            self.take_there();
+        }
+        let now = self.snapshot();
+        self.book.put(&now, history::now_ms());
+        self.book.open = Some(self.id.clone());
+        let text = space_drafts::to_text(&self.book);
+        if text != self.written {
+            self.write(text);
+        }
+    }
+
+    fn write(&mut self, text: String) {
+        match space_drafts::write_to(&self.book_file, &text) {
+            Ok(()) => {
+                self.written = text;
+                self.seen_at = space_drafts::written_at(&self.book_file);
+            }
+            Err(e) => eprintln!("[orb] couldn't keep the new-space drafts in {}: {e}", self.book_file.display()),
+        }
+    }
+
+    /// The file was written by another since this one last looked.
+    fn changed_there(&self) -> bool {
+        space_drafts::written_at(&self.book_file) != self.seen_at
+    }
+
+    /// What is in the file now is the book (an answer written there after
+    /// the window that asked had closed). The open draft is the file's if
+    /// it changed there since this window last kept it, else it stays as it
+    /// is here; gone from the file (launched), the one changed last opens.
+    fn take_there(&mut self) {
+        self.seen_at = space_drafts::written_at(&self.book_file);
+        let Ok(text) = std::fs::read_to_string(&self.book_file) else {
+            // Gone: this window's book is written again.
+            self.written.clear();
+            return;
+        };
+        if text == self.written {
+            return;
+        }
+        let Ok(there) = serde_json::from_str::<space_drafts::Book>(&text) else {
+            // It doesn't read: it is kept aside, and this window's book written again.
+            let _ = space_drafts::load_from(&self.book_file);
+            (self.written, self.seen_at) = (String::new(), None);
+            return;
+        };
+        let kept_here = self.book.get(&self.id).cloned();
+        let open_there = there.get(&self.id).cloned();
+        self.book = space_drafts::Book { drafts: there.drafts, open: Some(self.id.clone()) };
+        self.written = text;
+        match (open_there, kept_here) {
+            (Some(d), Some(k)) if !d.same(&k) => self.load(&d),
+            (Some(d), None) => self.load(&d),
+            (None, Some(_)) => {
+                let next = self.book.next_after(&self.id).cloned().unwrap_or_else(|| SpaceDraft::fresh(history::now_ms()));
+                self.load(&next);
+            }
+            _ => {}
+        }
+    }
+
+    /// The drafts as the list above the launcher shows them, oldest first:
+    /// the open one as it stands (one with nothing in it yet, last, while
+    /// there are others).
+    fn listed(&self) -> Vec<SpaceDraft> {
+        let open = self.snapshot();
+        let mut list: Vec<SpaceDraft> = self.book.drafts.iter().map(|d| if d.id == self.id { open.clone() } else { d.clone() }).filter(|d| !d.is_empty()).collect();
+        if !list.iter().any(|d| d.id == self.id) && (!list.is_empty() || !open.is_empty()) {
+            list.push(open);
+        }
+        list
+    }
+
+    /// How many new spaces are in draft (the open one once something was said in it).
+    pub(super) fn drafts_kept(&self) -> usize {
+        self.listed().iter().filter(|d| !d.is_empty()).count()
+    }
+
+    /// Where a command of the open draft runs (`draft`, `launch`): one at a time for each draft.
+    fn place(&self, what: &str) -> String {
+        format!("{what}:{}", self.id)
     }
 
     /// The saved projects, once the tower was asked.
@@ -580,9 +794,14 @@ impl LaunchUi {
     /// The project that is chosen, of those there are: with drafts, only one
     /// that was picked; without, the first until another is.
     fn setup(&self) -> Option<&Setup> {
+        self.setup_named(self.picked.as_deref())
+    }
+
+    /// The same for a draft whose project is `picked`.
+    fn setup_named(&self, picked: Option<&str>) -> Option<&Setup> {
         let list = self.setups.as_ref()?;
-        let picked = self.picked.as_ref().and_then(|p| list.iter().find(|s| &s.name == p));
-        if self.drafts() { picked } else { picked.or(list.first()) }
+        let found = picked.and_then(|p| list.iter().find(|s| s.name == p));
+        if self.drafts() { found } else { found.or(list.first()) }
     }
 
     /// A ticket that names no repo is drafted first (this tower's `launch` has `--draft`).
@@ -654,24 +873,139 @@ impl Panel {
     }
 
     /// `goal` is the launcher's ticket, said in its conversation (the plan
-    /// follows, as when it is said there).
+    /// follows, as when it is said there): a new draft's, if the open one
+    /// has something in it already.
     pub(super) fn launch_with(&mut self, goal: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(full) = self.full.as_ref() {
-            let (field, goal) = (full.launch.goal.clone(), goal.to_string());
-            field.update(cx, |s, cx| s.set_value(goal, window, cx));
+        if self.full.as_ref().is_some_and(|f| !f.launch.snapshot().is_empty()) {
+            self.new_draft(window, cx);
+        }
+        if let Some(full) = self.full.as_mut() {
+            full.launch.goal = goal.to_string();
         }
         self.tell("you", goal);
-        self.draft_hook(cx);
+        self.draft_hook();
+        self.keep_drafts();
+    }
+
+    /// The open draft goes into the book as it stands (and the book to its file, when it changed).
+    pub(super) fn keep_drafts(&mut self) {
+        if let Some(full) = self.full.as_mut() {
+            full.launch.keep();
+        }
+    }
+
+    /// Each second: what was written in the drafts' file by another (an
+    /// answer that came after an earlier window closed) is taken.
+    pub(super) fn drafts_tick(&mut self, cx: &mut Context<Self>) {
+        let Some(full) = self.full.as_mut() else { return };
+        let there = full.launch.changed_there();
+        full.launch.keep();
+        if there {
+            cx.notify();
+        }
+    }
+
+    /// The new space in draft `id` opens in the launcher; the one that was
+    /// open waits in the list, as it stands.
+    pub(super) fn open_draft(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.keep_drafts();
+        let Some(full) = self.full.as_mut() else { return };
+        if full.launch.id == id {
+            return;
+        }
+        let Some(d) = full.launch.book.get(id).cloned() else { return };
+        full.launch.load(&d);
+        self.opened_draft(window, cx);
+    }
+
+    /// Another new space, from nothing: the one open waits in the list, as it stands.
+    pub(super) fn new_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.keep_drafts();
+        let Some(full) = self.full.as_mut() else { return };
+        full.launch.load(&SpaceDraft::fresh(history::now_ms()));
+        self.opened_draft(window, cx);
+    }
+
+    /// The new space in draft `id` goes: its ticket and conversation, and a
+    /// plan of it (its planner ends). Nothing of it was opened. The open
+    /// one gone, the one changed last of the others opens (else a new one).
+    pub(super) fn delete_draft(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.keep_drafts();
+        let Some(full) = self.full.as_ref() else { return };
+        let open = full.launch.id == id;
+        let ticket = if open { full.launch.ticket() } else { full.launch.book.get(id).map(|d| d.ticket.trim().to_string()).unwrap_or_default() };
+        if !ticket.is_empty()
+            && let Some(p) = self.plan_for(&ticket, cx)
+        {
+            self.plan_close(&p.id, cx);
+        }
+        let Some(full) = self.full.as_mut() else { return };
+        full.launch.book.remove(id);
+        full.launch.deleting = None;
+        for what in ["draft", "launch"] {
+            full.notes.remove(&format!("{what}:{id}"));
+        }
+        if open {
+            let next = full.launch.book.next_after(id).cloned().unwrap_or_else(|| SpaceDraft::fresh(history::now_ms()));
+            full.launch.load(&next);
+            self.opened_draft(window, cx);
+        } else {
+            self.keep_drafts();
+            cx.notify();
+        }
+    }
+
+    /// After another draft opened: its conversation from its end, what the
+    /// tower will do asked again, the input ready for it, and the book kept.
+    fn opened_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(full) = self.full.as_mut() {
+            full.chat_seen = None;
+            full.notes.remove("plan");
+        }
+        self.keep_drafts();
+        self.ask_plan(cx);
+        self.text.update(cx, |s, cx| s.focus(window, cx));
+        cx.notify();
+    }
+
+    /// `who` said `text` in the draft `id` (the open one, or one in the
+    /// list: an answer that comes after the user moved on to another).
+    /// Nothing, for a draft that is gone.
+    fn tell_in(&mut self, id: &str, who: &str, text: &str, _cx: &mut Context<Self>) {
+        let Some(full) = self.full.as_mut() else { return };
+        if text.trim().is_empty() {
+            return;
+        }
+        let told = Told { who: who.into(), text: text.trim().to_string(), at: history::now_ms() };
+        if full.launch.id == id {
+            full.launch.story.push(told);
+        } else if let Some(d) = full.launch.book.get_mut(id) {
+            d.updated_ms = told.at;
+            d.story.push(told);
+        }
+        self.keep_drafts();
+    }
+
+    /// The brain's draft `d` of `ticket` is the draft `id`'s (the open one, or one in the list).
+    fn drafted_in(&mut self, id: &str, ticket: String, d: Drafted, _cx: &mut Context<Self>) {
+        let Some(full) = self.full.as_mut() else { return };
+        if full.launch.id == id {
+            full.launch.draft = Some((ticket, d));
+        } else if let Some(k) = full.launch.book.get_mut(id) {
+            k.drafted = Some(Drafting { of: ticket, raw: d.raw });
+            k.updated_ms = history::now_ms();
+        }
+        self.keep_drafts();
     }
 
     /// `HERDER_TOWER_ORB_DRAFT` (see the top): the launcher as it is while
     /// a ticket is drafted, or with a draft, to look at it with test data.
-    fn draft_hook(&mut self, cx: &mut Context<Self>) {
+    fn draft_hook(&mut self) {
         // `HERDER_TOWER_ORB_PLAN`: the open plan, of the ticket the window opened on.
         if let Some(path) = std::env::var("HERDER_TOWER_ORB_PLAN").ok().filter(|p| !p.trim().is_empty())
             && let Some(full) = self.full.as_mut()
         {
-            let ticket = full.launch.goal.read(cx).value().trim().to_string();
+            let ticket = full.launch.ticket();
             let text = std::fs::read_to_string(path.trim()).unwrap_or_default();
             match serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| model::plan(&serde_json::json!({ "plan": v }))) {
                 Some(mut p) => {
@@ -686,12 +1020,13 @@ impl Panel {
         }
         let Some(hook) = draft_from_start() else { return };
         let Some(full) = self.full.as_mut() else { return };
-        let ticket = full.launch.goal.read(cx).value().trim().to_string();
+        let ticket = full.launch.ticket();
         full.launch.draft_known = Some(true);
         match hook.as_str() {
             "ready" => {}
             "reading" => {
-                full.busy.insert("draft".into());
+                let place = full.launch.place("draft");
+                full.busy.insert(place);
             }
             path => match std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).as_ref().and_then(draft_from) {
                 Some(d) => full.launch.draft = Some((ticket, d)),
@@ -707,7 +1042,7 @@ impl Panel {
         if full.launch.dry_known != Some(true) {
             return;
         }
-        let goal = full.launch.goal.read(cx).value().trim().to_string();
+        let goal = full.launch.ticket();
         let key = (goal.clone(), full.launch.dry_setup());
         if goal.is_empty() || full.launch.dry.as_ref().is_some_and(|(k, _)| *k == key) {
             return;
@@ -736,7 +1071,7 @@ impl Panel {
     /// Launch: the space is made, and its view opens with what the tower said.
     fn launch(&mut self, missions: &Missions, cx: &mut Context<Self>) {
         let Some(full) = self.full.as_ref() else { return };
-        let goal = full.launch.goal.read(cx).value().trim().to_string();
+        let goal = full.launch.ticket();
         if goal.is_empty() {
             return;
         }
@@ -756,7 +1091,7 @@ impl Panel {
     /// Launch, on the draft as its card shows it: exactly that.
     fn launch_draft(&mut self, missions: &Missions, cx: &mut Context<Self>) {
         let Some(full) = self.full.as_ref() else { return };
-        let ticket = full.launch.goal.read(cx).value().trim().to_string();
+        let ticket = full.launch.ticket();
         // Planned: the plan's own draft (the planner may have revised it), and the plan with it.
         let any = self.plan_for(&ticket, cx);
         let plan = any.clone().filter(|p| p.status != "failed");
@@ -791,7 +1126,7 @@ impl Panel {
     /// card (another plan that is open ends).
     fn plan_new(&mut self, form: &'static str, cx: &mut Context<Self>) {
         let Some(full) = self.full.as_ref() else { return };
-        let ticket = full.launch.goal.read(cx).value().trim().to_string();
+        let ticket = full.launch.ticket();
         let local = full.launch.draft_of(&ticket).cloned();
         let d = match self.plan_for(&ticket, cx).and_then(|p| draft_from(&p.draft)).or(local) {
             Some(d) => d,
@@ -808,11 +1143,12 @@ impl Panel {
         }
         let args = plan_args(form, &d, &file.to_string_lossy());
         self.tell("you", &format!("Plan it first, as a {}.", if form == "whiteboard" { "whiteboard" } else { "page" }));
-        self.run("plan", args, cx, move |this, result, _| {
+        let id = self.full.as_ref().map(|f| f.launch.id.clone()).unwrap_or_default();
+        self.run("plan", args, cx, move |this, result, cx| {
             let _ = std::fs::remove_file(&file);
             match result {
-                Ok(_) => this.tell("tower", "The planner is on it: it reads the repos and the draft, writes the plan and publishes it on your claude.ai account, private (about five minutes). Nothing opens."),
-                Err(e) => this.tell("tower", &format!("The planner didn't start: {}.", e.trim().trim_end_matches('.'))),
+                Ok(_) => this.tell_in(&id, "tower", "The planner is on it: it reads the repos and the draft, writes the plan and publishes it on your claude.ai account, private (about five minutes). Nothing opens.", cx),
+                Err(e) => this.tell_in(&id, "tower", &format!("The planner didn't start: {}.", e.trim().trim_end_matches('.')), cx),
             }
         });
     }
@@ -842,14 +1178,15 @@ impl Panel {
         if words.is_empty() {
             return Err(String::new());
         }
-        if self.running("launch") {
+        let Some(full) = self.full.as_ref() else { return Err(String::new()) };
+        if self.running(&full.launch.place("launch")) {
             return Err("It is launching: say it in the new space.".into());
         }
-        if self.running("draft") {
+        if self.running(&full.launch.place("draft")) {
             return Err("The tower's brain is still on the last one: say it once its answer is here.".into());
         }
         let Some(full) = self.full.as_ref() else { return Err(String::new()) };
-        let ticket = full.launch.goal.read(cx).value().trim().to_string();
+        let ticket = full.launch.ticket();
         if let Some(p) = self.plan_for(&ticket, cx).filter(|p| p.status != "failed" && p.address.is_some()) {
             if self.running("plan-say") {
                 return Err("Still handing your last words to the planner.".into());
@@ -866,8 +1203,11 @@ impl Panel {
         }
         // No draft yet: the ticket, or more of it.
         let goal = if ticket.is_empty() { words.to_string() } else { format!("{ticket}\n\n{words}") };
-        let (field, drafts, dry) = (ui.goal.clone(), ui.drafts(), ui.dry_known == Some(true));
-        field.update(cx, |s, cx| s.set_value(goal.clone(), window, cx));
+        let (drafts, dry) = (ui.drafts(), ui.dry_known == Some(true));
+        if let Some(full) = self.full.as_mut() {
+            full.launch.goal = goal.clone();
+        }
+        let _ = window;
         match (drafts, dry) {
             (true, true) => self.dry_then_draft(goal, cx),
             (true, false) => self.draft(None, cx),
@@ -883,20 +1223,48 @@ impl Panel {
     /// is launched as it says (the tower says what that will open), any
     /// other is drafted.
     fn dry_then_draft(&mut self, goal: String, cx: &mut Context<Self>) {
+        let Some(full) = self.full.as_ref() else { return };
+        let (id, place, file) = (full.launch.id.clone(), full.launch.place("draft"), full.launch.book_file.clone());
         let args = vec!["launch".to_string(), goal.clone(), "--dry-run".into(), "--json".into()];
-        self.run("draft", args, cx, move |this, result, cx| {
+        let dry_of = |result: &Result<String, String>| {
             let dry = result.as_ref().ok().and_then(|out| serde_json::from_str::<Value>(out).ok()).as_ref().and_then(plan_from);
-            match dry.filter(|d| d.first_line && d.error.is_none()) {
-                Some(d) => {
-                    this.tell("you", &goal);
-                    this.tell("tower", &format!("Its first line names the repos, so there is no draft: {}. Launch opens exactly that.", d.lines.join("; ").trim_end_matches('.')));
-                    if let Some(full) = this.full.as_mut() {
-                        full.launch.dry = Some(((goal, None), d));
-                    }
+            dry.filter(|d| d.first_line && d.error.is_none())
+        };
+        // The window closed first: what was said is kept (a ticket to draft waits for Draft the space).
+        let gone = {
+            let (id, goal) = (id.clone(), goal.clone());
+            move |result: &Result<String, String>| {
+                let dry = dry_of(result);
+                let line = dry.as_ref().map(first_line_said).unwrap_or_default();
+                told_on_disk(&file, &id, &[("you", &goal), ("tower", &line)], None);
+                if let Some(d) = dry.filter(|d| !d.space.is_empty()) {
+                    space_drafts::update_at(&file, |b| {
+                        if let Some(k) = b.get_mut(&id) {
+                            k.named = Some(d.space);
+                        }
+                    });
                 }
-                None => this.draft(None, cx),
             }
-        });
+        };
+        // (Its answer is the draft's that asked, wherever the user is by then.)
+        let then = move |this: &mut Self, result: &Result<String, String>, cx: &mut Context<Self>| match dry_of(result) {
+            Some(d) => {
+                this.tell_in(&id, "you", &goal, cx);
+                this.tell_in(&id, "tower", &first_line_said(&d), cx);
+                let named = Some(d.space.clone()).filter(|n| !n.is_empty());
+                if let Some(full) = this.full.as_mut() {
+                    if full.launch.id == id {
+                        full.launch.named = named;
+                        full.launch.dry = Some(((goal, None), d));
+                    } else if let Some(k) = full.launch.book.get_mut(&id) {
+                        k.named = named;
+                    }
+                    full.launch.keep();
+                }
+            }
+            None => this.draft_in(id, goal, None, cx),
+        };
+        self.run_or(&place, args, cx, then, gone);
     }
 
     /// The plan ends, and its planner.
@@ -911,16 +1279,26 @@ impl Panel {
 
     /// Back to the plan that is open: its ticket is the launcher's (said
     /// first in the conversation, the plan's thread after it), its draft on the card.
+    /// The draft of that ticket opens if it is kept; else a new one is made of the plan.
     fn plan_back(&mut self, p: &PlanView, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(full) = self.full.as_mut() else { return };
         let ticket = p.ticket.trim().to_string();
-        if let Some(d) = draft_from(&p.draft) {
-            full.launch.draft = Some((ticket.clone(), d));
+        let kept = self.full.as_ref().and_then(|f| f.launch.book.drafts.iter().find(|d| d.ticket.trim() == ticket).map(|d| d.id.clone()));
+        match kept {
+            Some(id) => self.open_draft(&id, window, cx),
+            None => {
+                self.new_draft(window, cx);
+                let Some(full) = self.full.as_mut() else { return };
+                if let Some(d) = draft_from(&p.draft) {
+                    full.launch.draft = Some((ticket.clone(), d));
+                }
+                full.launch.story = vec![Told { who: "you".into(), text: ticket.clone(), at: p.created_ms }];
+                full.launch.goal = ticket;
+            }
         }
-        full.launch.draft_known = Some(true);
-        full.launch.story = vec![Told { who: "you".into(), text: ticket.clone(), at: p.created_ms }];
-        let goal = full.launch.goal.clone();
-        goal.update(cx, |s, cx| s.set_value(ticket, window, cx));
+        if let Some(full) = self.full.as_mut() {
+            full.launch.draft_known = Some(true);
+        }
+        self.keep_drafts();
         cx.notify();
     }
 
@@ -938,13 +1316,31 @@ impl Panel {
         if handed {
             args.extend(["--story-file".to_string(), file.to_string_lossy().into_owned()]);
         }
-        self.run("launch", args, cx, move |this, result, cx| {
+        let Some(full) = self.full.as_ref() else { return };
+        let (id, place, book) = (full.launch.id.clone(), full.launch.place("launch"), full.launch.book_file.clone());
+        // The window closed before the launch was done: launched, its draft
+        // leaves the list all the same (it is not launched twice); not, it says why.
+        let gone = {
+            let (id, story_file) = (id.clone(), file.clone());
+            move |result: &Result<String, String>| {
+                if handed {
+                    let _ = std::fs::remove_file(&story_file);
+                }
+                match result {
+                    Ok(_) => space_drafts::update_at(&book, |b| {
+                        b.remove(&id);
+                    }),
+                    Err(e) => told_on_disk(&book, &id, &[("tower", &format!("The launch didn't go: {}.", e.trim().trim_end_matches('.')))], None),
+                }
+            }
+        };
+        self.run_or(&place, args, cx, move |this, result, cx| {
             if handed {
                 let _ = std::fs::remove_file(&file);
             }
             let out = match result {
                 Ok(out) => out,
-                Err(e) => return this.tell("tower", &format!("The launch didn't go: {}.", e.trim().trim_end_matches('.'))),
+                Err(e) => return this.tell_in(&id, "tower", &format!("The launch didn't go: {}.", e.trim().trim_end_matches('.')), cx),
             };
             // Its receipt names the space and says what was opened.
             let receipt: Value = serde_json::from_str(out).unwrap_or_default();
@@ -954,9 +1350,12 @@ impl Panel {
                 if said.is_empty() { format!("Launched {space}. Nothing was asked. Change the goal from here.") } else { said }
             });
             if let Some(full) = this.full.as_mut() {
-                (full.launch.dry, full.launch.draft) = (None, None);
-                // It is the new space's now.
-                full.launch.story.clear();
+                // It is the new space's now (its conversation too): its draft leaves the list.
+                full.launch.book.remove(&id);
+                if full.launch.id == id {
+                    full.launch.load(&SpaceDraft::fresh(history::now_ms()));
+                }
+                full.launch.keep();
             }
             // What it opened is an act the tower keeps: Undo shows with what it said, as with a reply.
             let act = receipt["act"].as_str().map(String::from);
@@ -965,51 +1364,69 @@ impl Panel {
                 t.nav.receipt_of(act);
                 cx.notify();
             });
-        });
+        }, gone);
     }
 
     /// "Draft the space" (and Redraft, with the user's words): the tower's
-    /// brain reads the ticket; its draft takes the card's place.
+    /// brain reads the open draft's ticket; its draft takes the card's place.
     fn draft(&mut self, adjust: Option<String>, cx: &mut Context<Self>) {
         let Some(full) = self.full.as_ref() else { return };
-        let ticket = full.launch.goal.read(cx).value().trim().to_string();
+        let (id, ticket) = (full.launch.id.clone(), full.launch.ticket());
+        self.draft_in(id, ticket, adjust, cx);
+    }
+
+    /// The same for the draft `id` (the open one, or one in the list), of
+    /// `ticket`: the brain's answer is that draft's, wherever the user is by then.
+    fn draft_in(&mut self, id: String, ticket: String, adjust: Option<String>, cx: &mut Context<Self>) {
+        let Some(full) = self.full.as_ref() else { return };
         if ticket.is_empty() {
             return;
         }
+        let ui = &full.launch;
+        // Its latest draft, conversation and project, wherever it is.
+        let (latest, story, project) = if ui.id == id {
+            (ui.draft.clone(), &ui.story, ui.setup().map(|s| s.name.clone()))
+        } else {
+            let Some(k) = ui.book.get(&id) else { return };
+            (k.drafted.as_ref().and_then(|x| draft_from(&x.raw).map(|d| (x.of.clone(), d))), &k.story, ui.setup_named(k.picked.as_deref()).map(|s| s.name.clone()))
+        };
         // A change is to the latest draft (of this ticket, or of it before it was changed).
         let before = match &adjust {
-            Some(_) => full.launch.draft.as_ref().map(|(_, d)| d.clone()),
-            None => full.launch.draft_of(&ticket).cloned(),
+            Some(_) => latest.map(|(_, d)| d),
+            None => latest.filter(|(t, _)| *t == ticket).map(|(_, d)| d),
         };
-        let project = full.launch.setup().map(|s| s.name.clone());
         let args = draft_args(&ticket, project.as_deref(), adjust.as_deref().zip(before.as_ref()));
         // The conversation: what you said (the ticket once, or what to change).
         let said = adjust.clone().unwrap_or_else(|| ticket.clone());
-        let again = full.launch.story.iter().rev().find(|t| t.who == "you").is_some_and(|t| adjust.is_none() && t.text == ticket);
+        let again = story.iter().rev().find(|t| t.who == "you").is_some_and(|t| adjust.is_none() && t.text == ticket);
+        let (place, file) = (format!("draft:{id}"), full.launch.book_file.clone());
         if !again {
-            self.tell("you", &said);
+            self.tell_in(&id, "you", &said, cx);
         }
-        self.run("draft", args, cx, move |this, result, _| {
-            let out = match result {
-                Ok(out) => out,
-                Err(e) => return this.tell("tower", &format!("The draft didn't come: {}.", e.trim().trim_end_matches('.'))),
-            };
-            match serde_json::from_str::<Value>(out).ok().as_ref().and_then(draft_from) {
-                Some(d) => {
-                    this.tell("tower", &draft_said(&d, before.as_ref().filter(|_| adjust.is_some())));
-                    if let Some(full) = this.full.as_mut() {
-                        full.launch.draft = Some((ticket, d));
-                    }
-                }
-                None => {
-                    let why = "The tower answered no draft. Try again, or name the repos in the first line.";
-                    this.tell("tower", why);
-                    if let Some(full) = this.full.as_mut() {
-                        full.notes.insert("draft".into(), (false, why.into()));
-                    }
-                }
+        let before = before.filter(|_| adjust.is_some());
+        let at = place.clone();
+        // The window closed before the brain answered: its answer is kept with the draft all the same.
+        let gone = {
+            let (id, ticket, before) = (id.clone(), ticket.clone(), before.clone());
+            move |result: &Result<String, String>| {
+                let (said, d) = draft_answer(result, before.as_ref());
+                told_on_disk(&file, &id, &[("tower", &said)], d.as_ref().map(|d| (ticket, d)));
             }
-        });
+        };
+        let then = move |this: &mut Self, result: &Result<String, String>, cx: &mut Context<Self>| {
+            let (said, d) = draft_answer(result, before.as_ref());
+            this.tell_in(&id, "tower", &said, cx);
+            match d {
+                Some(d) => this.drafted_in(&id, ticket, d, cx),
+                None if result.is_ok() => {
+                    if let Some(full) = this.full.as_mut() {
+                        full.notes.insert(place.clone(), (false, NO_DRAFT.into()));
+                    }
+                }
+                None => {}
+            }
+        };
+        self.run_or(&at, args, cx, then, gone);
     }
 
     /// Start over: the draft, its conversation and the ticket are dropped
@@ -1018,7 +1435,7 @@ impl Panel {
     fn start_over(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A plan of it ends, and its planner.
         if let Some(full) = self.full.as_ref() {
-            let ticket = full.launch.goal.read(cx).value().trim().to_string();
+            let ticket = full.launch.ticket();
             if let Some(p) = self.plan_for(&ticket, cx) {
                 self.plan_close(&p.id, cx);
             }
@@ -1028,9 +1445,13 @@ impl Panel {
         // Its conversation goes with it: a new one starts with the next draft.
         full.launch.story.clear();
         full.notes.remove("plan");
-        full.notes.remove("draft");
-        let goal = full.launch.goal.clone();
-        goal.update(cx, |s, cx| s.set_value("", window, cx));
+        let place = full.launch.place("draft");
+        full.notes.remove(&place);
+        full.launch.goal.clear();
+        full.launch.named = None;
+        full.launch.deleting = None;
+        // Nothing is left in it: it leaves the list.
+        self.keep_drafts();
         self.text.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
     }
@@ -1248,15 +1669,114 @@ impl Panel {
             .into_any_element()
     }
 
+    /// The new spaces in draft, above the launcher: each by its name, the
+    /// open one lit, what is under way for one beside it. A click opens
+    /// another (this one waits, as it is); its × deletes it, once asked
+    /// again; + New draft starts another. None while there is only one
+    /// with nothing in it.
+    fn drafts_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let g = glass();
+        let full = self.full.as_ref()?;
+        let ui = &full.launch;
+        let list = ui.listed();
+        if list.is_empty() {
+            return None;
+        }
+        let kept = list.iter().filter(|d| !d.is_empty()).count();
+        let chips = list.iter().enumerate().map(|(i, d)| {
+            let on = d.id == ui.id;
+            let doing = if full.busy.contains(&format!("launch:{}", d.id)) {
+                Some("launching…")
+            } else if full.busy.contains(&format!("draft:{}", d.id)) {
+                Some("reading…")
+            } else {
+                None
+            };
+            let (open, gone) = (d.id.clone(), d.id.clone());
+            h_flex()
+                .flex_none()
+                .gap(px(2.0))
+                .items_center()
+                .rounded_full()
+                .border_1()
+                .text_size(px(12.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .when(on, |el| el.bg(rgb(PALE)).border_color(rgb(PALE)).text_color(rgb(NAVY)))
+                .when(!on, |el| el.border_color(rgba(LINE)).text_color(g.muted))
+                .child(
+                    h_flex()
+                        .id(SharedString::from(format!("draft-{i}")))
+                        .gap(px(6.0))
+                        .items_center()
+                        .pl(px(12.0))
+                        .pr(px(if d.is_empty() { 12.0 } else { 2.0 }))
+                        .py(px(5.0))
+                        .when(!on, |el| el.cursor_pointer().on_click(cx.listener(move |this, _, window, cx| this.open_draft(&open, window, cx))))
+                        .child(d.title())
+                        .children(doing.map(|w| div().font_weight(FontWeight::NORMAL).opacity(0.75).child(w))),
+                )
+                .when(!d.is_empty(), |el| {
+                    el.child(
+                        div().pr(px(4.0)).child(dismiss_mark(SharedString::from(format!("draft-del-{i}"))).when(on, |m| m.text_color(rgb(NAVY))).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                if let Some(full) = this.full.as_mut() {
+                                    full.launch.deleting = Some(gone.clone());
+                                }
+                                cx.notify();
+                            },
+                        ))),
+                    )
+                })
+        });
+        let another = (!ui.snapshot().is_empty()).then(|| tg("draft-new", "+ New draft", false).on_click(cx.listener(|this, _, window, cx| this.new_draft(window, cx))));
+        // Delete, once asked again: what goes with it.
+        let asking = ui.deleting.as_ref().and_then(|id| list.iter().find(|d| &d.id == id)).map(|d| {
+            let id = d.id.clone();
+            h_flex()
+                .w_full()
+                .flex_wrap()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(12.0))
+                .py(px(8.0))
+                .rounded(px(12.0))
+                .bg(rgba(SOFT))
+                .text_size(px(13.0))
+                .text_color(g.muted)
+                .child(div().min_w_0().child(format!("Delete “{}”? Its ticket and conversation go. Nothing of it was opened.", d.title())))
+                .child(tg("draft-delete-yes", "Delete", false).on_click(cx.listener(move |this, _, window, cx| this.delete_draft(&id, window, cx))))
+                .child(tg("draft-delete-no", "Keep it", false).on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(full) = this.full.as_mut() {
+                        full.launch.deleting = None;
+                    }
+                    cx.notify();
+                })))
+        });
+        let note = (kept == 1 && asking.is_none()).then(|| {
+            div().px(px(4.0)).text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child("It stays here as you leave it, until you launch it or delete it: + New draft starts another beside it.")
+        });
+        Some(
+            v_flex()
+                .gap(px(7.0))
+                .child(bay_label(&format!("Spaces in draft · {kept}")).px(px(0.0)))
+                .child(h_flex().flex_wrap().gap(px(6.0)).items_center().children(chips).children(another))
+                .children(asking)
+                .children(note)
+                .into_any_element(),
+        )
+    }
+
     /// The launcher's head and body.
     pub(super) fn launch_view(&mut self, missions: &Missions, window: &mut Window, cx: &mut Context<Self>) -> (AnyElement, Vec<AnyElement>) {
         let g = glass();
         let head = whead("New space", vec![div().child("Say in the conversation what it should get done, or paste the ticket there. Nothing opens until you launch.").into_any_element()], None);
         self.talk_tick(missions, window, cx);
+        // What changed in the open draft is kept as it is drawn.
+        self.keep_drafts();
         let plan_open = self.plan_now(cx);
         let Some(full) = self.full.as_ref() else { return (head, vec![]) };
         let ui = &full.launch;
-        let goal = ui.goal.read(cx).value().trim().to_string();
+        let goal = ui.ticket();
         let taken: Vec<&str> = missions.open.iter().map(|m| m.name.as_str()).chain(missions.quiet.iter().map(String::as_str)).collect();
         let setup = ui.setup().cloned();
         let drafts = ui.drafts() && !ui.names_repos(&goal);
@@ -1282,7 +1802,9 @@ impl Panel {
         } else {
             dry.lines.clone()
         };
-        let (busy, drafting) = (self.running("launch"), self.running("draft"));
+        let (busy, drafting) = (self.running(&ui.place("launch")), self.running(&ui.place("draft")));
+        // One launch at a time: another draft's holds this one's Launch.
+        let elsewhere = full.busy.iter().any(|p| p.starts_with("launch:")) && !busy;
         let label = |text: &str| bay_label(text).px(px(0.0));
         let note = |text: String| div().px(px(4.0)).text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child(text);
 
@@ -1367,7 +1889,7 @@ impl Panel {
                 },
             ),
         };
-        let can = !goal.is_empty() && !busy && !drafting;
+        let can = !goal.is_empty() && !busy && !drafting && !elsewhere;
         // "Review its PRs", on the draft and on the plan (not while a ticket is only to be drafted).
         let reviewing = ui.review;
         let review_row = (draft.is_some() || !drafts).then(|| {
@@ -1451,18 +1973,20 @@ impl Panel {
                 .child(tg("plan-close-stale", "Close it", false).on_click(cx.listener(move |this, _, _, cx| this.plan_close(&close, cx))))
                 .into_any_element()
         });
+        let strip = self.drafts_strip(cx);
         let body = v_flex()
             .w_full()
             .max_w(px(760.0))
             .gap(px(16.0))
+            .children(strip)
             .children(stale_line)
             .child(v_flex().gap(px(7.0)).child(label("Project")).child(projects).children(self.said("setups")))
-            .child(v_flex().gap(px(7.0)).child(label(section)).child(middle).children(review_row).children(self.said("draft")))
+            .child(v_flex().gap(px(7.0)).child(label(section)).child(middle).children(review_row).children(self.said(&ui.place("draft"))))
             .when(!plan_items.is_empty(), |el| el.child(v_flex().gap(px(10.0)).children(plan_items)))
             .child(v_flex().gap(px(10.0)).children(actions))
             .children(self.said("plan"))
             .children(self.said("plan-close"))
-            .children(self.said("launch"))
+            .children(self.said(&ui.place("launch")))
             .into_any_element();
         (head, vec![body])
     }
@@ -1472,7 +1996,7 @@ impl Panel {
     /// The conversation that makes the space, as it stands now (`story_with`).
     pub(super) fn story_now(&self, cx: &Context<Self>) -> Vec<Told> {
         let Some(full) = self.full.as_ref() else { return vec![] };
-        let ticket = full.launch.goal.read(cx).value().trim().to_string();
+        let ticket = full.launch.ticket();
         let plan = self.plan_for(&ticket, cx).filter(|_| full.launch.draft.is_some());
         story_with(&full.launch.story, plan.as_ref())
     }
@@ -1480,7 +2004,7 @@ impl Panel {
     /// Where the input's words go in New space, as its placeholder says.
     pub(super) fn new_hint(&self, cx: &Context<Self>) -> String {
         let Some(full) = self.full.as_ref() else { return String::new() };
-        let ticket = full.launch.goal.read(cx).value().trim().to_string();
+        let ticket = full.launch.ticket();
         let ui = &full.launch;
         // The column's input is narrow in a narrow window: the short words.
         let narrow = full.talk_w < 360.0;
@@ -1502,12 +2026,16 @@ impl Panel {
     pub(super) fn new_chat_column(&mut self, width: f32, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let g = glass();
         let story = self.story_now(cx);
-        let ticket = self.full.as_ref().map(|f| f.launch.goal.read(cx).value().trim().to_string()).unwrap_or_default();
+        let ticket = self.full.as_ref().map(|f| f.launch.ticket()).unwrap_or_default();
         let plan = self.plan_for(&ticket, cx);
         let drafted = self.full.as_ref().and_then(|f| f.launch.draft.as_ref().map(|(_, d)| d.space.clone()));
         let redrafting = drafted.is_some();
+        let (reading, launching) = match self.full.as_ref() {
+            Some(f) => (self.running(&f.launch.place("draft")), self.running(&f.launch.place("launch"))),
+            None => (false, false),
+        };
         // A new message, or one now awaited: the column goes to its end.
-        let waiting = self.running("draft") || self.running("launch") || self.running("plan") || plan.as_ref().is_some_and(|p| p.answering);
+        let waiting = reading || launching || self.running("plan") || plan.as_ref().is_some_and(|p| p.answering);
         if let Some(f) = self.full.as_mut() {
             let key = (Some(String::new()), story.len() + usize::from(waiting), story.last().map(|t| t.at).unwrap_or(0));
             if f.chat_seen.as_ref() != Some(&key) {
@@ -1518,7 +2046,7 @@ impl Panel {
         }
         let mut rows: Vec<AnyElement> = story.iter().map(super::talk::told_row).collect();
         let busy = |text: String| div().px(px(4.0)).child(cstat_busy(text)).into_any_element();
-        if self.running("draft") {
+        if reading {
             rows.push(busy(if redrafting { "The tower's brain is redrafting it…".into() } else { "The tower's brain is reading the ticket…".into() }));
         }
         if self.running("plan") {
@@ -1534,7 +2062,7 @@ impl Panel {
                 rows.push(busy(if p.planner == "working" { "The planner is answering…".into() } else { "With the planner: it answers once its turn is over…".into() }));
             }
         }
-        if self.running("launch") {
+        if launching {
             rows.push(busy("Launching…".into()));
         }
         if rows.is_empty() {
@@ -1590,7 +2118,9 @@ impl Panel {
     fn talk_tick(&mut self, missions: &Missions, window: &mut Window, cx: &mut Context<Self>) {
         let Some(full) = self.full.as_ref() else { return };
         let ui = &full.launch;
-        if ui.talk_hook.is_empty() || ui.draft_known.is_none() || ["draft", "launch", "plan", "plan-say", "setups"].iter().any(|p| self.running(p)) {
+        // (A draft's own command runs as `draft:<id>`, `launch:<id>`.)
+        let on_one = full.busy.iter().any(|p| ["draft", "launch", "plan", "plan-say", "setups"].contains(&p.split(':').next().unwrap_or("")));
+        if talk_left() == 0 || ui.draft_known.is_none() || on_one {
             return;
         }
         if ui.talk_at.is_some_and(|t| std::time::Instant::now() < t) {
@@ -1598,14 +2128,41 @@ impl Panel {
             return;
         }
         let Some(full) = self.full.as_mut() else { return };
-        let Some(line) = full.launch.talk_hook.pop_front() else { return };
+        let Some(line) = talk_lines().lock().ok().and_then(|mut l| l.pop_front()) else { return };
         full.launch.talk_at = Some(std::time::Instant::now() + Duration::from_millis(1500));
-        let left = full.launch.talk_hook.len();
+        let left = talk_left();
         eprintln!("[orb] talk: {line} ({left} left)");
         if let Some(secs) = line.strip_prefix("!wait").map(str::trim) {
             full.launch.talk_at = Some(std::time::Instant::now() + Duration::from_secs(secs.parse().unwrap_or(5)));
+        } else if line == "!new" {
+            self.new_draft(window, cx);
+        } else if let Some(secs) = line.strip_prefix("!reopen").map(str::trim) {
+            // The window closes as Esc closes it, and opens again on New space
+            // where it was, a moment later (`<s>`, else 3): what a reopen keeps.
+            let wait = Duration::from_secs(secs.parse().unwrap_or(3));
+            let b = window.bounds().origin;
+            let spot = Some((f64::from(f32::from(b.x)), f64::from(f32::from(b.y))));
+            let tower = self.tower.clone();
+            self.keep_drafts();
+            cx.spawn(async move |_, cx: &mut AsyncApp| {
+                cx.background_executor().timer(wait).await;
+                cx.update(|cx| super::super::open_full(&tower, Some(Scope::New), None, spot, false, false, cx));
+            })
+            .detach();
+            return self.close(window, cx);
+        } else if let Some(n) = line.strip_prefix("!open").map(str::trim) {
+            // The n-th in the list above the launcher, from 1.
+            match n.parse::<usize>().ok().and_then(|n| full.launch.listed().get(n.wrapping_sub(1)).map(|d| d.id.clone())) {
+                Some(id) => self.open_draft(&id, window, cx),
+                None => eprintln!("[orb] talk: no draft {n} to open"),
+            }
+        } else if let Some(n) = line.strip_prefix("!delete").map(str::trim) {
+            match n.parse::<usize>().ok().and_then(|n| full.launch.listed().get(n.wrapping_sub(1)).map(|d| d.id.clone())) {
+                Some(id) => self.delete_draft(&id, window, cx),
+                None => eprintln!("[orb] talk: no draft {n} to delete"),
+            }
         } else if line == "!launch" {
-            let ticket = full.launch.goal.read(cx).value().trim().to_string();
+            let ticket = full.launch.ticket();
             if full.launch.draft_of(&ticket).is_some() || self.plan_for(&ticket, cx).is_some() {
                 self.launch_draft(missions, cx);
             } else {
@@ -1622,6 +2179,67 @@ impl Panel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn told(who: &str, text: &str) -> Told {
+        Told { who: who.into(), text: text.into(), at: history::now_ms() }
+    }
+
+    #[test]
+    fn new_spaces_in_draft_outlast_the_window_and_take_an_answer_that_came_after_it_closed() {
+        let dir = std::env::temp_dir().join(format!("tower-launch-drafts-{}-{}", std::process::id(), history::now_ms()));
+        let file = dir.join("new-spaces.json");
+        // A window, and two drafts in it: the first waits while the second is said.
+        let mut ui = LaunchUi::at(file.clone());
+        assert!(ui.listed().is_empty(), "none yet, and an empty one is no row");
+        ui.goal = "open a session in draftcheck: qfix alpha".into();
+        ui.story.push(told("you", "open a session in draftcheck: qfix alpha"));
+        ui.named = Some("qfix-alpha".into());
+        ui.keep();
+        let alpha = ui.id.clone();
+        ui.keep();
+        ui.load(&SpaceDraft::fresh(history::now_ms()));
+        assert_eq!(ui.listed().iter().map(SpaceDraft::title).collect::<Vec<_>>(), ["qfix-alpha", "New draft"]);
+        ui.goal = "Case exports as PDF".into();
+        ui.story.push(told("you", "Case exports as PDF"));
+        ui.review = false;
+        ui.keep();
+        let bravo = ui.id.clone();
+        assert_eq!(ui.listed().iter().map(SpaceDraft::title).collect::<Vec<_>>(), ["qfix-alpha", "case-exports"]);
+        // The window closes; the next opens on the one that was open, the other listed.
+        drop(ui);
+        let mut again = LaunchUi::at(file.clone());
+        assert_eq!((again.id.as_str(), again.ticket().as_str(), again.review), (bravo.as_str(), "Case exports as PDF", false));
+        assert_eq!(again.listed().iter().map(|d| d.id.clone()).collect::<Vec<_>>(), [alpha.clone(), bravo.clone()]);
+        // Back to the first: its conversation as it was.
+        again.keep();
+        let a = again.book.get(&alpha).cloned().unwrap();
+        again.load(&a);
+        assert_eq!(again.story.len(), 1);
+        assert_eq!(again.named.as_deref(), Some("qfix-alpha"));
+        // The brain's answer for the second, written after the window that asked closed: it is that draft's.
+        told_on_disk(&file, &bravo, &[("tower", "Drafted case-exports.")], None);
+        again.keep();
+        assert_eq!(again.id, alpha, "the open one stays open");
+        assert_eq!(again.book.get(&bravo).unwrap().story.last().unwrap().text, "Drafted case-exports.");
+        // One for the open draft (the window that asked closed, this one opened on it): this one shows it.
+        told_on_disk(&file, &alpha, &[("tower", "The launch didn't go: no hc.")], None);
+        again.keep();
+        assert_eq!(again.story.last().unwrap().text, "The launch didn't go: no hc.");
+        // A launch of it that finished after its window closed: it leaves the list, the other opens.
+        space_drafts::update_at(&file, |b| {
+            b.remove(&alpha);
+        });
+        again.keep();
+        assert_eq!(again.id, bravo);
+        assert_eq!(again.listed().len(), 1);
+        assert_eq!(space_drafts::load_from(&file).drafts.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(), [bravo.as_str()]);
+        // Start over empties it: nothing is left in draft.
+        again.goal.clear();
+        again.story.clear();
+        again.keep();
+        assert!(space_drafts::load_from(&file).drafts.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_space_is_named_from_its_goal() {

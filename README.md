@@ -298,7 +298,12 @@ folded into one line, and **Record**, **Shots**, **Projects** and
   words…** with **Redraft** gets a new draft in its place ("leave the
   dashboard out", "call it msg-translation"); **Start over** drops it.
   Nothing opens before Launch. The whole ticket goes to the sessions as
-  their brief; the space's header keeps the title.
+  their brief; the space's header keeps the title. Several new spaces can
+  be in draft at once: **+ New draft** starts another and the first waits
+  in **Spaces in draft** above, as you left it, until you launch it or
+  delete it (its ×); a click opens one again. They are kept in
+  `~/.local/share/herder-tower/new-spaces.json`, so closing the window or
+  restarting the tower loses none.
   **Plan as a page** or **Plan as a whiteboard**, under the draft, shows
   you the plan before anything opens: the tower's planner (a Claude Code
   terminal of the tower's, `tower-planner`, on your default account and the

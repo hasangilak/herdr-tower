@@ -1282,6 +1282,27 @@ the pane has no field of its own for it.
   Start over drops the conversation with the draft and the ticket (the
   conversation was the only place it showed), and the input waits for the
   next; one that launched is the space's, and New space starts empty.
+- **Several at once** (`src/space_drafts.rs`): each new space in draft
+  (its ticket, conversation, the brain's draft, the project picked, the
+  review switch, the name the tower said) is kept in
+  `<data>/new-spaces.json`, written whenever one changes, so it outlasts
+  the window, the orb and the tower. Above the pane, **Spaces in draft ·
+  N**: a pill each (the space its draft or dry run names, else a name
+  from its ticket), the open one lit, "reading…" or "launching…" beside
+  one whose command runs. A click opens another (the one open waits, as
+  it is); **+ New draft** starts another from nothing; its **×** asks
+  "Delete “<name>”? Its ticket and conversation go. Nothing of it was
+  opened." (Delete, Keep it), and a plan of it closes. A draft with
+  nothing said in it is not kept. Each draft's commands run as
+  `draft:<id>` and `launch:<id>` (one launch at a time across drafts), and
+  an answer comes to the draft that asked, wherever the user is by then;
+  one that comes after the window closed is written to the file by the
+  window that asked (a launched draft leaves it, it is not launched
+  twice), and an open window takes what was written there within a
+  second. A launch takes its draft out of the list; Start over empties
+  the open one, which leaves it. The window opens on the draft that was
+  open last; the sidebar's New space row says "N in draft". A file that
+  doesn't read is kept aside as `new-spaces.bad-<ms>.json`.
 
 - **The first line names repos** (the dry run's `repos_from` is
   `first-line`, asked without `--setup` once the typing pauses): the plan
@@ -1326,8 +1347,12 @@ the pane has no field of its own for it.
   (with `show:projects`) opens the Projects form once.
   `HERDER_TOWER_ORB_TALK=<file>` (with `show:new`) says the file's lines
   in the conversation one after another, each once the tower is on none
-  (`!wait <s>` waits, `!launch` presses Launch), printing each to the log
-  (`[orb] talk: …`).
+  (`!wait <s>` waits, `!launch` presses Launch, `!new` starts another
+  draft, `!open <n>` and `!delete <n>` open and delete the n-th in the
+  list from 1, `!reopen [<s>]` closes the window as Esc does and opens it
+  again on New space after `s` seconds, 3 if none), printing each to the
+  log (`[orb] talk: …`). Its lines are said once for the run: a window
+  opened again goes on with the next.
 
 ### The plan, and the chat about it
 
