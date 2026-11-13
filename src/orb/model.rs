@@ -160,6 +160,8 @@ pub struct PrRef {
     pub merge: Option<MergeGate>,
     /// Its review (`crate::reviews`), when it has one.
     pub review: Option<crate::reviews::Brief>,
+    /// Whether it needs a human code review, and why (`crate::prscore`).
+    pub score: Option<crate::prscore::Score>,
 }
 
 impl PrRef {
@@ -434,6 +436,7 @@ pub fn adapt(sets: &[QuestionSet], prs: &BTreeMap<String, Pr>, agents: &Value, s
                 session: p.session.clone(),
                 merge: None,
                 review: p.review.clone(),
+                score: p.score.clone(),
             })
             .collect();
         let key = format!("merge:{repo}@{space}");
@@ -1129,6 +1132,9 @@ pub struct PlanView {
     pub thread: Vec<PlanMsg>,
     pub created_ms: u64,
     pub ready_ms: Option<u64>,
+    /// The pull requests it predicts, each with its review score (`tower plan prs`).
+    #[serde(deserialize_with = "or_default")]
+    pub prs: Vec<crate::prscore::Predicted>,
 }
 
 impl PlanView {

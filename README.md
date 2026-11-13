@@ -498,6 +498,19 @@ without agreement puts it to you as one decision ("Side with the owner",
 stays yours: a review that isn't agreed is said on the merge card, never
 in the way. Agreed, the PR merged or closed, the space closed or its
 review turned off, the reviewer ends; the record stays (`tower review`).
+
+**Every PR has a review score.** A plan says what its pull requests will
+look like before anything opens: one entry per PR (its repo, into dev
+first, its title, what it changes, roughly which files), each scored
+**Needs review** (a database migration, a breaking change, or anything on
+the escalate list: secrets, infrastructure, deploys, auth, deleting data,
+money, new dependencies, security) or **Low risk**, with why. The real PR
+carries its prediction's score, read again on its own files, on its row of
+the merge card. With **auto-merge** on (Settings → Pull requests, `tower
+automerge on`; off unless you turn it on) the tower merges a low-risk PR
+into dev itself once its checks pass and its reviewer found nothing;
+anything that needs review, and every merge into main or prod, stays
+yours.
 It is on for every space; New space's **Review its PRs** switch (`tower
 launch --no-review`), the space's own **Review PRs** switch and `tower
 space review <space> off` turn it off.

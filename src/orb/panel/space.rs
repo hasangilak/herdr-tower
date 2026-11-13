@@ -183,7 +183,8 @@ pub(super) fn closed_line(name: &str, out: &str) -> String {
 }
 
 /// The reviews of a space's open PRs, a line each: "PR #12 · Review: 2
-/// critical, round 2 · fix-login-review-app-12".
+/// critical, round 2 · fix-login-review-app-12 · Needs review" (its score's
+/// word, when it has one).
 pub(super) fn review_lines(space: &str, prs: &std::collections::BTreeMap<String, crate::prs::Pr>) -> Vec<String> {
     let mut list: Vec<&crate::prs::Pr> = prs.values().filter(|p| p.open() && p.space.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(space)) && p.review.is_some()).collect();
     list.sort_by_key(|p| (p.repo.clone(), p.number));
@@ -192,7 +193,9 @@ pub(super) fn review_lines(space: &str, prs: &std::collections::BTreeMap<String,
             let r = p.review.as_ref()?;
             let line = if r.line.is_empty() { crate::reviews::chip_line(r) } else { r.line.clone() };
             let who = if r.reviewer_name.is_empty() { String::new() } else { format!(" · {}", r.reviewer_name) };
-            Some(format!("PR #{} ({}) · {line}{who}", p.number, p.repo.rsplit('/').next().unwrap_or(&p.repo)))
+            // Whether a person must read it (`crate::prscore`), when it was scored.
+            let score = p.score.as_ref().map(|s| format!(" · {}", s.word())).unwrap_or_default();
+            Some(format!("PR #{} ({}) · {line}{who}{score}", p.number, p.repo.rsplit('/').next().unwrap_or(&p.repo)))
         })
         .collect()
 }

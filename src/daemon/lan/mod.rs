@@ -52,7 +52,9 @@ pub const API: u32 = 1;
 /// knows, `hosts` on the stream (`hello`, the `hosts` event) and `GET /v1/network`.
 /// `bonjour`: found by name on the local network (`_herdr-tower._tcp`, the
 /// fingerprint in its TXT), and `bonjour` where `hosts` is.
-pub const FEATURES: &[&str] = &["quiet", "acts", "pairing", "bonjour", "reviews"];
+/// `scores`: a PR's review score (`score`) and the tower's own merge of it
+/// (`auto`), a plan's predicted PRs (`prs`), and `auto_merge` in the state.
+pub const FEATURES: &[&str] = &["quiet", "acts", "pairing", "bonjour", "reviews", "scores"];
 const MAX_CONNECTIONS: usize = 32;
 /// Connections open at once from one address.
 const MAX_PER_IP: usize = 8;

@@ -80,6 +80,8 @@ pub(super) struct FullUi {
     pub tell: Option<String>,
     /// What it says out loud (`off`, `decisions`, `replies`), as just chosen here.
     pub voice: Option<String>,
+    /// Auto-merge of low-risk PRs into dev, as just switched here, until the state says it too.
+    pub auto_merge: Option<bool>,
     /// The window is being moved by its header or the sidebar's top.
     pub drag: Option<Drag>,
     /// Whether a space can have a tower of its own to talk to (this tower's
@@ -131,6 +133,7 @@ impl FullUi {
             busy: HashSet::new(),
             record: vec![],
             tell: None,
+            auto_merge: None,
             voice: None,
             drag: None,
             space_tower: None,

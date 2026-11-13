@@ -193,6 +193,9 @@ pub struct PrRef {
     /// Its review (`crate::reviews::Brief`), when it has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review: Option<crate::reviews::Brief>,
+    /// Whether it needs a human code review, and why (`crate::prscore`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<crate::prscore::Score>,
 }
 
 impl PrRef {
@@ -215,6 +218,7 @@ impl PrRef {
             session: p.session.clone(),
             merge: crate::prs::gate(p).view(),
             review: p.review.clone(),
+            score: p.score.clone(),
         }
     }
 
@@ -1266,17 +1270,24 @@ fn merge_title(refs: &[PrRef]) -> String {
 }
 
 /// One option per PR, in order. The tower's pick is the first, when it can
-/// be merged, its checks pass and it doesn't ship to production (that one
-/// is the user's call alone).
+/// be merged, its checks pass, it doesn't ship to production (that one is
+/// the user's call alone) and its score doesn't say a person must read it.
+/// A PR that needs review says why in its option.
 fn merge_options(refs: &[PrRef]) -> Vec<Opt> {
     refs.iter()
         .enumerate()
         .map(|(i, p)| {
             let blocked = p.merge["blocked"].as_str();
+            let review = p.score.as_ref().filter(|s| s.needs_review);
+            let why = match (blocked, review) {
+                (Some(b), _) => b.to_string(),
+                (None, Some(s)) => format!("{}; {}", p.note, s.line),
+                (None, None) => p.note.clone(),
+            };
             Opt {
                 label: format!("Merge {}", p.short()),
-                why: blocked.unwrap_or(&p.note).to_string(),
-                pick: i == 0 && blocked.is_none() && p.checks == "pass" && !crate::prs::is_prod(&p.base),
+                why,
+                pick: i == 0 && blocked.is_none() && p.checks == "pass" && !crate::prs::is_prod(&p.base) && review.is_none(),
                 ..Default::default()
             }
         })
@@ -1884,6 +1895,24 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_merge_decision_carries_each_prs_review_score() {
+        let mut b = Book::default();
+        let ev = |files: &[&str]| crate::prscore::Evidence { title: "x".into(), files: files.iter().map(|f| f.to_string()).collect(), ..Default::default() };
+        let migration = Pr { score: Some(crate::prscore::score(&ev(&["db/migrations/0042_orders.sql"]))), ..pr(88, "dev", "t1", "Shop", "passing") };
+        let ui = Pr { score: Some(crate::prscore::score(&ev(&["src/Cart.tsx"]))), ..pr(89, "dev", "t2", "Shop", "passing") };
+        let id = b.sync_merges(&[migration, ui], MIN).fresh[0].clone();
+        let d = b.find(&id).unwrap();
+        let v = d.view(false);
+        assert_eq!(v["prs"][0]["score"]["needs_review"], true);
+        assert_eq!(v["prs"][0]["score"]["line"], "Needs review: a database migration (db/migrations/0042_orders.sql)");
+        assert_eq!(v["prs"][1]["score"]["needs_review"], false);
+        // The tower doesn't pick a PR a person must read; its option says why.
+        assert!(d.pick().is_none(), "{:?}", d.options);
+        assert_eq!(d.options[0].why, "checks passing; Needs review: a database migration (db/migrations/0042_orders.sql)");
+        assert_eq!(d.options[1].why, "checks passing");
     }
 
     #[test]

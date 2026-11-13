@@ -40,6 +40,7 @@ mod protocol;
 mod projects;
 mod reopen;
 mod prs;
+mod prscore;
 mod questions;
 mod reviews;
 mod screenshots;
@@ -207,6 +208,15 @@ enum Cmd {
     /// let paired phones play it as they route it (`off`, the default). Kept across restarts.
     MacVoice {
         /// on, off, toggle or status (default).
+        #[arg(default_value = "status")]
+        action: String,
+    },
+    /// Whether the tower merges low-risk PRs into dev itself (`[prs] auto_merge_low_risk`, off
+    /// unless you turn it on): a PR a plan predicted, scored low risk on its own files too, its
+    /// checks passing and its reviewer agreeing without finding anything. Anything that needs
+    /// review, and every merge into main or prod, stays yours.
+    Automerge {
+        /// on, off or status (default).
         #[arg(default_value = "status")]
         action: String,
     },
@@ -845,6 +855,7 @@ fn run(cli: Cli) -> Result<()> {
             println!("{}", if muted { "Muted: the tower says nothing (tower mute off to hear it again)." } else { "Not muted: the tower talks." });
             Ok(())
         }
+        Cmd::Automerge { action } => automerge_cmd(&action),
         Cmd::MacVoice { action } => {
             let on = if protocol::is_running() {
                 let r = protocol::send(&Request::MacVoice { action })?;
@@ -1310,6 +1321,37 @@ fn show_history(jobs: Option<&str>, session: Option<&str>, n: usize) -> Result<(
 
 /// `tower tell [decisions|results|everything] [--voice off|decisions|replies]`:
 /// how much it tells and what it says out loud, or set them.
+/// `tower automerge on|off|status`: `[prs] auto_merge_low_risk` in config.toml,
+/// which the daemon reads as it goes (no restart).
+fn automerge_cmd(action: &str) -> Result<()> {
+    let path = config::config_file();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let now = config::Config::from_text(&text)?.prs.auto_merge_low_risk;
+    let on = match action.trim() {
+        "on" => true,
+        "off" => false,
+        "status" | "" => now,
+        _ => bail!("tower automerge on|off|status"),
+    };
+    if on != now {
+        let new = config::with_table_key(&text, "prs", "auto_merge_low_risk", if on { "true" } else { "false" });
+        // Kept only once it reads back as asked.
+        if config::Config::from_text(&new)?.prs.auto_merge_low_risk != on {
+            bail!("couldn't set [prs] auto_merge_low_risk in {}", path.display());
+        }
+        std::fs::create_dir_all(config::config_dir())?;
+        std::fs::write(&path, new)?;
+    }
+    if !std::io::stdout().is_terminal() {
+        println!("{}", serde_json::json!({ "auto_merge_low_risk": on, "changed": on != now }));
+    } else if on {
+        println!("Auto-merge is on: the tower merges a low-risk PR into dev itself once a plan predicted it, its checks pass and its reviewer found nothing. Anything that needs review, and every merge into main or prod, is still yours.");
+    } else {
+        println!("Auto-merge is off: every PR is yours to merge.");
+    }
+    Ok(())
+}
+
 fn tell_cmd(level: Option<&str>, voice: Option<&str>) -> Result<()> {
     let level = level.map(tell::parse).transpose()?;
     let voice = voice.map(tell::parse_voice).transpose()?;
