@@ -622,6 +622,15 @@ A spoken request in a space's view goes the same way: transcribe the take
 
 ## The chat
 
+(The Mac keeps what is typed in each of its inputs and not sent yet, across
+restarts: `docs/quiet-tower.md`, "What is typed and not sent is kept". The
+phone needs the same, on the device: keep each input's unsent text (the
+main chat, each space's conversation, each decision's "Other" field, New
+space's) in its own storage, by the same keys (`main`, `space:<name>`,
+`other:<decision id>:<tab>`), restore it when the screen shows again or the
+app restarts, and drop it once it is sent. No call is needed for it: drafts
+are each device's own.)
+
 There is one chat thread, the tower's, on every screen: the Mac and every
 phone show the same messages. It lives on the Mac in the history
 (`history.jsonl`, kept across restarts); what the phone sends goes into it

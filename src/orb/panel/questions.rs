@@ -143,6 +143,8 @@ pub(super) struct Card {
     options_open: bool,
     /// It stopped and the user wants another go: the questions show again.
     again: bool,
+    /// What was typed in its "Other" fields before (`crate::unsent`) was read back.
+    hydrated: bool,
     /// Where the dialog was (its tab, and which tabs were answered there)
     /// when the card last followed it.
     followed: Option<(usize, Vec<bool>)>,
@@ -336,18 +338,23 @@ impl Panel {
     /// keeping what was typed on another.
     pub(super) fn open_other(&mut self, id: &str, tab: usize, hint: &'static str, window: &mut Window, cx: &mut Context<Self>) {
         self.keep_other(cx);
+        self.hydrate_card(id);
         let content = self.asks.cards.get(id).and_then(|c| c.others.get(tab).cloned().flatten()).unwrap_or_else(|| InputContent::new(""));
         // Enter answers, as the card's own button does; Shift+Enter is a new line.
         let field = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 5).submit_on_enter(true).placeholder(hint));
-        field.update(cx, |s, cx| {
-            s.set_value(content, window, cx);
-            s.focus(window, cx);
-        });
+        field.update(cx, |s, cx| s.focus(window, cx));
+        // What it held (kept, or from before a restart), the caret at its end: what is typed next goes on from there.
+        let end = content.text().len();
+        self.set_content(&field, content, end, window, cx);
         let (id2, tab2) = (id.to_string(), tab);
-        cx.subscribe_in(&field, window, move |this, _, ev: &InputEvent, _, cx| {
-            if let InputEvent::PressEnter { shift: false, .. } = ev {
-                this.other_entered(&id2, tab2, cx);
+        cx.subscribe_in(&field, window, move |this, field, ev: &InputEvent, _, cx| match ev {
+            InputEvent::PressEnter { shift: false, .. } => this.other_entered(&id2, tab2, cx),
+            // Kept as it stands: it comes back after a restart, or with the window opened again.
+            // (Only while it is the open field: an answer that went closed it, and its words with it.)
+            InputEvent::Change if this.asks.other.as_ref().is_some_and(|(oid, ot, f)| *oid == id2 && *ot == tab2 && f == field) => {
+                crate::unsent::put(&crate::unsent::Key::other(&id2, tab2), super::typed::draft_of(&field.read(cx).content()))
             }
+            _ => {}
         })
         .detach();
         let card = self.asks.cards.entry(id.to_string()).or_default();
@@ -371,6 +378,36 @@ impl Panel {
             return;
         }
         self.answer_words(id, cx);
+    }
+
+    /// What was typed in a card's "Other" fields before (kept by
+    /// `crate::unsent`: before a restart, in a window closed since) is the
+    /// card's again, once: a question whose words were typed has "Other"
+    /// chosen again.
+    pub(super) fn hydrate_card(&mut self, id: &str) {
+        let card = self.asks.cards.entry(id.to_string()).or_default();
+        if card.hydrated {
+            return;
+        }
+        card.hydrated = true;
+        for (key, d) in crate::unsent::with_prefix(&crate::unsent::Key::others_of(id)) {
+            let Some(tab) = key.rsplit(':').next().and_then(|t| t.parse::<usize>().ok()).filter(|t| *t < 64) else { continue };
+            card.others.resize(card.others.len().max(tab + 1), None);
+            if card.others[tab].is_none() {
+                card.others[tab] = Some(super::typed::content_of(&d));
+                card.choices.resize(card.choices.len().max(tab + 1), Choice::None);
+                if matches!(card.choices[tab], Choice::None) {
+                    card.choices[tab] = Choice::Other;
+                }
+            }
+        }
+    }
+
+    /// What a decision's card keeps typed in its "Other" field, if anything (its closed pill shows it).
+    pub(super) fn other_kept(&self, id: &str) -> Option<String> {
+        let c = self.asks.cards.get(id)?.others.first()?.as_ref()?;
+        let text = c.text().split_whitespace().collect::<Vec<_>>().join(" ");
+        (!text.is_empty()).then_some(text)
     }
 
     /// Keeps the open field's answer with its question.
@@ -502,8 +539,10 @@ impl Panel {
                 });
                 if let Some(card) = this.asks.cards.get_mut(&id) {
                     card.sending = false;
-                    if let Err(e) = result {
-                        card.error = Some(format!("{e:#}"));
+                    match result {
+                        Err(e) => card.error = Some(format!("{e:#}")),
+                        // Its answers went: what was typed for them is not kept.
+                        Ok(_) => crate::unsent::clear(&crate::unsent::Key::others_of(&id)),
                     }
                 }
                 cx.notify();
@@ -590,6 +629,8 @@ impl Panel {
     pub(super) fn ask_card(&mut self, d: &Decision, set: &QuestionSet, tag: &str, now_ms: u64, cx: &mut Context<Self>) -> AnyElement {
         let n = set.tabs.len();
         let id = set.id.clone();
+        // What was typed for its questions before (a restart, a window closed since).
+        self.hydrate_card(&id);
         let (step, sending, error, note, again) = {
             let c = self.asks.cards.entry(id.clone()).or_default();
             follow_dialog(c, set);

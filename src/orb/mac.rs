@@ -135,6 +135,16 @@ impl Win {
         }
     }
 
+    /// A ghost's window that got the keyboard after all gives it back at once.
+    pub fn resign_key(self) {
+        // SAFETY: as above.
+        unsafe {
+            let app: id = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![self.0, resignKeyWindow];
+            let _: () = msg_send![app, deactivate];
+        }
+    }
+
     pub fn order_front(self) {
         // SAFETY: as above.
         unsafe {
@@ -174,12 +184,18 @@ impl Rect {
 }
 
 /// No Dock icon and no menu bar: the orb is all there is. (GPUI makes every
-/// app a regular one when it finishes launching; this runs after.)
+/// app a regular one when it finishes launching; this runs after.) A ghost
+/// (`ghost`) gives up being the active app at once: macOS activates a
+/// regular app as it launches, and its window would have the keyboard (a
+/// window of it that has it anyway gives it back, see `Win::resign_key`).
 pub fn accessory_app() {
-    // SAFETY: NSApplication's shared instance; 1 is NSApplicationActivationPolicyAccessory.
+    // SAFETY: NSApplication's shared instance; 1 is NSApplicationActivationPolicyAccessory, 2 Prohibited.
     unsafe {
         let app: id = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![app, setActivationPolicy: 1i64];
+        if ghost() {
+            let _: () = msg_send![app, deactivate];
+        }
     }
 }
 

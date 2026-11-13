@@ -56,6 +56,7 @@ mod spaces;
 mod split;
 mod tell;
 mod text;
+mod unsent;
 mod ticket;
 mod worktrees;
 
