@@ -142,6 +142,50 @@ pub struct Mission {
     /// The user said its goal is achieved (`tower space resolve`), when.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub achieved_ms: Option<u64>,
+    /// How its goal came to be what it is, oldest first: the last is the
+    /// goal now (`goal_by`). Empty for a goal set before the tower kept this.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub goals: Vec<GoalChange>,
+}
+
+/// One version of a space's goal: what it became, when, and what made it so.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoalChange {
+    pub goal: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub done_when: String,
+    pub at_ms: u64,
+    /// Who: `you` (by hand, in a window or on the phone), `request` (the
+    /// tower, after a request of the user's added to what the space is
+    /// for: see `crate::goals`), `launch` (the space was made with it),
+    /// `tower` (`tower space goal` with no `--by`: the brain, on the user's
+    /// word), "" (it was there before the tower kept how goals change).
+    pub by: String,
+    /// For `request`: the user's words that changed it.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub request: String,
+    /// For `request`: what it added or changed, in a phrase.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub why: String,
+}
+
+/// How many versions of a goal are kept: the first (what the space was
+/// made for) and the latest.
+pub const GOALS_KEPT: usize = 20;
+
+/// Who changes a goal (`GoalChange::by`), and with what.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Change {
+    pub by: String,
+    pub request: String,
+    pub why: String,
+}
+
+impl Change {
+    pub fn by(who: &str) -> Change {
+        Change { by: who.to_string(), ..Default::default() }
+    }
 }
 
 impl Default for Mission {
@@ -166,6 +210,7 @@ impl Default for Mission {
             setup: String::new(),
             review: true,
             achieved_ms: None,
+            goals: vec![],
         }
     }
 }
@@ -183,8 +228,32 @@ impl Mission {
             worktrees: std::mem::take(&mut self.worktrees),
             setup: std::mem::take(&mut self.setup),
             review: self.review,
+            goals: std::mem::take(&mut self.goals),
             ..Mission::born(now)
         };
+    }
+
+    /// `goal` and `done_when` are its goal now, as `change` made them (at
+    /// `now`): kept in its history, after the goal it had before when the
+    /// history doesn't have that one yet. Only the first and the latest
+    /// `GOALS_KEPT` are kept.
+    pub fn record_goal(&mut self, was: (&str, &str), goal: &str, done_when: &str, change: &Change, now: u64) {
+        if self.goals.is_empty() && !was.0.trim().is_empty() && (was.0.trim() != goal.trim() || was.1.trim() != done_when.trim()) {
+            let at_ms = if self.goal_ms > 0 { self.goal_ms } else { self.born_ms };
+            self.goals.push(GoalChange { goal: was.0.trim().to_string(), done_when: was.1.trim().to_string(), at_ms, ..Default::default() });
+        }
+        self.goals.push(GoalChange {
+            goal: goal.trim().to_string(),
+            done_when: done_when.trim().to_string(),
+            at_ms: now,
+            by: change.by.clone(),
+            request: change.request.trim().to_string(),
+            why: change.why.trim().to_string(),
+        });
+        if self.goals.len() > GOALS_KEPT {
+            let cut = self.goals.len() - GOALS_KEPT;
+            self.goals.drain(1..=cut);
+        }
     }
 }
 
@@ -544,6 +613,8 @@ pub fn view(s: &Spaces, src: &Sources) -> Value {
             "name": name,
             "goal": goal,
             "done_when": m.done_when,
+            // How the goal came to be what it is, oldest first (the last is the goal now).
+            "goal_history": m.goals,
             "standing": m.standing,
             "review": m.review,
             "state": m.state.word(),
@@ -614,13 +685,15 @@ pub fn poke() {
 
 fn brief(s: &Spaces, name: &str) -> Value {
     let m = s.missions.get(name).cloned().unwrap_or_default();
-    json!({ "space": name, "goal": goal_of(s, name), "done_when": m.done_when, "standing": m.standing, "review": m.review, "state": m.state.word(), "report": m.report })
+    json!({ "space": name, "goal": goal_of(s, name), "done_when": m.done_when, "standing": m.standing, "review": m.review, "state": m.state.word(), "report": m.report, "goal_history": m.goals })
 }
 
 /// A space's goal and what counts as done, set in `s` (each when given;
-/// a goal of "" clears it). A closed space that gets a goal is open again.
+/// a goal of "" clears it, and its history with it), as `change` says who
+/// set it (`you`: by hand). A change is kept in the goal's history
+/// (`Mission::goals`). A closed space that gets a goal is open again.
 /// Returns what `tower space goal` prints.
-pub fn goal_in(s: &mut Spaces, name: &str, goal: Option<&str>, done_when: Option<&str>, now: u64) -> Value {
+pub fn goal_by(s: &mut Spaces, name: &str, goal: Option<&str>, done_when: Option<&str>, change: &Change, now: u64) -> Value {
     let was = goal_of(s, name).to_string();
     match goal.map(str::trim) {
         Some("") => {
@@ -632,17 +705,55 @@ pub fn goal_in(s: &mut Spaces, name: &str, goal: Option<&str>, done_when: Option
         None => {}
     }
     let set = goal.map(str::trim).filter(|g| !g.is_empty());
+    let cleared = goal.is_some_and(|g| g.trim().is_empty());
     let m = s.missions.entry(name.to_string()).or_insert_with(|| Mission::born(now));
-    if set.is_some_and(|g| g != was) {
-        m.goal_ms = now;
-    }
+    let was_done = m.done_when.clone();
     if let Some(d) = done_when {
         m.done_when = d.trim().to_string();
+    }
+    // Kept in its history (the goal before with the time it was set), then dated.
+    if cleared {
+        m.goals.clear();
+    } else {
+        let goal_now = set.map(String::from).unwrap_or_else(|| was.clone());
+        if !goal_now.is_empty() && (goal_now != was || m.done_when != was_done.trim()) {
+            let done_now = m.done_when.clone();
+            m.record_goal((&was, &was_done), &goal_now, &done_now, change, now);
+        }
+    }
+    if set.is_some_and(|g| g != was) {
+        m.goal_ms = now;
     }
     if set.is_some() && (m.state == State::Closed || m.archived_ms.is_some()) {
         m.reopen(now);
     }
     brief(s, name)
+}
+
+/// What a request of the user's made of a space's goal (`crate::goals`):
+/// `goal` and `done_when` take the place of `seen` (the goal and done-when
+/// the judgement was made on), unless the goal changed since (by hand, or
+/// by another request): then nothing changes and `None` says so. A space
+/// that was ready to close is open again (what it is for grew, and what
+/// was finished before doesn't count toward it: `goal_ms`), and its report,
+/// which was of the goal before, goes.
+pub fn goal_from_request(s: &mut Spaces, name: &str, seen: (&str, &str), goal: &str, done_when: &str, change: &Change, now: u64) -> Option<GoalChange> {
+    let (key, m) = of(s, name).map(|(k, m)| (k.clone(), m.clone()))?;
+    if m.standing || m.state == State::Closed || m.archived_ms.is_some() {
+        return None;
+    }
+    if goal_of(s, &key) != seen.0.trim() || m.done_when.trim() != seen.1.trim() {
+        return None;
+    }
+    goal_by(s, &key, Some(goal), Some(done_when), change, now);
+    let m = s.missions.get_mut(&key)?;
+    if m.state == State::Ready {
+        m.state = State::Open;
+        (m.ready_since_ms, m.idle_since_ms, m.wait_until_ms) = (None, None, None);
+        m.report.clear();
+        (m.report_ms, m.report_asked_ms) = (0, 0);
+    }
+    m.goals.last().cloned()
 }
 
 /// Keeps a space (`on`), or makes it a mission with an end again, in `s`.
@@ -658,19 +769,21 @@ pub fn review_in(s: &mut Spaces, name: &str, on: bool, now: u64) -> Value {
     brief(s, &key)
 }
 
-/// Sets a space's goal ("" clears it) and, when given, what counts as done.
+/// Sets a space's goal ("" clears it) and, when given, what counts as done,
+/// as `by` says who set it (`you`: by hand; else the tower's brain).
 /// A closed space that gets a goal is open again.
-pub fn set_goal(space: &str, goal: &str, done_when: Option<&str>) -> Result<Value> {
+pub fn set_goal(space: &str, goal: &str, done_when: Option<&str>, by: Option<&str>) -> Result<Value> {
     let name = spaces::pick(space)?;
     let now = history::now_ms();
-    let v = spaces::update(|s| goal_in(s, &name, Some(goal), done_when, now));
+    let change = Change::by(by.map(str::trim).filter(|b| !b.is_empty()).unwrap_or("tower"));
+    let v = spaces::update(|s| goal_by(s, &name, Some(goal), done_when, &change, now));
     poke();
     Ok(v)
 }
 
-/// `tower space goal <space> "<goal>" [--done-when "<…>"]` (and `tower space agenda`).
-pub fn cmd_goal(space: String, goal: String, done_when: Option<String>) -> Result<()> {
-    let v = set_goal(&space, &goal, done_when.as_deref())?;
+/// `tower space goal <space> "<goal>" [--done-when "<…>"] [--by you]` (and `tower space agenda`).
+pub fn cmd_goal(space: String, goal: String, done_when: Option<String>, by: Option<String>) -> Result<()> {
+    let v = set_goal(&space, &goal, done_when.as_deref(), by.as_deref())?;
     let name = v["space"].as_str().unwrap_or("");
     if !std::io::stdout().is_terminal() {
         println!("{}", serde_json::to_string_pretty(&v)?);
@@ -1340,6 +1453,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_goals_history_keeps_who_changed_it_and_the_goal_it_had_before() {
+        let mut s = Spaces::default();
+        // A goal from before the tower kept its history.
+        s.agendas.insert("Shop".into(), "Ship the checkout".into());
+        s.missions.insert("Shop".into(), Mission { goal_ms: 50, done_when: "it is live".into(), ..Mission::born(10) });
+        goal_by(&mut s, "Shop", Some("Ship the checkout, with Apple Pay"), None, &Change::by("you"), 100);
+        let g = &s.missions["Shop"].goals;
+        assert_eq!(g.iter().map(|c| (c.goal.as_str(), c.by.as_str(), c.at_ms)).collect::<Vec<_>>(), [("Ship the checkout", "", 50), ("Ship the checkout, with Apple Pay", "you", 100)]);
+        assert_eq!(g[1].done_when, "it is live", "a version keeps the done-when it had");
+        // The same again is no new version; a done-when alone is one.
+        goal_by(&mut s, "Shop", Some("Ship the checkout, with Apple Pay"), None, &Change::by("you"), 110);
+        assert_eq!(s.missions["Shop"].goals.len(), 2);
+        goal_by(&mut s, "Shop", None, Some("it is live; Apple Pay works"), &Change::by("tower"), 120);
+        assert_eq!(s.missions["Shop"].goals.last().map(|c| (c.by.as_str(), c.done_when.as_str())), Some(("tower", "it is live; Apple Pay works")));
+        assert_eq!(brief(&s, "Shop")["goal_history"].as_array().map(Vec::len), Some(3), "tower space goal prints it");
+        // The first version and the latest are kept.
+        for i in 0..30 {
+            goal_by(&mut s, "Shop", Some(&format!("Ship the checkout, step {i}")), None, &Change::by("request"), 200 + i);
+        }
+        let g = &s.missions["Shop"].goals;
+        assert_eq!((g.len(), g[0].goal.as_str(), g.last().unwrap().goal.as_str()), (GOALS_KEPT, "Ship the checkout", "Ship the checkout, step 29"));
+        // Cleared: its history goes with it.
+        goal_by(&mut s, "Shop", Some(""), None, &Change::by("you"), 300);
+        assert!(s.missions["Shop"].goals.is_empty());
+        // A request's change, when the goal is still what it was weighed on.
+        goal_by(&mut s, "Shop", Some("Ship the checkout"), Some(""), &Change::by("launch"), 400);
+        let req = Change { by: "request".into(), request: "add Apple Pay too".into(), why: "adds Apple Pay".into() };
+        assert!(goal_from_request(&mut s, "Shop", ("Ship the checkout", "other"), "Ship it with Apple Pay", "", &req, 410).is_none(), "the done-when changed meanwhile");
+        let c = goal_from_request(&mut s, "shop", ("Ship the checkout", ""), "Ship it with Apple Pay", "Apple Pay works", &req, 420).unwrap();
+        assert_eq!((c.by.as_str(), c.request.as_str(), s.agendas["Shop"].as_str(), s.missions["Shop"].goal_ms), ("request", "add Apple Pay too", "Ship it with Apple Pay", 420));
+        // The view carries it for the windows and the phone.
+        let v = view(&s, &Sources { sessions: None, decisions: &[], ledger: &crate::agenda::Ledger::default(), threads: &BTreeMap::new(), towers: &BTreeMap::new(), now: 500, auto_close_hours: 24 });
+        let row = v["spaces"].as_array().unwrap().iter().find(|r| r["name"] == "Shop").unwrap();
+        assert_eq!(row["goal_history"].as_array().unwrap().last().unwrap()["by"], "request");
+    }
+
+    #[test]
     fn a_resolved_space_says_its_goal_is_achieved_in_the_record() {
         assert_eq!(closed_text("isa", Some("Ship the clips"), "Clips are live."), "isa is resolved: its goal is achieved (Ship the clips), and it is closed. Clips are live.");
         assert_eq!(closed_text("isa", None, ""), "isa is closed. No closing report.");
@@ -1692,6 +1842,7 @@ mod tests {
                 "name": "Shop",
                 "goal": "Ship the new checkout",
                 "done_when": "the checkout is live",
+                "goal_history": [],
                 "standing": false,
                 "review": true,
                 "state": "ready",

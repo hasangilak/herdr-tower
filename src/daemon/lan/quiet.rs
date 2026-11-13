@@ -706,7 +706,7 @@ mod tests {
         fn goal(&self, space: &str, goal: Option<&str>, done_when: Option<&str>, standing: Option<bool>) -> Result<Value> {
             let now = crate::history::now_ms();
             Ok(spaces::update_in(&self.ui, |s| {
-                let v = crate::missions::goal_in(s, space, goal, done_when, now);
+                let v = crate::missions::goal_by(s, space, goal, done_when, &crate::missions::Change::by("you"), now);
                 match standing {
                     Some(on) => crate::missions::standing_in(s, space, on, now),
                     None => v,

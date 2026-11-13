@@ -24,6 +24,7 @@ mod covered;
 mod daemon;
 mod decisions;
 mod dispatch;
+mod goals;
 mod draft;
 mod hc;
 mod history;
@@ -699,7 +700,10 @@ enum Cmd {
         clear: bool,
     },
     /// A space is a mission with an end. `tower space goal b2c "Answer support tickets" [--done-when
-    /// "the queue is empty"]` ("" clears it; `agenda` is the same). `tower space standing <space>
+    /// "the queue is empty"]` ("" clears it; `agenda` is the same; `--by you`: set by hand). A goal
+    /// follows the user's requests there: one that adds scope rewrites it, and its history is kept.
+    /// `tower space goal-request <space> "<words>" [--dry-run]` weighs words as such a request by hand.
+    /// `tower space standing <space>
     /// on|off`: a space you keep (never ready, never closed by the tower, no worktrees).
     /// `tower space report <space> "<text>"`: its closing report. `tower space close <space>
     /// [--force]`: ends its sessions, removes its clean worktrees, archives it (refused while a
@@ -712,17 +716,20 @@ enum Cmd {
     /// `tower space review <space> on|off`: whether the PRs its sessions open get a reviewer session
     /// (on by default; off ends one that is open there).
     Space {
-        /// goal | agenda | standing | report | close | resolve | follow | unfollow | mute | unmute | review
+        /// goal | agenda | goal-request | standing | report | close | resolve | follow | unfollow | mute | unmute | review
         what: String,
         space: String,
         text: Vec<String>,
         /// goal: what counts as done.
         #[arg(long)]
         done_when: Option<String>,
+        /// goal: who sets it: `you` (the user, by hand: a window, the phone); else the tower's brain.
+        #[arg(long)]
+        by: Option<String>,
         /// close, resolve: though a session there still works or waits for you.
         #[arg(long)]
         force: bool,
-        /// resolve: say what it would end and remove, and change nothing.
+        /// resolve, goal-request: say what it would do, and change nothing.
         #[arg(long)]
         dry_run: bool,
     },
@@ -1198,8 +1205,9 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Focus { space, clear } => spaces::cmd_focus(Some(space.join(" ")).filter(|s| !s.is_empty()), clear),
-        Cmd::Space { what, space, text, done_when, force, dry_run } => match what.as_str() {
-            "goal" | "agenda" => missions::cmd_goal(space, text.join(" "), done_when),
+        Cmd::Space { what, space, text, done_when, by, force, dry_run } => match what.as_str() {
+            "goal" | "agenda" => missions::cmd_goal(space, text.join(" "), done_when, by),
+            "goal-request" => goals::cmd_request(&space, &text.join(" "), dry_run),
             "report" => missions::cmd_report(space, text.join(" ")),
             // The space's name may be several words.
             "standing" => missions::cmd_standing(std::iter::once(space).chain(text).collect()),
@@ -1209,7 +1217,7 @@ fn run(cli: Cli) -> Result<()> {
             "mute" | "unmute" => spaces::cmd_mute(std::iter::once(space).chain(text).collect::<Vec<_>>().join(" "), what == "mute"),
             "review" => missions::cmd_review(std::iter::once(space).chain(text).collect()),
             other => bail!(
-                "tower space {other}: use `tower space goal <space> \"<goal>\" [--done-when \"<…>\"]`, `standing <space> on|off`, `review <space> on|off`, `report <space> \"<text>\"`, `close <space> [--force]`, `resolve <space> [--force] [--dry-run]`, or `follow|unfollow|mute|unmute <space>`"
+                "tower space {other}: use `tower space goal <space> \"<goal>\" [--done-when \"<…>\"] [--by you]`, `goal-request <space> \"<the user's words>\" [--dry-run]`, `standing <space> on|off`, `review <space> on|off`, `report <space> \"<text>\"`, `close <space> [--force]`, `resolve <space> [--force] [--dry-run]`, or `follow|unfollow|mute|unmute <space>`"
             ),
         },
         Cmd::Review { action, pr, critical, json, text } => review_cmd(action.as_deref().unwrap_or("list"), pr.as_deref().unwrap_or(""), critical, &text.join(" "), json),

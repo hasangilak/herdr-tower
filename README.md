@@ -376,6 +376,15 @@ A space with a goal is a mission: it has a goal, what counts as done, and
 an end. `tower space goal <space> "<goal>" [--done-when "<…>"]` sets them
 (or the Goal button in the space's view).
 
+The goal follows your requests: when you ask for something in a space
+that adds to what it is for (of its tower, of the main tower about it, or
+work the tower hands out there for you), the tower rewrites the goal and
+its done-when, keeping what the space was first for, and keeps every
+version; a request that is a step toward the goal leaves it. The Goal card
+says "updated by your request at 3:55 PM", the request, and the earlier
+versions, folded. Your own edit wins. `tower space goal-request <space>
+"<words>" [--dry-run]` weighs words as such a request by hand.
+
 - **open**: it has sessions at work.
 - **quiet**: its last session is gone. What was raised there closes (a PR
   waiting for your merge stays yours). A day later it is archived: out of
@@ -841,7 +850,8 @@ tower plan [show [<id>]] [--json] | list | close [<id>]   # the open plan (and i
 tower setups                         # the projects `tower launch` opens with; tower setup add "<name>" --account <a> [--about "<line>"] --repo "<dir>=<role>" [--repo …] [--was "<old>"], tower setup remove "<name>"
 tower missions                       # every open space as a mission: goal, state, what needs you, sessions (worktree, port), requests
 tower spaces [--all]                 # every space: focus, goal, state, unread news, sessions (--all: archived and closed ones too)
-tower space goal <space> "<goal>" [--done-when "<…>"]   # what a space is for and what counts as done
+tower space goal <space> "<goal>" [--done-when "<…>"] [--by you]   # what a space is for and what counts as done
+tower space goal-request <space> "<words>" [--dry-run]   # weigh words as your request there: the goal follows when they add scope
 tower space standing <space> on|off  # a space you keep: never ready, never closed by the tower, no worktrees
 tower space report <space> "<text>"  # its closing report (the brain writes it when the space is ready)
 tower space close <space> [--force]  # end its sessions, remove its clean worktrees, archive it

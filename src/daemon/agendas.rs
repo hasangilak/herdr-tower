@@ -190,7 +190,8 @@ impl Agendas {
             return None;
         }
         // The real tower and a test one never follow each other's sessions.
-        if !reg.session.is_empty() && hc::get(&reg.session).is_some_and(|t| super::watch::left_alone(&t)) {
+        let session = (!reg.session.is_empty()).then(|| hc::get(&reg.session)).flatten();
+        if session.as_ref().is_some_and(super::watch::left_alone) {
             return None;
         }
         // What goes to a brain (the main one, a space's own) is no task of anyone's.
@@ -198,12 +199,17 @@ impl Agendas {
             return None;
         }
         let heard = self.heard();
-        let r = {
+        let (r, request) = {
             let mut l = self.lock();
             let r = l.register(&reg, &heard, now_ms())?;
             self.save(&l);
-            r
+            // A request of the user's handed out into a space: it may add to what that space is for.
+            let request = l.request_in_space(&r, session.as_ref().and_then(crate::spaces::space_of).as_deref());
+            (r, request)
         };
+        if let Some((space, words, at_ms)) = request {
+            super::goals::heard(&space, &words, at_ms, "a dispatch into it");
+        }
         eprintln!("[agenda] #{} is {} in {} ({})", reg.queue_id, r.task, r.agenda, r.how);
         self.kick();
         Some(r)
