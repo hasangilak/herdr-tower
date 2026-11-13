@@ -79,7 +79,8 @@ pub struct Pr {
     pub checked_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub closed_ms: Option<u64>,
-    /// Who merged it: `mac`, `phone:<device>`, or `github` (seen merged).
+    /// Who merged it: `mac`, `phone:<device>`, `tower` (low risk, into dev:
+    /// `crate::prscore::auto_path`), or `github` (seen merged).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub merged_by: Option<String>,
     /// Looked at once more after it closed: no more polling.
@@ -91,6 +92,13 @@ pub struct Pr {
     /// it; none when its space has review off, or it got no reviewer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review: Option<crate::reviews::Brief>,
+    /// Whether it needs a human code review, and why (`crate::prscore`):
+    /// its plan's prediction, read again on its own files at its head.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<crate::prscore::Score>,
+    /// The tower's own merge of it (`[prs] auto_merge_low_risk`): merged, or why it couldn't.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto: Option<crate::prscore::Auto>,
 }
 
 impl Pr {
@@ -371,6 +379,10 @@ pub fn gate(pr: &Pr) -> Gate {
     if let Some(w) = pr.review.as_ref().and_then(crate::reviews::merge_warning) {
         g.warnings.push(w);
     }
+    // Its score says a person must read it: said before the merge too.
+    if let Some(s) = pr.score.as_ref().filter(|s| s.needs_review) {
+        g.warnings.push(format!("{}.", s.line.trim_end_matches('.')));
+    }
     g
 }
 
@@ -401,6 +413,14 @@ fn gh(bin: &Path, args: &[&str]) -> Result<String> {
 pub fn fetch(bin: &Path, repo: &str, number: u64) -> Result<Value> {
     let out = gh(bin, &["pr", "view", &number.to_string(), "--repo", repo, "--json", FIELDS])?;
     serde_json::from_str(&out).context("reading gh's answer")
+}
+
+/// The files a PR changes and its head commit, as GitHub has them now
+/// (`gh pr view --json files,headRefOid`): what its score reads.
+pub fn fetch_files(bin: &Path, repo: &str, number: u64) -> Result<(Vec<String>, String)> {
+    let out = gh(bin, &["pr", "view", &number.to_string(), "--repo", repo, "--json", "files,headRefOid"])?;
+    let v: Value = serde_json::from_str(&out).context("reading gh's answer")?;
+    Ok((crate::prscore::files_of(&v), v["headRefOid"].as_str().unwrap_or("").to_string()))
 }
 
 /// The repo's default merge method for this user: `--merge`, `--squash` or `--rebase`.
@@ -489,6 +509,10 @@ pub type OnChange = Box<dyn Fn(&str, &Pr) + Send + Sync>;
 /// waited on): the daemon tells the session and the brain.
 pub type OnMerged = Box<dyn Fn(&Pr, &str) + Send + Sync>;
 
+/// A PR found just now, before it is shown: its review score (the daemon's:
+/// its plan's prediction, and its own files).
+pub type OnScore = Box<dyn Fn(&Pr) -> Option<crate::prscore::Score> + Send + Sync>;
+
 /// A phone's confirmation: the PR's key, the device, the head commit, until when.
 type Token = (String, String, String, u64);
 
@@ -501,6 +525,7 @@ pub struct Prs {
     version: Arc<AtomicU64>,
     on_change: Arc<OnceLock<OnChange>>,
     on_merged: Arc<OnceLock<OnMerged>>,
+    on_score: Arc<OnceLock<OnScore>>,
     /// Phone confirmations: token → (key, device, head sha, until).
     tokens: Arc<Mutex<BTreeMap<String, Token>>>,
     /// Chat entries are written to the history (the daemon's; tests keep none).
@@ -559,6 +584,7 @@ impl Prs {
             version: Arc::default(),
             on_change: Arc::default(),
             on_merged: Arc::default(),
+            on_score: Arc::default(),
             tokens: Arc::default(),
             chat: false,
         }
@@ -578,6 +604,11 @@ impl Prs {
 
     pub fn on_merged(&self, f: OnMerged) {
         let _ = self.on_merged.set(f);
+    }
+
+    /// How a PR found from now on is scored, before it is shown.
+    pub fn on_score(&self, f: OnScore) {
+        let _ = self.on_score.set(f);
     }
 
     /// The user merged `key` (from the Mac panel or a phone): GitHub is
@@ -603,6 +634,26 @@ impl Prs {
             return;
         }
         pr.review = review;
+        self.store(pr, "update", true);
+    }
+
+    /// Its review score as it stands now (read again at a new head commit).
+    pub fn set_score(&self, k: &str, score: Option<crate::prscore::Score>) {
+        let Some(mut pr) = self.get(k) else { return };
+        if pr.score == score {
+            return;
+        }
+        pr.score = score;
+        self.store(pr, "update", true);
+    }
+
+    /// The tower's own merge of it, as it went.
+    pub fn set_auto(&self, k: &str, auto: Option<crate::prscore::Auto>) {
+        let Some(mut pr) = self.get(k) else { return };
+        if pr.auto == auto {
+            return;
+        }
+        pr.auto = auto;
         self.store(pr, "update", true);
     }
 
@@ -640,17 +691,19 @@ impl Prs {
     }
 
     /// Stores `pr` as it is now, tells listeners (`op`: open, update, closed).
-    /// Its review stays as `set_review` last put it: a look at GitHub that
-    /// began before the review moved doesn't take it back.
+    /// Its review, score and the tower's merge stay as `set_review`,
+    /// `set_score` and `set_auto` last put them: a look at GitHub that began
+    /// before they moved doesn't take them back.
     fn put(&self, pr: Pr, op: &str) {
         self.store(pr, op, false);
     }
 
-    fn store(&self, mut pr: Pr, op: &str, review: bool) {
+    /// `own`: the tower's own fields (review, score, auto) are `pr`'s.
+    fn store(&self, mut pr: Pr, op: &str, own: bool) {
         {
             let mut all = self.lock();
-            if !review && let Some(old) = all.get(&pr.key()) {
-                pr.review = old.review.clone();
+            if !own && let Some(old) = all.get(&pr.key()) {
+                keep_own(&mut pr, old);
             }
             all.insert(pr.key(), pr.clone());
             self.save(&all);
@@ -703,7 +756,17 @@ impl Prs {
             if !pr.open() {
                 continue;
             }
-            eprintln!("[prs] {k} by {session} ({name}): {} into {}, {}", pr.title, pr.base, pr.checks_line());
+            // Its review score, from the start (its plan's prediction, its own files).
+            if let Some(f) = self.on_score.get() {
+                pr.score = f(&pr);
+            }
+            eprintln!(
+                "[prs] {k} by {session} ({name}): {} into {}, {}{}",
+                pr.title,
+                pr.base,
+                pr.checks_line(),
+                pr.score.as_ref().map(|s| format!("; {}", s.line)).unwrap_or_default()
+            );
             if self.chat {
                 crate::history::append(crate::history::Entry {
                     kind: "pr".into(),
@@ -782,7 +845,7 @@ impl Prs {
             // Only when it was looked at changed: saved, nobody told.
             let mut all = self.lock();
             if let Some(old) = all.get(&pr.key()) {
-                pr.review = old.review.clone();
+                keep_own(&mut pr, old);
             }
             all.insert(pr.key(), pr.clone());
             self.save(&all);
@@ -847,6 +910,13 @@ impl Prs {
         let (key, dev, sha, until) = t.remove(token)?;
         (key == k && dev == device && until > crate::history::now_ms()).then_some(sha)
     }
+}
+
+/// The tower's own fields of `old` onto `pr` (a look at GitHub knows none of them).
+fn keep_own(pr: &mut Pr, old: &Pr) {
+    pr.review = old.review.clone();
+    pr.score = old.score.clone();
+    pr.auto = old.auto.clone();
 }
 
 /// A PR without when and whether it is looked at: what the chip shows.

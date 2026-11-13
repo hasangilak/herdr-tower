@@ -119,7 +119,7 @@ impl Plans {
 
     /// A `plan` request (see `Request::Plan`).
     pub fn request(&self, req: &Request) -> Response {
-        let Request::Plan { action, id, form, ticket, draft, text, url, who, launched } = req else { return Response::err("not a plan request") };
+        let Request::Plan { action, id, form, ticket, draft, text, url, who, launched, prs } = req else { return Response::err("not a plan request") };
         let id = id.trim();
         let id = (!id.is_empty()).then_some(id);
         let done = |r: Result<Value>| match r {
@@ -134,12 +134,13 @@ impl Plans {
                 who.and_then(|w| self.say(&id, w, text))
             })),
             "draft" => view(self.pick_id(id).and_then(|id| self.revise(&id, draft.clone().unwrap_or_default()))),
+            "prs" => view(self.pick_id(id).and_then(|id| self.predict(&id, prs.clone().unwrap_or_default()))),
             "published" => view(self.pick_id(id).and_then(|id| self.change(|b| b.published(&id, url, now())))),
             "failed" => view(self.pick_id(id).and_then(|id| self.change(|b| b.failed(&id, text, now())))),
             "close" => view(self.pick_id(id).and_then(|id| self.close(&id, launched.as_deref()))),
             "show" | "" => done(lock(&self.book).pick(id).map(Plan::view)),
             "list" => done(Ok(json!({ "plans": lock(&self.book).plans.iter().rev().map(Plan::view).collect::<Vec<_>>() }))),
-            other => Response::err(format!("plan is new, say, draft, published, failed, show, close or list, not {other:?}")),
+            other => Response::err(format!("plan is new, say, draft, prs, published, failed, show, close or list, not {other:?}")),
         }
     }
 
@@ -223,6 +224,28 @@ impl Plans {
         Ok(p)
     }
 
+    /// The PRs the planner predicts: checked against the plan's draft, scored, kept.
+    fn predict(&self, id: &str, v: Value) -> Result<Plan> {
+        let repos = {
+            let b = lock(&self.book);
+            plans::repos_of(&b.get(id).ok_or_else(|| anyhow::anyhow!("no plan {id}"))?.draft)
+        };
+        let prs = crate::prscore::check(&v, &repos)?;
+        let p = self.change(|b| b.set_prs(id, prs, now()))?;
+        eprintln!("[plans] {id}: {} PR(s) predicted, {} needing review", p.prs.len(), p.prs.iter().filter(|x| x.score.needs_review).count());
+        Ok(p)
+    }
+
+    /// The prediction a PR just found is, in the plan its space was
+    /// launched with: (the plan's id, the prediction), marked as opened.
+    pub fn match_pr(&self, pr: &crate::prs::Pr) -> Option<(String, crate::prscore::Predicted)> {
+        let mut b = lock(&self.book);
+        let found = b.match_pr(pr.space.as_deref().unwrap_or(""), &pr.repo, &pr.base, &pr.title, &pr.key(), now())?;
+        self.save(&b);
+        self.publish(&b);
+        Some(found)
+    }
+
     /// Closed, and its planner ended.
     fn close(&self, id: &str, launched: Option<&str>) -> Result<Plan> {
         let p = self.change(|b| b.close(id, launched, now()))?;
@@ -257,7 +280,7 @@ mod tests {
     }
 
     fn ask(action: &str, id: &str) -> Request {
-        Request::Plan { action: action.into(), id: id.into(), form: String::new(), ticket: String::new(), draft: None, text: String::new(), url: String::new(), who: String::new(), launched: None }
+        Request::Plan { action: action.into(), id: id.into(), form: String::new(), ticket: String::new(), draft: None, text: String::new(), url: String::new(), who: String::new(), launched: None, prs: None }
     }
 
     #[test]
@@ -292,6 +315,23 @@ mod tests {
             *d = Some(v);
         }
         assert!(plans.request(&revised).ok, "no id: the open plan");
+        // The planner's predicted PRs: scored and shown; one for a repo the draft hasn't is refused.
+        let mut predicted = ask("prs", "p1");
+        if let Request::Plan { prs, .. } = &mut predicted {
+            *prs = Some(json!({ "prs": [
+                { "repo": "eyz-customer-support", "title": "Translations table", "files": ["db/migrations/0042_translations.sql"], "migration": true },
+                { "repo": "/w/eyz/eyz-customer-support", "title": "Translate button styling", "files": ["src/ui/Button.tsx"] },
+            ]}));
+        }
+        let r = plans.request(&predicted);
+        assert!(r.ok, "{:?}", r.error);
+        let shown = shared.get().plan.unwrap();
+        assert_eq!((shown["prs"][0]["score"]["needs_review"].as_bool(), shown["prs"][1]["score"]["needs_review"].as_bool()), (Some(true), Some(false)));
+        let mut wrong = ask("prs", "p1");
+        if let Request::Plan { prs, .. } = &mut wrong {
+            *prs = Some(json!([{ "repo": "elsewhere", "title": "x" }]));
+        }
+        assert!(plans.request(&wrong).error.unwrap().contains("isn't one of the draft's"));
         let state = shared.get().plan.unwrap();
         assert_eq!((state["status"].as_str(), state["url"].as_str(), state["revision"].as_u64()), (Some("ready"), Some("https://claude.ai/artifact/wb"), Some(1)));
         assert_eq!((state["thread"][0]["from"].as_str(), state["draft"]["space"].as_str()), (Some("planner"), Some("msg-translate")));

@@ -1399,7 +1399,8 @@ answers; the open one and the last 20 closed), and shows the open one in
   "blocked": a dialog waits in its terminal, "answering": the user's last line has no answer yet,
   "dir", "plan_md": its folder and plan.md, "url": the artifact's link or null, "why": why it failed, or that the planner ended,
   "thread": [ { "from": "user" | "planner", "text", "at" } ],   (oldest first, at most 200)
-  "created_ms", "ready_ms", "updated_ms", "closed_ms", "launched": the space launched with it }
+  "created_ms", "ready_ms", "updated_ms", "closed_ms", "launched": the space launched with it,
+  "prs": [ Predicted ] }   (the PRs it predicts, each with its score: "Predicted PRs and their review score" below)
 ```
 
 Every two seconds the open plan's planner is looked at (`hc get`): its
@@ -1425,6 +1426,11 @@ talk it over).
   checked as a draft is (`ticket::check`: an unknown folder is left out and
   said so; none left is an error) and kept as its receipt; it prints what
   it took.
+- `tower plan prs <id> --json-file <file>`: the PRs the plan predicts
+  (`{"prs": [{repo, base, title, changes, files, migration, breaking,
+  escalate, after}]}`), checked against the draft's repos and scored; it
+  prints each one's score, for the planner to put in the plan as it is.
+  Again after a change: a PR that opened keeps its prediction.
 - `tower plan published <id> --url <link>` (an `https://` link; again after
   a republish), `tower plan failed <id> "<why>"`.
 - `tower plan [show [<id>]] [--json]` (the open one when no id; from
@@ -1468,6 +1474,12 @@ this ticket:
   session its part. A planner that ended: why, and Plan again.
 - **Failed**: "The plan didn't come: <why>." and **Plan again as a page** ·
   **Plan again as a whiteboard**.
+- **Pull requests**: once the planner predicted them, under the plan's
+  line: "2 pull requests, 1 needs review", then a row each (`PR 1 ·
+  <repo> → dev`, its title, what it changes, roughly which files, its
+  badge, **Needs review** in amber or **Low risk** in cyan, and why, and
+  "After PR 1" / "Opened: <key>"), and who merges which (auto-merge on or
+  off).
 - **The chat** is New space's conversation (above): the user's lines
   (You, amber) and the planner's answers (The planner), with "The plan is
   ready, a page on your claude.ai account: <link>." among them, in time
@@ -1687,6 +1699,111 @@ Review { "key": "owner/repo#12", "repo", "number", "url", "title", "base", "head
   The merge stays the user's: it never blocks it.
 - **The state** has `reviews`: every review not over and those over in the
   last day, the latest first (`Review` + `chip`).
+
+## Predicted PRs and their review score
+
+The model is `src/prscore.rs`; the tower's own merges run in
+`src/daemon/automerge.rs`.
+
+### The plan predicts them
+
+When a plan changes code, its planner says what the future pull requests
+will look like, one entry per PR, in `prs.json` in its folder, and hands
+them over with `tower plan prs <id> --json-file prs.json`:
+
+```
+{ "prs": [ { "repo": "<the repo's folder name, as the draft has it>", "base": "dev",
+             "title", "changes": "<what it changes>", "files": ["<roughly which files>"],
+             "migration": false, "breaking": "<what it breaks, or empty>",
+             "escalate": ["<anything else on the escalate list>"], "after": [<the PRs it waits for, by number>] } ] }
+```
+
+`base` is `dev` when not said: the user's release rule is dev first, then
+dev into main or prod as a release PR of its own, which the user merges.
+The tower checks each (its repo is one of the draft's; it has a title; what
+it waits for is in the list; 30 at most), numbers them from 1, scores them
+and keeps them with the plan (`prs`). It prints the scores; the planner
+puts a `## Pull requests` section in `plan.md` and in the artifact, one
+entry per PR with its score and reason as printed. A launched session's
+first instruction carries that section with the rest of its part of the
+plan.
+
+### The score
+
+A PR **needs review** when a person must read it, and is **low risk**
+otherwise. It needs review for:
+
+- **a database migration**: the planner says so (`migration`), a file in a
+  `migrations/` (`migrate/`, `alembic/`, …) folder, a `.sql` file,
+  `schema.prisma`, or words such as "add column", "drop table", "backfill";
+- **a breaking change**: the planner says what breaks (`breaking`), an API
+  contract file changes (`openapi.*`, `swagger.*`, `.proto`, `.graphql`),
+  or the words say it ("breaking", "changes the response", "renames the
+  total field", "removes the v1 endpoint": a verb that takes something
+  away, then within four words a thing others rely on);
+- **anything on the escalate list**: secrets or credentials (`.env`,
+  `.pem`, "api key"), infrastructure (Terraform, `.github/workflows/`,
+  Docker, `serverless.yml`, "AWS", "DNS"), a deploy or release ("release:
+  dev into main"; a release build isn't one), auth (`auth/`, `sign-in`,
+  "permissions"), deleting or overwriting data, money or billing, new
+  dependencies (a dependency manifest), security; and whatever the planner
+  lists in `escalate`.
+
+A word said as not done ("no migration", "without breaking changes")
+doesn't count. Each reason names what it was found in; the line is
+"Needs review: a database migration (db/migrations/0042_orders.sql)" (two
+reasons, then "and N more"), or "Low risk: no migration, breaking change,
+secrets, infrastructure or auth".
+
+### The real PR carries it
+
+When a session's turn opens a PR (`prs::Prs::found`), the daemon scores it
+before it is shown (`score_found`): the plan its space was launched with
+(the latest) is asked for the prediction it is (`plans::Book::match_pr`:
+the same repo, not matched yet, the same base first, then the title that
+shares the most words, then the first in order; a PR found again keeps its
+prediction), and the PR's own title and files at its head are read (`gh pr
+view --json files,headRefOid`). The score is the prediction's with what the
+files show added; what they show and the plan didn't is said so ("…, which
+the plan didn't predict"). A PR no plan predicted is scored on its own
+title and files. A push since (its head moved) is read again at the next
+look. The score is on the PR (`score`, in `prs.json`, `GET /v1/prs`, the
+`pr` event), on the merge card's row and in a merge decision's `prs[]`; a
+PR that needs review has its line among the merge's warnings and is never
+the tower's pick; the space's view adds the word to each PR's line.
+
+### Merging without asking
+
+`[prs] auto_merge_low_risk` (off by default; `tower automerge on|off|status`,
+Settings → Pull requests). While it is off every merge is the user's, as
+before. While it is on, the tower merges a PR itself (`prscore::auto_path`)
+only when all of these hold:
+
+- a plan predicted it (`score.planned`), and it is scored low risk, read on
+  its own files at its head commit;
+- it merges into dev (`dev`, `develop`, `development`): never main or prod;
+- it is open, no draft, without conflicts, and GitHub says it merges
+  cleanly;
+- its checks pass (none running, none failing; a PR with no checks is the
+  user's);
+- its reviewer agreed without finding anything critical (agreed in round
+  0): a PR with no reviewer, one whose reviewer found something (even if
+  fixed since), or a review that ended without agreement is the user's;
+- the tower hasn't failed to merge it at this commit.
+
+Every ten seconds the daemon's PR thread looks (`AutoMerger::tick`): a
+ready PR's files are read once more right before the merge (a migration
+that came in with the last push stops it), then `prs::merge` merges it
+pinned to that head commit, with the repo's own method, never `--admin`.
+GitHub is asked, `merged_by` is `tower`, `auto` says how it went, and the
+session and the brain are told as after any merge ("The tower merged PR #N
+(…) into dev itself: low risk, into dev; its checks passed and its
+reviewer found nothing."). A merge GitHub refuses (branch protection, a
+required review) is kept as `auto: failed` with why: the PR is the user's
+from then on, until a new commit. While a PR is on its way (checks
+running, its reviewer reading, or ready) it is no merge decision: it waits
+for nobody; once it falls off the way (checks fail, the reviewer finds
+something, its files need review), its decision comes as before.
 
 ## What you type in a session and what the tower queues for it
 
