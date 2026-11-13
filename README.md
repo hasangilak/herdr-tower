@@ -535,6 +535,12 @@ searches every repo under ~/Work for who uses them. Anything it would break
 makes it "Needs review: a breaking change", with a warning that names what
 breaks and who uses it (repo, file, function); the reviewer checks the
 dependents' builds and tests too. Nothing depends on it: it says so.
+
+**Every space has a release track.** Per repo, each of its PRs open,
+merged into dev, on dev (deployed) or on prod, with when, and each release
+to prod (dev into main) with what it carried, worked out from GitHub:
+"On main since 14:20: #829, #830", "On dev, not on main: #831". It is on
+the space's view, its row in the sidebar, the phone and `tower releases`.
 It is on for every space; New space's **Review its PRs** switch (`tower
 launch --no-review`), the space's own **Review PRs** switch and `tower
 space review <space> off` turn it off.

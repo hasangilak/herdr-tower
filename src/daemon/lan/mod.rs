@@ -58,7 +58,8 @@ pub const API: u32 = 1;
 /// `validation` (each check passed, failed, not run or not reported yet).
 /// `impact`: who outside depends on what a PR changes (`impact` on a PR,
 /// `dependents` and `outside` on a predicted one), and a breaking change's warning.
-pub const FEATURES: &[&str] = &["quiet", "acts", "pairing", "bonjour", "reviews", "scores", "validation", "impact"];
+/// `releases`: each space's release track (`releases` in the state, `GET /v1/releases`).
+pub const FEATURES: &[&str] = &["quiet", "acts", "pairing", "bonjour", "reviews", "scores", "validation", "impact", "releases"];
 const MAX_CONNECTIONS: usize = 32;
 /// Connections open at once from one address.
 const MAX_PER_IP: usize = 8;
@@ -1401,6 +1402,17 @@ impl Lan {
                     self.ctx.prs.list().into_iter().filter(|p| p.open() || p.closed_ms.is_some_and(|c| c >= day_ago)).collect();
                 list.sort_by_key(|p| (!p.open(), !p.waiting, std::cmp::Reverse(p.found_ms)));
                 Response::json(200, &json!({ "prs": list.iter().map(crate::prs::Pr::view).collect::<Vec<_>>() }))
+            }
+            // Each space's release track (see docs/mobile-api.md, "Release track"): `?space=` for one.
+            ("GET", ["releases"]) => {
+                let all = self.ctx.shared.get().releases;
+                match req.query.get("space").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    Some(s) => match all.as_object().and_then(|o| o.iter().find(|(k, _)| k.eq_ignore_ascii_case(s))) {
+                        Some((_, t)) => Response::json(200, &json!({ "release": t })),
+                        None => Response::error(404, "no_track", "no release track for that space: it has no PR the tower tracks"),
+                    },
+                    None => Response::json(200, &json!({ "releases": all })),
+                }
             }
             ("GET", ["prs", owner, repo, n]) => match self.ctx.prs.get(&format!("{owner}/{repo}#{n}")) {
                 Some(p) => Response::json(200, &json!({ "pr": p.view() })),

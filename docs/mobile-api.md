@@ -798,6 +798,37 @@ cases under each predicted PR. A PR whose planned checks haven't all
 passed is never merged by the tower, and the missing ones are among the
 merge's `warnings`.
 
+**Release track** (feature `releases`). Where each space's changes stand,
+worked out from GitHub: `GET /v1/releases` → `{"releases": {"<space>":
+Track}}`, `GET /v1/releases?space=<space>` → `{"release": Track}` (404
+`no_track` when it has no PR the tower tracks); the state's `releases` (by
+space) is the same and comes with every `state` event.
+
+```
+Track { "space", "summary": "prod 14:20 · 1 on dev", "checked_ms",
+  "repos": [ { "repo": "eyzhub/shop-api", "dev": "dev", "prod": "main",
+    "lines": ["On main since 14:20: #829, #830", "On dev, not on main: #831", "Open: #832"],
+    "on_prod": [ { "since_ms", "prs": [829, 830] } ],     (newest release first)
+    "on_dev_not_prod": [831],
+    "changes": [ { "number", "title", "url", "base",
+                   "stage": "open" | "merged" | "deployed" | "released" | "closed",
+                   "merged_ms", "deployed_ms", "released_ms", "release": the release PR's number,
+                   "skipped_dev": merged straight into prod, "stage_line": "on main since 14:20 (release #840)" } ],
+    "releases": [ { "number", "title", "url", "head", "base", "state": "open" | "merged",
+                    "merged_ms": when it landed, "carried": [829, 830] } ],   (newest first)
+    "deployed": { "sha", "at_ms", "environment" } } ] }
+```
+
+What the Android app needs: on each space (its row in Spaces, and its
+screen), the `summary` under its name; on its screen a "Release track"
+section per repo with its `lines` (a line starting "On <prod> since" in
+cyan, "On <dev>, not on" in amber, one about the dev-then-prod rule in
+rose), each change as a row (`#number`, title, a chip from `stage`: open,
+merged into dev, on dev, on prod, closed; and `stage_line`), and each
+release (`Release #n dev → main`, "landed on main 14:20" or "under way",
+"carried #829, #830"). Times are the tower's (`*_ms`); the `lines` and
+`stage_line` already say them in the Mac's local time.
+
 **Breaking changes** (feature `impact`). A PR carries `impact`: `{things:
 [{kind: function | type | route | field | column | config | event, name,
 change: removed | renamed | signature | unread, renamed_to, file}],
@@ -1641,6 +1672,7 @@ stream's `hello` event). A tower from before there were features sends no
 | `bonjour` | Found by name on the local network: the `_herdr-tower._tcp` advert with the certificate's `fp` in its TXT, and `bonjour` in `GET /v1/network`, `GET /v1/hello`, `POST /v1/pair`'s answer, the stream's `hello` and the `hosts` event (see "Finding the Mac by Bonjour") |
 | `acts` | Acts and what came with them: `GET /v1/acts`, `/v1/acts/{id}`, `POST /v1/acts/{id}/undo`, the chat's `kind: "act"` messages and the `act` event; `rule` in a decision's answer and `POST /v1/decisions/{id}/rule`; `voice` in `/v1/tell` and `tell_voice` in the state |
 | `reviews` | PR review: `review` on a PR (`GET /v1/prs`, the `pr` event, a chat chip's `pr`, a merge decision's `prs[]`), `review` on a mission, `reviews` in the state, and a review that isn't agreed among a merge's `warnings` |
+| `releases` | Each space's release track: `releases` in the state (by space) and `GET /v1/releases` (`?space=` for one) |
 | `impact` | Who outside depends on what a PR changes: `impact` on a PR (wherever `score` is) and `dependents` / `outside` on a predicted one (`plan.prs`), and a breaking change's warning among a merge's `warnings` |
 | `validation` | A predicted PR's `checks` and `edge_cases` (`plan.prs`), and `validation` on a PR (wherever `score` is), with the missing checks among a merge's `warnings` |
 | `scores` | Review scores: `score` and `auto` on a PR (wherever `review` is), a plan's predicted PRs (`plan.prs`), `auto_merge` in the state, `merged_by: "tower"`, and a PR that needs review among a merge's `warnings` |

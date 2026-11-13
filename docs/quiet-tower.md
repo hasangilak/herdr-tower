@@ -1943,6 +1943,41 @@ functionality (`src/impact.rs`):
 The search is by name: a same-named thing that isn't the same one is a
 false alarm, which sends the PR to the user; never the other way.
 
+### The release track: dev and prod
+
+A space's work goes into dev (and is deployed there), then to prod, and
+that can happen several times in one space. Each space has a **release
+track** per repo (`src/releases.rs`, run by `src/daemon/releases.rs`),
+worked out from GitHub and git, never from what sessions say:
+
+- **Its changes**: the PRs the tower tracks in that space (found in the
+  last two weeks). Each one's stage: `open`; `merged` into dev (when); `deployed`
+  on dev (dev's last successful GitHub deployment, its ref the dev branch or
+  its environment dev, development or staging, has the PR's merge commit);
+  `released` to prod (a release PR that landed has it); `closed` without merging.
+- **Its releases**: the repo's release PRs, from a dev branch into a prod
+  one (`gh pr list`, and the release PRs the tower tracks), what of the
+  space each carried and when it landed. A change is on prod since the first
+  release whose head contained its merge commit (GitHub's compare,
+  `repos/<repo>/compare/<commit>...<release head>`: `ahead` or
+  `identical`), however that release merged into main.
+- **The user's rule** is dev first, then dev into prod: a PR merged straight
+  into main is on prod and said so: "#850 went to main without dev first,
+  against the dev-then-prod rule".
+- **What it says**, per repo, a line each: "On main since 14:20: #829,
+  #830" (one per release, newest first), "On dev, not on main: #831",
+  "Release under way: #841 dev → main, carries #831", "Open: #832"; and per
+  change its stage with when ("on main since 14:20 (release #840)", "on
+  dev (deployed since 14:35)", "merged into dev since 14:05, not deployed
+  yet").
+- **Where it shows**: the space's view (a "Release track" card: the lines
+  in colour, on prod cyan and on dev amber, each change with its stage chip,
+  each release with what it carried), the space's row in the sidebar ("2
+  of 3 · prod 14:20 · 1 on dev"), `state.json` (`releases`, by space), the
+  phone (`GET /v1/releases`, feature `releases`), and `tower releases [<space>]`.
+- Every 90 seconds; what can't change (a commit in another's history, a
+  merged PR's merge commit) is asked once.
+
 ### Merging without asking
 
 `[prs] auto_merge_low_risk` (off by default; `tower automerge on|off|status`,

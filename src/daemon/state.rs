@@ -141,6 +141,10 @@ pub struct State {
     /// address, model, effort, restart}], restart_needed, locked_by_args,
     /// locked: {model, effort}, says}`.
     pub brain_model: serde_json::Value,
+    /// Each space's release track (`crate::releases`, `daemon::releases`):
+    /// by space, `{space, repos: [{repo, dev, prod, changes, releases,
+    /// deployed, lines, on_prod, on_dev_not_prod}], summary, checked_ms}`.
+    pub releases: serde_json::Value,
     /// What the tower opened for the user lately (see `crate::acts`), newest
     /// first, at most 10: `{id, kind, at_ms, by, space, line, sessions,
     /// assumed: [{what, value, why}], request: {at, text} or null, state:
@@ -253,6 +257,7 @@ impl State {
             missions: serde_json::json!({ "spaces": [], "quiet": [], "closed_today": [] }),
             brains: vec![],
             brain_model: serde_json::Value::Null,
+            releases: serde_json::json!({}),
             acts: vec![],
             plan: None,
             reviews: vec![],
