@@ -45,6 +45,10 @@ impl Tower for Daemon {
         self.decisions.dismiss_with(id, &self.asks)
     }
 
+    fn hold(&self, id: &str, words: &str, unhold: bool, by: &str) -> Result<Value, Refused> {
+        self.decisions.hold_with(id, words, unhold, by)
+    }
+
     fn missions(&self) -> Value {
         self.missions.now()
     }

@@ -28,6 +28,8 @@
 //! window (`show:<view>` at a view, as `nav::Scope::parse` reads it); either
 //! with `@<x>,<y>` opens at that spot, in screen points. With `show:phone`,
 //! `HERDER_TOWER_ORB_PAIR=open` opens the Phone card's pairing box too.
+//! `HERDER_TOWER_ORB_GHOST=1` makes every window of the orb click-through
+//! and never key (`mac::ghost`): for a test window beside the real tower.
 //! `HERDER_TOWER_ORB_MINIMIZE=1` minimizes the full window once, as its
 //! button does, and brings it back with the orb's click.
 

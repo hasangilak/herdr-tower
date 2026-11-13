@@ -188,6 +188,9 @@ pub struct PrRef {
     pub note: String,
     /// The session that opened it.
     pub session: String,
+    /// Its head commit when last looked at: new commits on a decision on hold bring it back.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub sha: String,
     /// Whether it can be merged now, and what to mind (`prs::Gate::view`).
     pub merge: Value,
     /// Its review (`crate::reviews::Brief`), when it has one.
@@ -222,6 +225,7 @@ impl PrRef {
             .into(),
             note: p.checks_line(),
             session: p.session.clone(),
+            sha: p.head_sha.clone(),
             merge: crate::prs::gate(p).view(),
             review: p.review.clone(),
             score: p.score.clone(),
@@ -233,6 +237,54 @@ impl PrRef {
     fn short(&self) -> String {
         format!("PR #{} into {}", self.number, if self.base.is_empty() { "?" } else { &self.base })
     }
+}
+
+/// A decision the user put on hold ("wait for the ingest filters, then we
+/// go for prod"): still theirs and still listed, in an "On hold" section
+/// of its own with their words, but out of the count, the orb's badge and
+/// the phone's, and never told or reminded. It comes back to the queue
+/// (counted, and told once) when it is updated (`Book::wake`: new commits
+/// or checks on its PRs, it came up again, what it asks changed), when
+/// what it waits for looks done (a PR it names merged, or one merged in its
+/// space that the tower reads as it), or when it is let go (`tower unhold`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Hold {
+    /// The user's words: why it waits, or what for. Empty: none given.
+    pub reason: String,
+    /// Who held it: `mac` (its card), `phone:<device>`, a brain (`tower`,
+    /// `tower-<space>`: a tower, from what the user said in its chat), `cli`.
+    pub by: String,
+    pub since_ms: u64,
+    /// The PRs it waits for, as its reason names them (`owner/name#n`, or
+    /// `#n` in its space): one of them merged, it comes back.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub until_prs: Vec<String>,
+    /// PRs merged in its space since it was held that were weighed against
+    /// its reason already (`daemon::decisions`): each is read once.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub weighed: Vec<String>,
+    /// How it stood when it was held, to tell an update from what it was.
+    pub seen: Seen,
+}
+
+/// What of a decision counts as an update to one on hold.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Seen {
+    /// Its PRs: key, head commit, checks.
+    pub prs: Vec<(String, String, String)>,
+    pub count: u32,
+    pub title: String,
+    pub detail: String,
+}
+
+/// Why a decision that was on hold came back, and when: its card says so.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Back {
+    pub why: String,
+    pub at_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -284,9 +336,59 @@ pub struct Decision {
     pub answer: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub closed_ms: Option<u64>,
+    /// On hold (see `Hold`); None: it waits for the user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold: Option<Hold>,
+    /// It was on hold and came back: why (its card says so).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub back: Option<Back>,
 }
 
 impl Decision {
+    /// On hold: out of the count and never told (see `Hold`).
+    pub fn held(&self) -> bool {
+        self.hold.is_some()
+    }
+
+    /// How it stands now, as far as a hold minds (`Hold::seen`).
+    pub fn seen(&self) -> Seen {
+        Seen { prs: self.prs.iter().map(|p| (p.key.clone(), p.sha.clone(), p.checks.clone())).collect(), count: self.count, title: self.title.clone(), detail: self.detail.clone() }
+    }
+
+    /// What changed since it stood as `was`, in words; None: nothing a hold
+    /// minds (its PRs' reviews and scores may move meanwhile).
+    pub fn update_since(&self, was: &Seen) -> Option<String> {
+        let mut said: Vec<String> = vec![];
+        for p in &self.prs {
+            match was.prs.iter().find(|(k, _, _)| *k == p.key) {
+                None => said.push(format!("{} joined it", p.short())),
+                Some((_, sha, checks)) => {
+                    if !sha.is_empty() && !p.sha.is_empty() && *sha != p.sha {
+                        said.push(format!("PR #{} has new commits", p.number));
+                    } else if *checks != p.checks {
+                        said.push(match p.checks.as_str() {
+                            "pass" => format!("PR #{}'s checks pass now", p.number),
+                            "fail" => format!("PR #{}'s checks fail now", p.number),
+                            "pending" => format!("PR #{}'s checks run again", p.number),
+                            _ => format!("PR #{}'s checks changed", p.number),
+                        });
+                    }
+                }
+            }
+        }
+        // (A blocked session is seen again at every new status line: only what it shows counts.)
+        if said.is_empty() && self.count > was.count && self.kind != Kind::Blocked {
+            said.push("it came up again".into());
+        }
+        if said.is_empty() && self.title != was.title {
+            said.push("what it asks changed".into());
+        }
+        if said.is_empty() && self.detail != was.detail && !self.detail.trim().is_empty() {
+            said.push("it has more to read".into());
+        }
+        (!said.is_empty()).then(|| said.join("; "))
+    }
+
     /// The option the tower would pick.
     pub fn pick(&self) -> Option<&Opt> {
         self.options.iter().find(|o| o.pick)
@@ -342,6 +444,8 @@ impl Decision {
             "count": self.count,
             "state": self.state.word(),
             "muted": muted,
+            "hold": self.hold.as_ref().map(|h| json!({ "reason": h.reason, "by": h.by, "since_ms": h.since_ms, "until_prs": h.until_prs })),
+            "back": self.back.as_ref().map(|b| json!({ "why": b.why, "at_ms": b.at_ms })),
         })
     }
 
@@ -708,7 +812,7 @@ pub fn options_from(v: &Value) -> Result<Vec<Opt>> {
 }
 
 /// The PR numbers a line names (`#42`, `PR 42`).
-fn pr_numbers(text: &str) -> Vec<u64> {
+pub(crate) fn pr_numbers(text: &str) -> Vec<u64> {
     let low = text.to_lowercase();
     let mut out = vec![];
     let mut take = |rest: &str| {
@@ -750,6 +854,10 @@ pub struct Book {
     /// once the PR no longer waits.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub settled_prs: BTreeMap<String, State>,
+    /// Decisions on hold that came back in this change (id, why), for the
+    /// daemon to tell once (`Decisions::change` takes them).
+    #[serde(skip)]
+    pub came_back: Vec<(String, String)>,
 }
 
 impl Book {
@@ -986,6 +1094,8 @@ impl Book {
         for (id, state) in over {
             ch.closed.extend(if state == State::Answered { self.answered(&id, "merged", now) } else { self.close(&id, state, now) });
         }
+        // What a decision on hold waits for merged: it comes back.
+        self.wake_on_merged(prs, now);
         ch
     }
 
@@ -1253,6 +1363,90 @@ impl Book {
             w.waiting = waiting;
         }
         changed
+    }
+
+    /// Puts the open decision `id` on hold (see `Hold`): `reason`, the
+    /// user's words (may be empty); `by`, who did. Held again, its reason is
+    /// the new one and what counts as an update starts from now.
+    pub fn hold(&mut self, id: &str, reason: &str, by: &str, now: u64) -> Result<Decision> {
+        let Some(d) = self.open.iter_mut().find(|d| d.id == id) else {
+            match self.find(id) {
+                Some(d) => bail!("{id} is {} already: only an open decision is put on hold", d.state.word()),
+                None => bail!("no decision {id} (`tower decisions` lists them)"),
+            }
+        };
+        let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+        // The PRs its reason names (its own PRs aside: their updates bring it back anyway).
+        let repo = d.prs.first().map(|p| p.repo.clone());
+        let own: Vec<String> = d.prs.iter().map(|p| p.key.clone()).collect();
+        let mut until: Vec<String> = crate::prs::links(&reason).into_iter().map(|(r, n)| format!("{r}#{n}")).collect();
+        for n in pr_numbers(&reason) {
+            let key = match &repo {
+                Some(r) => format!("{r}#{n}"),
+                None => format!("#{n}"),
+            };
+            if !until.iter().any(|u| u.ends_with(&format!("#{n}"))) {
+                until.push(key);
+            }
+        }
+        until.retain(|u| !own.contains(u));
+        d.hold = Some(Hold { reason, by: by.trim().to_string(), since_ms: now, until_prs: until, weighed: vec![], seen: d.seen() });
+        d.back = None;
+        Ok(d.clone())
+    }
+
+    /// Lets the decision `id` go from hold: it waits for the user again,
+    /// counted, and is told once more (`told` is reset). `why`: what brought it back.
+    pub fn unhold(&mut self, id: &str, why: &str, now: u64) -> Result<Decision> {
+        let Some(d) = self.open.iter_mut().find(|d| d.id == id) else {
+            match self.find(id) {
+                Some(d) => bail!("{id} is {} already", d.state.word()),
+                None => bail!("no decision {id} (`tower decisions` lists them)"),
+            }
+        };
+        if d.hold.is_none() {
+            bail!("{id} isn't on hold");
+        }
+        d.hold = None;
+        d.back = Some(Back { why: why.trim().to_string(), at_ms: now });
+        d.told = false;
+        let d = d.clone();
+        self.came_back.push((d.id.clone(), d.back.as_ref().map(|b| b.why.clone()).unwrap_or_default()));
+        Ok(d)
+    }
+
+    /// The decisions on hold that were updated since they were held (see
+    /// `Decision::update_since`) come back: (id, why) each.
+    pub fn wake(&mut self, now: u64) -> Vec<(String, String)> {
+        let woke: Vec<(String, String)> =
+            self.open.iter().filter_map(|d| d.hold.as_ref().and_then(|h| d.update_since(&h.seen)).map(|why| (d.id.clone(), why))).collect();
+        for (id, why) in &woke {
+            let _ = self.unhold(id, why, now);
+        }
+        woke
+    }
+
+    /// The decisions on hold whose reason names a PR that merged now (in
+    /// `prs`, the store's): they come back, what they waited for done.
+    fn wake_on_merged(&mut self, prs: &[Pr], now: u64) {
+        let merged = |u: &str, d: &Decision| {
+            prs.iter().find(|p| {
+                p.state == "merged"
+                    && (p.key() == u || (u.starts_with('#') && u == format!("#{}", p.number) && space_part(p.space.as_deref()) == space_part(d.space.as_deref())))
+            })
+        };
+        let done: Vec<(String, String)> = self
+            .open
+            .iter()
+            .filter_map(|d| {
+                let h = d.hold.as_ref()?;
+                let p = h.until_prs.iter().find_map(|u| merged(u, d))?;
+                Some((d.id.clone(), format!("PR #{} merged, which it waited for", p.number)))
+            })
+            .collect();
+        for (id, why) in done {
+            let _ = self.unhold(&id, &why, now);
+        }
     }
 
     /// The user dismissed it. A merge's PRs make no decision again while
@@ -1926,6 +2120,69 @@ mod tests {
         assert!(d.pick().is_none(), "{:?}", d.options);
         assert_eq!(d.options[0].why, "checks passing; Needs review: a database migration (db/migrations/0042_orders.sql)");
         assert_eq!(d.options[1].why, "checks passing");
+    }
+
+    /// "Wait for the ingest filters, then we go for prod": the merge card
+    /// stays, on hold, until its PR changes, what it waits for merges, or
+    /// it is let go; held, nothing about it counts as an update but that.
+    #[test]
+    fn a_held_decision_comes_back_when_it_is_updated() {
+        let mut b = Book::default();
+        let release = |checks: &str, sha: &str| Pr { head_sha: sha.into(), ..pr(830, "main", "t1", "isa", checks) };
+        let id = b.sync_merges(&[release("failing", "aaa")], MIN).fresh[0].clone();
+        let d = b.hold(&id, "wait for the ingest   filters then we go for prod", "tower-isa", 2 * MIN).unwrap();
+        let h = d.hold.as_ref().unwrap();
+        assert_eq!((h.reason.as_str(), h.by.as_str(), h.since_ms, h.until_prs.len()), ("wait for the ingest filters then we go for prod", "tower-isa", 2 * MIN, 0));
+        assert!(d.held() && d.state == State::Open, "still open: answered, merged or dismissed as any other");
+        let v = d.view(false);
+        assert_eq!((v["hold"]["reason"].as_str(), v["back"].is_null()), (Some("wait for the ingest filters then we go for prod"), true));
+        // Seen again as it was (a review or score moving is no update): still on hold.
+        let mut same = release("failing", "aaa");
+        same.review = Some(Default::default());
+        b.sync_merges(&[same], 3 * MIN);
+        assert!(b.wake(3 * MIN).is_empty() && b.find(&id).unwrap().held());
+        // Its checks change: it comes back, why said, told once more.
+        b.sync_merges(&[release("passing", "aaa")], 4 * MIN);
+        assert_eq!(b.wake(4 * MIN), [(id.clone(), "PR #830's checks pass now".to_string())]);
+        let d = b.find(&id).unwrap();
+        assert!(!d.held() && !d.told && d.back.as_ref().is_some_and(|x| x.why == "PR #830's checks pass now" && x.at_ms == 4 * MIN));
+        assert_eq!(std::mem::take(&mut b.came_back), [(id.clone(), "PR #830's checks pass now".to_string())]);
+        // Held again: new commits bring it back.
+        b.hold(&id, "", "mac", 5 * MIN).unwrap();
+        assert!(b.find(&id).unwrap().back.is_none(), "held again: the old \"back\" is gone");
+        b.sync_merges(&[release("passing", "bbb")], 6 * MIN);
+        assert_eq!(b.wake(6 * MIN), [(id.clone(), "PR #830 has new commits".to_string())]);
+        // Held until a PR its words name: that PR merging brings it back (another one doesn't).
+        let d = b.hold(&id, "wait for #829 to land", "mac", 7 * MIN).unwrap();
+        assert_eq!(d.hold.as_ref().unwrap().until_prs, ["o/app#829"]);
+        let ingest = |state: &str, n: u64| Pr { state: state.into(), waiting: false, ..pr(n, "dev", "t2", "isa", "passing") };
+        b.sync_merges(&[release("passing", "bbb"), ingest("merged", 828), ingest("open", 829)], 8 * MIN);
+        assert!(b.find(&id).unwrap().held(), "another PR merged; #829 is still open");
+        b.came_back.clear();
+        b.sync_merges(&[release("passing", "bbb"), ingest("merged", 829)], 9 * MIN);
+        assert_eq!(b.came_back, [(id.clone(), "PR #829 merged, which it waited for".to_string())]);
+        assert!(!b.find(&id).unwrap().held());
+        // Its own PR named in its words isn't something it waits for.
+        assert!(b.hold(&id, "until #830's checks pass", "mac", 10 * MIN).unwrap().hold.unwrap().until_prs.is_empty());
+        // Let go by the user; then there is no hold to let go of.
+        assert_eq!(b.unhold(&id, "you let it go from hold", 11 * MIN).unwrap().back.unwrap().why, "you let it go from hold");
+        assert!(b.unhold(&id, "x", 12 * MIN).unwrap_err().to_string().contains("isn't on hold"));
+        // A raise held, raised again (its session posted something new about it): back.
+        let r = b.raise(Raise { space: Some("isa".into()), who: who("t3"), why: "design".into(), text: "Tabs or a sidebar?".into(), ..Default::default() }, 13 * MIN);
+        b.hold(&r.id, "after the demo", "mac", 14 * MIN).unwrap();
+        b.raise(Raise { space: Some("isa".into()), who: who("t3"), why: "design".into(), text: "tabs or a sidebar".into(), ..Default::default() }, 15 * MIN);
+        assert_eq!(b.wake(15 * MIN), [(r.id.clone(), "it came up again".to_string())]);
+        // A blocked session seen again on the same screen is no update; another screen is.
+        let blocked = b.blocked(Some("isa".into()), Who::new("t4", "api"), "Asks to use Frobnicate", 16 * MIN).id;
+        b.hold(&blocked, "", "mac", 16 * MIN).unwrap();
+        b.blocked(Some("isa".into()), Who::new("t4", "api"), "Asks to use Frobnicate", 17 * MIN);
+        assert!(b.wake(17 * MIN).is_empty());
+        b.blocked(Some("isa".into()), Who::new("t4", "api"), "Asks to delete the cache", 18 * MIN);
+        assert_eq!(b.wake(18 * MIN), [(blocked, "what it asks changed".to_string())]);
+        // Only an open one is held.
+        b.dismiss(&r.id, 16 * MIN).unwrap();
+        assert!(b.hold(&r.id, "", "mac", 17 * MIN).unwrap_err().to_string().contains("is dismissed already"));
+        assert!(b.hold("d000000000000", "", "mac", 17 * MIN).unwrap_err().to_string().contains("no decision"));
     }
 
     #[test]

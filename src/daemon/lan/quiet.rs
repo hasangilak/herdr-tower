@@ -32,6 +32,9 @@ impl Lan {
             ("GET", ["decisions", id]) => t().and_then(|t| decision(t, id)).map(|d| Response::json(200, &json!({ "decision": d }))),
             ("POST", ["decisions", id, "answer"]) => t().and_then(|t| self.answer_decision(t, req, id)),
             ("DELETE", ["decisions", id]) => t().and_then(|t| dismiss_decision(t, id)),
+            // On hold (`{"reason": "<the user's words>"}`, may be empty), and back.
+            ("POST", ["decisions", id, "hold"]) => t().and_then(|t| hold_decision(t, req, device, id, false)),
+            ("POST", ["decisions", id, "unhold"]) => t().and_then(|t| hold_decision(t, req, device, id, true)),
             // The answer just given, made a standing rule: asked of the tower in the user's words.
             ("POST", ["decisions", id, "rule"]) => t().and_then(|t| self.make_rule(t, req, device, id)),
             // What the tower opened lately, and taking one back.
@@ -434,6 +437,20 @@ fn dismiss_decision(t: &dyn Tower, id: &str) -> Answered {
     }
 }
 
+/// `POST /v1/decisions/{id}/hold` (`{"reason"}`) and `/unhold` (`{"why"}`):
+/// the decision as it stands after. One that is over already: `409 closed`.
+fn hold_decision(t: &dyn Tower, req: &Request, device: &auth::Device, id: &str, unhold: bool) -> Answered {
+    decision(t, id)?;
+    let body = req.json().unwrap_or_default();
+    let words = body[if unhold { "why" } else { "reason" }].as_str().unwrap_or("");
+    match t.hold(id, words, unhold, &format!("phone:{}", device.id)) {
+        Ok(d) => Ok(Response::json(200, &json!({ "decision": d }))),
+        Err(Refused::Unknown(_)) => Err(Response::error(404, "no_decision", "no decision with that id")),
+        Err(Refused::Closed { state, .. }) => Err(Response::error(409, "closed", &format!("it is {} already", state.word()))),
+        Err(e) => Err(Response::error(409, if unhold { "not_on_hold" } else { "cannot_hold" }, &e.to_string())),
+    }
+}
+
 /// A spoken answer as a choice, to show before sending: `{tab, choice:
 /// {options, other}}` (and `heard`, for a take). For a decision that is no
 /// question, `answer` is the body to send to its `/answer`.
@@ -693,6 +710,9 @@ mod tests {
         }
         fn dismiss(&self, id: &str) -> Result<Value, Refused> {
             self.decisions.dismiss_with(id, &self.asks)
+        }
+        fn hold(&self, id: &str, words: &str, unhold: bool, by: &str) -> Result<Value, Refused> {
+            self.decisions.hold_with(id, words, unhold, by)
         }
         fn missions(&self) -> Value {
             self.publish()
@@ -1025,6 +1045,32 @@ mod tests {
 
     fn code(v: &Value) -> Option<&str> {
         v["error"]["code"].as_str()
+    }
+
+    /// The phone holds a decision with the user's words and lets it go:
+    /// held, it leaves the queue and the count and is listed under `on_hold`.
+    #[test]
+    fn a_decision_is_put_on_hold_and_let_go_from_the_phone() {
+        let r = rig("hold");
+        let ship = r.raise("Shop", "Ship the release?", &[]);
+        let other = r.raise("Shop", "Tabs or a sidebar?", &[]);
+        assert_eq!(r.get("/v1/decisions").1["count"], 2);
+        let (st, v) = r.post(&format!("/v1/decisions/{ship}/hold"), r#"{"reason":"wait for the ingest filters, then we go for prod"}"#);
+        assert_eq!((st, v["decision"]["hold"]["reason"].as_str()), (200, Some("wait for the ingest filters, then we go for prod")), "{v}");
+        assert!(v["decision"]["hold"]["by"].as_str().is_some_and(|b| b.starts_with("phone:")));
+        let (_, q) = r.get("/v1/decisions");
+        assert_eq!((q["count"].as_u64(), q["decisions"][0]["id"].as_str(), q["on_hold"][0]["id"].as_str()), (Some(1), Some(other.as_str()), Some(ship.as_str())), "{q}");
+        assert_eq!(r.get("/v1/state").1["decisions_count"], 1, "the phone's count");
+        assert!(r.get("/v1/state").1.get("decisions_held").is_none(), "the list is the decisions call's, as the queue is");
+        // Let go: back in the queue, why said.
+        let (st, v) = r.post(&format!("/v1/decisions/{ship}/unhold"), "{}");
+        assert_eq!((st, v["decision"]["hold"].is_null(), v["decision"]["back"]["why"].as_str()), (200, true, Some("you let it go from hold")), "{v}");
+        assert_eq!(r.get("/v1/decisions").1["count"], 2);
+        assert_eq!(code(&r.post(&format!("/v1/decisions/{ship}/unhold"), "{}").1), Some("not_on_hold"));
+        assert_eq!(r.post("/v1/decisions/d000000000000/hold", "{}").0, 404);
+        r.delete(&format!("/v1/decisions/{other}"));
+        let (st, v) = r.post(&format!("/v1/decisions/{other}/hold"), "{}");
+        assert_eq!((st, code(&v)), (409, Some("closed")), "{v}");
     }
 
     #[test]

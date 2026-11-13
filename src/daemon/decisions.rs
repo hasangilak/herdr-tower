@@ -12,6 +12,14 @@
 //! tower tells everything, the alerts it always made stay. A muted space's
 //! decisions (`tower space mute`) are out of the main queue and the count,
 //! and are not said.
+//!
+//! On hold (`decisions::Hold`: `tower hold`, the card's Hold, the phone):
+//! out of the queue and the count (the state has them apart, in
+//! `decisions_held`), and never said. One that comes back (updated, what
+//! it waited for done, let go) is in the queue again and said once
+//! (`came_back`). A PR that merges in a held decision's space is read
+//! against the user's words once (`weigh`): the tower's model says
+//! whether it is what they waited for.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -30,6 +38,9 @@ use crate::prs::Pr;
 use crate::questions::QuestionSet;
 use crate::tell::Level;
 
+/// How a decision back from hold is said (`Decisions::on_back`).
+type Say = Box<dyn Fn(&Decision, &str) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct Decisions {
     book: Arc<Mutex<Book>>,
@@ -40,6 +51,12 @@ pub struct Decisions {
     muted: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     /// How much the tower tells the user now.
     level: fn() -> Level,
+    /// Says a decision that came back from hold (the daemon's: as a raise
+    /// is said, by its first session). Unset: written down only.
+    back: Arc<std::sync::OnceLock<Say>>,
+    /// Whether a PR that merged is what a hold's words wait for (the
+    /// daemon's: one model call, see `judge_merged`); none in tests.
+    judge: Option<fn(&str, &Pr) -> Option<bool>>,
 }
 
 fn in_muted(d: &Decision, muted: &[String]) -> bool {
@@ -49,13 +66,14 @@ fn in_muted(d: &Decision, muted: &[String]) -> bool {
 impl Decisions {
     /// Decisions kept nowhere, with no space muted.
     pub fn new(shared: Shared) -> Decisions {
-        Decisions { book: Arc::default(), path: None, shared, muted: Arc::new(Vec::new), level: crate::tell::level }
+        Decisions { book: Arc::default(), path: None, shared, muted: Arc::new(Vec::new), level: crate::tell::level, back: Arc::default(), judge: None }
     }
 
     /// The daemon's: `decisions.json` in the state folder, as the last run left it.
     pub fn open(shared: Shared) -> Decisions {
         let mut d = Decisions::at(shared, Self::path());
         d.muted = Arc::new(|| crate::spaces::load().mute.into_iter().collect());
+        d.judge = Some(judge_merged);
         d.refresh();
         d
     }
@@ -89,12 +107,13 @@ impl Decisions {
     }
 
     /// The open decisions in queue order as the state carries them (each
-    /// says whether its space is muted), and how many are in the main queue.
-    fn views(&self, book: &Book, now: u64) -> (Vec<Value>, usize) {
+    /// says whether its space is muted), how many are in the main queue,
+    /// and those on hold apart (newest hold first).
+    fn views(&self, book: &Book, now: u64) -> (Vec<Value>, usize, Vec<Value>) {
         let muted = (self.muted)();
-        let list: Vec<Value> = book.ordered(now).iter().map(|d| d.view(in_muted(d, &muted))).collect();
+        let list: Vec<Value> = book.ordered(now).iter().filter(|d| !d.held()).map(|d| d.view(in_muted(d, &muted))).collect();
         let count = list.iter().filter(|v| v["muted"] != true).count();
-        (list, count)
+        (list, count, held_views(book, &muted))
     }
 
     /// Changes the book, keeps it, and publishes the queue as it stands
@@ -102,24 +121,118 @@ impl Decisions {
     /// never leave the older queue in the state.
     fn change<R>(&self, f: impl FnOnce(&mut Book, u64) -> R) -> R {
         let now = crate::history::now_ms();
-        let mut b = lock(&self.book);
-        let before = b.clone();
-        let r = f(&mut b, now);
-        if *b != before {
-            self.save(&b);
-        }
-        let (list, count) = self.views(&b, now);
-        self.shared.update(|s| {
-            s.decisions = list;
-            s.decisions_count = count;
-        });
-        // One opened or closed: each mission counts what its space needs
-        // (`needs`), so the missions are looked at now, not at their next round.
-        let open = |b: &Book| b.open.iter().map(|d| (d.id.clone(), d.space.clone())).collect::<Vec<_>>();
-        if open(&b) != open(&before) {
-            super::missions::kick();
+        let (r, back) = {
+            let mut b = lock(&self.book);
+            let before = b.clone();
+            let r = f(&mut b, now);
+            // On hold and updated since: back in the queue.
+            b.wake(now);
+            let back = std::mem::take(&mut b.came_back);
+            if *b != before {
+                self.save(&b);
+            }
+            let (list, count, held) = self.views(&b, now);
+            self.shared.update(|s| {
+                s.decisions = list;
+                s.decisions_count = count;
+                s.decisions_held = held;
+            });
+            // One opened, closed, held or back: each mission counts what its
+            // space needs (`needs`), so the missions are looked at now, not
+            // at their next round.
+            let open = |b: &Book| b.open.iter().filter(|d| !d.held()).map(|d| (d.id.clone(), d.space.clone())).collect::<Vec<_>>();
+            if open(&b) != open(&before) {
+                super::missions::kick();
+            }
+            (r, back)
+        };
+        for (id, why) in back {
+            self.came_back(&id, &why);
         }
         r
+    }
+
+    /// A decision on hold came back (`why`): written down, and said once,
+    /// as a new one is (`tells`: not in a muted space).
+    fn came_back(&self, id: &str, why: &str) {
+        let Some(d) = self.get(id) else { return };
+        eprintln!("[decisions] {id} is back from hold ({why}): {}", d.title);
+        record_hold(&d, why);
+        if self.tells(std::slice::from_ref(&d.id), true) {
+            let line = format!("Back from hold: {}. {}.", d.title.trim_end_matches('.'), capital(why.trim_end_matches('.')));
+            if let Some(say) = self.back.get() {
+                say(&d, &line);
+            }
+        }
+    }
+
+    /// A session (`address`, `name`, in `space`) ended its turn with
+    /// `message`: a merge on hold there whose PR it names comes back (the
+    /// session posted something new about it).
+    pub fn posted(&self, space: Option<&str>, address: &str, name: &str, message: &str) {
+        let mut named = decisions::pr_numbers(message);
+        named.extend(crate::prs::links(message).into_iter().map(|(_, n)| n));
+        if named.is_empty() {
+            return;
+        }
+        let ids: Vec<String> = lock(&self.book)
+            .open
+            .iter()
+            .filter(|d| d.held() && d.kind == decisions::Kind::Merge)
+            .filter(|d| d.sessions.iter().any(|w| w.address == address) || space.is_some_and(|s| d.in_space(s)))
+            .filter(|d| d.prs.iter().any(|p| named.contains(&p.number)))
+            .map(|d| d.id.clone())
+            .collect();
+        let line: String = message.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").chars().take(100).collect();
+        for id in ids {
+            let _ = self.unhold(&id, &format!("{name} posted about it: {line}"));
+        }
+    }
+
+    /// How a decision that comes back from hold is said (the daemon's).
+    pub fn on_back(&self, say: impl Fn(&Decision, &str) + Send + Sync + 'static) {
+        let _ = self.back.set(Box::new(say));
+    }
+
+    /// Puts `id` on hold (`reason`: the user's words, may be empty; `by`:
+    /// who): out of the queue and the count, never said, until it comes back.
+    pub fn hold(&self, id: &str, reason: &str, by: &str) -> Result<Decision> {
+        let d = self.change(|b, now| b.hold(id, reason, by, now))?;
+        eprintln!("[decisions] {id} is on hold ({by}){}: {}", if d.hold.as_ref().is_some_and(|h| !h.reason.is_empty()) { format!(", \"{}\"", d.hold.as_ref().unwrap().reason) } else { String::new() }, d.title);
+        record_hold(&d, "");
+        Ok(d)
+    }
+
+    /// Lets `id` go from hold (`why`: what brought it back): in the queue
+    /// again, counted, and said once.
+    pub fn unhold(&self, id: &str, why: &str) -> Result<Decision> {
+        self.change(|b, now| b.unhold(id, why, now))
+    }
+
+    /// The card's Hold, the phone's, `tower hold`: on hold with `words`
+    /// (the user's), or (`unhold`) let go, `words` saying what brought it
+    /// back (none: the user did). The decision as the state carries it.
+    pub fn hold_with(&self, id: &str, words: &str, unhold: bool, by: &str) -> Result<Value, Refused> {
+        if self.get(id).is_none() {
+            return Err(Refused::Unknown(id.to_string()));
+        }
+        let r = if unhold {
+            let why = match words.trim() {
+                "" if by.starts_with("tower") => "the tower let it go from hold",
+                "" => "you let it go from hold",
+                w => w,
+            };
+            self.unhold(id, why)
+        } else {
+            self.hold(id, words, by)
+        };
+        match r {
+            Ok(d) => Ok(d.view(in_muted(&d, &(self.muted)()))),
+            Err(e) => Err(match self.get(id) {
+                Some(d) if d.closed_ms.is_some() => Refused::Closed { id: id.to_string(), state: d.state },
+                _ => Refused::Bad(format!("{e:#}")),
+            }),
+        }
     }
 
     /// A round of one source: what opened and closed is logged, and what
@@ -152,6 +265,61 @@ impl Decisions {
     /// The PRs as they are now: those waiting for a merge are one decision per repo and space.
     pub fn sync_prs(&self, prs: &[Pr]) {
         self.round("a merge", |b, now| b.sync_merges(prs, now));
+        self.weigh(prs);
+    }
+
+    /// The PRs that merged in a held decision's space since it was held
+    /// (not its own, not one its words name: those bring it back anyway),
+    /// each read once against the user's words (`judge`), in the background:
+    /// the one that is what they waited for brings it back.
+    fn weigh(&self, prs: &[Pr]) {
+        let Some(judge) = self.judge else { return };
+        let todo: Vec<(String, String, Pr)> = {
+            let b = lock(&self.book);
+            let mut todo = vec![];
+            for d in &b.open {
+                let Some(h) = d.hold.as_ref().filter(|h| !h.reason.is_empty()) else { continue };
+                for p in prs {
+                    let key = p.key();
+                    if p.state == "merged"
+                        && p.closed_ms.unwrap_or(0) >= h.since_ms
+                        && p.space.as_deref().is_some_and(|s| d.in_space(s))
+                        && !d.prs.iter().any(|r| r.key == key)
+                        && !h.weighed.contains(&key)
+                        && !h.until_prs.contains(&key)
+                    {
+                        todo.push((d.id.clone(), h.reason.clone(), p.clone()));
+                    }
+                }
+            }
+            todo
+        };
+        if todo.is_empty() {
+            return;
+        }
+        // Weighed once, whatever comes of it.
+        self.change(|b, _| {
+            for (id, _, p) in &todo {
+                if let Some(h) = b.open.iter_mut().find(|d| d.id == *id).and_then(|d| d.hold.as_mut()) {
+                    h.weighed.push(p.key());
+                }
+            }
+        });
+        for (id, reason, p) in todo {
+            let me = self.clone();
+            thread::spawn(move || {
+                let done = judge(&reason, &p);
+                eprintln!("[decisions] {id} on hold (\"{reason}\"): {} merged, read as {}", p.key(), match done {
+                    Some(true) => "what it waited for",
+                    Some(false) => "something else",
+                    None => "nothing (the model couldn't say)",
+                });
+                if done == Some(true) {
+                    let title: String = p.title.chars().take(80).collect();
+                    let _ = me.unhold(&id, &format!("PR #{} \"{title}\" merged, which looks like what it waited for", p.number));
+                }
+            });
+        }
     }
 
     /// `tower raise`: the decision it is, as it stands, and whether the user
@@ -317,13 +485,19 @@ impl Decisions {
     /// and marks them told. At a quiet level: only when one of them hasn't
     /// been told yet (the same key again says nothing). While the tower
     /// tells everything: `loud`, what it did before there were decisions.
-    /// Never when their spaces are muted. No decision stands for it: `loud`.
+    /// Never when their spaces are muted, nor when they are on hold. No
+    /// decision stands for it: `loud`.
     pub fn tells(&self, ids: &[String], loud: bool) -> bool {
         let spaces = (self.muted)();
         let (known, first, muted) = {
             let mut b = lock(&self.book);
             let (mut known, mut first, mut muted) = (false, false, true);
             for id in ids {
+                // On hold: not said, and not marked told (it is told once it comes back).
+                if b.find(id).is_some_and(|d| d.held() && d.closed_ms.is_none()) {
+                    known = true;
+                    continue;
+                }
                 if let Some(f) = b.claim_told(id) {
                     known = true;
                     first |= f;
@@ -428,8 +602,10 @@ impl Decisions {
             Some(s) => d.in_space(s),
             None => !in_muted(d, &muted),
         };
-        let list: Vec<Value> = b.ordered(now).into_iter().filter(|d| wanted(d)).map(|d| d.view(in_muted(d, &muted))).collect();
-        let mut v = json!({ "space": space, "count": list.len(), "decisions": list });
+        let list: Vec<Value> = b.ordered(now).into_iter().filter(|d| wanted(d) && !d.held()).map(|d| d.view(in_muted(d, &muted))).collect();
+        // On hold: listed apart, not counted.
+        let held: Vec<Value> = held_views(&b, &muted).into_iter().filter(|v| b.find(v["id"].as_str().unwrap_or("")).is_some_and(wanted)).collect();
+        let mut v = json!({ "space": space, "count": list.len(), "decisions": list, "on_hold": held });
         if all {
             v["closed"] = Value::Array(b.closed.iter().rev().filter(|d| wanted(d)).map(|d| d.view(in_muted(d, &muted))).collect());
         }
@@ -713,6 +889,57 @@ impl Decisions {
 }
 
 /// A decision that is over, written down (kind `decision`, for the record).
+/// The open decisions on hold as the state carries them, newest hold first.
+fn held_views(book: &Book, muted: &[String]) -> Vec<Value> {
+    let mut held: Vec<&Decision> = book.open.iter().filter(|d| d.held()).collect();
+    held.sort_by_key(|d| std::cmp::Reverse(d.hold.as_ref().map(|h| h.since_ms).unwrap_or(0)));
+    held.into_iter().map(|d| d.view(in_muted(d, muted))).collect()
+}
+
+fn capital(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
+/// The record's line for a hold (`why` empty), or a decision back from one.
+fn record_hold(d: &Decision, why: &str) {
+    if cfg!(test) {
+        return;
+    }
+    let who = d.sessions.first().cloned();
+    let (status, text) = match &d.hold {
+        Some(h) if why.is_empty() => ("on hold", if h.reason.is_empty() { format!("On hold: {}", d.title) } else { format!("On hold: {} (\"{}\")", d.title, h.reason) }),
+        _ => ("back", format!("Back from hold: {} ({why})", d.title)),
+    };
+    let entry = crate::history::Entry {
+        kind: "decision".into(),
+        id: Some(d.id.clone()),
+        session: who.as_ref().map(|w| w.address.clone()),
+        name: who.map(|w| w.name).filter(|n| !n.is_empty()),
+        space: d.space.clone(),
+        status: Some(status.into()),
+        why: Some(d.why.clone()).filter(|w| !w.is_empty()),
+        text,
+        record: true,
+        ..Default::default()
+    };
+    crate::history::later(move || crate::history::append(entry));
+}
+
+/// Whether the PR `pr`, which merged, is what a hold's words (`reason`)
+/// wait for: one call to the model (the default account, `[brains] model`,
+/// as `covered` reads). None: it couldn't say.
+fn judge_merged(reason: &str, pr: &Pr) -> Option<bool> {
+    let prompt = format!(
+        "The user put a decision on hold with these words: <hold>{}</hold>\nThis pull request just merged: <pr>#{} \"{}\" ({} into {}, branch {})</pr>\n\
+         Is this pull request what the user said to wait for, so the wait is over? Only when it plainly is. \
+         Answer with JSON only: {{\"done\": true|false, \"why\": \"a few words\"}}",
+        reason, pr.number, pr.title, pr.repo, pr.base, pr.head
+    );
+    let out = crate::covered::ask(&prompt).ok()?;
+    crate::ticket::parse_reply(&out).ok()?["done"].as_bool()
+}
+
 fn record(d: &Decision) {
     // Tests never write the history.
     if cfg!(test) {
@@ -777,6 +1004,92 @@ mod tests {
             found_ms: 1_000,
             ..Default::default()
         }
+    }
+
+    /// On hold: listed apart (the state's `decisions_held`, `tower
+    /// decisions`' `on_hold`), out of the count, never told; back (updated,
+    /// or let go), it is counted again and told once.
+    #[test]
+    fn a_decision_on_hold_is_listed_apart_and_not_counted_or_told() {
+        let s = shared();
+        let d = Decisions::telling(s.clone(), || Level::Decisions);
+        let said: Arc<Mutex<Vec<String>>> = Arc::default();
+        let heard = said.clone();
+        d.on_back(move |_, line| heard.lock().unwrap().push(line.to_string()));
+        let (r, _, told) = d.raise(raise("Shop", "t1", "Ship the release?"));
+        assert!(told, "a new one is told");
+        d.sync_prs(&[pr(830, "main", "t2")]);
+        assert_eq!(s.get().decisions_count, 2);
+        let held = d.hold(&r.id, "wait for the ingest filters", "tower-shop").unwrap();
+        assert!(held.held());
+        let st = s.get();
+        assert_eq!((st.decisions.len(), st.decisions_count, st.decisions_held.len()), (1, 1, 1), "out of the queue and the count");
+        assert_eq!((st.decisions_held[0]["id"].as_str(), st.decisions_held[0]["hold"]["reason"].as_str()), (Some(r.id.as_str()), Some("wait for the ingest filters")));
+        let listed = d.list(Some("Shop"), false);
+        assert_eq!((listed["count"].as_u64(), listed["decisions"].as_array().map(Vec::len), listed["on_hold"][0]["id"].as_str()), (Some(1), Some(1), Some(r.id.as_str())));
+        assert_eq!(d.list(None, false)["count"], 1, "the main queue's count too");
+        // Never told while held, whatever asks.
+        assert!(!d.tells(std::slice::from_ref(&r.id), true));
+        // Raised again (its session posted something new): back in the queue, counted, and told once.
+        d.raise(raise("Shop", "t1", "ship the release"));
+        let st = s.get();
+        assert_eq!((st.decisions_count, st.decisions_held.len()), (2, 0));
+        assert_eq!(st.decisions.iter().find(|v| v["id"] == r.id.as_str()).unwrap()["back"]["why"], "it came up again");
+        assert_eq!(said.lock().unwrap().as_slice(), ["Back from hold: Ship the release?. It came up again."]);
+        assert!(!d.tells(std::slice::from_ref(&r.id), true), "told once, not again");
+        // A merge held, its session posting about its PR: back.
+        let merge = s.get().decisions.iter().find(|v| v["kind"] == "merge").unwrap()["id"].as_str().unwrap().to_string();
+        d.hold(&merge, "", "mac").unwrap();
+        assert_eq!(s.get().decisions_count, 1);
+        d.posted(Some("Shop"), "t9", "s-t9", "Nothing about the release here.");
+        assert_eq!(s.get().decisions_held.len(), 1, "it doesn't name the PR");
+        d.posted(Some("Shop"), "t2", "s-t2", "Rebased PR #830 on main; it is ready again.\nMore below.");
+        assert_eq!(s.get().decisions_count, 2);
+        assert_eq!(d.get(&merge).unwrap().back.unwrap().why, "s-t2 posted about it: Rebased PR #830 on main; it is ready again.");
+        // The phone and the CLI hold and let go the same way; one that is over can't be.
+        let v = d.hold_with(&merge, "after lunch", false, "phone:p1").unwrap();
+        assert_eq!((v["hold"]["by"].as_str(), v["hold"]["reason"].as_str()), (Some("phone:p1"), Some("after lunch")));
+        let v = d.hold_with(&merge, "", true, "phone:p1").unwrap();
+        assert_eq!((v["hold"].is_null(), v["back"]["why"].as_str()), (true, Some("you let it go from hold")));
+        assert!(matches!(d.hold_with(&merge, "", true, "mac"), Err(Refused::Bad(_))), "not on hold");
+        assert!(matches!(d.hold_with("d000000000000", "", false, "mac"), Err(Refused::Unknown(_))));
+        d.dismiss(&r.id).unwrap();
+        assert!(matches!(d.hold_with(&r.id, "", false, "mac"), Err(Refused::Closed { .. })));
+    }
+
+    /// A PR merged in a held merge's space is read against the user's
+    /// words once (the judge here a stand-in for the model): the one that
+    /// is what they waited for brings it back.
+    #[test]
+    fn a_merged_pr_that_is_what_a_hold_waited_for_brings_it_back() {
+        let s = shared();
+        let mut d = Decisions::telling(s.clone(), || Level::Decisions);
+        d.judge = Some(|reason, pr| Some(reason.contains("ingest filters") && pr.title.contains("filters")));
+        d.sync_prs(&[pr(830, "main", "t1")]);
+        let id = s.get().decisions[0]["id"].as_str().unwrap().to_string();
+        d.hold(&id, "wait for the ingest filters then we go for prod", "tower-shop").unwrap();
+        let since = d.get(&id).unwrap().hold.unwrap().since_ms;
+        let merged = |n: u64, title: &str, at: u64| Pr { state: "merged".into(), waiting: false, title: title.into(), closed_ms: Some(at), ..pr(n, "dev", "t2") };
+        // The judge reads on a thread of its own: back as soon as it is, else after `ms`.
+        let wait = |ms: u64| {
+            for _ in 0..ms / 10 {
+                if !d.get(&id).unwrap().held() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        // Merged before it was held, and one that is something else: it stays on hold.
+        d.sync_prs(&[pr(830, "main", "t1"), merged(828, "Ingest filters, the first try", since - 1), merged(829, "Fix a typo", since + 1)]);
+        wait(500);
+        assert!(d.get(&id).unwrap().held());
+        assert_eq!(d.get(&id).unwrap().hold.unwrap().weighed, ["o/app#829"], "each read once; one merged before the hold isn't");
+        // The filters merge: back, why said.
+        d.sync_prs(&[pr(830, "main", "t1"), merged(829, "Fix a typo", since + 1), merged(831, "Ingest page list filters", since + 2)]);
+        wait(5_000);
+        let back = d.get(&id).unwrap();
+        assert!(!back.held());
+        assert_eq!(back.back.unwrap().why, "PR #831 \"Ingest page list filters\" merged, which looks like what it waited for");
     }
 
     #[test]
@@ -1015,5 +1328,24 @@ mod tests {
         let loud = Decisions::telling(shared(), || Level::Everything);
         assert!(loud.blocked(None, Who::new("t4", "api"), "Asks to use Frobnicate"));
         assert!(loud.blocked(None, Who::new("t4", "api"), "Asks to use Frobnicate"));
+    }
+}
+
+#[cfg(test)]
+mod live {
+    use super::*;
+
+    /// One real call each (`cargo test live_hold_judge -- --ignored`): a
+    /// merged PR read against the words a merge was held with.
+    #[test]
+    #[ignore]
+    fn live_hold_judge() {
+        let pr = |n: u64, title: &str, head: &str| Pr { repo: "eyzhub/eyzflow".into(), number: n, title: title.into(), base: "dev".into(), head: head.into(), state: "merged".into(), ..Default::default() };
+        let words = "wait for the ingest filters then we go for prod";
+        let started = std::time::Instant::now();
+        let yes = judge_merged(words, &pr(831, "Ingest page: list filters (Published, Ready to publish, Empty)", "feat/ingest-list-filters"));
+        let no = judge_merged(words, &pr(832, "Fix a typo in the README", "chore/readme-typo"));
+        eprintln!("took {} ms: the filters PR {yes:?}, the typo PR {no:?}", started.elapsed().as_millis());
+        assert_eq!((yes, no), (Some(true), Some(false)));
     }
 }

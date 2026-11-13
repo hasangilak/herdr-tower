@@ -727,6 +727,12 @@ impl Panel {
         let queue: Vec<Decision> = all.iter().filter(|d| d.live() && d.in_space(name)).cloned().collect();
         let cards = self.queue_items(&queue, false, &|n| format!("{n} more waiting here"), "Nothing needs you here.", cx);
         items.push(bay("Needs you", cards));
+        // What the user put on hold here: listed, not counted.
+        let held: Vec<Decision> = self.held_decisions(cx).into_iter().filter(|d| d.in_space(name)).collect();
+        if !held.is_empty() {
+            let cards = self.held_items(&held, cx);
+            items.push(bay(&format!("On hold · {}", held.len()), cards));
+        }
 
         if !m.requests.is_empty() {
             let rows = m.requests.iter().enumerate().map(|(i, r)| {

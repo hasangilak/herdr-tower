@@ -163,6 +163,14 @@ pub fn run() -> Result<()> {
     // PRs that wait: what is open at the start was told before, and isn't again.
     sync_merges(&decisions, &prs);
     decisions.told_all();
+    // A decision back from hold is said as a raise is: by its first session.
+    {
+        let watches = watches.clone();
+        decisions.on_back(move |d, line| {
+            let address = d.sessions.first().map(|w| w.address.clone()).unwrap_or_default();
+            watches.raise(&address, line);
+        });
+    }
     decisions.start();
 
     let listener = UnixListener::bind(&sock).with_context(|| format!("listening on {}", sock.display()))?;
@@ -889,6 +897,7 @@ impl Daemon {
             // A decision's id: its question sets, its sessions or its task get the answer.
             Request::Answer { target, answers, submit } if crate::decisions::is_id(&target) => return self.answer_decision(&target, &answers, submit),
             Request::Dismiss { id } if crate::decisions::is_id(&id) => return self.dismiss_decision(&id),
+            Request::Hold { id, reason, unhold, by, from } => return self.hold(&id, &reason, unhold, &by, from.as_deref()),
             Request::Answer { target, answers, submit } => {
                 let answers: Vec<crate::questions::Answer> = match serde_json::from_value(answers) {
                     Ok(a) => a,
@@ -1313,6 +1322,19 @@ impl Daemon {
 
     /// `tower dismiss <decision>`: out of the queue, with nothing sent. A
     /// question's sets are dismissed with it.
+    /// `tower hold` / `tower unhold`, the card's Hold: who held it is `by`,
+    /// or the brain whose terminal asked (it heard the user say so), else `cli`.
+    fn hold(&self, id: &str, reason: &str, unhold: bool, by: &str, from: Option<&str>) -> Response {
+        let by = match by.trim() {
+            "" => from.and_then(brains::name_at).unwrap_or_else(|| "cli".into()),
+            b => b.to_string(),
+        };
+        match self.decisions.hold_with(id, reason, unhold, &by) {
+            Ok(v) => Response { ok: true, error: None, state: Some(v) },
+            Err(e) => Response::err(e),
+        }
+    }
+
     fn dismiss_decision(&self, id: &str) -> Response {
         match self.decisions.dismiss_with(id, &self.asks) {
             Ok(v) => Response { ok: true, error: None, state: Some(v) },

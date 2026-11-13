@@ -209,6 +209,49 @@ pub struct Decision {
     pub state: Stage,
     /// Its space is muted, by the daemon's word (see `muted_spaces`).
     pub muted: bool,
+    /// On hold (`crate::decisions::Hold`): the state has it in
+    /// `decisions_held`, not in the queue.
+    pub hold: Option<HoldOf>,
+    /// It was on hold and came back: why.
+    pub back: Option<BackOf>,
+}
+
+/// A decision's hold as the state carries it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HoldOf {
+    /// The user's words (empty: none given).
+    pub reason: String,
+    /// Who held it: `mac`, `phone:<device>`, a brain's name, `cli`.
+    pub by: String,
+    pub since_ms: u64,
+    /// The PRs it waits for: one merged, it comes back.
+    pub until_prs: Vec<String>,
+}
+
+/// Why a decision came back from hold.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BackOf {
+    pub why: String,
+    pub at_ms: u64,
+}
+
+impl HoldOf {
+    /// Who held it, in words: "you" (here, the phone, a command), or the tower that heard you say so.
+    pub fn who(&self) -> String {
+        match self.by.as_str() {
+            b if b.starts_with("tower-") => format!("the {} tower, from what you said", &b["tower-".len()..]),
+            b if b.starts_with("tower") => "the tower, from what you said".into(),
+            b if b.starts_with("phone") => "you, on the phone".into(),
+            _ => "you".into(),
+        }
+    }
+}
+
+/// The open decisions on hold, newest hold first (the state's `decisions_held`).
+pub fn held(state: &Value) -> Vec<Decision> {
+    state["decisions_held"].as_array().map(|a| a.iter().filter_map(|v| serde_json::from_value::<Decision>(v.clone()).ok()).filter(|d| !d.id.is_empty()).collect()).unwrap_or_default()
 }
 
 impl Decision {
@@ -409,6 +452,8 @@ pub fn adapt(sets: &[QuestionSet], prs: &BTreeMap<String, Pr>, agents: &Value, s
                 _ => Stage::Open,
             },
             muted: false,
+            hold: None,
+            back: None,
         });
     }
 
@@ -466,6 +511,8 @@ pub fn adapt(sets: &[QuestionSet], prs: &BTreeMap<String, Pr>, agents: &Value, s
             count: 1,
             state: Stage::Open,
             muted: false,
+            hold: None,
+            back: None,
         });
     }
     out

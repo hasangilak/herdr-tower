@@ -1806,6 +1806,7 @@ impl Lan {
             o.remove("threads");
             o.remove("missions");
             o.remove("decisions");
+            o.remove("decisions_held");
             // What the tower opened lately: each is a chat message and an `act` event.
             o.remove("acts");
         }
@@ -1974,7 +1975,8 @@ impl Lan {
         // What the state says besides its counter: only a change there is a `state` event.
         let mut said = stateless(&state);
         // The queue and the missions as last sent: each has its own event, sent when it changes.
-        let (mut decisions, mut count, mut missions) = self.ctx.shared.with(|s| (s.decisions.clone(), s.decisions_count, s.missions.clone()));
+        let (mut decisions, mut count, mut missions, mut held) =
+            self.ctx.shared.with(|s| (s.decisions.clone(), s.decisions_count, s.missions.clone(), s.decisions_held.clone()));
         let net = self.network_now();
         let hello = json!({
             "api": API, "device": device.id, "voice": voice, "features": FEATURES,
@@ -1982,7 +1984,7 @@ impl Lan {
         });
         let mut ok = send(w, "hello", &hello)
             && send(w, "state", &state)
-            && send(w, "decisions", &decisions_event(&decisions, count))
+            && send(w, "decisions", &decisions_event(&decisions, count, &held))
             && send(w, "missions", &missions);
         let history = self.history.clone();
         let mut tail = Tail::end(&history);
@@ -2012,10 +2014,10 @@ impl Lan {
                     said = now;
                     ok = send(w, "state", &state);
                 }
-                let (d, c, m) = self.ctx.shared.with(|s| (s.decisions.clone(), s.decisions_count, s.missions.clone()));
-                if ok && (d != decisions || c != count) {
-                    (decisions, count) = (d, c);
-                    ok = send(w, "decisions", &decisions_event(&decisions, count));
+                let (d, c, m, h) = self.ctx.shared.with(|s| (s.decisions.clone(), s.decisions_count, s.missions.clone(), s.decisions_held.clone()));
+                if ok && (d != decisions || c != count || h != held) {
+                    (decisions, count, held) = (d, c, h);
+                    ok = send(w, "decisions", &decisions_event(&decisions, count, &held));
                 }
                 if ok && m != missions {
                     missions = m;
@@ -2431,8 +2433,9 @@ fn thread_event(line: usize, entry: &Value) -> Option<Value> {
 
 /// The `decisions` event: every open decision in queue order, each saying
 /// whether its space is muted, and how many are in the main queue.
-fn decisions_event(list: &[Value], count: usize) -> Value {
-    json!({ "count": count, "decisions": list })
+/// The `decisions` event: the queue, its count, and those on hold apart (not counted).
+fn decisions_event(list: &[Value], count: usize, held: &[Value]) -> Value {
+    json!({ "count": count, "decisions": list, "on_hold": held })
 }
 
 /// `t3`, `vps/t3`, a name: letters, digits, `-`, `_`, one `/`, starting

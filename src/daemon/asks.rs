@@ -921,6 +921,10 @@ impl Asks {
             let waits = questions::waits_for_user(&message);
             let watched = reported.lock().unwrap_or_else(|e| e.into_inner()).contains(&address);
             let (name, space) = (hc::spoken_name(&t), crate::spaces::space_of(&t));
+            // A merge on hold whose PR it names: the session posted something new about it.
+            if let Some(d) = me.decisions.get() {
+                d.posted(space.as_deref(), &address, &name, &message);
+            }
             // It only says it is ready: that hands the user nothing.
             let ready = questions::ready_only(&message);
             // PRs it opened (or ends on): chips in the chat, waiting for the user's merge.

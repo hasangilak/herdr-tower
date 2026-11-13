@@ -613,11 +613,56 @@ is asked for, and `state.json` carries them marked `muted: true`.
     `prs[].key`. Nothing merges through the socket.
 - `tower dismiss <id>`: out of the queue, nothing sent (a question's sets
   are dismissed with it).
+- `tower hold <id> [--reason "<the user's words>"]` and `tower unhold <id>
+  [--why "<what is done now>"]`: see "On hold" below.
 - `tower answer` and `tower dismiss` still take a question set's id as
   before; `tower questions` is unchanged.
 - `tower space mute|unmute <space>`.
 - The socket: `{"cmd":"decisions","space":null,"all":false}`; `answer`
-  (`target` a decision id, `answers` the body above) and `dismiss` (`id`).
+  (`target` a decision id, `answers` the body above) and `dismiss` (`id`);
+  `{"cmd":"hold","id","reason","unhold":false,"by":"mac"}` (`by` none: the
+  caller's terminal says, a brain's name, else `cli`).
+
+### On hold
+
+"Wait for the ingest filters, then we go for prod", said about a merge
+card, means the card is still the user's but not now. Holding it
+(`decisions::Hold`, in `src/decisions.rs`; the daemon's part in
+`src/daemon/decisions.rs`):
+
+- **How**: the card's **Hold** (on every card's head, beside its ×) opens a
+  field for what it waits for (optional; Enter holds it); `tower hold <id>
+  --reason "…"`; the phone's `POST /v1/decisions/{id}/hold`; or a tower,
+  told so in chat: its instructions say to hold, never dismiss, with the
+  user's words (`assets/tower-core.md`, "On hold, not dismissed").
+- **Held**: still open, still listed, but out of the queue and every count
+  (the state has it in `decisions_held`, not `decisions`; not in
+  `decisions_count`, the orb's badge, the phone's `count`, a mission's
+  `needs`), and never told (`Decisions::tells` says no and doesn't mark it
+  told). The panel lists held ones under "On hold · n · not counted" below
+  the queue (All spaces) and under "Needs you" (a space), each with the
+  user's words, who held it, since when, what brings it back, and "Back to
+  waiting". `tower decisions` lists them apart.
+- **Back** (`Book::wake`, after every change; `Book::unhold`): it is in the
+  queue again, counted, and told once (`came_back`: the alert "Back from
+  hold: <title>. <why>.", said as a raise is), with `back.why` on its card:
+  - updated since it was held (`Decision::update_since` against
+    `Hold::seen`): a PR's head commit (`PrRef::sha`) or checks changed, a PR
+    joined it, it came up again (`count`: raised again, another session
+    asked), what it asks changed, more detail. A review or score moving is
+    not an update;
+  - its session posted about it: a session in its space ends its turn with
+    a message naming a held merge's PR (`Decisions::posted`);
+  - a PR its reason names merged (`Hold::until_prs`, from `#829`, `PR 829`
+    or a PR's URL in the reason; its own PRs aside);
+  - a PR merged in its space since the hold, read once against the
+    reason by the tower's model (`judge_merged`, one headless call as
+    `covered` makes; `Hold::weighed` keeps each read once) and found to
+    be what it waited for;
+  - let go: `tower unhold`, "Back to waiting", `/unhold`, or a tower that
+    saw what it waited for done.
+- History: a `decision` entry with `status` `on hold` or `back`, for the
+  record.
 
 ### In `state.json`
 
@@ -625,7 +670,11 @@ is asked for, and `state.json` carries them marked `muted: true`.
   step 11, each with `muted`. The main queue is those with `muted: false`.
   (The phone's state leaves the list out and keeps the count: step 11.)
 - `decisions_count`: how many of them are outside muted spaces (the orb's
-  number).
+  number). None on hold.
+- `decisions_held`: the open decisions on hold, as `decisions` has the
+  others, newest hold first (left out of the phone's state, as `decisions`
+  is: the phone has them in `GET /v1/decisions`' `on_hold` and the
+  `decisions` event).
 - `questions` is unchanged.
 
 `decisions.json`: `{"open": [Decision], "closed": [Decision], "settled_prs":

@@ -97,6 +97,7 @@ const ACCOUNT_HUES: [u32; 8] = [0x6eeaa8, 0xf0a6ff, 0xffb98a, 0xc8f06e, 0xc9b3ff
 mod behaviors;
 mod cli;
 mod gallery;
+mod hold;
 mod home;
 mod launch;
 mod phone;
@@ -216,6 +217,8 @@ pub struct Panel {
     /// The accounts sessions can run on (as `tower accounts` lists them, the
     /// default first), re-read while the panel is open; `None` until read.
     accounts: Option<Vec<String>>,
+    /// Holding a decision (`hold`): the open Hold field, holds on their way.
+    hold: hold::HoldUi,
     _subs: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -361,6 +364,7 @@ impl Panel {
             holding: false,
             live,
             live_read: false,
+            hold: Default::default(),
             accounts: None,
             _subs: subs,
             _poll: poll,

@@ -114,11 +114,16 @@ pub struct State {
     /// What only the user can decide (see `decisions`), every open one in
     /// queue order (heaviest first): `{id, key, kind, space, sessions,
     /// waiting, title, why, options, pick, prs, question_id, task, first_ms,
-    /// last_ms, count, state, muted}`. The main queue is those whose space
-    /// isn't muted (`muted: false`).
+    /// last_ms, count, state, muted, hold, back}`. The main queue is those
+    /// whose space isn't muted (`muted: false`). Those on hold are not here.
     pub decisions: Vec<serde_json::Value>,
-    /// The open decisions outside muted spaces: the orb's number.
+    /// The open decisions outside muted spaces: the orb's number (none on hold).
     pub decisions_count: usize,
+    /// The open decisions the user put on hold (`decisions::Hold`), as
+    /// `decisions` has the others, newest hold first: still theirs, listed
+    /// apart ("On hold"), not counted and never told.
+    #[serde(default)]
+    pub decisions_held: Vec<serde_json::Value>,
     /// "Merge all N" chains the tower is merging, and those that ended
     /// lately (`crate::merges::Chain`: `{id, card, space, by, links: [{key,
     /// number, base, step: {step, why}}], started_ms, stopped}`, with `over`).
@@ -253,6 +258,7 @@ impl State {
             threads: Default::default(),
             decisions: vec![],
             decisions_count: 0,
+            decisions_held: vec![],
             merges: vec![],
             missions: serde_json::json!({ "spaces": [], "quiet": [], "closed_today": [] }),
             brains: vec![],

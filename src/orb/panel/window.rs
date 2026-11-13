@@ -935,7 +935,11 @@ impl Panel {
             );
         }
         let pane_w = self.full.as_ref().map(|f| f.pane_w).unwrap_or(900.0);
-        let queue_col = v_flex().gap(px(10.0)).child(bay_label("Your queue · most waiting work first")).children(cards);
+        // On hold (muted spaces' aside, as their queue is): under the queue, not counted.
+        let muted = missions.muted();
+        let held: Vec<Decision> = self.held_decisions(cx).into_iter().filter(|d| !d.muted && !muted.iter().any(|m| d.in_space(m))).collect();
+        let held = self.held_bay(&held, cx);
+        let queue_col = v_flex().gap(px(10.0)).child(bay_label("Your queue · most waiting work first")).children(cards).children(held);
         let missions_col = v_flex().min_w_0().gap(px(8.0)).child(bay_label("Missions")).child(v_flex().gap(px(2.0)).children(rows));
         // Side by side when both have room; else the missions under the queue, each the pane's width.
         let cols = if pane_w >= QUEUE_W + 22.0 + 300.0 {

@@ -78,6 +78,8 @@ tower tell [decisions|results|everything]   # how much it tells you: what you mu
 tower tell --voice off|decisions|replies    # what it says out loud: nothing, a decision once and nothing else, or its answers too (the default)
 tower undo [<id>] [--force]         # take back what the tower just opened for you (a session, a launched space); tower acts lists what it opened and what it assumed
 tower decisions [--space <space>]   # what only you can decide, most pressing first; tower answer <id> --choice <n> | --other "…", tower dismiss <id>
+tower hold <id> [--reason "…"]      # on hold: listed under On hold, not counted or said, back when it changes or what it waits for is done
+tower unhold <id> [--why "…"]       # back to waiting for you: counted again, said once
 tower orb           # just the orb
 ```
 
@@ -175,7 +177,14 @@ tower sent it once more. The same thing from several sessions of a space is
 one decision with all of them waiting, told once. They form **the queue**,
 ordered by sessions waiting × how long they have waited, heaviest first.
 `tower decisions` lists it; `tower answer <id> --choice <n>` or `--other
-"<your words>"` answers one, `tower dismiss <id>` takes one off.
+"<your words>"` answers one, `tower dismiss <id>` takes one off. A decision
+you want to wait on ("wait for the ingest filters, then we go for prod") is
+put **on hold** instead: its card's Hold, `tower hold <id> --reason "…"`,
+the phone, or just telling the tower. It stays listed under On hold with
+your words but leaves the count and is never said, until it is updated (new
+commits or checks on its PR, its session raises or posts about it), a PR
+your words name merges (or one that reads as what you waited for), or you
+let it go (`tower unhold <id>`).
 
 ### The floating panel
 

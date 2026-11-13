@@ -934,9 +934,11 @@ of them run with `curl` against a tower, with what came back.
 
 | Call | Body | Returns |
 |---|---|---|
-| `GET /v1/decisions?space=<name>&all=1` | | `{"space": name or null, "count": n, "decisions": [Decision]}` in queue order. Without `space`: the main queue, muted spaces left out. With it: that space's own, muted or not. `all=1` adds `"closed": [Decision]`, the last 50 that closed, newest first. |
+| `GET /v1/decisions?space=<name>&all=1` | | `{"space": name or null, "count": n, "decisions": [Decision], "on_hold": [Decision]}` in queue order. Without `space`: the main queue, muted spaces left out. With it: that space's own, muted or not. `on_hold`: those the user put on hold there, newest hold first, not in `decisions` and not in `count` (see "On hold"). `all=1` adds `"closed": [Decision]`, the last 50 that closed, newest first. |
 | `GET /v1/decisions/{id}` | | `{"decision": Decision}`: an open one, or one that closed lately. `404 no_decision`. |
 | `POST /v1/decisions/{id}/answer` | `{"choice": n}`, `{"other": "text"}`, or a question's answers (below) | What the answer did (below). `409 closed` when it is over already. |
+| `POST /v1/decisions/{id}/hold` | `{"reason": "wait for the ingest filters, then we go for prod"}` (optional: the user's words) | Puts it on hold: `200 {"decision": Decision}` with its `hold`. Held again, the reason is the new one. `404 no_decision`, `409 closed` (it is over already). |
+| `POST /v1/decisions/{id}/unhold` | `{"why": "…"}` (optional; none: "you let it go from hold") | Back in the queue: `200 {"decision": Decision}` with `hold: null` and its `back`. `409 not_on_hold`, `404 no_decision`, `409 closed`. |
 | `DELETE /v1/decisions/{id}` | | Dismisses it: out of the queue, nothing sent (a question's sets are dismissed with it). `200 {"dismissed": id, "state": "dismissed"}`; for one that is over already, `200` with the `state` it ended in. `404 no_decision`; `409 cannot_dismiss` (it can't go now: its answer is going in, say). |
 | `POST /v1/decisions/{id}/interpret` | `{"tab": 0, "text": "the second one"}` | A spoken answer as a choice, to show before sending (below). |
 | `POST /v1/decisions/{id}/voice?tab=N` | a WAV take | The same from a recording, with `heard`. |
@@ -993,7 +995,9 @@ of one repo waiting for a merge in one space are one decision.
   "last_ms": 1794368749472,
   "count": 2,
   "state": "open",                   // open | answering | answered | stopped | dismissed
-  "muted": false
+  "muted": false,
+  "hold": null,                      // on hold: {"reason", "by", "since_ms", "until_prs"} (see "On hold")
+  "back": null                       // back from hold: {"why", "at_ms"}
 }
 ```
 
@@ -1168,7 +1172,50 @@ The stream sends a `decisions` event right after `hello` and `state`, so an
 app that was away catches up on connecting with the same rule: what it has
 not seen yet is new. `count` in the event (and `decisions_count` in the
 state) is the badge: the open decisions outside muted spaces, those whose
-answer is going in included.
+answer is going in included, none on hold.
+
+5. A decision **back from hold** (its `back.at_ms` is later than the last
+   one the app saw for that id, or it had none) is notified once, as a new
+   one is, with `back.why` ("PR #830 has new commits"). Keep the last
+   `back.at_ms` seen per id with the seen ids. A decision on hold (in
+   `on_hold`) is never notified.
+
+### On hold
+
+The user can put a decision on hold instead of answering or dismissing it
+("wait for the ingest filters, then we go for prod"): on the Mac (its card's
+Hold, with an optional reason), on the phone (`POST
+/v1/decisions/{id}/hold`), with `tower hold <id> --reason "…"`, or by
+saying so to a tower in chat (the tower holds it with their words).
+
+- A held decision is still open and still theirs, but it is **not** in
+  `decisions`, not in `count` or `decisions_count`, and never notified,
+  said or reminded. It is listed apart: `on_hold` in `GET /v1/decisions`
+  and in the `decisions` event, newest hold first, each a Decision with
+  `hold`: `{"reason": the user's words ("" when none were given), "by":
+  "mac" | "phone:<device>" | "tower" | "tower-<space>" (a tower, from what
+  the user said) | "cli", "since_ms", "until_prs": ["owner/repo#n"] (PRs the
+  reason names; one merging brings it back)}`.
+- It comes back by itself into `decisions` (counted, and notified once,
+  rule 5) when it is updated (new commits or a checks change on its PRs,
+  another PR joining it, its session raising it again or posting about its
+  PR, what it asks changing), when a PR its reason names merges, when a PR
+  merges in its space that the tower reads as what the user waited for, or
+  when the user lets it go (`/unhold`, the Mac's "Back to waiting", `tower
+  unhold`). Its `back` says why: `{"why": "PR #829 merged, which it waited
+  for", "at_ms"}`; it stays on the card until it is answered or held again.
+- It can still be answered, merged or dismissed while held, as any other.
+
+**What the app needs for it:** an "On hold" section (from `on_hold`, per
+space and in the main queue, muted spaces' left out of the main one as
+their decisions are) showing each card's title, `hold.reason` in quotes,
+who held it and since when, and a "Back to waiting" button (`/unhold`); a
+Hold action on every card that asks for an optional reason (`/hold`);
+"Back from hold: `back.why`" on a card that has `back`; the badge from
+`count` as before (held ones are already out of it); and notification
+rule 5. Without these, an app built before this treats a held decision as
+gone from the queue (rule 4) and doesn't show it, which is safe: it is not
+counted or notified either.
 
 A decision is also said on the Mac once, when it first appears (an alert:
 a chat message of role `event`, and one spoken sentence, as an `audio` clip

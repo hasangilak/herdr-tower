@@ -758,6 +758,8 @@ mod tests {
             assert!(text.contains("The user is told of it once") && text.contains("Never tell it again"));
             assert!(text.contains("An idle session is not a decision"));
             assert!(text.contains("tower answer <id> --choice <n>") && text.contains("tower dismiss <id>"));
+            // Waiting on a decision is a hold, not a dismissal.
+            assert!(text.contains("tower hold <id> --reason") && text.contains("tower unhold <id>") && text.contains("never dismiss it"));
         }
         // A quiet level: the tower's own decisions aren't raised again, and a session's message to the brain is a note.
         assert!(quiet.contains("never raise what the tower put there itself") && quiet.contains("`[watch]`, `[queue]`, `[agenda]`, `[session]` or `[space]` note"));
