@@ -7,11 +7,11 @@
 //! - **The strip** (the sidebar, over its foot): a line per account, its
 //!   badge, and the window nearest its limit as a bar with its percent
 //!   (`usage::Line::fullest`: the 5-hour one unless the 7-day one is fuller
-//!   or the only one Claude Code reports), and under it which window that
-//!   is, when it resets and the other's percent. Amber from `NEAR`, and "out
+//!   or the only one the account has), and under it which window that is,
+//!   when it resets and the other's percent, when it has another. Amber from `NEAR`, and "out
 //!   until 15:00" once the tower found it out. A click opens the view.
-//! - **The view**: a card per account (both windows, with when each
-//!   resets; out until when, and why; the default; where a new session
+//! - **The view**: a card per account (its windows, with when each
+//!   resets: the 5-hour one only when it has a 5-hour limit, `Line::rows`; out until when, and why; the default; where a new session
 //!   starts; how many sessions and towers run on it), then **Who runs
 //!   where**: the main tower, each open space (its own tower first, then
 //!   its sessions), and the sessions outside any space, each with its
@@ -133,6 +133,8 @@ impl Panel {
                         words.push(format!("{o} {}", usage::pct(w.used)));
                     }
                 }
+                // Each part held together (no break inside "5h 37%"): a line that wraps does so at " · ".
+                let words: Vec<String> = words.iter().map(|w| w.replace(' ', "\u{a0}")).collect();
                 div().text_color(g.faint).child(if words.is_empty() { "no usage recorded yet".to_string() } else { words.join(" · ") })
             };
             v_flex()
@@ -145,7 +147,8 @@ impl Panel {
                         .child(div().flex_1().min_w_0().child(bar(full.map(|(_, w)| w.used).unwrap_or(0.0), 5.0)))
                         .child(div().w(px(34.0)).flex_none().flex().justify_end().child(pct_el(full.map(|(_, w)| w), 12.0, &g))),
                 )
-                .child(div().pl(px(72.0)).text_size(px(11.0)).line_height(px(14.0)).truncate().child(under))
+                // (Two lines when an account has both windows: "7d ↻Mon 15:00 · 5h 37%" doesn't fit in one.)
+                .child(div().pl(px(72.0)).text_size(px(11.0)).line_height(px(14.0)).line_clamp(2).child(under))
         });
         Some(
             v_flex()
@@ -232,8 +235,8 @@ impl Panel {
                     capital(&usage::out_words(l, now))
                 )))
             })
-            .child(window("5-hour", l.five_hour.as_ref()))
-            .child(window("7-day", l.seven_day.as_ref()))
+            // The 5-hour row only for an account that has a 5-hour limit (`Line::rows`).
+            .children(l.rows().into_iter().map(|(label, w)| window(label, w)))
             .when(!recorded, |el| {
                 el.child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.faint).child("No usage recorded for it yet: the accounts mod records it from Claude Code's status line."))
             })

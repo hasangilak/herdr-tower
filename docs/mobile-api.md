@@ -886,14 +886,15 @@ acts):
 
 `used` is a percent of the window's limit, as the accounts mod (`cca`)
 last recorded it; a window past its reset reads as 0 with no `resets_ms`;
-null: nothing recorded. Who runs where: `account` on each of `agents`, on
+null: none recorded. An account without a 5-hour limit has `five_hour`
+null: show no 5-hour row for it (the Mac doesn't), only the 7-day one. Who runs where: `account` on each of `agents`, on
 each mission's `sessions[]` (`GET /v1/missions`), and now on each of
 `brains` and each mission's `tower`. A seat was moved by the failover when
 the last of `moves` with its `address` has `how: "moved"` and its `to` is
 the account it runs on now.
 
 What the Android app needs (it doesn't show it yet): the accounts with
-both windows as bars (amber from 80 %, and "out until 15:00 (5-hour
+their windows as bars (the 5-hour one only when it isn't null) (amber from 80 %, and "out until 15:00 (5-hour
 limit)" while `out_until_ms` is set), and on each space's screen each
 session's and the tower's account, a moved one marked "moved from default
 at 15:02". The Mac's full window has it as its Accounts view and a strip in

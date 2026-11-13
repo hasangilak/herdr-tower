@@ -2767,7 +2767,9 @@ fn accounts_usage(json_out: bool) -> Result<()> {
         }
         let tags = if tags.is_empty() { String::new() } else { format!("  ({})", tags.join(", ")) };
         println!("{}  {}{tags}", l.name, l.email);
-        println!("  {}   {}", usage::window_words("5h", l.five_hour.as_ref(), now), usage::window_words("7d", l.seven_day.as_ref(), now));
+        // The 5-hour window only for an account that has one (`Line::rows`).
+        let windows: Vec<String> = l.rows().into_iter().map(|(label, w)| usage::window_words(if label == "5-hour" { "5h" } else { "7d" }, w, now)).collect();
+        println!("  {}", windows.join("   "));
         let out = usage::out_words(l, now);
         if !out.is_empty() {
             println!("  {out}");

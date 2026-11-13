@@ -53,8 +53,8 @@ pub struct Line {
 
 impl Line {
     /// The window nearest its limit, for a line that has room for one: the
-    /// 5-hour one unless the 7-day one is fuller, or the only one Claude
-    /// Code reports (it sends a window only while that window applies).
+    /// 5-hour one unless the 7-day one is fuller, or the only one the
+    /// account has (one without a 5-hour limit records only its 7-day one).
     pub fn fullest(&self) -> Option<(&'static str, &Window)> {
         match (&self.five_hour, &self.seven_day) {
             (Some(f), Some(s)) if s.used > f.used => Some(("7d", s)),
@@ -62,6 +62,18 @@ impl Line {
             (None, Some(s)) => Some(("7d", s)),
             (None, None) => None,
         }
+    }
+
+    /// The windows an account shows, in order: the 5-hour one only when its
+    /// recorded usage has one (an account without a 5-hour limit has none,
+    /// and no 5-hour row), then the 7-day one, always.
+    pub fn rows(&self) -> Vec<(&'static str, Option<&Window>)> {
+        let mut rows = vec![];
+        if let Some(w) = &self.five_hour {
+            rows.push(("5-hour", Some(w)));
+        }
+        rows.push(("7-day", self.seven_day.as_ref()));
+        rows
     }
 }
 
@@ -356,6 +368,13 @@ mod tests {
         let both = Line { five_hour: win(20.0, None), seven_day: win(70.0, None), ..Default::default() };
         assert_eq!(both.fullest().map(|(l, _)| l), Some("7d"));
         assert_eq!(Line::default().fullest(), None);
+        // The rows: no 5-hour one for an account without a 5-hour limit; the 7-day one always.
+        let labels = |l: &Line| l.rows().iter().map(|(label, w)| (*label, w.map(|w| w.used))).collect::<Vec<_>>();
+        assert_eq!(labels(&weekly), [("7-day", Some(99.0))], "no 5-hour limit: no 5-hour row");
+        assert_eq!(labels(&both), [("5-hour", Some(20.0)), ("7-day", Some(70.0))], "a 5-hour limit: its row, first");
+        assert_eq!(labels(&Line::default()), [("7-day", None)], "nothing recorded: the 7-day row, as before");
+        let five_only = Line { five_hour: win(5.0, None), ..Default::default() };
+        assert_eq!(labels(&five_only), [("5-hour", Some(5.0)), ("7-day", None)]);
 
         // The tower found the default out: it is out until then, and new sessions start on orca.
         let mut book = Book::default();
