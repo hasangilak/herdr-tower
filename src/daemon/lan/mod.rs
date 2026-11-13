@@ -56,7 +56,9 @@ pub const API: u32 = 1;
 /// (`auto`), a plan's predicted PRs (`prs`), and `auto_merge` in the state.
 /// `validation`: a predicted PR's `checks` and `edge_cases`, and a PR's
 /// `validation` (each check passed, failed, not run or not reported yet).
-pub const FEATURES: &[&str] = &["quiet", "acts", "pairing", "bonjour", "reviews", "scores", "validation"];
+/// `impact`: who outside depends on what a PR changes (`impact` on a PR,
+/// `dependents` and `outside` on a predicted one), and a breaking change's warning.
+pub const FEATURES: &[&str] = &["quiet", "acts", "pairing", "bonjour", "reviews", "scores", "validation", "impact"];
 const MAX_CONNECTIONS: usize = 32;
 /// Connections open at once from one address.
 const MAX_PER_IP: usize = 8;

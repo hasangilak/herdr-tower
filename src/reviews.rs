@@ -280,7 +280,11 @@ pub fn reviewer_settings() -> Value {
             "allow": [
                 "Bash(gh pr view:*)", "Bash(gh pr diff:*)", "Bash(gh pr checkout:*)", "Bash(gh pr review:*)", "Bash(gh pr comment:*)",
                 "Bash(gh api:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git status:*)", "Bash(git fetch:*)",
-                "Bash(tower review:*)", "Bash(tower queue:*)", "Bash(hc read:*)"
+                "Bash(tower review:*)", "Bash(tower queue:*)", "Bash(tower impact:*)", "Bash(hc read:*)",
+                // Whether it breaks what depends on it: searching, type-checking, the dependents' tests.
+                "Bash(git grep:*)", "Bash(rg:*)", "Bash(npx tsc:*)", "Bash(npm test:*)", "Bash(npm run test:*)", "Bash(npm run typecheck:*)", "Bash(npm run build:*)",
+                "Bash(pnpm test:*)", "Bash(yarn test:*)", "Bash(cargo check:*)", "Bash(cargo test:*)", "Bash(go build:*)", "Bash(go test:*)", "Bash(go vet:*)", "Bash(pytest:*)",
+                "Bash(./gradlew test:*)", "Bash(./gradlew compileDebugKotlin:*)"
             ],
             "deny": [
                 "Bash(git push:*)", "Bash(git commit:*)", "Bash(git merge:*)", "Bash(git rebase:*)", "Bash(git reset:*)",
@@ -322,8 +326,9 @@ Review it for CRITICAL issues only:\n\
 - security;\n\
 - data loss or corruption;\n\
 - a build or test failure the PR introduces;\n\
-- an API or contract break with another repo.\n\
+- a breaking change: something outside this PR uses what it removes, renames or changes (a function's callers, an API route, a request or response field, a DB column, an event, a config key, a shared type), in this repo or another (the dashboard that calls this API, the SDK, the mobile app), and no longer works.\n\
 Nothing else: no style, naming, nits or suggestions. What isn't critical, leave out.\n\n\
+Does it break other people's code? The tower searched every repo under ~/Work for what uses what this PR changes: tower impact {key} lists them (repo, file, the function each is in). For each, check it still works: type-check or compile it, run its tests against this change where you can, and search the other repos for what the tower missed (git grep). A break is a critical issue: post it as the others, naming what breaks and who uses it, and report it: tower impact {key} breaks \"<what breaks, and who uses it: repo, file, function>\". Nothing breaks: tower impact {key} clean \"<what you compiled, type-checked or ran>\".\n\n\
 1. Post each critical issue as a review comment on the PR, inline where you can, opening with \"Critical:\": gh api repos/{repo}/pulls/{n}/comments -f body='Critical: …' -f commit_id={sha} -f path=<file> -F line=<line> -f side=RIGHT (one that has no line: gh pr comment {n} --repo {repo} --body 'Critical: …').\n\
 2. Message the owner yourself, with the list and the links: tower queue {addr} \"<the critical issues, each with its link>\". The tower doesn't pass your messages on: you two talk directly.\n\
 3. Report to the tower: tower review report {key} --critical <n> \"<one line>\".\n\n\
@@ -852,7 +857,12 @@ mod tests {
             "security",
             "data loss or corruption",
             "a build or test failure the PR introduces",
-            "an API or contract break with another repo",
+            "a breaking change: something outside this PR uses what it removes, renames or changes",
+            "the dashboard that calls this API, the SDK, the mobile app",
+            "tower impact acme/shop#12 lists them",
+            "type-check or compile it, run its tests against this change",
+            "tower impact acme/shop#12 breaks \"<what breaks, and who uses it: repo, file, function>\"",
+            "tower impact acme/shop#12 clean \"<what you compiled, type-checked or ran>\"",
             "no style, naming, nits",
             "opening with \"Critical:\"",
             "gh api repos/acme/shop/pulls/12/comments -f body='Critical: …' -f commit_id=abc123",
@@ -873,6 +883,10 @@ mod tests {
         // It may comment, never push, merge or edit.
         let s = reviewer_settings();
         let deny: Vec<&str> = s["permissions"]["deny"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        let allow: Vec<&str> = s["permissions"]["allow"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        for a in ["Bash(tower impact:*)", "Bash(git grep:*)", "Bash(npx tsc:*)", "Bash(npm test:*)", "Bash(cargo check:*)"] {
+            assert!(allow.contains(&a), "{a}: {allow:?}");
+        }
         assert!(deny.contains(&"Bash(git push:*)") && deny.contains(&"Bash(gh pr merge:*)") && deny.contains(&"Edit"));
     }
 

@@ -109,6 +109,10 @@ pub struct Pr {
     /// where each check stands (`tower validate`); none when no plan predicted it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validation: Option<crate::prscore::Validation>,
+    /// Who outside depends on what it changes, and whether that breaks
+    /// (`crate::impact`), as of its head commit `impact.sha`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub impact: Option<crate::impact::Impact>,
 }
 
 impl Pr {
@@ -394,6 +398,10 @@ pub fn gate(pr: &Pr) -> Gate {
     if let Some(s) = pr.score.as_ref().filter(|s| s.needs_review) {
         g.warnings.push(format!("{}.", s.line.trim_end_matches('.')));
     }
+    // What it breaks for others, and who uses it.
+    if let Some(i) = pr.impact.as_ref().filter(|i| i.breaks()) {
+        g.warnings.push(format!("{}.", i.line().trim_end_matches('.')));
+    }
     // Its plan's checks that haven't passed: which, and how they stand.
     if let Some(v) = pr.validation.as_ref().filter(|v| !v.checks.is_empty() && !v.all_passed()) {
         g.warnings.push(format!("Planned checks not all passed: {}.", v.missing_line()));
@@ -531,9 +539,9 @@ pub type OnChange = Box<dyn Fn(&str, &Pr) + Send + Sync>;
 pub type OnMerged = Box<dyn Fn(&Pr, &str) + Send + Sync>;
 
 /// A PR found just now, before it is shown: its review score (the daemon's:
-/// its plan's prediction, and its own files), and the validation its plan
-/// gives it (none: no plan predicted it).
-pub type OnScore = Box<dyn Fn(&Pr) -> (Option<crate::prscore::Score>, Option<crate::prscore::Validation>) + Send + Sync>;
+/// its plan's prediction, and its own files), the validation its plan
+/// gives it (none: no plan predicted it), and who depends on what it changes.
+pub type OnScore = Box<dyn Fn(&Pr) -> crate::prscore::Scored + Send + Sync>;
 
 /// Its session finished its turn on a PR without reporting these planned
 /// checks (now marked not run): the daemon tells the session.
@@ -642,6 +650,32 @@ impl Prs {
     /// Who is told when a session finished its turn on a PR with planned checks unreported.
     pub fn on_unreported(&self, f: OnUnreported) {
         let _ = self.on_unreported.set(f);
+    }
+
+    /// Who depends on what it changes, read again (at a new head commit).
+    pub fn set_impact(&self, k: &str, impact: Option<crate::impact::Impact>) {
+        let Some(mut pr) = self.get(k) else { return };
+        if pr.impact == impact {
+            return;
+        }
+        pr.impact = impact;
+        self.store(pr, "update", true);
+    }
+
+    /// A break the reviewer or the PR's session found by compiling,
+    /// type-checking or running the dependents' tests, or that it found none
+    /// (`tower impact`). The PR as it is now.
+    pub fn report_impact(&self, k: &str, verdict: &str, text: &str, by: &str) -> Result<Pr> {
+        let mut pr = self.get(k).with_context(|| format!("the tower doesn't know {k}"))?;
+        let impact = pr.impact.get_or_insert_with(Default::default);
+        impact.report(verdict, text, by, crate::history::now_ms())?;
+        // A break makes it a breaking change in its score too.
+        if impact.breaks() {
+            let more = impact.score();
+            pr.score = Some(crate::prscore::union(&pr.score.clone().unwrap_or_default(), &more));
+        }
+        self.store(pr.clone(), "update", true);
+        Ok(pr)
     }
 
     /// Its session reports one of its planned checks (`tower validate`):
@@ -804,7 +838,8 @@ impl Prs {
             }
             // Its review score, from the start (its plan's prediction, its own files).
             if let Some(f) = self.on_score.get() {
-                (pr.score, pr.validation) = f(&pr);
+                let found = f(&pr);
+                (pr.score, pr.validation, pr.impact) = (found.score, found.validation, found.impact);
             }
             // Found as its session finished its turn on it: none of its checks was reported.
             let unreported = if waiting { pr.validation.as_mut().map(|v| v.finished(now)).unwrap_or_default() } else { vec![] };
@@ -977,6 +1012,7 @@ fn keep_own(pr: &mut Pr, old: &Pr) {
     pr.score = old.score.clone();
     pr.auto = old.auto.clone();
     pr.validation = old.validation.clone();
+    pr.impact = old.impact.clone();
 }
 
 /// A PR without when and whether it is looked at: what the chip shows.
@@ -1129,6 +1165,7 @@ echo "$*" >> "$D/calls.log"
 case "$1 $2" in
   "pr view") f="$D/pr-$3.json"; [ -f "$f" ] && cat "$f" || { echo "no pull requests found" >&2; exit 1; } ;;
   "repo view") echo '{"viewerDefaultMergeMethod":"SQUASH"}' ;;
+  "pr diff") f="$D/diff-$3.patch"; [ -f "$f" ] && cat "$f"; true ;;
   "pr merge") sed -i '' 's/"state":"OPEN"/"state":"MERGED"/' "$D/pr-$3.json" ;;
   *) echo "fake gh: $*" >&2; exit 1 ;;
 esac

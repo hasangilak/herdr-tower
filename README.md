@@ -527,6 +527,14 @@ PR's session reports each check with its evidence (`tower validate`); what
 it doesn't report counts as not run. A PR whose planned checks haven't all
 passed is never merged by the tower, and its merge card says which are
 missing.
+
+**Every PR is checked for what it breaks.** The tower reads each PR's diff,
+finds what it removes, renames or changes that others use (functions,
+API routes and fields, DB columns, events, config keys, shared types) and
+searches every repo under ~/Work for who uses them. Anything it would break
+makes it "Needs review: a breaking change", with a warning that names what
+breaks and who uses it (repo, file, function); the reviewer checks the
+dependents' builds and tests too. Nothing depends on it: it says so.
 It is on for every space; New space's **Review its PRs** switch (`tower
 launch --no-review`), the space's own **Review PRs** switch and `tower
 space review <space> off` turn it off.

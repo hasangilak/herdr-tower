@@ -171,6 +171,18 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<String>,
     },
+    /// Who depends on a PR's changes (`tower impact`): `pr` (its key, its
+    /// link, or `#12`), `verdict` (`breaks` or `clean`; empty: show it),
+    /// `text` (what breaks and who uses it, or what was compiled or run).
+    Impact {
+        pr: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        verdict: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+    },
     /// What only the user can decide, in queue order (`tower decisions`).
     /// No `space`: the main queue (muted spaces left out). `space`: that
     /// space's own. `all`: the last ones that closed too.
@@ -384,7 +396,7 @@ fn wait_for(req: &Request) -> Duration {
         // Ending a brain's terminal, and Herdr's answers on the way (a plan's planner too).
         Request::Model { .. } | Request::Brains { .. } | Request::Plan { .. } => Duration::from_secs(45),
         // A PR the tower doesn't know yet is looked up on GitHub first.
-        Request::Validate { .. } => Duration::from_secs(30),
+        Request::Validate { .. } | Request::Impact { .. } => Duration::from_secs(30),
         _ => Duration::from_secs(10),
     }
 }

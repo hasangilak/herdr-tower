@@ -111,11 +111,34 @@ pub struct Predicted {
     pub checks: Vec<Check>,
     /// The edge cases to cover, each tied to the checks that cover it (at least one).
     pub edge_cases: Vec<EdgeCase>,
+    /// What outside the changed code uses what it changes, and whether it still works.
+    pub dependents: Vec<Uses>,
+    /// How the planner checked who depends on it; when nothing does, that it doesn't.
+    pub outside: String,
     /// The tower's score of it.
     pub score: Score,
     /// The real PR, once it opened (`owner/name#12`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr: Option<String>,
+}
+
+/// Something outside a planned PR that uses what it changes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Uses {
+    /// What the PR changes that it uses ("the response field translated_text").
+    pub what: String,
+    /// Who uses it: repo, file, function ("eyzflow-admin-dashboard src/inbox/api.ts loadMessages").
+    pub used_by: String,
+    /// The change breaks it.
+    pub breaks: bool,
+}
+
+impl Uses {
+    /// "the response field translated_text, used by eyzflow-admin-dashboard src/inbox/api.ts loadMessages".
+    pub fn said(&self) -> String {
+        format!("{}, used by {}", self.what, self.used_by)
+    }
 }
 
 impl Predicted {
@@ -133,6 +156,7 @@ impl Predicted {
             migration: self.migration,
             breaking: self.breaking.clone(),
             escalate: self.escalate.clone(),
+            breaks: self.dependents.iter().filter(|d| d.breaks).map(Uses::said).collect(),
         }
     }
 }
@@ -146,6 +170,8 @@ pub struct Evidence {
     pub migration: bool,
     pub breaking: String,
     pub escalate: Vec<String>,
+    /// What it breaks for others, and who uses it ("X, used by Y").
+    pub breaks: Vec<String>,
 }
 
 // ---- how it is validated ----
@@ -610,9 +636,15 @@ pub fn hits(e: &Evidence) -> Vec<(&'static str, String)> {
     if e.migration {
         add("migration", files_of("migration").unwrap_or_else(|| "the plan says so".into()));
     }
-    let breaking = e.breaking.trim();
-    if !breaking.is_empty() {
-        add("breaking", breaking.to_string());
+    // What it breaks: the planner's word, then each dependent it breaks.
+    let mut parts: Vec<String> = e.breaking.trim().is_empty().then(Vec::new).unwrap_or_else(|| vec![e.breaking.trim().to_string()]);
+    parts.extend(e.breaks.iter().map(|b| b.trim().to_string()).filter(|b| !b.is_empty()));
+    if !parts.is_empty() {
+        let mut what = parts.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
+        if parts.len() > 3 {
+            what += &format!("; and {} more", parts.len() - 3);
+        }
+        add("breaking", what);
     }
     for x in e.escalate.iter().map(|x| x.trim()).filter(|x| !x.is_empty()) {
         let kind = word_hits(x).first().map(|(k, _)| *k).unwrap_or("escalate");
@@ -688,6 +720,33 @@ pub fn files_of(v: &Value) -> Vec<String> {
     v["files"].as_array().into_iter().flatten().filter_map(|f| f["path"].as_str().or(f.as_str())).map(String::from).collect()
 }
 
+/// What a PR found just now carries from the start (the daemon's scorer):
+/// its score, the validation its plan gives it, and who depends on what it changes.
+#[derive(Debug, Clone, Default)]
+pub struct Scored {
+    pub score: Option<Score>,
+    pub validation: Option<Validation>,
+    pub impact: Option<crate::impact::Impact>,
+}
+
+/// Two readings of the same real PR as one score (its files and words,
+/// and who depends on what it changes): every reason of both.
+pub fn union(a: &Score, b: &Score) -> Score {
+    let mut s = a.clone();
+    for (k, r) in b.flags.iter().zip(&b.reasons) {
+        if !s.flags.contains(k) {
+            s.flags.push(k.clone());
+            s.reasons.push(r.clone());
+        }
+    }
+    let mut both: Vec<(String, String)> = s.flags.iter().cloned().zip(s.reasons.iter().cloned()).collect();
+    both.sort_by_key(|(k, _)| weight(k));
+    (s.flags, s.reasons) = both.into_iter().unzip();
+    s.needs_review = !s.reasons.is_empty();
+    s.line = if s.needs_review { format!("Needs review: {}", reasons_line(&s.reasons)) } else { LOW_LINE.to_string() };
+    s
+}
+
 // ---- reading the planner's list ----
 
 /// A repo's folder name, from a name or a path.
@@ -735,6 +794,7 @@ pub fn check(v: &Value, repos: &[String]) -> Result<Vec<Predicted>> {
             _ => String::new(),
         };
         let (checks, edge_cases) = validation_of(x, n, name)?;
+        let (dependents, outside) = dependents_of(x, n, name)?;
         let mut p = Predicted {
             n,
             repo: name.to_string(),
@@ -748,6 +808,8 @@ pub fn check(v: &Value, repos: &[String]) -> Result<Vec<Predicted>> {
             after: x["after"].as_array().into_iter().flatten().filter_map(Value::as_u64).map(|a| a as u32).filter(|a| *a != n).collect(),
             checks,
             edge_cases,
+            dependents,
+            outside,
             ..Default::default()
         };
         p.score = score(&p.evidence());
@@ -812,6 +874,29 @@ fn validation_of(x: &Value, n: u32, name: &str) -> Result<(Vec<Check>, Vec<EdgeC
     Ok((checks, edges))
 }
 
+/// Who outside depends on what a predicted PR changes, as the planner
+/// found it (`dependents`: what, used by whom, whether it breaks), and how
+/// it checked (`outside`). One of them is needed: a PR nothing depends on says so.
+fn dependents_of(x: &Value, n: u32, name: &str) -> Result<(Vec<Uses>, String)> {
+    let pr = format!("PR {n} ({name})");
+    let mut out = vec![];
+    for d in x["dependents"].as_array().into_iter().flatten() {
+        let s = |k: &str| d[k].as_str().unwrap_or("").trim().to_string();
+        let (what, used_by) = (s("what"), s("used_by"));
+        if what.is_empty() || used_by.is_empty() {
+            bail!("{pr}: a dependent needs \"what\" (what the PR changes that it uses) and \"used_by\" (repo, file, function)");
+        }
+        out.push(Uses { what, used_by, breaks: d["breaks"].as_bool().unwrap_or(false) });
+    }
+    let outside = x["outside"].as_str().unwrap_or("").trim().to_string();
+    if out.is_empty() && outside.is_empty() {
+        bail!(
+            "{pr}: say who outside depends on what it changes: \"dependents\": [{{\"what\": \"<what it changes>\", \"used_by\": \"<repo, file, function>\", \"breaks\": true}}], or \"outside\": \"<nothing outside depends on it: what you searched>\""
+        );
+    }
+    Ok((out, outside))
+}
+
 /// The predicted PRs in a few lines, as `tower plan prs` prints them for
 /// the planner (to put in the plan as they are) and `tower plan show` says.
 pub fn said(prs: &[Predicted]) -> String {
@@ -823,6 +908,14 @@ pub fn said(prs: &[Predicted]) -> String {
             }
             for e in &p.edge_cases {
                 s += &format!("\n  edge case: {} (covered by {})", e.case, e.checks.join(", "));
+            }
+            for d in &p.dependents {
+                s += &format!("\n  {}: {}", if d.breaks { "BREAKS" } else { "depends on it, still works" }, d.said());
+            }
+            if p.dependents.is_empty() {
+                s += &format!("\n  nothing outside depends on it: {}", p.outside);
+            } else if !p.outside.is_empty() {
+                s += &format!("\n  checked: {}", p.outside);
             }
             if !p.after.is_empty() {
                 s += &format!("\n  after PR {}", p.after.iter().map(u32::to_string).collect::<Vec<_>>().join(", PR "));
@@ -913,6 +1006,13 @@ pub fn auto_path(pr: &Pr, on: bool) -> Path {
     let Some(s) = &pr.score else { return yours("it has no review score") };
     if s.needs_review {
         return Path::Yours(s.line.clone());
+    }
+    // Who depends on what it changes: checked at its head, and nothing breaks.
+    match &pr.impact {
+        None => return yours("who depends on what it changes wasn't checked"),
+        Some(i) if i.breaks() => return Path::Yours(i.line()),
+        Some(i) if i.sha != pr.head_sha => return Path::Waits("its dependents checked at its head commit".into()),
+        Some(_) => {}
     }
     if s.planned.is_none() {
         return yours("no plan predicted it");
@@ -1084,7 +1184,9 @@ pub(crate) mod tests {
                 { "case": "A message already translated: no second row", "checks": ["c2"] },
                 { "case": "An unsupported language is refused", "checks": ["c2"] },
                 { "case": "Rolling back after rows exist", "checks": ["c1"] },
-              ] },
+              ],
+              "dependents": [{ "what": "GET /v1/messages and its response", "used_by": "eyzflow-admin-dashboard src/inbox/api.ts loadMessages", "breaks": false }],
+              "outside": "rg over ~/Work for /v1/messages and message_translations: the field is added, nothing is renamed or removed" },
             { "repo": "eyzflow-admin-dashboard", "title": "Show translated messages in the inbox", "changes": "The inbox shows each message's translation under it, with a toggle.",
               "files": ["src/inbox/MessageRow.tsx", "src/inbox/TranslationToggle.tsx"], "after": [1],
               "checks": [
@@ -1094,7 +1196,8 @@ pub(crate) mod tests {
               "edge_cases": [
                 { "case": "A message with no translation yet shows the original, no empty line", "checks": ["c1"] },
                 { "case": "A very long message wraps, nothing is cut", "checks": ["c2"] },
-              ] },
+              ],
+              "outside": "rg over ~/Work for MessageRow and TranslationToggle: only the inbox uses them" },
         ]})
     }
 
@@ -1110,7 +1213,7 @@ pub(crate) mod tests {
         // The list alone reads too; a whole path is its folder's name.
         let ok_checks = json!([{ "what": "w", "how": "h", "evidence": "e" }]);
         let ok_edges = json!([{ "case": "c", "check": "c1" }]);
-        let bare = json!([{ "repo": "/w/eyz/eyzflow-admin-dashboard/", "title": "x", "base": "main", "files": "a.tsx, b.tsx", "checks": ok_checks, "edge_cases": ok_edges }]);
+        let bare = json!([{ "repo": "/w/eyz/eyzflow-admin-dashboard/", "title": "x", "base": "main", "files": "a.tsx, b.tsx", "checks": ok_checks, "edge_cases": ok_edges, "outside": "nothing" }]);
         let p = check(&bare, &draft_repos()).unwrap();
         assert_eq!((p[0].repo.as_str(), p[0].base.as_str(), p[0].files.len()), ("eyzflow-admin-dashboard", "main", 2));
         // What can't be.
@@ -1127,7 +1230,7 @@ pub(crate) mod tests {
         let v = prs[1].validation();
         assert_eq!((v.all_passed(), v.missing().len(), v.line().as_str()), (false, 2, "Checks missing: c1 Each message shows its translation, and the toggle shows the… (not reported yet), c2 On dev, the inbox shows translated messages to a German-spea… (not reported yet) (0 of 2 passed)"));
         // What the planner must give: checks with what, how and evidence; edge cases each covered by a check.
-        let one = |checks: Value, edges: Value| check(&json!([{ "repo": "eyz-customer-support", "title": "x", "checks": checks, "edge_cases": edges }]), &draft_repos());
+        let one = |checks: Value, edges: Value| check(&json!([{ "repo": "eyz-customer-support", "title": "x", "checks": checks, "edge_cases": edges, "outside": "nothing" }]), &draft_repos());
         assert!(one(json!([]), ok_edges.clone()).unwrap_err().to_string().contains("has no checks: say how it is validated for sure"));
         assert!(one(json!([{ "what": "w", "evidence": "e" }]), ok_edges.clone()).unwrap_err().to_string().contains("check c1: no \"how\""));
         assert!(one(json!([{ "what": "w", "how": "h" }]), ok_edges.clone()).unwrap_err().to_string().contains("no \"evidence\""));
@@ -1140,6 +1243,38 @@ pub(crate) mod tests {
         assert!(said.contains("\n  edge case: Rolling back after rows exist (covered by c1)"), "{said}");
         assert!(said.contains("PR 1 · eyz-customer-support → dev: Store each message's translation\n  Needs review: a database migration"), "{said}");
         assert!(said.contains("PR 2 · eyzflow-admin-dashboard → dev: Show translated messages in the inbox\n  Low risk:") && said.contains("after PR 1"), "{said}");
+    }
+
+    #[test]
+    fn a_planned_pr_says_who_depends_on_it_and_one_that_breaks_them_is_a_breaking_change() {
+        let base = || json!({ "repo": "eyz-customer-support", "title": "Messages carry their translation", "changes": "The messages response sends the translation under a new key.",
+            "checks": [{ "what": "the dashboard still reads it", "how": "npx tsc --noEmit in eyzflow-admin-dashboard, then npm test -- inbox", "evidence": "the output" }],
+            "edge_cases": [{ "case": "an old client", "checks": ["c1"] }] });
+        // Nothing said about who depends on it: refused.
+        assert!(check(&json!([base()]), &draft_repos()).unwrap_err().to_string().contains("say who outside depends on what it changes"));
+        // A dependent it breaks: a breaking change, naming what breaks and who uses it.
+        let mut b = base();
+        b["dependents"] = json!([
+            { "what": "the response field translated_text", "used_by": "eyzflow-admin-dashboard src/inbox/api.ts loadMessages", "breaks": true },
+            { "what": "GET /v1/messages", "used_by": "eyz-mobile src/sync.kt syncAll", "breaks": false },
+        ]);
+        b["outside"] = json!("rg over ~/Work for translated_text and /v1/messages");
+        let p = check(&json!([b]), &draft_repos()).unwrap();
+        assert!(p[0].score.needs_review && p[0].score.flags == ["breaking"], "{:?}", p[0].score);
+        assert_eq!(p[0].score.line, "Needs review: a breaking change (the response field translated_text, used by eyzflow-admin-dashboard src/inbox/api.ts loadMessages)");
+        let text = said(&p);
+        assert!(text.contains("BREAKS: the response field translated_text, used by eyzflow-admin-dashboard src/inbox/api.ts loadMessages"), "{text}");
+        assert!(text.contains("depends on it, still works: GET /v1/messages, used by eyz-mobile src/sync.kt syncAll") && text.contains("checked: rg over ~/Work"), "{text}");
+        // Dependents it doesn't break, or none at all (said so): not a breaking change.
+        let mut fine = base();
+        fine["outside"] = json!("rg over ~/Work for translated_text: nothing outside reads it");
+        let p = check(&json!([fine]), &draft_repos()).unwrap();
+        assert!(!p[0].score.flags.contains(&"breaking".to_string()), "{:?}", p[0].score);
+        assert!(said(&p).contains("nothing outside depends on it: rg over ~/Work for translated_text"));
+        // A dependent needs what and who.
+        let mut bad = base();
+        bad["dependents"] = json!([{ "what": "x" }]);
+        assert!(check(&json!([bad]), &draft_repos()).unwrap_err().to_string().contains("\"used_by\""));
     }
 
     #[test]
@@ -1181,6 +1316,7 @@ pub(crate) mod tests {
                 checks: vec![Check { id: "c1".into(), what: "It works".into(), how: "npm test".into(), evidence: "test output".into(), status: PASSED.into(), ..Default::default() }],
                 edge_cases: vec![EdgeCase { case: "empty".into(), checks: vec!["c1".into()] }],
             }),
+            impact: Some(crate::impact::Impact { sha: "abc".into(), searched: vec!["shop-web".into()], ..Default::default() }),
             ..Default::default()
         }
     }
@@ -1200,6 +1336,15 @@ pub(crate) mod tests {
         assert!(matches!(with(&|p| p.score = Some(score(&ev("x", "", &["db/migrations/1.sql"])))), Path::Yours(w) if w.starts_with("Needs review: a database migration")));
         assert_eq!(with(&|p| p.score.as_mut().unwrap().planned = None), Path::Yours("no plan predicted it".into()));
         assert_eq!(with(&|p| p.score = None), Path::Yours("it has no review score".into()));
+        // Who depends on what it changes: checked at its head, and nothing breaks.
+        assert_eq!(with(&|p| p.impact = None), Path::Yours("who depends on what it changes wasn't checked".into()));
+        assert_eq!(with(&|p| p.impact.as_mut().unwrap().sha = "old".into()), Path::Waits("its dependents checked at its head commit".into()));
+        let broken = |p: &mut Pr| {
+            let i = p.impact.as_mut().unwrap();
+            i.things = vec![crate::impact::Thing { kind: "function".into(), name: "formatTotal".into(), change: "removed".into(), file: "src/money.ts".into(), ..Default::default() }];
+            i.dependents = vec![crate::impact::Dependent { repo: "shop-web".into(), file: "src/cart/Total.tsx".into(), line: 4, uses: "formatTotal".into(), within: "renderTotal".into(), ..Default::default() }];
+        };
+        assert_eq!(with(&broken), Path::Yours("Breaking change: removes formatTotal, used by shop-web src/cart/Total.tsx:4 in renderTotal".into()));
         assert_eq!(with(&|p| p.checks.state = "pending".into()), Path::Waits("its checks".into()));
         assert_eq!(with(&|p| p.checks.state = "failing".into()), Path::Yours("its checks fail".into()));
         assert_eq!(with(&|p| p.checks.state = "none".into()), Path::Yours("no checks ran on it".into()));
@@ -1212,7 +1357,14 @@ pub(crate) mod tests {
         assert_eq!(with(&|p| p.mergeable = "conflicting".into()), Path::Yours("it has conflicts".into()));
         assert_eq!(with(&|p| p.mergeable = "unknown".into()), Path::Waits("GitHub to say it merges cleanly".into()));
         // A push since its files were read: they are read again first.
-        assert_eq!(with(&|p| p.head_sha = "new".into()), Path::Waits("its files read at its head commit".into()));
+        assert_eq!(with(&|p| p.head_sha = "new".into()), Path::Waits("its dependents checked at its head commit".into()));
+        assert_eq!(
+            with(&|p| {
+                p.head_sha = "new".into();
+                p.impact.as_mut().unwrap().sha = "new".into();
+            }),
+            Path::Waits("its files read at its head commit".into())
+        );
         // The tower couldn't merge it at this commit: the user's; a new commit tries again.
         let failed = Auto { state: "failed".into(), why: "a review is required".into(), sha: "abc".into(), at_ms: 1 };
         assert_eq!(with(&|p| p.auto = Some(failed.clone())), Path::Yours("the tower couldn't merge it: a review is required".into()));

@@ -164,6 +164,8 @@ pub struct PrRef {
     pub score: Option<crate::prscore::Score>,
     /// Its plan's checks and edge cases, and where each check stands.
     pub validation: Option<crate::prscore::Validation>,
+    /// Who outside depends on what it changes, and whether that breaks.
+    pub impact: Option<crate::impact::Impact>,
 }
 
 impl PrRef {
@@ -440,6 +442,7 @@ pub fn adapt(sets: &[QuestionSet], prs: &BTreeMap<String, Pr>, agents: &Value, s
                 review: p.review.clone(),
                 score: p.score.clone(),
                 validation: p.validation.clone(),
+                impact: p.impact.clone(),
             })
             .collect();
         let key = format!("merge:{repo}@{space}");

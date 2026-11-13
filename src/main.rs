@@ -28,6 +28,7 @@ mod draft;
 mod hc;
 mod history;
 mod hooks;
+mod impact;
 mod install;
 mod introduce;
 mod launch;
@@ -222,6 +223,21 @@ enum Cmd {
         /// on, off or status (default).
         #[arg(default_value = "status")]
         action: String,
+    },
+    /// Who outside depends on what a PR changes (callers in other repos, readers of an API field,
+    /// …), as the tower found it: `tower impact <pr>`. The reviewer or the PR's session reports
+    /// what compiling, type-checking or running the dependents' tests showed: `tower impact <pr>
+    /// breaks "<what breaks, and who uses it: repo, file, function>"` or `tower impact <pr> clean
+    /// "<what you compiled or ran>"`. A break makes it a breaking change, for the user to review.
+    Impact {
+        /// The PR: owner/repo#12, its link, or #12.
+        pr: String,
+        /// breaks or clean.
+        verdict: Option<String>,
+        /// What breaks and who uses it, or what was compiled or run.
+        text: Vec<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// Report one of the planned checks of your PR (its plan lists them: what it shows, how, the
     /// evidence): `tower validate <pr> <check> passed|failed|not-run --evidence "<test output, a
@@ -877,6 +893,7 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Automerge { action } => automerge_cmd(&action),
+        Cmd::Impact { pr, verdict, text, json } => impact_cmd(&pr, verdict.as_deref(), &text.join(" "), json),
         Cmd::Validate { pr, check, status, evidence, json } => validate_cmd(&pr, check.as_deref(), status.as_deref(), evidence.as_deref(), json),
         Cmd::MacVoice { action } => {
             let on = if protocol::is_running() {
@@ -1343,6 +1360,29 @@ fn show_history(jobs: Option<&str>, session: Option<&str>, n: usize) -> Result<(
 
 /// `tower tell [decisions|results|everything] [--voice off|decisions|replies]`:
 /// how much it tells and what it says out loud, or set them.
+/// `tower impact <pr> [breaks|clean "<words>"]`.
+fn impact_cmd(pr: &str, verdict: Option<&str>, text: &str, as_json: bool) -> Result<()> {
+    let verdict = verdict.unwrap_or("").trim();
+    if !verdict.is_empty() && text.trim().is_empty() {
+        bail!("tower impact <pr> {verdict} \"<what breaks and who uses it (repo, file, function), or what you compiled or ran>\"");
+    }
+    let r = protocol::send(&Request::Impact { pr: pr.trim().to_string(), verdict: verdict.to_string(), text: text.trim().to_string(), from: peers::caller() })?;
+    if !r.ok {
+        bail!("{}", r.error.unwrap_or_default());
+    }
+    let v = r.state.unwrap_or_default();
+    if as_json || !std::io::stdout().is_terminal() {
+        print_json(&v);
+        return Ok(());
+    }
+    println!("{}: {}", v["pr"].as_str().unwrap_or(""), v["line"].as_str().unwrap_or("who depends on it wasn't checked"));
+    for d in v["impact"]["dependents"].as_array().into_iter().flatten() {
+        let within = d["within"].as_str().filter(|w| !w.is_empty()).map(|w| format!(" in {w}")).unwrap_or_default();
+        println!("  {} uses {}: {} {}:{}{within}", d["repo"].as_str().unwrap_or(""), d["uses"].as_str().unwrap_or(""), d["repo"].as_str().unwrap_or(""), d["file"].as_str().unwrap_or(""), d["line"]);
+    }
+    Ok(())
+}
+
 /// `tower validate <pr> [<check> <status> --evidence "…"]`.
 fn validate_cmd(pr: &str, check: Option<&str>, status: Option<&str>, evidence: Option<&str>, as_json: bool) -> Result<()> {
     let (check, status) = (check.unwrap_or("").trim(), status.unwrap_or("").trim());

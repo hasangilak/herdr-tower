@@ -199,6 +199,9 @@ pub struct PrRef {
     /// Its plan's checks and edge cases, and where each check stands.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validation: Option<crate::prscore::Validation>,
+    /// Who outside depends on what it changes, and whether that breaks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub impact: Option<crate::impact::Impact>,
 }
 
 impl PrRef {
@@ -223,6 +226,7 @@ impl PrRef {
             review: p.review.clone(),
             score: p.score.clone(),
             validation: p.validation.clone(),
+            impact: p.impact.clone(),
         }
     }
 

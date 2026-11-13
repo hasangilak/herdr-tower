@@ -181,7 +181,7 @@ pub struct Config {
 }
 
 /// `[prs]` in config.toml.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrsCfg {
     /// The tower merges a PR into dev itself when a plan predicted it, it
@@ -192,6 +192,15 @@ pub struct PrsCfg {
     /// merge. Anything that needs review, and every merge into main or
     /// prod, is the user's either way.
     pub auto_merge_low_risk: bool,
+    /// Where a PR's dependents are looked for (`crate::impact`): every git
+    /// checkout under these folders (`~` allowed).
+    pub impact_roots: Vec<String>,
+}
+
+impl Default for PrsCfg {
+    fn default() -> Self {
+        Self { auto_merge_low_risk: false, impact_roots: vec!["~/Work".into()] }
+    }
 }
 
 /// `[brains]` in config.toml: one setting for every tower brain, the main
