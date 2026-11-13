@@ -51,6 +51,20 @@ pub struct Line {
     pub out_why: String,
 }
 
+impl Line {
+    /// The window nearest its limit, for a line that has room for one: the
+    /// 5-hour one unless the 7-day one is fuller, or the only one Claude
+    /// Code reports (it sends a window only while that window applies).
+    pub fn fullest(&self) -> Option<(&'static str, &Window)> {
+        match (&self.five_hour, &self.seven_day) {
+            (Some(f), Some(s)) if s.used > f.used => Some(("7d", s)),
+            (Some(f), _) => Some(("5h", f)),
+            (None, Some(s)) => Some(("7d", s)),
+            (None, None) => None,
+        }
+    }
+}
+
 /// A session waiting for an account: every one was out when it hit its limit.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -336,6 +350,12 @@ mod tests {
         assert_eq!((d.out_until_ms, d.out_why.as_str()), (None, ""));
         assert_eq!((b.list[1].five_hour.clone(), b.list[1].seven_day.clone()), (None, None), "nothing recorded: no windows");
         assert_eq!(b.starts_on.as_deref(), Some("default"));
+        assert_eq!(d.fullest().map(|(l, w)| (l, w.used)), Some(("5h", 42.4)), "the 7-day one reset to 0");
+        let weekly = Line { seven_day: win(99.0, Some(NOW + 1)), ..Default::default() };
+        assert_eq!(weekly.fullest().map(|(l, w)| (l, w.used)), Some(("7d", 99.0)), "only the 7-day window reported (as Claude Code sends it now)");
+        let both = Line { five_hour: win(20.0, None), seven_day: win(70.0, None), ..Default::default() };
+        assert_eq!(both.fullest().map(|(l, _)| l), Some("7d"));
+        assert_eq!(Line::default().fullest(), None);
 
         // The tower found the default out: it is out until then, and new sessions start on orca.
         let mut book = Book::default();
