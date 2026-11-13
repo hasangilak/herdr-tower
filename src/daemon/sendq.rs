@@ -760,7 +760,7 @@ impl SendQueue {
         Self::at(config::state_dir().join("queue.json"))
     }
 
-    fn at(path: PathBuf) -> SendQueue {
+    pub(super) fn at(path: PathBuf) -> SendQueue {
         SendQueue {
             book: Arc::new(Mutex::new(Book::load_from(&path))),
             path,

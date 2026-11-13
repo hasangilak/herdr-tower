@@ -67,6 +67,12 @@ pub struct Pr {
     pub draft: bool,
     /// `mergeable`, `conflicting` or `unknown` (GitHub is still working it out).
     pub mergeable: String,
+    /// GitHub's merge state, lowercase (`clean`, `behind`: its branch is
+    /// behind the base and the repo wants it up to date, `dirty`:
+    /// conflicts, `blocked`, `unstable`, `has_hooks`, `draft`, `unknown`);
+    /// empty when it wasn't asked.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub merge_state: String,
     pub checks: Checks,
     /// The session that made it (address), its name and space.
     pub session: String,
@@ -217,7 +223,7 @@ fn creates_pr(input: &Value) -> bool {
 // ---- what GitHub says ----
 
 /// The fields asked of `gh pr view`.
-pub const FIELDS: &str = "number,title,url,state,isDraft,mergeable,statusCheckRollup,baseRefName,headRefName,headRefOid,mergedAt,closedAt";
+pub const FIELDS: &str = "number,title,url,state,isDraft,mergeable,mergeStateStatus,statusCheckRollup,baseRefName,headRefName,headRefOid,mergedAt,closedAt";
 
 /// The PR as `gh pr view --json FIELDS` gives it, onto `pr` (keeping who
 /// made it and what the tower knows).
@@ -245,6 +251,7 @@ pub fn apply_gh(pr: &mut Pr, v: &Value) {
         _ => "unknown",
     }
     .into();
+    pr.merge_state = s("mergeStateStatus").to_lowercase();
     pr.checks = rollup(&v["statusCheckRollup"]);
 }
 
@@ -401,6 +408,12 @@ fn gh(bin: &Path, args: &[&str]) -> Result<String> {
 pub fn fetch(bin: &Path, repo: &str, number: u64) -> Result<Value> {
     let out = gh(bin, &["pr", "view", &number.to_string(), "--repo", repo, "--json", FIELDS])?;
     serde_json::from_str(&out).context("reading gh's answer")
+}
+
+/// Brings a PR's branch up to date with its base on GitHub (a merge of the
+/// base into it, `gh pr update-branch`): for one that fell behind.
+pub fn update_branch(bin: &Path, repo: &str, number: u64) -> Result<()> {
+    gh(bin, &["pr", "update-branch", &number.to_string(), "--repo", repo]).map(|_| ())
 }
 
 /// The repo's default merge method for this user: `--merge`, `--squash` or `--rebase`.
