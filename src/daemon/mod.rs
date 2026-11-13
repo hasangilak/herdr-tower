@@ -700,6 +700,12 @@ impl Daemon {
                     return Response::err(brain::spoken_error(&format!("{e:#}")));
                 }
             }
+            Request::Withdraw { at } => {
+                return match brains::withdraw(at) {
+                    Ok(v) => Response { ok: true, error: None, state: Some(v) },
+                    Err(e) => Response::err(format!("{e:#}")),
+                };
+            }
             Request::Watch { terminal, note, account } => {
                 return match self.watches.add(&terminal, &note, account) {
                     Ok(address) => Response { ok: true, error: None, state: Some(serde_json::json!({ "address": address })) },

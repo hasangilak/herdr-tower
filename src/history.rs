@@ -34,7 +34,9 @@ pub struct Entry {
     /// `status` is who said it, `you`, `tower` or `planner`; always
     /// `record`), `reply` (a session's last words at the end of a turn
     /// that a message of the user's or the tower's started: `reply_to`
-    /// names that message), and others (`queue`, `screenshot`, `pr`,
+    /// names that message), `unanswered` (no answer will come to the
+    /// request `reply_to` names: `status` says why, `empty`, `failed` or
+    /// `taken-back`), and others (`queue`, `screenshot`, `pr`,
     /// `behavior`, `introduce`, `answered`).
     pub kind: String,
     /// The session's address (`t3`, `vps/t2`).
@@ -108,7 +110,8 @@ pub struct Entry {
     pub act: Option<serde_json::Value>,
     /// `answer`, `reply`: the message it answers, by its `at`: the user's
     /// request a brain's turn began with (`request_for_prompt`), or what a
-    /// session was given that started its turn (`message_for_turn`).
+    /// session was given that started its turn (`message_for_turn`);
+    /// `unanswered`: the request no answer will come to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<u64>,
 }
@@ -381,6 +384,19 @@ pub fn record_request(message: &str, source: &str, space: Option<String>) {
     let (text, attachments) = split(message);
     let source = (!source.is_empty()).then(|| source.to_string());
     append(Entry { kind: "request".into(), text, attachments, source, space, ..Default::default() });
+}
+
+/// No answer will come to the request at `reply_to`: the brain's turn
+/// ended without one (`why`: `empty`), it failed (`failed`, `text` says
+/// how), or the user took the request back (`taken-back`). The chat says
+/// so on the question instead of waiting.
+pub fn record_unanswered(reply_to: u64, why: &str, text: &str, space: Option<String>) {
+    append(Entry { kind: "unanswered".into(), status: Some(why.into()), text: text.into(), reply_to: Some(reply_to), space, record: true, ..Default::default() });
+}
+
+/// The record that no answer will come to the request at `at`, if any.
+pub fn unanswered_of(entries: &[Entry], at: u64) -> Option<&Entry> {
+    entries.iter().rev().find(|e| e.kind == "unanswered" && e.reply_to == Some(at))
 }
 
 /// A job starts: the brain handed `session` this work. Returns its id.

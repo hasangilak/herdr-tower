@@ -687,6 +687,12 @@ between, and in whatever order answers arrive:
   time), so it is the same after a restart. A tower's answer names the
   request its turn began with; a session's reply, the message that
   started its turn. Answers from before this came have neither.
+- Not served yet: whether an answer will still come. The Mac panel shows
+  a spinner on an unanswered request, and the reason when none will come
+  (the tower's turn ended without one, it failed, the user took it back).
+  It reads that from the history's `unanswered` entries, which `/v1/chat`
+  doesn't carry. Until then, treat a recent request without `answered_by`
+  as waiting.
 
 `id` is `h<line>`: stable, unique, in order. What the tower is writing
 right now isn't a message yet: the state's `work` (its working line) and

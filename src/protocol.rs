@@ -60,6 +60,11 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         space: Option<String>,
     },
+    /// Take back the request at `at` (its `at` in the history): its brain
+    /// is stopped if it is still on it, and the chat says no answer comes.
+    Withdraw {
+        at: u64,
+    },
     /// Tell the brain when this terminal stops working.
     Watch {
         terminal: String,

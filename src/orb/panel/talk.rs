@@ -19,7 +19,8 @@
 //! is that conversation while it is still being had (`launch`).
 
 use gpui::{AnyElement, Context, FontWeight, SharedString, Window, div, prelude::*, px, rgb, rgba};
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 
 use super::home::{ActShown, LINE, SOFT, bay_label, cstat, cstat_busy};
 use super::{AMBER, CYAN, Panel, glass};
@@ -83,6 +84,62 @@ pub(super) fn pairs(said: &[Said]) -> Vec<Pair> {
         }
     }
     out
+}
+
+/// How long a question to the tower is waited on before "No answer came".
+const WAIT_FOR_MS: u64 = 30 * 60 * 1000;
+
+/// How long a message a click went to stays lit, fading.
+const FLASH_SECS: f32 = 1.8;
+
+/// Where a question stands.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum Waits {
+    /// Answered: its answer is the row given.
+    Answered(usize),
+    /// Still waiting for its answer.
+    Pending,
+    /// No answer comes: why, in words (the tower's turn ended without
+    /// one, it failed, you took it back, the tower isn't running, too long).
+    Ended(String),
+    /// Not followed: asked before answers named their questions, an answer
+    /// after it that names none (its link failed), or not a question.
+    Unknown,
+}
+
+/// Where the question at row `i` stands: answered by its pair; else what
+/// the history keeps of it (`history::unanswered_of`); else waiting, for
+/// half an hour at most. `since`: when answers began naming their
+/// questions (one asked before then is followed only while it is new);
+/// `broken`: an answer of the tower's came after it that names no
+/// question (its link failed); `absent`: it went to the main brain, which
+/// isn't running.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn standing(said: &[Said], pairs: &[Pair], i: usize, entries: &[Entry], since: Option<u64>, broken: bool, absent: bool, now: u64) -> Waits {
+    let s = &said[i];
+    if let Some(j) = pairs[i].answer {
+        return Waits::Answered(j);
+    }
+    let age = now.saturating_sub(s.at);
+    if !s.asks() || (!since.is_some_and(|since| s.at >= since) && age >= WAIT_FOR_MS) || (s.with.is_none() && broken) {
+        return Waits::Unknown;
+    }
+    if let Some(e) = history::unanswered_of(entries, s.at) {
+        return Waits::Ended(match e.status.as_deref() {
+            Some("taken-back") => "You took it back.".into(),
+            _ if !e.text.trim().is_empty() => e.text.trim().to_string(),
+            _ => "No answer came.".into(),
+        });
+    }
+    if absent && age > 30_000 {
+        return Waits::Ended("No answer: the tower isn't running.".into());
+    }
+    if s.with.is_some() || age < WAIT_FOR_MS { Waits::Pending } else { Waits::Ended("No answer came.".into()) }
+}
+
+/// Words cut for a log line.
+fn short(words: &str) -> String {
+    if words.chars().count() > 40 { format!("{}…", words.chars().take(39).collect::<String>()) } else { words.to_string() }
 }
 
 /// The line on an answer that says what it answers: "↳ you asked: …", or
@@ -464,26 +521,30 @@ impl Panel {
         // Each answer with the message it answers, and each question with its answer.
         let pairs = pairs(&said);
         let first = rows.len();
+        let mut index: Vec<(u64, String, Option<bool>)> = vec![(0, String::new(), None); first];
         let now = history::now_ms();
         // Asked since answers were paired (earlier ones never were): it may still wait.
         let paired_since = self.entries.iter().filter(|e| e.reply_to.is_some()).map(|e| e.at).min();
+        // The last of the tower's answers here that names no question (a link that failed).
+        let oldest = said.first().map(|s| s.at).unwrap_or(0);
+        let unlinked: std::collections::HashSet<u64> = self.entries.iter().filter(|e| e.kind == "answer" && e.reply_to.is_none() && e.at >= oldest).map(|e| e.at).collect();
+        let last_unlinked = said.iter().rposition(|a| !a.you && a.with.is_none() && unlinked.contains(&a.at));
+        // A question to the main brain while it isn't running gets no answer.
+        let main_brain = space.is_none_or(|sp| !self.space_tower_of(sp, cx));
+        let absent = main_brain && self.tower.read(cx).s("brain").as_str() == Some("absent");
+        // The message a click went to: lit a moment, fading.
+        let flash = self.full.as_ref().and_then(|f| f.chat_flash).map(|(at, t)| (at, t.elapsed().as_secs_f32() / FLASH_SECS)).filter(|(_, t)| *t < 1.0);
+        if flash.is_some() {
+            window.request_animation_frame();
+        }
         for (i, s) in said.iter().enumerate() {
             let mut extra = if Some(i) == last_of_latest { act_items.take().unwrap_or_default() } else { vec![] };
+            let go = |to: usize| {
+                let at = said[to].at;
+                cx.listener(move |this: &mut Panel, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Panel>| this.chat_jump(first + to, at, cx))
+            };
             let jump = |to: usize, id: String, words: String, color: gpui::Hsla| {
-                div()
-                    .id(SharedString::from(id))
-                    .text_size(px(12.0))
-                    .text_color(color)
-                    .cursor_pointer()
-                    .hover(|st| st.text_color(glass().text))
-                    .child(words)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(f) = this.full.as_ref() {
-                            f.chat_scroll.scroll_to_top_of_item(first + to);
-                        }
-                        cx.notify();
-                    }))
-                    .into_any_element()
+                div().id(SharedString::from(id)).text_size(px(12.0)).text_color(color).cursor_pointer().hover(|st| st.text_color(glass().text)).child(words).on_click(go(to)).into_any_element()
             };
             // What it answers: a line on top, to the question.
             let top = match (pairs[i].asks, s.reply_to) {
@@ -496,19 +557,66 @@ impl Panel {
                 }),
                 _ => None,
             };
-            // A question: answered (to the answer), or still waiting for one.
-            if s.asks() {
-                match pairs[i].answer {
-                    Some(j) => extra.push(jump(j, format!("answered-{i}-{}", s.at), "answered ↓".into(), gpui::Hsla::from(faded(CYAN, 0xee)))),
-                    None if paired_since.is_some_and(|since| s.at >= since) && now.saturating_sub(s.at) < 12 * 3_600_000 => {
-                        extra.push(div().text_size(px(12.0)).text_color(g.faint).child("waiting for an answer").into_any_element())
-                    }
-                    None => {}
+            // A question: answered (to the answer), still waiting for one, or given up on.
+            let state = if s.asks() { standing(&said, &pairs, i, &self.entries, paired_since, last_unlinked.is_some_and(|j| j > i), absent && s.with.is_none(), now) } else { Waits::Unknown };
+            match &state {
+                Waits::Answered(j) => extra.push(jump(*j, format!("answered-{i}-{}", s.at), "answered ↓".into(), gpui::Hsla::from(faded(CYAN, 0xee)))),
+                // The tower's own: a spinner, and a way to take it back.
+                Waits::Pending if s.with.is_none() => {
+                    let at = s.at;
+                    extra.push(
+                        h_flex()
+                            .w_full()
+                            .gap(px(8.0))
+                            .items_center()
+                            .child(Spinner::new().xsmall().color(gpui::Hsla::from(rgb(CYAN))))
+                            .child(div().flex_1().min_w_0().text_size(px(12.0)).text_color(g.muted).child(format!("waiting for {} · {}", if who == "The tower" { "the tower".to_string() } else { who.to_lowercase() }, super::span(now.saturating_sub(at)))))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("take-back-{at}")))
+                                    .flex_none()
+                                    .text_size(px(12.0))
+                                    .text_color(g.faint)
+                                    .cursor_pointer()
+                                    .hover(|st| st.text_color(glass().text))
+                                    .child("Take back")
+                                    .on_click(cx.listener(move |this, _, _, cx| this.take_back(at, cx))),
+                            )
+                            .into_any_element(),
+                    )
                 }
+                // A session's: it may take a while.
+                Waits::Pending if now.saturating_sub(s.at) < 12 * 3_600_000 => extra.push(div().text_size(px(12.0)).text_color(g.faint).child("waiting for an answer").into_any_element()),
+                Waits::Ended(why) => extra.push(div().text_size(px(12.0)).text_color(gpui::Hsla::from(faded(AMBER, 0xdd))).child(why.clone()).into_any_element()),
+                _ => {}
             }
-            rows.push(said_row_with(s, &who, top, extra));
+            let row = said_row_with(s, &who, top, extra);
+            // An answered question: the whole of it goes to its answer.
+            let row = match &state {
+                Waits::Answered(j) => div().id(SharedString::from(format!("question-{i}-{}", s.at))).w_full().rounded(px(14.0)).cursor_pointer().hover(|st| st.bg(rgba(0xffffff0a))).on_click(go(*j)).child(row).into_any_element(),
+                _ => row,
+            };
+            // Gone to: lit, fading out.
+            let row = match flash {
+                Some((at, t)) if at == s.at => {
+                    let a = ((1.0 - t * t).clamp(0.0, 1.0) * 255.0) as u32;
+                    div()
+                        .relative()
+                        .w_full()
+                        .child(row)
+                        .child(div().absolute().top_0().left_0().size_full().rounded(px(14.0)).border_2().border_color(faded(CYAN, a)).bg(faded(CYAN, a * 0x30 / 0xff)))
+                        .into_any_element()
+                }
+                _ => row,
+            };
+            rows.push(row);
+            index.push((s.at, s.text.clone(), if matches!(state, Waits::Answered(_)) { Some(true) } else { pairs[i].asks.map(|_| false) }));
         }
+        index.extend(waits.iter().map(|_| (0, String::new(), None)));
         rows.extend(waits);
+        if let Some(f) = self.full.as_mut() {
+            f.chat_rows = index;
+        }
         if rows.is_empty() {
             rows.push(
                 div()
@@ -558,6 +666,80 @@ impl Panel {
             .children(status)
             .child(self.input(window, cx))
             .into_any_element()
+    }
+
+    /// A click on a question (or its line on an answer) went to row `ix`
+    /// of the column, the message at `at`: it comes to the top and lights
+    /// up (the frames of its fading are asked for as it is drawn: a frame
+    /// can't be asked for from a click).
+    fn chat_jump(&mut self, ix: usize, at: u64, cx: &mut Context<Self>) {
+        if let Some(f) = self.full.as_mut() {
+            f.chat_scroll.scroll_to_top_of_item(ix);
+            f.chat_flash = Some((at, std::time::Instant::now()));
+        }
+        cx.notify();
+    }
+
+    /// "Take back" on a question the tower is still at: the daemon stops
+    /// its brain if it is on it, and keeps that no answer comes.
+    fn take_back(&mut self, at: u64, cx: &mut Context<Self>) {
+        let task = cx.background_executor().spawn(async move { crate::protocol::send(&crate::protocol::Request::Withdraw { at }) });
+        cx.spawn(async move |this, cx| {
+            let r = task.await;
+            let _ = this.update(cx, |this, cx| {
+                match r {
+                    Ok(r) if r.ok => {}
+                    Ok(r) => this.status = Some((false, r.error.unwrap_or_else(|| "It couldn't be taken back.".into()))),
+                    Err(e) => this.status = Some((false, format!("It couldn't be taken back: {e:#}"))),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `HERDER_TOWER_ORB_CLICK` (see `crate::orb`): where to click the
+    /// column's row whose words hold `words`, once it can be clicked: a
+    /// question with its answer (on its head), or an answer with its
+    /// question (on its "↳ you asked" line), in the window. None: not yet
+    /// (it is brought into view first).
+    pub(crate) fn click_point(&mut self, words: &str, cx: &mut Context<Self>) -> Option<gpui::Point<gpui::Pixels>> {
+        let f = self.full.as_ref()?;
+        let (ix, question) = f.chat_rows.iter().enumerate().find_map(|(ix, (at, text, click))| click.filter(|_| *at > 0 && text.contains(words)).map(|q| (ix, q)))?;
+        let (b, view, off) = (f.chat_scroll.bounds_for_item(ix)?, f.chat_scroll.bounds(), f.chat_scroll.offset());
+        let top = b.top() + off.y;
+        if top < view.top() || top + px(30.0) > view.bottom() {
+            f.chat_scroll.scroll_to_item(ix);
+            cx.notify();
+            return None;
+        }
+        eprintln!(
+            "[orb] HERDER_TOWER_ORB_CLICK: row {ix} ({:?}, {}) is at y {:.0} of the column's {:.0}..{:.0}",
+            short(words),
+            if question { "a question: its head" } else { "an answer: its line to the question" },
+            f32::from(top),
+            f32::from(view.top()),
+            f32::from(view.bottom())
+        );
+        Some(gpui::point(b.left() + px(80.0), top + px(if question { 22.0 } else { 47.0 })))
+    }
+
+    /// `HERDER_TOWER_ORB_CLICK`: where the click went (the lit message's row) and where it is now.
+    pub(crate) fn click_report(&mut self) {
+        let Some(f) = self.full.as_ref() else { return };
+        let Some((at, t)) = f.chat_flash else {
+            eprintln!("[orb] HERDER_TOWER_ORB_CLICK: nothing lit: the click went nowhere");
+            return;
+        };
+        let ix = f.chat_rows.iter().position(|(a, _, _)| *a == at);
+        let shown = ix.and_then(|ix| f.chat_scroll.bounds_for_item(ix)).map(|b| f32::from(b.top() + f.chat_scroll.offset().y));
+        let words = ix.map(|ix| short(&f.chat_rows[ix].1)).unwrap_or_default();
+        eprintln!(
+            "[orb] HERDER_TOWER_ORB_CLICK: lit row {ix:?} ({words:?}) {} ms ago, now at y {:.0} (the column's top: {:.0})",
+            t.elapsed().as_millis(),
+            shown.unwrap_or(-1.0),
+            f32::from(f.chat_scroll.bounds().top())
+        );
     }
 
     /// While the brain works, what it is doing; a message on its way; what
@@ -640,6 +822,58 @@ mod tests {
         let p = pairs(&main);
         assert_eq!((p[2].asks, p[0].answer, p[1].answer), (Some(0), Some(2), None), "the second still waits");
         assert!(main[0].asks() && main[1].asks() && !main[2].asks());
+    }
+
+    /// A question to the tower waits (the spinner) until its answer is in;
+    /// one that will get none says why: the turn ended without one, the
+    /// tower failed, you took it back, it isn't running, or too long passed.
+    #[test]
+    fn a_question_waits_until_answered_or_says_why_no_answer_comes() {
+        let min = 60_000;
+        let at = |n: u64| 1_000_000 + n * min;
+        let mut answer = e("answer", "Yes, on prod.", None, at(2));
+        answer.reply_to = Some(at(1));
+        let unanswered = |of: u64, why: &str, text: &str, when: u64| Entry { kind: "unanswered".into(), status: Some(why.into()), text: text.into(), reply_to: Some(of), at: when, record: true, ..Default::default() };
+        let entries = vec![
+            e("request", "is it on prod?", None, at(1)),
+            answer,
+            e("request", "and the docs?", None, at(3)),
+            e("request", "check the logs", None, at(4)),
+            unanswered(at(4), "failed", "The tower couldn't answer: it hit its rate limit.", at(5)),
+            e("request", "never mind that", None, at(6)),
+            unanswered(at(6), "taken-back", "You took it back.", at(7)),
+            e("request", "and now?", None, at(8)),
+            unanswered(at(8), "empty", "The tower's turn ended without an answer.", at(9)),
+            e("request", "the last one", None, at(10)),
+        ];
+        let said = conversation(&entries, None, 200);
+        let p = pairs(&said);
+        let since = Some(at(2));
+        let stand = |i: usize, now: u64, absent: bool| standing(&said, &p, i, &entries, since, false, absent, now);
+        let now = at(11);
+        assert_eq!(stand(0, now, false), Waits::Answered(1));
+        assert_eq!(stand(1, now, false), Waits::Unknown, "an answer is no question");
+        assert_eq!(stand(2, now, false), Waits::Pending, "asked 8 minutes ago: still waiting");
+        assert_eq!(stand(2, at(3) + WAIT_FOR_MS, false), Waits::Ended("No answer came.".into()), "half an hour on, it isn't coming");
+        assert_eq!(stand(3, now, false), Waits::Ended("The tower couldn't answer: it hit its rate limit.".into()));
+        assert_eq!(stand(4, now, false), Waits::Ended("You took it back.".into()));
+        assert_eq!(stand(5, now, false), Waits::Ended("The tower's turn ended without an answer.".into()));
+        assert_eq!(stand(6, now, false), Waits::Pending);
+        assert_eq!(stand(6, now, true), Waits::Ended("No answer: the tower isn't running.".into()), "the main brain is gone");
+        assert_eq!(stand(6, at(10) + 10_000, true), Waits::Pending, "just asked: it may be starting");
+        // Asked before answers named their questions: followed while new (the
+        // first question of all, too), then nothing is claimed.
+        assert_eq!(standing(&said, &p, 2, &entries, Some(at(20)), false, false, now), Waits::Pending);
+        assert_eq!(standing(&said, &p, 2, &entries, None, false, false, now), Waits::Pending);
+        assert_eq!(standing(&said, &p, 2, &entries, Some(at(20)), false, false, at(3) + WAIT_FOR_MS), Waits::Unknown);
+        // An answer after it that names no question (its link failed): nothing is claimed either.
+        let mut loose = entries.clone();
+        loose.push(e("answer", "The logs are clean.", None, at(10) + 5));
+        let said2 = conversation(&loose, None, 200);
+        let p2 = pairs(&said2);
+        let i = said2.iter().position(|s| s.text == "the last one").unwrap();
+        assert_eq!(standing(&said2, &p2, i, &loose, since, true, false, now), Waits::Unknown);
+        assert_eq!(standing(&said2, &p2, i, &loose, since, false, false, now), Waits::Pending);
     }
 
     /// What you type in a session, and what the tower queues for it and sends
