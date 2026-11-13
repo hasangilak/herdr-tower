@@ -17,6 +17,13 @@
 //! What a session was given is kept on its terminal, as Herdr labels
 //! (`tower.worktree`, `tower.branch`, `tower.repo`, `tower.port`): they live
 //! and end with the terminal, whether or not the voice runs.
+//!
+//! A space the tower makes for sessions in worktrees starts with a tab of
+//! its own (`home_of`): a shell in `.tower-worktrees/<space-slug>/`, beside
+//! its worktrees. Herdr's sidebar places a space by its first terminal's
+//! folder, and nests one whose folder is a worktree under the space that
+//! holds the repo's own checkout; the home tab, in no checkout, keeps the
+//! space a space of its own.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -81,6 +88,18 @@ pub fn place(repo: &Path, space: &str) -> Place {
     let slug = slug(space);
     let path = repo.parent().unwrap_or(repo).join(DIR).join(&slug).join(&name);
     Place { repo: repo.to_string_lossy().into_owned(), path: path.to_string_lossy().into_owned(), branch: format!("{slug}/{}", branch_part(&name)) }
+}
+
+/// The home tab of a space the tower makes (see the module's notes): its
+/// label, and the folder it opens in for a session in the worktree
+/// `place` (`…/.tower-worktrees/<space-slug>/`). None: not one of the
+/// tower's worktrees, or the folder isn't there.
+pub const LABEL_HOME: &str = "tower.role=home";
+
+pub fn home_of(worktree: &str) -> Option<String> {
+    let (_, top) = repo_of(Path::new(worktree))?;
+    let home = top.parent()?;
+    home.is_dir().then(|| home.to_string_lossy().into_owned())
 }
 
 /// A folder inside one of the tower's worktrees: the repo it is a worktree
@@ -622,6 +641,14 @@ pub(crate) mod tests {
         );
         assert_eq!(repo_of(Path::new("/w/eyz/eyzflow")), None);
         assert_eq!(repo_of(Path::new("/w/eyz/.tower-worktrees/fix-login")), None);
+        // A space's home tab opens beside its worktrees, when that folder is there.
+        let base = std::env::temp_dir().join(format!("tower-home-{}", std::process::id()));
+        std::fs::create_dir_all(base.join(".tower-worktrees/fix-login/eyzflow/src")).unwrap();
+        let home = base.join(".tower-worktrees/fix-login").to_string_lossy().into_owned();
+        assert_eq!(home_of(&base.join(".tower-worktrees/fix-login/eyzflow/src").to_string_lossy()), Some(home));
+        assert_eq!(home_of("/w/eyz/.tower-worktrees/fix-login/eyzflow"), None, "not there");
+        assert_eq!(home_of(&base.to_string_lossy()), None, "no worktree of the tower's");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

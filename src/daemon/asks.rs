@@ -37,6 +37,9 @@ type Record = Arc<dyn Fn(crate::history::Entry) + Send + Sync>;
 /// what the reply the tower holds for it answers (that reply): then the
 /// reply is moot (`covered::answers_held`; tests give their own).
 type Covers = Arc<dyn Fn(&str, &str, &str) -> Result<bool> + Send + Sync>;
+/// Whether a message the tower passed on answers a question: (the session's
+/// name, what it asked, the user's words to the tower, the message).
+type Relays = Arc<dyn Fn(&str, &str, &str, &str) -> Result<bool> + Send + Sync>;
 
 /// A queued reply drops after this long (its question is stale by then).
 const REPLY_TTL_MS: u64 = 30 * 60 * 1000;
@@ -337,6 +340,8 @@ pub struct Asks {
     record: Record,
     waits: Waits,
     covers: Covers,
+    /// Whether a message a brain passed on answers a session's question (`relayed`).
+    relays: Relays,
     /// Answers a set the tower decided to answer itself (`auto_answer`,
     /// in a thread of its own); tests keep which ones it would have.
     answers: Auto,
@@ -373,6 +378,7 @@ impl Asks {
             }),
             waits: Waits::default(),
             covers: Arc::new(crate::covered::answers_held),
+            relays: Arc::new(crate::covered::answers_question),
             answers: Arc::new(|a: &Asks, id: &str| {
                 let (me, id) = (a.clone(), id.to_string());
                 std::thread::spawn(move || me.auto_answer(&id));
@@ -1225,14 +1231,59 @@ impl Asks {
                 .collect()
         };
         for (session, id) in &about {
-            let w = what.clone();
-            self.close_where(session, |s| s.id == *id, move |_| CloseWhy::Settled { what: w.clone() }, true);
-            if let Some(d) = self.decisions.get() {
-                d.settled(id, &what);
-            }
-            eprintln!("[questions] {id} ({session}): {what}: settled");
+            self.settle(session, id, &what);
         }
         about.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// A set settled outside its dialog (`what` settled it): closed, and the
+    /// decision it stood in answered with `what`.
+    fn settle(&self, session: &str, id: &str, what: &str) {
+        // The decision first: closing the set would close it with no answer.
+        if let Some(d) = self.decisions.get() {
+            d.settled(id, what);
+        }
+        let w = what.to_string();
+        self.close_where(session, |s| s.id == id, move |_| CloseWhy::Settled { what: w.clone() }, true);
+        eprintln!("[questions] {id} ({session}): {what}: settled");
+    }
+
+    /// A brain passed `message` on to `session` (`tower queue`) after the
+    /// user spoke to it (`users`: their words, at `users_ms`). A question the
+    /// session asked at the end of its turn before that, which is the user's
+    /// (it stands in a decision), is the user's answer relayed when the
+    /// message answers it (`relays`: one headless call): settled with it,
+    /// and its decision answered. One asked after the user spoke, a dialog,
+    /// a question the tower answers itself, or a message about something
+    /// else stays open, as one the tower types for itself (a note, a message
+    /// from another session) always does. The sets settled.
+    pub fn relayed(&self, session: &str, users: &str, users_ms: u64, message: &str) -> Vec<String> {
+        let theirs = |s: &QuestionSet| self.decisions.get().is_some_and(|d| !d.for_question(&s.id).is_empty());
+        let sets: Vec<QuestionSet> = self.list().into_iter().filter(|s| s.session == session && s.kind == "text" && s.at_ms <= users_ms && theirs(s)).collect();
+        let mut out = vec![];
+        for s in sets {
+            let asked: Vec<&str> = s.tabs.iter().map(|t| t.question.trim()).filter(|q| !q.is_empty()).collect();
+            let question = format!("{}\n\n(The end of its message:) {}", if asked.is_empty() { s.title.clone() } else { asked.join("\n") }, s.detail);
+            match (self.relays)(&s.name, &question, users, message) {
+                Ok(true) => {
+                    // Answered some other way while the model was asked (the card, the terminal): nothing more to do.
+                    if self.get(&s.id).is_none() {
+                        eprintln!("[questions] {} ({session}): the tower passed on the user's answer, but it was over already", s.id);
+                        continue;
+                    }
+                    let what = format!("answered through the tower: {}", clip(message.trim(), 200));
+                    // Its session leaves its decision (over when nobody else asks the same), answered with it.
+                    let left = self.decisions.get().map(|d| d.passed_on(&s.id, &what)).unwrap_or_default();
+                    self.close_where(session, |x| x.id == s.id, |_| CloseWhy::Settled { what: what.clone() }, true);
+                    let cards: Vec<String> = left.iter().map(|(d, over)| format!("{d}{}", if *over { " (over)" } else { " (others still wait)" })).collect();
+                    eprintln!("[questions] {} ({session}): {what}: settled; its card: {}", s.id, if cards.is_empty() { "none".to_string() } else { cards.join(", ") });
+                    out.push(s.id.clone());
+                }
+                Ok(false) => eprintln!("[questions] {} ({session}): what the tower passed on doesn't answer it: it stays open", s.id),
+                Err(e) => eprintln!("[questions] {} ({session}): couldn't tell whether what the tower passed on answers it ({e:#}): it stays open", s.id),
+            }
+        }
+        out
     }
 
     fn there(&self, id: &str) -> Option<There> {
@@ -3004,6 +3055,78 @@ mod tests {
         let mut q = questions::text_set(session, name, "I made the change in src/api.rs. Want me to open the PR, or wait?", "");
         q.at_ms = crate::history::now_ms();
         q
+    }
+
+    /// The user answers a session's question by telling a brain, which passes
+    /// it on (`tower queue`): the question and its card close, answered
+    /// through the tower. What the tower passes on that doesn't answer it,
+    /// and anything when the user said nothing since the question came,
+    /// leaves the card waiting for them.
+    #[test]
+    fn the_users_answer_passed_on_by_the_tower_closes_the_question() {
+        let (mut a, d, _user, record) = recording(None);
+        let asked = Arc::new(Mutex::new(vec![]));
+        let seen = asked.clone();
+        a.relays = Arc::new(move |name: &str, question: &str, users: &str, message: &str| {
+            seen.lock().unwrap().push(format!("{name} | {users} | {message} | {}", question.contains("open the PR, or wait?")));
+            Ok(message.contains("go ahead"))
+        });
+        // The question is theirs (a card), then the user tells the tower, which passes it on.
+        let q = a.asked_after(text_q("tw-rl1", "eyzflow"), false);
+        a.escalate(&q.id, "the user decides");
+        let id = d.for_question(&q.id)[0].clone();
+        let said = q.at_ms + 1000;
+        a.seen("tw-rl1", &Value::Null, &SessionStatus::parse("working"));
+        a.typed_by_tower("tw-rl1", None);
+        assert_eq!(a.relayed("tw-rl1", "its saved. go ahead", said, "The user saved the webhook; go ahead and open the PR."), vec![q.id.clone()]);
+        assert!(a.get(&q.id).is_none() && open_decisions(&a) == 0, "settled, and its card with it");
+        let decided = d.get(&id).unwrap();
+        assert_eq!(decided.state, crate::decisions::State::Answered);
+        assert_eq!(decided.answer, "answered through the tower: The user saved the webhook; go ahead and open the PR.");
+        assert_eq!(asked.lock().unwrap().as_slice(), ["eyzflow | its saved. go ahead | The user saved the webhook; go ahead and open the PR. | true"]);
+        // (Its line in the record is the decision's: "<question> -> answered through the tower: …".)
+        let _ = &record;
+
+        // A card that came at once (a turn the user typed in its terminal): the same.
+        let mut typed = questions::text_set("tw-rl0", "web", "Done. Should I add the line hello to notes.txt now, or wait?", "");
+        typed.at_ms = crate::history::now_ms();
+        let q0 = a.asked_after(typed, true);
+        let id0 = d.for_question(&q0.id)[0].clone();
+        assert_eq!(a.relayed("tw-rl0", "yes, add it", q0.at_ms + 1000, "The user says: go ahead, add the line hello to notes.txt now."), vec![q0.id.clone()]);
+        assert_eq!(d.get(&id0).unwrap().answer, "answered through the tower: The user says: go ahead, add the line hello to notes.txt now.");
+
+        // Passed on, but about something else: still theirs.
+        let q2 = a.asked_after(text_q("tw-rl2", "api"), false);
+        a.escalate(&q2.id, "the user decides");
+        assert!(a.relayed("tw-rl2", "is the import done?", q2.at_ms + 1000, "For your information: the import ran.").is_empty());
+        assert!(a.get(&q2.id).is_some() && open_decisions(&a) == 1, "still waits for the user");
+
+        // Another session asks the same (one card, two waiting): the answer passed on to
+        // one leaves the card to the other, who still waits.
+        let q3 = a.asked_after(text_q("tw-rl3", "docs"), false);
+        a.escalate(&q3.id, "the user decides");
+        let shared = d.for_question(&q3.id)[0].clone();
+        assert_eq!(d.for_question(&q2.id), vec![shared.clone()], "the same question: one card");
+        assert_eq!(a.relayed("tw-rl3", "go ahead", q3.at_ms + 1000, "go ahead with it"), vec![q3.id.clone()]);
+        assert!(a.get(&q3.id).is_none() && a.get(&q2.id).is_some());
+        let card = d.get(&shared).unwrap();
+        assert!(card.closed_ms.is_none() && card.sessions.iter().all(|w| w.address == "tw-rl2"), "the other session still waits on it");
+
+        // The user spoke before the session asked: whatever the brain sends, it isn't their answer to it.
+        let mut later = questions::text_set("tw-rl4", "sdk", "The build is green. Ship it to staging now, or hold?", "");
+        later.at_ms = crate::history::now_ms();
+        let q4 = a.asked_after(later, false);
+        a.escalate(&q4.id, "the user decides");
+        let before = asked.lock().unwrap().len();
+        assert!(a.relayed("tw-rl4", "go ahead", q4.at_ms.saturating_sub(5_000), "go ahead with it").is_empty());
+        assert_eq!(asked.lock().unwrap().len(), before, "not even asked");
+        assert!(a.get(&q4.id).is_some());
+        assert_eq!(open_decisions(&a), 2, "both still wait");
+
+        // The judge fails (no model): it stays theirs.
+        a.relays = Arc::new(|_: &str, _: &str, _: &str, _: &str| Err(anyhow::anyhow!("claude: timed out")));
+        assert!(a.relayed("tw-rl2", "go ahead", q2.at_ms + 2000, "go ahead").is_empty());
+        assert!(a.get(&q2.id).is_some());
     }
 
     /// The user replies in the terminal to the question a session asked at

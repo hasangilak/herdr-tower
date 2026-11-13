@@ -506,8 +506,10 @@ pub enum Step {
     Type { address: String, line: String },
     /// A new tab in a space that is there (by its id).
     Tab { space_id: String, tab: String, folder: String, argv: Vec<String> },
-    /// A new space (for the first of its sessions; the next ones are its tabs).
-    Space { name: String, folder: String, tab: String, argv: Vec<String> },
+    /// A new space (for the first of its sessions; the next ones are its
+    /// tabs). `home`: for a session in one of the tower's worktrees, the
+    /// space opens on a home tab there first (`worktrees::home_of`).
+    Space { name: String, folder: String, tab: String, argv: Vec<String>, home: Option<String> },
 }
 
 /// Where each chosen session goes, or why it can't (`(session, why)`).
@@ -551,7 +553,15 @@ pub fn plan(
             }
             made.push(k.space.clone());
             let folder = folders.get(&k.space).filter(|f| !f.is_empty() && exists(f)).cloned().unwrap_or_else(|| k.cwd.clone());
-            Ok(Step::Space { name: k.space.clone(), folder, tab, argv })
+            // In a worktree: the space opens on its home tab, so Herdr doesn't nest it under the repo's.
+            let home = k
+                .labels
+                .get("tower.worktree")
+                .or(Some(&k.cwd))
+                .and_then(|w| crate::worktrees::repo_of(Path::new(w)))
+                .and_then(|(_, top)| top.parent().map(|h| h.to_string_lossy().into_owned()))
+                .filter(|h| exists(h));
+            Ok(Step::Space { name: k.space.clone(), folder, tab, argv, home })
         })();
         out.push(((*k).clone(), step));
     }
@@ -563,8 +573,9 @@ pub trait Hands {
     fn type_line(&self, address: &str, line: &str) -> Result<()>;
     /// A new tab: its terminal's address.
     fn tab(&self, space_id: &str, tab: &str, folder: &str, argv: &[String]) -> Result<String>;
-    /// A new space with its first tab: its terminal's address.
-    fn space(&self, name: &str, folder: &str, tab: &str, argv: &[String]) -> Result<String>;
+    /// A new space with its first tab (after a home tab in `home`, when
+    /// given): its terminal's address.
+    fn space(&self, name: &str, folder: &str, tab: &str, argv: &[String], home: Option<&str>) -> Result<String>;
     /// A space's id by its name, as Herdr has it now.
     fn space_id(&self, name: &str) -> Option<String>;
     fn label(&self, address: &str, labels: &[String]);
@@ -599,7 +610,7 @@ pub fn run(steps: Vec<(Kept, Result<Step, String>)>, hands: &dyn Hands) -> Vec<D
                     None => Err(anyhow::anyhow!("its space {} isn't in Herdr's window", k.space)),
                 }
             }
-            Ok(Step::Space { name, folder, tab, argv }) => hands.space(&name, &folder, &tab, &argv).map(|a| (a, "space")),
+            Ok(Step::Space { name, folder, tab, argv, home }) => hands.space(&name, &folder, &tab, &argv, home.as_deref()).map(|a| (a, "space")),
         };
         match result {
             Ok((address, how)) => {
@@ -790,8 +801,8 @@ mod tests {
             self.calls.lock().unwrap().push(format!("tab {space_id} {tab} {folder} {}", argv.join(" ")));
             Ok("t50".into())
         }
-        fn space(&self, name: &str, folder: &str, tab: &str, argv: &[String]) -> Result<String> {
-            self.calls.lock().unwrap().push(format!("space {name} {folder} {tab} {}", argv.join(" ")));
+        fn space(&self, name: &str, folder: &str, tab: &str, argv: &[String], home: Option<&str>) -> Result<String> {
+            self.calls.lock().unwrap().push(format!("space {name} {folder} {tab} {}{}", argv.join(" "), home.map(|h| format!(" home {h}")).unwrap_or_default()));
             Ok("t60".into())
         }
         fn space_id(&self, name: &str) -> Option<String> {
@@ -819,7 +830,8 @@ mod tests {
         let mut in_a_tab = k("sandbox", "t7j", "sandbox-mediaroom", "s-2", "/w/media room");
         in_a_tab.account = None;
         in_a_tab.labels.insert("tower.port".into(), "3002".into());
-        let first = k("zendesk", "t10h", "zendesk-eyzflow", "s-3", "/w/tw/eyzflow");
+        let mut first = k("zendesk", "t10h", "zendesk-eyzflow", "s-3", "/w/.tower-worktrees/zendesk/eyzflow");
+        first.labels.insert("tower.worktree".into(), "/w/.tower-worktrees/zendesk/eyzflow".into());
         let second = Kept { app: "codex".into(), ..k("zendesk", "t10j", "zendesk-api", "s-4", "/w/tw/api") };
         let gone = k("sandbox", "t7k", "sandbox-project", "s-5", "/w/removed");
         let windows = vec![Window { id: "sp-sandbox".into(), name: "sandbox".into(), folder: "/w/eyzflow".into(), machine: None, active: false }];
@@ -830,7 +842,7 @@ mod tests {
         let steps = plan(&chosen, &windows, &folders, &get, &exists, Some("/bin/cca"), Some("default"));
         assert_eq!(steps[0].1, Ok(Step::Type { address: "t7h".into(), line: "cd /w/eyzflow && /bin/cca orca -n sandbox-eyzflow --resume s-1".into() }));
         assert!(matches!(&steps[1].1, Ok(Step::Tab { space_id, argv, .. }) if space_id == "sp-sandbox" && argv[..2] == ["/bin/cca".to_string(), "default".to_string()]), "its account not known: the default one");
-        assert!(matches!(&steps[2].1, Ok(Step::Space { name, folder, .. }) if name == "zendesk" && folder == "/w/tw"));
+        assert!(matches!(&steps[2].1, Ok(Step::Space { name, folder, home, .. }) if name == "zendesk" && folder == "/w/tw" && home.as_deref() == Some("/w/.tower-worktrees/zendesk")), "{:?}", steps[2].1);
         assert!(matches!(&steps[3].1, Ok(Step::Tab { space_id, argv, .. }) if space_id.is_empty() && argv == &["codex", "resume", "s-4"]));
         assert_eq!(steps[4].1, Err("its folder /w/removed is gone".into()));
         let hands = Fake { calls: Default::default() };
@@ -840,7 +852,7 @@ mod tests {
         assert_eq!(calls[0], "type t7h cd /w/eyzflow && /bin/cca orca -n sandbox-eyzflow --resume s-1");
         assert_eq!(calls[1], "tab sp-sandbox sandbox-mediaroom /w/media room /bin/cca default -n sandbox-mediaroom --resume s-2");
         assert_eq!(calls[2], "label t50 tower.port=3002 tower.name=sandbox-mediaroom", "what the tower gave it goes with it");
-        assert!(calls[3].starts_with("space zendesk /w/tw zendesk-eyzflow "));
+        assert!(calls[3].starts_with("space zendesk /w/tw zendesk-eyzflow ") && calls[3].ends_with(" home /w/.tower-worktrees/zendesk"), "{}", calls[3]);
         assert_eq!(calls[5], "tab sp-new zendesk-api /w/tw/api codex resume s-4", "into the space made a step ago");
         assert_eq!(shell_line("/w/media room", &["claude".into(), "it's".into()]), r"cd '/w/media room' && claude 'it'\''s'");
     }

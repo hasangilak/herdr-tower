@@ -246,6 +246,24 @@ impl Decisions {
         out
     }
 
+    /// The user's answer to the question set `set` was passed on to its
+    /// session by the tower (`with`: how): that session leaves the decision
+    /// it stood in, which closes as answered with it when nobody else asks
+    /// the same (and is written down). The decisions it was in: (id, over now).
+    pub fn passed_on(&self, set: &str, with: &str) -> Vec<(String, bool)> {
+        if !lock(&self.book).open.iter().any(|d| d.sessions.iter().any(|w| w.question_id.as_deref() == Some(set))) {
+            return vec![];
+        }
+        let out = self.change(|b, now| b.answered_with(set, with, now));
+        for (id, over) in &out {
+            eprintln!("[decisions] {id}: {set} was answered through the tower{}", if *over { "; the decision is over" } else { "; others still wait on it" });
+            if *over {
+                self.record_closed(id);
+            }
+        }
+        out
+    }
+
     /// A question set was settled elsewhere (a PR it asked about merged): the
     /// decision it stood in is answered with `what`.
     pub fn settled(&self, set: &str, what: &str) {

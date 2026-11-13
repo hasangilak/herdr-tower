@@ -467,7 +467,11 @@ own from `[spaces] port_range` ("3000-3050"). Both are said in its first
 instruction, kept on its terminal's labels and shown in its space's view.
 Not in a space with no goal, a standing space, a folder that is no git
 checkout, on another machine, or with `tower start --no-worktree`;
-`[spaces] worktrees = false` turns it off everywhere.
+`[spaces] worktrees = false` turns it off everywhere. Such a space opens
+on a **home tab** (a shell in `.tower-worktrees/<space>/`), with its
+sessions in the tabs after it. Herdr's sidebar nests a space whose first
+terminal is in a worktree under the space holding that repo's checkout;
+the home tab keeps it a top-level space of its own.
 
 **Sessions write to each other** without the tower in between: a session
 that runs `tower queue <address> "<message>"` sends a message, not a task

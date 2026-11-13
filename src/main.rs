@@ -1773,7 +1773,14 @@ fn start(
         (Some(sp), _) => (start_in_space(sp, &how, &spaces)?, Some(sp.name.clone())),
         (None, Some(name)) => {
             notes.push(format!("made the space \"{name}\""));
-            (new_space_with(name, &how, &spaces)?, Some(name.clone()))
+            // In a worktree: the space opens on a home tab beside its worktrees, so
+            // Herdr shows it as a space of its own, never nested under the repo's.
+            let home = made.as_ref().filter(|_| on.is_none()).and_then(|m| worktrees::home_of(&m.place.path));
+            let address = match home {
+                Some(home) => new_space_at_home(name, &home, &how, &spaces)?,
+                None => new_space_with(name, &how, &spaces)?,
+            };
+            (address, Some(name.clone()))
         }
         (None, None) => {
             let args = accounts::hc_run_args(&how);
@@ -2281,6 +2288,35 @@ fn new_space_with(name: &str, how: &accounts::Start, all: &[spaces::Window]) -> 
         let _ = std::process::Command::new(config::herdr_app_bin()).args(["do", "space.select", "--id", &was.id]).output();
     }
     Ok(address)
+}
+
+/// A new space called `name` that opens on its home tab (a shell in `home`,
+/// beside the space's worktrees: see `worktrees::home_of`), the session a
+/// tab after it: the session's address. Herdr's sidebar places a space by
+/// its first terminal's folder and nests one in a worktree under the
+/// space that holds the repo's own checkout; the home tab is in none.
+fn new_space_at_home(name: &str, home: &str, how: &accounts::Start, all: &[spaces::Window]) -> Result<String> {
+    let args = ["do", "space.new", "--name", name, "--tab", name, "--folder", home];
+    let out = match std::process::Command::new(config::herdr_app_bin()).args(args).stdin(std::process::Stdio::null()).output() {
+        Ok(o) => o,
+        Err(e) => bail!("herdr-app: {e}"),
+    };
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let Some(terminal) = v["terminal"].as_str() else {
+        bail!("herdr-app space.new: {}{}", String::from_utf8_lossy(&out.stdout).trim(), String::from_utf8_lossy(&out.stderr).trim());
+    };
+    // The tower's own tab, never taken for a session.
+    let _ = hc::run(&["label", terminal, worktrees::LABEL_HOME, &format!("tower.name={name}")]);
+    let made = spaces::windows().into_iter().find(|w| w.name == name && w.machine.is_none());
+    let address = match made {
+        Some(sp) => start_in_space(&sp, how, all),
+        None => Err(anyhow::anyhow!("herdr-app made the space \"{name}\", but its window doesn't list it")),
+    };
+    // space.new shows the new space; give the window back to the one it showed.
+    if let Some(was) = all.iter().find(|s| s.active) {
+        let _ = std::process::Command::new(config::herdr_app_bin()).args(["do", "space.select", "--id", &was.id]).output();
+    }
+    address
 }
 
 /// The space a session landed in, once the voice has given it a tab (up to 3 s).
