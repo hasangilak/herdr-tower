@@ -87,7 +87,11 @@ fn said_as(prompt: Option<&str>, level: crate::tell::Level) -> Said {
 /// brain's answer is kept as that space's, and said like the main one's.
 fn finish(text: &str, prompt: Option<&str>, who: &Who) {
     match said_as(prompt, crate::tell::level()) {
-        Said::Answer => say(text, "answer", who),
+        Said::Answer => {
+            // The request this turn began with: the answer names it, so the chat pairs them.
+            let reply_to = prompt.and_then(|p| crate::history::request_for_prompt(&crate::history::load_tail(1 << 20), p, who.space.as_deref()));
+            say_to(text, "answer", who, reply_to)
+        }
         Said::Note(session) => {
             crate::history::record_note(session.as_deref(), text, who.space.clone());
             // The turn is over all the same.
@@ -116,7 +120,7 @@ pub fn claude_notify(brain: Option<&str>) {
     let msg = v["message"].as_str().unwrap_or("");
     let lower = msg.to_lowercase();
     if lower.contains("permission") || lower.contains("approve") || lower.contains("confirm") {
-        say(&go_ahead(msg, &who), "alert", &who);
+        say_to(&go_ahead(msg, &who), "alert", &who, None);
     }
 }
 
@@ -142,12 +146,13 @@ pub fn codex(args: &[String]) {
     }
 }
 
-fn say(text: &str, kind: &str, who: &Who) {
+/// Says `text` (`reply_to`: the request it answers, by its `at`).
+fn say_to(text: &str, kind: &str, who: &Who, reply_to: Option<u64>) {
     if text.trim().is_empty() {
         return;
     }
     // The text without its screenshot markers; the screenshots beside it.
-    crate::history::record_said(kind, text, who.space.clone());
+    crate::history::record_said(kind, text, who.space.clone(), reply_to);
     let _ = protocol::send(&Request::Say { text: text.to_string(), interrupt: false, kind: kind.into(), from: None, brain: who.name() });
 }
 

@@ -35,7 +35,7 @@ pub fn shown(e: &Entry) -> bool {
     !e.held
         && !e.record
         && match e.kind.as_str() {
-            "request" | "answer" | "watch" | "alert" | "summary" | "answered" | "behavior" | "receipt" | "act" => true,
+            "request" | "answer" | "watch" | "alert" | "summary" | "answered" | "behavior" | "receipt" | "act" | "reply" => true,
             "screenshot" => e.path.is_some(),
             // A PR a session opened: its chip.
             "pr" => e.id.is_some(),
@@ -275,6 +275,8 @@ pub fn thread_of(
             "request" => ("user", e.text.clone(), e.source.clone().unwrap_or_else(|| "mac".into())),
             // A receipt is the tower's reply to the request it closes.
             "answer" | "receipt" => ("tower", e.text.clone(), "tower".into()),
+            // A session's reply to what started its turn.
+            "reply" => ("session", e.text.clone(), "session".into()),
             _ => ("event", event_text(e), "tower".into()),
         };
         // A space's own tower's requests and answers carry its space. The
@@ -301,14 +303,45 @@ pub fn thread_of(
         if e.kind == "behavior" {
             m["diff"] = json!(e.diff);
         }
-        if role == "event" {
+        if role == "event" || role == "session" {
             m["session"] = json!(e.session);
             m["name"] = json!(e.name);
             m["status"] = json!(e.status);
         }
+        if let Some(r) = e.reply_to {
+            m["reply_to_at"] = json!(r);
+        }
         out.push(m);
     }
+    pair(&mut out, lines);
     out
+}
+
+/// Each answer with the message it answers (`reply_to`: its id, and `asks`:
+/// `{id, text, you}`, its words even when it is no message of the chat: a
+/// line typed in a session's terminal, what the tower queued for one), and
+/// each message with its first answer (`answered_by`). By the history's
+/// `reply_to`.
+fn pair(out: &mut [Value], lines: &[(usize, Entry)]) {
+    let ids: std::collections::HashMap<u64, String> = out.iter().filter_map(|m| Some((m["at"].as_u64()?, m["id"].as_str()?.to_string()))).collect();
+    for i in 0..out.len() {
+        let Some(at) = out[i]["reply_to_at"].as_u64() else { continue };
+        if let Some(obj) = out[i].as_object_mut() {
+            obj.remove("reply_to_at");
+        }
+        let Some((_, q)) = lines.iter().find(|(_, e)| e.at == at) else { continue };
+        let you = q.kind == "request";
+        let words = if you { q.text.clone() } else { q.text.split_once(": ").map(|(_, m)| m.to_string()).unwrap_or_else(|| q.text.clone()) };
+        let id = ids.get(&at).cloned();
+        out[i]["reply_to"] = json!(id);
+        out[i]["asks"] = json!({ "id": id, "text": words.trim(), "you": you });
+        let me = out[i]["id"].clone();
+        if let Some(j) = id.as_ref().and_then(|id| out.iter().position(|m| m["id"].as_str() == Some(id.as_str())))
+            && out[j]["answered_by"].is_null()
+        {
+            out[j]["answered_by"] = me;
+        }
+    }
 }
 
 /// Whether a message belongs to the conversation with a space's own tower
@@ -324,8 +357,9 @@ pub fn in_conversation(m: &Value, space: Option<&str>) -> bool {
     let own = m["space"].as_str().filter(|s| !s.is_empty());
     let kind = m["kind"].as_str().unwrap_or("");
     match space {
-        Some(s) => matches!(kind, "request" | "answer" | "receipt" | "act") && own.is_some_and(|o| o.eq_ignore_ascii_case(s.trim())),
-        None => !(matches!(kind, "request" | "answer" | "act") && own.is_some()),
+        Some(s) => matches!(kind, "request" | "answer" | "receipt" | "act" | "reply") && own.is_some_and(|o| o.eq_ignore_ascii_case(s.trim())),
+        // (A session's reply is its space's.)
+        None => !(matches!(kind, "request" | "answer" | "act" | "reply") && own.is_some()),
     }
 }
 
@@ -345,6 +379,40 @@ mod tests {
 
     fn e(kind: &str, at: u64, text: &str) -> Entry {
         Entry { at, kind: kind.into(), text: text.into(), ..Default::default() }
+    }
+
+    /// The phone's thread pairs them too: an answer names the message it
+    /// answers (`reply_to`, `asks` with its words), the question its answer
+    /// (`answered_by`); a session's reply is its space's, quoting what it was
+    /// given even when that is no chat message.
+    #[test]
+    fn the_phone_gets_each_answer_with_its_question() {
+        let mut q1 = e("request", 1, "is it on prod?");
+        q1.space = Some("isa".into());
+        let mut q2 = e("request", 2, "and the docs?");
+        q2.space = Some("isa".into());
+        let mut a2 = e("answer", 3, "The docs are up.");
+        a2.space = Some("isa".into());
+        a2.reply_to = Some(2);
+        let mut typed = e("request", 4, "we tested on ingest filter?");
+        typed.source = Some("terminal:t7".into());
+        typed.record = true;
+        let mut reply = e("reply", 5, "Both filters pass.");
+        reply.space = Some("isa".into());
+        reply.session = Some("t7".into());
+        reply.reply_to = Some(4);
+        let lines: Vec<(usize, Entry)> = vec![q1, q2, a2, typed, reply].into_iter().enumerate().map(|(i, e)| (i + 1, e)).collect();
+        let t = thread_with(&lines, Path::new("/x"), &Default::default(), &["isa".to_string()]);
+        let by = |id: &str| t.iter().find(|m| m["id"] == id).unwrap().clone();
+        assert_eq!(by("h3")["reply_to"], "h2");
+        assert_eq!(by("h3")["asks"], json!({ "id": "h2", "text": "and the docs?", "you": true }));
+        assert_eq!(by("h2")["answered_by"], "h3");
+        assert!(by("h1")["answered_by"].is_null(), "still waits");
+        let r = by("h5");
+        assert_eq!((r["role"].as_str(), r["session"].as_str(), r["reply_to"].clone()), (Some("session"), Some("t7"), Value::Null));
+        assert_eq!(r["asks"], json!({ "id": null, "text": "we tested on ingest filter?", "you": true }), "typed in its terminal: no chat message, its words");
+        assert!(in_conversation(&r, Some("isa")) && !in_conversation(&r, None));
+        assert!(r.get("reply_to_at").is_none());
     }
 
     fn shot_entry(at: u64, id: &str, session: &str) -> Entry {

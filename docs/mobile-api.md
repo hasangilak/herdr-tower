@@ -634,8 +634,8 @@ A message:
 ```json
 {
   "id": "h812", "at": 1794158000000, "updated_at": 1794158000000,
-  "role": "user",                // user | tower | screenshots | event
-  "kind": "request",             // the history's: request, answer, receipt, screenshot, watch, alert, job, summary
+  "role": "user",                // user | tower | session | screenshots | event
+  "kind": "request",             // the history's: request, answer, reply, receipt, screenshot, watch, alert, job, summary
   "text": "[Image #1] [File #2: notes.pdf] compare these",
   "source": "phone:d_9fce5c6c",  // mac (typed in the panel, tower ask) | voice (the Mac's microphone) | phone:<device> | tower
   "space": null,                 // a space's name: see "Whose conversation"
@@ -662,9 +662,31 @@ A message:
   found, `pr` the PR as it is now. It changes in place: a `chat` `update`
   (and a `pr` event) when its checks finish or it's merged or closed,
   never a new message. `session`, `name`, `space`.
+- **session** (`kind: "reply"`): a session's reply, its last words at the
+  end of a turn that a message of the user's (typed in its terminal, or
+  their answer on its card) or one the tower queued for it started;
+  `session`, `name`, `space`. It is its space's conversation's.
 - **event**: news the panel shows between messages (a watched session
   finished, a job done or blocked, an alert, a summary), `text` as the
   panel words it; `session`, `name`, `status`.
+
+**Answers paired with their questions.** However many messages come in
+between, and in whatever order answers arrive:
+
+- An answer (`tower` `answer`, `session` `reply`) has `asks`: `{"id": <the
+  message it answers, or null when that is no message of the chat: a line
+  typed in a session's terminal, what the tower queued for it>, "text": its
+  words, "you": true for the user's own (false: the tower's message to the
+  session)}`, and `reply_to`: the same id (or null). Show `asks.text` as a
+  short quoted line on top ("↳ you asked: …", "↳ the tower sent it: …"),
+  a tap scrolling to `reply_to` when there is one.
+- A message that got an answer has `answered_by`: the first answer's id.
+  Show "answered" with a link to it; a request of the user's without one
+  (recent) waits for an answer.
+- The pairing is kept in the history (`reply_to`, the answered message's
+  time), so it is the same after a restart. A tower's answer names the
+  request its turn began with; a session's reply, the message that
+  started its turn. Answers from before this came have neither.
 
 `id` is `h<line>`: stable, unique, in order. What the tower is writing
 right now isn't a message yet: the state's `work` (its working line) and
@@ -685,15 +707,15 @@ Every message has `space` (a space's name, or `null`).
 
 So the app shows two kinds of conversation from one thread:
 
-- **A space's own**: the messages of kind `request`, `answer`, `receipt` or
-  `act` whose `space` is that space. `GET /v1/chat?space=<name>` returns
+- **A space's own**: the messages of kind `request`, `answer`, `reply`,
+  `receipt` or `act` whose `space` is that space. `GET /v1/chat?space=<name>` returns
   exactly these, and pages back with `before` (the first message's `id`)
   and `limit` as the main chat does, `more` saying older ones remain. An
   `act` (what the tower opened in answer to a request) is the conversation
   of the request it answers: asked of the space's own tower, or of the main
   tower as `In <space>: …`.
 - **The main one**: everything else, that is every message except the
-  requests, answers and acts that have a `space`. `GET /v1/chat?main=1`
+  requests, answers, replies and acts that have a `space`. `GET /v1/chat?main=1`
   returns exactly these. (A receipt that names a space is in both: it is
   the reply to a request that may have been asked in either place.)
 

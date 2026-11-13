@@ -404,6 +404,38 @@ impl Daemon {
         });
     }
 
+    /// A session's turn ended with `said`. When what started that turn was
+    /// a message of the user's (typed in its terminal, or their answer on
+    /// its card) or one the tower queued for it, its reply is kept as one
+    /// (`reply`, `reply_to` naming that message: `history::message_for_turn`),
+    /// once, so the conversation pairs them. Not for the tower's own
+    /// terminals or a test session.
+    fn replied(&self, address: &str, t: Option<&serde_json::Value>, said: &str) {
+        let Some(t) = t else { return };
+        if said.trim().is_empty() || watch::left_alone(t) || brain::brain_of(t).is_some() {
+            return;
+        }
+        let Some(s) = sessions::registry().get(address).filter(|s| !s.prompt.trim().is_empty() && s.prompt_ms > 0) else { return };
+        let (address, said, name, space) = (address.to_string(), said.trim().to_string(), crate::hc::spoken_name(t), crate::spaces::space_of(t));
+        crate::history::later(move || {
+            let entries = crate::history::load_tail(1 << 20);
+            let Some(at) = crate::history::message_for_turn(&entries, &address, &s.prompt, s.prompt_ms) else { return };
+            if entries.iter().any(|e| e.kind == "reply" && e.session.as_deref() == Some(address.as_str()) && e.reply_to == Some(at)) {
+                return;
+            }
+            eprintln!("[sessions] {address} ({name}) answered the message of {at}");
+            crate::history::append(crate::history::Entry {
+                kind: "reply".into(),
+                session: Some(address),
+                name: Some(name).filter(|n| !n.is_empty()),
+                space,
+                text: said,
+                reply_to: Some(at),
+                ..Default::default()
+            });
+        });
+    }
+
     /// What the user typed in a session's own terminal (`prompted`).
     fn typed_there(&self, ev: &sessions::AgentEvent, t: &serde_json::Value) {
         let address = ev.terminal.as_str();
@@ -770,6 +802,10 @@ impl Daemon {
                 if change == sessions::Change::Prompted {
                     acts::given(&event.terminal, &event.text);
                     self.prompted(&event, terminal.as_ref());
+                }
+                // A turn that a message of the user's or the tower's started: its reply, paired with it.
+                if let sessions::Change::Stopped(said) = &change {
+                    self.replied(&event.terminal, terminal.as_ref(), said);
                 }
                 if change != sessions::Change::Nothing {
                     self.watches.agent(&event, &change);

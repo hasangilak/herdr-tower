@@ -40,6 +40,57 @@ pub(super) struct Said {
     pub request_at: u64,
     /// Between you or the tower and one session, not the tower's own conversation.
     pub with: Option<With>,
+    /// The message it answers, by its `at` (the history's `reply_to`).
+    pub reply_to: Option<u64>,
+}
+
+impl Said {
+    /// A message that waits for an answer: yours (to the tower, or typed
+    /// to a session), or one the tower sent a session.
+    pub fn asks(&self) -> bool {
+        match &self.with {
+            None => self.you,
+            Some(w) => self.you || matches!(w.how.as_str(), "sent" | "queued"),
+        }
+    }
+
+    /// A session's reply.
+    fn reply(&self) -> bool {
+        self.with.as_ref().is_some_and(|w| w.how == "replied")
+    }
+}
+
+/// How the rows of a conversation pair up: the row a row answers (`asks`)
+/// and the first row that answers it (`answer`), by index.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(super) struct Pair {
+    pub asks: Option<usize>,
+    pub answer: Option<usize>,
+}
+
+/// Each row's pair, by the `reply_to` its answers carry: an answer of the
+/// tower's names the request it answers, a session's reply the message
+/// that started its turn. However many messages came in between.
+pub(super) fn pairs(said: &[Said]) -> Vec<Pair> {
+    let mut out = vec![Pair::default(); said.len()];
+    for (i, s) in said.iter().enumerate() {
+        let Some(at) = s.reply_to else { continue };
+        if let Some(j) = said.iter().position(|q| q.at == at && q.asks()) {
+            out[i].asks = Some(j);
+            if out[j].answer.is_none() {
+                out[j].answer = Some(i);
+            }
+        }
+    }
+    out
+}
+
+/// The line on an answer that says what it answers: "↳ you asked: …", or
+/// for a message the tower sent, "↳ the tower sent it: …".
+pub(super) fn asked_line(q: &Said) -> String {
+    let words: String = q.text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let short = if words.chars().count() > 70 { format!("{}…", words.chars().take(69).collect::<String>().trim_end()) } else { words };
+    if q.you { format!("↳ you asked: {short}") } else { format!("↳ the tower sent it: {short}") }
 }
 
 /// The session a message passed to, and how it went.
@@ -70,6 +121,8 @@ pub(super) fn session_said(e: &Entry) -> Option<Said> {
         ("request", _) if source.starts_with("answer:") => (true, "answered its question".into(), text.into()),
         ("queue", Some("queued")) => (false, "queued".into(), after_colon(text).into()),
         ("queue", Some("delivered" | "sent")) => (false, "sent".into(), after_colon(text).into()),
+        // Its reply to what started its turn.
+        ("reply", _) => (false, "replied".into(), text.into()),
         ("queue", Some("not-sent")) => match text.strip_prefix("Not sent: you had told it yourself (").and_then(|r| r.split_once("\"): ")) {
             Some((_, message)) => (false, "not sent: you had told it yourself".into(), message.trim().into()),
             None => (false, "not sent".into(), text.strip_prefix("Not sent: ").unwrap_or(text).into()),
@@ -80,7 +133,7 @@ pub(super) fn session_said(e: &Entry) -> Option<Said> {
     if said.is_empty() || (you && (said.starts_with("<agent-message ") || said.starts_with("<task-notification>"))) {
         return None;
     }
-    Some(Said { you, text: said, at: e.at, request_at: 0, with: Some(With { addr, name, how }) })
+    Some(Said { you, text: said, at: e.at, request_at: 0, with: Some(With { addr, name, how }), reply_to: e.reply_to })
 }
 
 /// `s` into `out`: what went in (or didn't) of a message the tower queued is
@@ -161,7 +214,7 @@ pub(super) fn conversation(entries: &[Entry], space: Option<&str>, max: usize) -
             match mine {
                 Some(text) => {
                     let text = if text.is_empty() && !e.attachments.is_empty() { "(files)".to_string() } else { text };
-                    out.push(Said { you: true, text, at: e.at, request_at: e.at, with: None });
+                    out.push(Said { you: true, text, at: e.at, request_at: e.at, with: None, reply_to: None });
                     from = Some(of(e));
                     request_at = e.at;
                 }
@@ -174,7 +227,7 @@ pub(super) fn conversation(entries: &[Entry], space: Option<&str>, max: usize) -
             && let Some(f) = &from
             && (of(e) == *f || (f.is_none() && e.kind == "receipt"))
         {
-            out.push(Said { you: false, text: e.text.trim().to_string(), at: e.at, request_at, with: None });
+            out.push(Said { you: false, text: e.text.trim().to_string(), at: e.at, request_at, with: None, reply_to: e.reply_to });
         }
     }
     // In time order (a line can be written a little after a later one).
@@ -220,6 +273,11 @@ fn faded(color: u32, a: u32) -> gpui::Rgba {
 /// One message's row: who said it to whom, when, how it went, and its words
 /// whole; `extra` under them. `who`: the tower's name in this view.
 pub(super) fn said_row(s: &Said, who: &str, extra: Vec<AnyElement>) -> AnyElement {
+    said_row_with(s, who, None, extra)
+}
+
+/// `said_row`, with a line on top (`top`: what it answers, as `asked_line`).
+pub(super) fn said_row_with(s: &Said, who: &str, top: Option<AnyElement>, extra: Vec<AnyElement>) -> AnyElement {
     let g = glass();
     let (bar, bg) = match (&s.with, s.you) {
         (None, true) => (rgb(AMBER).into(), rgba(0xffffff24)),
@@ -231,12 +289,15 @@ pub(super) fn said_row(s: &Said, who: &str, extra: Vec<AnyElement>) -> AnyElemen
         (None, true) => "You".to_string(),
         (None, false) => who.to_string(),
         (Some(w), true) => format!("You → {}", w.name),
+        (Some(w), false) if s.reply() => w.name.clone(),
         (Some(w), false) => format!("Tower → {}", w.name),
     };
-    let how = s.with.as_ref().map(|w| {
+    let how = s.with.as_ref().filter(|_| !s.reply()).map(|w| {
         let warn = w.how.starts_with("not sent") || w.how.starts_with("held");
-        div().text_size(px(12.0)).text_color(if warn { gpui::Hsla::from(faded(AMBER, 0xdd)) } else { g.faint }).child(w.how.clone())
+        div().text_size(px(12.0)).text_color(if warn { gpui::Hsla::from(faded(AMBER, 0xdd)) } else { g.faint }).child(w.how.clone()).into_any_element()
     });
+    let lines: Vec<AnyElement> = top.into_iter().chain(how).collect();
+    let how = (!lines.is_empty()).then(|| v_flex().gap(px(3.0)).children(lines));
     message_row(bar, bg, head, if s.at > 0 { when(s.at) } else { String::new() }, how, s.text.clone(), extra)
 }
 
@@ -400,9 +461,52 @@ impl Panel {
             }
         }
         let mut act_items = Some(act_items);
+        // Each answer with the message it answers, and each question with its answer.
+        let pairs = pairs(&said);
+        let first = rows.len();
+        let now = history::now_ms();
+        // Asked since answers were paired (earlier ones never were): it may still wait.
+        let paired_since = self.entries.iter().filter(|e| e.reply_to.is_some()).map(|e| e.at).min();
         for (i, s) in said.iter().enumerate() {
-            let extra = if Some(i) == last_of_latest { act_items.take().unwrap_or_default() } else { vec![] };
-            rows.push(said_row(s, &who, extra));
+            let mut extra = if Some(i) == last_of_latest { act_items.take().unwrap_or_default() } else { vec![] };
+            let jump = |to: usize, id: String, words: String, color: gpui::Hsla| {
+                div()
+                    .id(SharedString::from(id))
+                    .text_size(px(12.0))
+                    .text_color(color)
+                    .cursor_pointer()
+                    .hover(|st| st.text_color(glass().text))
+                    .child(words)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(f) = this.full.as_ref() {
+                            f.chat_scroll.scroll_to_top_of_item(first + to);
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            };
+            // What it answers: a line on top, to the question.
+            let top = match (pairs[i].asks, s.reply_to) {
+                (Some(j), _) => Some(jump(j, format!("asked-{i}-{}", s.at), asked_line(&said[j]), g.faint)),
+                // Its question is further back than the column goes: said, not linked.
+                (None, Some(at)) => self.entries.iter().find(|e| e.at == at).map(|q| {
+                    let you = q.kind == "request";
+                    let q = Said { you, text: q.text.split_once(": ").filter(|_| !you).map(|(_, m)| m.to_string()).unwrap_or_else(|| q.text.clone()), at, request_at: 0, with: None, reply_to: None };
+                    div().text_size(px(12.0)).text_color(g.faint).child(asked_line(&q)).into_any_element()
+                }),
+                _ => None,
+            };
+            // A question: answered (to the answer), or still waiting for one.
+            if s.asks() {
+                match pairs[i].answer {
+                    Some(j) => extra.push(jump(j, format!("answered-{i}-{}", s.at), "answered ↓".into(), gpui::Hsla::from(faded(CYAN, 0xee)))),
+                    None if paired_since.is_some_and(|since| s.at >= since) && now.saturating_sub(s.at) < 12 * 3_600_000 => {
+                        extra.push(div().text_size(px(12.0)).text_color(g.faint).child("waiting for an answer").into_any_element())
+                    }
+                    None => {}
+                }
+            }
+            rows.push(said_row_with(s, &who, top, extra));
         }
         rows.extend(waits);
         if rows.is_empty() {
@@ -444,7 +548,12 @@ impl Panel {
                     .min_h_0()
                     .overflow_y_scroll()
                     .when_some(scroll, |el, s| el.track_scroll(&s))
-                    .child(v_flex().w_full().gap(px(8.0)).pb(px(4.0)).children(rows)),
+                    // Each row a child of its own: a link scrolls to one (`scroll_to_top_of_item`).
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .pb(px(4.0))
+                    .children(rows),
             )
             .children(status)
             .child(self.input(window, cx))
@@ -495,6 +604,42 @@ mod tests {
             record: kind == "request",
             ..Default::default()
         }
+    }
+
+    /// Two questions in a row, their answers out of order: each answer quotes
+    /// the right one, and each question says it was answered, by which.
+    #[test]
+    fn answers_out_of_order_are_paired_with_their_questions() {
+        let mut first = of("request", Some("answer"), Some("terminal:t7"), "t7", "we tested on ingest filter and offer filters?", 10);
+        first.name = Some("eyzflow".into());
+        let second = of("request", None, Some("terminal:t8"), "t8", "is the API on dev yet?", 20);
+        let mut sent = of("queue", Some("queued"), None, "t7", "Queued for eyzflow: Run the e2e tests.", 25);
+        sent.record = false;
+        // The API session answers first, then eyzflow, then eyzflow on the tower's message.
+        let mut api = of("reply", None, None, "t8", "Yes: deployed at 14:02.", 30);
+        api.reply_to = Some(20);
+        let mut ingest = of("reply", None, None, "t7", "Both filters pass on dev.", 40);
+        ingest.reply_to = Some(10);
+        let mut e2e = of("reply", None, None, "t7", "The e2e tests pass.", 50);
+        e2e.reply_to = Some(25);
+        let entries = vec![first, second, sent, api, ingest, e2e];
+        let said = conversation(&entries, Some("support-translation"), 200);
+        assert_eq!(said.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(), [
+            "we tested on ingest filter and offer filters?", "is the API on dev yet?", "Run the e2e tests.", "Yes: deployed at 14:02.", "Both filters pass on dev.", "The e2e tests pass."
+        ]);
+        let p = pairs(&said);
+        assert_eq!((p[3].asks, p[4].asks, p[5].asks), (Some(1), Some(0), Some(2)), "each answer to its own question");
+        assert_eq!((p[0].answer, p[1].answer, p[2].answer), (Some(4), Some(3), Some(5)), "each question answered, by its answer");
+        assert_eq!(asked_line(&said[0]), "↳ you asked: we tested on ingest filter and offer filters?");
+        assert_eq!(asked_line(&said[2]), "↳ the tower sent it: Run the e2e tests.");
+        assert!(said[3].with.as_ref().is_some_and(|w| w.how == "replied" && w.name == "eyzflow"));
+        // The tower's answer to a request in its own conversation pairs the same way.
+        let mut answer = e("answer", "Yes, it is on prod.", None, 80);
+        answer.reply_to = Some(60);
+        let main = conversation(&[e("request", "is it on prod?", None, 60), e("request", "and the docs?", None, 70), answer], None, 200);
+        let p = pairs(&main);
+        assert_eq!((p[2].asks, p[0].answer, p[1].answer), (Some(0), Some(2), None), "the second still waits");
+        assert!(main[0].asks() && main[1].asks() && !main[2].asks());
     }
 
     /// What you type in a session, and what the tower queues for it and sends
