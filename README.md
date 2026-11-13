@@ -677,6 +677,55 @@ Every Claude session on this Mac carries its account: `tower agents`,
 account never changes, so it's looked up once per pid and kept in
 `~/.local/state/herder-tower/accounts.json`.
 
+#### When an account hits its usage limit
+
+A session whose turn ends on its account's usage limit ("You've hit your
+5-hour limit · resets 3pm", "You're out of usage credits") moves to
+another account on its own, and so does a tower: the main one, each
+space's own, the planner and the reviewers. Claude Code's StopFailure hook
+tells the tower; a plain rate limit, which Claude Code waits out itself,
+isn't one.
+
+- **Where to.** The next account `cca` lists that has usage, the default
+  first, then the others in order. An account the tower found out, one
+  whose usage cca recorded at 100% (its `U` lines), and one not signed in
+  are skipped. The account it left is out until its reset (from the
+  message, else from cca's record, else for an hour), kept in
+  `~/.local/state/herder-tower/failover.json`. Meanwhile sessions and
+  towers that start without an account named start on the next one too.
+- **The move happens in the session's own terminal.** Herdr keeps the
+  terminal, the tower ends its `claude`, and the shell Herdr leaves runs
+  `cd <folder> && exec cca <account> -n <name> <flags> --resume
+  <session>`. The conversation goes on, with the same session id, model
+  and effort. Its terminal stays the same, so its agenda tasks, the
+  instructions queued for it, its watch and its cards stay with it. The
+  agenda doesn't count the limit as a failure, and the queue holds what
+  waits for it until it runs again.
+- **What it was doing goes back in.** A session gets one note, ahead of
+  anything queued for it: why it moved, and its last instruction. A tower
+  gets its unfinished prompt again, as it was, so its answer still pairs
+  with your request.
+- **You're told once, in one line**, in the chat: "fix-login (sandbox)
+  moved from the default account to orca: default hit its 5-hour limit
+  (back at 15:00)."
+- **Every account out.** Nothing moves. One decision says so and when the
+  first account is back: "Every Claude account is out of usage: 2
+  sessions wait (fix-login (sandbox), the sandbox tower). The first back
+  is orca, at 15:00." It offers **Go on at 15:00** (the default) and
+  **Leave them stopped**. The tower looks every 30 seconds. A session
+  whose own account is back is told to carry on where it is, one that can
+  move to another is moved, and the card follows what still waits.
+
+```sh
+tower failover                          # each account: has usage, or out until when; what moved; what waits
+tower failover move fix-login [--to orca]   # move one now (else to the next account with usage)
+tower failover clear                    # forget what is out and what waits
+```
+
+Claude Code drops a conversation's earlier thinking when it is resumed
+under another organization ("Claude can't use thinking from another
+organization"). The conversation itself goes on.
+
 ### Questions: answered for you, or with a tap
 
 When a session asks something, the tower reads it as a **question set**:
@@ -1146,7 +1195,14 @@ for **Herdr Core**, because the voice runs in a Herdr terminal.
   label (`tower.space`) and ends with the space; `tower show tower-<space>`
   brings it on screen.
 - Restarting a brain (for a new model) starts a new conversation: it reads
-  its instructions again, but not what it was in the middle of.
+  its instructions again, but not what it was in the middle of. (Moving a
+  brain to another account at a usage limit resumes its conversation.)
+- Moving a session to another account at its usage limit ends its `claude`
+  with SIGKILL. Herdr keeps a shell only for a program that a signal
+  killed, and Claude Code exits cleanly on SIGTERM. The turn is over by
+  then and its conversation is on disk, but a background command it
+  started may be left running. Codex sessions and sessions on other
+  machines aren't moved.
 - A space whose name is longer than 26 letters gets a shortened terminal
   name (`tower-…-<4 letters>`), since Herdr's names end at 32.
 - Questions: dialogs on other machines aren't read yet (their plain-text

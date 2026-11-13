@@ -24,6 +24,7 @@ mod covered;
 mod daemon;
 mod decisions;
 mod dispatch;
+mod failover;
 mod goals;
 mod draft;
 mod hc;
@@ -182,6 +183,21 @@ enum Cmd {
         spaces: Vec<String>,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// A Claude account at its usage limit, and the work moved off it: each session or tower that hits
+    /// its account's limit is resumed on the next account with usage (the default first), in its own
+    /// terminal, with its conversation and what it was doing. No action: what is out, what moved, what
+    /// waits. `move <session> [--to <account>]`: move one now. `clear`: forget what is out and what waits.
+    Failover {
+        /// status, move or clear.
+        action: Option<String>,
+        /// The session to move (its address or name).
+        target: Option<String>,
+        /// Where to move it (else the next account with usage).
+        #[arg(long)]
+        to: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -1025,6 +1041,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Introduce { space, dry_run } => introduce_cmd(&space.join(" "), dry_run),
         Cmd::Reopen { action, spaces, dry_run, json } => reopen_cmd(action.as_deref().unwrap_or("list"), &spaces, dry_run, json),
         Cmd::Accounts { on } => list_accounts(on.as_deref()),
+        Cmd::Failover { action, target, to, json } => failover_cmd(action.as_deref().unwrap_or("status"), target.as_deref().unwrap_or(""), to.as_deref().unwrap_or(""), json),
         Cmd::Project { name } => {
             let asked = name.join(" ");
             match projects::best(&asked) {
@@ -2223,6 +2240,49 @@ fn agenda_do(cmd: &agenda::Cmd) -> Result<Value> {
 }
 
 /// `tower reopen [list|go|forget] [<space>…] [--dry-run]`.
+fn failover_cmd(action: &str, target: &str, to: &str, json_out: bool) -> Result<()> {
+    if !protocol::is_running() {
+        bail!("the tower's voice isn't running (tower up): it moves sessions between accounts");
+    }
+    if action == "move" && target.trim().is_empty() {
+        bail!("tower failover move <session> [--to <account>]");
+    }
+    let r = protocol::send(&Request::Failover { action: action.into(), target: target.into(), account: to.into() })?;
+    if !r.ok {
+        bail!("{}", r.error.unwrap_or_default());
+    }
+    let v = r.state.unwrap_or_default();
+    if json_out || !std::io::stdout().is_terminal() {
+        print_json(&v);
+        return Ok(());
+    }
+    let s = |v: &Value, k: &str| v[k].as_str().unwrap_or("").to_string();
+    match action {
+        "move" => println!("Moving {} from the {} account to {}: its conversation resumes in its own terminal.", s(&v, "moving"), s(&v, "from"), s(&v, "to")),
+        "clear" => println!("Forgot {} account(s) out of usage and {} session(s) waiting for one.", v["forgot_out"], v["forgot_waiting"]),
+        _ => {
+            for a in v["accounts"].as_array().into_iter().flatten() {
+                let out = match a["out_until"].as_str() {
+                    Some(u) => format!("out of usage until {u}"),
+                    None => "has usage".to_string(),
+                };
+                println!("{} ({}): {out}", s(a, "name"), s(a, "email"));
+            }
+            for w in v["waiting"].as_array().into_iter().flatten() {
+                println!("Waiting for an account: {} ({}) on {}", s(w, "name"), s(w, "address"), s(w, "account"));
+            }
+            for m in v["moves"].as_array().into_iter().flatten().rev().take(10) {
+                let when = phone::ago(m["at_ms"].as_u64().unwrap_or(0));
+                match s(m, "how").as_str() {
+                    "moved" => println!("{when}: {} ({}) moved from {} to {}", s(m, "name"), s(m, "address"), s(m, "from"), s(m, "to")),
+                    _ => println!("{when}: {} ({}) couldn't move from {} to {}: {}", s(m, "name"), s(m, "address"), s(m, "from"), s(m, "to"), s(m, "why")),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn reopen_cmd(action: &str, spaces: &[String], dry_run: bool, json_out: bool) -> Result<()> {
     if !protocol::is_running() {
         bail!("the tower's voice isn't running (tower up): it keeps what was open");

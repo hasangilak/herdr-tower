@@ -225,7 +225,7 @@ impl Reopen {
         };
         let windows = crate::spaces::windows_open().context("Herdr's window doesn't answer: open Herdr, then reopen them")?;
         let cca = crate::accounts::cca_bin().map(|p| p.to_string_lossy().into_owned());
-        let default_account = crate::accounts::list().ok().and_then(|l| l.first().map(|a| a.name.clone()));
+        let default_account = crate::accounts::list().ok().and_then(|l| crate::accounts::default_of(&l));
         let refs: Vec<&Kept> = chosen.iter().collect();
         let steps = reopen::plan(&refs, &windows, &folders, &|a| crate::hc::get(a), &|p| Path::new(p).exists(), cca.as_deref(), default_account.as_deref());
         if dry_run {
@@ -401,7 +401,8 @@ mod tests {
         let asks = super::super::asks::Asks::new(shared, Arc::new(crate::daemon::lan::hub::Hub::default()), "normal").stored_at(dir.join("questions.json"));
         let send = |_: &str, _: &str| -> Result<Value> { panic!("nothing is sent to a session") };
         let agenda = |_: &crate::agenda::Cmd| crate::protocol::Response { ok: true, error: None, state: None };
-        let carry = super::super::decisions::Carry { asks: &asks, send: &send, agenda: &agenda, reopen: &reopen };
+        let accounts = |_: bool| -> Result<Value> { panic!("no account card here") };
+        let carry = super::super::decisions::Carry { asks: &asks, send: &send, agenda: &agenda, reopen: &reopen, accounts: &accounts };
         let v = decisions.answer_with(&id, &json!({ "choice": 0 }), true, &carry).unwrap();
         assert_eq!((v["state"].as_str(), v["answer"].as_str()), (Some("answered"), Some("Reopen all")));
         assert_eq!(picked.lock().unwrap().clone(), Some(Pick::All));

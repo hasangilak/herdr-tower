@@ -57,9 +57,16 @@ fn settings() -> Config {
     Config::live()
 }
 
-/// A terminal's command line.
+/// A terminal's command line: its agent's own (`claude …` once `cca` or a
+/// shell started it: a brain moved to another account runs in the shell
+/// Herdr kept), else what the terminal was started with.
 fn argv_of(t: &Value) -> Vec<String> {
-    t["argv"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(String::from)).collect()
+    let of = |v: &Value| -> Vec<String> { v.as_array().into_iter().flatten().filter_map(|a| a.as_str().map(String::from)).collect() };
+    let fg = of(&t["foreground"]["argv"]);
+    if fg.first().is_some_and(|p| matches!(p.rsplit('/').next(), Some("claude" | "codex"))) {
+        return fg;
+    }
+    of(&t["argv"])
 }
 
 /// A brain's terminal as the tower keeps it, on what it knew (`before`): a

@@ -603,7 +603,8 @@ impl Radar {
                     self.fire_watch(address, &name, space, &SessionStatus::Exited, "");
                 }
             }
-            Change::Prompted | Change::Nothing => {}
+            // The tower moves it to another account (`failover`): no finish to report.
+            Change::Limited(_) | Change::Prompted | Change::Nothing => {}
         }
     }
 

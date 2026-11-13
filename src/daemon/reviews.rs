@@ -244,7 +244,8 @@ impl Reviews {
             eprintln!("[reviews] {}: no reviewer ({why})", pr.key());
             return None;
         }
-        let account = owner.as_ref().and_then(account_of_terminal);
+        // Its session's account, unless that one is out of usage (then the default `tower start` picks).
+        let account = owner.as_ref().and_then(account_of_terminal).filter(|a| crate::failover::usable(a));
         let r = b.begin(pr, account, owner.as_ref().and_then(crate::hc::created_ms), crate::history::now_ms());
         lock(&self.opening).insert(r.key.clone());
         self.save(&b);

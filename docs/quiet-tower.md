@@ -2677,7 +2677,10 @@ which, whatever came between them and in whatever order they came back:
     without an answer." (its Stop hook);
   - it failed: "The tower couldn't answer: it hit its rate limit." and
     the like (the brains' **StopFailure** hook, `tower hook
-    claude-failed`, by its `error`);
+    claude-failed`, by its `error`). At its Claude account's usage limit
+    it isn't left unanswered: the tower moves that brain to the next
+    account with usage, and gives it the same prompt again there (see
+    the README, "When an account hits its usage limit");
   - you took it back: "You took it back." (**Take back** sends
     `{"cmd":"withdraw","at":…}`; the daemon stops the brain with `hc
     interrupt` if that request is still the latest it was given and it is

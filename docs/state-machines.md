@@ -454,7 +454,8 @@ pub enum AgendaState { Open, Done, Closed, Abandoned }
 | any open | its turn ends with a message (Stop hook); another instruction went in after it | done-claimed |
 | done-claimed | the message says it's done and names what it was asked | verified |
 | any open | `tower job done`, `tower agenda verify` | verified |
-| any but verified, abandoned | it says it couldn't, StopFailure, `tower job failed`, `tower agenda fail` | failed |
+| any but verified, abandoned | it says it couldn't, StopFailure (but at the account's usage limit: see below), `tower job failed`, `tower agenda fail` | failed |
+| any open | its turn ends at its account's usage limit (StopFailure, read as `limited`) | as it was: not judged while its session moves to another account or waits for one (`daemon::failover::holds`); its next turn there decides |
 | any open | parked / expired in the queue, the session exited, vanished or is another terminal, error, never took it after a re-send, no progress 25 min, an id the queue has no trace of | stalled |
 | any | `tower agenda requeue`, the reconciler's re-send, a follow-up, a parked id retargeted | queued |
 | failed, never retried (`retries` 0), at `tower tell decisions|results`, unless `[agenda] retry_failed = false` | the daemon sends it once more by itself | queued (`retries` 1) |

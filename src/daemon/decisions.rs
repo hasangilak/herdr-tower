@@ -681,6 +681,8 @@ pub struct Carry<'a> {
     pub agenda: &'a dyn Fn(&crate::agenda::Cmd) -> crate::protocol::Response,
     /// Puts back (or lets go) what a restart closed: what was done.
     pub reopen: &'a dyn Fn(&crate::reopen::Pick) -> Result<Value>,
+    /// The sessions waiting for an account: on at the reset (true), or let go.
+    pub accounts: &'a dyn Fn(bool) -> Result<Value>,
 }
 
 /// Whether the answer just given can be made a rule, and the request that
@@ -828,6 +830,14 @@ impl Decisions {
                 self.answered(id, &label);
                 Ok(json!({ "ok": true, "id": id, "state": "answered", "answer": label, "reopen": done }))
             }
+            Act::Accounts { wait, label } => {
+                self.answered(id, &label);
+                let done = match (with.accounts)(wait) {
+                    Ok(v) => v,
+                    Err(e) => return Err(Refused::Failed(format!("{e:#}"))),
+                };
+                Ok(json!({ "ok": true, "id": id, "state": "answered", "answer": label, "accounts": done }))
+            }
         }
     }
 
@@ -851,6 +861,31 @@ impl Decisions {
         let raised = raised?;
         if raised.fresh {
             eprintln!("[decisions] {} (reopen) for the user: what the restart closed", raised.id);
+        }
+        let told = raised.fresh && self.tells(std::slice::from_ref(&raised.id), true);
+        Some((raised.id, told))
+    }
+
+    /// The card saying every Claude account is out (`crate::failover`), as
+    /// it should stand now (None: nothing waits, an open one stops). Its id,
+    /// and whether the user is told now (the first time, as a raise is).
+    pub fn offer_accounts(&self, card: Option<crate::failover::Card>) -> Option<(String, bool)> {
+        let had = lock(&self.book).open.iter().find(|d| d.key == decisions::ACCOUNTS_KEY).map(|d| (d.title.clone(), d.detail.clone(), d.options.clone()));
+        let same = match (&had, &card) {
+            (None, None) => return None,
+            (Some((title, detail, options)), Some(c)) => {
+                *title == c.title && *detail == decisions::detail_cut(&c.detail, false) && options.iter().map(|x| &x.label).eq(c.options.iter().map(|x| &x.0))
+            }
+            _ => false,
+        };
+        let raised = if same {
+            lock(&self.book).open.iter().find(|d| d.key == decisions::ACCOUNTS_KEY).map(|d| Raised { id: d.id.clone(), fresh: false, folded: false, count: d.count, waiting: 0 })
+        } else {
+            self.change(|b, now| b.accounts_out(card, now))
+        };
+        let raised = raised?;
+        if raised.fresh {
+            eprintln!("[decisions] {} (accounts) for the user: every Claude account is out of usage", raised.id);
         }
         let told = raised.fresh && self.tells(std::slice::from_ref(&raised.id), true);
         Some((raised.id, told))
