@@ -358,7 +358,7 @@ pub struct Asks {
 type Auto = Arc<dyn Fn(&Asks, &str) + Send + Sync>;
 
 /// Why the tower said yes itself to a prompt that only writes Claude's memory.
-pub const MEMORY_YES: &str = "it only writes Claude's own memory or notes (a plain yes, this once)";
+pub const MEMORY_YES: &str = "it only writes Claude's own memory, notes or files in its own folder (a plain yes, this once)";
 
 impl Asks {
     pub fn new(shared: Shared, hub: Arc<Hub>, policy: &str) -> Asks {
@@ -2942,9 +2942,63 @@ mod tests {
         assert_eq!(told(&brain, 1).len(), 1);
     }
 
+    /// A file prompt for a Claude folder (the memory edit through orca's
+    /// profile that waited 20 minutes as a bare card) is answered by the
+    /// tower at once with its plain yes; one for a file elsewhere, and a
+    /// menu the tower doesn't know, are questions for the brain.
+    #[test]
+    fn a_file_prompt_for_a_claude_folder_is_answered_at_once_and_others_go_to_the_brain() {
+        let home = crate::config::home().to_string_lossy().into_owned();
+        let answering = |a: &mut Asks| {
+            let went = Arc::new(Mutex::new(vec![]));
+            let w = went.clone();
+            a.answers = Arc::new(move |_: &Asks, id: &str| w.lock().unwrap_or_else(|e| e.into_inner()).push(id.to_string()));
+            went
+        };
+        let screen = questions::parse_screen(&fixture("claude-edit-claude-folder.txt").replace("{home}", &home)).unwrap();
+        let msg = format!("approve Update: {home}/Library/Application Support/orca/claude-profiles/4c1e9b2a-0000-4000-8000-000000000001/home/projects/-Users-me-Work-shop/memory/search-notes.md");
+        let set = questions::build("t12v", "mediaroom", false, &screen, None, &msg, "Measure the search.");
+        let (mut a, brain) = asks();
+        let went = answering(&mut a);
+        let s = a.upsert(set.clone());
+        assert_eq!((s.state.decision, s.reason.as_str()), (Decision::Auto, MEMORY_YES));
+        assert_eq!(*went.lock().unwrap(), [set.id.clone()], "the tower answers it");
+        assert!(told(&brain, 1).is_empty(), "the brain isn't asked");
+        let pick = |i: usize| vec![Answer { tab: 0, choice: json!(i), attachments: vec![] }];
+        assert_eq!(a.recheck(&set, &pick(0)).unwrap(), pick(0), "its Yes goes in, checked on the screen again");
+        assert!(a.recheck(&set, &pick(1)).is_err(), "never its No");
+
+        // A file in the session's own project: the brain's question, with its three options.
+        let edit = questions::build("t12t", "sooner", false, &questions::parse_screen(&fixture("claude-edit-file.txt")).unwrap(), None, "approve Update: /Users/me/Work/shop/src/search.rs", "");
+        let (mut b, brain) = asks();
+        let went = answering(&mut b);
+        assert_eq!(b.upsert(edit.clone()).state.decision, Decision::Deciding);
+        assert!(went.lock().unwrap().is_empty());
+        let note = told(&brain, 1);
+        assert!(note.len() == 1 && note[0].starts_with(&format!("[question] t12t {}", edit.id)) && note[0].contains("Yes, allow all edits"), "{note:?}");
+
+        // A dialog of another kind: the brain's question as well, not a bare card.
+        let menu = questions::build("t5", "db", false, &questions::parse_screen(&fixture("claude-unknown-menu.txt")).unwrap(), None, "", "");
+        let (mut c, brain) = asks();
+        let went = answering(&mut c);
+        assert_eq!(c.upsert(menu.clone()).state.decision, Decision::Deciding);
+        assert!(went.lock().unwrap().is_empty());
+        assert!(told(&brain, 1)[0].contains("Use this MCP server?"));
+
+        // Put to the user (the brain escalated it): a decision with the dialog's own options,
+        // each with its answer, so the phone can answer it as the Mac does, not "Show on Mac".
+        let mut mine = edit.clone();
+        card::apply(&mut mine, &Ev::Decide { auto: false }).unwrap();
+        let asked = crate::decisions::asked(&mine).expect("the user's");
+        assert_eq!(asked.options.iter().map(|o| o.label.as_str()).collect::<Vec<_>>(), ["Yes", "Yes, allow all edits during this session (shift+tab)", "No, and tell Claude what to do differently (esc)"]);
+        assert_eq!(asked.options[2].answers, json!([{ "tab": 0, "choice": 2 }]));
+        assert_eq!(asked.who.question_id.as_deref(), Some(edit.id.as_str()));
+    }
+
     /// `cargo test replay_a_captured_prompt_through_the_tower -- --ignored
     /// --nocapture` with `HERDER_TOWER_REPLAY=<a screen>` (and
-    /// `HERDER_TOWER_REPLAY_CONTEXT=<what the session was asked>`): the
+    /// `HERDER_TOWER_REPLAY_CONTEXT=<what the session was asked>`,
+    /// `HERDER_TOWER_REPLAY_MSG=<Herdr's status line for it>`): the
     /// screen as the radar would hand it to the tower, said: how it is
     /// decided, and whether the brain or the user would get it. Nothing is typed.
     #[test]
@@ -2952,7 +3006,10 @@ mod tests {
     fn replay_a_captured_prompt_through_the_tower() {
         let screen = std::fs::read_to_string(std::env::var("HERDER_TOWER_REPLAY").expect("HERDER_TOWER_REPLAY=<screen file>")).unwrap();
         let context = std::env::var("HERDER_TOWER_REPLAY_CONTEXT").ok().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
-        let set = questions::build("t7p", "replay", false, &questions::parse_screen(&screen).expect("no dialog on that screen"), None, "", &context);
+        // `HERDER_TOWER_REPLAY_MSG`: Herdr's status line for it (`approve Update: /path`), as `hc get` had it.
+        let msg = std::env::var("HERDER_TOWER_REPLAY_MSG").unwrap_or_default();
+        let set = questions::build("t7p", "replay", false, &questions::parse_screen(&screen).expect("no dialog on that screen"), None, &msg, &context);
+        eprintln!("read as {} {:?}: {:?} {:?}", set.kind, set.title, set.tabs[0].question, set.tabs[0].options.iter().map(|o| &o.label).collect::<Vec<_>>());
         let (mut a, brain) = asks();
         let went = Arc::new(Mutex::new(vec![]));
         let w = went.clone();

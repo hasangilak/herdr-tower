@@ -89,6 +89,11 @@ pub struct QuestionSet {
     pub title: String,
     /// More to read: the command, the plan.
     pub detail: String,
+    /// What a permission prompt asks to use, as Herdr says it in full
+    /// (`Update: /path/to/file`, `Bash: touch /tmp/x`; the screen may cut a
+    /// long path): empty for the other kinds.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub target: String,
     /// What the session was asked to do (its open job), for context.
     pub context: String,
     pub tabs: Vec<Tab>,
@@ -188,7 +193,8 @@ pub struct ScreenOpt {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Screen {
-    /// `ask`, `review`, `permission`, `plan`, `codex`.
+    /// `ask`, `review`, `permission`, `plan`, `codex`, or `menu` (a dialog
+    /// it doesn't know by its question: numbered options and `Esc to cancel`).
     pub kind: String,
     /// The tab bar: (title, answered); empty without one.
     pub tabs: Vec<(String, bool)>,
@@ -285,6 +291,55 @@ fn last_index(lines: &[&str], f: impl Fn(&str) -> bool) -> Option<usize> {
     lines.iter().rposition(|l| f(l))
 }
 
+/// A permission prompt's question from line `at` (it may wrap over a line
+/// or two) and where its options start, right under it. None: no options
+/// follow it, or it isn't a question (a line of the conversation above).
+fn question_then_options(lines: &[&str], at: usize) -> Option<(String, usize)> {
+    let mut question = vec![ungutter(lines[at])];
+    for (i, l) in lines.iter().enumerate().skip(at + 1).take(4) {
+        if option_line(l).is_some() {
+            let q = question.join(" ");
+            return q.ends_with('?').then_some((q, i));
+        }
+        if !l.trim().is_empty() {
+            question.push(ungutter(l));
+        }
+    }
+    None
+}
+
+/// A dialog the tower doesn't know by its question (Claude Code's of
+/// another kind): numbered options, one under the cursor, with the footer
+/// (`Esc to cancel`) under them; its question is the line above them. So
+/// it is a question set too (the brain's, or the user's with its options),
+/// not a session blocked on something only its own screen can answer.
+fn menu(lines: &[&str]) -> Option<Screen> {
+    let foot = last_index(lines, |l| l.contains("Esc to cancel"))?;
+    let last = lines[..foot].iter().rposition(|l| option_line(l).is_some())?;
+    // Up through its options (and their indented descriptions) to the first.
+    let mut first = last;
+    for i in (0..last).rev() {
+        let l = lines[i];
+        if option_line(l).is_some() {
+            first = i;
+        } else if l.trim().is_empty() || l.len() - l.trim_start().len() < 4 || is_rule(l) {
+            break;
+        }
+    }
+    let options = options_from(lines, first);
+    if options.len() < 2 || !options.iter().any(|o| o.cursor) {
+        return None;
+    }
+    // The dialog's own lines: from the rule over it to its options. Its
+    // question: the last of them that asks (ends with `?`), else the last.
+    // (No rule close above: only the few lines right over its options, never the conversation.)
+    let start = lines[..first].iter().rposition(|l| l.trim_start().starts_with("────")).map(|i| i + 1).filter(|s| first - s <= 15).unwrap_or(first.saturating_sub(3));
+    let own: Vec<&str> = lines[start..first].iter().map(|l| ungutter(l)).filter(|l| !l.is_empty() && !is_rule(l)).collect();
+    let q = own.iter().rposition(|l| l.ends_with('?')).or_else(|| own.len().checked_sub(1))?;
+    let detail = own.iter().enumerate().filter(|(i, _)| *i != q).map(|(_, l)| *l).collect::<Vec<_>>().join("\n");
+    Some(Screen { kind: "menu".into(), question: own[q].to_string(), detail, options, ..Default::default() })
+}
+
 /// The tab bar: `←  ☐ Database  ☒ Features  ✔ Submit  →`, or ` ☐ Color` for one question.
 fn tab_bar(l: &str) -> Option<(Vec<(String, bool)>, bool)> {
     let t = l.trim();
@@ -329,11 +384,20 @@ pub fn parse_screen(screen: &str) -> Option<Screen> {
     let lines: Vec<&str> = screen.lines().map(|l| l.trim_end()).collect();
     let bar = last_index(&lines, |l| tab_bar(l).is_some());
     let review = last_index(&lines, |l| l.trim() == "Review your answers");
-    let perm = last_index(&lines, |l| l.trim() == "Do you want to proceed?");
+    // Claude Code's permission prompts: "Do you want to proceed?" (a
+    // command), "Do you want to make this edit to x.md?", "Do you want to
+    // create x.md?" (a file), "Do you want to allow Claude to fetch …?": a
+    // question so put, with its options right under it.
+    // (Not a question of Claude's own that happens to start so: one under a
+    // tab bar, in the same box, is that question's.)
+    let perm = last_index(&lines, |l| ungutter(l).starts_with("Do you want to "))
+        .filter(|&i| question_then_options(&lines, i).is_some())
+        .filter(|&i| bar.is_none_or(|b| b > i || lines[b + 1..i].iter().any(|l| l.trim_start().starts_with("────"))));
     let plan = last_index(&lines, |l| l.contains("Would you like to proceed?"));
     let codex = last_index(&lines, |l| l.trim() == "Would you like to run the following command?");
-    // The dialog at the bottom is the one that's up.
-    let best = [bar, perm, plan, codex].into_iter().flatten().max()?;
+    // The dialog at the bottom is the one that's up; none it knows by its
+    // question: a menu of another kind, if the screen ends on one.
+    let Some(best) = [bar, perm, plan, codex].into_iter().flatten().max() else { return menu(&lines) };
     if Some(best) == bar {
         let (tabs, has_submit) = tab_bar(lines[best])?;
         if let Some(r) = review.filter(|r| *r > best) {
@@ -364,10 +428,11 @@ pub fn parse_screen(screen: &str) -> Option<Screen> {
         lines[from..to].iter().map(|l| l.trim()).filter(|l| !l.is_empty() && !is_rule(l)).collect::<Vec<_>>().join("\n")
     };
     if Some(best) == perm {
+        let (question, first) = question_then_options(&lines, best)?;
         let start = lines[..best].iter().rposition(|l| l.trim_start().starts_with("────")).map(|i| i + 1).unwrap_or(0);
         let detail = block(start, best);
-        let options = options_from(&lines, best + 1);
-        return (!options.is_empty()).then(|| Screen { kind: "permission".into(), question: "Do you want to proceed?".into(), detail, options, ..Default::default() });
+        let options = options_from(&lines, first);
+        return (!options.is_empty()).then(|| Screen { kind: "permission".into(), question, detail, options, ..Default::default() });
     }
     if Some(best) == plan {
         let from = last_index(&lines[..best], |l| l.contains("Here is Claude's plan")).map(|i| i + 1).unwrap_or(best);
@@ -563,10 +628,16 @@ pub fn build(session: &str, name: &str, codex: bool, screen: &Screen, transcript
                 q.title = format!("{} questions: {}", q.tabs.len(), q.tabs.iter().map(|t| t.title.as_str()).collect::<Vec<_>>().join(", "));
             }
         }
-        "permission" => {
+        // A menu it doesn't know by its question is answered as a permission prompt is: by its option's number.
+        "permission" | "menu" if screen.kind == "permission" || !codex => {
             q.kind = "claude-permission".into();
             q.detail = screen.detail.clone();
-            q.title = hc_msg.strip_prefix("approve ").map(|m| format!("Allow {m}?")).unwrap_or_else(|| "Allow this?".into());
+            q.target = hc_msg.strip_prefix("approve ").map(str::trim).unwrap_or("").to_string();
+            q.title = match hc_msg.strip_prefix("approve ") {
+                Some(m) => format!("Allow {m}?"),
+                None if screen.kind == "menu" => screen.question.clone(),
+                None => "Allow this?".into(),
+            };
             q.tabs = vec![Tab { title: "Permission".into(), question: screen.question.clone(), options: opts(screen), ..Default::default() }];
             q.submit_state = "single".into();
         }
@@ -1216,7 +1287,11 @@ pub fn brain_note(set: &QuestionSet) -> String {
             })
         })
         .collect();
-    let body = json!({ "id": set.id, "session": set.session, "name": set.name, "kind": set.kind, "asked": set.context, "detail": set.detail, "tabs": tabs });
+    let mut body = json!({ "id": set.id, "session": set.session, "name": set.name, "kind": set.kind, "asked": set.context, "detail": set.detail, "tabs": tabs });
+    // What a permission prompt asks to use, in full (the screen may cut a long path).
+    if !set.target.is_empty() {
+        body["target"] = json!(set.target);
+    }
     format!("[question] {} {} {}", set.session, set.id, serde_json::to_string(&body).unwrap_or_default())
 }
 
@@ -2210,18 +2285,83 @@ pub fn claude_memory(path: &str, home: &str) -> bool {
     }
 }
 
-/// A permission prompt whose only sensitive target is Claude's own memory
-/// or notes (`claude_memory`, every file its reason names), and whose
-/// command does nothing the 90/10 rule names when what it writes is left
-/// out (`without_data`; the session's task is no part of it): the tower
-/// answers it with its plain one-time yes, never one that stops asking.
+/// A file in a Claude config folder of `home` (`~/.claude`,
+/// `~/.claude-accounts/<name>`, a profile's `…/claude-profiles/<id>/home`)
+/// that Claude keeps for itself: anything there but what decides what a
+/// session may do or runs code (its `settings*.json`, `.claude.json`,
+/// `.credentials.json`, `hooks/`, `plugins/`). `path` without whitespace,
+/// as `sensitive_targets` and `file_write_targets` give it.
+pub fn claude_folder_file(path: &str, home: &str) -> bool {
+    let home: String = home.trim_end_matches('/').chars().filter(|c| !c.is_whitespace()).collect();
+    let Some(rest) = path.strip_prefix(&home).and_then(|r| r.strip_prefix('/')) else { return false };
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.iter().any(|p| p.is_empty() || *p == "." || *p == "..") {
+        return false;
+    }
+    let inside: &[&str] = match parts.as_slice() {
+        [".claude", r @ ..] => r,
+        [".claude-accounts", _, r @ ..] => r,
+        ["Library", "ApplicationSupport", _, "claude-profiles", _, "home", r @ ..] => r,
+        _ => return false,
+    };
+    let Some(file) = inside.last() else { return false };
+    let grants = (file.starts_with("settings") && file.ends_with(".json")) || file.starts_with(".claude.json") || *file == ".credentials.json";
+    !grants && !matches!(inside.first(), Some(&"hooks") | Some(&"plugins"))
+}
+
+/// The files a file-writing prompt (Claude Code's Edit, Update, Write:
+/// "Do you want to make this edit to x.md?", "Do you want to create x.md?")
+/// writes, whitespace out: the one asked for, in full from Herdr's line
+/// (`target`), and each one it says it modifies through a symlink ("This
+/// will modify <path> … via a symlink"). None: not such a prompt, or its
+/// question isn't about that file.
+pub fn file_write_targets(set: &QuestionSet) -> Option<Vec<String>> {
+    let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let (tool, path) = set.target.split_once(": ")?;
+    if !matches!(tool.trim(), "Update" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
+        return None;
+    }
+    let question = set.tabs.first()?.question.trim();
+    let about = ["Do you want to make this edit to ", "Do you want to create ", "Do you want to overwrite ", "Do you want to write "].iter().find_map(|p| question.strip_prefix(p))?;
+    let path = squash(path.trim().trim_end_matches('?'));
+    let name = path.rsplit('/').next().unwrap_or("");
+    if name.is_empty() || squash(about.trim_end_matches('?')) != name {
+        return None;
+    }
+    let mut out = vec![path];
+    let detail = set.detail.lines().map(ungutter).collect::<Vec<_>>().join(" ");
+    for part in detail.split("This will modify ").skip(1) {
+        let end = [" (outside", " via a symlink", ". "].iter().filter_map(|m| part.find(m)).min().unwrap_or(part.len());
+        out.push(squash(&part[..end]));
+    }
+    // A sensitive-file reason names files too: each of them is written as well.
+    out.extend(sensitive_targets(set).into_iter());
+    Some(out)
+}
+
+/// A permission prompt the tower answers itself, with its plain one-time
+/// yes (never one that stops asking), without the brain or the user:
+/// - a file-writing prompt (`file_write_targets`) whose every file is in a
+///   Claude folder (`claude_folder_file`: its memory, notes, projects, todos;
+///   not its settings, credentials, hooks or plugins);
+/// - a prompt whose only sensitive target is Claude's own memory or notes
+///   (`claude_memory`, every file its reason names), and whose command does
+///   nothing the 90/10 rule names when what it writes is left out
+///   (`without_data`; the session's task is no part of it).
+///
 /// That yes (its option's place), or None.
 pub fn memory_yes(set: &QuestionSet) -> Option<usize> {
     if set.kind != "claude-permission" {
         return None;
     }
-    let targets = sensitive_targets(set);
     let home = crate::config::home().to_string_lossy().into_owned();
+    if let Some(files) = file_write_targets(set) {
+        if files.is_empty() || !files.iter().all(|p| claude_folder_file(p, &home)) {
+            return None;
+        }
+        return set.tabs.first()?.options.iter().position(plain_yes);
+    }
+    let targets = sensitive_targets(set);
     if targets.is_empty() || !targets.iter().all(|p| claude_memory(p, &home)) {
         return None;
     }
@@ -2355,6 +2495,121 @@ mod tests {
 
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(format!("{}/tests/fixtures/questions/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    fn squash(p: &str) -> String {
+        p.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// Claude Code's file prompts are permission prompts too (an edit to a
+    /// memory file through orca's profile waited 20 minutes as a bare card):
+    /// read with their question and options, the file in full from Herdr's
+    /// line, and where a symlink leads from the screen.
+    #[test]
+    fn file_prompts_are_read_as_permission_prompts() {
+        let home = crate::config::home().to_string_lossy().into_owned();
+        let s = parse_screen(&fixture("claude-edit-claude-folder.txt").replace("{home}", &home)).unwrap();
+        assert_eq!((s.kind.as_str(), s.question.as_str()), ("permission", "Do you want to make this edit to search-notes.md?"));
+        assert_eq!(s.options.iter().map(|o| o.label.as_str()).collect::<Vec<_>>(), ["Yes", "No"]);
+        assert!(s.detail.starts_with("Edit file") && s.detail.contains("This will modify"), "{}", s.detail);
+        let asked = format!("{home}/Library/Application Support/orca/claude-profiles/4c1e9b2a-0000-4000-8000-000000000001/home/projects/-Users-me-Work-shop/memory/search-notes.md");
+        let set = build("t12", "mediaroom", false, &s, None, &format!("approve Update: {asked}"), "");
+        assert_eq!((set.kind.as_str(), set.target.as_str()), ("claude-permission", format!("Update: {asked}").as_str()));
+        assert!(brain_note(&set).contains(&format!("\"target\":\"Update: {asked}\"")), "the brain gets the file in full");
+        let modified = squash(&format!("{home}/.claude/projects/-Users-me-Work-shop/memory/search-notes.md"));
+        assert_eq!(file_write_targets(&set).unwrap(), [squash(&asked), modified], "the file asked for, and where its symlink leads");
+        // The tower's own: its plain one-time Yes, whatever the file's text says ("merge", "push to prod").
+        assert_eq!(memory_yes(&set), Some(0));
+        assert_eq!(must_escalate(&set), None);
+
+        // An edit in the session's own project: a permission prompt (for the brain), with all three options.
+        let e = parse_screen(&fixture("claude-edit-file.txt")).unwrap();
+        assert_eq!((e.kind.as_str(), e.question.as_str(), e.options.len()), ("permission", "Do you want to make this edit to search.rs?", 3));
+        let edit = build("t12", "web", false, &e, None, "approve Update: /Users/me/Work/shop/src/search.rs", "");
+        assert_eq!(memory_yes(&edit), None, "not a Claude folder");
+        // The same prompt for a file in a Claude folder: its plain yes, never the one for the whole session.
+        let note = parse_screen(&fixture("claude-edit-file.txt").replace("search.rs?", "notes.md?")).unwrap();
+        let note = build("t12", "web", false, &note, None, &format!("approve Write: {home}/.claude/projects/-Users-me-Work-shop/notes.md"), "");
+        assert_eq!(memory_yes(&note), Some(0));
+        // "Do you want to proceed?" reads as it always did.
+        let bash = parse_screen(&fixture("claude-permission.txt")).unwrap();
+        assert_eq!((bash.kind.as_str(), bash.question.as_str()), ("permission", "Do you want to proceed?"));
+        // A question in the conversation, with no options under it, is no prompt.
+        assert_eq!(parse_screen("⏺ Do you want to ship it today?\n\n  I can wait.\n"), None);
+        // Claude's own question that starts so, under its tab bar: still Claude's question.
+        let ask = parse_screen(&fixture("claude-ask-single.txt").replace("\nPick a color\n", "\nDo you want to use Postgres?\n")).unwrap();
+        assert_eq!((ask.kind.as_str(), ask.question.as_str()), ("ask", "Do you want to use Postgres?"));
+    }
+
+    /// Every file a file prompt writes must be in a Claude folder, and be
+    /// the file its question is about, for the tower to say yes itself.
+    #[test]
+    fn what_a_file_prompt_writes_must_all_be_in_a_claude_folder() {
+        let home = crate::config::home().to_string_lossy().into_owned();
+        let screen = |text: String| parse_screen(&text).unwrap();
+        let base = fixture("claude-edit-claude-folder.txt").replace("{home}", &home);
+        let asked = format!("{home}/Library/Application Support/orca/claude-profiles/4c1e9b2a-0000-4000-8000-000000000001/home/projects/-Users-me-Work-shop/memory/search-notes.md");
+        let yes = |s: &Screen, msg: &str| memory_yes(&build("t12", "x", false, s, None, msg, ""));
+        let ok = screen(base.clone());
+        assert_eq!(yes(&ok, &format!("approve Update: {asked}")), Some(0));
+        // Its symlink leads out of the Claude folder.
+        let out = screen(base.replace(&format!("{home}/.claude/projects/-Users-me-Work-shop/memory/search-notes.md"), &format!("{home}/Work/shop/.git/hooks/search-notes.md")));
+        assert_eq!(yes(&out, &format!("approve Update: {asked}")), None);
+        // Herdr's line names another file than its question, or none at all (the screen cuts the path).
+        assert_eq!(yes(&ok, &format!("approve Update: {home}/.claude/projects/-Users-me-Work-shop/memory/other.md")), None);
+        assert_eq!(yes(&ok, ""), None);
+        // Not a tool that writes a file.
+        assert_eq!(yes(&ok, &format!("approve Bash: {asked}")), None);
+        // What decides what a session may do, or runs code, in a Claude folder: the brain's.
+        for (file, path) in [("settings.json", ".claude/settings.json"), ("settings.local.json", ".claude/settings.local.json"), ("pre.sh", ".claude/hooks/pre.sh")] {
+            let s = screen(base.replace("search-notes.md?", &format!("{file}?")).replace("This will modify", "Will modify"));
+            assert_eq!(yes(&s, &format!("approve Update: {home}/{path}")), None, "{path}");
+        }
+
+        let f = |p: &str| claude_folder_file(&squash(&format!("{home}/{p}")), &home);
+        for p in [
+            ".claude/projects/-Users-me-Work-shop/memory/a.md",
+            ".claude/projects/-Users-me-Work-shop/notes.md",
+            ".claude/CLAUDE.md",
+            ".claude/todos/t.json",
+            ".claude-accounts/work/projects/p/memory/a.md",
+            "Library/Application Support/orca/claude-profiles/x/home/projects/p/memory/a.md",
+        ] {
+            assert!(f(p), "{p}");
+        }
+        for p in [
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            ".claude/.credentials.json",
+            ".claude/hooks/pre.sh",
+            ".claude/plugins/x/run.js",
+            "Library/Application Support/orca/claude-profiles/x/home/.claude.json",
+            "Library/Application Support/orca/claude-profiles/x/home/settings.json",
+            ".claude/../.ssh/id_rsa",
+            ".claude/projects/../../.zshrc",
+            ".claude",
+            "Work/shop/notes.md",
+        ] {
+            assert!(!f(p), "{p}");
+        }
+        assert!(!claude_folder_file("/etc/.claude/projects/p/memory/a.md", &home));
+    }
+
+    /// A dialog the tower doesn't know by its question is a question set
+    /// too: numbered options under a cursor, `Esc to cancel` under them.
+    #[test]
+    fn a_menu_it_doesnt_know_is_a_question_too() {
+        let s = parse_screen(&fixture("claude-unknown-menu.txt")).unwrap();
+        assert_eq!((s.kind.as_str(), s.question.as_str(), s.detail.as_str()), ("menu", "Use this MCP server?", "New MCP server found in .mcp.json: shop-db"));
+        assert_eq!((s.options.len(), s.cursor()), (3, Some(1)));
+        let set = build("t5", "db", false, &s, None, "", "");
+        assert_eq!((set.kind.as_str(), set.title.as_str(), set.tabs[0].options.len()), ("claude-permission", "Use this MCP server?", 3));
+        assert_eq!(memory_yes(&set), None);
+        // With Herdr's line, its title says what it asks to use.
+        assert_eq!(build("t5", "db", false, &s, None, "approve MCP: shop-db", "").title, "Allow MCP: shop-db?");
+        // A list in the conversation, with no cursor or footer: no dialog.
+        assert_eq!(parse_screen("⏺ Two ways:\n\n  1. first\n  2. second\n"), None);
+        assert_eq!(parse_screen("⏺ Two ways:\n\n  1. first\n  2. second\n\n Esc to cancel\n"), None, "no option under a cursor");
     }
 
     #[test]

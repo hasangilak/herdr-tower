@@ -34,7 +34,7 @@ screen (`hc read`) and finds the dialog at the bottom:
 |---|---|---|
 | Claude Code questions | the tab bar `←  ☐ Database  ☒ Features  ✔ Submit  →` (one question: ` ☐ Color`) | `claude-ask` |
 | … its review tab | `Review your answers` | `claude-ask`, `submit_state: review` |
-| Claude Code permission | `Do you want to proceed?` | `claude-permission` |
+| Claude Code permission | `Do you want to …?` with options right under it: `Do you want to proceed?` (a command), `Do you want to make this edit to x.md?`, `Do you want to create x.md?` (a file) | `claude-permission`, with `target` (Herdr's line in full: `Update: /path`) |
 | Claude Code plan | `Would you like to proceed?` under the plan | `claude-plan` |
 | Codex approval | `Would you like to run the following command?` | `codex-menu` |
 
@@ -47,8 +47,12 @@ call without an answer has every question, option and the multi-choice flag
 exactly (`exact: true`). Without it, the other tabs are known only by title
 until visited.
 
-A screen it can't read gives no question set: the user answers as before,
-through the tower ("approve it", "say no").
+A dialog it doesn't know by its question is a question set too, when the
+screen ends on a menu: numbered options, one under the cursor, and `Esc to
+cancel` under them; its question is the line over them that asks (`…?`).
+It is a `claude-permission` (answered by its option's number), for the brain
+and, when put to the user, with its options on the Mac and the phone. Only a
+screen with no such menu gives no question set (the `blocked` card).
 
 Every change of herdr-core's status line (a new tab, a new question) reads
 the screen again, and so does the user answering the dialog in the terminal
@@ -246,6 +250,19 @@ the menu check run on what it shows now; if one fails, it escalates instead.
   prompt of that session a push). `git merge-base`, `git log --merges` and
   `git stash push` are none. A heredoc whose end isn't shown is read whole.
   Questions in words ("Want me to merge this into main?") are read as before.
+- **A file in Claude's own folder gets the plain yes** (`questions::
+  memory_yes`, `file_write_targets`, `claude_folder_file`): a file prompt
+  (Edit, Update, Write: "Do you want to make this edit to x.md?") whose file,
+  in full from Herdr's line, and every file it says it modifies through a
+  symlink ("This will modify <path> … via a symlink") are in a Claude folder
+  (`~/.claude/**`, `~/.claude-accounts/<name>/**`, any
+  `…/claude-profiles/<id>/home/**`), and are the file its question names,
+  is answered by the tower at once with its plain one-time yes (never "Yes,
+  allow all edits"): no brain, no card. Not the files that decide what a
+  session may do or that run code: `settings*.json`, `.claude.json`,
+  `.credentials.json`, `hooks/`, `plugins/` (those go to the brain). It
+  came from a memory edit through orca's profile that waited 20 minutes as
+  a bare card. With `ask-everything` it is the user's like every other.
 - **Claude's own memory and notes get the plain yes** (`questions::
   memory_yes`, `Asks::memory_rule`): a permission prompt whose every
   sensitive-file target ("Claude requested permissions to edit <path> which
