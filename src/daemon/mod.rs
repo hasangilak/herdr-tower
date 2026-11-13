@@ -348,6 +348,23 @@ impl Daemon {
         thread::spawn(move || d.typed_there(&ev, &t));
     }
 
+    /// The brain `brain` handed `session` an instruction: when the user spoke
+    /// to that brain since the session asked them something at the end of
+    /// its turn, the instruction may be their answer, relayed (`Asks::relayed`,
+    /// in a thread: it asks the model). Its card closes then.
+    fn relayed(&self, brain: &str, session: &str, text: &str) {
+        let Some((at_ms, words)) = brain::last_asked(brain) else { return };
+        if !self.asks.list().iter().any(|s| s.session == session && s.kind == "text" && s.at_ms <= at_ms) {
+            return;
+        }
+        let (asks, session, text) = (self.asks.clone(), session.to_string(), text.to_string());
+        thread::spawn(move || {
+            for id in asks.relayed(&session, &words, at_ms, &text) {
+                eprintln!("[questions] {id} ({session}): the user's answer, passed on by the tower: settled");
+            }
+        });
+    }
+
     /// What the user typed in a session's own terminal (`prompted`).
     fn typed_there(&self, ev: &sessions::AgentEvent, t: &serde_json::Value) {
         let address = ev.terminal.as_str();
@@ -853,7 +870,14 @@ impl Daemon {
                         let text = if to_brain { crate::peers::for_brain(from, text) } else { text.to_string() };
                         self.sendq.add_from(session, &text, after, from)
                     }
-                    crate::peers::Route::Instruction { text } => self.sendq.add(session, text, after),
+                    crate::peers::Route::Instruction { text } => {
+                        let added = self.sendq.add(session, text, after);
+                        // A brain passing something on after the user spoke to it: maybe their answer to the session's question.
+                        if let (Ok((_, address, _)), Some(brain)) = (&added, caller.as_ref().and_then(brain::brain_of)) {
+                            self.relayed(brain, address, text);
+                        }
+                        added
+                    }
                 };
                 let (id, address, name, mut v) = match added {
                     Ok((sendq::Added::Sent { id }, address, name)) => {

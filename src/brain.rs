@@ -190,9 +190,26 @@ pub fn ask_as(to: &Target, text: &str, radar: &str, source: &str) -> Result<()> 
     if to.space.is_none() {
         crate::activity::start();
     }
+    asked_now(&to.name, text);
     let (text, source, space) = (text.to_string(), source.to_string(), to.space.clone());
     crate::history::later(move || crate::history::record_request(&text, &source, space));
     Ok(())
+}
+
+/// What the user last asked each brain (by its name), and when: what that
+/// brain passes on to a session may be their answer (`Asks::relayed`).
+fn asked() -> &'static std::sync::Mutex<std::collections::HashMap<String, (u64, String)>> {
+    static ASKED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (u64, String)>>> = std::sync::OnceLock::new();
+    ASKED.get_or_init(Default::default)
+}
+
+fn asked_now(brain: &str, text: &str) {
+    asked().lock().unwrap_or_else(|e| e.into_inner()).insert(brain.to_string(), (crate::history::now_ms(), text.to_string()));
+}
+
+/// When the user last asked the brain called `brain`, and what (in this run of the daemon).
+pub fn last_asked(brain: &str) -> Option<(u64, String)> {
+    asked().lock().unwrap_or_else(|e| e.into_inner()).get(brain).cloned()
 }
 
 /// A note after a request that reads as separate tasks for different

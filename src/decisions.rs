@@ -1157,6 +1157,12 @@ impl Book {
     /// is the caller's to say (`note_answer`), once it knows. The decisions
     /// it was in: (id, over now).
     pub fn answered_in_terminal(&mut self, set: &str, now: u64) -> Vec<(String, bool)> {
+        self.answered_with(set, "", now)
+    }
+
+    /// `answered_in_terminal`, the answer known (`with`): one that is over
+    /// closes with it.
+    pub fn answered_with(&mut self, set: &str, with: &str, now: u64) -> Vec<(String, bool)> {
         let mut out = vec![];
         for d in self.open.iter_mut().filter(|d| d.kind.asks()) {
             if !d.sessions.iter().any(|w| w.question_id.as_deref() == Some(set)) {
@@ -1168,7 +1174,7 @@ impl Book {
         }
         for (id, over) in &out {
             if *over {
-                self.answered(id, "", now);
+                self.answered(id, with, now);
             }
         }
         out

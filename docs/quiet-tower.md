@@ -372,6 +372,23 @@ question set behind it (a raise) has that block now too.
   else `dismissed` when one was dismissed, else `stopped`. It is
   `answering` while an answer goes in (keys into a dialog, or a reply
   waiting for its session to stop).
+- **Answered through a brain.** The user tells a brain (the main one or a
+  space's own: the panel, the phone, the voice) their answer to a question
+  a session asked at the end of its turn, and the brain passes it on with
+  `tower queue <session> "…"` instead of `tower answer`. The queue types it
+  in like any instruction, so it doesn't count as the user's own prompt;
+  but when the caller is a brain, the user spoke to that brain after the
+  question came (`brain::last_asked`), and the session has such a question
+  that is the user's (it stands in a decision), one headless call
+  (`covered::answers_question`, low effort, as `covered::judge`) reads
+  whether the message answers it: gives the decision or the go-ahead, says
+  what to do instead, or makes it moot (`Asks::relayed`). If it does, the
+  set closes (`settled`) and its session leaves the decision, which closes
+  `answered` with "answered through the tower: <the message>" when nobody
+  else asks the same (`Decisions::passed_on`). A note of the tower's, a
+  message from another session, a brain writing on its own, a message
+  about something else, or no answer from the model leaves the question
+  and its card open, as before.
 - A merge's: when none of its PRs is open and waiting (`answered` when one
   was merged, else `stopped`), or when its space is closed or archived
   (`stopped`). Not when its sessions end: a PR that is still open and

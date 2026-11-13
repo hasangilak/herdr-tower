@@ -58,6 +58,37 @@ pub fn answers_held(name: &str, words: &str, reply: &str) -> Result<bool> {
     Ok(!judge(&c)?.is_empty())
 }
 
+/// Whether `message`, which the tower typed into a session (`name`) on the
+/// user's behalf after they spoke to it (`users`: their words to the
+/// tower), answers `question`, what that session asked the user at the end
+/// of its turn: it gives the decision or the go-ahead, says what to do
+/// instead, or makes the question moot. One headless call, as `judge`'s.
+pub fn answers_question(name: &str, question: &str, users: &str, message: &str) -> Result<bool> {
+    let reply = ask(&question_prompt(name, question, users, message))?;
+    let v: Value = crate::ticket::parse_reply(&reply)?;
+    match v["answers"].as_bool() {
+        Some(b) => Ok(b),
+        None => bail!("the answer has no \"answers\""),
+    }
+}
+
+/// What the model is asked by `answers_question`.
+fn question_prompt(name: &str, question: &str, users: &str, message: &str) -> String {
+    format!(
+        "A coding agent's terminal session (\"{}\") ended its turn asking the user something, and waits for their answer. \
+         The user then spoke to the tower that runs these sessions, and the tower typed a message into the session on the user's behalf.\n\
+         Decide whether that message answers what the session asked: it gives the decision or the go-ahead, says what to do instead, \
+         or makes the question moot (the user did the thing themselves). A message about something else, or one that only informs \
+         without settling what was asked, does NOT answer it. When unsure, it does NOT.\n\n\
+         <session_question>{}</session_question>\n<user_to_tower>{}</user_to_tower>\n<tower_message>{}</tower_message>\n\n\
+         Answer with JSON only, no other words: {{\"answers\": true}} or {{\"answers\": false}}.",
+        if name.is_empty() { "the session" } else { name },
+        clip(question, 3000),
+        clip(users, 2000),
+        clip(message, 3000)
+    )
+}
+
 /// The PR a note of the tower's says was merged (its number), if it is one.
 fn merged_note(text: &str) -> Option<u64> {
     let t = text.trim();
@@ -190,6 +221,14 @@ mod tests {
     }
 
     #[test]
+    fn the_question_prompt_shows_what_was_asked_said_and_sent() {
+        let p = question_prompt("eyzflow", "Build the workflows now, or wait?", "its saved. go ahead", "The user saved the webhook: build it.");
+        assert!(p.contains("(\"eyzflow\")") && p.contains("<session_question>Build the workflows now, or wait?</session_question>"));
+        assert!(p.contains("<user_to_tower>its saved. go ahead</user_to_tower>") && p.contains("<tower_message>The user saved the webhook: build it.</tower_message>"));
+        assert!(p.contains("When unsure, it does NOT") && p.contains("{\"answers\": true}"));
+    }
+
+    #[test]
     fn the_prompt_numbers_the_users_words_and_names_each_message() {
         let p = prompt("eyzflow", &said(&["merged on dev"]), &[(812, "Release #787".into())]);
         assert!(p.contains("(\"eyzflow\")") && p.contains("<user_message n=\"1\">merged on dev</user_message>") && p.contains("<tower_message id=\"812\">Release #787</tower_message>"));
@@ -219,6 +258,19 @@ mod live {
         let got = judge(&c).unwrap();
         eprintln!("took {} ms: {got:?}", started.elapsed().as_millis());
         assert_eq!(got.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![1]);
+    }
+
+    /// Real calls (`cargo test live_relayed -- --ignored`): the user's go-ahead,
+    /// passed on by the tower, answers the session's question; a note about
+    /// something else doesn't.
+    #[test]
+    #[ignore]
+    fn live_relayed() {
+        let q = "Sooner DE Slack notification: build the workflows now with the webhook left empty for you to paste in, or wait until you've created the Slack webhooks (a test channel for dev, #zendesk-sooner for prod)?";
+        let yes = answers_question("eyzflow", q, "its saved. go ahead", "The user has created the Slack webhook and saved it themselves as a Slack webhook connection in EYZMEDIA. Build the Sooner DE notification workflow on it now.").unwrap();
+        let no = answers_question("eyzflow", q, "is the production import done?", "For your information: the production import ran, 15 tickets are in prod. Nothing to do.").unwrap();
+        eprintln!("go-ahead answers it: {yes}; a note about something else: {no}");
+        assert!(yes && !no);
     }
 
     /// Real calls: a link to keep in mind is no answer to the question the
