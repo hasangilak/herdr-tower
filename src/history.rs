@@ -32,8 +32,10 @@ pub struct Entry {
     /// `creation` (a message of the conversation that made a space, in the
     /// full window's New space, kept as that space's once it launched:
     /// `status` is who said it, `you`, `tower` or `planner`; always
-    /// `record`), and others (`queue`, `screenshot`, `pr`, `behavior`,
-    /// `introduce`, `answered`).
+    /// `record`), `reply` (a session's last words at the end of a turn
+    /// that a message of the user's or the tower's started: `reply_to`
+    /// names that message), and others (`queue`, `screenshot`, `pr`,
+    /// `behavior`, `introduce`, `answered`).
     pub kind: String,
     /// The session's address (`t3`, `vps/t2`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -104,6 +106,11 @@ pub struct Entry {
     /// or `undone`, its `text` the line the reply shows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub act: Option<serde_json::Value>,
+    /// `answer`, `reply`: the message it answers, by its `at`: the user's
+    /// request a brain's turn began with (`request_for_prompt`), or what a
+    /// session was given that started its turn (`message_for_turn`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<u64>,
 }
 
 pub fn path() -> PathBuf {
@@ -205,16 +212,94 @@ pub fn record(kind: &str, text: &str) {
 /// What a brain said (its Stop hook): the text without its screenshot
 /// markers, and the screenshots they name. `space`: a space's own brain's
 /// words are that space's (None: the main brain's).
-pub fn record_said(kind: &str, text: &str, space: Option<String>) {
+pub fn record_said(kind: &str, text: &str, space: Option<String>, reply_to: Option<u64>) {
     let (clean, refs) = crate::text::shot_refs(text);
     if refs.is_empty() {
-        return append(Entry { kind: kind.into(), text: text.into(), space, ..Default::default() });
+        return append(Entry { kind: kind.into(), text: text.into(), space, reply_to, ..Default::default() });
     }
     let shots = resolve_shots(&refs, &load());
     if clean.trim().is_empty() && shots.is_empty() {
         return;
     }
-    append(Entry { kind: kind.into(), text: clean, shots, space, ..Default::default() });
+    append(Entry { kind: kind.into(), text: clean, shots, space, reply_to, ..Default::default() });
+}
+
+/// The history's last `max_bytes` (whole lines): enough to find what a
+/// turn that ends now was given, without reading it all.
+pub fn load_tail(max_bytes: u64) -> Vec<Entry> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path()) else { return vec![] };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(max_bytes);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return vec![];
+    }
+    let mut buf = String::new();
+    if f.read_to_string(&mut buf).is_err() {
+        return vec![];
+    }
+    // A line cut at the start is left out.
+    let body = if start > 0 { buf.split_once('\n').map(|(_, rest)| rest).unwrap_or("") } else { &buf };
+    body.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+}
+
+/// Words compared loosely: case, punctuation and spacing aside.
+fn loose(text: &str) -> String {
+    text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect::<Vec<_>>().join(" ")
+}
+
+/// The user's request a brain's turn began with (`prompt`, as its
+/// transcript has it: `[voice] <their words> <what the radar adds>`), by
+/// its `at`: the latest request of theirs to that brain (`space`: a
+/// space's own, None: the main one) whose words begin the prompt. None
+/// for a turn that began with anything else (a note, a watch, a question).
+pub fn request_for_prompt(entries: &[Entry], prompt: &str, space: Option<&str>) -> Option<u64> {
+    let asked = loose(prompt.trim().strip_prefix("[voice]")?);
+    entries
+        .iter()
+        .rev()
+        .filter(|e| e.kind == "request" && e.space.as_deref() == space)
+        .filter(|e| !e.source.as_deref().is_some_and(|s| s.starts_with("terminal:") || s.starts_with("answer:")))
+        .find(|e| {
+            let words = loose(&e.text);
+            !words.is_empty() && asked.starts_with(&words)
+        })
+        .map(|e| e.at)
+}
+
+/// What a session was given that started the turn ending now (`prompt`,
+/// which came at `prompt_ms`), by its `at`: what the user typed in its
+/// terminal, their answer on its card, or what the tower queued for it.
+/// The latest such message for that session, from the 30 minutes before
+/// the prompt, whose words are the prompt's (one contains the other). For
+/// a message the tower queued, the first line of it (`queued`), as the
+/// conversation shows it. None: the turn began with something else (a
+/// message from another session, a note, an introduction).
+pub fn message_for_turn(entries: &[Entry], session: &str, prompt: &str, prompt_ms: u64) -> Option<u64> {
+    let p = loose(prompt);
+    if p.is_empty() {
+        return None;
+    }
+    let close = |e: &Entry| e.session.as_deref() == Some(session) && e.at <= prompt_ms + 10_000 && prompt_ms.saturating_sub(e.at) < 30 * 60_000;
+    let words_of = |e: &Entry| -> Option<String> {
+        let source = e.source.as_deref().unwrap_or("");
+        match (e.kind.as_str(), e.status.as_deref()) {
+            ("request", _) if source.starts_with("terminal:") || source.starts_with("answer:") => Some(e.text.clone()),
+            ("queue", Some("queued" | "delivered" | "sent")) => Some(e.text.split_once(": ").map(|(_, m)| m.to_string()).unwrap_or_else(|| e.text.clone())),
+            _ => None,
+        }
+    };
+    let same = |w: &str| {
+        let w = loose(w);
+        !w.is_empty() && (p.contains(&w) || w.contains(&p))
+    };
+    let hit = entries.iter().rev().filter(|e| close(e)).find(|e| words_of(e).is_some_and(|w| same(&w)))?;
+    if hit.kind != "queue" {
+        return Some(hit.at);
+    }
+    // The tower's message: its first line (queued), as its row has it.
+    let text = words_of(hit).unwrap_or_default();
+    entries.iter().filter(|e| close(e) && e.kind == "queue" && e.at <= hit.at && words_of(e).as_deref() == Some(text.as_str())).map(|e| e.at).min()
 }
 
 /// How many screenshots one message carries.
@@ -597,6 +682,55 @@ pub fn keep_attachment(src: &std::path::Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use super::{message_for_turn, request_for_prompt};
+
+    fn req(at: u64, text: &str, source: &str, space: Option<&str>, session: Option<&str>) -> super::Entry {
+        super::Entry { at, kind: "request".into(), text: text.into(), source: Some(source.into()), space: space.map(String::from), session: session.map(String::from), ..Default::default() }
+    }
+
+    fn queue(at: u64, status: &str, session: &str, text: &str) -> super::Entry {
+        super::Entry { at, kind: "queue".into(), status: Some(status.into()), session: Some(session.into()), text: text.into(), ..Default::default() }
+    }
+
+    /// A brain's answer is to the request its turn began with: the one whose
+    /// words open the prompt, of that brain (the main one, or a space's
+    /// own), whatever came in between; a note's turn answers none.
+    #[test]
+    fn a_brains_answer_names_the_request_its_turn_began_with() {
+        let entries = vec![
+            req(10, "we tested on ingest filter and offer filters?", "mac", Some("isa"), None),
+            req(20, "is it on prod?", "phone:p1", Some("isa"), None),
+            req(30, "is it on prod?", "mac", None, None),
+            req(40, "typed in its terminal", "terminal:t11k", Some("isa"), Some("t11k")),
+        ];
+        let prompt = "[voice] we tested on ingest filter and offer filters? [radar] t11k eyzflow: working";
+        assert_eq!(request_for_prompt(&entries, prompt, Some("isa")), Some(10));
+        assert_eq!(request_for_prompt(&entries, "[voice] Is it on prod?", Some("isa")), Some(20), "case and punctuation aside");
+        assert_eq!(request_for_prompt(&entries, "[voice] is it on prod?", None), Some(30), "the main tower's own");
+        assert_eq!(request_for_prompt(&entries, "[watch] t11k is done", Some("isa")), None);
+        assert_eq!(request_for_prompt(&entries, "[voice] typed in its terminal", Some("isa")), None, "a session's, not the brain's");
+    }
+
+    /// A session's turn answers what started it: the user's words in its
+    /// terminal, their answer on its card, or what the tower queued for it
+    /// (its first line); not a message from another session.
+    #[test]
+    fn a_sessions_reply_names_the_message_that_started_its_turn() {
+        let entries = vec![
+            req(1_000, "we tested on ingest filter and offer filters?", "answer:t11k", Some("isa"), Some("t11k")),
+            queue(2_000, "queued", "t11k", "Queued for eyzflow: Check Isa's filter on dev."),
+            queue(2_100, "delivered", "t11k", "Delivered to eyzflow: Check Isa's filter on dev."),
+            req(3_000, "now the release PR", "terminal:t11k", Some("isa"), Some("t11k")),
+            req(3_500, "something else", "terminal:t11m", Some("isa"), Some("t11m")),
+        ];
+        assert_eq!(message_for_turn(&entries, "t11k", "we tested on ingest filter and offer filters?", 1_200), Some(1_000));
+        assert_eq!(message_for_turn(&entries, "t11k", "Check Isa's filter on dev.", 2_200), Some(2_000), "the tower's message: its first line");
+        assert_eq!(message_for_turn(&entries, "t11k", "now the release PR", 3_050), Some(3_000));
+        assert_eq!(message_for_turn(&entries, "t11k", "From t11m: the API is ready", 3_600), None, "another session's message");
+        assert_eq!(message_for_turn(&entries, "t11m", "now the release PR", 3_600), None, "another session's words");
+        assert_eq!(message_for_turn(&entries, "t11k", "now the release PR", 3_000 + 31 * 60_000), None, "too long before");
+    }
+
     use super::*;
 
     #[test]

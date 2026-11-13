@@ -2561,6 +2561,32 @@ Next or Review, not while its answer goes in), the space's goal editor
 line with Shift+Enter) and the phone's name. Search behaviors takes no
 new line.
 
+### Answers paired with their questions
+
+A question and its answer are paired in the history (`Entry::reply_to`:
+the answered message's `at`), so the conversation shows which answers
+which, whatever came between them and in whatever order they came back:
+
+- **The tower's answer** names the request its turn began with: the
+  brain's Stop hook has the turn's prompt (`[voice] <the words> …`), and
+  `history::request_for_prompt` finds the user's request to that brain
+  (the main one, or a space's own) whose words open it. A note's or a
+  watch's turn answers none.
+- **A session's reply** is kept as one (kind `reply`): when a session's
+  turn ends, what started it (`history::message_for_turn`: its prompt,
+  matched to the user's words in its terminal, their answer on its card,
+  or the first line of what the tower queued for it, from the 30 minutes
+  before) is what it answers, once. A turn a message from another session
+  or a note started answers none.
+- **In the conversation column** (a space's, the main tower's, a
+  session's thread): an answer has a line on top, "↳ you asked: …" (or "↳
+  the tower sent it: …"), that scrolls to the question; a question has
+  "answered ↓", scrolling to its answer, or "waiting for an answer" while
+  none came (asked within 12 hours, since answers were paired). A
+  session's reply is a row of its own, headed by its name.
+- **On the phone**: `GET /v1/chat` has `reply_to`, `asks` and
+  `answered_by` (see the phone API's "Answers paired with their questions").
+
 ## Step 11: the phone
 
 The Android app (its own repo, `~/Work/herder-tower-android`) opens on the
