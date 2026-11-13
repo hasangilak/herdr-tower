@@ -200,8 +200,13 @@ pub fn track(space: &str, prs: &[Pr], releases: &[ReleasePr], deployed: &BTreeMa
                 }
                 "merged" => {
                     let commit = commit_of(p);
-                    // The first release that landed with it in its head.
-                    let carried = rels.iter().filter(|r| r.state == "merged").find(|r| !commit.is_empty() && git.contains(&repo, commit, &r.head_sha) == Some(true));
+                    // The first release that landed with it in its head. One that landed
+                    // before it merged can't have it: never asked.
+                    let landed_after = |r: &&ReleasePr| match (r.merged_ms, p.merged_ms) {
+                        (Some(rm), Some(pm)) => rm >= pm,
+                        _ => true,
+                    };
+                    let carried = rels.iter().filter(|r| r.state == "merged").filter(landed_after).find(|r| !commit.is_empty() && git.contains(&repo, commit, &r.head_sha) == Some(true));
                     match carried {
                         Some(r) => {
                             c.release = Some(r.number);
@@ -435,14 +440,14 @@ pub(crate) mod tests {
         }
     }
 
-    fn git(dir: &Path, args: &[&str]) -> String {
+    pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git").arg("-C").arg(dir).args(args).env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t").output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     /// A feature branch off dev with one commit, merged into dev (no fast-forward): the merge commit.
-    fn feature(dir: &Path, name: &str) -> String {
+    pub(crate) fn feature(dir: &Path, name: &str) -> String {
         git(dir, &["checkout", "-q", "-b", name, "dev"]);
         std::fs::write(dir.join(format!("{name}.txt")), name).unwrap();
         git(dir, &["add", "-A"]);
@@ -453,7 +458,7 @@ pub(crate) mod tests {
     }
 
     /// dev released into main (a merge commit on main): dev's head, which the release PR carried.
-    fn release(dir: &Path) -> String {
+    pub(crate) fn release(dir: &Path) -> String {
         let head = git(dir, &["rev-parse", "dev"]);
         git(dir, &["checkout", "-q", "main"]);
         git(dir, &["merge", "-q", "--no-ff", "-m", "release", "dev"]);

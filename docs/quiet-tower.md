@@ -2027,8 +2027,14 @@ worked out from GitHub and git, never from what sessions say:
   each release with what it carried), the space's row in the sidebar ("2
   of 3 · prod 14:20 · 1 on dev"), `state.json` (`releases`, by space), the
   phone (`GET /v1/releases`, feature `releases`), and `tower releases [<space>]`.
-- Every 90 seconds; what can't change (a commit in another's history, a
-  merged PR's merge commit) is asked once.
+- Every 90 seconds, asking GitHub as little as it can: one PR list per
+  repo (its release PRs, and every recent PR's merge commit and time, so a
+  PR found before the tower kept those needs no call of its own); a compare
+  only against a release that landed after the PR merged, the likely ones
+  asked eight at a time; what can't change (a commit in another's history,
+  a merge commit) kept in `releases-cache.json` in the state folder, so a
+  restart starts warm. Measured on the user's tracked PRs (9 spaces, 3
+  repos): about 12 s the first time, about 4 s after a restart.
 
 ### Merging without asking
 
