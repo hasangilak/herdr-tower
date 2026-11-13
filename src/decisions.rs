@@ -196,6 +196,9 @@ pub struct PrRef {
     /// Whether it needs a human code review, and why (`crate::prscore`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<crate::prscore::Score>,
+    /// Its plan's checks and edge cases, and where each check stands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation: Option<crate::prscore::Validation>,
 }
 
 impl PrRef {
@@ -219,6 +222,7 @@ impl PrRef {
             merge: crate::prs::gate(p).view(),
             review: p.review.clone(),
             score: p.score.clone(),
+            validation: p.validation.clone(),
         }
     }
 
@@ -1271,23 +1275,28 @@ fn merge_title(refs: &[PrRef]) -> String {
 
 /// One option per PR, in order. The tower's pick is the first, when it can
 /// be merged, its checks pass, it doesn't ship to production (that one is
-/// the user's call alone) and its score doesn't say a person must read it.
-/// A PR that needs review says why in its option.
+/// the user's call alone), its score doesn't say a person must read it and
+/// its plan's checks all passed. A PR that needs review, or whose planned
+/// checks are missing, says so in its option.
 fn merge_options(refs: &[PrRef]) -> Vec<Opt> {
     refs.iter()
         .enumerate()
         .map(|(i, p)| {
             let blocked = p.merge["blocked"].as_str();
             let review = p.score.as_ref().filter(|s| s.needs_review);
-            let why = match (blocked, review) {
+            let missing = p.validation.as_ref().filter(|v| !v.checks.is_empty() && !v.all_passed());
+            let mut why = match (blocked, review) {
                 (Some(b), _) => b.to_string(),
                 (None, Some(s)) => format!("{}; {}", p.note, s.line),
                 (None, None) => p.note.clone(),
             };
+            if let Some(v) = missing.filter(|_| blocked.is_none()) {
+                why += &format!("; {}", v.line());
+            }
             Opt {
                 label: format!("Merge {}", p.short()),
                 why,
-                pick: i == 0 && blocked.is_none() && p.checks == "pass" && !crate::prs::is_prod(&p.base) && review.is_none(),
+                pick: i == 0 && blocked.is_none() && p.checks == "pass" && !crate::prs::is_prod(&p.base) && review.is_none() && missing.is_none(),
                 ..Default::default()
             }
         })

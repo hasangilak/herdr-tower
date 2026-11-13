@@ -1783,13 +1783,18 @@ them over with `tower plan prs <id> --json-file prs.json`:
 { "prs": [ { "repo": "<the repo's folder name, as the draft has it>", "base": "dev",
              "title", "changes": "<what it changes>", "files": ["<roughly which files>"],
              "migration": false, "breaking": "<what it breaks, or empty>",
-             "escalate": ["<anything else on the escalate list>"], "after": [<the PRs it waits for, by number>] } ] }
+             "escalate": ["<anything else on the escalate list>"], "after": [<the PRs it waits for, by number>],
+             "checks": [ { "id": "c1", "what": "<what it shows>", "how": "<the exact test, command or live step>",
+                           "evidence": "<test output, a screenshot, a log, the deployed state>" } ],
+             "edge_cases": [ { "case": "<the edge case>", "checks": ["c1"] } ] } ] }
 ```
 
 `base` is `dev` when not said: the user's release rule is dev first, then
 dev into main or prod as a release PR of its own, which the user merges.
 The tower checks each (its repo is one of the draft's; it has a title; what
-it waits for is in the list; 30 at most), numbers them from 1, scores them
+it waits for is in the list; 30 at most; at least one check, each with its
+what, how and evidence, ids unique; at least one edge case, each naming a
+check of its PR), numbers them from 1, scores them
 and keeps them with the plan (`prs`). It prints the scores; the planner
 puts a `## Pull requests` section in `plan.md` and in the artifact, one
 entry per PR with its score and reason as printed. A launched session's
@@ -1840,6 +1845,39 @@ look. The score is on the PR (`score`, in `prs.json`, `GET /v1/prs`, the
 PR that needs review has its line among the merge's warnings and is never
 the tower's pick; the space's view adds the word to each PR's line.
 
+### How each PR is validated
+
+The plan's validation is what gives the user the confidence to merge and
+release, so it is part of every PR from the plan on (`prscore::Validation`):
+
+- **In the plan.** Each predicted PR has its `checks` (what it shows, how:
+  the exact test to add or run, the command, or the live step such as
+  running it, opening it or checking the deployed state on dev, and the
+  evidence it produces) and its `edge_cases`, each tied to the checks that
+  cover it. The planner puts them in `plan.md` and the artifact beside the
+  score, and gives each session (each task) a `#### Validation` and
+  `#### Edge cases` of its own. New space shows them under each PR's row
+  (VALIDATION · n, EDGE CASES · n).
+- **In the launch.** A launched session's first instruction lists the PRs
+  the plan predicts for its repo, with their checks and edge cases, and how
+  to report each (`plans::checks_text`).
+- **On the real PR.** The PR matched to its prediction carries them
+  (`validation`: each check `planned`, until reported). Its session reports
+  each with `tower validate <pr> <check> passed|failed|not-run --evidence
+  "<the test output, a screenshot's path, a log, or why it wasn't run>"`
+  (`<pr>`: its key, its link, or `#12`, its own; a PR the tower doesn't know
+  yet is looked up on GitHub first, as the caller's). `tower validate <pr>`
+  shows where they stand. When the session finishes its turn on the PR
+  (its turn's end finds the PR, `waiting`), what it hasn't reported is
+  marked `not_run` ("not reported when its session finished its turn on the
+  PR") and the session gets one quiet note listing them and how to report
+  them; a later report replaces it.
+- **On the merge card and in the decision.** Each PR's row says "All 3
+  planned checks passed", or "Checks missing: c2 … (not run), c3 … (failed)
+  (1 of 3 passed)" (amber; rose when one failed); a merge decision's
+  `prs[]` carry `validation`, its option says what is missing and is never
+  the tower's pick, and the missing checks are among the merge's warnings.
+
 ### Merging without asking
 
 `[prs] auto_merge_low_risk` (off by default; `tower automerge on|off|status`,
@@ -1849,6 +1887,9 @@ only when all of these hold:
 
 - a plan predicted it (`score.planned`), and it is scored low risk, read on
   its own files at its head commit;
+- every check its plan lists for it passed, with its evidence: one not
+  reported yet is waited for (no decision meanwhile), one failed or not run
+  makes it the user's, and a planned PR with no checks is the user's;
 - it merges into dev (`dev`, `develop`, `development`): never main or prod;
 - it is open, no draft, without conflicts, and GitHub says it merges
   cleanly;

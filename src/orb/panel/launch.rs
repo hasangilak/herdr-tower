@@ -61,6 +61,8 @@
 //!   shows the launcher reading a ticket; `ready`, the button before it.
 //!   `HERDER_TOWER_ORB_PLAN=<file>`: the plan in the file (the state's
 //!   `plan`, as `Plan::view` writes it) is the open plan, of that ticket.
+//!   `HERDER_TOWER_ORB_PLAN_SCROLL=end`: once that plan's pull requests show,
+//!   the pane goes to its end, where they are (for a screenshot).
 //!   `HERDER_TOWER_ORB_TALK=<file>`: its lines are said in the
 //!   conversation one after another (`talk_from_start`; `!new`, `!open
 //!   <n>`, `!delete <n>`, `!reopen [<s>]` for the drafts).
@@ -344,6 +346,10 @@ pub(super) struct PrRow {
     pub reason: String,
     /// "After PR 1", "Opened: o/r#12".
     pub notes: Vec<String>,
+    /// How it is validated: (id, what it shows, how, the evidence).
+    pub checks: Vec<(String, String, String, String)>,
+    /// The edge cases: (the case, the checks that cover it).
+    pub edge_cases: Vec<(String, String)>,
 }
 
 /// The plan's predicted PRs as rows, in the plan's order.
@@ -371,6 +377,8 @@ pub(super) fn pr_rows(prs: &[crate::prscore::Predicted]) -> Vec<PrRow> {
                 needs_review: p.score.needs_review,
                 reason: p.score.reason().to_string(),
                 notes,
+                checks: p.checks.iter().map(|c| (c.id.clone(), c.what.clone(), c.how.clone(), c.evidence.clone())).collect(),
+                edge_cases: p.edge_cases.iter().map(|e| (e.case.clone(), e.checks.join(", "))).collect(),
             }
         })
         .collect()
@@ -1659,6 +1667,34 @@ impl Panel {
                 .when(!r.files.is_empty(), |el| el.child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.faint).child(r.files)))
                 .child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(if r.needs_review { rgb(AMBER) } else { rgb(CYAN) }).child(r.reason))
                 .when(!r.notes.is_empty(), |el| el.child(div().text_size(px(12.0)).text_color(g.faint).child(r.notes.join(" · "))))
+                // How it is validated, and the edge cases each check covers: as plain as its score.
+                .when(!r.checks.is_empty(), |el| {
+                    el.child(div().pt(px(4.0)).text_size(px(11.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.faint).child(format!("VALIDATION · {}", r.checks.len())))
+                        .children(r.checks.iter().map(|(id, what, how, evidence)| {
+                            h_flex()
+                                .gap(px(8.0))
+                                .items_start()
+                                .child(div().flex_none().w(px(24.0)).text_size(px(12.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.muted).child(id.clone()))
+                                .child(
+                                    v_flex()
+                                        .min_w_0()
+                                        .child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.text).child(what.clone()))
+                                        .child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.muted).child(how.clone()))
+                                        .child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.faint).child(format!("Evidence: {evidence}"))),
+                                )
+                        }))
+                })
+                .when(!r.edge_cases.is_empty(), |el| {
+                    el.child(div().pt(px(4.0)).text_size(px(11.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.faint).child(format!("EDGE CASES · {}", r.edge_cases.len())))
+                        .children(r.edge_cases.iter().map(|(case, by)| {
+                            h_flex()
+                                .gap(px(8.0))
+                                .items_start()
+                                .child(div().flex_none().text_size(px(12.0)).text_color(g.faint).child("•"))
+                                .child(div().flex_1().min_w_0().text_size(px(12.0)).line_height(px(16.0)).text_color(g.text).child(case.clone()))
+                                .child(div().flex_none().text_size(px(12.0)).text_color(g.muted).child(by.clone()))
+                        }))
+                })
         });
         v_flex()
             .w_full()
@@ -1774,6 +1810,16 @@ impl Panel {
         // What changed in the open draft is kept as it is drawn.
         self.keep_drafts();
         let plan_open = self.plan_now(cx);
+        // `HERDER_TOWER_ORB_PLAN_SCROLL` (test data): to the plan's pull requests, over the first frames (the pane is laid out by then).
+        if plan_open.as_ref().is_some_and(|p| !p.prs.is_empty()) && std::env::var_os("HERDER_TOWER_ORB_PLAN_SCROLL").is_some() {
+            static FRAMES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 30 {
+                if let Some(f) = self.full.as_ref() {
+                    f.launch_scroll.scroll_to_bottom();
+                }
+                window.request_animation_frame();
+            }
+        }
         let Some(full) = self.full.as_ref() else { return (head, vec![]) };
         let ui = &full.launch;
         let goal = ui.ticket();
@@ -2453,6 +2499,15 @@ mod tests {
         assert_eq!((rows[1].head.as_str(), rows[1].word, rows[1].needs_review), ("PR 2 · eyzflow-admin-dashboard → dev", "Low risk", false));
         assert_eq!(rows[1].reason, "no migration, breaking change, secrets, infrastructure or auth");
         assert_eq!(rows[1].notes, ["After PR 1"]);
+        // Each PR's validation and edge cases, next to its score.
+        assert_eq!(rows[0].checks.len(), 3);
+        assert_eq!(
+            rows[0].checks[0],
+            ("c1".to_string(), "The migration creates message_translations and rolls back cleanly".to_string(), "npm run db:migrate, then npm run db:rollback, on a scratch database".to_string(), "the migrate and rollback output".to_string())
+        );
+        assert_eq!(rows[0].edge_cases[2], ("Rolling back after rows exist".to_string(), "c1".to_string()));
+        assert_eq!(rows[1].checks[1].3, "two screenshots: translated and original");
+        assert_eq!(rows[1].edge_cases.len(), 2);
         assert_eq!(prs_head(&p.prs), "2 pull requests, 1 needs review");
         assert!(prs_note(&p.prs, false).contains("auto-merge of low-risk PRs into dev is off"));
         assert!(prs_note(&p.prs, true).starts_with("The tower merges the low-risk ones into dev itself"));

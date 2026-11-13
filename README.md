@@ -519,6 +519,14 @@ automerge on`; off unless you turn it on) the tower merges a low-risk PR
 into dev itself once its checks pass and its reviewer found nothing;
 anything that needs review, and every merge into main or prod, stays
 yours.
+
+**Every PR says how it is validated.** The plan gives each PR its checks
+(what each shows, the exact test, command or live step, the evidence it
+produces) and the edge cases each check covers, shown beside its score. The
+PR's session reports each check with its evidence (`tower validate`); what
+it doesn't report counts as not run. A PR whose planned checks haven't all
+passed is never merged by the tower, and its merge card says which are
+missing.
 It is on for every space; New space's **Review its PRs** switch (`tower
 launch --no-review`), the space's own **Review PRs** switch and `tower
 space review <space> off` turn it off.

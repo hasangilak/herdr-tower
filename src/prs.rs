@@ -105,6 +105,10 @@ pub struct Pr {
     /// The tower's own merge of it (`[prs] auto_merge_low_risk`): merged, or why it couldn't.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto: Option<crate::prscore::Auto>,
+    /// How its plan said it is validated (its checks and edge cases), and
+    /// where each check stands (`tower validate`); none when no plan predicted it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation: Option<crate::prscore::Validation>,
 }
 
 impl Pr {
@@ -390,6 +394,10 @@ pub fn gate(pr: &Pr) -> Gate {
     if let Some(s) = pr.score.as_ref().filter(|s| s.needs_review) {
         g.warnings.push(format!("{}.", s.line.trim_end_matches('.')));
     }
+    // Its plan's checks that haven't passed: which, and how they stand.
+    if let Some(v) = pr.validation.as_ref().filter(|v| !v.checks.is_empty() && !v.all_passed()) {
+        g.warnings.push(format!("Planned checks not all passed: {}.", v.missing_line()));
+    }
     g
 }
 
@@ -523,8 +531,13 @@ pub type OnChange = Box<dyn Fn(&str, &Pr) + Send + Sync>;
 pub type OnMerged = Box<dyn Fn(&Pr, &str) + Send + Sync>;
 
 /// A PR found just now, before it is shown: its review score (the daemon's:
-/// its plan's prediction, and its own files).
-pub type OnScore = Box<dyn Fn(&Pr) -> Option<crate::prscore::Score> + Send + Sync>;
+/// its plan's prediction, and its own files), and the validation its plan
+/// gives it (none: no plan predicted it).
+pub type OnScore = Box<dyn Fn(&Pr) -> (Option<crate::prscore::Score>, Option<crate::prscore::Validation>) + Send + Sync>;
+
+/// Its session finished its turn on a PR without reporting these planned
+/// checks (now marked not run): the daemon tells the session.
+pub type OnUnreported = Box<dyn Fn(&Pr, &[crate::prscore::Check]) + Send + Sync>;
 
 /// A phone's confirmation: the PR's key, the device, the head commit, until when.
 type Token = (String, String, String, u64);
@@ -539,6 +552,7 @@ pub struct Prs {
     on_change: Arc<OnceLock<OnChange>>,
     on_merged: Arc<OnceLock<OnMerged>>,
     on_score: Arc<OnceLock<OnScore>>,
+    on_unreported: Arc<OnceLock<OnUnreported>>,
     /// Phone confirmations: token → (key, device, head sha, until).
     tokens: Arc<Mutex<BTreeMap<String, Token>>>,
     /// Chat entries are written to the history (the daemon's; tests keep none).
@@ -598,6 +612,7 @@ impl Prs {
             on_change: Arc::default(),
             on_merged: Arc::default(),
             on_score: Arc::default(),
+            on_unreported: Arc::default(),
             tokens: Arc::default(),
             chat: false,
         }
@@ -622,6 +637,21 @@ impl Prs {
     /// How a PR found from now on is scored, before it is shown.
     pub fn on_score(&self, f: OnScore) {
         let _ = self.on_score.set(f);
+    }
+
+    /// Who is told when a session finished its turn on a PR with planned checks unreported.
+    pub fn on_unreported(&self, f: OnUnreported) {
+        let _ = self.on_unreported.set(f);
+    }
+
+    /// Its session reports one of its planned checks (`tower validate`):
+    /// passed, failed or not run, with its evidence. The PR as it is now.
+    pub fn report_check(&self, k: &str, check: &str, status: &str, proof: &str, by: &str) -> Result<Pr> {
+        let mut pr = self.get(k).with_context(|| format!("the tower doesn't know {k}"))?;
+        let Some(v) = pr.validation.as_mut() else { bail!("{k} has no planned checks: no plan predicted it") };
+        v.report(check, status, proof, by, crate::history::now_ms())?;
+        self.store(pr.clone(), "update", true);
+        Ok(pr)
     }
 
     /// The user merged `key` (from the Mac panel or a phone): GitHub is
@@ -739,10 +769,13 @@ impl Prs {
             let k = key(repo, *n);
             if let Some(mut pr) = self.get(&k) {
                 if pr.open() {
-                    if waiting && !pr.waiting {
+                    // Its session finished its turn on it: what it didn't report is not run.
+                    let unreported = if waiting { pr.validation.as_mut().map(|v| v.finished(now)).unwrap_or_default() } else { vec![] };
+                    if waiting && (!pr.waiting || !unreported.is_empty()) {
                         pr.waiting = true;
-                        self.put(pr.clone(), "update");
+                        self.store(pr.clone(), "update", true);
                     }
+                    self.told_unreported(&pr, &unreported);
                     open.push(pr);
                 }
                 continue;
@@ -771,8 +804,10 @@ impl Prs {
             }
             // Its review score, from the start (its plan's prediction, its own files).
             if let Some(f) = self.on_score.get() {
-                pr.score = f(&pr);
+                (pr.score, pr.validation) = f(&pr);
             }
+            // Found as its session finished its turn on it: none of its checks was reported.
+            let unreported = if waiting { pr.validation.as_mut().map(|v| v.finished(now)).unwrap_or_default() } else { vec![] };
             eprintln!(
                 "[prs] {k} by {session} ({name}): {} into {}, {}{}",
                 pr.title,
@@ -792,9 +827,20 @@ impl Prs {
                 });
             }
             self.put(pr.clone(), "open");
+            self.told_unreported(&pr, &unreported);
             open.push(pr);
         }
         open
+    }
+
+    fn told_unreported(&self, pr: &Pr, unreported: &[crate::prscore::Check]) {
+        if unreported.is_empty() {
+            return;
+        }
+        eprintln!("[prs] {}: {} planned check(s) not reported when its session finished: not run", pr.key(), unreported.len());
+        if let Some(f) = self.on_unreported.get() {
+            f(pr, unreported);
+        }
     }
 
     /// The queue is being looked at (a window opened, a phone asked): the
@@ -930,6 +976,7 @@ fn keep_own(pr: &mut Pr, old: &Pr) {
     pr.review = old.review.clone();
     pr.score = old.score.clone();
     pr.auto = old.auto.clone();
+    pr.validation = old.validation.clone();
 }
 
 /// A PR without when and whether it is looked at: what the chip shows.

@@ -222,6 +222,24 @@ enum Cmd {
         #[arg(default_value = "status")]
         action: String,
     },
+    /// Report one of the planned checks of your PR (its plan lists them: what it shows, how, the
+    /// evidence): `tower validate <pr> <check> passed|failed|not-run --evidence "<test output, a
+    /// screenshot's path, a log, or why it wasn't run>"`. `tower validate <pr>` shows its checks.
+    /// A PR is its key (owner/repo#12), its link, or #12 (yours). Until every planned check
+    /// passed, the PR is never merged without the user.
+    Validate {
+        /// The PR: owner/repo#12, its link, or #12.
+        pr: String,
+        /// The check's id (c1, c2, …).
+        check: Option<String>,
+        /// passed, failed or not-run.
+        status: Option<String>,
+        /// What shows it: the test output, a screenshot's path, a log, or why it wasn't run.
+        #[arg(long)]
+        evidence: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// What the tower is doing.
     Status,
     /// Every agent on every machine (JSON when piped).
@@ -858,6 +876,7 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Automerge { action } => automerge_cmd(&action),
+        Cmd::Validate { pr, check, status, evidence, json } => validate_cmd(&pr, check.as_deref(), status.as_deref(), evidence.as_deref(), json),
         Cmd::MacVoice { action } => {
             let on = if protocol::is_running() {
                 let r = protocol::send(&Request::MacVoice { action })?;
@@ -1323,6 +1342,37 @@ fn show_history(jobs: Option<&str>, session: Option<&str>, n: usize) -> Result<(
 
 /// `tower tell [decisions|results|everything] [--voice off|decisions|replies]`:
 /// how much it tells and what it says out loud, or set them.
+/// `tower validate <pr> [<check> <status> --evidence "…"]`.
+fn validate_cmd(pr: &str, check: Option<&str>, status: Option<&str>, evidence: Option<&str>, as_json: bool) -> Result<()> {
+    let (check, status) = (check.unwrap_or("").trim(), status.unwrap_or("").trim());
+    if !check.is_empty() && status.is_empty() {
+        bail!("tower validate <pr> {check} passed|failed|not-run --evidence \"<what shows it>\"");
+    }
+    if !check.is_empty() && evidence.is_none_or(|e| e.trim().is_empty()) {
+        bail!("give its evidence: --evidence \"<the test output, a screenshot's path, a log, or why it wasn't run>\"");
+    }
+    let r = protocol::send(&Request::Validate {
+        pr: pr.trim().to_string(),
+        check: check.to_string(),
+        status: status.to_string(),
+        evidence: evidence.unwrap_or("").to_string(),
+        from: peers::caller(),
+    })?;
+    if !r.ok {
+        bail!("{}", r.error.unwrap_or_default());
+    }
+    let v = r.state.unwrap_or_default();
+    if as_json || !std::io::stdout().is_terminal() {
+        print_json(&v);
+        return Ok(());
+    }
+    println!("{}: {}", v["pr"].as_str().unwrap_or(""), v["line"].as_str().unwrap_or("no planned checks"));
+    for c in v["validation"]["checks"].as_array().into_iter().flatten() {
+        println!("  {} {}: {}", c["id"].as_str().unwrap_or(""), c["status"].as_str().unwrap_or(""), c["what"].as_str().unwrap_or(""));
+    }
+    Ok(())
+}
+
 /// `tower automerge on|off|status`: `[prs] auto_merge_low_risk` in config.toml,
 /// which the daemon reads as it goes (no restart).
 fn automerge_cmd(action: &str) -> Result<()> {

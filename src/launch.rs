@@ -1199,7 +1199,7 @@ mod tests {
         let two = vec![s(&flow), s(&room)];
         let mut p2 = plan_with(ticket, &Ask { repos: &two, name: Some("msg-translation"), setup: Some("EYZFlow"), ..Default::default() }, &w).unwrap();
         let md = format!("# Plan\n\n## Sessions\n\n### eyzflow\n\nThe web app's part.\n{}\n### eyz-mediaroom-serverless\n\nThe media backend's part.\n", "More of the web app.\n".repeat(400));
-        p2.plan = Some(crate::plans::PlanBrief { id: "p3".into(), url: Some("https://claude.ai/artifact/plan".into()), md });
+        p2.plan = Some(crate::plans::PlanBrief { id: "p3".into(), url: Some("https://claude.ai/artifact/plan".into()), md, ..Default::default() });
         let room_first = instruction(&p2, &p2.sessions[1]);
         let (brief, part) = room_first.split_once("\n\nThe space's plan (https://claude.ai/artifact/plan)").expect("the plan follows the brief");
         assert!(brief.ends_with("say what you did and what is left."), "{brief}");

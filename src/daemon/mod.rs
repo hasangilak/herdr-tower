@@ -321,7 +321,21 @@ pub fn run() -> Result<()> {
     // A PR found from now on carries its review score: its plan's prediction, and its own files.
     {
         let (plans, gh) = (plans.clone(), prs.gh().to_path_buf());
-        prs.on_score(Box::new(move |pr| Some(score_found(&plans, &gh, pr))));
+        prs.on_score(Box::new(move |pr| {
+            let (score, validation) = score_found(&plans, &gh, pr);
+            (Some(score), validation)
+        }));
+        // A session that finished its turn on a PR without reporting its planned checks: told once, quietly.
+        let sendq = sendq.clone();
+        prs.on_unreported(Box::new(move |pr, missing| {
+            if pr.session.is_empty() {
+                return;
+            }
+            let note = crate::prscore::unreported_note(pr, missing, &crate::config::tower_bin().display().to_string());
+            if let Err(e) = sendq.add_note(&pr.session, &note) {
+                eprintln!("[prs] {}: couldn't tell {} about its unreported checks: {e:#}", pr.key(), pr.session);
+            }
+        }));
     }
     let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks, sendq, prs, agendas, introducer, decisions, missions, brains, acts, plans, reviews };
     // The phone API reaches the rest of the tower through the daemon itself
@@ -441,6 +455,41 @@ impl Daemon {
 /// A PR its session made was merged (`by`: mac, phone:<device>, github):
 /// the session is queued that it was, so it can carry on, and the brain is
 /// told (as a report on work it handed out: through the focus).
+/// `tower validate`: a planned check of a PR, reported by its session (or
+/// the PR's checks, with no check named). The PR is its key, its link, or
+/// `#12` (the caller's own); one the tower doesn't know yet is looked up on
+/// GitHub now as the caller's, as its turn's end would.
+fn validate(prs: &crate::prs::Prs, pr: &str, check: &str, status: &str, evidence: &str, from: Option<&str>) -> anyhow::Result<serde_json::Value> {
+    let Some((repo, n)) = crate::reviews::pr_of(pr) else { anyhow::bail!("give the PR: its key (owner/repo#12), its link, or #12") };
+    let key = match repo {
+        Some(r) => crate::prs::key(&r, n),
+        None => prs
+            .list()
+            .into_iter()
+            .filter(|p| p.number == n && p.open())
+            .min_by_key(|p| from.is_none_or(|f| p.session != f))
+            .map(|p| p.key())
+            .ok_or_else(|| anyhow::anyhow!("no open PR #{n} the tower knows: give its key (owner/repo#{n}) or its link"))?,
+    };
+    if prs.get(&key).is_none() {
+        let caller = from.ok_or_else(|| anyhow::anyhow!("the tower doesn't know {key} yet: run this from the session that opened it"))?;
+        let t = crate::hc::get(caller).unwrap_or_default();
+        let (name, space) = (crate::hc::spoken_name(&t), crate::spaces::space_of(&t));
+        let repo = key.rsplit_once('#').map(|(r, _)| r.to_string()).unwrap_or_default();
+        if prs.found(&[(repo, n)], caller, &name, space.as_deref(), false).is_empty() {
+            anyhow::bail!("{key} isn't an open PR GitHub knows");
+        }
+    }
+    let pr = if check.trim().is_empty() {
+        prs.get(&key).ok_or_else(|| anyhow::anyhow!("no PR {key}"))?
+    } else {
+        let p = prs.report_check(&key, check, status, evidence, from.unwrap_or(""))?;
+        eprintln!("[prs] {key}: check {check} {status} (by {})", from.unwrap_or("?"));
+        p
+    };
+    Ok(serde_json::json!({ "pr": pr.key(), "validation": pr.validation, "line": pr.validation.as_ref().map(|v| v.line()) }))
+}
+
 /// `[prs] auto_merge_low_risk` as config.toml has it now.
 fn auto_merge_on() -> bool {
     crate::config::Config::live().prs.auto_merge_low_risk
@@ -455,8 +504,9 @@ fn sync_merges(decisions: &decisions::Decisions, prs: &crate::prs::Prs) {
 /// A PR's review score when it is found: the prediction it is in the plan
 /// its space was launched with (none: no plan predicted it), and its own
 /// title and files at its head (GitHub asked). When GitHub can't say, the
-/// prediction alone, to be read again before any merge.
-fn score_found(plans: &plans::Plans, gh: &std::path::Path, pr: &crate::prs::Pr) -> crate::prscore::Score {
+/// prediction alone, to be read again before any merge. With it, the
+/// validation the plan gives it (its checks, none reported yet, and its edge cases).
+fn score_found(plans: &plans::Plans, gh: &std::path::Path, pr: &crate::prs::Pr) -> (crate::prscore::Score, Option<crate::prscore::Validation>) {
     let predicted = plans.match_pr(pr);
     let (files, sha) = match crate::prs::fetch_files(gh, &pr.repo, pr.number) {
         Ok(x) => x,
@@ -466,8 +516,9 @@ fn score_found(plans: &plans::Plans, gh: &std::path::Path, pr: &crate::prs::Pr) 
         }
     };
     let mut s = crate::prscore::combine(predicted.as_ref().map(|(_, p)| &p.score), &crate::prscore::real_score(&pr.title, &files), &sha);
+    let validation = predicted.as_ref().map(|(_, p)| p.validation());
     s.planned = predicted.map(|(id, p)| format!("{id}#{}", p.n));
-    s
+    (s, validation)
 }
 
 fn after_merge(sendq: &sendq::SendQueue, watches: &watch::Watches, pr: &crate::prs::Pr, by: &str) {
@@ -642,6 +693,12 @@ impl Daemon {
             Request::Missions => return Response { ok: true, error: None, state: Some(self.missions.now()) },
             Request::Review { action, pr, critical, text, from } => {
                 return match self.reviews.request(&action, &pr, critical, &text, from.as_deref()) {
+                    Ok(v) => Response { ok: true, error: None, state: Some(v) },
+                    Err(e) => Response::err(format!("{e:#}")),
+                };
+            }
+            Request::Validate { pr, check, status, evidence, from } => {
+                return match validate(&self.prs, &pr, &check, &status, &evidence, from.as_deref()) {
                     Ok(v) => Response { ok: true, error: None, state: Some(v) },
                     Err(e) => Response::err(format!("{e:#}")),
                 };

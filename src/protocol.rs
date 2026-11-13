@@ -155,6 +155,22 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<String>,
     },
+    /// A planned check of a PR, reported by its session (`tower validate`):
+    /// `pr` (its key, its link, or `#12`: the caller's own), `check` (its id;
+    /// empty: show the PR's checks), `status` (`passed`, `failed`,
+    /// `not-run`), `evidence`. A PR the tower doesn't know yet is looked up
+    /// first, as the caller's.
+    Validate {
+        pr: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        check: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        status: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        evidence: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+    },
     /// What only the user can decide, in queue order (`tower decisions`).
     /// No `space`: the main queue (muted spaces left out). `space`: that
     /// space's own. `all`: the last ones that closed too.
@@ -367,6 +383,8 @@ fn wait_for(req: &Request) -> Duration {
         Request::Act { action, .. } if action == "undo" => Duration::from_secs(120),
         // Ending a brain's terminal, and Herdr's answers on the way (a plan's planner too).
         Request::Model { .. } | Request::Brains { .. } | Request::Plan { .. } => Duration::from_secs(45),
+        // A PR the tower doesn't know yet is looked up on GitHub first.
+        Request::Validate { .. } => Duration::from_secs(30),
         _ => Duration::from_secs(10),
     }
 }

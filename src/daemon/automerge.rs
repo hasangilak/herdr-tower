@@ -142,21 +142,39 @@ mod tests {
         std::fs::write(gh.with_file_name(format!("pr-{n}.json")), serde_json::to_string(&v).unwrap()).unwrap();
     }
 
-    /// A store with one PR found as the daemon finds it: scored as its plan
-    /// predicted (`predicted`), its reviewer agreed with nothing found.
+    /// The validation a plan gives a PR: two checks and an edge case.
+    fn planned_checks() -> prscore::Validation {
+        let check = |id: &str, what: &str, how: &str| prscore::Check { id: id.into(), what: what.into(), how: how.into(), evidence: "test output".into(), status: prscore::PLANNED.into(), ..Default::default() };
+        prscore::Validation {
+            checks: vec![check("c1", "The cart shows the total", "npm test -- Cart.test.tsx"), check("c2", "The total on dev matches the order", "open /cart on dev, screenshot")],
+            edge_cases: vec![prscore::EdgeCase { case: "An empty cart".into(), checks: vec!["c1".into()] }],
+        }
+    }
+
+    /// A store with one PR found as the daemon finds it at its session's
+    /// turn end: scored as its plan predicted (`predicted`), with the plan's
+    /// checks when `planned` (none reported: they are marked not run), its
+    /// reviewer agreed with nothing found.
     fn found(gh: &std::path::Path, n: u64, predicted: &prscore::Evidence, planned: bool) -> Prs {
         let prs = Prs::at(gh.with_file_name(format!("prs-{n}.json")), gh.to_path_buf());
         let pred = prscore::score(predicted);
         let gh2 = gh.to_path_buf();
         prs.on_score(Box::new(move |pr| {
-            let (files, sha) = crate::prs::fetch_files(&gh2, &pr.repo, pr.number).ok()?;
+            let Ok((files, sha)) = crate::prs::fetch_files(&gh2, &pr.repo, pr.number) else { return (None, None) };
             let mut s = prscore::combine(Some(&pred), &prscore::real_score(&pr.title, &files), &sha);
             s.planned = planned.then(|| "p1#1".to_string());
-            Some(s)
+            (Some(s), planned.then(planned_checks))
         }));
         prs.found(&[("o/app".into(), n)], "t7", "web", Some("shop"), true);
         prs.set_review(&crate::prs::key("o/app", n), Some(crate::reviews::Brief { status: "agreed".into(), ..Default::default() }));
         prs
+    }
+
+    /// Its session reports every planned check passed, with its evidence.
+    fn pass_all(prs: &Prs, k: &str) {
+        for c in ["c1", "c2"] {
+            prs.report_check(k, c, "passed", "12 tests passed", "t7").unwrap();
+        }
     }
 
     fn ui() -> prscore::Evidence {
@@ -173,6 +191,7 @@ mod tests {
         let gh = fake_gh("auto-off");
         serve(&gh, 12, "dev", &["src/Cart.tsx"], "abc");
         let prs = found(&gh, 12, &ui(), true);
+        pass_all(&prs, "o/app#12");
         let pr = prs.get("o/app#12").unwrap();
         assert_eq!((pr.score.as_ref().unwrap().needs_review, pr.score.as_ref().unwrap().sha.as_str()), (false, "abc"));
         let on = Arc::new(AtomicBool::new(false));
@@ -231,6 +250,7 @@ mod tests {
         let gh = fake_gh("auto-push");
         serve(&gh, 31, "dev", &["src/Cart.tsx"], "s1");
         let prs = found(&gh, 31, &ui(), true);
+        pass_all(&prs, "o/app#31");
         // A new commit with a migration, seen by the poll (head s2), not yet read.
         serve(&gh, 31, "dev", &["src/Cart.tsx", "prisma/migrations/2/migration.sql"], "s2");
         prs.poll("o/app#31");
@@ -244,6 +264,7 @@ mod tests {
         let gh = fake_gh("auto-refused");
         serve(&gh, 32, "dev", &["src/Cart.tsx"], "r1");
         let prs = found(&gh, 32, &ui(), true);
+        pass_all(&prs, "o/app#32");
         // The fake gh refuses: its merge needs a review (as a protected branch would say).
         let script = std::fs::read_to_string(&gh).unwrap().replace(r#""pr merge") sed"#, r#""pr merge") echo "a review is required" >&2; exit 1; sed"#);
         std::fs::write(&gh, script).unwrap();
@@ -254,5 +275,88 @@ mod tests {
         assert!(matches!(prscore::auto_path(&pr, true), Path::Yours(w) if w.contains("a review is required")), "{:?}", prscore::auto_path(&pr, true));
         assert!(m.tick().is_empty(), "not tried again at the same commit");
         assert_eq!(calls(&gh).matches("pr merge").count(), 1);
+    }
+
+    #[test]
+    fn a_pr_whose_planned_checks_did_not_all_pass_never_merges_by_itself_and_its_card_says_which() {
+        let gh = fake_gh("auto-checks");
+        serve(&gh, 41, "dev", &["src/Cart.tsx"], "v1");
+        // Found before its session finished: its checks are waited for, and it is nobody's decision meanwhile.
+        let prs = Prs::at(gh.with_file_name("prs-41.json"), gh.clone());
+        let gh2 = gh.clone();
+        prs.on_score(Box::new(move |pr| {
+            let (files, sha) = crate::prs::fetch_files(&gh2, &pr.repo, pr.number).unwrap();
+            let mut s = prscore::combine(Some(&prscore::score(&ui())), &prscore::real_score(&pr.title, &files), &sha);
+            s.planned = Some("p1#2".into());
+            (Some(s), Some(planned_checks()))
+        }));
+        let told = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let t2 = told.clone();
+        prs.on_unreported(Box::new(move |pr, missing| t2.lock().unwrap().push(format!("{} {}", pr.key(), missing.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(",")))));
+        prs.found(&[("o/app".into(), 41)], "t7", "web", Some("shop"), false);
+        let k = "o/app#41";
+        prs.set_review(k, Some(crate::reviews::Brief { status: "agreed".into(), ..Default::default() }));
+        let m = AutoMerger::new(prs.clone(), || true);
+        assert_eq!(prscore::auto_path(&prs.get(k).unwrap(), true), Path::Waits("its planned checks (c1, c2)".into()));
+        assert!(m.tick().is_empty());
+        // Its session reports one; then finishes its turn on the PR without the other: not run, and it is told once.
+        prs.report_check(k, "c1", "passed", "Cart.test.tsx: 6 passed", "t7").unwrap();
+        prs.found(&[("o/app".into(), 41)], "t7", "web", Some("shop"), true);
+        assert_eq!(*told.lock().unwrap(), ["o/app#41 c2"]);
+        let pr = prs.get(k).unwrap();
+        let v = pr.validation.clone().unwrap();
+        assert_eq!((v.checks[0].status.as_str(), v.checks[1].status.as_str()), ("passed", "not_run"));
+        assert!(m.tick().is_empty(), "a missing check: never merged by the tower");
+        assert!(!calls(&gh).contains("pr merge"));
+        // Where it shows: the auto path, the card's line, the merge warnings, the decision's option.
+        assert_eq!(prscore::auto_path(&pr, true), Path::Yours("planned checks missing: c2 The total on dev matches the order (not run)".into()));
+        assert_eq!(v.line(), "Checks missing: c2 The total on dev matches the order (not run) (1 of 2 passed)");
+        assert_eq!(prscore::auto_line(&pr, true).as_deref(), Some("Yours to merge: planned checks missing: c2 The total on dev matches the order (not run)."));
+        assert!(crate::prs::gate(&pr).warnings.contains(&"Planned checks not all passed: c2 The total on dev matches the order (not run).".to_string()), "{:?}", crate::prs::gate(&pr).warnings);
+        let user = prscore::for_the_user(&prs.list(), true);
+        assert!(user[0].waiting, "the user's merge decision");
+        let mut b = crate::decisions::Book::default();
+        let id = b.sync_merges(&user, 1).fresh[0].clone();
+        let d = b.find(&id).unwrap();
+        assert!(d.pick().is_none(), "never the tower's pick");
+        assert!(d.options[0].why.ends_with("Checks missing: c2 The total on dev matches the order (not run) (1 of 2 passed)"), "{}", d.options[0].why);
+        assert_eq!(d.view(false)["prs"][0]["validation"]["checks"][1]["status"], "not_run");
+        // It failed: still the user's, and said so.
+        prs.report_check(k, "c2", "failed", "the total is off by the shipping cost", "t7").unwrap();
+        assert!(matches!(prscore::auto_path(&prs.get(k).unwrap(), true), Path::Yours(w) if w.contains("(failed)")));
+        assert!(m.tick().is_empty());
+        // A report needs its evidence and a check the plan has.
+        assert!(prs.report_check(k, "c2", "passed", "  ", "t7").is_err());
+        assert!(prs.report_check(k, "c9", "passed", "x", "t7").unwrap_err().to_string().contains("its checks are c1, c2"));
+        assert!(prs.report_check(k, "c2", "maybe", "x", "t7").is_err());
+        // Fixed and passed, with its evidence: now it merges by itself.
+        prs.report_check(k, "c2", "passed", "/tmp/cart-dev.png", "t7").unwrap();
+        assert_eq!(prscore::auto_path(&prs.get(k).unwrap(), true), Path::Ready);
+        assert_eq!(m.tick(), [k]);
+        assert!(calls(&gh).contains("pr merge 41 --repo o/app --squash --match-head-commit v1"));
+        // A planned PR whose plan lists no checks is the user's too.
+        let no_checks = crate::prs::Pr { validation: Some(prscore::Validation::default()), ..prs.get(k).unwrap() };
+        assert_eq!(prscore::auto_path(&crate::prs::Pr { state: "open".into(), ..no_checks }, true), Path::Yours("its plan lists no checks for it".into()));
+    }
+
+    #[test]
+    fn a_session_reports_its_checks_by_the_prs_key_link_or_number() {
+        let gh = fake_gh("validate");
+        serve(&gh, 51, "dev", &["src/Cart.tsx"], "w1");
+        let prs = found(&gh, 51, &ui(), true);
+        let validate = super::super::validate;
+        // By its key; then its link; then #51 (the caller's own).
+        let v = validate(&prs, "o/app#51", "c1", "passed", "Cart.test.tsx: 6 passed", Some("t7")).unwrap();
+        assert_eq!((v["pr"].as_str(), v["validation"]["checks"][0]["status"].as_str(), v["validation"]["checks"][0]["by"].as_str()), (Some("o/app#51"), Some("passed"), Some("t7")));
+        validate(&prs, "https://github.com/o/app/pull/51", "c2", "not-run", "dev is down", Some("t7")).unwrap();
+        assert_eq!(prs.get("o/app#51").unwrap().validation.unwrap().checks[1].status, "not_run");
+        let v = validate(&prs, "#51", "c2", "passed", "/tmp/dev.png", Some("t7")).unwrap();
+        assert_eq!(v["line"], "Both planned checks passed");
+        // Shown without a check named; refused without its evidence or for a PR nobody knows.
+        assert_eq!(validate(&prs, "#51", "", "", "", Some("t7")).unwrap()["validation"]["checks"].as_array().unwrap().len(), 2);
+        assert!(validate(&prs, "#51", "c1", "passed", "", Some("t7")).unwrap_err().to_string().contains("evidence"));
+        assert!(validate(&prs, "#99", "c1", "passed", "x", Some("t7")).unwrap_err().to_string().contains("no open PR #99"));
+        assert!(validate(&prs, "o/app#77", "c1", "passed", "x", None).unwrap_err().to_string().contains("run this from the session that opened it"));
+        assert!(!calls(&gh).contains("pr merge"));
     }
 }
