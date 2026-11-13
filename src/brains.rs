@@ -232,6 +232,8 @@ pub fn settings(tower: &str, brain: Option<&str>) -> Value {
     let mut hooks = json!({
         "Stop": [{ "hooks": [{ "type": "command", "command": format!("'{tower}' hook claude{as_brain}") }] }],
         "Notification": [{ "hooks": [{ "type": "command", "command": format!("'{tower}' hook claude-notify{as_brain}") }] }],
+        // A turn that ends on an error (a rate limit, the account): its request is told no answer comes.
+        "StopFailure": [{ "hooks": [{ "type": "command", "command": format!("'{tower}' hook claude-failed{as_brain}") }] }],
         "PreToolUse": [
             // One hand-off per task: a bundle for several projects is turned back.
             { "matcher": "Bash", "hooks": [{ "type": "command", "command": format!("'{tower}' hook brain-guard"), "timeout": 5 }] },
@@ -1033,6 +1035,7 @@ mod tests {
         let own = settings("/bin/tower", Some("tower-sandbox"));
         assert_eq!(own["hooks"]["Stop"][0]["hooks"][0]["command"], "'/bin/tower' hook claude tower-sandbox");
         assert_eq!(own["hooks"]["Notification"][0]["hooks"][0]["command"], "'/bin/tower' hook claude-notify tower-sandbox");
+        assert_eq!(own["hooks"]["StopFailure"][0]["hooks"][0]["command"], "'/bin/tower' hook claude-failed tower-sandbox");
         // The orb's working line is the main brain's: a space's brain reports none.
         assert!(own["hooks"]["UserPromptSubmit"].is_null() && own["hooks"]["PostToolUse"].is_null());
         assert_eq!(own["hooks"]["PreToolUse"].as_array().map(Vec::len), Some(1));
@@ -1040,6 +1043,7 @@ mod tests {
         // The main brain's are as they were.
         let main = settings("/bin/tower", None);
         assert_eq!(main["hooks"]["Stop"][0]["hooks"][0]["command"], "'/bin/tower' hook claude");
+        assert_eq!(main["hooks"]["StopFailure"][0]["hooks"][0]["command"], "'/bin/tower' hook claude-failed");
         assert_eq!(main["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"], "'/bin/tower' hook activity-prompt");
         assert_eq!(main["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "'/bin/tower' hook activity-pre");
         assert_eq!(main["hooks"]["PreToolUse"][1]["hooks"][0]["command"], "'/bin/tower' hook brain-guard");

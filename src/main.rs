@@ -1267,6 +1267,8 @@ fn run(cli: Cli) -> Result<()> {
                 // A space's own brain's hooks say whose they are: `tower hook claude tower-<space>`.
                 "claude" => hooks::claude_stop(arg),
                 "claude-notify" => hooks::claude_notify(arg),
+                // Its turn ended on an error: the request it began with gets no answer.
+                "claude-failed" => hooks::claude_failed(arg),
                 "codex" => hooks::codex(&args),
                 "activity-prompt" => activity::hook("prompt"),
                 "activity-pre" => activity::hook("pre"),

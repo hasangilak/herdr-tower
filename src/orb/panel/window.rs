@@ -114,6 +114,15 @@ pub(super) struct FullUi {
     /// view, how many messages, the latest's time), to go to its end on a new one.
     pub chat_scroll: gpui::ScrollHandle,
     pub chat_seen: Option<(Option<String>, usize, u64)>,
+    /// The message a click on its question or its answer went to (by its
+    /// `at`), and when: it lights up a moment, so the eye finds it.
+    pub chat_flash: Option<(u64, std::time::Instant)>,
+    /// What each of the column's rows is, as last drawn (a message's `at`,
+    /// its words, and where a click on it goes: Some(true) a question to
+    /// its answer, Some(false) an answer to its question; 0 and none for a
+    /// label): for clicking one by its words without the pointer
+    /// (`HERDER_TOWER_ORB_CLICK`).
+    pub chat_rows: Vec<(u64, String, Option<bool>)>,
     /// How wide a thread message's text is, in points, as last drawn.
     pub text_w: f32,
     pub thread_earlier: HashSet<String>,
@@ -150,6 +159,8 @@ impl FullUi {
             talk_w: 0.0,
             chat_scroll: gpui::ScrollHandle::new(),
             chat_seen: None,
+            chat_flash: None,
+            chat_rows: vec![],
             text_w: 600.0,
             thread_earlier: HashSet::new(),
             copied: None,

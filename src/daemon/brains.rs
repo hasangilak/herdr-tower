@@ -285,6 +285,42 @@ pub fn ask(space: Option<&str>, text: &str, shared: &Shared, source: &str) -> Re
     Ok(())
 }
 
+/// The user takes back the request at `at` (the chat's "Take back"): its
+/// brain is stopped (`hc interrupt`) if that is still the latest request
+/// it was given and it is working, and the chat is told no answer comes.
+/// One that was answered already, or given up on, is left as it is.
+pub fn withdraw(at: u64) -> Result<Value> {
+    let entries = crate::history::load_tail(4 << 20);
+    let Some(asked) = entries.iter().find(|e| e.at == at && e.kind == "request") else {
+        anyhow::bail!("there is no request at {at} to take back");
+    };
+    if entries.iter().any(|e| e.reply_to == Some(at) && matches!(e.kind.as_str(), "answer" | "unanswered")) {
+        return Ok(json!({ "taken_back": false, "why": "it was answered already" }));
+    }
+    let space = asked.space.clone();
+    // Its brain, if that brain still runs for it (a space's that is gone is not the main one's).
+    let to = target(space.as_deref());
+    let working = to.space == space && latest_request(&entries, space.as_deref()) == Some(at) && hc::get(&to.terminal).is_some_and(|t| hc::status(&t) == hc::SessionStatus::Working);
+    let stopped = working && hc::run(&["interrupt", &to.terminal]).is_ok_and(|o| o.code == 0);
+    if to.space.is_none() && (stopped || latest_request(&entries, None) == Some(at)) {
+        crate::activity::clear();
+    }
+    crate::history::record_unanswered(at, "taken-back", "You took it back.", space);
+    eprintln!("[brains] the request at {at} was taken back{}", if stopped { &", its brain stopped" } else { &"" });
+    Ok(json!({ "taken_back": true, "stopped": stopped }))
+}
+
+/// The latest request of the user's to a brain (`space`: a space's own,
+/// None: the main one), by its `at`.
+fn latest_request(entries: &[crate::history::Entry], space: Option<&str>) -> Option<u64> {
+    entries
+        .iter()
+        .rev()
+        .filter(|e| e.kind == "request" && e.space.as_deref() == space)
+        .find(|e| !e.source.as_deref().is_some_and(|s| s.starts_with("terminal:") || s.starts_with("answer:")))
+        .map(|e| e.at)
+}
+
 /// Tells every brain that runs (but `except`, by its terminal's address)
 /// to read its instructions again: `what` says why, and each is given its
 /// own file. Each is told on a thread of its own (typing waits for a

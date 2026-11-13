@@ -56,10 +56,54 @@ pub fn claude_stop(brain: Option<&str>) {
         .or_else(|| v["transcript_path"].as_str().and_then(last_assistant_text));
     match text {
         Some(text) => finish(&text, prompt.as_deref(), &who),
-        // Nothing to say, but the turn is over all the same.
+        // Nothing to say, but the turn is over all the same: a request it began with gets no answer.
         None => {
+            unanswered(prompt.as_deref(), &who, "empty", "The tower's turn ended without an answer.");
             let _ = protocol::send(&Request::Say { text: String::new(), interrupt: false, kind: "answer".into(), from: None, brain: who.name() });
         }
+    }
+}
+
+/// Claude Code's StopFailure hook: the brain's turn ended on an error (a
+/// rate limit, the account, the API). The request it began with is told
+/// it gets no answer, and why; the turn is over all the same.
+pub fn claude_failed(brain: Option<&str>) {
+    let who = Who::of(brain);
+    if who.brain.is_none() {
+        crate::activity::clear();
+    }
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let v: Value = serde_json::from_str(&input).unwrap_or_default();
+    let prompt = v["transcript_path"].as_str().and_then(last_prompt);
+    unanswered(prompt.as_deref(), &who, "failed", &failure_words(&v));
+    let _ = protocol::send(&Request::Say { text: String::new(), interrupt: false, kind: "answer".into(), from: None, brain: who.name() });
+}
+
+/// What a StopFailure's input says went wrong, as the chat says it.
+fn failure_words(v: &Value) -> String {
+    let what = match v["error"].as_str().unwrap_or("") {
+        "rate_limit" => "it hit its rate limit",
+        "authentication_failed" => "its Claude account couldn't sign in",
+        "billing_error" => "its Claude account has a billing problem",
+        "invalid_request" => "the request was refused",
+        "server_error" => "the Claude API failed",
+        "max_output_tokens" => "its answer ran too long",
+        _ => "it ran into an error",
+    };
+    let detail = v["error_details"].as_str().or_else(|| v["error_message"].as_str()).map(str::trim).filter(|d| !d.is_empty());
+    match detail {
+        Some(d) => format!("The tower couldn't answer: {what} ({}).", d.chars().take(160).collect::<String>()),
+        None => format!("The tower couldn't answer: {what}."),
+    }
+}
+
+/// A brain's turn after `prompt` ended without an answer (`why`, `text`:
+/// see `history::record_unanswered`): kept, if the turn began with a request of the user's.
+fn unanswered(prompt: Option<&str>, who: &Who, why: &str, text: &str) {
+    let Some(p) = prompt.filter(|p| !crate::brain::is_question_prompt(p)) else { return };
+    if let Some(at) = crate::history::request_for_prompt(&crate::history::load_tail(1 << 20), p, who.space.as_deref()) {
+        crate::history::record_unanswered(at, why, text, who.space.clone());
     }
 }
 
@@ -538,5 +582,12 @@ mod tests {
         ];
         std::fs::write(&p, lines.join("\n")).unwrap();
         assert_eq!(last_assistant_text(p.to_str().unwrap()).as_deref(), Some("Two sessions are working."));
+    }
+
+    #[test]
+    fn a_failed_turn_says_what_went_wrong() {
+        assert_eq!(failure_words(&json!({"error": "rate_limit"})), "The tower couldn't answer: it hit its rate limit.");
+        assert_eq!(failure_words(&json!({"error": "server_error", "error_details": "529 overloaded"})), "The tower couldn't answer: the Claude API failed (529 overloaded).");
+        assert_eq!(failure_words(&json!({})), "The tower couldn't answer: it ran into an error.");
     }
 }

@@ -2629,12 +2629,42 @@ which, whatever came between them and in whatever order they came back:
   or a note started answers none.
 - **In the conversation column** (a space's, the main tower's, a
   session's thread): an answer has a line on top, "↳ you asked: …" (or "↳
-  the tower sent it: …"), that scrolls to the question; a question has
-  "answered ↓", scrolling to its answer, or "waiting for an answer" while
-  none came (asked within 12 hours, since answers were paired). A
-  session's reply is a row of its own, headed by its name.
+  the tower sent it: …"), that goes to the question; an answered question
+  goes to its answer when it is clicked anywhere (or its "answered ↓").
+  What it went to comes to the top of the column and lights up a moment
+  (a cyan outline, fading over 1.8 s: `FullUi::chat_flash`). A session's
+  reply is a row of its own, headed by its name.
+- **While the tower hasn't answered** a question of yours to it, the
+  question has a spinner, "waiting for the tower · 12s", and **Take
+  back**. That spinner clears as the answer comes in. A session's
+  question says "waiting for an answer" (for 12 hours). When no answer
+  will come, the question says why, in amber, instead of waiting:
+  - the brain's turn ended with nothing to say: "The tower's turn ended
+    without an answer." (its Stop hook);
+  - it failed: "The tower couldn't answer: it hit its rate limit." and
+    the like (the brains' **StopFailure** hook, `tower hook
+    claude-failed`, by its `error`);
+  - you took it back: "You took it back." (**Take back** sends
+    `{"cmd":"withdraw","at":…}`; the daemon stops the brain with `hc
+    interrupt` if that request is still the latest it was given and it is
+    working);
+  - the main brain isn't running: "No answer: the tower isn't running.";
+  - half an hour passed: "No answer came."
+
+  The first three are kept in the history as `unanswered` entries
+  (`reply_to`: the request; `status`: `empty`, `failed` or `taken-back`;
+  always `record`), so they survive restarts. A question isn't claimed
+  either way when an answer after it names no question (its link failed),
+  or when it is older than half an hour and was asked before answers were
+  paired. (`talk::standing` decides.)
 - **On the phone**: `GET /v1/chat` has `reply_to`, `asks` and
   `answered_by` (see the phone API's "Answers paired with their questions").
+  It doesn't have the pending or no-answer state yet. The app would show a
+  pending indicator on a message of the user's without `answered_by`, but
+  it can't tell "still coming" from "never coming". That needs the
+  `unanswered` entries served as a field (say `unanswered: {why, text}`) and
+  a Take back call (`POST /v1/chat/{id}/withdraw`), plus tap-to-scroll on
+  `asks.id` and `answered_by`, which the app can do already.
 
 ## Step 11: the phone
 

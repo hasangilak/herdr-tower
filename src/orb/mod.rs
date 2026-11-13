@@ -945,6 +945,19 @@ fn answer_from_start() -> Option<(String, usize, bool)> {
 /// `{enter}`, `{shift-enter}` or another key in braces. What the field
 /// holds, and whether the card is still open, is said after each run. For
 /// checking what Enter and Shift+Enter do there without the keyboard.
+/// `HERDER_TOWER_ORB_CLICK=<words>[|<words>...]`: a moment after the
+/// start, the full window's conversation clicks the row whose words hold
+/// `words`, once it can be clicked (a question once its answer is in), with
+/// a mouse event of the window's own (the pointer stays where it is; the
+/// window needn't be in front); then the next, three seconds later. Where
+/// each click went is said just after. For checking that a question goes
+/// to its answer, and back, without the pointer.
+fn click_from_start() -> Option<Vec<String>> {
+    let v = std::env::var("HERDER_TOWER_ORB_CLICK").ok()?;
+    let all: Vec<String> = v.split('|').map(|w| w.trim().to_string()).filter(|w| !w.is_empty()).collect();
+    (!all.is_empty()).then_some(all)
+}
+
 /// What `HERDER_TOWER_ORB_KEYS` types: each run (what it is, for the log) and its key presses.
 type KeySteps = Vec<(String, Vec<gpui::Keystroke>)>;
 
@@ -1206,6 +1219,36 @@ fn open_full(tower: &Entity<Tower>, to: Option<nav::Scope>, anchor: Option<mac::
                         });
                         cx.background_executor().timer(Duration::from_millis(300)).await;
                         let _ = view.update(cx, |p, cx| p.keys_report(&id, &label, cx));
+                    }
+                })
+                .detach();
+            }
+            // `HERDER_TOWER_ORB_CLICK`: a row of the conversation clicked, once it can be.
+            static CLICKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if let Some(clicks) = click_from_start().filter(|_| !focus && !CLICKED.swap(true, std::sync::atomic::Ordering::SeqCst)) {
+                let view = view.clone();
+                cx.spawn(async move |cx: &mut AsyncApp| {
+                    cx.background_executor().timer(Duration::from_millis(2500)).await;
+                    'clicks: for words in clicks {
+                        for _ in 0..240 {
+                            let at = view.update(cx, |p, cx| p.click_point(&words, cx));
+                            if let Some(position) = at {
+                                let _ = handle.update(cx, |_, window, cx| {
+                                    let modifiers = gpui::Modifiers::default();
+                                    window.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent { position, pressed_button: None, modifiers }), cx);
+                                    window.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { button: gpui::MouseButton::Left, position, modifiers, click_count: 1, first_mouse: false }), cx);
+                                    window.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { button: gpui::MouseButton::Left, position, modifiers, click_count: 1 }), cx);
+                                });
+                                eprintln!("[orb] HERDER_TOWER_ORB_CLICK: clicked {words:?} at ({:.0}, {:.0})", f32::from(position.x), f32::from(position.y));
+                                cx.background_executor().timer(Duration::from_millis(500)).await;
+                                let _ = view.update(cx, |p, _| p.click_report());
+                                cx.background_executor().timer(Duration::from_millis(3000)).await;
+                                continue 'clicks;
+                            }
+                            cx.background_executor().timer(Duration::from_millis(500)).await;
+                        }
+                        eprintln!("[orb] HERDER_TOWER_ORB_CLICK: no row to click holds {words:?}");
+                        return;
                     }
                 })
                 .detach();
