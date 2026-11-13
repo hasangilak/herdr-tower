@@ -1023,7 +1023,8 @@ core) doesn't lose it: `open.json` in the state folder (`crate::reopen`,
   - Else a new tab of its space (`tab.new`, its tab's name, its folder),
     with its `tower.*` labels set again.
   - Else its space is made again (`space.new`, the folder Herdr had for
-    it), and the space's next sessions are its tabs.
+    it; for a session in a worktree, on a home tab first, as `tower
+    launch` makes one), and the space's next sessions are its tabs.
   - Not when its folder is gone (a removed worktree) or its conversation's
     file is: that one is said, the rest go on. One the tower put back that
     isn't seen again within 2 minutes (its resume failed) is lost again.
@@ -1496,6 +1497,18 @@ worktree with the same `worktrees::add`).
   `missions` shows it. `tower start` prints `worktree`, `branch`, `repo`,
   `worktree_fresh` (it made that worktree now) and `port`. The space's
   mission lists the worktrees made for it.
+- **A space of its own in Herdr's sidebar.** Herdr's sidebar (its
+  `spaces` mod) places a space by its first terminal's live folder, and
+  nests a space whose place is a git worktree under the space whose place
+  is that repo's own checkout (a fork, with a branch icon). A space the
+  tower makes for a session in a worktree (`tower launch`, `tower start
+  --space … --new-space`, and a space `tower reopen` makes again) opens
+  on a **home tab** first: a shell named after the space, in
+  `.tower-worktrees/<space-slug>/` beside its worktrees (in no checkout),
+  labelled `tower.role=home`; the sessions are the tabs after it. It is no
+  session (no agent: never in `missions`, never kept by `crate::reopen`),
+  so undoing a launch still closes the space whole. Closing that tab
+  brings the nesting back. Spaces made before this keep their place.
 - `tower start --no-worktree` opts one session out (it gets no port
   either). A space with no goal, a standing space, a start without
   `--space`, a folder that is no git checkout, `--on <machine>`, or

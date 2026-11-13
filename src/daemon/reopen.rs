@@ -235,7 +235,7 @@ impl Reopen {
                     let how = match s {
                         Ok(reopen::Step::Type { address, line }) => json!({ "how": "typed", "terminal": address, "line": line }),
                         Ok(reopen::Step::Tab { tab, folder, argv, .. }) => json!({ "how": "tab", "tab": tab, "folder": folder, "argv": argv }),
-                        Ok(reopen::Step::Space { name, folder, tab, argv }) => json!({ "how": "space", "space": name, "folder": folder, "tab": tab, "argv": argv }),
+                        Ok(reopen::Step::Space { name, folder, tab, argv, home }) => json!({ "how": "space", "space": name, "folder": folder, "tab": tab, "argv": argv, "home": home }),
                         Err(why) => json!({ "how": "failed", "why": why }),
                     };
                     json!({ "space": k.space, "name": k.called(), "step": how })
@@ -333,7 +333,15 @@ impl reopen::Hands for Real {
         made(std::process::Command::new(crate::config::herdr_app_bin()).args(&args).stdin(std::process::Stdio::null()).output(), "tab.new")
     }
 
-    fn space(&self, name: &str, folder: &str, tab: &str, argv: &[String]) -> Result<String> {
+    fn space(&self, name: &str, folder: &str, tab: &str, argv: &[String], home: Option<&str>) -> Result<String> {
+        // A home tab first (a shell beside its worktrees), then the session as a tab.
+        if let Some(home) = home {
+            let args = ["do", "space.new", "--name", name, "--tab", name, "--folder", home];
+            let t = made(std::process::Command::new(crate::config::herdr_app_bin()).args(args).stdin(std::process::Stdio::null()).output(), "space.new")?;
+            let _ = crate::hc::run(&["label", &t, crate::worktrees::LABEL_HOME, &format!("tower.name={name}")]);
+            let Some(id) = self.space_id(name) else { bail!("herdr-app made the space {name}, but its window doesn't list it") };
+            return self.tab(&id, tab, folder, argv);
+        }
         let argv = serde_json::to_string(argv)?;
         let mut args = vec!["do", "space.new", "--name", name, "--tab", tab, "--argv", &argv];
         if !folder.is_empty() {
