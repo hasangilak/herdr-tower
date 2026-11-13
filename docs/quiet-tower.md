@@ -306,7 +306,7 @@ question set behind it (a raise) has that block now too.
 
 | Source | Kind | Key | Options |
 |---|---|---|---|
-| A question set that is the user's (`decision: escalate`; a "waits for you" card is one) | `permission` for a permission, plan or approval menu; `question` otherwise | `ask:<space>:<what it asks>` | The tower's recommendations, the first one the pick (for a set with several questions, option *i* answers each with its recommendation *i*); with none, a menu's own options and no pick; a wait card has none |
+| A question set that is the user's (`decision: escalate`; a "waits for you" card is one) | `permission` for a permission, plan or approval menu; `question` otherwise | `ask:<space>:<what it asks>` | The tower's recommendations, the first one the pick (for a set with several questions, option *i* answers each with its recommendation *i*); with none, a menu's own options and no pick. A wait card, and a question after a turn the user typed, gets "Go ahead" and "Not yet" at once and then two or three of its own (`crate::choices`) |
 | The PRs of one repo that wait for a merge in one space (`waiting` and open in `prs.json`) | `merge` | `merge:<space>:<owner/repo>` | One per PR, in order. The pick is the first, when it can be merged, its checks pass and its base is not production |
 | `tower raise` | `raised`; `choice` with `--options` | `raise:<space>:<the line>` | As given, the first one the pick |
 | A PR's review stuck after three rounds ("PR review") | `choice` (`why` `review`), about the owner and the reviewer | `raise:<space>:<its line>` | "Side with the owner", "Side with the reviewer", "I'll look"; no pick |
@@ -364,6 +364,30 @@ question set behind it (a raise) has that block now too.
   `everything`), which raises it (`tower raise … --why failed`) or sends it
   again (`tower agenda requeue`); a task that fails after any retry is
   still a `failed` decision.
+
+### Every card has buttons
+
+A card the brain doesn't read used to come with nothing to tap: a turn
+that ended waiting for the user ("waits for you", `questions::WAITS`) and
+a question at the end of a turn they typed in the session's terminal
+(`questions::TYPED_THERE`), and one escalated without answers. Such a text
+set (one question, no recommendations, the user's) now gets them
+(`Asks::give_buttons`, `crate::choices`), once:
+
+- at once, "Go ahead" ("Go ahead with what you proposed.") and "Not yet"
+  ("Not yet: hold off and wait for me.");
+- a few seconds later, two or three of its own, read from what the
+  session said by one headless call (the default account, `[brains] model`
+  at low effort, no tools, nothing kept): a short label and the
+  instruction it sends, the tower's pick first with why ("Push and open
+  the PR", "Push only, no PR", "Not yet"). They take the generic ones'
+  place while nobody is answering; when the call fails or brings fewer
+  than two, the generic ones stay.
+
+They are the set's recommendations for its one question, so the card's
+rows, the decision's `options` (the phone's buttons) and the reply typed
+into the session work as for any question the tower reads. "Other" stays
+below; the decision stays the user's (nothing is answered by itself).
 
 ### When one closes
 

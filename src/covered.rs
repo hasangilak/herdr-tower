@@ -166,7 +166,7 @@ fn parse_reply(out: &str, said: &[Said], items: &[(u64, String)]) -> Result<Vec<
 }
 
 /// Asks the model once: what it printed.
-fn ask(prompt: &str) -> Result<String> {
+pub(crate) fn ask(prompt: &str) -> Result<String> {
     let cfg = crate::config::Config::load()?;
     let cca = crate::accounts::cca_bin();
     let account = crate::accounts::list().ok().and_then(|l| l.first().map(|a| a.name.clone()));
