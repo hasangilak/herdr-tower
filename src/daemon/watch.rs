@@ -1236,6 +1236,7 @@ impl Radar {
                 waiting: vec![],
                 jobs: super::running::jobs_of(a),
                 servers: super::running::servers_of(a),
+                browsers: super::running::browsers_of(a),
             })
             .filter(|a| !a.name.starts_with("tower"))
             .collect();

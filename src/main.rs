@@ -17,6 +17,7 @@ mod activity;
 mod behaviors;
 mod brain;
 mod brains;
+mod browsers;
 mod chat;
 mod choices;
 mod config;
@@ -1890,6 +1891,11 @@ fn agents(all: bool) -> Result<()> {
             if let Some(line) = r["job"]["line"].as_str() {
                 println!("{:<12} {line}", "");
             }
+            for b in r["browsers"].as_array().into_iter().flatten() {
+                if let Some(line) = b["line"].as_str() {
+                    println!("{:<12} {line}", "");
+                }
+            }
         }
         for e in &errors {
             println!("! {}: {}", e["machine"].as_str().unwrap_or(""), e["error"].as_str().unwrap_or(""));
@@ -1913,6 +1919,9 @@ fn agent_rows(all: bool) -> (Vec<Value>, Vec<Value>) {
         let a = state["agents"].as_array().into_iter().flatten().find(|a| a["address"] == address);
         let jobs: Vec<running::Job> = a.and_then(|a| serde_json::from_value(a["jobs"].clone()).ok()).unwrap_or_default();
         (jobs, a.map(|a| a["servers"].clone()).filter(|s| s.is_array()).unwrap_or(json!([])))
+    };
+    let browsers = |address: &str| -> Value {
+        state["agents"].as_array().into_iter().flatten().find(|a| a["address"] == address).map(|a| a["browsers"].clone()).filter(|b| b.is_array()).unwrap_or(json!([]))
     };
     let mut rows = Vec::new();
     let mut errors = Vec::new();
@@ -1954,6 +1963,8 @@ fn agent_rows(all: bool) -> (Vec<Value>, Vec<Value>) {
                         "job": running::shown(&jobs, history::now_ms()),
                         "jobs": jobs,
                         "servers": servers,
+                        // A browser it uses now: Chrome, the built-in one, a headless one (the latest first).
+                        "browsers": if machine.is_none() { browsers(t["address"].as_str().unwrap_or("")) } else { json!([]) },
                     }));
                 }
             }

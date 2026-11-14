@@ -135,7 +135,17 @@ impl Panel {
         let mut sub = vec![super::space::status_word(&status).to_string()];
         sub.extend(member.as_ref().map(|m| m.place()).filter(|p| !p.is_empty()));
         sub.extend(member.as_ref().and_then(|m| m.account.clone()).map(|a| format!("on {a}")));
-        let head = whead(&title, vec![div().child(sub.join(" · ")).into_any_element()], back);
+        let mut lines = vec![div().child(sub.join(" · ")).into_any_element()];
+        // A browser it uses now: which, its site, since when (amber when it shares the user's).
+        let browser = member
+            .as_ref()
+            .and_then(|m| m.browser.clone())
+            .or_else(|| agent.as_ref().and_then(|a| serde_json::from_value::<Vec<crate::browsers::Use>>(a["browsers"].clone()).ok()).and_then(|b| b.into_iter().next()));
+        if let Some(b) = browser {
+            let colour = if b.shared_with.is_empty() { super::CYAN } else { super::AMBER };
+            lines.push(div().text_color(rgb(colour)).child(b.line).into_any_element());
+        }
+        let head = whead(&title, lines, back);
 
         let said = |text: String| div().px(px(4.0)).text_size(px(13.0)).line_height(px(19.0)).text_color(g.muted).child(text);
         let mut items: Vec<AnyElement> = vec![];

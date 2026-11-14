@@ -888,6 +888,11 @@ impl Daemon {
                     eprintln!("[sessions] {}: {} from another agent inside it (pid {}): not the terminal's", event.terminal, event.event, event.pid);
                     return Response { ok: true, error: None, state: None };
                 }
+                // A browser call (the PreToolUse hook on browser tools): shown at once.
+                if event.event == "browser" {
+                    self.running.browser_call(&event.terminal, &event.text, event.at_ms);
+                    return Response { ok: true, error: None, state: None };
+                }
                 // A turn that failed on its account's usage limit is no failure: the session moves on.
                 if event.event == "stop-failed" && crate::failover::limit_of(&event.error, &event.text, crate::history::now_ms()).is_some() {
                     event.event = "limited".into();
