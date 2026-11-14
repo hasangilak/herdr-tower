@@ -139,6 +139,8 @@ pub struct Acts {
     chain: HashSet<String>,
     /// Where each PR's merge stands (by the PR's key).
     steps: HashMap<String, prchip::Step>,
+    /// The PRs whose full description is open on their merge card (by key).
+    bodies: HashSet<String>,
 }
 
 pub struct Panel {

@@ -119,6 +119,15 @@ pub struct Pr {
     /// (`crate::impact`), as of its head commit `impact.sha`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub impact: Option<crate::impact::Impact>,
+    /// Its description on GitHub (`""`: it has none); None until the tower looked (`crate::describe`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// Its description in one or two plain sentences, for the merge card (`crate::describe`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub described: Option<crate::describe::Described>,
+    /// It had no description and its session was asked to write one (once).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub asked_body: bool,
 }
 
 impl Pr {
@@ -129,6 +138,14 @@ impl Pr {
 
     pub fn open(&self) -> bool {
         self.state == "open"
+    }
+
+    /// Ready for the user's merge: not a draft, and no review of it still
+    /// running (its reviewer reading it, or its session fixing what the
+    /// review found). Until then it waits for nobody: it is in no merge
+    /// decision, and comes in when it is ready.
+    pub fn ready_for_user(&self) -> bool {
+        !self.draft && !self.review.as_ref().is_some_and(|r| matches!(r.status.as_str(), "reviewing" | "changes"))
     }
 
     /// As the chat, the panel and the phone show it: the PR and whether
@@ -270,7 +287,7 @@ fn creates_pr(input: &Value) -> bool {
 // ---- what GitHub says ----
 
 /// The fields asked of `gh pr view`.
-pub const FIELDS: &str = "number,title,url,state,isDraft,mergeable,mergeStateStatus,statusCheckRollup,baseRefName,headRefName,headRefOid,mergedAt,closedAt,mergeCommit";
+pub const FIELDS: &str = "number,title,url,state,isDraft,mergeable,mergeStateStatus,statusCheckRollup,baseRefName,headRefName,headRefOid,mergedAt,closedAt,mergeCommit,body";
 
 /// The PR as `gh pr view --json FIELDS` gives it, onto `pr` (keeping who
 /// made it and what the tower knows).
@@ -306,6 +323,9 @@ pub fn apply_gh(pr: &mut Pr, v: &Value) {
         pr.merge_commit = c.to_string();
     }
     pr.checks = rollup(&v["statusCheckRollup"]);
+    if let Some(b) = v.get("body").and_then(Value::as_str) {
+        pr.body = Some(b.trim().to_string());
+    }
 }
 
 /// The checks, the latest run of each (a check re-run after failing counts as its last run).
@@ -797,6 +817,26 @@ impl Prs {
         self.store(pr, "update", true);
     }
 
+    /// Its description's summary, made (`crate::describe::summarize`).
+    pub fn set_described(&self, k: &str, described: crate::describe::Described) {
+        let Some(mut pr) = self.get(k) else { return };
+        if pr.described.as_ref() == Some(&described) {
+            return;
+        }
+        pr.described = Some(described);
+        self.store(pr, "update", true);
+    }
+
+    /// It had no description, and its session was asked to write one.
+    pub fn set_asked_body(&self, k: &str) {
+        let Some(mut pr) = self.get(k) else { return };
+        if pr.asked_body {
+            return;
+        }
+        pr.asked_body = true;
+        self.store(pr, "update", true);
+    }
+
     /// The tower's own merge of it, as it went.
     pub fn set_auto(&self, k: &str, auto: Option<crate::prscore::Auto>) {
         let Some(mut pr) = self.get(k) else { return };
@@ -1095,6 +1135,8 @@ fn keep_own(pr: &mut Pr, old: &Pr) {
     pr.auto = old.auto.clone();
     pr.validation = old.validation.clone();
     pr.impact = old.impact.clone();
+    pr.described = old.described.clone();
+    pr.asked_body = old.asked_body;
 }
 
 /// A PR without when and whether it is looked at: what the chip shows.

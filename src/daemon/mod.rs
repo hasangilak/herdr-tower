@@ -25,6 +25,7 @@ pub mod reopen;
 pub mod reviews;
 pub mod running;
 pub mod sendq;
+mod describe;
 pub mod sessions;
 pub mod state;
 pub mod stt;
@@ -341,6 +342,8 @@ pub fn run() -> Result<()> {
     running.start();
     // "Merge all N": a merge card's PRs, merged in order by the tower.
     merges::Merges::new(shared.clone(), prs.clone(), sendq.clone()).start();
+    // What each PR in the merge queue does, in words (its description summarized); one without asks its session for one.
+    describe::start(prs.clone(), sendq.clone());
     // What the tower opened for the user lately, to show with the reply and to undo.
     let acts = acts::Acts::open(shared.clone(), hub.clone());
     // Where each space's changes stand: open, on dev, on prod (from GitHub, never from what sessions say).

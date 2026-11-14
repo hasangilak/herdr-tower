@@ -165,12 +165,41 @@ fn parse_reply(out: &str, said: &[Said], items: &[(u64, String)]) -> Result<Vec<
     Ok(got)
 }
 
-/// Asks the model once: what it printed.
+/// Asks the model once: what it printed. On the default account, else
+/// (it answered that its usage is spent) on each other account in turn.
 pub(crate) fn ask(prompt: &str) -> Result<String> {
+    let list = crate::accounts::list().unwrap_or_default();
+    let first = crate::accounts::default_of(&list);
+    let mut tried = vec![first.clone()];
+    let mut got = ask_on(prompt, first.as_deref());
+    for other in list.iter().map(|a| Some(a.name.clone())) {
+        if !spent(&got) {
+            break;
+        }
+        if tried.contains(&other) {
+            continue;
+        }
+        eprintln!("[ask] {} is out of usage: asking on {}", tried.last().cloned().flatten().unwrap_or_default(), other.as_deref().unwrap_or(""));
+        got = ask_on(prompt, other.as_deref());
+        tried.push(other);
+    }
+    got
+}
+
+/// The account's usage is spent: its answer (or its failure) says so.
+fn spent(got: &Result<String>) -> bool {
+    let text = match got {
+        Ok(out) => out.clone(),
+        Err(e) => format!("{e:#}"),
+    };
+    crate::failover::limit_of("", &text, crate::history::now_ms()).is_some()
+}
+
+/// Asks the model once on `account` (None: Claude Code's own login).
+fn ask_on(prompt: &str, account: Option<&str>) -> Result<String> {
     let cfg = crate::config::Config::load()?;
     let cca = crate::accounts::cca_bin();
-    let account = crate::accounts::list().ok().and_then(|l| crate::accounts::default_of(&l));
-    let argv = crate::ticket::argv(cca.as_deref().filter(|_| account.is_some()), account.as_deref(), &cfg.brains.model);
+    let argv = crate::ticket::argv(cca.as_deref().filter(|_| account.is_some()), account, &cfg.brains.model);
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]).current_dir(std::env::temp_dir());
     for (key, _) in std::env::vars_os() {
