@@ -286,6 +286,16 @@ pub enum Request {
     },
     /// What the agent sessions' hooks said (`tower sessions`).
     Sessions,
+    /// `tower progress <session> [question]`: how its turn goes, asked of
+    /// it aside (`/btw`) while it works, else read from its transcript
+    /// (`daemon::progress`). `by`: user, brain or phone.
+    Progress {
+        session: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        question: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        by: String,
+    },
     /// The phone API: `on`, `off`, `pair`, `revoked` (arg: device id), `status`.
     Phone {
         action: String,
@@ -451,6 +461,8 @@ pub fn send(req: &Request) -> Result<Response> {
 fn wait_for(req: &Request) -> Duration {
     match req {
         Request::Answer { .. } => Duration::from_secs(180),
+        // Typed in, answered aside, read off its screen.
+        Request::Progress { .. } => Duration::from_secs(150),
         Request::Queue { .. } | Request::Agenda { .. } => Duration::from_secs(90),
         // It asks Herdr about every session first.
         Request::Missions => Duration::from_secs(60),

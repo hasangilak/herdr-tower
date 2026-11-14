@@ -370,7 +370,9 @@ fn radar_entry(a: &super::state::AgentLine) -> String {
     let job = crate::running::line(&a.jobs, crate::history::now_ms()).map(|l| format!(", {l}")).unwrap_or_default();
     // A browser it uses now (and with whom it shares the user's).
     let browser = a.browsers.first().map(|u| format!(", {}", u.line)).unwrap_or_default();
-    format!("{} {}{folder}: {status}{job}{browser}{queued}", a.address, a.name)
+    // How its turn goes, while it works: step N of M, time in, last update.
+    let progress = a.progress.as_ref().filter(|_| a.status == "working").map(|p| format!(", {}", crate::progress::line(p, crate::history::now_ms()))).unwrap_or_default();
+    format!("{} {}{folder}: {status}{progress}{job}{browser}{queued}", a.address, a.name)
 }
 
 fn is_only_stop(norm: &str, stop_words: &[String]) -> bool {

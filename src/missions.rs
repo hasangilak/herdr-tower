@@ -545,6 +545,10 @@ pub struct Seen {
     /// A browser it uses now (`crate::browsers`): "using Chrome: sooner.de, since 04:00".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser: Option<crate::browsers::Use>,
+    /// How its turn goes, while it works (`crate::progress`): "step 3 of 7:
+    /// running the test suite · 14 min in · last update 1 min ago".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub progress: Option<crate::progress::Progress>,
 }
 
 /// A terminal as a session of a space, if it is one: live, an agent, in a
@@ -572,6 +576,7 @@ pub fn seen_of(row: &Value, full: Option<&Value>, said: Option<String>) -> Optio
     }
     let given = worktrees::given(t);
     let said = said.map(|s| clip_said(&s)).filter(|s| !s.is_empty());
+    let working = status == "working";
     Some(Seen {
         space,
         address: row["address"].as_str()?.to_string(),
@@ -584,6 +589,7 @@ pub fn seen_of(row: &Value, full: Option<&Value>, said: Option<String>) -> Optio
         said,
         job: row["address"].as_str().and_then(crate::daemon::running::shown_of),
         browser: row["address"].as_str().and_then(|a| crate::daemon::running::browsers_of(a).into_iter().next()),
+        progress: row["address"].as_str().and_then(crate::daemon::running::progress_of).filter(|_| working),
     })
 }
 

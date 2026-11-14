@@ -213,6 +213,10 @@ pub struct AgentLine {
     /// headless one; each with its site, since when and its line.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub browsers: Vec<crate::browsers::Use>,
+    /// How its turn goes, while it works (`crate::progress`): step N of M,
+    /// the call at work, time in, last update, in `line`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub progress: Option<crate::progress::Progress>,
 }
 
 /// One message waiting for a session in the send queue.

@@ -644,7 +644,7 @@ A message:
 {
   "id": "h812", "at": 1794158000000, "updated_at": 1794158000000,
   "role": "user",                // user | tower | session | screenshots | event
-  "kind": "request",             // the history's: request, answer, reply, receipt, screenshot, watch, alert, job, summary
+  "kind": "request",             // the history's: request, answer, reply, receipt, screenshot, watch, alert, job, summary, progress
   "text": "[Image #1] [File #2: notes.pdf] compare these",
   "source": "phone:d_9fce5c6c",  // mac (typed in the panel, tower ask) | voice (the Mac's microphone) | phone:<device> | tower
   "space": null,                 // a space's name: see "Whose conversation"
@@ -917,6 +917,58 @@ and each of the state's `agents` has `browsers` (the same, the latest
 first). Show the `line` under the session's name; in amber when
 `shared_with` isn't empty (two sessions in the user's Chrome can take each
 other's tabs).
+
+**Progress of working sessions** (feature `progress`). While a session
+works, a mission's session and each of the state's `agents` carry how its
+turn goes, read from its transcript every 15 s (absent when it isn't
+working):
+
+```
+"progress": { "line": "step 3 of 7: running the test suite · 14 min in · last update 1 min ago",
+              "step": 3, "steps": 7, "done": 2,          (only with a task list)
+              "item": "Running the test suite",          (the item at work, or "next: <subject>")
+              "items": [ { "id": "1", "subject": "Count the files", "active": "Counting the files",
+                           "status": "pending" | "in_progress" | "completed" } ],
+              "tool": "Bash: Run the tests", "tool_ms": 1794625200000,   (the call at work, since when)
+              "turn_ms": 1794624360000,                  (the turn started)
+              "last_ms": 1794625140000,                  (its last write)
+              "said": "Fixing the parser now.",          (its latest words this turn)
+              "job": "train.py: epoch 3 of 10" }         (a job's own progress, when it said some)
+```
+
+Show `line` under the session's name (the Mac shows it in amber once
+`last_ms` is 10 min old). The line was said when the tower read it: to keep
+"14 min in · last update 1 min ago" true, say them from `turn_ms` and
+`last_ms` against the clock. `step`/`steps`/`items` come only from a session
+that keeps a task list (Claude Code gives current models that only with
+`CLAUDE_CODE_ENABLE_TODO_TOOLS=1`); without one, the line is the call at
+work, else its latest words.
+
+`GET /v1/progress` lists every working session's: `{"working": [{"session":
+"t7", "name": "api", "where": "M5 Pro / api", "progress": {…}}]}`.
+
+`POST /v1/sessions/{t}/progress` asks one how it is going without stopping
+it, as `tower progress` does. Body (optional): `{"question": "is the
+migration nearly done?"}` (none: what is done, what it does now, what is
+left). A working Claude Code session answers it as its `/btw` side question
+while its turn goes on; any other is answered from its transcript. It can
+take up to ~90 s:
+
+```
+200 { "session": "t7", "name": "api", "status": "working",
+      "asked": "How is it going? …",
+      "via": "btw" | "transcript",
+      "answer": "I'm on step 3: the tests run; the migration and docs are left.",
+      "why": null | "it isn't working (done): nothing to ask aside",
+      "progress": { … } | null }
+400 bad_address · 400 not_here (a session on another machine) · 404 no_session · 503 herdr
+```
+
+The question and its answer also land in the history, as the session's
+(`GET /v1/history?session=t7&kind=progress`): entries of `kind: "progress"`
+with `status` `asked:<who>` for the question (`asked:user`, `asked:phone`,
+`asked:brain`), and `btw` or `transcript` for the answer. The Mac shows them
+in the session's thread.
 
 **Jobs running** (feature `jobs`). A session's turn can end while a job it
 started keeps running in the background (a training run it watches): its
@@ -1872,6 +1924,7 @@ stream's `hello` event). A tower from before there were features sends no
 | `releases` | Each space's release track: `releases` in the state (by space) and `GET /v1/releases` (`?space=` for one) |
 | `accounts` | Each Claude account's usage and the failover's moves: `accounts` in the state, and `account` on each of the state's `brains` and on a mission's `tower` (see "Accounts and usage") |
 | `browsers` | A session using a browser: `browser` on a mission's session, `browsers` on each of the state's `agents` (see "Browsers in use") |
+| `progress` | How a working session's turn goes: `progress` on a mission's session and on each of the state's `agents`, `GET /v1/progress`, `POST /v1/sessions/{t}/progress`, and history entries of `kind: "progress"` (see "Progress of working sessions") |
 | `jobs` | Jobs sessions left running in the background: `job` on a mission's session, `jobs` and `servers` on each of the state's `agents` (see "Jobs running") |
 | `impact` | Who outside depends on what a PR changes: `impact` on a PR (wherever `score` is) and `dependents` / `outside` on a predicted one (`plan.prs`), and a breaking change's warning among a merge's `warnings` |
 | `validation` | A predicted PR's `checks` and `edge_cases` (`plan.prs`), and `validation` on a PR (wherever `score` is), with the missing checks among a merge's `warnings` |

@@ -692,6 +692,32 @@ started after the hook. Cleared 90 s after the last call. Two sessions in
 the user's own Chrome (or built-in browser) at once can take each other's
 tabs: each says with whom, and the tower is told once.
 
+#### How a working session's turn goes
+
+While a session works, the tower says how its turn goes: "step 3 of 7:
+running the test suite · 14 min in · last update 1 min ago" on the radar
+line, in `tower agents` and `tower progress`, in a space's session rows and a
+session's view on the Mac (amber once its transcript has been quiet 10 min),
+and on the phone (`src/progress.rs`). It reads the session's transcript
+every 15 s: its task list (Claude Code's TaskCreate/TaskUpdate, or the older
+TodoWrite) for step N of M and the item at work, the call at work and for
+how long, when the turn started, its last write, its latest words, and a
+background job's own progress. Claude Code gives current models a task list
+only with `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`; without one, the line is the
+call at work, else its latest words.
+
+`tower progress <session> [question]` (and How is it going? in a session's
+view, and the phone) asks the session itself without stopping it. A working
+Claude Code session gets the question as its own `/btw` side question: the
+daemon types it (as itself: typed as a session's message, `<hc from=…>`, it
+would be a queued prompt, not a command), reads the answer off the overlay,
+and closes the overlay with Esc only while it still shows (Esc on a working
+session without it would stop its turn). Nothing of it enters the session's
+conversation. Any other session, or one whose answer doesn't show within
+90 s, is answered from its transcript, and says why. The question and the
+answer go into the history (`kind: progress`) and the session's thread. The
+brain asks this way when the user asks how something is going.
+
 #### A session with a job running
 
 A session's turn can end while a job it started keeps running in the

@@ -145,6 +145,28 @@ impl Panel {
             let colour = if b.shared_with.is_empty() { super::CYAN } else { super::AMBER };
             lines.push(div().text_color(rgb(colour)).child(b.line).into_any_element());
         }
+        // While it works: how its turn goes, and a side question to it that doesn't stop it.
+        if status == "working" {
+            let progress = member
+                .as_ref()
+                .and_then(|m| m.progress.clone())
+                .or_else(|| agent.as_ref().and_then(|a| serde_json::from_value::<crate::progress::Progress>(a["progress"].clone()).ok()));
+            if let Some(p) = progress {
+                lines.push(super::space::progress_line(&p, crate::history::now_ms()));
+            }
+            let place = format!("progress:{addr}");
+            let asking = self.full.as_ref().is_some_and(|f| f.busy.contains(&place));
+            let who = addr.to_string();
+            lines.push(
+                h_flex()
+                    .pt(px(4.0))
+                    .child(
+                        mbtn("session-progress", if asking { "Asking it aside…" } else { "How is it going?" }, false, None)
+                            .on_click(cx.listener(move |this, _, _, cx| this.ask_progress(&who, cx))),
+                    )
+                    .into_any_element(),
+            );
+        }
         let head = whead(&title, lines, back);
 
         let said = |text: String| div().px(px(4.0)).text_size(px(13.0)).line_height(px(19.0)).text_color(g.muted).child(text);
@@ -273,5 +295,24 @@ mod tests {
     #[test]
     fn test_sessions_are_never_listed() {
         assert!(is_test("qfix-two") && is_test(" Tower.Test=1 ") && !is_test("eyzflow") && !is_test("fix-q"));
+    }
+}
+
+impl Panel {
+    /// "How is it going?": `tower progress <session>`; the question and its
+    /// answer land in its thread (the history), a failure says why here.
+    pub(super) fn ask_progress(&mut self, addr: &str, cx: &mut Context<Self>) {
+        let place = format!("progress:{addr}");
+        let at = self.tower.read(cx).nav.scope.clone();
+        self.run(&place, vec!["progress".into(), addr.to_string(), "--json".into()], cx, move |this, result, cx| {
+            if let Err(e) = result {
+                let text = format!("It couldn't be asked: {}", e.trim());
+                this.tower.update(cx, |t, cx| {
+                    t.nav.say(at.clone(), text);
+                    cx.notify();
+                });
+            }
+            cx.notify();
+        });
     }
 }

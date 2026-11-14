@@ -19,6 +19,7 @@ pub mod mic;
 pub mod missions;
 pub mod narrate;
 pub mod plans;
+pub mod progress;
 pub mod queue;
 pub mod releases;
 pub mod reopen;
@@ -969,6 +970,12 @@ impl Daemon {
                     other => Err(anyhow::anyhow!("tower failover {other}: use status, move or clear")),
                 };
                 return match v {
+                    Ok(v) => Response { ok: true, error: None, state: Some(v) },
+                    Err(e) => Response::err(format!("{e:#}")),
+                };
+            }
+            Request::Progress { session, question, by } => {
+                return match progress::ask(&session, &question, if by.is_empty() { "user" } else { &by }) {
                     Ok(v) => Response { ok: true, error: None, state: Some(v) },
                     Err(e) => Response::err(format!("{e:#}")),
                 };

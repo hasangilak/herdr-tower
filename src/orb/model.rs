@@ -623,6 +623,8 @@ pub struct Member {
     pub browser: Option<crate::browsers::Use>,
     /// Where it is at, in a few sentences (`crate::briefs`).
     pub brief: Option<crate::briefs::SessionBrief>,
+    /// How its turn goes, while it works (`crate::progress`).
+    pub progress: Option<crate::progress::Progress>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1113,6 +1115,11 @@ pub fn adapt_missions(spaces: &Spaces, live: &[Live], known: &[String], agents: 
                         .and_then(|l| l.iter().find(|a| a["address"] == address.as_str()))
                         .and_then(|a| serde_json::from_value::<Vec<crate::browsers::Use>>(a["browsers"].clone()).ok())
                         .and_then(|b| b.into_iter().next()),
+                    progress: agents
+                        .as_array()
+                        .and_then(|l| l.iter().find(|a| a["address"] == address.as_str()))
+                        .and_then(|a| serde_json::from_value::<crate::progress::Progress>(a["progress"].clone()).ok())
+                        .filter(|_| status == "working"),
                     ..Default::default()
                 })
                 .collect(),
