@@ -877,6 +877,8 @@ impl Asks {
                 if !had
                     && let Some(t) = blocked
                     && !super::watch::left_alone(&t)
+                    // Its usage limit's screen: the failover moves it, nothing for the user to look at.
+                    && !super::failover::at_limit(address)
                 {
                     let notice = blocked_notice(&hc::spoken_name(&t), &t["status"]);
                     let told = match self.decisions.get() {

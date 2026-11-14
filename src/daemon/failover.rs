@@ -117,6 +117,31 @@ pub fn holds(address: &str) -> bool {
     get().is_some_and(|f| f.holding(address))
 }
 
+/// A session at its account's usage limit: the failover moves it or it
+/// waits for an account (`holds`), or, while the failover runs, the bottom
+/// of its screen says so ("You've hit your weekly limit · resets …") before
+/// the hook that tells the failover has come in. That is no error, and
+/// nothing for the user to look at in Herdr: the failover says in one line
+/// what happens (13 Nov: "stuck on an error" alerts and a "can't read" card,
+/// seconds before the sessions moved).
+pub fn at_limit(address: &str) -> bool {
+    if holds(address) {
+        return true;
+    }
+    if get().is_none() {
+        return false;
+    }
+    hc::run(&["read", address, "--lines", "15"]).is_ok_and(|o| o.code == 0 && limit_on_screen(&o.stdout))
+}
+
+/// The last lines of a screen show a usage limit (`failover::limit_of`);
+/// what scrolled up from the conversation doesn't count.
+pub fn limit_on_screen(screen: &str) -> bool {
+    let lines: Vec<&str> = screen.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let tail = lines[lines.len().saturating_sub(12)..].join("\n");
+    failover::limit_of("", &tail, crate::history::now_ms()).is_some()
+}
+
 fn program(t: &Value) -> String {
     t["foreground"]["argv"][0].as_str().unwrap_or("").rsplit('/').next().unwrap_or("").to_string()
 }
@@ -935,6 +960,18 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("{address} never finished moving");
+    }
+
+    /// 13 Nov, 23:08: t138's limit screen became a "can't read" card, and
+    /// t138 and t139 "stuck on an error" alerts, seconds before the failover
+    /// moved them. The bottom of the screen says it is the limit.
+    #[test]
+    fn a_limit_on_the_screens_last_lines_is_one_and_one_scrolled_up_is_not() {
+        let limit = "⏺ Running the dev smoke suite…\n\n  ⎿  You've hit your weekly limit · resets Nov 15 at 2am (Europe/Berlin)\n     /upgrade or /extra-usage to finish what you're working on.\n\n────────\n❯ \n────────\n  ⏵⏵ accept edits on\n";
+        assert!(limit_on_screen(limit));
+        let scrolled = format!("{limit}{}", (1..=20).map(|i| format!("⏺ step {i} done\n")).collect::<String>());
+        assert!(!limit_on_screen(&scrolled), "talk of a limit higher up isn't this one");
+        assert!(!limit_on_screen("⎿  API Error: 500 {\"type\":\"error\"}\n❯ \n"), "a plain error stays an error");
     }
 
     #[test]
