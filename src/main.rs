@@ -1931,6 +1931,11 @@ fn agents(all: bool) -> Result<()> {
     Ok(())
 }
 
+/// `tower agents`' rows (with each working session's `progress`), for the phone API.
+pub fn agent_rows_for_phone() -> (Vec<Value>, Vec<Value>) {
+    agent_rows(false)
+}
+
 /// `tower agents` as JSON (the phone API serves it too).
 pub fn agents_value(all: bool) -> Value {
     let (rows, errors) = agent_rows(all);

@@ -59,7 +59,7 @@ pub const API: u32 = 1;
 /// `impact`: who outside depends on what a PR changes (`impact` on a PR,
 /// `dependents` and `outside` on a predicted one), and a breaking change's warning.
 /// `releases`: each space's release track (`releases` in the state, `GET /v1/releases`).
-pub const FEATURES: &[&str] = &["quiet", "acts", "pairing", "bonjour", "reviews", "scores", "validation", "impact", "releases", "accounts", "jobs", "browsers"];
+pub const FEATURES: &[&str] = &["quiet", "acts", "pairing", "bonjour", "reviews", "scores", "validation", "impact", "releases", "accounts", "jobs", "browsers", "progress"];
 const MAX_CONNECTIONS: usize = 32;
 /// Connections open at once from one address.
 const MAX_PER_IP: usize = 8;
@@ -1517,6 +1517,36 @@ impl Lan {
                     }
                 }
             }
+            // How a session's turn goes, asked of it aside (`tower progress`):
+            // a working Claude Code session answers its /btw while its turn
+            // goes on; any other is answered from its transcript. Up to ~90 s.
+            ("POST", ["sessions", address, "progress"]) => {
+                if !valid_address(address) {
+                    return Some(Response::error(400, "bad_address", "an address looks like t3 or vps/t3"));
+                }
+                if address.contains('/') {
+                    return Some(Response::error(400, "not_here", "only a session on this Mac can be asked"));
+                }
+                let body = req.json().unwrap_or_default();
+                let question = body["question"].as_str().map(clean_text).unwrap_or_default();
+                match super::progress::ask(address, question.trim(), "phone") {
+                    Ok(v) => Response::json(200, &v),
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        if msg.starts_with("no session") { Response::error(404, "no_session", &msg) } else { Response::error(503, "herdr", &msg) }
+                    }
+                }
+            }
+            // Every working session's progress line, as the tower read it last (every 15 s).
+            ("GET", ["progress"]) => {
+                let (rows, _) = crate::agent_rows_for_phone();
+                let working: Vec<Value> = rows
+                    .into_iter()
+                    .filter(|r| !r["progress"].is_null())
+                    .map(|r| json!({ "session": r["address"], "name": r["spoken"], "where": r["where"], "progress": r["progress"] }))
+                    .collect();
+                Response::json(200, &json!({ "working": working }))
+            }
             ("GET", ["sessions", address, "screen"]) => {
                 if !valid_address(address) {
                     return Some(Response::error(400, "bad_address", "an address looks like t3 or vps/t3"));
@@ -2667,6 +2697,13 @@ mod tests {
         assert_eq!(call(addr, &fp, "POST", "/v1/sessions/qnope-no-such-terminal/show", Some(&token), "").unwrap().0, 404);
         assert_eq!(call(addr, &fp, "POST", "/v1/sessions/a%3Bb/show", Some(&token), "").unwrap().0, 400);
         assert_eq!(call(addr, &fp, "POST", "/v1/sessions/t1/show", None, "").unwrap().0, 401);
+        // Asking how a session goes: the same address rules; the list of working ones.
+        assert_eq!(call(addr, &fp, "POST", "/v1/sessions/qnope-no-such-terminal/progress", Some(&token), "{}").unwrap().0, 404);
+        assert_eq!(call(addr, &fp, "POST", "/v1/sessions/a%3Bb/progress", Some(&token), "{}").unwrap().0, 400);
+        assert_eq!(call(addr, &fp, "POST", "/v1/sessions/vps%2Ft3/progress", Some(&token), "{}").unwrap().0, 400);
+        assert_eq!(call(addr, &fp, "POST", "/v1/sessions/t1/progress", None, "{}").unwrap().0, 401);
+        let (st, v) = call(addr, &fp, "GET", "/v1/progress", Some(&token), "").unwrap();
+        assert!(st == 200 && v["working"].is_array(), "{v}");
         // Screenshots: by id, never by path; the token is needed as everywhere.
         assert_eq!(call(addr, &fp, "GET", "/v1/screenshots/..%2F..%2Fdevices.json", Some(&token), "").unwrap().0, 400);
         assert_eq!(call(addr, &fp, "GET", "/v1/screenshots/0-no-such-shot.png", Some(&token), "").unwrap().0, 404);
