@@ -40,6 +40,10 @@ pub struct SessionBrief {
     /// The whole of it, in a few sentences.
     pub text: String,
     pub asked: String,
+    /// What came of what it was asked last, in its own words.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub result: String,
+    /// What else it finished lately, each in its own words.
     pub done: Vec<String>,
     pub now: String,
     pub next: Vec<String>,
@@ -88,6 +92,8 @@ pub struct SessionFacts<'a> {
     pub waits_on: Vec<String>,
     /// Its live progress line (step N of M, …), when the tower has one.
     pub progress: Option<&'a str>,
+    /// Its own task list's items still to do (the progress's pending items).
+    pub upcoming: Vec<String>,
     pub now: u64,
 }
 
@@ -113,10 +119,21 @@ pub struct SpaceFacts<'a> {
 pub fn session(f: &SessionFacts) -> SessionBrief {
     let mut tasks = f.tasks.clone();
     tasks.sort_by_key(|t| t.created_at_ms);
-    let asked = tasks.last().map(|t| title(t)).unwrap_or_default();
     let recent = |t: &&&Task| f.now.saturating_sub(t.since_ms) <= DONE_WITHIN_MS;
-    let mut done: Vec<String> = tasks.iter().rev().filter(recent).filter(|t| t.state == TaskState::Verified).map(|t| with_how(t)).collect();
-    done.extend(tasks.iter().rev().filter(recent).filter(|t| t.state == TaskState::DoneClaimed).map(|t| format!("{} (it says so; not checked yet)", title(t))));
+    // The latest it took up (a queued one is "next"), else the latest.
+    let latest = tasks.iter().rev().find(|t| t.state != TaskState::Queued).or(tasks.last()).copied();
+    // What it was asked last, and where that stands.
+    let asked = latest
+        .map(|t| match state_word(t) {
+            "" => title(t),
+            w => format!("{} ({w})", title(t)),
+        })
+        .unwrap_or_default();
+    // What came of it, in its own words (its turn's end), and how it was checked.
+    let result = latest.filter(|t| matches!(t.state, TaskState::Verified | TaskState::DoneClaimed)).map(|t| outcome(t)).unwrap_or_default();
+    // What else it finished lately.
+    let done: Vec<String> =
+        tasks.iter().rev().filter(recent).filter(|t| t.state == TaskState::Verified && Some(**t) != latest).map(|t| outcome(t)).collect();
     let running = tasks.iter().rev().find(|t| t.state == TaskState::Running);
     let blocked = tasks.iter().rev().find(|t| t.state == TaskState::Blocked);
     let now = match (f.progress.filter(|p| !p.trim().is_empty()), f.status) {
@@ -126,16 +143,18 @@ pub fn session(f: &SessionFacts) -> SessionBrief {
             None => "working".into(),
         },
         (_, "blocked") => match (f.waits_on.first(), blocked) {
-            (Some(d), _) => format!("waiting for you: {}", clip(d, 140)),
-            (None, Some(t)) if !t.question.is_empty() => format!("waiting for you: {}", clip(&t.question, 140)),
+            (Some(d), _) => format!("waiting for you: {}", clip(d, 120)),
+            (None, Some(t)) if !t.question.is_empty() => format!("waiting for you: {}", clip(&t.question, 120)),
             _ => "waiting on a prompt in its terminal".into(),
         },
-        _ => match f.said.map(first_sentence).filter(|s| !s.is_empty()) {
-            Some(s) => format!("idle; it last said: {}", clip(&s, 160)),
+        // Idle: what it last said, unless that is the result already told.
+        _ => match f.said.map(first_sentence).filter(|s| !s.is_empty() && result.is_empty()) {
+            Some(s) => format!("idle; it last said: {}", clip(&s, 140)),
             None => "idle".into(),
         },
     };
-    let next: Vec<String> = tasks.iter().filter(|t| t.state == TaskState::Queued).map(|t| title(t)).collect();
+    let mut next: Vec<String> = tasks.iter().filter(|t| t.state == TaskState::Queued).map(|t| title(t)).collect();
+    next.extend(f.upcoming.iter().map(|u| clip(u, 90)));
     let mut stuck: Vec<String> =
         tasks.iter().rev().filter(recent).filter(|t| matches!(t.state, TaskState::Stalled | TaskState::Failed)).map(|t| why_line(t)).collect();
     // A decision it waits on while it isn't blocked (a wait at the end of its turn).
@@ -143,9 +162,32 @@ pub fn session(f: &SessionFacts) -> SessionBrief {
         stuck.extend(f.waits_on.iter().map(|d| format!("waits for your answer: {}", clip(d, 120))));
     }
     let stuck = stuck.into_iter().next();
-    let mut s = SessionBrief { asked, done, now, next, stuck, ..Default::default() };
+    let mut s = SessionBrief { asked, result, done, now, next, stuck, ..Default::default() };
     s.text = session_text(&s);
     s
+}
+
+/// A task's state in a word or two for "Asked: … (done)"; nothing while it runs (its "now" says).
+fn state_word(t: &Task) -> &'static str {
+    match t.state {
+        TaskState::Verified => "done",
+        TaskState::DoneClaimed => "it says done; not checked yet",
+        TaskState::Failed => "failed",
+        TaskState::Stalled => "stalled",
+        TaskState::Queued => "queued",
+        TaskState::Blocked => "waiting for you",
+        TaskState::Abandoned => "dropped",
+        TaskState::Running => "",
+    }
+}
+
+/// What came of a task: the first sentence of what its session said at the
+/// end of it (its title when that says nothing), and "checked by the brain"
+/// when the brain verified it (the evidence is then the brain's, not only its word).
+fn outcome(t: &Task) -> String {
+    let said = first_sentence(&t.said);
+    let what = if said.split_whitespace().count() >= 4 { clip(&said, 140) } else { title(t) };
+    if t.state == TaskState::Verified && t.why.trim_start().starts_with("the brain checked it") { format!("{} (checked by the brain)", end(&what)) } else { what }
 }
 
 /// A session's brief as labelled lines ("Asked", "Done", "Now", "Next", "Stuck"): the panel's, and its text's.
@@ -154,8 +196,11 @@ pub fn session_lines(s: &SessionBrief) -> Vec<(&'static str, String)> {
     if !s.asked.is_empty() {
         parts.push(("Asked", end(&s.asked).to_string()));
     }
+    if !s.result.is_empty() {
+        parts.push(("Result", end(&s.result).to_string()));
+    }
     if !s.done.is_empty() {
-        parts.push(("Done", list(&s.done, 2)));
+        parts.push(("Earlier today", if s.done.len() == 1 { end(&s.done[0]).to_string() } else { format!("{} more tasks done", s.done.len()) }));
     }
     if !s.now.is_empty() {
         parts.push(("Now", end(&s.now).to_string()));
@@ -192,8 +237,15 @@ pub fn space(f: &SpaceFacts) -> SpaceBrief {
     if let Some(r) = f.release.as_deref().filter(|r| !r.is_empty()) {
         stage = format!("{stage}; release {r}");
     }
-    let done: Vec<String> = tasks.iter().rev().filter(recent).filter(|t| t.state == TaskState::Verified).map(|t| with_how(t)).collect();
-    let doing: Vec<String> = f.sessions.iter().filter(|(_, _, w)| *w).map(|(n, b, _)| format!("{n} is {}", lower_first(&b.now))).collect();
+    // What was done lately, each in its session's words, the newest first.
+    let done: Vec<String> = tasks
+        .iter()
+        .rev()
+        .filter(recent)
+        .filter(|t| t.state == TaskState::Verified)
+        .map(|t| if t.name.is_empty() { outcome(t) } else { format!("{}: {}", t.name, outcome(t)) })
+        .collect();
+    let doing: Vec<String> = f.sessions.iter().filter(|(_, _, w)| *w).map(|(n, b, _)| format!("{n}: {}", clip(&b.now, 90))).collect();
     let next: Vec<String> = tasks.iter().filter(|t| t.state == TaskState::Queued).map(|t| title(t)).collect();
     let mut waits = f.waits.clone();
     waits.extend(tasks.iter().rev().filter(|t| t.state == TaskState::Blocked && !t.question.is_empty()).map(|t| clip(&t.question, 120)));
@@ -210,7 +262,9 @@ pub fn space(f: &SpaceFacts) -> SpaceBrief {
 pub fn space_lines(s: &SpaceBrief) -> Vec<(&'static str, String)> {
     let mut parts = vec![if s.goal.is_empty() { ("No goal", s.stage.clone()) } else { ("Goal", format!("{} ({})", end(&s.goal), s.stage)) }];
     if !s.done.is_empty() {
-        parts.push(("Done", list(&s.done, 2)));
+        let more = s.done.len().saturating_sub(2);
+        let shown = s.done.iter().take(2).map(|d| end(d).to_string()).collect::<Vec<_>>().join("; ");
+        parts.push(("Done", if more > 0 { format!("{shown} (and {more} more today)") } else { shown }));
     }
     parts.push(if s.doing.is_empty() { ("In progress", "nobody is working now".to_string()) } else { ("In progress", list(&s.doing, 3)) });
     if !s.next.is_empty() {
@@ -243,13 +297,6 @@ fn title(t: &Task) -> String {
     clip(words.trim(), 120)
 }
 
-/// A verified task with how it was checked ("… (verified: tests pass)").
-fn with_how(t: &Task) -> String {
-    match t.why.trim() {
-        "" => title(t),
-        how => format!("{} (verified: {})", title(t), clip(how, 100)),
-    }
-}
 
 fn why_line(t: &Task) -> String {
     let state = if t.state == TaskState::Failed { "failed" } else { "stalled" };
@@ -443,28 +490,34 @@ mod tests {
         verified.why = "its last message matches: tests pass, screenshot sent".into();
         let running = task("a2.1", "Count open gaps in the studio column", TaskState::Running, 20 * MIN);
         let queued = task("a3.1", "Draft help page", TaskState::Queued, 30 * MIN);
-        let f = SessionFacts { status: "working", said: None, tasks: vec![&verified, &running, &queued], waits_on: vec![], progress: None, now: 40 * MIN };
+        let f = SessionFacts { status: "working", said: None, tasks: vec![&verified, &running, &queued], waits_on: vec![], progress: None, upcoming: vec![], now: 40 * MIN };
         let b = session(&f);
-        assert_eq!(b.asked, "Draft help page", "its latest task");
+        assert_eq!(b.asked, "Count open gaps in the studio column", "the latest it took up");
         assert_eq!(b.now, "working on count open gaps in the studio column");
         assert_eq!(
             b.text,
-            "Asked: Draft help page. Done: Rename Unanswered to Knowledge gaps (verified: its last message matches: tests pass, screenshot sent). Now: working on count open gaps in the studio column. Next: Draft help page."
+            "Asked: Count open gaps in the studio column. Earlier today: Rename Unanswered to Knowledge gaps. Now: working on count open gaps in the studio column. Next: Draft help page."
         );
+        // Done: what came of it, in its own words; checked by the brain when it was.
+        let mut finished = task("a5.1", "ok go", TaskState::Verified, 39 * MIN);
+        finished.said = "Main is pushed and equals origin/main. 16 commits went up.".into();
+        finished.why = "the brain checked it: pushed, tests pass".into();
+        let d = session(&SessionFacts { status: "done", said: Some("Main is pushed and equals origin/main."), tasks: vec![&verified, &finished], waits_on: vec![], progress: None, upcoming: vec![], now: 40 * MIN });
+        assert_eq!(d.text, "Asked: ok go (done). Result: Main is pushed and equals origin/main (checked by the brain). Earlier today: Rename Unanswered to Knowledge gaps. Now: idle.");
         // Its live progress line, when the tower has one, is its "now" as it is.
         let p = session(&SessionFacts { progress: Some("step 3 of 5: running the tests · 12m in"), ..f });
         assert_eq!(p.now, "step 3 of 5: running the tests · 12m in");
         // Blocked on the user: what for. Idle: what it last said.
-        let blocked = session(&SessionFacts { status: "blocked", said: None, tasks: vec![], waits_on: vec!["Merge PR #839 into dev".into()], progress: None, now: 40 * MIN });
+        let blocked = session(&SessionFacts { status: "blocked", said: None, tasks: vec![], waits_on: vec!["Merge PR #839 into dev".into()], progress: None, upcoming: vec![], now: 40 * MIN });
         assert_eq!(blocked.text, "Now: waiting for you: Merge PR #839 into dev.");
-        let idle = session(&SessionFacts { status: "done", said: Some("**Done.** The PR is open. Want me to merge it?"), tasks: vec![], waits_on: vec![], progress: None, now: 40 * MIN });
+        let idle = session(&SessionFacts { status: "done", said: Some("**Done.** The PR is open. Want me to merge it?"), tasks: vec![], waits_on: vec![], progress: None, upcoming: vec![], now: 40 * MIN });
         assert_eq!(idle.now, "idle; it last said: Done.");
         // A task stalled, and a wait at the end of its turn: what it's stuck on.
         let mut stalled = task("a4.1", "Train the LoRA", TaskState::Stalled, 35 * MIN);
         stalled.why = "no progress for 2 hours".into();
-        let s = session(&SessionFacts { status: "done", said: None, tasks: vec![&stalled], waits_on: vec![], progress: None, now: 40 * MIN });
+        let s = session(&SessionFacts { status: "done", said: None, tasks: vec![&stalled], waits_on: vec![], progress: None, upcoming: vec![], now: 40 * MIN });
         assert_eq!(s.stuck.as_deref(), Some("Train the LoRA stalled: no progress for 2 hours"));
-        let w = session(&SessionFacts { status: "done", said: None, tasks: vec![], waits_on: vec!["Push to main?".into()], progress: None, now: 40 * MIN });
+        let w = session(&SessionFacts { status: "done", said: None, tasks: vec![], waits_on: vec!["Push to main?".into()], progress: None, upcoming: vec![], now: 40 * MIN });
         assert_eq!(w.stuck.as_deref(), Some("waits for your answer: Push to main?"));
     }
 
@@ -491,7 +544,7 @@ mod tests {
         let b = space(&facts);
         assert_eq!(
             b.text,
-            "Goal: Answer payment questions from the knowledge base (open; 1 of 3 tasks verified today; release prod 14:20 · 1 on dev). Done: Rename the page (verified: tests pass). In progress: mediaroom is step 2 of 4: writing the migration. Next: Draft help page. Waiting for you: Ship #1408 to prod?. Risks: Deploy to dev failed: the build broke; PR #841 has conflicts with dev."
+            "Goal: Answer payment questions from the knowledge base (open; 1 of 3 tasks verified today; release prod 14:20 · 1 on dev). Done: Rename the page. In progress: mediaroom: step 2 of 4: writing the migration. Next: Draft help page. Waiting for you: Ship #1408 to prod?. Risks: Deploy to dev failed: the build broke; PR #841 has conflicts with dev."
         );
         // Who works this moment isn't a change worth a version.
         let calm = space(&SpaceFacts { sessions: vec![("mediaroom".into(), &idle, false)], ..facts });

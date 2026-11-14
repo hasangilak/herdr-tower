@@ -232,7 +232,7 @@ impl Missions {
         let tasks: Vec<&crate::agenda::Task> = ledger.agendas.iter().flat_map(|a| a.tasks.iter()).collect();
         let prs = crate::prs::daemon().map(|p| p.list()).unwrap_or_default();
         let releases = self.shared.with(|s| s.releases.clone());
-        let progress: HashMap<String, String> = progress_lines(&self.shared);
+        let progress: HashMap<String, (String, Vec<String>)> = progress_lines(&self.shared);
         let mut hist = lock(&self.briefs);
         let mut keys = std::collections::HashSet::new();
         for m in view["spaces"].as_array_mut().into_iter().flatten() {
@@ -255,7 +255,8 @@ impl Missions {
                     said: x["said"].as_str(),
                     tasks: tasks.iter().copied().filter(|t| t.session == addr).collect(),
                     waits_on: waits_on(&addr),
-                    progress: progress.get(&addr).map(String::as_str),
+                    progress: progress.get(&addr).map(|(l, _)| l.as_str()).filter(|l| !l.is_empty()),
+                    upcoming: progress.get(&addr).map(|(_, u)| u.clone()).unwrap_or_default(),
                     now,
                 });
                 let key = format!("session:{addr}");
@@ -362,18 +363,23 @@ impl Missions {
     }
 }
 
-/// Each working session's live progress line, by address, when the tower
-/// has one (the state's agents' `progress`: step N of M, time in, last
-/// update), for its brief's "now".
-fn progress_lines(shared: &Shared) -> HashMap<String, String> {
+/// Each working session's live progress line and its task list's items
+/// still to do, by address, when the tower has them (the state's agents'
+/// `progress`: step N of M, time in, last update; `items`), for its
+/// brief's "now" and "next".
+fn progress_lines(shared: &Shared) -> HashMap<String, (String, Vec<String>)> {
     let agents = serde_json::to_value(shared.with(|s| s.agents.clone())).unwrap_or_default();
     agents
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|a| {
-            let line = a["progress"]["line"].as_str().or_else(|| a["progress"].as_str())?.trim();
-            (!line.is_empty()).then(|| (a["address"].as_str().unwrap_or("").to_string(), line.to_string()))
+            let p = &a["progress"];
+            let line = p["line"].as_str().or_else(|| p.as_str()).unwrap_or("").trim().to_string();
+            // Its own task list's items still to do: what's next.
+            let upcoming: Vec<String> =
+                p["items"].as_array().into_iter().flatten().filter(|i| i["status"] == "pending").filter_map(|i| i["subject"].as_str().map(String::from)).collect();
+            (!line.is_empty() || !upcoming.is_empty()).then(|| (a["address"].as_str().unwrap_or("").to_string(), (line, upcoming)))
         })
         .collect()
 }
