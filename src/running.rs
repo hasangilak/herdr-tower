@@ -29,6 +29,24 @@ use serde_json::Value;
 
 /// A job with no write and no CPU for this long may be stuck.
 pub const QUIET_MS: u64 = 30 * 60_000;
+/// A background shell is a job once it has run this long…
+pub const MIN_JOB_MS: u64 = 2 * 60_000;
+/// …or once it is seen running while its session's turn is over (done or
+/// idle), and has run at least this long (a helper that ends a moment
+/// after the turn is no job).
+pub const TURN_OVER_MIN_MS: u64 = 15_000;
+
+/// Whether a background shell counts as a job: a short helper a session
+/// runs in the background while it works (`S=…; until …; done`, a quick
+/// check) isn't, and its end is nobody's news. It counts once it has
+/// outlived the session's turn (`turn_over`: seen running while the session
+/// is done or idle) or run `MIN_JOB_MS`; once counted (`counted`), it stays
+/// so (a Monitor's event may wake the session meanwhile). A job the session
+/// declared always counts.
+pub fn counts(job: &Job, now_ms: u64, turn_over: bool, counted: bool) -> bool {
+    let age = now_ms.saturating_sub(job.since_ms);
+    job.source == "declared" || counted || age >= MIN_JOB_MS || (turn_over && age >= TURN_OVER_MIN_MS)
+}
 /// A process above this CPU percent is at work, whatever it writes.
 const BUSY_CPU: f32 = 5.0;
 
@@ -605,6 +623,23 @@ mod tests {
 
     fn open(fd: &str, a: &str, name: &str) -> Open {
         Open { fd: fd.into(), access: a.into(), name: name.into() }
+    }
+
+    #[test]
+    fn a_short_helper_is_no_job_until_it_outlives_the_turn_or_runs_two_minutes() {
+        let at = |secs: u64| Job { since_ms: NOW - secs * 1000, source: "background".into(), ..Default::default() };
+        // While the session works: a helper of a few seconds, or of a minute, isn't a job.
+        assert!(!counts(&at(5), NOW, false, false));
+        assert!(!counts(&at(90), NOW, false, false));
+        // Two minutes in: a job, turn or no turn.
+        assert!(counts(&at(120), NOW, false, false));
+        // Its session's turn is over and it still runs: a job (but not one that only just started).
+        assert!(counts(&at(20), NOW, true, false));
+        assert!(!counts(&at(5), NOW, true, false));
+        // Counted once: it stays a job when the session works again.
+        assert!(counts(&at(30), NOW, false, true));
+        // Declared: always.
+        assert!(counts(&Job { source: "declared".into(), ..at(1) }, NOW, false, false));
     }
 
     #[test]
