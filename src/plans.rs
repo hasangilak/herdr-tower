@@ -1268,7 +1268,10 @@ impl Book {
         }
         let p = self.open_mut(id)?;
         p.url = Some(url.to_string());
-        p.status = Status::Ready;
+        // A live plan republished (revised) stays live.
+        if p.status != Status::Live {
+            p.status = Status::Ready;
+        }
         p.why.clear();
         p.ready_ms.get_or_insert(now);
         p.updated_ms = now;

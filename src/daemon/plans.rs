@@ -660,6 +660,9 @@ impl Plans {
     /// planner runs); else the brain, to start one or say it to the user.
     fn tell_reviser(&self, p: &Plan, f: &plans::Finding) -> &'static str {
         let tower = config::tower_bin().display().to_string();
+        // The plan as it is now, with the finding in it (a planner started for it reads its findings from it).
+        let fresh = lock(&self.book).get(&p.id).cloned();
+        let p = fresh.as_ref().unwrap_or(p);
         if let Some(address) = &p.address {
             match self.sendq.add_note(address, &plans::finding_note(p, f, &tower)) {
                 Ok(_) => return "the planner",
@@ -1278,6 +1281,16 @@ mod tests {
         assert_eq!((kept["plan"]["applied"].as_bool(), kept["plan"]["version"].as_u64()), (Some(false), Some(3)));
         assert_eq!(shared.get().plans_live[0]["revisions"][2]["status"], "rejected");
         assert_eq!(decisions.list(None, false)["count"], 0);
+        // Republished (the planner revised its page): still live; a live planner's first task names the findings that wait.
+        let mut again = ask("published", "p1");
+        if let Request::Plan { url, .. } = &mut again {
+            *url = "https://claude.ai/artifact/plan".into();
+        }
+        assert!(plans.request(&again).ok);
+        assert_eq!(shared.get().plans_live[0]["status"], "live");
+        plans.found("p1", "risk", "The provider throttles at 50 rps", "s2", "", "t5").unwrap();
+        let p = lock(&plans.book).get("p1").cloned().unwrap();
+        assert!(plans::first_task(&p, "/bin/tower").contains("Findings waiting: f3 (risk): The provider throttles at 50 rps"), "{}", plans::first_task(&p, "/bin/tower"));
         // A new plan being written leaves the live one live.
         plans.change(|b| Ok(b.add(Form::Page, "Another", draft(), |id| dir.join(id), 9).0)).unwrap();
         assert_eq!((shared.get().plans_live.len(), shared.get().plan.unwrap()["id"].as_str()), (1, Some("p2")));
