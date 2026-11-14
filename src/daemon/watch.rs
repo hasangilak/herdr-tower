@@ -361,13 +361,15 @@ struct Radar {
     /// Sessions that stopped to wait for the user (a watch's report said so):
     /// their job stays blocked until they work again or end.
     waiting: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Each session's status as last written to the history (`status` lines, `crate::active`).
+    written: Arc<Mutex<HashMap<String, &'static str>>>,
 }
 
 pub fn start(shared: Shared, mouth: Mouth, alerts: Alerts, watches: Watches, asks: super::asks::Asks, decisions: super::decisions::Decisions) {
     // What was known when the last run ended, before this run's first look updates it.
     let before = watches.snapshot();
     let radar =
-        Radar { shared, mouth, alerts, watches: watches.clone(), asks, decisions, seen: Arc::new(Mutex::new(HashMap::new())), waiting: Arc::default() };
+        Radar { shared, mouth, alerts, watches: watches.clone(), asks, decisions, seen: Arc::new(Mutex::new(HashMap::new())), waiting: Arc::default(), written: Arc::default() };
     let _ = watches.radar.set(radar.clone());
     let r = radar.clone();
     radar.asks.set_notify(move |address, text| r.announce(address, text));
@@ -737,6 +739,31 @@ impl Radar {
         // What it asks, as a question set (this machine's sessions).
         if machine.is_none() {
             self.asks.seen(&address, t, &if live { status.clone() } else { SessionStatus::Exited });
+        }
+        // Its status as it changes (working, waiting on the user, idle, ended), for its space's active
+        // time (`crate::active`): a line each time, not in the record.
+        if machine.is_none()
+            && let Some(sp) = space.clone().filter(|s| !s.is_empty())
+        {
+            let word = match &status {
+                _ if !live => "exited",
+                SessionStatus::Working => "working",
+                SessionStatus::Blocked => "blocked",
+                SessionStatus::Starting => "",
+                _ => "idle",
+            };
+            let changed = !word.is_empty() && lock(&self.written).insert(address.clone(), word) != Some(word);
+            if changed && !cfg!(test) {
+                let e = crate::history::Entry {
+                    kind: "status".into(),
+                    session: Some(address.clone()),
+                    name: Some(name.clone()).filter(|n| !n.is_empty()),
+                    space: Some(sp),
+                    status: Some(word.into()),
+                    ..Default::default()
+                };
+                crate::history::later(move || crate::history::append(e));
+            }
         }
         // A decision about it: it waits on that unless it works on something else.
         if live {
