@@ -261,6 +261,7 @@ impl Running {
             // One still running was missed by this look (kept), or is a
             // server after all (dropped): neither is an end.
             let mut carried: Vec<(String, Job)> = vec![];
+            let mut gone_told: Vec<String> = vec![];
             for (address, before) in &i.jobs {
                 let now_keys: HashSet<String> = jobs.get(address).map(|l| l.iter().map(key).collect()).unwrap_or_default();
                 for j in before.iter().filter(|j| !now_keys.contains(&key(j))) {
@@ -271,6 +272,8 @@ impl Running {
                         continue;
                     }
                     let summary = j.task.as_ref().and_then(|t| i.transcripts.values().find_map(|(_, tasks)| tasks.ended.get(t).cloned()));
+                    // Over: what was told of it is forgotten.
+                    gone_told.push(format!("{address}/{}", key(j)));
                     told.push((address.clone(), ended_line(names.get(address).map(String::as_str).unwrap_or(address), j, summary.as_deref(), now)));
                 }
             }
@@ -287,9 +290,11 @@ impl Running {
                     }
                 }
             }
-            // Jobs gone: forgotten.
-            let live: HashSet<String> = jobs.iter().flat_map(|(a, l)| l.iter().map(move |j| format!("{a}/{}", key(j)))).collect();
-            i.stuck_told.retain(|k| live.contains(k));
+            // Jobs that ended: forgotten (only then: a look that saw nothing, as
+            // the first one after a restart may, forgets nothing).
+            for k in &gone_told {
+                i.stuck_told.remove(k);
+            }
             if i.stuck_told != told_before {
                 let tmp = self.path.with_file_name("jobs-told.json.tmp");
                 if std::fs::write(&tmp, serde_json::to_string(&i.stuck_told).unwrap_or_default()).is_ok() {
@@ -509,6 +514,8 @@ mod tests {
         r.settle(quiet.clone(), &names, now + 45_000);
         // Nor by a tower started again (what was told is kept on disk).
         let again = Running::open_at(r.shared.clone(), r.tell.clone(), r.path.clone());
+        // (Its first look may see nothing yet: that forgets nothing.)
+        again.settle(BTreeMap::new(), &names, now + 55_000);
         again.settle(quiet.clone(), &names, now + 60_000);
         let t = lock(&told).clone();
         assert_eq!(t.len(), 1, "{t:?}");

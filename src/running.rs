@@ -212,7 +212,7 @@ fn tag<'a>(s: &'a str, name: &str) -> Option<&'a str> {
 /// Takes in more lines of a transcript.
 pub fn read_tasks(lines: &str, tasks: &mut Tasks) {
     for line in lines.lines() {
-        if !(line.contains("run_in_background") || line.contains("\"Monitor\"") || line.contains("in background with ID") || line.contains("Monitor started") || line.contains("task-notification")) {
+        if !(line.contains("\"Bash\"") || line.contains("\"Monitor\"") || line.contains("in background with ID") || line.contains("moved to the background") || line.contains("Monitor started") || line.contains("task-notification")) {
             continue;
         }
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
@@ -225,8 +225,9 @@ pub fn read_tasks(lines: &str, tasks: &mut Tasks) {
             match b["type"].as_str() {
                 Some("tool_use") => {
                     let input = &b["input"];
+                    // Every Bash call: one in the foreground may yet be moved to the background.
                     let kind = match b["name"].as_str() {
-                        Some("Bash") if input["run_in_background"].as_bool() == Some(true) => TaskKind::Bash,
+                        Some("Bash") => TaskKind::Bash,
                         Some("Monitor") => TaskKind::Monitor,
                         _ => continue,
                     };
@@ -244,9 +245,11 @@ pub fn read_tasks(lines: &str, tasks: &mut Tasks) {
                 Some("tool_result") => {
                     let Some(task) = b["tool_use_id"].as_str().and_then(|id| tasks.pending.remove(id)) else { continue };
                     let text = text_of(&b["content"]);
+                    // Its result says it went to the background (with its id); else it was a call in the foreground.
                     let id = text
                         .split("in background with ID: ")
                         .nth(1)
+                        .or_else(|| text.split("moved to the background (ID: ").nth(1))
                         .or_else(|| text.split("Monitor started (task ").nth(1))
                         .map(|r| r.chars().take_while(|c| c.is_ascii_alphanumeric()).collect::<String>())
                         .filter(|id| !id.is_empty());
@@ -626,8 +629,10 @@ pub fn look(claude: u32, world: &World, tasks: &Tasks, now_ms: u64, turn_over: b
         if task_id.as_ref().is_some_and(|id| tasks.ended.contains_key(id)) {
             continue;
         }
-        // While the session works, a shell with no task is its call in the foreground.
-        if task_id.is_none() && !turn_over {
+        // While the session works, a shell the transcript doesn't know as a
+        // background task is its call in the foreground (Claude Code writes a
+        // foreground call's output to a task file too, until it is done).
+        if !turn_over && !task_id.as_ref().is_some_and(|id| tasks.by_id.contains_key(id)) {
             continue;
         }
         let task = task_id.as_ref().and_then(|id| tasks.by_id.get(id));
@@ -741,6 +746,9 @@ mod tests {
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu2","name":"Monitor","input":{"command":"tail -f log | grep val","description":"val loss"}}]}}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu2","content":[{"type":"text","text":"Monitor started (task bd49c9q53, expires in 30m)"}]}]}}"#,
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu3","name":"Bash","input":{"command":"ls","description":"List"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu3","content":"a.txt b.txt"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu4","name":"Bash","input":{"command":"cargo build","description":"Build"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu4","content":"Command did not complete within its 120s timeout and was moved to the background (ID: bmoved1). Output is being written to: /tmp/p/tasks/bmoved1.output."}]}}"#,
             r#"{"type":"user","message":{"content":"<task-notification>\n<task-id>bold1</task-id>\n<status>completed</status>\n<summary>Background command \"Old\" completed (exit code 0)</summary>\n</task-notification>"}}"#,
         ]
         .join("\n");
@@ -750,7 +758,8 @@ mod tests {
         assert_eq!((train.kind, train.description.as_str(), train.command.as_str()), (TaskKind::Bash, "Train the model", "python train.py > log 2>&1"));
         assert!(train.at_ms > 0);
         assert_eq!(t.by_id["bd49c9q53"].kind, TaskKind::Monitor);
-        assert_eq!(t.by_id.len(), 2, "a call in the foreground is no task");
+        assert_eq!(t.by_id["bmoved1"].description, "Build", "moved to the background on its timeout: a task");
+        assert_eq!(t.by_id.len(), 3, "a call in the foreground is no task");
         assert_eq!(t.ended["bold1"], "Background command \"Old\" completed (exit code 0)");
     }
 
@@ -863,9 +872,12 @@ mod tests {
         let (jobs, _) = look(1, &w2, &t, NOW, true);
         assert_eq!((jobs[0].what.as_str(), jobs[0].task.as_deref()), ("Train the 1.2B LoRA", Some("btrain")));
         assert!(look(999, &w, &t, NOW, true).0.is_empty());
-        // While the session works: its foreground call (a tool shell with no task) is nothing.
+        // While the session works: its foreground call (a tool shell the
+        // transcript has no background task for, its output in a task file
+        // all the same) is nothing.
         let mut w3 = World { procs: w.procs.clone(), files: w.files.clone(), listen: w.listen.clone(), mtimes: w.mtimes.clone() };
         w3.procs.push(shell(60, 1, 150, "cargo build --release && ./target/release/tower install"));
+        w3.files.insert(60, vec![open("1", "w", "/tmp/p/tasks/bfore.output")]);
         let names = |turn_over: bool| look(1, &w3, &t, NOW, turn_over).0.into_iter().map(|j| j.what).collect::<Vec<_>>();
         assert_eq!(names(false), ["Train the 1.2B LoRA", "Post-training pipeline"], "the background tasks only");
         assert_eq!(names(true).len(), 3, "its turn over: a shell left is a background one");
