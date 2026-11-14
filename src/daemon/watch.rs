@@ -361,16 +361,13 @@ struct Radar {
     /// Sessions that stopped to wait for the user (a watch's report said so):
     /// their job stays blocked until they work again or end.
     waiting: Arc<Mutex<std::collections::HashSet<String>>>,
-    /// Sessions whose turn count this run has seen: the first such look may
-    /// find a turn that ended while the tower was down (`Asks::missed_turn`).
-    counted: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 pub fn start(shared: Shared, mouth: Mouth, alerts: Alerts, watches: Watches, asks: super::asks::Asks, decisions: super::decisions::Decisions) {
     // What was known when the last run ended, before this run's first look updates it.
     let before = watches.snapshot();
     let radar =
-        Radar { shared, mouth, alerts, watches: watches.clone(), asks, decisions, seen: Arc::new(Mutex::new(HashMap::new())), waiting: Arc::default(), counted: Arc::default() };
+        Radar { shared, mouth, alerts, watches: watches.clone(), asks, decisions, seen: Arc::new(Mutex::new(HashMap::new())), waiting: Arc::default() };
     let _ = watches.radar.set(radar.clone());
     let r = radar.clone();
     radar.asks.set_notify(move |address, text| r.announce(address, text));
@@ -759,20 +756,7 @@ impl Radar {
         // A turn that ended since the last look, even if nobody saw it working.
         let before_turn = before.as_ref().and_then(|b| b.turn).or_else(|| watch.as_ref().and_then(|w| w.turn));
         let turned = matches!((before_turn, turn), (Some(a), Some(b)) if b > a) && status.ready();
-        // The first look since the tower started that has its turn count (a hook's event may come
-        // first, without one), at a turn that ended while it was down (it last looked at this
-        // terminal at a lower turn, lately): that turn's end is looked at now.
         let now = crate::history::now_ms();
-        let first_count = turn.is_some() && machine.is_none() && lock(&self.counted).insert(address.clone());
-        let missed = first_count
-            && !turned
-            && machine.is_none()
-            && live
-            && status.ready()
-            && turn.is_some_and(|n| self.asks.missed_turn(&address, created_ms, n, now));
-        if missed {
-            eprintln!("[radar] {address} ended a turn while the tower was down: its end is looked at now");
-        }
         // Each turn looked at, kept for the next start.
         if machine.is_none()
             && live
@@ -788,11 +772,11 @@ impl Radar {
             self.fire_watch(&address, &name, space.clone(), &SessionStatus::Exited, "");
             return;
         }
-        if was == status && !turned && !missed {
+        if was == status && !turned {
             return;
         }
         let working = SessionStatus::Working;
-        let stopped_working = (was == working && status != working) || (turned && was != working) || missed;
+        let stopped_working = (was == working && status != working) || (turned && was != working);
         // A turn ended: its last message may ask the user something.
         if stopped_working && status.ready() {
             self.asks.finished(&address, t, self.waiting.clone());
@@ -1223,6 +1207,17 @@ impl Radar {
             .map(|j| OpenJob { session: j.session, status: j.status, title: j.title })
             .collect();
         let owed = book::reconcile(&before, &jobs, &now, reachable);
+        // A turn that ended while the tower was down (a higher turn count than the
+        // last run looked at): its end is looked at now, as if the radar saw it.
+        for (a, n) in now.iter().filter(|(a, n)| !a.contains('/') && n.live && n.status.ready()) {
+            let Some(turn) = n.turn else { continue };
+            if !self.asks.missed_turn(a, n.created_ms, turn, crate::history::now_ms()) {
+                continue;
+            }
+            let Some(t) = hc::get(a).or_else(|| facts.get(a).cloned()) else { continue };
+            eprintln!("[radar] {a} ended a turn while the tower was down: its end is looked at now");
+            self.asks.finished(a, &t, self.waiting.clone());
+        }
         eprintln!("[radar] start: {} watch(es), {} open job(s), {} owed", before.watches.len(), jobs.len(), owed.len());
         let name_of = |a: &str| facts.get(a).map(hc::spoken_name).unwrap_or_else(|| a.to_string());
         let space_of = |a: &str| facts.get(a).and_then(crate::spaces::space_of);
