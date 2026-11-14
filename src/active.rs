@@ -276,6 +276,8 @@ impl Active {
     pub fn side_word(&self, now: u64) -> Option<String> {
         let a = self.at(now);
         match a.since_ms.filter(|_| a.now) {
+            // A stretch under a minute is "at work now", never "at work 0m" (as the phone says it).
+            Some(since) if now.saturating_sub(since) < 60_000 => Some("at work now".into()),
             Some(since) => Some(format!("at work {}", short(now.saturating_sub(since)))),
             None if a.today_ms >= 60_000 => Some(format!("{} today", short(a.today_ms))),
             None => None,
@@ -290,6 +292,8 @@ impl Active {
             return None;
         }
         let mut parts = vec![match a.since_ms.filter(|_| a.now) {
+            // A stretch under a minute leaves its part out (as the phone says it).
+            Some(since) if now.saturating_sub(since) < 60_000 => "Active now".to_string(),
             Some(since) => format!("Active now · {} this stretch", short(now.saturating_sub(since))),
             None if a.waiting_now => "Waiting on you now".to_string(),
             None => "Not at work now".to_string(),
@@ -429,6 +433,11 @@ mod tests {
         assert_eq!(idle.head_line(205 * MIN).as_deref(), Some("Not at work now · 3h 05m today · 14h 20m since it opened · waited on you 25m today"));
         let waiting = Active { waiting_now: true, ..idle.clone() };
         assert!(waiting.head_line(205 * MIN).unwrap().starts_with("Waiting on you now · 3h 05m today"));
+        // A stretch under a minute: "at work now", and no "0m this stretch" (the phone says the same).
+        let fresh = Active { since_ms: Some(200 * MIN - 30_000), ..a.clone() };
+        assert_eq!(fresh.side_word(200 * MIN).as_deref(), Some("at work now"));
+        assert_eq!(fresh.head_line(200 * MIN).as_deref(), Some("Active now · 3h 05m today · 14h 20m since it opened · waited on you 25m today"));
+        assert_eq!(fresh.side_word(200 * MIN + 30_000).as_deref(), Some("at work 1m"), "from a minute on, as before");
         assert_eq!(Active::default().side_word(5 * MIN), None);
         assert_eq!(Active::default().head_line(5 * MIN), None, "never at work: nothing said");
     }
