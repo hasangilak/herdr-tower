@@ -48,6 +48,9 @@ struct Inner {
     transcripts: HashMap<PathBuf, (u64, Tasks)>,
     /// Jobs told stuck (session/key): told once, until they write again.
     stuck_told: HashSet<String>,
+    /// Background shells that count as jobs (session/key, `running::counts`):
+    /// once they outlived their session's turn or ran two minutes.
+    counted: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -148,6 +151,8 @@ impl Running {
         let sessions: Vec<(String, String)> = self
             .shared
             .with(|s| s.agents.iter().filter(|a| a.app == "claude-code" && !a.address.contains('/')).map(|a| (a.address.clone(), a.name.clone())).collect());
+        // Whose turn is over (done or idle) now: a shell still running then has outlived it.
+        let turn_over: HashSet<String> = self.shared.with(|s| s.agents.iter().filter(|a| matches!(a.status.as_str(), "done" | "idle")).map(|a| a.address.clone()).collect());
         let claudes: Vec<(String, String, u32)> = sessions
             .into_iter()
             .filter_map(|(a, n)| crate::hc::get(&a).filter(|t| !super::watch::left_alone(t)).as_ref().and_then(crate::accounts::claude_pid).map(|p| (a, n, p)))
@@ -176,10 +181,30 @@ impl Running {
                 }
                 None => Tasks::default(),
             };
-            let found = running::look(*pid, &world, &tasks, now);
-            if !found.0.is_empty() || !found.1.is_empty() {
-                seen.insert(address.clone(), found);
+            let (jobs, servers) = running::look(*pid, &world, &tasks, now);
+            // Only what counts as a job (a helper of the session's turn isn't); counted ones stay so.
+            let jobs: Vec<Job> = {
+                let mut i = lock(&self.inner);
+                jobs.into_iter()
+                    .filter(|j| {
+                        let k = format!("{address}/{}", key(j));
+                        let ok = running::counts(j, now, turn_over.contains(address), i.counted.contains(&k));
+                        if ok {
+                            i.counted.insert(k);
+                        }
+                        ok
+                    })
+                    .collect()
+            };
+            if !jobs.is_empty() || !servers.is_empty() {
+                seen.insert(address.clone(), (jobs, servers));
             }
+        }
+        // Forget what no longer runs.
+        {
+            let mut i = lock(&self.inner);
+            let live: HashSet<String> = seen.iter().flat_map(|(a, (j, _))| j.iter().map(move |j| format!("{a}/{}", key(j)))).collect();
+            i.counted.retain(|k| live.contains(k));
         }
         self.settle(seen, &names, now);
     }
@@ -367,13 +392,17 @@ pub fn look_at(address: &str) -> Result<Value> {
         running::read_tasks(&text, &mut tasks);
     }
     let now = crate::history::now_ms();
-    let (jobs, servers) = running::look(pid, &world, &tasks, now);
+    let (all, servers) = running::look(pid, &world, &tasks, now);
+    // As the daemon counts them (without what it remembers): the rest are helpers of its turn.
+    let turn_over = matches!(crate::hc::status(&t), crate::hc::SessionStatus::Done | crate::hc::SessionStatus::Idle);
+    let (jobs, helpers): (Vec<Job>, Vec<Job>) = all.into_iter().partition(|j| running::counts(j, now, turn_over, false));
     let shells: Vec<Value> = world
         .shells(pid)
         .iter()
         .map(|s| json!({ "pid": s.pid, "task": running::task_of(world.files.get(&s.pid).map(Vec::as_slice).unwrap_or(&[])), "command": running::clip(&running::shell_command(&s.command).unwrap_or_default(), 120) }))
         .collect();
-    Ok(json!({ "session": address, "claude": pid, "line": running::line(&jobs, now), "jobs": jobs, "servers": servers, "shells": shells }))
+    let helpers: Vec<Value> = helpers.iter().map(|j| json!({ "what": j.what, "since_ms": j.since_ms })).collect();
+    Ok(json!({ "session": address, "claude": pid, "line": running::line(&jobs, now), "jobs": jobs, "helpers": helpers, "servers": servers, "shells": shells }))
 }
 
 fn cpu_busy(pid: u32) -> bool {
@@ -450,6 +479,40 @@ mod tests {
         assert_eq!(t.len(), 2);
         assert!(t[1].msg.starts_with("[job] eyz search llm's job ended: Train the 1.2B LoRA (ran 10 min)") && t[1].session == "t12r", "{}", t[1].msg);
         assert!(lock(&r.inner).jobs.is_empty());
+    }
+
+    /// The t13z case: short helpers of a working session are no jobs, and
+    /// their ends are told to nobody; one that outlives the turn is.
+    #[test]
+    fn a_helper_that_ends_within_the_turn_is_never_told() {
+        let (r, told) = running();
+        let names: HashMap<String, String> = [("t13z".to_string(), "panel window level".to_string())].into();
+        let now = 1_794_620_000_000;
+        let helper = Job { what: "S=/private/tmp/x; until [ -f done ]; do sleep 1; done".into(), since_ms: now - 4_000, task: Some("bh1".into()), source: "background".into(), ..Default::default() };
+        // What the look keeps of it while the session works: nothing.
+        let keep = |j: &Job, turn_over: bool| {
+            let mut i = lock(&r.inner);
+            let k = format!("t13z/{}", key(j));
+            let ok = running::counts(j, now, turn_over, i.counted.contains(&k));
+            if ok {
+                i.counted.insert(k);
+            }
+            ok
+        };
+        assert!(!keep(&helper, false));
+        r.settle(BTreeMap::new(), &names, now);
+        r.settle(BTreeMap::new(), &names, now + 15_000);
+        assert!(lock(&told).is_empty(), "a helper's end is no news");
+        // One that outlives the turn: counted, then told once when it ends.
+        let long = Job { what: "Train it".into(), since_ms: now - 30_000, task: Some("bj1".into()), source: "background".into(), ..Default::default() };
+        assert!(keep(&long, true));
+        assert!(keep(&long, false), "counted: it stays a job when the session works again");
+        let mut seen = BTreeMap::new();
+        seen.insert("t13z".to_string(), (vec![long], vec![]));
+        r.settle(seen, &names, now);
+        r.settle(BTreeMap::new(), &names, now + 60_000);
+        let t = lock(&told).clone();
+        assert!(t.len() == 1 && t[0].msg.contains("job ended: Train it"), "{t:?}");
     }
 
     #[test]
