@@ -722,6 +722,7 @@ mod tests {
         let prompt = "[voice] we tested on ingest filter and offer filters? [radar] t11k eyzflow: working";
         assert_eq!(request_for_prompt(&entries, prompt, Some("isa")), Some(10));
         assert_eq!(request_for_prompt(&entries, "[voice] Is it on prod?", Some("isa")), Some(20), "case and punctuation aside");
+        assert_eq!(request_for_prompt(&entries, "[voice] is it on prod? [phone] [radar] t11k eyzflow: done", Some("isa")), Some(20), "asked on the phone: its tag comes after the words");
         assert_eq!(request_for_prompt(&entries, "[voice] is it on prod?", None), Some(30), "the main tower's own");
         assert_eq!(request_for_prompt(&entries, "[watch] t11k is done", Some("isa")), None);
         assert_eq!(request_for_prompt(&entries, "[voice] typed in its terminal", Some("isa")), None, "a session's, not the brain's");
