@@ -621,6 +621,8 @@ pub struct Member {
     pub job: Option<crate::running::Shown>,
     /// A browser it uses now (`crate::browsers`).
     pub browser: Option<crate::browsers::Use>,
+    /// Where it is at, in a few sentences (`crate::briefs`).
+    pub brief: Option<crate::briefs::SessionBrief>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -738,6 +740,8 @@ pub struct Mission {
     pub auto_close_ms: Option<u64>,
     /// How long its sessions have been at work (`crate::active`; none from a daemon that doesn't say).
     pub active: Option<crate::active::Active>,
+    /// Where it is at, in a few sentences (`crate::briefs`).
+    pub brief: Option<crate::briefs::SpaceBrief>,
 }
 
 impl Mission {

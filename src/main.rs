@@ -16,6 +16,7 @@ mod answers;
 mod active;
 mod activity;
 mod behaviors;
+mod briefs;
 mod brain;
 mod brains;
 mod browsers;
@@ -489,6 +490,19 @@ enum Cmd {
         /// add: the project's name before, to rename it in its place.
         #[arg(long)]
         was: Option<String>,
+    },
+    /// Where we are, in a few sentences: each open space's brief (its goal and stage, what is done,
+    /// in progress and by whom, next, waiting for the user, risks), or one space's with its
+    /// sessions' (what each was asked, did, does now, next, is stuck on), or one session's:
+    /// `tower brief [<space>|<session>] [--history]`. JSON when piped.
+    Brief {
+        /// A space's name (or part of it), or a session's address or name; none: every space.
+        what: Vec<String>,
+        /// Also how each brief read before (its last versions).
+        #[arg(long)]
+        history: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Every space as a mission: its goal and state (open, quiet, ready to close), what needs you
     /// there, its sessions (with worktree and port) and its requests. JSON when piped.
@@ -1090,6 +1104,7 @@ fn run(cli: Cli) -> Result<()> {
             other => bail!("tower setup {other}: use `tower setup add \"<name>\" --account <account> --repo <folder>` or `tower setup remove \"<name>\"` (`tower setups` lists them)"),
         },
         Cmd::Missions { json } => missions::cmd_missions(json),
+        Cmd::Brief { what, history, json } => briefs::cmd_brief(&what.join(" "), history, json),
         Cmd::Agenda { action, args, all, force, title, space } => agenda_cmd(&action, &args, all, force, title, space),
         Cmd::Introduce { space, dry_run } => introduce_cmd(&space.join(" "), dry_run),
         Cmd::Reopen { action, spaces, dry_run, json } => reopen_cmd(action.as_deref().unwrap_or("list"), &spaces, dry_run, json),
