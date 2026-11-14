@@ -75,6 +75,57 @@ pub struct Task {
     /// Its own session in a git worktree, beside other work in the project.
     #[serde(default)]
     pub isolate: bool,
+    /// Sent from a plan (`p1`) for one of its stages (`s2`): its
+    /// instruction goes out as the structured handoff (`plans::handoff_text`),
+    /// with the fields below, and its agenda task is linked to the stage.
+    #[serde(default)]
+    pub plan: Option<String>,
+    #[serde(default)]
+    pub stage: Option<String>,
+    #[serde(default)]
+    pub goal: Option<String>,
+    #[serde(default)]
+    pub so_far: Option<String>,
+    #[serde(default)]
+    pub constraints: Option<String>,
+    #[serde(default)]
+    pub uncertain: Option<String>,
+}
+
+/// A plan's tasks go out as the structured handoff: each task with `plan`
+/// and `stage` gets its instruction rendered (its words are the `Next`),
+/// and its stage (`p1/s2`). The plans are read once.
+fn with_handoffs(plan: &mut Plan) -> Result<BTreeMap<String, String>> {
+    let mut stages = BTreeMap::new();
+    let mut read: BTreeMap<String, crate::plans::Plan> = BTreeMap::new();
+    for t in plan.tasks.iter_mut() {
+        let (Some(pid), Some(sid)) = (t.plan.clone().filter(|x| !x.trim().is_empty()), t.stage.clone().filter(|x| !x.trim().is_empty())) else {
+            if t.plan.is_some() || t.stage.is_some() {
+                bail!("task {}: a task from a plan names both its plan and its stage", t.id);
+            }
+            continue;
+        };
+        if !read.contains_key(&pid) {
+            let v = crate::plans::show(Some(&pid))?;
+            read.insert(pid.clone(), serde_json::from_value(v).context("the plan")?);
+        }
+        let p = &read[&pid];
+        let text = crate::plans::handoff_text(
+            p,
+            &sid,
+            &crate::plans::TaskHandoff {
+                task: &t.id,
+                goal: t.goal.as_deref().unwrap_or(""),
+                so_far: t.so_far.as_deref().unwrap_or(""),
+                constraints: t.constraints.as_deref().unwrap_or(""),
+                uncertain: t.uncertain.as_deref().unwrap_or(""),
+                next: &t.instruction,
+            },
+        )?;
+        t.instruction = text;
+        stages.insert(t.id.clone(), format!("{}/{}", pid.trim(), sid.trim()));
+    }
+    Ok(stages)
 }
 
 /// Where a task went.
@@ -97,7 +148,8 @@ pub struct Live {
 }
 
 pub fn run(json_text: &str, dry_run: bool) -> Result<()> {
-    let plan: Plan = serde_json::from_str(json_text).context("the plan: {\"tasks\":[{\"id\",\"project\",\"instruction\",\"after\"}]}")?;
+    let mut plan: Plan = serde_json::from_str(json_text).context("the plan: {\"tasks\":[{\"id\",\"project\",\"instruction\",\"after\"}]}")?;
+    let stages = with_handoffs(&mut plan)?;
     let order = check(&plan)?;
     let live = live_sessions();
     let routes = route(&plan, &order, &live)?;
@@ -126,6 +178,7 @@ pub fn run(json_text: &str, dry_run: bool) -> Result<()> {
             space: t.space.clone(),
             skip: false,
             from: None,
+            stage: stages.get(&t.id).cloned().unwrap_or_default(),
         };
         let (line, id, task) = match &routes[&t.id] {
             Route::Queue { session } => queue(session, &t.instruction, &after, tag)?,
@@ -327,6 +380,9 @@ fn start(t: &Task, name: &str, cwd: &str, own_worktree: bool, after: &[u64], tag
         args.extend(["--agenda".into(), a.clone()]);
     }
     args.extend(["--title".into(), tag.title.clone(), "--plan-id".into(), tag.plan_id.clone()]);
+    if !tag.stage.is_empty() {
+        args.extend(["--plan-stage".into(), tag.stage.clone()]);
+    }
     if !after.is_empty() {
         let mut held = args.clone();
         held.push("--no-track".into());
@@ -500,6 +556,12 @@ mod tests {
             account: None,
             on: None,
             isolate: false,
+            plan: None,
+            stage: None,
+            goal: None,
+            so_far: None,
+            constraints: None,
+            uncertain: None,
         }
     }
 

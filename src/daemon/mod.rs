@@ -362,7 +362,23 @@ pub fn run() -> Result<()> {
                 eprintln!("[plans] the brain can't take it: {e:#}");
             }
         });
-        plans::Plans::open(shared.clone(), sendq.clone()).wired(decisions.clone(), pr_checks, brain)
+        // A draft is read by a critic before its questions go out; each stage shows its agenda tasks.
+        let critic: plans::CriticCall = std::sync::Arc::new(|prompt: &str| crate::covered::ask(prompt));
+        let ledger = agendas.clone();
+        let stage_tasks: plans::StageTasks = std::sync::Arc::new(move |plan: &str| {
+            let want = format!("{plan}/");
+            ledger
+                .ledger()
+                .agendas
+                .iter()
+                .flat_map(|a| a.tasks.iter())
+                .filter_map(|t| {
+                    let st = t.stage.strip_prefix(&want)?;
+                    Some((st.to_string(), serde_json::json!({ "id": t.id, "title": t.title, "state": t.state, "session": t.session, "name": t.name })))
+                })
+                .collect()
+        });
+        plans::Plans::open(shared.clone(), sendq.clone()).wired(decisions.clone(), pr_checks, brain).reviewed(critic, stage_tasks)
     };
     plans.start();
     // A PR found from now on carries its review score: its plan's prediction, and its own files.
@@ -930,6 +946,8 @@ impl Daemon {
                 // A turn that a message of the user's or the tower's started: its reply, paired with it.
                 if let sessions::Change::Stopped(said) = &change {
                     self.replied(&event.terminal, terminal.as_ref(), said);
+                    // A Handoff block on a plan's task: what it found feeds the plan.
+                    self.plans.handoff(&event.terminal, said);
                 }
                 if change != sessions::Change::Nothing {
                     self.watches.agent(&event, &change);
