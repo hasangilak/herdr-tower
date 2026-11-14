@@ -18,6 +18,7 @@ mod behaviors;
 mod brain;
 mod brains;
 mod browsers;
+mod progress;
 mod chat;
 mod choices;
 mod config;
@@ -240,6 +241,22 @@ enum Cmd {
         space: Vec<String>,
         #[arg(long)]
         dry_run: bool,
+    },
+    /// How a session's turn is going. `progress <session> [question]`: asked of the session itself
+    /// without interrupting it (a working Claude Code session gets the question as its /btw side
+    /// question, and the tower reads the answer off its screen); any other session is answered from its
+    /// transcript. No session: every working session's progress line (step N of M, the call at work,
+    /// time in, last update). The brain asks this when the user asks how something is going.
+    Progress {
+        /// The session (its address or name).
+        session: Option<String>,
+        /// What to ask (default: how it is going, what is done, what is left).
+        question: Vec<String>,
+        /// Who asks: user (default), brain or phone.
+        #[arg(long, default_value = "")]
+        by: String,
+        #[arg(long)]
+        json: bool,
     },
     /// What every agent session's hooks told the tower: its terminal, session id, prompt, last answer.
     Sessions {
@@ -959,6 +976,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Model { model, effort, restart, json } => brains::cmd_model(model, effort, restart, json),
         Cmd::Queue { args } => queue_cmd(&args),
         Cmd::Dispatch { json, dry_run } => dispatch::run(&json, dry_run),
+        Cmd::Progress { session, question, by, json } => progress_cmd(session.as_deref(), &question.join(" "), &by, json),
         Cmd::Sessions { terminal } => {
             let v = protocol::send(&Request::Sessions)?.state.unwrap_or_default();
             let all = v["sessions"].as_array().cloned().unwrap_or_default();
@@ -1892,6 +1910,9 @@ fn agents(all: bool) -> Result<()> {
                 r["folder"].as_str().unwrap_or(""),
                 r["title"].as_str().unwrap_or("")
             );
+            if let Some(line) = r["progress"]["line"].as_str() {
+                println!("{:<12} {line}", "");
+            }
             if let Some(line) = r["job"]["line"].as_str() {
                 println!("{:<12} {line}", "");
             }
@@ -1926,6 +1947,17 @@ fn agent_rows(all: bool) -> (Vec<Value>, Vec<Value>) {
     };
     let browsers = |address: &str| -> Value {
         state["agents"].as_array().into_iter().flatten().find(|a| a["address"] == address).map(|a| a["browsers"].clone()).filter(|b| b.is_array()).unwrap_or(json!([]))
+    };
+    // How its turn goes, while it works: its line said as of now.
+    let progress = |address: &str, status: &Value| -> Value {
+        let p = state["agents"].as_array().into_iter().flatten().find(|a| a["address"] == address).and_then(|a| serde_json::from_value::<progress::Progress>(a["progress"].clone()).ok());
+        match p.filter(|_| status.as_str() == Some("working")) {
+            Some(mut p) => {
+                p.line = progress::line(&p, history::now_ms());
+                serde_json::to_value(p).unwrap_or(Value::Null)
+            }
+            None => Value::Null,
+        }
     };
     let mut rows = Vec::new();
     let mut errors = Vec::new();
@@ -1969,6 +2001,8 @@ fn agent_rows(all: bool) -> (Vec<Value>, Vec<Value>) {
                         "servers": servers,
                         // A browser it uses now: Chrome, the built-in one, a headless one (the latest first).
                         "browsers": if machine.is_none() { browsers(t["address"].as_str().unwrap_or("")) } else { json!([]) },
+                        // How its turn goes while it works (`progress`): step N of M, the call at work, time in, last update.
+                        "progress": if machine.is_none() { progress(t["address"].as_str().unwrap_or(""), &json!(status)) } else { Value::Null },
                     }));
                 }
             }
@@ -2355,6 +2389,51 @@ fn job_running(action: &str, what: &str, pid: Option<u32>, until: &str, minutes:
         bail!("{}", r.error.unwrap_or_default());
     }
     print_json(&r.state.unwrap_or_default());
+    Ok(())
+}
+
+/// `tower progress [<session> [question]]`.
+fn progress_cmd(session: Option<&str>, question: &str, by: &str, json_out: bool) -> Result<()> {
+    let plain = json_out || !std::io::stdout().is_terminal();
+    let Some(session) = session.map(str::trim).filter(|s| !s.is_empty()) else {
+        // Every working session's line, as the daemon last read them.
+        let (rows, _) = agent_rows(false);
+        let working: Vec<Value> = rows.into_iter().filter(|r| !r["progress"].is_null()).map(|r| json!({ "session": r["address"], "name": r["spoken"], "where": r["where"], "progress": r["progress"] })).collect();
+        if plain {
+            print_json(&json!({ "working": working }));
+        } else if working.is_empty() {
+            println!("No session is working now.");
+        } else {
+            for w in &working {
+                println!("{:<6} {:<24} {}", w["session"].as_str().unwrap_or(""), w["name"].as_str().unwrap_or(""), w["progress"]["line"].as_str().unwrap_or(""));
+            }
+        }
+        return Ok(());
+    };
+    if !protocol::is_running() {
+        bail!("the tower's voice isn't running (tower up): it asks the sessions");
+    }
+    let r = protocol::send(&Request::Progress { session: session.into(), question: question.into(), by: by.into() })?;
+    if !r.ok {
+        bail!("{}", r.error.unwrap_or_default());
+    }
+    let v = r.state.unwrap_or_default();
+    if plain {
+        print_json(&v);
+    } else {
+        println!("{} {} ({})", v["session"].as_str().unwrap_or(""), v["name"].as_str().unwrap_or(""), v["status"].as_str().unwrap_or(""));
+        if let Some(line) = v["progress"]["line"].as_str() {
+            println!("  {line}");
+        }
+        println!();
+        println!("{}", v["answer"].as_str().unwrap_or(""));
+        let how = match (v["via"].as_str(), v["why"].as_str()) {
+            (Some("btw"), _) => "asked aside with /btw: its turn went on".to_string(),
+            (_, Some(why)) => format!("from its transcript: {why}"),
+            _ => "from its transcript".to_string(),
+        };
+        println!("({how})");
+    }
     Ok(())
 }
 

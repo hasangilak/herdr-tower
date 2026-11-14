@@ -71,6 +71,10 @@ struct Inner {
     /// Each session's transcript, as last found (Claude Code rewrites the
     /// file that names it; a look that catches it mid-write keeps this one).
     paths: HashMap<String, PathBuf>,
+    /// How each transcript's turn goes (`crate::progress`).
+    readers: HashMap<PathBuf, crate::progress::Reader>,
+    /// Each working session's progress now.
+    progress: BTreeMap<String, crate::progress::Progress>,
 }
 
 /// A sharing that has not been seen for this long is over.
@@ -97,6 +101,20 @@ pub fn get() -> Option<&'static Running> {
 /// The jobs `address` has running now.
 pub fn jobs_of(address: &str) -> Vec<Job> {
     get().map(|r| lock(&r.inner).jobs.get(address).cloned().unwrap_or_default()).unwrap_or_default()
+}
+
+/// What `address`'s transcript said of its turns, as last read (its turn
+/// may be over: its words and task list are kept until its next prompt).
+pub fn reader_of(address: &str) -> Option<crate::progress::Reader> {
+    get().and_then(|r| {
+        let i = lock(&r.inner);
+        i.paths.get(address).and_then(|p| i.readers.get(p)).cloned()
+    })
+}
+
+/// How `address`'s turn goes now (None: it isn't working, or nothing read yet).
+pub fn progress_of(address: &str) -> Option<crate::progress::Progress> {
+    get().and_then(|r| lock(&r.inner).progress.get(address).cloned())
 }
 
 /// The browsers `address` uses now (the latest first).
@@ -190,6 +208,8 @@ impl Running {
             .with(|s| s.agents.iter().filter(|a| a.app == "claude-code" && !a.address.contains('/')).map(|a| (a.address.clone(), a.name.clone())).collect());
         // Whose turn is over (done or idle) now: a shell still running then has outlived it.
         let turn_over: HashSet<String> = self.shared.with(|s| s.agents.iter().filter(|a| matches!(a.status.as_str(), "done" | "idle")).map(|a| a.address.clone()).collect());
+        let working: HashSet<String> = self.shared.with(|s| s.agents.iter().filter(|a| a.status == "working").map(|a| a.address.clone()).collect());
+        let mut readers: BTreeMap<String, crate::progress::Reader> = BTreeMap::new();
         let claudes: Vec<(String, String, u32)> = sessions
             .into_iter()
             .filter_map(|(a, n)| crate::hc::get(&a).filter(|t| !super::watch::left_alone(t)).as_ref().and_then(crate::accounts::claude_pid).map(|p| (a, n, p)))
@@ -217,15 +237,19 @@ impl Running {
                     let mut i = lock(&self.inner);
                     let (from, mut tasks) = i.transcripts.remove(&path).unwrap_or_default();
                     let mut calls = i.calls.remove(&path).unwrap_or_default();
+                    let mut reader = i.readers.remove(&path).unwrap_or_default();
                     let at = match read_on(&path, from) {
                         Some((text, at)) => {
                             running::read_tasks(&text, &mut tasks);
                             calls.read(&text);
+                            reader.read(&text);
                             at
                         }
                         None => from,
                     };
                     i.transcripts.insert(path.clone(), (at, tasks.clone()));
+                    i.readers.insert(path.clone(), reader.clone());
+                    readers.insert(address.clone(), reader);
                     i.calls.insert(path, calls.clone());
                     (tasks, calls)
                 }
@@ -288,6 +312,25 @@ impl Running {
             i.serving.retain(|p| alive(*p));
             let live: HashSet<String> = seen.iter().flat_map(|(a, (j, _))| j.iter().map(move |j| format!("{a}/{}", key(j)))).collect();
             i.counted.retain(|k| live.contains(k));
+        }
+        // How each working session's turn goes, with its job's own words.
+        let progress: BTreeMap<String, crate::progress::Progress> = readers
+            .iter()
+            .filter(|(a, _)| working.contains(*a))
+            .filter_map(|(a, r)| {
+                let job = seen.get(a).and_then(|(jobs, _)| jobs.iter().find(|j| !j.note.is_empty()).map(|j| format!("{}: {}", j.what, j.note)));
+                r.progress(job, now).map(|p| (a.clone(), p))
+            })
+            .collect();
+        let moved = {
+            let mut i = lock(&self.inner);
+            let moved = i.progress != progress;
+            i.progress = progress;
+            moved
+        };
+        if moved {
+            self.publish();
+            super::missions::kick();
         }
         self.settle(seen, &names, now);
         self.browsers_now(browser_uses, &names, now);
@@ -484,9 +527,14 @@ impl Running {
             let i = lock(&self.inner);
             (i.jobs.clone(), i.servers.clone())
         };
-        let browsers = lock(&self.inner).browsers.clone();
+        let (browsers, progress) = {
+            let i = lock(&self.inner);
+            (i.browsers.clone(), i.progress.clone())
+        };
         self.shared.update(|s| {
             for a in s.agents.iter_mut() {
+                // Only while it works: a turn that ended has no progress to show.
+                a.progress = progress.get(&a.address).filter(|_| a.status == "working").cloned();
                 a.jobs = jobs.get(&a.address).cloned().unwrap_or_default();
                 a.servers = servers.get(&a.address).cloned().unwrap_or_default();
                 a.browsers = browsers.get(&a.address).cloned().unwrap_or_default();

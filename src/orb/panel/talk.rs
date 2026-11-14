@@ -180,6 +180,11 @@ pub(super) fn session_said(e: &Entry) -> Option<Said> {
         ("queue", Some("delivered" | "sent")) => (false, "sent".into(), after_colon(text).into()),
         // Its reply to what started its turn.
         ("reply", _) => (false, "replied".into(), text.into()),
+        // How it goes (`tower progress`): asked aside, without stopping its turn, and its answer.
+        ("progress", Some("asked:brain")) => (false, "the tower asked how it goes".into(), text.into()),
+        ("progress", Some(s)) if s.starts_with("asked:") => (true, "asked how it goes".into(), text.into()),
+        ("progress", Some("btw")) => (false, "answered aside (/btw), its turn went on".into(), text.into()),
+        ("progress", _) => (false, "how it goes, from its transcript".into(), text.into()),
         ("queue", Some("not-sent")) => match text.strip_prefix("Not sent: you had told it yourself (").and_then(|r| r.split_once("\"): ")) {
             Some((_, message)) => (false, "not sent: you had told it yourself".into(), message.trim().into()),
             None => (false, "not sent".into(), text.strip_prefix("Not sent: ").unwrap_or(text).into()),

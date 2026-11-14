@@ -787,6 +787,10 @@ impl Panel {
                 if let Some(words) = s.last_words().or_else(|| last_words(&self.entries, &s.address)) {
                     under.push(div().text_size(px(13.0)).line_height(px(18.0)).text_color(g.muted).line_clamp(2).child(words).into_any_element());
                 }
+                // How its turn goes while it works (amber once quiet a while).
+                if let Some(p) = s.progress.as_ref().filter(|_| s.status == "working") {
+                    under.push(progress_line(p, now));
+                }
                 // A browser it uses now (amber when another session shares the user's).
                 if let Some(b) = &s.browser {
                     let colour = if b.shared_with.is_empty() { CYAN } else { AMBER };
@@ -1291,3 +1295,20 @@ mod tests {
         assert!(!refused_close("tower space: no space called \"isa\""));
     }
 }
+
+/// A session's progress, as of `now`: "step 3 of 7: running the test suite ·
+/// 14 min in · last update 1 min ago" (amber once its transcript has been
+/// quiet `QUIET_PROGRESS_MS`).
+pub fn progress_line(p: &crate::progress::Progress, now: u64) -> AnyElement {
+    let quiet = p.last_ms > 0 && now.saturating_sub(p.last_ms) >= QUIET_PROGRESS_MS;
+    div()
+        .text_size(px(12.5))
+        .line_height(px(17.0))
+        .text_color(rgb(if quiet { AMBER } else { CYAN }))
+        .line_clamp(2)
+        .child(crate::progress::line(p, now))
+        .into_any_element()
+}
+
+/// A working session whose transcript is quiet this long shows its progress in amber.
+pub const QUIET_PROGRESS_MS: u64 = 10 * 60_000;

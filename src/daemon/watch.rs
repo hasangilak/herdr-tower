@@ -1263,6 +1263,7 @@ impl Radar {
                 jobs: super::running::jobs_of(a),
                 servers: super::running::servers_of(a),
                 browsers: super::running::browsers_of(a),
+                progress: super::running::progress_of(a).filter(|_| s.status.word() == "working"),
             })
             .filter(|a| !a.name.starts_with("tower"))
             .collect();
