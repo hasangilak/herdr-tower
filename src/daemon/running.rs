@@ -190,7 +190,7 @@ impl Running {
                 }
                 None => Tasks::default(),
             };
-            let (jobs, mut servers) = running::look(*pid, &world, &tasks, now);
+            let (jobs, mut servers) = running::look(*pid, &world, &tasks, now, turn_over.contains(address));
             // Only what counts as a job (a helper of the session's turn isn't); counted ones stay so.
             let jobs: Vec<Job> = {
                 let mut i = lock(&self.inner);
@@ -426,9 +426,9 @@ pub fn look_at(address: &str) -> Result<Value> {
         running::read_tasks(&text, &mut tasks);
     }
     let now = crate::history::now_ms();
-    let (all, servers) = running::look(pid, &world, &tasks, now);
     // As the daemon counts them (without what it remembers): the rest are helpers of its turn.
     let turn_over = matches!(crate::hc::status(&t), crate::hc::SessionStatus::Done | crate::hc::SessionStatus::Idle);
+    let (all, servers) = running::look(pid, &world, &tasks, now, turn_over);
     let (jobs, helpers): (Vec<Job>, Vec<Job>) = all.into_iter().partition(|j| running::counts(j, now, turn_over, false));
     let shells: Vec<Value> = world
         .shells(pid)

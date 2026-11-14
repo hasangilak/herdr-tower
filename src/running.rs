@@ -601,7 +601,12 @@ pub fn task_of(files: &[Open]) -> Option<String> {
 
 /// A session's background shells, read: its jobs and its servers (watches
 /// mark the jobs they watch, and count for nothing else).
-pub fn look(claude: u32, world: &World, tasks: &Tasks, now_ms: u64) -> (Vec<Job>, Vec<Server>) {
+///
+/// `turn_over`: the session is done or idle. While it works, its foreground
+/// Bash call runs in a tool shell too: then only a shell that is a background
+/// task (its output is Claude Code's task file, or the transcript has its
+/// `run_in_background` call) is looked at.
+pub fn look(claude: u32, world: &World, tasks: &Tasks, now_ms: u64, turn_over: bool) -> (Vec<Job>, Vec<Server>) {
     let mut jobs = vec![];
     let mut servers = vec![];
     let mut watches: Vec<String> = vec![];
@@ -619,6 +624,10 @@ pub fn look(claude: u32, world: &World, tasks: &Tasks, now_ms: u64) -> (Vec<Job>
         });
         // A task Claude Code said is over, whose shell lingers a moment: done.
         if task_id.as_ref().is_some_and(|id| tasks.ended.contains_key(id)) {
+            continue;
+        }
+        // While the session works, a shell with no task is its call in the foreground.
+        if task_id.is_none() && !turn_over {
             continue;
         }
         let task = task_id.as_ref().and_then(|id| tasks.by_id.get(id));
@@ -821,7 +830,7 @@ mod tests {
     #[test]
     fn a_session_with_training_running_has_a_job_not_the_watch_or_the_servers() {
         let (w, t) = world();
-        let (jobs, servers) = look(1, &w, &t, NOW);
+        let (jobs, servers) = look(1, &w, &t, NOW, true);
         let names: Vec<&str> = jobs.iter().map(|j| j.what.as_str()).collect();
         assert_eq!(names, ["Train the 1.2B LoRA", "Post-training pipeline"], "the Monitor watches, the MCP server isn't a tool shell, the dev server serves");
         let train = &jobs[0];
@@ -843,16 +852,22 @@ mod tests {
         // A task Claude Code said ended, whose shell lingers: gone.
         let mut t2 = t.clone();
         t2.ended.insert("btrain".into(), "completed".into());
-        assert_eq!(look(1, &w, &t2, NOW).0.len(), 1);
+        assert_eq!(look(1, &w, &t2, NOW, true).0.len(), 1);
         // No transcript: named by its command, still a job.
-        let (jobs, _) = look(1, &w, &Tasks::default(), NOW);
+        let (jobs, _) = look(1, &w, &Tasks::default(), NOW, true);
         assert_eq!(jobs[0].what, "python train.py > /w/train.log 2>&1");
         // A command that redirects itself whole: its stdout is its log, not the
         // task's file; known by its command instead.
         let mut w2 = World { procs: w.procs.clone(), files: w.files.clone(), listen: w.listen.clone(), mtimes: w.mtimes.clone() };
         w2.files.insert(10, vec![open("1", "w", "/w/train.log")]);
-        let (jobs, _) = look(1, &w2, &t, NOW);
+        let (jobs, _) = look(1, &w2, &t, NOW, true);
         assert_eq!((jobs[0].what.as_str(), jobs[0].task.as_deref()), ("Train the 1.2B LoRA", Some("btrain")));
-        assert!(look(999, &w, &t, NOW).0.is_empty());
+        assert!(look(999, &w, &t, NOW, true).0.is_empty());
+        // While the session works: its foreground call (a tool shell with no task) is nothing.
+        let mut w3 = World { procs: w.procs.clone(), files: w.files.clone(), listen: w.listen.clone(), mtimes: w.mtimes.clone() };
+        w3.procs.push(shell(60, 1, 150, "cargo build --release && ./target/release/tower install"));
+        let names = |turn_over: bool| look(1, &w3, &t, NOW, turn_over).0.into_iter().map(|j| j.what).collect::<Vec<_>>();
+        assert_eq!(names(false), ["Train the 1.2B LoRA", "Post-training pipeline"], "the background tasks only");
+        assert_eq!(names(true).len(), 3, "its turn over: a shell left is a background one");
     }
 }
