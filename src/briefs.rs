@@ -156,6 +156,8 @@ pub fn session(f: &SessionFacts) -> SessionBrief {
             (None, Some(t)) if !t.question.is_empty() => format!("waiting for you: {}", clip(&t.question, 120)),
             _ => "waiting on a prompt in its terminal".into(),
         },
+        // Its turn ended on a question of the user's (their card): that is where it is.
+        _ if !f.waits_on.is_empty() => format!("waiting for your answer: {}", clip(&f.waits_on[0], 120)),
         // Its turn is over, its job isn't: the job is what it does now.
         _ if f.job.is_some_and(|j| !j.trim().is_empty()) => clip(f.job.unwrap_or("").trim(), 140),
         // Idle: what it last said, unless that is the result already told.
@@ -168,10 +170,6 @@ pub fn session(f: &SessionFacts) -> SessionBrief {
     next.extend(f.upcoming.iter().map(|u| clip(u, 90)));
     let mut stuck: Vec<String> =
         tasks.iter().rev().filter(recent).filter(|t| matches!(t.state, TaskState::Stalled | TaskState::Failed)).map(|t| why_line(t)).collect();
-    // A decision it waits on while it isn't blocked (a wait at the end of its turn).
-    if f.status != "blocked" {
-        stuck.extend(f.waits_on.iter().map(|d| format!("waits for your answer: {}", clip(d, 120))));
-    }
     let stuck = stuck.into_iter().next();
     let mut s = SessionBrief { asked, result, done, now, next, stuck, ..Default::default() };
     s.text = session_text(&s);
@@ -541,8 +539,9 @@ mod tests {
         let j = session(&SessionFacts { status: "done", said: Some("Stage 1 started."), tasks: vec![], waits_on: vec![], progress: None, upcoming: vec![], job: Some("running a job: Train v2, since 01:21, last progress 07:04"), now: 40 * MIN });
         assert_eq!(j.now, "running a job: Train v2, since 01:21, last progress 07:04");
         assert_eq!(s.stuck.as_deref(), Some("Train the LoRA stalled: no progress for 2 hours"));
-        let w = session(&SessionFacts { status: "done", said: None, tasks: vec![], waits_on: vec!["Push to main?".into()], progress: None, upcoming: vec![], job: None, now: 40 * MIN });
-        assert_eq!(w.stuck.as_deref(), Some("waits for your answer: Push to main?"));
+        // Its turn ended on a question of the user's: said once, as where it is.
+        let w = session(&SessionFacts { status: "done", said: Some("Push to main?"), tasks: vec![], waits_on: vec!["Push to main?".into()], progress: None, upcoming: vec![], job: None, now: 40 * MIN });
+        assert_eq!((w.now.as_str(), w.stuck.as_deref(), w.text.as_str()), ("waiting for your answer: Push to main?", None, "Now: waiting for your answer: Push to main?."));
     }
 
     #[test]
