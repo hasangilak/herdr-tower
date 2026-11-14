@@ -114,6 +114,9 @@ pub struct Entry {
     /// `unanswered`: the request no answer will come to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<u64>,
+    /// When what it records began (a `bgjob`: the background job's start).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<u64>,
 }
 
 pub fn path() -> PathBuf {

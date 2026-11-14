@@ -741,6 +741,12 @@ impl Panel {
                 Some(r) => format!("{} · {r}", m.side_line()),
                 None => m.side_line(),
             };
+            // How long it has been at work: "at work 12m", "1h 12m today".
+            let line = match m.active.as_ref().and_then(|a| a.side_word(now)) {
+                Some(w) if line.is_empty() => w,
+                Some(w) => format!("{line} · {w}"),
+                None => line,
+            };
             list = list.child(
                 item(SharedString::from(format!("side-space-{i}")), sign(m.chip(), 22.0, format!("side-pulse-{i}")), &m.name, line, here == Side::Space(m.name.clone()))
                     .on_click(cx.listener(move |this, _, _, cx| this.nav_to(Scope::Space(name.clone()), cx))),

@@ -645,6 +645,8 @@ pub struct Sources<'a> {
     pub towers: &'a BTreeMap<String, Value>,
     pub now: u64,
     pub auto_close_hours: u64,
+    /// Each space's active time, by its name and when it opened (`crate::active`; the daemon's).
+    pub active: Option<&'a dyn Fn(&str, u64) -> crate::active::Active>,
 }
 
 impl Sources<'_> {
@@ -715,6 +717,11 @@ pub fn view(s: &Spaces, src: &Sources) -> Value {
             "ready_since_ms": m.ready_since_ms,
             "auto_close_ms": closes,
         });
+        // How long its sessions have been at work: now, today, since it opened (`crate::active`).
+        let mut v = v;
+        if let Some(f) = src.active {
+            v["active"] = json!(f(name, m.born_ms));
+        }
         rows.push((m.state == State::Quiet, needs == 0, !working, name.to_lowercase(), v));
     }
     rows.sort_by(|a, b| (a.0, a.1, a.2, &a.3).cmp(&(b.0, b.1, b.2, &b.3)).then_with(|| a.4["name"].as_str().cmp(&b.4["name"].as_str())));
@@ -743,7 +750,7 @@ fn from_files() -> Value {
         true => crate::daemon::brains::towers_of(&crate::brains::known_from_herdr(), &Default::default()),
         false => BTreeMap::new(),
     };
-    view(&spaces::load(), &Sources { sessions: sessions.as_deref(), decisions: &decisions, ledger: &ledger, threads: &threads, towers: &towers, now: history::now_ms(), auto_close_hours })
+    view(&spaces::load(), &Sources { sessions: sessions.as_deref(), decisions: &decisions, ledger: &ledger, threads: &threads, towers: &towers, now: history::now_ms(), auto_close_hours, active: None })
 }
 
 /// The missions now: the voice's (it looks again first), or from the files.
@@ -1573,7 +1580,7 @@ mod tests {
         let c = goal_from_request(&mut s, "shop", ("Ship the checkout", ""), "Ship it with Apple Pay", "Apple Pay works", &req, 420).unwrap();
         assert_eq!((c.by.as_str(), c.request.as_str(), s.agendas["Shop"].as_str(), s.missions["Shop"].goal_ms), ("request", "add Apple Pay too", "Ship it with Apple Pay", 420));
         // The view carries it for the windows and the phone.
-        let v = view(&s, &Sources { sessions: None, decisions: &[], ledger: &crate::agenda::Ledger::default(), threads: &BTreeMap::new(), towers: &BTreeMap::new(), now: 500, auto_close_hours: 24 });
+        let v = view(&s, &Sources { sessions: None, decisions: &[], ledger: &crate::agenda::Ledger::default(), threads: &BTreeMap::new(), towers: &BTreeMap::new(), now: 500, auto_close_hours: 24, active: None });
         let row = v["spaces"].as_array().unwrap().iter().find(|r| r["name"] == "Shop").unwrap();
         assert_eq!(row["goal_history"].as_array().unwrap().last().unwrap()["by"], "request");
     }
@@ -1587,7 +1594,7 @@ mod tests {
         let held = json!({ "id": "d1", "space": "docs", "hold": { "reason": "after the launch", "by": "mac", "at_ms": 200 } });
         let waits = json!({ "id": "d2", "space": "Docs" });
         let needs = |decisions: &[Value]| {
-            let v = view(&s, &Sources { sessions: None, decisions, ledger: &crate::agenda::Ledger::default(), threads: &BTreeMap::new(), towers: &BTreeMap::new(), now: 500, auto_close_hours: 24 });
+            let v = view(&s, &Sources { sessions: None, decisions, ledger: &crate::agenda::Ledger::default(), threads: &BTreeMap::new(), towers: &BTreeMap::new(), now: 500, auto_close_hours: 24, active: None });
             v["spaces"][0]["needs"].as_u64()
         };
         assert_eq!(needs(std::slice::from_ref(&held)), Some(0));
@@ -1982,7 +1989,7 @@ mod tests {
             ("Shop".to_string(), json!({ "name": "tower-shop", "status": "ready", "address": "t20" })),
             ("zeta".to_string(), json!({ "name": "tower-zeta", "status": "off", "address": null })),
         ]);
-        let src = Sources { sessions: Some(&sessions), decisions: &decisions, ledger: &l, threads: &threads, towers: &towers, now, auto_close_hours: 24 };
+        let src = Sources { sessions: Some(&sessions), decisions: &decisions, ledger: &l, threads: &threads, towers: &towers, now, auto_close_hours: 24, active: None };
         let v = view(&s, &src);
         let names: Vec<&str> = v["spaces"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap()).collect();
         // Needs you, then at work (by name, any case), then the rest, then the quiet ones.
