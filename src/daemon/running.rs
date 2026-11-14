@@ -64,9 +64,17 @@ struct Inner {
     hooked: BTreeMap<String, crate::browsers::Calls>,
     /// Each session's browser uses now.
     browsers: BTreeMap<String, Vec<crate::browsers::Use>>,
-    /// Sessions told sharing a browser of the user's (kind and addresses): once while it lasts.
-    sharing_told: HashSet<String>,
+    /// Sessions told sharing a browser of the user's (kind and addresses),
+    /// and when last seen sharing: told once while it lasts, forgotten only
+    /// `SHARING_GONE_MS` after it ended (one look that misses it is no end).
+    sharing_told: HashMap<String, u64>,
+    /// Each session's transcript, as last found (Claude Code rewrites the
+    /// file that names it; a look that catches it mid-write keeps this one).
+    paths: HashMap<String, PathBuf>,
 }
+
+/// A sharing that has not been seen for this long is over.
+const SHARING_GONE_MS: u64 = 3 * 60_000;
 
 /// How long a wait holds when no time is given.
 const WAIT_MS: u64 = 6 * 60 * 60_000;
@@ -193,7 +201,18 @@ impl Running {
         for (address, name, pid) in &claudes {
             names.insert(address.clone(), name.clone());
             // Its transcript, read on: its background tasks and its browser calls.
-            let (tasks, calls) = match crate::questions::transcript_path_of(*pid) {
+            let found = crate::questions::transcript_path_of(*pid);
+            let path = {
+                let mut i = lock(&self.inner);
+                match found {
+                    Some(p) => {
+                        i.paths.insert(address.clone(), p.clone());
+                        Some(p)
+                    }
+                    None => i.paths.get(address).cloned(),
+                }
+            };
+            let (tasks, calls) = match path {
                 Some(path) => {
                     let mut i = lock(&self.inner);
                     let (from, mut tasks) = i.transcripts.remove(&path).unwrap_or_default();
@@ -282,16 +301,15 @@ impl Running {
         let mut told: Vec<(String, String)> = vec![];
         let changed = {
             let mut i = lock(&self.inner);
-            let keys: HashSet<String> = shared.iter().map(|(k, l)| format!("{k:?}/{}", l.join(","))).collect();
             for (k, l) in &shared {
                 let key = format!("{k:?}/{}", l.join(","));
-                if i.sharing_told.insert(key) {
+                if i.sharing_told.insert(key, now).is_none() {
                     let who: Vec<String> = l.iter().map(|a| names.get(a).map(|n| format!("{n} ({a})")).unwrap_or_else(|| a.clone())).collect();
                     let line = format!("{} use {} at once: {}. They can take each other's tabs; one should wait for the other.", who.join(" and "), k.name(), all.get(&l[0]).and_then(|u| u.iter().find(|u| u.kind == Some(*k))).map(|u| u.line.clone()).unwrap_or_default());
                     told.push((l[0].clone(), line));
                 }
             }
-            i.sharing_told.retain(|k| keys.contains(k));
+            i.sharing_told.retain(|_, seen| now.saturating_sub(*seen) < SHARING_GONE_MS);
             // Hook calls past their time are gone.
             i.hooked.retain(|_, c| c.runs.values().any(|r| now <= r.last_ms + crate::browsers::CLEAR_MS));
             let changed = i.browsers != all;
@@ -318,7 +336,12 @@ impl Running {
         let host = Some(host.trim()).filter(|h| !h.is_empty()).map(String::from);
         {
             let mut i = lock(&self.inner);
-            i.hooked.entry(terminal.to_string()).or_default().call(kind, at_ms, host.clone());
+            let calls = i.hooked.entry(terminal.to_string()).or_default();
+            let new_run = calls.runs.get(&kind).is_none_or(|r| at_ms > r.last_ms + crate::browsers::CLEAR_MS);
+            calls.call(kind, at_ms, host.clone());
+            if new_run {
+                eprintln!("[browsers] {terminal}: {} ({tool}, from its hook){}", kind.name(), host.as_deref().map(|h| format!(" on {h}")).unwrap_or_default());
+            }
             // Shown at once: added to what the last look had.
             let mut c = crate::browsers::Calls::default();
             c.call(kind, at_ms, host);
