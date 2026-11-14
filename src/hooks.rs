@@ -263,6 +263,8 @@ pub fn agent_event(app: &str, terminal: &str, v: &Value) -> Option<crate::daemon
         "Stop" => "stop",
         "StopFailure" => "stop-failed",
         "SessionEnd" => "end",
+        // Only a browser tool's (the hook's matcher asks for those only).
+        "PreToolUse" if v["tool_name"].as_str().and_then(crate::browsers::kind_of_tool).is_some() => "browser",
         _ => return None,
     };
     let text = match event {
@@ -280,6 +282,12 @@ pub fn agent_event(app: &str, terminal: &str, v: &Value) -> Option<crate::daemon
             Some(if what.is_empty() { format!("permission to use {tool}") } else { format!("permission to use {tool}: {what}") })
         }
         "end" => v["reason"].as_str().map(String::from),
+        // `<tool>\t<site>`: the site the call names, if it does.
+        "browser" => {
+            let tool = v["tool_name"].as_str().unwrap_or("");
+            let host = v["tool_input"]["url"].as_str().and_then(crate::browsers::host_of).or_else(|| crate::browsers::host_of(&v["tool_input"].to_string()));
+            Some(format!("{tool}\t{}", host.unwrap_or_default()))
+        }
         _ => None,
     };
     Some(crate::daemon::sessions::AgentEvent {
@@ -598,6 +606,10 @@ mod tests {
             .unwrap();
         assert_eq!(e.text, "permission to use Bash: npm test");
         assert!(agent_event("claude", "t5", &json!({"hook_event_name":"PreToolUse"})).is_none());
+        // A browser tool's call: shown at once, with the site it names.
+        let b = agent_event("claude", "t5", &json!({"hook_event_name":"PreToolUse","tool_name":"mcp__claude-in-chrome__navigate","tool_input":{"tabId":1,"url":"https://www.sooner.de/de"}})).unwrap();
+        assert_eq!((b.event.as_str(), b.text.as_str()), ("browser", "mcp__claude-in-chrome__navigate\tsooner.de"));
+        assert!(agent_event("claude", "t5", &json!({"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}})).is_none(), "no other tool");
         // A failed turn keeps its error type: the daemon reads a usage limit off it and the message.
         let e = agent_event(
             "claude",

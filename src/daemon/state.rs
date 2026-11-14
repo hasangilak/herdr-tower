@@ -205,6 +205,10 @@ pub struct AgentLine {
     /// Servers it left running (a dev server): not jobs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub servers: Vec<crate::running::Server>,
+    /// Browsers it uses now (`crate::browsers`): Chrome, the built-in one, a
+    /// headless one; each with its site, since when and its line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub browsers: Vec<crate::browsers::Use>,
 }
 
 /// One message waiting for a session in the send queue.

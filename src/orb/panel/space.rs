@@ -785,6 +785,11 @@ impl Panel {
                 if let Some(words) = s.last_words().or_else(|| last_words(&self.entries, &s.address)) {
                     under.push(div().text_size(px(13.0)).line_height(px(18.0)).text_color(g.muted).line_clamp(2).child(words).into_any_element());
                 }
+                // A browser it uses now (amber when another session shares the user's).
+                if let Some(b) = &s.browser {
+                    let colour = if b.shared_with.is_empty() { CYAN } else { AMBER };
+                    under.push(div().text_size(px(12.5)).line_height(px(17.0)).text_color(rgb(colour)).line_clamp(2).child(b.line.clone()).into_any_element());
+                }
                 // A job it left running: what, since when, its last progress (amber when quiet).
                 if let Some(j) = &s.job {
                     let colour = if j.stuck { AMBER } else { CYAN };

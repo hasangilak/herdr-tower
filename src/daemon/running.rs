@@ -58,6 +58,14 @@ struct Inner {
     /// Jobs said to wait (session/key: what for, until when at most): no
     /// stuck check meanwhile. Kept in `jobs-waits.json`.
     waits: BTreeMap<String, (String, u64)>,
+    /// Browser calls each transcript showed (`crate::browsers`).
+    calls: HashMap<PathBuf, crate::browsers::Calls>,
+    /// Browser calls the PreToolUse hook told, by session (seen at once).
+    hooked: BTreeMap<String, crate::browsers::Calls>,
+    /// Each session's browser uses now.
+    browsers: BTreeMap<String, Vec<crate::browsers::Use>>,
+    /// Sessions told sharing a browser of the user's (kind and addresses): once while it lasts.
+    sharing_told: HashSet<String>,
 }
 
 /// How long a wait holds when no time is given.
@@ -81,6 +89,11 @@ pub fn get() -> Option<&'static Running> {
 /// The jobs `address` has running now.
 pub fn jobs_of(address: &str) -> Vec<Job> {
     get().map(|r| lock(&r.inner).jobs.get(address).cloned().unwrap_or_default()).unwrap_or_default()
+}
+
+/// The browsers `address` uses now (the latest first).
+pub fn browsers_of(address: &str) -> Vec<crate::browsers::Use> {
+    get().map(|r| lock(&r.inner).browsers.get(address).cloned().unwrap_or_default()).unwrap_or_default()
 }
 
 pub fn servers_of(address: &str) -> Vec<Server> {
@@ -176,27 +189,57 @@ impl Running {
         let world = world_for(&claudes.iter().map(|c| c.2).collect::<Vec<_>>());
         let mut seen: BTreeMap<String, (Vec<Job>, Vec<Server>)> = BTreeMap::new();
         let mut names: HashMap<String, String> = HashMap::new();
+        let mut browser_uses: BTreeMap<String, Vec<crate::browsers::Use>> = BTreeMap::new();
         for (address, name, pid) in &claudes {
             names.insert(address.clone(), name.clone());
-            if world.shells(*pid).is_empty() {
-                continue;
-            }
-            let tasks = match crate::questions::transcript_path_of(*pid) {
+            // Its transcript, read on: its background tasks and its browser calls.
+            let (tasks, calls) = match crate::questions::transcript_path_of(*pid) {
                 Some(path) => {
                     let mut i = lock(&self.inner);
                     let (from, mut tasks) = i.transcripts.remove(&path).unwrap_or_default();
+                    let mut calls = i.calls.remove(&path).unwrap_or_default();
                     let at = match read_on(&path, from) {
                         Some((text, at)) => {
                             running::read_tasks(&text, &mut tasks);
+                            calls.read(&text);
                             at
                         }
                         None => from,
                     };
-                    i.transcripts.insert(path, (at, tasks.clone()));
-                    tasks
+                    i.transcripts.insert(path.clone(), (at, tasks.clone()));
+                    i.calls.insert(path, calls.clone());
+                    (tasks, calls)
                 }
-                None => Tasks::default(),
+                None => (Tasks::default(), crate::browsers::Calls::default()),
             };
+            // A browser it uses: its calls (the transcript's, the hook's) and a
+            // headless one its shells run (not an MCP server that only waits).
+            let shell_cmds: Vec<String> = world.shells(*pid).iter().flat_map(|s| world.subtree(s.pid)).map(|p| p.command.clone()).collect();
+            let headless = crate::browsers::headless_of(&shell_cmds.iter().map(String::as_str).collect::<Vec<_>>()).map(|k| {
+                let oldest = world.shells(*pid).iter().flat_map(|s| world.subtree(s.pid)).map(|p| p.secs).max().unwrap_or(0);
+                (k, now.saturating_sub(oldest * 1000))
+            });
+            let mut uses = crate::browsers::uses(&calls, headless, now);
+            if let Some(h) = lock(&self.inner).hooked.get(address) {
+                for u in crate::browsers::uses(h, None, now) {
+                    match uses.iter_mut().find(|x| x.kind == u.kind) {
+                        Some(x) => {
+                            x.since_ms = x.since_ms.min(u.since_ms);
+                            if u.last_ms > x.last_ms {
+                                x.last_ms = u.last_ms;
+                                x.host = u.host.or(x.host.take());
+                            }
+                        }
+                        None => uses.push(u),
+                    }
+                }
+            }
+            if !uses.is_empty() {
+                browser_uses.insert(address.clone(), uses);
+            }
+            if world.shells(*pid).is_empty() {
+                continue;
+            }
             let (jobs, mut servers) = running::look(*pid, &world, &tasks, now, turn_over.contains(address));
             // Only what counts as a job (a helper of the session's turn isn't); counted ones stay so.
             let jobs: Vec<Job> = {
@@ -228,6 +271,73 @@ impl Running {
             i.counted.retain(|k| live.contains(k));
         }
         self.settle(seen, &names, now);
+        self.browsers_now(browser_uses, &names, now);
+    }
+
+    /// Each session's browser uses, who shares the user's own browser with
+    /// whom (told once while it lasts), published.
+    fn browsers_now(&self, mut all: BTreeMap<String, Vec<crate::browsers::Use>>, names: &HashMap<String, String>, now: u64) {
+        let names: BTreeMap<String, String> = names.iter().map(|(a, n)| (a.clone(), n.clone())).collect();
+        let shared = crate::browsers::settle(&mut all, &names, now);
+        let mut told: Vec<(String, String)> = vec![];
+        let changed = {
+            let mut i = lock(&self.inner);
+            let keys: HashSet<String> = shared.iter().map(|(k, l)| format!("{k:?}/{}", l.join(","))).collect();
+            for (k, l) in &shared {
+                let key = format!("{k:?}/{}", l.join(","));
+                if i.sharing_told.insert(key) {
+                    let who: Vec<String> = l.iter().map(|a| names.get(a).map(|n| format!("{n} ({a})")).unwrap_or_else(|| a.clone())).collect();
+                    let line = format!("{} use {} at once: {}. They can take each other's tabs; one should wait for the other.", who.join(" and "), k.name(), all.get(&l[0]).and_then(|u| u.iter().find(|u| u.kind == Some(*k))).map(|u| u.line.clone()).unwrap_or_default());
+                    told.push((l[0].clone(), line));
+                }
+            }
+            i.sharing_told.retain(|k| keys.contains(k));
+            // Hook calls past their time are gone.
+            i.hooked.retain(|_, c| c.runs.values().any(|r| now <= r.last_ms + crate::browsers::CLEAR_MS));
+            let changed = i.browsers != all;
+            i.browsers = all;
+            changed
+        };
+        for (address, line) in told {
+            eprintln!("[browsers] {line}");
+            let name = names.get(&address).cloned().unwrap_or_else(|| address.clone());
+            self.shared.record(&address, &line, "browser");
+            (self.tell)(Note { session: address, name, space: None, msg: format!("[browser] {line}"), speech: String::new() });
+        }
+        if changed {
+            self.publish();
+            super::missions::kick();
+        }
+    }
+
+    /// The PreToolUse hook saw a browser call (`text`: the tool, a tab, its
+    /// site if the call named one): shown at once, not at the next look.
+    pub fn browser_call(&self, terminal: &str, text: &str, at_ms: u64) {
+        let (tool, host) = text.split_once('\t').unwrap_or((text, ""));
+        let Some(kind) = crate::browsers::kind_of_tool(tool) else { return };
+        let host = Some(host.trim()).filter(|h| !h.is_empty()).map(String::from);
+        {
+            let mut i = lock(&self.inner);
+            i.hooked.entry(terminal.to_string()).or_default().call(kind, at_ms, host.clone());
+            // Shown at once: added to what the last look had.
+            let mut c = crate::browsers::Calls::default();
+            c.call(kind, at_ms, host);
+            let list = i.browsers.entry(terminal.to_string()).or_default();
+            for u in crate::browsers::uses(&c, None, at_ms) {
+                match list.iter_mut().find(|x| x.kind == u.kind) {
+                    Some(x) => {
+                        x.last_ms = at_ms;
+                        if u.host.is_some() {
+                            x.host = u.host;
+                        }
+                    }
+                    None => list.push(u),
+                }
+            }
+        }
+        let names: HashMap<String, String> = self.shared.with(|s| s.agents.iter().map(|a| (a.address.clone(), a.name.clone())).collect());
+        let all = lock(&self.inner).browsers.clone();
+        self.browsers_now(all, &names, at_ms);
     }
 
     /// What was seen, with what is declared: kept, told, published.
@@ -351,10 +461,12 @@ impl Running {
             let i = lock(&self.inner);
             (i.jobs.clone(), i.servers.clone())
         };
+        let browsers = lock(&self.inner).browsers.clone();
         self.shared.update(|s| {
             for a in s.agents.iter_mut() {
                 a.jobs = jobs.get(&a.address).cloned().unwrap_or_default();
                 a.servers = servers.get(&a.address).cloned().unwrap_or_default();
+                a.browsers = browsers.get(&a.address).cloned().unwrap_or_default();
             }
         });
     }
@@ -452,10 +564,12 @@ pub fn look_at(address: &str) -> Result<Value> {
     let pid = crate::accounts::claude_pid(&t).with_context(|| format!("{address} runs no Claude Code session on this machine"))?;
     let world = world_for(&[pid]);
     let mut tasks = Tasks::default();
+    let mut calls = crate::browsers::Calls::default();
     if let Some(path) = crate::questions::transcript_path_of(pid)
         && let Some((text, _)) = read_on(&path, 0)
     {
         running::read_tasks(&text, &mut tasks);
+        calls.read(&text);
     }
     let now = crate::history::now_ms();
     // As the daemon counts them (without what it remembers): the rest are helpers of its turn.
@@ -468,7 +582,18 @@ pub fn look_at(address: &str) -> Result<Value> {
         .map(|s| json!({ "pid": s.pid, "task": running::task_of(world.files.get(&s.pid).map(Vec::as_slice).unwrap_or(&[])), "command": running::clip(&running::shell_command(&s.command).unwrap_or_default(), 120) }))
         .collect();
     let helpers: Vec<Value> = helpers.iter().map(|j| json!({ "what": j.what, "since_ms": j.since_ms })).collect();
-    Ok(json!({ "session": address, "claude": pid, "line": running::line(&jobs, now), "jobs": jobs, "helpers": helpers, "servers": servers, "shells": shells }))
+    // A browser it uses now, and its latest run of calls with each (even one over).
+    let shell_cmds: Vec<String> = world.shells(pid).iter().flat_map(|s| world.subtree(s.pid)).map(|p| p.command.clone()).collect();
+    let headless = crate::browsers::headless_of(&shell_cmds.iter().map(String::as_str).collect::<Vec<_>>()).map(|k| (k, now));
+    let mut browsers: BTreeMap<String, Vec<crate::browsers::Use>> = BTreeMap::new();
+    browsers.insert(address.to_string(), crate::browsers::uses(&calls, headless, now));
+    crate::browsers::settle(&mut browsers, &BTreeMap::new(), now);
+    let runs: Vec<Value> = calls
+        .runs
+        .iter()
+        .map(|(k, r)| json!({ "browser": k.name(), "host": r.host, "since": crate::failover::when(r.since_ms, now), "last": crate::failover::when(r.last_ms, now) }))
+        .collect();
+    Ok(json!({ "session": address, "claude": pid, "line": running::line(&jobs, now), "jobs": jobs, "helpers": helpers, "servers": servers, "shells": shells, "browsers": browsers.remove(address).unwrap_or_default(), "browser_runs": runs }))
 }
 
 fn save_json<T: serde::Serialize>(path: &std::path::Path, v: &T) {

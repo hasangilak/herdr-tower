@@ -677,6 +677,21 @@ Every Claude session on this Mac carries its account: `tower agents`,
 account never changes, so it's looked up once per pid and kept in
 `~/.local/state/herder-tower/accounts.json`.
 
+#### A session using a browser
+
+While a session drives a browser, the tower says so: "using Chrome:
+sooner.de, since 04:00" on the radar line, in `tower agents`, in a space's
+and a session's view on the Mac, and on the phone (`src/browsers.rs`). It
+knows the browser by the tool's MCP server (`mcp__claude-in-chrome__…` is
+the user's Chrome; Claude_Browser the built-in one; Playwright, Puppeteer,
+Chrome DevTools, agent-browser), its site by the URLs a call names or its
+result shows, and a headless browser by the processes a session's shells
+run. It reads the session's transcript every 15 s, and a PreToolUse hook on
+browser tools only (`tower hooks install`) tells it at once, for sessions
+started after the hook. Cleared 90 s after the last call. Two sessions in
+the user's own Chrome (or built-in browser) at once can take each other's
+tabs: each says with whom, and the tower is told once.
+
 #### A session with a job running
 
 A session's turn can end while a job it started keeps running in the

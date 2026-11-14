@@ -619,6 +619,8 @@ pub struct Member {
     pub said: Option<String>,
     /// A job it left running (`crate::running`): its turn may be done, its work isn't.
     pub job: Option<crate::running::Shown>,
+    /// A browser it uses now (`crate::browsers`).
+    pub browser: Option<crate::browsers::Use>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1080,6 +1082,11 @@ pub fn adapt_missions(spaces: &Spaces, live: &[Live], known: &[String], agents: 
                         .and_then(|l| l.iter().find(|a| a["address"] == address.as_str()))
                         .and_then(|a| serde_json::from_value::<Vec<crate::running::Job>>(a["jobs"].clone()).ok())
                         .and_then(|jobs| crate::running::shown(&jobs, crate::history::now_ms())),
+                    browser: agents
+                        .as_array()
+                        .and_then(|l| l.iter().find(|a| a["address"] == address.as_str()))
+                        .and_then(|a| serde_json::from_value::<Vec<crate::browsers::Use>>(a["browsers"].clone()).ok())
+                        .and_then(|b| b.into_iter().next()),
                     ..Default::default()
                 })
                 .collect(),

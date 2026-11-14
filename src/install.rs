@@ -69,7 +69,9 @@ pub fn install(keys: bool) -> Result<()> {
 
 /// The agent events the tower follows, per program (Claude Code's and
 /// Codex's hook names). Tool calls are left out: far too many.
-const CLAUDE_EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit", "Notification", "PermissionRequest", "Stop", "StopFailure", "SessionEnd"];
+const CLAUDE_EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit", "Notification", "PermissionRequest", "Stop", "StopFailure", "SessionEnd", "PreToolUse"];
+/// PreToolUse is hooked for browser tools only (`crate::browsers`): no other call pays for it.
+const BROWSER_TOOLS: &str = "mcp__claude-in-chrome__.*|mcp__.*Claude_Browser.*|mcp__playwright.*|mcp__puppeteer.*|mcp__chrome-devtools.*|mcp__agent-browser.*|mcp__.*browser.*";
 const CODEX_EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit", "PermissionRequest", "Stop"];
 
 /// Where each program keeps its hooks.
@@ -157,7 +159,11 @@ fn with_hooks(settings: &Value, events: &[&str], command: &str) -> Value {
     for event in events {
         let list = v["hooks"][*event].as_array().cloned().unwrap_or_default();
         let mut list: Vec<Value> = list.into_iter().filter(|e| !is_ours(e)).collect();
-        list.push(serde_json::json!({ "hooks": [{ "type": "command", "command": command, "timeout": 5 }] }));
+        let mut entry = serde_json::json!({ "hooks": [{ "type": "command", "command": command, "timeout": 5 }] });
+        if *event == "PreToolUse" {
+            entry["matcher"] = serde_json::json!(BROWSER_TOOLS);
+        }
+        list.push(entry);
         v["hooks"][*event] = Value::Array(list);
     }
     v

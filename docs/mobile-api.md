@@ -900,6 +900,24 @@ session's and the tower's account, a moved one marked "moved from default
 at 15:02". The Mac's full window has it as its Accounts view and a strip in
 its sidebar.
 
+**Browsers in use** (feature `browsers`). While a session drives a browser
+(Claude in Chrome, the built-in browser, a Playwright, Puppeteer or Chrome
+DevTools server, or a headless browser its shell runs), a mission's session
+carries it, cleared 90 s after its last call:
+
+```
+"browser": { "kind": "chrome" | "built-in" | "playwright" | "puppeteer" | "dev-tools" | "agent-browser" | "headless",
+             "browser": "Chrome", "host": "sooner.de" | null, "since_ms": 1794625200000, "last_ms": 1794625260000,
+             "via": "tools" | "process",
+             "shared_with": ["sooner app web (t14w)"],   (others in the user's own browser now)
+             "line": "using Chrome: sooner.de, since 04:00" }
+```
+
+and each of the state's `agents` has `browsers` (the same, the latest
+first). Show the `line` under the session's name; in amber when
+`shared_with` isn't empty (two sessions in the user's Chrome can take each
+other's tabs).
+
 **Jobs running** (feature `jobs`). A session's turn can end while a job it
 started keeps running in the background (a training run it watches): its
 `status` says `done`, its work doesn't. The tower sees Claude Code's
@@ -1853,6 +1871,7 @@ stream's `hello` event). A tower from before there were features sends no
 | `reviews` | PR review: `review` on a PR (`GET /v1/prs`, the `pr` event, a chat chip's `pr`, a merge decision's `prs[]`), `review` on a mission, `reviews` in the state, and a review that isn't agreed among a merge's `warnings` |
 | `releases` | Each space's release track: `releases` in the state (by space) and `GET /v1/releases` (`?space=` for one) |
 | `accounts` | Each Claude account's usage and the failover's moves: `accounts` in the state, and `account` on each of the state's `brains` and on a mission's `tower` (see "Accounts and usage") |
+| `browsers` | A session using a browser: `browser` on a mission's session, `browsers` on each of the state's `agents` (see "Browsers in use") |
 | `jobs` | Jobs sessions left running in the background: `job` on a mission's session, `jobs` and `servers` on each of the state's `agents` (see "Jobs running") |
 | `impact` | Who outside depends on what a PR changes: `impact` on a PR (wherever `score` is) and `dependents` / `outside` on a predicted one (`plan.prs`), and a breaking change's warning among a merge's `warnings` |
 | `validation` | A predicted PR's `checks` and `edge_cases` (`plan.prs`), and `validation` on a PR (wherever `score` is), with the missing checks among a merge's `warnings` |
