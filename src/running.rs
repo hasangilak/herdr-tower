@@ -353,7 +353,10 @@ fn serves(command: &str) -> Option<Kind> {
         " python -m http.server ",
         " manage.py runserver ",
     ];
-    if SERVE.iter().any(|s| c.contains(s)) || compose_up(&c) {
+    // A command that sets the port it serves on, or runs a dev-server script, serves too.
+    let sets_port = c.split_whitespace().any(|t| t.strip_prefix("port=").is_some_and(|v| !v.is_empty() && v.chars().all(|ch| ch.is_ascii_digit())));
+    let dev_server = ["dev-server", "devserver", "dev_server"].iter().any(|w| c.contains(w));
+    if SERVE.iter().any(|s| c.contains(s)) || compose_up(&c) || sets_port || dev_server {
         return Some(Kind::Server);
     }
     None
@@ -760,6 +763,10 @@ mod tests {
         for c in ["docker compose -f docker-compose.dev.yml up --build > /tmp/x.log 2>&1", "docker-compose up", "cd app && docker compose --profile dev up web"] {
             assert_eq!(kind_of(Some(&bash(c)), &[], false), Kind::Server, "{c}");
         }
+        for c in ["npx dotenv -e .env.local -- env APP_NAME=management PORT=3002 node scripts/dev-server.mjs", "PORT=8080 node app.js", "node scripts/devserver.js"] {
+            assert_eq!(kind_of(Some(&bash(c)), &[], false), Kind::Server, "{c}");
+        }
+        assert_eq!(kind_of(Some(&bash("node scripts/report.js --port-check")), &[], false), Kind::Job);
         for c in ["docker compose -f x.yml up -d", "docker compose up --detach && npm test", "docker-compose up --wait", "docker compose up -dV", "docker compose build", "docker compose -f x.yml run --rm migrate"] {
             assert_eq!(kind_of(Some(&bash(c)), &[], false), Kind::Job, "{c}");
         }

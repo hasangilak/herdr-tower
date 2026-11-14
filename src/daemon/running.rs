@@ -52,6 +52,9 @@ struct Inner {
     /// Background shells that count as jobs (session/key, `running::counts`):
     /// once they outlived their session's turn or ran two minutes.
     counted: HashSet<String>,
+    /// Shells seen serving (a listening port): servers for as long as they
+    /// run, even when a look misses their port.
+    serving: HashSet<u32>,
 }
 
 #[derive(Clone)]
@@ -187,10 +190,14 @@ impl Running {
                 }
                 None => Tasks::default(),
             };
-            let (jobs, servers) = running::look(*pid, &world, &tasks, now);
+            let (jobs, mut servers) = running::look(*pid, &world, &tasks, now);
             // Only what counts as a job (a helper of the session's turn isn't); counted ones stay so.
             let jobs: Vec<Job> = {
                 let mut i = lock(&self.inner);
+                // A shell once seen serving stays a server (its port may be missed in a look).
+                i.serving.extend(servers.iter().map(|s| s.pid));
+                let (was_serving, jobs): (Vec<Job>, Vec<Job>) = jobs.into_iter().partition(|j| j.pid.is_some_and(|p| i.serving.contains(&p)));
+                servers.extend(was_serving.into_iter().map(|j| Server { what: j.what, pid: j.pid.unwrap_or(0), ports: vec![] }));
                 jobs.into_iter()
                     .filter(|j| {
                         let k = format!("{address}/{}", key(j));
@@ -209,6 +216,7 @@ impl Running {
         // Forget what no longer runs.
         {
             let mut i = lock(&self.inner);
+            i.serving.retain(|p| alive(*p));
             let live: HashSet<String> = seen.iter().flat_map(|(a, (j, _))| j.iter().map(move |j| format!("{a}/{}", key(j)))).collect();
             i.counted.retain(|k| live.contains(k));
         }
@@ -249,13 +257,25 @@ impl Running {
             for (a, d) in &i.declared {
                 jobs.entry(a.clone()).or_default().extend(d.iter().cloned());
             }
-            // Jobs gone since the last look: ended.
+            // Jobs gone since the last look: ended, when their process is gone.
+            // One still running was missed by this look (kept), or is a
+            // server after all (dropped): neither is an end.
+            let mut carried: Vec<(String, Job)> = vec![];
             for (address, before) in &i.jobs {
                 let now_keys: HashSet<String> = jobs.get(address).map(|l| l.iter().map(key).collect()).unwrap_or_default();
                 for j in before.iter().filter(|j| !now_keys.contains(&key(j))) {
+                    if let Some(p) = j.pid.filter(|p| j.source != "declared" && alive(*p)) {
+                        if !servers.get(address).is_some_and(|l| l.iter().any(|s| s.pid == p)) {
+                            carried.push((address.clone(), j.clone()));
+                        }
+                        continue;
+                    }
                     let summary = j.task.as_ref().and_then(|t| i.transcripts.values().find_map(|(_, tasks)| tasks.ended.get(t).cloned()));
                     told.push((address.clone(), ended_line(names.get(address).map(String::as_str).unwrap_or(address), j, summary.as_deref(), now)));
                 }
+            }
+            for (address, j) in carried {
+                jobs.entry(address).or_default().push(j);
             }
             // Quiet: told once for as long as it runs (not again when it wrote
             // meanwhile and went quiet again, nor after a restart of the tower).
@@ -530,6 +550,37 @@ mod tests {
         let mut seen = BTreeMap::new();
         seen.insert("t13z".to_string(), (vec![long], vec![]));
         r.settle(seen, &names, now);
+        r.settle(BTreeMap::new(), &names, now + 60_000);
+        let t = lock(&told).clone();
+        assert!(t.len() == 1 && t[0].msg.contains("job ended: Train it"), "{t:?}");
+    }
+
+    /// A job still running is no end, whatever one look said: missed (kept),
+    /// or seen as the server it is (dropped, silently). Only a gone process ends.
+    #[test]
+    fn only_a_job_whose_process_is_gone_has_ended() {
+        let (r, told) = running();
+        let names: HashMap<String, String> = [("t13q".to_string(), "eyz mediaroom serverless".to_string())].into();
+        let now = 1_794_620_000_000;
+        let me = std::process::id();
+        let live = Job { what: "PORT=3002 node scripts/dev-server.mjs".into(), since_ms: now - 30 * 60_000, pid: Some(me), task: Some("bdev".into()), source: "background".into(), ..Default::default() };
+        let mut seen = BTreeMap::new();
+        seen.insert("t13q".to_string(), (vec![live.clone()], vec![]));
+        r.settle(seen.clone(), &names, now);
+        // A look misses it: kept, not ended.
+        r.settle(BTreeMap::new(), &names, now + 15_000);
+        assert_eq!(lock(&r.inner).jobs["t13q"].len(), 1, "carried over");
+        // Seen as a server: no job, and still no end.
+        let mut as_server = BTreeMap::new();
+        as_server.insert("t13q".to_string(), (vec![], vec![Server { what: live.what.clone(), pid: me, ports: vec![3002] }]));
+        r.settle(as_server, &names, now + 30_000);
+        assert!(lock(&r.inner).jobs.get("t13q").is_none());
+        assert!(lock(&told).is_empty(), "{:?}", lock(&told));
+        // A process that is gone: ended, told.
+        let dead = Job { pid: Some(999_999_999), task: Some("bgone".into()), what: "Train it".into(), ..live };
+        let mut seen = BTreeMap::new();
+        seen.insert("t13q".to_string(), (vec![dead], vec![]));
+        r.settle(seen, &names, now + 45_000);
         r.settle(BTreeMap::new(), &names, now + 60_000);
         let t = lock(&told).clone();
         assert!(t.len() == 1 && t[0].msg.contains("job ended: Train it"), "{t:?}");
