@@ -1874,7 +1874,7 @@ impl Panel {
             .border_color(rgba(LINE))
             .child(h_flex().gap(px(8.0)).items_center().child(div().flex_1().min_w_0().text_size(px(14.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.text).child(live_head(p))).children(open))
             .children(stage_rows)
-            .when(waiting > 0, |el| el.child(div().text_size(px(12.5)).text_color(rgb(AMBER)).child(format!("{waiting} finding{} wait for the plan's revision.", if waiting == 1 { "" } else { "s" }))))
+            .when(waiting > 0, |el| el.child(div().text_size(px(12.5)).text_color(rgb(AMBER)).child(format!("{waiting} finding{} for the plan's revision.", if waiting == 1 { " waits" } else { "s wait" }))))
             .when(!p.revisions.is_empty(), |el| {
                 el.child(div().pt(px(4.0)).text_size(px(11.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.faint).child("WHAT CHANGED"))
                     .children(p.revisions.iter().rev().take(4).map(|r| {
