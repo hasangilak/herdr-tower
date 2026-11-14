@@ -150,14 +150,49 @@ pub fn settle(address: &str) {
 /// is showing: Claude Code's ("Yes, I trust this folder", sometimes below a
 /// highlighted "No, exit") and Codex's.
 fn trust_answer(screen: &str) -> Option<Vec<&'static str>> {
+    trust_keys(screen, true)
+}
+
+/// A reply to a folder-trust question, in the words a card or the user gave
+/// it: `Some(true)` to trust ("yes", "Yes, trust it", "trust it", "ok"),
+/// `Some(false)` not to ("no", "No, exit", "don't"). None: no answer to it.
+pub fn trust_reply(text: &str) -> Option<bool> {
+    let t = text.trim().to_lowercase();
+    // A card's answer comes framed: `About "…": the user decided: Yes, trust it.`
+    let t = ["the user decided:", "the user says:"]
+        .iter()
+        .find_map(|k| t.rfind(k).map(|i| t[i + k.len()..].trim().to_string()))
+        .unwrap_or(t);
+    let t = t.trim_end_matches(['.', '!']);
+    let first = t.split(|c: char| !c.is_alphanumeric() && c != '\'').find(|w| !w.is_empty()).unwrap_or("");
+    match first {
+        "yes" | "y" | "ok" | "okay" | "trust" | "sure" | "allow" => Some(true),
+        "no" | "n" | "don't" | "dont" | "exit" | "deny" => Some(false),
+        _ => None,
+    }
+}
+
+/// The keys that pick its yes (`yes`) or its no on a folder-trust question
+/// on screen ("Yes, I trust this folder" / "No, exit"), from where its
+/// cursor is. None: no such question shows.
+pub fn trust_keys(screen: &str, yes: bool) -> Option<Vec<&'static str>> {
     let lower = screen.to_lowercase();
     if !lower.contains("trust") {
         return None;
     }
     let lines: Vec<&str> = screen.lines().collect();
+    // An option's words, past its cursor and its number ("❯ 1. Yes, …").
+    let option = |l: &str| {
+        let l = l.trim_start().trim_start_matches(['❯', '›', '>']).trim_start();
+        l.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')').trim_start().to_lowercase()
+    };
     let yes = lines.iter().position(|l| {
-        let l = l.to_lowercase();
-        l.contains("yes") && (l.contains("trust") || l.contains("proceed") || l.contains("allow"))
+        let l = option(l);
+        if yes {
+            l.starts_with("yes") && (l.contains("trust") || l.contains("proceed") || l.contains("allow"))
+        } else {
+            l.starts_with("no") && (l.contains("exit") || l.contains("trust") || l.contains("quit"))
+        }
     })?;
     let cursor =
         lines.iter().position(|l| l.trim_start().starts_with('❯') || l.trim_start().starts_with('›') || l.trim_start().starts_with('>'));
@@ -500,7 +535,7 @@ pub fn brain_dir_exists() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::trust_answer;
+    use super::{trust_answer, trust_keys, trust_reply};
 
     #[test]
     fn a_brain_is_known_by_its_own_name_never_by_a_sessions_label() {
@@ -630,6 +665,13 @@ mod tests {
     #[test]
     fn answers_claude_trust() {
         let screen = " Quick safety check: Is this a project you created or one you trust?\n ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm";
+        // Its no, too: already under the cursor.
+        assert_eq!(trust_keys(screen, false), Some(vec!["enter"]));
+        assert_eq!(trust_keys(" ❯ Yes, I trust this folder\n   No, exit\n Enter to confirm", false), Some(vec!["down", "enter"]));
+        assert_eq!(trust_keys("no question here", true), None);
+        for (t, want) in [("yes", Some(true)), ("Yes, trust it", Some(true)), ("y", Some(true)), ("trust it.", Some(true)), ("No", Some(false)), ("No, exit", Some(false)), ("don't", Some(false)), ("archive the old notes", None), ("About \"May it trust the folder?\": the user decided: Yes, trust it.", Some(true)), ("About \"Trust it?\": the user says: no, leave it", Some(false)), ("About \"Trust it?\": the user decided: Later.", None)] {
+            assert_eq!(trust_reply(t), want, "{t}");
+        }
         assert_eq!(trust_answer(screen), Some(vec!["down", "enter"]));
         let screen = " Do you trust the files in this folder?\n ❯ 1. Yes, proceed\n   2. No, exit";
         assert_eq!(trust_answer(screen), Some(vec!["enter"]));

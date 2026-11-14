@@ -1115,6 +1115,11 @@ impl Daemon {
     /// `tower queue`: add (sent now when the session is free), list, cancel.
     /// The agenda ledger takes on what the queue just did.
     fn ledger(&self, queue_id: u64, session: &str, name: &str, text: &str, tag: Option<crate::agenda::Tag>) -> Option<crate::agenda::Registered> {
+        // Id 0: nothing was queued, its answer was pressed on its screen (a
+        // folder-trust question's yes or no): no task of anyone's.
+        if queue_id == 0 {
+            return None;
+        }
         self.agendas.register(crate::agenda::Reg { queue_id, session: session.into(), name: name.into(), text: text.into(), tag: tag.unwrap_or_default() })
     }
 
