@@ -28,6 +28,7 @@ mod dispatch;
 mod failover;
 mod goals;
 mod draft;
+mod fixes;
 mod hc;
 mod history;
 mod hooks;
@@ -284,6 +285,17 @@ enum Cmd {
         text: Vec<String>,
         #[arg(long)]
         json: bool,
+    },
+    /// About your PR the tower follows: `tower pr cant-fix <pr> "<why>"` when you were asked to
+    /// resolve its conflicts with its base (or bring it up to date) and can't. It then goes to
+    /// the user, with your words. A PR is its key (owner/repo#12), its link, or #12 (yours).
+    Pr {
+        /// cant-fix.
+        action: String,
+        /// The PR: owner/repo#12, its link, or #12.
+        pr: String,
+        /// Why it can't be resolved.
+        why: Vec<String>,
     },
     /// Report one of the planned checks of your PR (its plan lists them: what it shows, how, the
     /// evidence): `tower validate <pr> <check> passed|failed|not-run --evidence "<test output, a
@@ -972,6 +984,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Automerge { action } => automerge_cmd(&action),
         Cmd::Releases { space, json } => releases_cmd(space.as_deref(), json),
         Cmd::Impact { pr, verdict, text, json } => impact_cmd(&pr, verdict.as_deref(), &text.join(" "), json),
+        Cmd::Pr { action, pr, why } => pr_cmd(&action, &pr, &why.join(" ")),
         Cmd::Validate { pr, check, status, evidence, json } => validate_cmd(&pr, check.as_deref(), status.as_deref(), evidence.as_deref(), json),
         Cmd::MacVoice { action } => {
             let on = if protocol::is_running() {
@@ -1472,6 +1485,23 @@ fn releases_cmd(space: Option<&str>, as_json: bool) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// `tower pr cant-fix <pr> "<why>"`.
+fn pr_cmd(action: &str, pr: &str, why: &str) -> Result<()> {
+    if action != "cant-fix" {
+        bail!("tower pr cant-fix <pr> \"<why you can't resolve its conflicts>\"");
+    }
+    if why.trim().is_empty() {
+        bail!("say why: tower pr cant-fix {pr} \"<why you can't resolve its conflicts>\"");
+    }
+    let r = protocol::send(&Request::CantFix { pr: pr.trim().to_string(), why: why.trim().to_string(), from: peers::caller() })?;
+    if !r.ok {
+        bail!("{}", r.error.unwrap_or_default());
+    }
+    let v = r.state.unwrap_or_default();
+    println!("{}: {}", v["pr"].as_str().unwrap_or(pr), v["line"].as_str().unwrap_or("it goes to the user"));
     Ok(())
 }
 

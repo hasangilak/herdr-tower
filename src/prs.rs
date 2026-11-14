@@ -128,6 +128,9 @@ pub struct Pr {
     /// It had no description and its session was asked to write one (once).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub asked_body: bool,
+    /// It conflicts with its base (or fell behind it) and its session was asked to fix that (`crate::fixes`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<crate::fixes::Fix>,
 }
 
 impl Pr {
@@ -144,8 +147,11 @@ impl Pr {
     /// running (its reviewer reading it, or its session fixing what the
     /// review found). Until then it waits for nobody: it is in no merge
     /// decision, and comes in when it is ready.
+    /// Nor one with conflicts (or behind its base) that its session is
+    /// fixing (`crate::fixes::with_user`): it comes when it merges cleanly,
+    /// or when the fix came back to the user.
     pub fn ready_for_user(&self) -> bool {
-        !self.draft && !self.review.as_ref().is_some_and(|r| matches!(r.status.as_str(), "reviewing" | "changes"))
+        !self.draft && !self.review.as_ref().is_some_and(|r| matches!(r.status.as_str(), "reviewing" | "changes")) && crate::fixes::with_user(self)
     }
 
     /// As the chat, the panel and the phone show it: the PR and whether
@@ -827,6 +833,16 @@ impl Prs {
         self.store(pr, "update", true);
     }
 
+    /// Its fix as it goes (`crate::fixes`); None: done with.
+    pub fn set_fix(&self, k: &str, fix: Option<crate::fixes::Fix>) {
+        let Some(mut pr) = self.get(k) else { return };
+        if pr.fix == fix {
+            return;
+        }
+        pr.fix = fix;
+        self.store(pr, "update", true);
+    }
+
     /// It had no description, and its session was asked to write one.
     pub fn set_asked_body(&self, k: &str) {
         let Some(mut pr) = self.get(k) else { return };
@@ -887,7 +903,7 @@ impl Prs {
     /// Its review, score and the tower's merge stay as `set_review`,
     /// `set_score` and `set_auto` last put them: a look at GitHub that began
     /// before they moved doesn't take them back.
-    fn put(&self, pr: Pr, op: &str) {
+    pub(crate) fn put(&self, pr: Pr, op: &str) {
         self.store(pr, op, false);
     }
 
@@ -1137,6 +1153,7 @@ fn keep_own(pr: &mut Pr, old: &Pr) {
     pr.impact = old.impact.clone();
     pr.described = old.described.clone();
     pr.asked_body = old.asked_body;
+    pr.fix = old.fix.clone();
 }
 
 /// A PR without when and whether it is looked at: what the chip shows.
