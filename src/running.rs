@@ -40,8 +40,84 @@ pub fn quiet_ms() -> u64 {
 const FINITE: &[&str] = &[
     "build", "builds", "rebuild", "test", "tests", "testing", "train", "training", "retrain", "migrate", "migration", "migrations", "import",
     "export", "seed", "install", "lint", "typecheck", "bench", "benchmark", "eval", "evaluate", "deploy", "compile", "generate", "backfill",
-    "sync", "download", "upload", "convert", "score", "scan", "check", "checks", "run once",
+    "sync", "download", "upload", "convert", "score", "scan", "check", "checks", "run once", "evals", "evaluation", "evaluating", "scoring",
+    "benchmarks", "baseline", "baselines", "finetune", "fine-tune", "fine-tuning", "tune", "tuning", "label", "labels", "labelling", "labeling",
+    "migrating", "importing", "exporting", "generating", "building", "compiling", "index", "indexing", "reindex", "embed", "embedding",
+    "embeddings", "crawl", "scrape", "transcode", "render", "predict", "predictions", "inference", "infer", "validate", "validation", "verify",
+    "sweep", "pytest", "jest", "vitest", "mocha", "cypress", "playwright test", "cargo test", "go test", "dbt run", "wait", "waits",
+    "waiting",
 ];
+
+/// Words of serving that outweigh a finite one in a call's description:
+/// "Serve the build", "Start the dev server and its tests" stays a server.
+fn strong_serving(description: &str) -> bool {
+    let w = words_of(description);
+    let has = |x: &str| w.iter().any(|y| y == x);
+    let pair = |a: &str, b: &str| w.windows(2).any(|p| p[0] == a && p[1] == b);
+    ["server", "servers", "serve", "serves", "serving", "watch", "watcher", "watching"].iter().any(|x| has(x))
+        || ["bring", "spin", "compose", "stack"].iter().any(|a| pair(a, "up"))
+}
+
+/// Words of a finite step in `text` ("Evaluate v1 and v2", "eval_real_both.sh").
+fn names_finite(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let w = words_of(text);
+    // `eval_real_both` reads as eval, real, both; `fine-tune` as one.
+    let parts: Vec<String> = w.iter().flat_map(|x| x.split('_').map(String::from).collect::<Vec<_>>()).collect();
+    FINITE.iter().any(|f| if f.contains(' ') || f.contains('-') { lower.contains(f) } else { w.iter().chain(parts.iter()).any(|y| y == f) })
+}
+
+/// A call's description that names finite work and no serving: "Evaluate v1
+/// and v2 on the real labelled queries", "Run the test suite". It stays a
+/// job though something under it listens (a model server its eval starts).
+pub fn described_finite(description: &str) -> bool {
+    names_finite(description) && !strong_serving(description)
+}
+
+/// A command that does finite work and is no server itself (`python
+/// scripts/run_baselines.py`, `bash eval_real_both.sh`, `pytest -x`): a
+/// server under it is its helper, not what the shell is.
+pub fn finite_command(command: &str) -> bool {
+    names_finite(&work_words(&name_of(command))) && serves(command) != Some(Kind::Server)
+}
+
+/// The words of a command that say what it does: its programs, the names
+/// of the scripts it runs (`scripts/eval_real_both.sh` → `eval_real_both`)
+/// and its plain words, not the folders it names or the files it writes
+/// to (`> /tmp/…zendesk-ticket-import…/x.output` is no import).
+fn work_words(command: &str) -> String {
+    let toks: Vec<&str> = command.split_whitespace().collect();
+    let mut out: Vec<String> = vec![];
+    let mut redirect = false;
+    for t in toks {
+        if redirect {
+            redirect = false;
+            continue;
+        }
+        if matches!(t, ">" | ">>" | "2>" | "2>>" | "&>" | "1>" | "<") {
+            redirect = true;
+            continue;
+        }
+        if t.starts_with('>') || t.starts_with("2>") || t.starts_with("&>") || t.starts_with('<') {
+            continue;
+        }
+        // NAME=value before a command: neither.
+        if t.split_once('=').is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')) {
+            continue;
+        }
+        if t.contains('/') {
+            let base = t.trim_matches(|c| c == '"' || c == '\'').rsplit('/').next().unwrap_or("");
+            // A script or a program by its path; a folder or a URL says nothing.
+            let script = base.rsplit_once('.').is_some_and(|(_, ext)| matches!(ext, "py" | "sh" | "js" | "mjs" | "cjs" | "ts" | "rb" | "pl" | "bash" | "zsh"));
+            if script || (!base.is_empty() && !base.contains('.') && !t.contains("://") && !t.ends_with('/') && out.is_empty()) {
+                out.push(base.to_string());
+            }
+            continue;
+        }
+        out.push(t.to_string());
+    }
+    out.join(" ")
+}
 
 fn words_of(s: &str) -> Vec<String> {
     s.to_lowercase().split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).map(String::from).collect()
@@ -207,6 +283,9 @@ pub struct Task {
     pub description: String,
     pub command: String,
     pub at_ms: u64,
+    /// The session said it serves (a server, localhost:<port>, listening)
+    /// in its words after it started it.
+    pub said_serving: bool,
 }
 
 /// What a transcript says of its background tasks, read line by line as it grows.
@@ -241,9 +320,23 @@ fn tag<'a>(s: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// Takes in more lines of a transcript.
+/// How soon after starting a task the session's words about serving count for it.
+const SAID_WITHIN_MS: u64 = 10 * 60_000;
+
+/// Words that say something serves: "the dev server is up on
+/// localhost:3000", "listening on 8091", "serving the docs".
+fn says_serving(text: &str) -> bool {
+    let l = text.to_lowercase();
+    let words = ["dev server", "server is up", "server is running", "server running", "serving ", "listening on", "localhost:", "127.0.0.1:", "0.0.0.0:", "running on port", "up on port"];
+    // "up on :7899", "runs at :3000".
+    let port = [" on :", " at :"].iter().any(|w| l.match_indices(w).any(|(i, _)| l[i + w.len()..].chars().take_while(char::is_ascii_digit).count() >= 2));
+    words.iter().any(|w| l.contains(w)) || port
+}
+
 pub fn read_tasks(lines: &str, tasks: &mut Tasks) {
     for line in lines.lines() {
-        if !(line.contains("\"Bash\"") || line.contains("\"Monitor\"") || line.contains("in background with ID") || line.contains("moved to the background") || line.contains("Monitor started") || line.contains("task-notification")) {
+        let assistant_text = line.contains("\"type\":\"assistant\"") && line.contains("\"text\"") && says_serving(line);
+        if !(assistant_text || line.contains("\"Bash\"") || line.contains("\"Monitor\"") || line.contains("in background with ID") || line.contains("moved to the background") || line.contains("Monitor started") || line.contains("task-notification")) {
             continue;
         }
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
@@ -268,6 +361,7 @@ pub fn read_tasks(lines: &str, tasks: &mut Tasks) {
                         description: input["description"].as_str().unwrap_or("").trim().to_string(),
                         command: input["command"].as_str().unwrap_or("").trim().to_string(),
                         at_ms: ts_ms(&v),
+                        said_serving: false,
                     };
                     if let Some(id) = b["id"].as_str() {
                         tasks.pending.insert(id.to_string(), task);
@@ -291,9 +385,23 @@ pub fn read_tasks(lines: &str, tasks: &mut Tasks) {
                 _ => {
                     let text = b["text"].as_str().map(String::from).unwrap_or_else(|| text_of(b));
                     for n in text.split("<task-notification>").skip(1) {
-                        if let Some(id) = tag(n, "task-id") {
+                        // Ended: a status (completed, failed, stopped, killed), or a
+                        // Monitor that expired. A Monitor's event isn't its end.
+                        let n = n.split("</task-notification>").next().unwrap_or(n);
+                        if let Some(id) = tag(n, "task-id")
+                            && (tag(n, "status").is_some_and(|s| !s.trim().is_empty() && s.trim() != "running") || n.contains("Monitor expired"))
+                        {
                             let summary = tag(n, "summary").or_else(|| tag(n, "status")).unwrap_or("").to_string();
                             tasks.ended.insert(id.to_string(), summary);
+                        }
+                    }
+                    // The session's own words: a task it started a while ago that it says serves.
+                    if v["type"] == "assistant" && says_serving(&text) {
+                        let at = ts_ms(&v);
+                        for t in tasks.by_id.values_mut() {
+                            if !tasks.ended.contains_key(&t.id) && t.at_ms <= at && at.saturating_sub(t.at_ms) < SAID_WITHIN_MS {
+                                t.said_serving = true;
+                            }
                         }
                     }
                 }
@@ -342,9 +450,19 @@ pub enum Kind {
 
 /// A command that serves or watches rather than finishes.
 fn serves(command: &str) -> Option<Kind> {
-    let c = format!(" {} ", command.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" "));
-    const WATCH: &[&str] = &[" tail -f ", " tail -F ", " tail -n +1 -f ", " tail -n 0 -f ", " --watch ", " -w ", " fswatch ", " entr ", " watchexec ", " cargo watch ", " nodemon "];
-    if WATCH.iter().any(|w| c.contains(&w.to_lowercase())) || c.contains(" tail ") && c.contains(" -f ") {
+    // Programs by their names (`./node_modules/.bin/next dev` is `next dev`).
+    let c = format!(
+        " {} ",
+        command
+            .to_lowercase()
+            .split_whitespace()
+            .map(|t| if t.contains('/') && !t.contains("://") && !t.starts_with('>') { t.rsplit('/').next().unwrap_or(t) } else { t })
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    const WATCH: &[&str] = &[" --watch ", " fswatch ", " entr ", " watchexec ", " cargo watch ", " nodemon ", " --no-buffer "];
+    // (`curl -N` by its case: `-n` is another flag.)
+    if WATCH.iter().any(|w| c.contains(w)) || segments(&c).iter().any(|s| follows(s) || watch_flag(s)) || segments(command).iter().any(|s| curl_stream(s)) {
         return Some(Kind::Watch);
     }
     const SERVE: &[&str] = &[
@@ -387,6 +505,14 @@ fn serves(command: &str) -> Option<Kind> {
         " python -m http.server ",
         " manage.py runserver ",
     ];
+    // `<tool> dev` on a port (`storybook dev -p 6026`), and a daemon left running.
+    let dev_on_port = segments(&c).iter().any(|s| {
+        let t: Vec<&str> = s.split_whitespace().collect();
+        t.windows(2).any(|w| w[1] == "dev" && !w[0].starts_with('-')) && t.iter().any(|x| matches!(*x, "-p" | "--port") || x.starts_with("--port="))
+    });
+    if dev_on_port || c.contains(" storybook dev ") || c.contains(" start-storybook ") || segments(&c).iter().any(|s| s.split_whitespace().skip_while(|t| matches!(*t, "exec" | "nohup" | "env") || t.contains('=')).nth(1) == Some("daemon")) {
+        return Some(Kind::Server);
+    }
     // A command that sets the port it serves on, or runs a dev-server script, serves too.
     let sets_port = c.split_whitespace().any(|t| t.strip_prefix("port=").is_some_and(|v| !v.is_empty() && v.chars().all(|ch| ch.is_ascii_digit())));
     let dev_server = ["dev-server", "devserver", "dev_server"].iter().any(|w| c.contains(w));
@@ -394,6 +520,31 @@ fn serves(command: &str) -> Option<Kind> {
         return Some(Kind::Server);
     }
     None
+}
+
+/// A command line's simple commands (split at `&&`, `||`, `;`, `|`, `(`, `)`, `$(`), each trimmed.
+fn segments(c: &str) -> Vec<String> {
+    c.replace("&&", ";").replace("||", ";").replace("$(", ";").replace(['|', '(', ')', '`'], ";").split(';').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+}
+
+/// `tail -f` / `-F` / `--follow` in one simple command (not `[ -f x ]` and a `tail -5` elsewhere).
+fn follows(segment: &str) -> bool {
+    let t: Vec<&str> = segment.split_whitespace().collect();
+    t.first() == Some(&"tail") && t.iter().skip(1).any(|a| a.starts_with("--follow") || (a.starts_with('-') && !a.starts_with("--") && (a.contains('f') || a.contains('F'))))
+}
+
+/// A watcher's `-w` (`tsc -w`, `webpack -w`): not `grep -w`, `wc -w`, `curl -w`.
+fn watch_flag(segment: &str) -> bool {
+    let t: Vec<&str> = segment.split_whitespace().collect();
+    let prog = t.iter().find(|x| !x.contains('=')).copied().unwrap_or("");
+    let prog = if matches!(prog, "npx" | "pnpm" | "yarn" | "bunx") { t.iter().skip_while(|x| **x != prog).nth(1).copied().unwrap_or("") } else { prog };
+    matches!(prog, "tsc" | "webpack" | "rollup" | "esbuild" | "sass" | "babel" | "tailwindcss" | "postcss" | "coffee" | "lessc" | "jest" | "vitest" | "elm-live" | "parcel") && t.contains(&"-w")
+}
+
+/// `curl -N` (or with `-sN`, `-skN`…): a stream it keeps reading (`/v1/events`).
+fn curl_stream(segment: &str) -> bool {
+    let t: Vec<&str> = segment.split_whitespace().collect();
+    t.first() == Some(&"curl") && t.iter().skip(1).any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('N'))
 }
 
 /// `docker run …` in the foreground that isn't a one-off: without `--rm`
@@ -443,6 +594,10 @@ fn compose_up(c: &str) -> bool {
 pub fn kind_of(task: Option<&Task>, commands: &[&str], listening: bool) -> Kind {
     if task.is_some_and(|t| t.kind == TaskKind::Monitor) {
         return Kind::Watch;
+    }
+    // Its call names finite work and no serving: a job, whatever listens under it.
+    if task.is_some_and(|t| described_finite(&t.description)) {
+        return Kind::Job;
     }
     if listening {
         return Kind::Server;
@@ -728,9 +883,22 @@ pub fn look(claude: u32, world: &World, tasks: &Tasks, now_ms: u64, turn_over: b
         }
         let task = task_id.as_ref().and_then(|id| tasks.by_id.get(id));
         let command = task.map(|t| t.command.clone()).filter(|c| !c.is_empty()).or_else(|| shell_command(&shell.command)).unwrap_or_default();
-        let commands: Vec<&str> = std::iter::once(command.as_str()).chain(tree.iter().skip(1).map(|p| p.command.as_str())).collect();
-        let ports: Vec<u16> = tree.iter().flat_map(|p| world.listen.get(&p.pid).cloned().unwrap_or_default()).collect();
-        let kind = kind_of(task, &commands, !ports.is_empty());
+        // What is under a finite command (an eval script, a test run) is its
+        // helper: a model server it starts, a server its tests bring up. Its
+        // ports and commands don't make the shell a server.
+        let root_finite = finite_command(&command) || task.is_some_and(|t| described_finite(&t.description));
+        let helper = helpers_of(&tree, shell.pid, root_finite);
+        let top: Vec<&&Proc> = tree.iter().skip(1).filter(|p| !helper.contains(&p.pid)).collect();
+        let commands: Vec<&str> = std::iter::once(command.as_str()).chain(top.iter().map(|p| p.command.as_str())).collect();
+        let ports: Vec<u16> = std::iter::once(&shell).chain(top.iter().copied()).flat_map(|p| world.listen.get(&p.pid).cloned().unwrap_or_default()).collect();
+        let mut kind = kind_of(task, &commands, !ports.is_empty());
+        // Claude Code's own word: a background task still running when the turn
+        // ended is what the session waits on ("1 shell still running"). Unless
+        // it is a server by more than a port (its command, its description) or
+        // the session said it serves, it is work in progress.
+        if kind == Kind::Server && turn_over && task.is_some_and(|t| !t.said_serving) && kind_of(task, &commands, false) != Kind::Server {
+            kind = Kind::Job;
+        }
         let what = task.map(|t| t.description.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| clip(&name_of(&command), 80));
         match kind {
             Kind::Watch => watches.push(task.map(|t| t.command.clone()).unwrap_or(command)),
@@ -769,6 +937,20 @@ pub fn look(claude: u32, world: &World, tasks: &Tasks, now_ms: u64, turn_over: b
     }
     siblings(&mut jobs, now_ms);
     (jobs, servers)
+}
+
+/// The processes of a shell's tree (`tree`, parents before children, the
+/// shell first) that are under a finite command: helpers of its work, not
+/// what it is. `root_finite`: the shell's own command (or its call) is one.
+pub fn helpers_of(tree: &[&Proc], shell: u32, root_finite: bool) -> std::collections::HashSet<u32> {
+    let mut under: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for p in tree.iter().skip(1) {
+        let parent_finite = if p.ppid == shell { root_finite } else { tree.iter().find(|q| q.pid == p.ppid).is_some_and(|q| finite_command(&q.command)) };
+        if parent_finite || under.contains(&p.ppid) {
+            under.insert(p.pid);
+        }
+    }
+    under
 }
 
 /// Jobs a session declared (`tower job-running`), by session: kept by the daemon.
@@ -936,12 +1118,175 @@ mod tests {
         w.mtimes.insert("/w/post.log".into(), NOW - 40 * 60_000);
         w.mtimes.insert("/tmp/p/tasks/bpost.output".into(), NOW - 40 * 60_000);
         let mut t = Tasks::default();
-        let task = |id: &str, kind, d: &str, c: &str| Task { id: id.into(), kind, description: d.into(), command: c.into(), at_ms: 0 };
+        let task = |id: &str, kind, d: &str, c: &str| Task { id: id.into(), kind, description: d.into(), command: c.into(), at_ms: 0, said_serving: false };
         t.by_id.insert("btrain".into(), task("btrain", TaskKind::Bash, "Train the 1.2B LoRA", "python train.py > /w/train.log 2>&1"));
         t.by_id.insert("bpost".into(), task("bpost", TaskKind::Bash, "Post-training pipeline", "bash post.sh > /w/post.log 2>&1"));
         t.by_id.insert("bmon".into(), task("bmon", TaskKind::Monitor, "val loss", "tail -n +1 -f /w/train.log | grep val"));
         t.by_id.insert("bdev".into(), task("bdev", TaskKind::Bash, "Start the dev server", "npm run dev"));
         (w, t)
+    }
+
+    /// t12r's eval (search-llm, 14 Nov): a background script that writes and
+    /// runs `eval_real_both.sh`, whose `run_baselines.py --mlx` starts a local
+    /// MLX model server on 8091 for itself. A job, not a server.
+    fn eval_world(desc: &str, eval_cmd: &str) -> (World, Tasks) {
+        let mut w = World::default();
+        let cmd = "cat > scripts/eval_real_both.sh <<'EOF'\nset -euo pipefail\n$PY scripts/run_baselines.py --mlx --only mlx-ft-1.2b --sets real\nEOF\nchmod +x scripts/eval_real_both.sh && scripts/eval_real_both.sh > data/cache/eval_real.log 2>&1";
+        w.procs = vec![
+            Proc { pid: 1, ppid: 0, secs: 9000, cpu: 2.0, command: "claude".into() },
+            shell(96519, 1, 215, cmd),
+            Proc { pid: 96525, ppid: 96519, secs: 214, cpu: 0.0, command: eval_cmd.into() },
+            Proc { pid: 2497, ppid: 96525, secs: 29, cpu: 0.0, command: ".venv/bin/python -I -u scripts/run_baselines.py --mlx --only mlx-ftv2-1.2b --sets real --suffix=-real".into() },
+            Proc { pid: 2498, ppid: 2497, secs: 29, cpu: 1.0, command: "/w/.venv/bin/python -I /w/serve/mlx_server.py --model /w/models/hf/LFM2.5-1.2B".into() },
+        ];
+        w.files.insert(96519, vec![open("1", "w", "/tmp/p/tasks/babjmq4ak.output")]);
+        w.files.insert(96525, vec![open("1", "w", "/w/data/cache/eval_real.log")]);
+        w.listen.insert(2498, vec![8091]);
+        w.mtimes.insert("/w/data/cache/eval_real.log".into(), NOW - 30_000);
+        let mut t = Tasks::default();
+        t.by_id.insert("babjmq4ak".into(), Task { id: "babjmq4ak".into(), kind: TaskKind::Bash, description: desc.into(), command: cmd.into(), at_ms: 0, said_serving: false });
+        (w, t)
+    }
+
+    #[test]
+    fn a_finite_script_that_starts_its_own_model_server_is_a_job() {
+        // As it was: the eval's description names finite work.
+        let (w, t) = eval_world("Evaluate v1 and v2 on the real labelled queries", "bash scripts/eval_real_both.sh");
+        let (jobs, servers) = look(1, &w, &t, NOW, true);
+        assert!(servers.is_empty(), "{servers:?}");
+        assert_eq!((jobs.len(), jobs[0].what.as_str(), jobs[0].task.as_deref()), (1, "Evaluate v1 and v2 on the real labelled queries", Some("babjmq4ak")));
+        // Without a finite description, the port is still under a finite command (rule 2).
+        let (w, t) = eval_world("Run v1 and v2", "bash scripts/eval_real_both.sh");
+        let (jobs, servers) = look(1, &w, &t, NOW, false);
+        assert!(servers.is_empty() && jobs.len() == 1, "{servers:?} {jobs:?}");
+        // A script named for nothing finite whose child listens: a server while the session works…
+        let (mut w, mut t) = eval_world("Bring the models online", "bash scripts/models.sh");
+        let cmd = "scripts/models.sh > data/cache/models.log 2>&1";
+        w.procs[1] = shell(96519, 1, 215, cmd);
+        w.procs[3].command = ".venv/bin/python -I -u scripts/launch.py".into();
+        t.by_id.get_mut("babjmq4ak").unwrap().command = cmd.into();
+        assert_eq!(look(1, &w, &t, NOW, false).1.len(), 1, "a port it holds itself makes it a server");
+        // …and when its turn is over (Claude Code: "1 shell still running") and it never said it serves: work in progress (rule 3).
+        let (jobs, servers) = look(1, &w, &t, NOW, true);
+        assert!(servers.is_empty() && jobs.len() == 1, "{servers:?}");
+        // Said it serves: a server.
+        t.by_id.get_mut("babjmq4ak").unwrap().said_serving = true;
+        assert_eq!(look(1, &w, &t, NOW, true).1.len(), 1);
+    }
+
+    #[test]
+    fn a_dev_server_stays_a_server_and_a_test_runs_own_server_is_its_helper() {
+        let mut w = World::default();
+        w.procs = vec![
+            Proc { pid: 1, ppid: 0, secs: 9000, cpu: 2.0, command: "claude".into() },
+            shell(50, 1, 3000, "npm run dev"),
+            Proc { pid: 51, ppid: 50, secs: 2999, cpu: 0.5, command: "node /w/node_modules/.bin/next dev".into() },
+            shell(60, 1, 400, "npx playwright test --project chromium"),
+            Proc { pid: 61, ppid: 60, secs: 399, cpu: 30.0, command: "node /w/node_modules/.bin/playwright test --project chromium".into() },
+            Proc { pid: 62, ppid: 61, secs: 390, cpu: 5.0, command: "node /w/node_modules/.bin/next start -p 3100".into() },
+        ];
+        w.listen.insert(51, vec![3000]);
+        w.listen.insert(62, vec![3100]);
+        let mut t = Tasks::default();
+        let task = |id: &str, d: &str, c: &str| Task { id: id.into(), kind: TaskKind::Bash, description: d.into(), command: c.into(), at_ms: 0, said_serving: false };
+        t.by_id.insert("bdev".into(), task("bdev", "Start the dev server", "npm run dev"));
+        t.by_id.insert("be2e".into(), task("be2e", "Run the e2e suite", "npx playwright test --project chromium"));
+        w.files.insert(50, vec![open("1", "w", "/tmp/p/tasks/bdev.output")]);
+        w.files.insert(60, vec![open("1", "w", "/tmp/p/tasks/be2e.output")]);
+        for turn_over in [false, true] {
+            let (jobs, servers) = look(1, &w, &t, NOW, turn_over);
+            assert_eq!(servers.iter().map(|s| (s.what.as_str(), s.ports.clone())).collect::<Vec<_>>(), [("Start the dev server", vec![3000])]);
+            assert_eq!(jobs.iter().map(|j| j.what.as_str()).collect::<Vec<_>>(), ["Run the e2e suite"]);
+        }
+    }
+
+    #[test]
+    fn finite_words_beat_a_port_unless_serving_is_named() {
+        assert!(described_finite("Evaluate v1 and v2 on the real labelled queries"));
+        assert!(described_finite("Fine-tune the 1.2B on v2 data") && described_finite("Label 5k queries with Claude") && described_finite("Run baselines on the test set"));
+        assert!(!described_finite("Serve the eval dashboard") && !described_finite("Start the dev server and its tests") && !described_finite("Bring up the stack"));
+        assert!(!described_finite("Start Postgres"));
+        assert!(finite_command("bash scripts/eval_real_both.sh") && finite_command(".venv/bin/python -u scripts/run_baselines.py --mlx") && finite_command("cd /w && pytest -x"));
+        assert!(!finite_command("npm run dev") && !finite_command("npm run build && npm start") && !finite_command("node server.js"));
+        assert!(!finite_command("cd /w/test-app && node api.js"), "a folder's name isn't the work");
+        assert!(!finite_command("./node_modules/.bin/next dev -p 3031 > /tmp/zendesk-ticket-import/x.output 2>&1"), "nor a file it writes to");
+    }
+
+    /// What the last day's background calls (all spaces, 14 Nov) showed read wrong.
+    #[test]
+    fn the_misreadings_the_review_found() {
+        // Wait loops are finite: not watches (`[ -f x ]` and a `tail -10`; `grep -w`), not servers.
+        assert_eq!(serves("until [ -f $SB/five.txt ]; do sleep 5; done; grep -E x log | tail -10"), None);
+        assert_eq!(serves("while true; do L=$($ADB devices -l | grep -w device); sleep 5; done"), None);
+        assert_eq!(serves("tail -n +1 -f /w/train.log | grep val"), Some(Kind::Watch));
+        assert_eq!(serves("tail -F /w/x.log"), Some(Kind::Watch));
+        assert_eq!(serves("npx tsc -w -p ."), Some(Kind::Watch));
+        assert!(!described_server("Wait until the rebuilt server on :3000 is ready"));
+        // Dev servers by their path, and a stream read for good.
+        assert_eq!(serves("API_BASE_URL=http://127.0.0.1:3002 ./node_modules/.bin/next dev --webpack -p 3031 > /tmp/x.output"), Some(Kind::Server));
+        assert_eq!(serves("NEXT_PUBLIC_SUPPORT_FIXTURES=1 ./node_modules/.bin/storybook dev -p 6026 --no-open --ci"), Some(Kind::Server));
+        assert_eq!(serves("source /tmp/t/env.sh; cd /tmp/t; exec ~/Work/herder-tower/target/release/tower daemon > /tmp/t/daemon.log 2>&1"), Some(Kind::Server));
+        assert_eq!(serves(r#"curl -skN "https://127.0.0.1:7899/v1/events?voice=1" -H "Authorization: Bearer x" > /tmp/sse.log"#), Some(Kind::Watch));
+        assert_eq!(serves("curl -sn https://x/y -o out"), None);
+        assert_eq!(serves("gh run watch 435 --exit-status --interval 30 > log"), None, "it ends with the run");
+        // The session's words: "up on :7899".
+        assert!(says_serving("The fake tower is up on :7899.") && !says_serving("Done at 14:38."));
+    }
+
+    #[test]
+    fn a_monitors_event_isnt_its_end_and_words_about_serving_are_kept() {
+        let line = |v: Value| v.to_string();
+        let mut t = Tasks::default();
+        read_tasks(
+            &[
+                line(serde_json::json!({"type":"assistant","timestamp":"2026-11-14T10:00:00Z","message":{"content":[{"type":"tool_use","id":"u1","name":"Monitor","input":{"description":"val loss","command":"tail -f x"}}]}})),
+                line(serde_json::json!({"type":"user","timestamp":"2026-11-14T10:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"u1","content":"Monitor started (task bmon, expires in 30m)"}]}})),
+                line(serde_json::json!({"type":"assistant","timestamp":"2026-11-14T10:00:02Z","message":{"content":[{"type":"tool_use","id":"u2","name":"Bash","input":{"description":"Run the API","command":"python api.py","run_in_background":true}}]}})),
+                line(serde_json::json!({"type":"user","timestamp":"2026-11-14T10:00:03Z","message":{"content":[{"type":"tool_result","tool_use_id":"u2","content":"Command running in background with ID: bapi."}]}})),
+                line(serde_json::json!({"type":"user","timestamp":"2026-11-14T10:05:00Z","message":{"content":"<task-notification>\n<task-id>bmon</task-id>\n<summary>Monitor event: \"val loss\"</summary>\n<event>2500 val 0.557</event>\n</task-notification>"}})),
+                line(serde_json::json!({"type":"assistant","timestamp":"2026-11-14T10:05:10Z","message":{"content":[{"type":"text","text":"The API is up on localhost:8000."}]}})),
+            ]
+            .join("\n"),
+            &mut t,
+        );
+        assert!(!t.ended.contains_key("bmon"), "an event, not its end");
+        assert!(t.by_id["bapi"].said_serving);
+        read_tasks(&line(serde_json::json!({"type":"user","timestamp":"2026-11-14T10:40:00Z","message":{"content":"<task-notification>\n<task-id>bmon</task-id>\n<summary>Monitor event: \"val loss\"</summary>\n<event>[Monitor expired after 30m with 2 events delivered.]</event>\n</task-notification>"}})), &mut t);
+        read_tasks(&line(serde_json::json!({"type":"user","timestamp":"2026-11-14T10:41:00Z","message":{"content":"<task-notification>\n<task-id>bapi</task-id>\n<status>failed</status>\n<summary>Background command \"Run the API\" failed with exit code 1</summary>\n</task-notification>"}})), &mut t);
+        assert!(t.ended.contains_key("bmon") && t.ended.contains_key("bapi"));
+    }
+
+    /// `HERDER_TOWER_JOB_CALLS=<calls.json>` (`[[project, id, description,
+    /// command], …]`): how each background call reads, for a review.
+    #[test]
+    #[ignore]
+    fn review_background_calls() {
+        let Ok(path) = std::env::var("HERDER_TOWER_JOB_CALLS") else { return };
+        let calls: Vec<(String, String, String, String)> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        for (proj, id, d, c) in calls {
+            let t = Task { id: id.clone(), kind: TaskKind::Bash, description: d.clone(), command: c.clone(), at_ms: 0, said_serving: false };
+            let plain = kind_of(Some(&t), &[c.as_str()], false);
+            let port = kind_of(Some(&t), &[c.as_str()], true);
+            let flags = format!("{}{}{}{}", if described_server(&d) { "S" } else { "-" }, if described_finite(&d) { "F" } else { "-" }, if finite_command(&c) { "f" } else { "-" }, match serves(&c) { Some(Kind::Server) => "s", Some(Kind::Watch) => "w", _ => "-" });
+            println!("REVIEW\t{plain:?}\t{port:?}\t{flags}\t{proj}\t{d}\t{}", c.replace('\n', " ⏎ ").chars().take(150).collect::<String>());
+        }
+    }
+
+    /// A script with nothing written yet ("No output available") is a job,
+    /// quiet but not stuck until the threshold.
+    #[test]
+    fn a_job_with_no_output_yet_is_quiet_not_stuck() {
+        let (mut w, t) = eval_world("Evaluate v1 and v2 on the real labelled queries", "bash scripts/eval_real_both.sh");
+        w.mtimes.clear();
+        for p in &mut w.procs {
+            p.cpu = 0.0;
+        }
+        let (jobs, _) = look(1, &w, &t, NOW, true);
+        assert!(!jobs[0].stuck && jobs[0].progress_ms.is_none(), "{:?}", jobs[0]);
+        for p in &mut w.procs {
+            p.secs = 31 * 60;
+        }
+        assert!(look(1, &w, &t, NOW, true).0[0].stuck, "quiet past the threshold");
     }
 
     #[test]
