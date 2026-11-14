@@ -506,7 +506,9 @@ pub fn transcript_questions(jsonl: &str) -> Option<Vec<Tab>> {
 
 /// The transcript of the Claude Code process `pid`: its session file (in
 /// `~/.claude/sessions`, or its account's config folder) names it.
-pub fn transcript_of(pid: u32) -> Option<String> {
+/// The transcript file of the `claude` running as `pid` (its config
+/// folder's `sessions/<pid>.json` names it).
+pub fn transcript_path_of(pid: u32) -> Option<std::path::PathBuf> {
     let home = dirs::home_dir()?;
     let mut roots = vec![home.join(".claude")];
     if let Some(dir) = config_dir_of(pid) {
@@ -524,15 +526,19 @@ pub fn transcript_of(pid: u32) -> Option<String> {
         } else {
             std::fs::read_dir(root.join("projects")).ok()?.flatten().map(|d| d.path().join(format!("{sid}.jsonl"))).find(|p| p.exists())
         };
-        if let Some(p) = path {
-            // The tail is enough: the question is the latest call.
-            let bytes = std::fs::read(&p).ok()?;
-            let start = bytes.len().saturating_sub(2 * 1024 * 1024);
-            let tail = String::from_utf8_lossy(&bytes[start..]).into_owned();
-            return Some(tail.split_once('\n').map(|(_, rest)| rest.to_string()).filter(|_| start > 0).unwrap_or(tail));
+        if path.is_some() {
+            return path;
         }
     }
     None
+}
+
+pub fn transcript_of(pid: u32) -> Option<String> {
+    // The tail is enough: the question is the latest call.
+    let bytes = std::fs::read(transcript_path_of(pid)?).ok()?;
+    let start = bytes.len().saturating_sub(2 * 1024 * 1024);
+    let tail = String::from_utf8_lossy(&bytes[start..]).into_owned();
+    Some(tail.split_once('\n').map(|(_, rest)| rest.to_string()).filter(|_| start > 0).unwrap_or(tail))
 }
 
 /// `CLAUDE_CONFIG_DIR` in a process's environment (its value may have spaces).

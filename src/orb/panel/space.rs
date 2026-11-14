@@ -774,6 +774,11 @@ impl Panel {
                 if let Some(words) = s.last_words().or_else(|| last_words(&self.entries, &s.address)) {
                     under.push(div().text_size(px(13.0)).line_height(px(18.0)).text_color(g.muted).line_clamp(2).child(words).into_any_element());
                 }
+                // A job it left running: what, since when, its last progress (amber when quiet).
+                if let Some(j) = &s.job {
+                    let colour = if j.stuck { AMBER } else { CYAN };
+                    under.push(div().text_size(px(12.5)).line_height(px(17.0)).text_color(rgb(colour)).line_clamp(2).child(j.line.clone()).into_any_element());
+                }
                 let place = s.place();
                 if !place.is_empty() {
                     under.push(div().font_family("Menlo").text_size(px(11.5)).line_height(px(17.0)).text_color(g.faint).child(place).into_any_element());
@@ -783,7 +788,12 @@ impl Panel {
                 }
                 let to = Scope::Session { space: name.to_string(), addr: s.address.clone() };
                 rows.push(
-                    lrow(session_mark(&s.status, format!("session-pulse-{i}")), nm(&label).truncate().into_any_element(), Some(pg(status_word(&s.status), false)), under)
+                    lrow(
+                        session_mark(if s.runs_job() { "working" } else { &s.status }, format!("session-pulse-{i}")),
+                        nm(&label).truncate().into_any_element(),
+                        Some(pg(status_word(s.status_shown()), false)),
+                        under,
+                    )
                         .id(SharedString::from(format!("session-{}", s.address)))
                         .cursor_pointer()
                         .hover(|st| st.bg(rgba(SOFT)))

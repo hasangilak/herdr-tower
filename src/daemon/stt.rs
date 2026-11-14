@@ -366,7 +366,9 @@ fn radar_entry(a: &super::state::AgentLine) -> String {
     };
     let status = if a.status.is_empty() { "starting" } else { &a.status };
     let queued = if a.queued > 0 { format!(", {} queued", a.queued) } else { String::new() };
-    format!("{} {}{folder}: {status}{queued}", a.address, a.name)
+    // Its turn may be over while a job it started runs: said, with how it goes.
+    let job = crate::running::line(&a.jobs, crate::history::now_ms()).map(|l| format!(", {l}")).unwrap_or_default();
+    format!("{} {}{folder}: {status}{job}{queued}", a.address, a.name)
 }
 
 fn is_only_stop(norm: &str, stop_words: &[String]) -> bool {

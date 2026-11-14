@@ -1227,6 +1227,8 @@ impl Radar {
                 folder: s.cwd.clone(),
                 queued: 0,
                 waiting: vec![],
+                jobs: super::running::jobs_of(a),
+                servers: super::running::servers_of(a),
             })
             .filter(|a| !a.name.starts_with("tower"))
             .collect();

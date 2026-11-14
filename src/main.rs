@@ -49,6 +49,7 @@ mod prs;
 mod prscore;
 mod questions;
 mod reviews;
+mod running;
 mod screenshots;
 mod selftest;
 mod setups;
@@ -186,6 +187,21 @@ enum Cmd {
         dry_run: bool,
         #[arg(long)]
         json: bool,
+    },
+    /// A job this session runs in the background beyond its turn (a training run, a long script),
+    /// said to the tower so it shows the session as running a job, not done, and tells when it ends:
+    /// `start '<what>' [--pid <pid>]` (with a pid it ends by itself when that process does),
+    /// `progress ['<how far>']`, `end`. Background shells are seen without it; this is for jobs the
+    /// tower can't see (another machine, a process started some other way). `look <session>`: what
+    /// the tower sees running under a session now (it reads only).
+    JobRunning {
+        /// start, progress or end.
+        action: String,
+        /// What the job is (start), how far it is (progress).
+        what: Option<String>,
+        /// Its process.
+        #[arg(long)]
+        pid: Option<u32>,
     },
     /// A Claude account at its usage limit, and the work moved off it: each session or tower that hits
     /// its account's limit is resumed on the next account with usage (the default first), in its own
@@ -1051,6 +1067,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Reopen { action, spaces, dry_run, json } => reopen_cmd(action.as_deref().unwrap_or("list"), &spaces, dry_run, json),
         Cmd::Accounts { usage: true, json, .. } => accounts_usage(json),
         Cmd::Accounts { on, .. } => list_accounts(on.as_deref()),
+        Cmd::JobRunning { action, what, pid } => job_running(&action, what.as_deref().unwrap_or(""), pid),
         Cmd::Failover { action, target, to, json } => failover_cmd(action.as_deref().unwrap_or("status"), target.as_deref().unwrap_or(""), to.as_deref().unwrap_or(""), json),
         Cmd::Project { name } => {
             let asked = name.join(" ");
@@ -1827,6 +1844,9 @@ fn agents(all: bool) -> Result<()> {
                 r["folder"].as_str().unwrap_or(""),
                 r["title"].as_str().unwrap_or("")
             );
+            if let Some(line) = r["job"]["line"].as_str() {
+                println!("{:<12} {line}", "");
+            }
         }
         for e in &errors {
             println!("! {}: {}", e["machine"].as_str().unwrap_or(""), e["error"].as_str().unwrap_or(""));
@@ -1844,6 +1864,13 @@ pub fn agents_value(all: bool) -> Value {
 }
 
 fn agent_rows(all: bool) -> (Vec<Value>, Vec<Value>) {
+    // The jobs and servers sessions left running, as the daemon last saw them.
+    let state: Value = std::fs::read_to_string(config::ui_dir().join("state.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let running = |address: &str| -> (Vec<running::Job>, Value) {
+        let a = state["agents"].as_array().into_iter().flatten().find(|a| a["address"] == address);
+        let jobs: Vec<running::Job> = a.and_then(|a| serde_json::from_value(a["jobs"].clone()).ok()).unwrap_or_default();
+        (jobs, a.map(|a| a["servers"].clone()).filter(|s| s.is_array()).unwrap_or(json!([])))
+    };
     let mut rows = Vec::new();
     let mut errors = Vec::new();
     let mut lists = vec![(None, hc::list_on(None))];
@@ -1867,6 +1894,7 @@ fn agent_rows(all: bool) -> (Vec<Value>, Vec<Value>) {
                     // `hc ls` has the reporting app (or else the program) as `agent`.
                     let app = hc::agent_app(&t).or_else(|| t["agent"].as_str().map(String::from));
                     let account = if machine.is_none() { accounts::of_address(t["address"].as_str().unwrap_or("")) } else { None };
+                    let (jobs, servers) = if machine.is_none() { running(t["address"].as_str().unwrap_or("")) } else { (vec![], json!([])) };
                     rows.push(json!({
                         "address": t["address"],
                         "account": account,
@@ -1879,6 +1907,10 @@ fn agent_rows(all: bool) -> (Vec<Value>, Vec<Value>) {
                         "title": t["title"],
                         "folder": t["foreground"]["cwd"].as_str().or(t["cwd"].as_str()),
                         "where": t["labels"].get("where").unwrap_or(&t["where"]),
+                        // Its turn may be done while a job it started runs: shown, with every job and server.
+                        "job": running::shown(&jobs, history::now_ms()),
+                        "jobs": jobs,
+                        "servers": servers,
                     }));
                 }
             }
@@ -2250,6 +2282,24 @@ fn agenda_do(cmd: &agenda::Cmd) -> Result<Value> {
 }
 
 /// `tower reopen [list|go|forget] [<space>…] [--dry-run]`.
+fn job_running(action: &str, what: &str, pid: Option<u32>) -> Result<()> {
+    // One look at a session now, without the daemon (it reads only).
+    if action == "look" {
+        print_json(&daemon::running::look_at(what.trim())?);
+        return Ok(());
+    }
+    if !protocol::is_running() {
+        bail!("the tower's voice isn't running (tower up): it keeps the jobs");
+    }
+    let terminal = peers::caller().unwrap_or_default();
+    let r = protocol::send(&Request::JobRunning { terminal, action: action.into(), what: what.into(), pid })?;
+    if !r.ok {
+        bail!("{}", r.error.unwrap_or_default());
+    }
+    print_json(&r.state.unwrap_or_default());
+    Ok(())
+}
+
 fn failover_cmd(action: &str, target: &str, to: &str, json_out: bool) -> Result<()> {
     if !protocol::is_running() {
         bail!("the tower's voice isn't running (tower up): it moves sessions between accounts");

@@ -23,6 +23,7 @@ pub mod queue;
 pub mod releases;
 pub mod reopen;
 pub mod reviews;
+pub mod running;
 pub mod sendq;
 pub mod sessions;
 pub mod state;
@@ -67,6 +68,7 @@ struct Daemon {
     plans: plans::Plans,
     reviews: reviews::Reviews,
     failover: failover::Failover,
+    running: running::Running,
 }
 
 pub fn run() -> Result<()> {
@@ -330,6 +332,13 @@ pub fn run() -> Result<()> {
     failover.start();
     // Each account's usage, and who the failover moved: in the state, for the windows and the phone.
     failover.publish_to(shared.clone());
+    // Jobs sessions leave running in the background (a training run while
+    // the session waits on it): seen, shown, and told when they end or go quiet.
+    let running = {
+        let watches = watches.clone();
+        running::Running::open(shared.clone(), std::sync::Arc::new(move |note| watches.tell_agenda(note)))
+    };
+    running.start();
     // "Merge all N": a merge card's PRs, merged in order by the tower.
     merges::Merges::new(shared.clone(), prs.clone(), sendq.clone()).start();
     // What the tower opened for the user lately, to show with the reply and to undo.
@@ -355,7 +364,7 @@ pub fn run() -> Result<()> {
             }
         }));
     }
-    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks, sendq, prs, agendas, introducer, decisions, missions, brains, acts, plans, reviews, failover };
+    let daemon = Daemon { cfg, shared, mouth, narrator, ears, watches, lan, asks, sendq, prs, agendas, introducer, decisions, missions, brains, acts, plans, reviews, failover, running };
     // The phone API reaches the rest of the tower through the daemon itself
     // (`desk`), so it starts only now that the daemon is whole.
     daemon.lan.attach(std::sync::Arc::new(daemon.clone()));
@@ -912,6 +921,12 @@ impl Daemon {
             Request::Limited { hit } => {
                 let v = self.failover.limited(hit);
                 return Response { ok: true, error: None, state: Some(v) };
+            }
+            Request::JobRunning { terminal, action, what, pid } => {
+                return match running::dispatch(Some(&self.running), &terminal, &action, &what, pid) {
+                    Ok(v) => Response { ok: true, error: None, state: Some(v) },
+                    Err(e) => Response { ok: false, error: Some(format!("{e:#}")), state: None },
+                };
             }
             Request::Failover { action, target, account } => {
                 let v = match action.as_str() {
