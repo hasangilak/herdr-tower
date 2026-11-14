@@ -980,7 +980,10 @@ impl Asks {
         let (me, address, t) = (self.clone(), address.to_string(), t.clone());
         let ended_ms = crate::history::now_ms();
         std::thread::spawn(move || {
-            let Some(message) = turn_message(&address, &t, ended_ms) else { return };
+            let Some(message) = turn_message(&address, &t, ended_ms) else {
+                eprintln!("[questions] {address}: its turn's last message couldn't be read");
+                return;
+            };
             // A turn the user started in its own terminal: the user is in that conversation.
             let own = super::typed::users_turn(&address);
             let context = crate::history::jobs(&crate::history::load()).into_iter().find(|j| j.session == address).map(|j| j.title).unwrap_or_default();
@@ -2234,6 +2237,9 @@ pub fn pr_line(name: &str, open: &[crate::prs::Pr]) -> String {
 }
 
 fn last_message(address: &str, t: &Value) -> Option<String> {
+    // A row of `hc ls` (the radar's look) has no foreground process: the terminal itself has.
+    let full = if t["foreground"]["pid"].is_null() && !address.contains('/') { hc::get(address) } else { None };
+    let t = full.as_ref().unwrap_or(t);
     if hc::agent_app(t).as_deref() == Some("claude-code")
         && !address.contains('/')
         && let Some(pid) = t["foreground"]["pid"].as_u64()
