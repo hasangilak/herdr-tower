@@ -143,7 +143,14 @@ pub fn session(f: &SessionFacts) -> SessionBrief {
         tasks.iter().rev().filter(recent).filter(|t| t.state == TaskState::Verified && Some(**t) != latest).map(|t| outcome(t)).collect();
     let running = tasks.iter().rev().find(|t| t.state == TaskState::Running);
     let blocked = tasks.iter().rev().find(|t| t.state == TaskState::Blocked);
+    // A progress line that only says how long ("4 s in · last update just now") says nothing of what.
+    let timing_only = |p: &str| p.trim().chars().next().is_some_and(|c| c.is_ascii_digit());
     let now = match (f.progress.filter(|p| !p.trim().is_empty()), f.status) {
+        (Some(p), "working") if timing_only(p) => match tasks.iter().rev().find(|t| t.state == TaskState::Running) {
+            Some(t) if latest.is_some_and(|l| std::ptr::eq(l, *t)) => format!("working on it · {}", p.trim()),
+            Some(t) => format!("working on {} · {}", lower_first(&title(t)), p.trim()),
+            None => format!("working · {}", p.trim()),
+        },
         (Some(p), "working") => p.trim().to_string(),
         // On what it was asked (said just above): "working on it".
         (_, "working") => match running {
@@ -526,6 +533,9 @@ mod tests {
         // Its live progress line, when the tower has one, is its "now" as it is.
         let p = session(&SessionFacts { progress: Some("step 3 of 5: running the tests · 12m in"), ..f });
         assert_eq!(p.now, "step 3 of 5: running the tests · 12m in");
+        // One that only says how long: what it works on, then that.
+        let t = session(&SessionFacts { status: "working", said: None, tasks: vec![&verified, &running, &queued], waits_on: vec![], progress: Some("4 s in · last update just now"), upcoming: vec![], job: None, now: 40 * MIN });
+        assert_eq!(t.now, "working on it · 4 s in · last update just now");
         // Blocked on the user: what for. Idle: what it last said.
         let blocked = session(&SessionFacts { status: "blocked", said: None, tasks: vec![], waits_on: vec!["Merge PR #839 into dev".into()], progress: None, upcoming: vec![], job: None, now: 40 * MIN });
         assert_eq!(blocked.text, "Now: waiting for you: Merge PR #839 into dev.");
