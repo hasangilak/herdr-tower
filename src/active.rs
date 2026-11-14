@@ -4,9 +4,10 @@
 //! counted apart; idle time isn't counted. The space's own tower and its
 //! PRs' reviewers aren't its sessions here.
 //!
-//! - **From status changes, never polled**: the `job` lines of the history
-//!   (each session's status as the radar saw it change: working, blocked,
-//!   done …) and its `bgjob` lines (a background job that ended, with when
+//! - **From status changes, never polled**: the `status` lines of the
+//!   history (each session's status as the radar saw it change: working,
+//!   blocked, idle, exited; a session without them, from before: its `job`
+//!   lines), and its `bgjob` lines (a background job that ended, with when
 //!   it began), read once at the start and then only what was added since
 //!   (`Tracker::read`). The jobs running now come from the daemon's own list.
 //! - **Per space** (`Active`): whether it is at work now and since when (this
@@ -61,6 +62,8 @@ struct Session {
     state: Option<(State, u64)>,
     /// Its last word of any kind in the history.
     last_ms: u64,
+    /// The radar writes its status as it changes (`status` lines): its job lines are left aside.
+    statused: bool,
 }
 
 /// Every session's intervals so far, kept per space, and where reading the history stopped.
@@ -124,8 +127,13 @@ impl Tracker {
             s.space = Some(sp);
         }
         let space = s.space.clone();
+        // Its turns as the radar saw them, where it has them; else its jobs (an older history).
+        let status_line = e.kind == "status";
+        if status_line {
+            s.statused = true;
+        }
         match e.kind.as_str() {
-            "job" => {
+            "job" | "status" if status_line || !s.statused => {
                 let to = match e.status.as_deref() {
                     Some("working") => State::Working,
                     Some("blocked") => State::Blocked,
@@ -375,6 +383,24 @@ mod tests {
         // And one that ended, read back from its line.
         t.take(&Entry { at: 210 * MIN, kind: "bgjob".into(), session: Some("t1".into()), since: Some(190 * MIN), ..Default::default() });
         assert_eq!(of(&t, 220 * MIN, &|_| Some(false), &[]).today_ms, 60 * MIN);
+    }
+
+    /// The radar's status lines are a session's turns, its job lines aside:
+    /// a message from another session opens no job, but its turn is work.
+    #[test]
+    fn the_radars_status_lines_count_every_turn() {
+        let mut t = Tracker::default();
+        let status = |at: u64, st: &str| Entry { at, kind: "status".into(), session: Some("t1".into()), space: Some("Shop".into()), status: Some(st.into()), ..Default::default() };
+        t.take(&job(110 * MIN, "t1", "Shop", "working"));
+        t.take(&status(110 * MIN, "working"));
+        t.take(&status(115 * MIN, "idle"));
+        t.take(&job(116 * MIN, "t1", "Shop", "done"));
+        // A message from another session: no job line, a turn all the same.
+        t.take(&status(120 * MIN, "working"));
+        t.take(&status(130 * MIN, "blocked"));
+        t.take(&status(135 * MIN, "idle"));
+        let a = of(&t, 140 * MIN, &|_| Some(false), &[]);
+        assert_eq!((a.today_ms, a.waiting_today_ms), (15 * MIN, 5 * MIN));
     }
 
     /// A status the tower missed: the radar says the session isn't working,
