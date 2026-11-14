@@ -577,8 +577,10 @@ impl Sources<'_> {
         self.sessions.unwrap_or_default().iter().filter(|x| x.space == space).collect()
     }
 
+    /// The decisions in `space` that wait for the user: one on hold doesn't
+    /// (the daemon's state lists none; `tower missions` reads them all).
     fn needs(&self, space: &str) -> usize {
-        self.decisions.iter().filter(|d| d["space"].as_str().is_some_and(|s| s.eq_ignore_ascii_case(space))).count()
+        self.decisions.iter().filter(|d| d["hold"].is_null() && d["space"].as_str().is_some_and(|s| s.eq_ignore_ascii_case(space))).count()
     }
 
     /// What `step` needs: a line for every space with live sessions.
@@ -1492,6 +1494,22 @@ mod tests {
         let v = view(&s, &Sources { sessions: None, decisions: &[], ledger: &crate::agenda::Ledger::default(), threads: &BTreeMap::new(), towers: &BTreeMap::new(), now: 500, auto_close_hours: 24 });
         let row = v["spaces"].as_array().unwrap().iter().find(|r| r["name"] == "Shop").unwrap();
         assert_eq!(row["goal_history"].as_array().unwrap().last().unwrap()["by"], "request");
+    }
+
+    /// `tower missions` reads every open decision, those on hold too: one on
+    /// hold needs nobody, so a space whose only decision is held needs 0.
+    #[test]
+    fn a_decision_on_hold_needs_nobody_in_its_space() {
+        let mut s = Spaces::default();
+        s.missions.insert("Docs".into(), Mission::born(100));
+        let held = json!({ "id": "d1", "space": "docs", "hold": { "reason": "after the launch", "by": "mac", "at_ms": 200 } });
+        let waits = json!({ "id": "d2", "space": "Docs" });
+        let needs = |decisions: &[Value]| {
+            let v = view(&s, &Sources { sessions: None, decisions, ledger: &crate::agenda::Ledger::default(), threads: &BTreeMap::new(), towers: &BTreeMap::new(), now: 500, auto_close_hours: 24 });
+            v["spaces"][0]["needs"].as_u64()
+        };
+        assert_eq!(needs(std::slice::from_ref(&held)), Some(0));
+        assert_eq!(needs(&[held, waits]), Some(1));
     }
 
     #[test]

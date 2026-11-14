@@ -440,7 +440,7 @@ impl Panel {
                 return false;
             }
             // Put on hold here a moment ago: out of the queue already.
-            if self.hold.holding(&d.id) {
+            if self.hold.holding(&d.id) || acts.held_here(&d.id) {
                 return false;
             }
             if d.kind == Kind::Merge && d.prs.iter().any(|p| acts.merged.contains(&p.key())) {

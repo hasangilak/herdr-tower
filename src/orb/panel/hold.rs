@@ -135,6 +135,9 @@ impl Panel {
     pub(super) fn send_hold(&mut self, id: &str, words: &str, unhold: bool, cx: &mut Context<Self>) {
         self.hold.pending.retain(|(i, _)| i != id);
         self.hold.pending.push((id.to_string(), !unhold));
+        // The orb's number too, not only this window's queue.
+        let held_id = id.to_string();
+        self.act(cx, |a| if unhold { a.held.remove(&held_id) } else { a.held.insert(held_id) });
         let (id2, words) = (id.to_string(), words.to_string());
         let task = cx.background_executor().spawn(async move {
             crate::protocol::send(&crate::protocol::Request::Hold { id: id2, reason: words, unhold, by: "mac".into(), from: None })
@@ -146,6 +149,8 @@ impl Panel {
             cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
             let _ = this.update(cx, |this, cx| {
                 this.hold.pending.retain(|(i, _)| *i != id3);
+                // The state has it by now (or it didn't go): the daemon's word again.
+                this.act(cx, |a| a.held.remove(&id3));
                 match r {
                     Ok(r) if r.ok => {}
                     Ok(r) => this.status = Some((false, r.error.unwrap_or_else(|| "It couldn't be put on hold.".into()))),
