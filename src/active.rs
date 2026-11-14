@@ -137,7 +137,8 @@ impl Tracker {
                 match was {
                     Some((st, from)) if st == to => s.state = Some((st, from)),
                     Some((st, from)) => {
-                        if let Some(sp) = space {
+                        // Its tower's or a reviewer's: not the space's work.
+                        if let Some(sp) = space.filter(|_| !self.apart.contains(&addr)) {
                             self.spans.entry(sp).or_default().push((from, e.at, st == State::Blocked));
                         }
                     }
@@ -146,7 +147,7 @@ impl Tracker {
             }
             // A background job that ended, with when it began.
             "bgjob" => {
-                if let (Some(sp), Some(from)) = (space, e.since) {
+                if let (Some(sp), Some(from)) = (space.filter(|_| !self.apart.contains(&addr)), e.since) {
                     self.spans.entry(sp).or_default().push((from.min(e.at), e.at, false));
                 }
             }
@@ -356,6 +357,11 @@ mod tests {
         t.take(&tw);
         let a = of(&t, 160 * MIN, &|_| None, &[]);
         assert_eq!((a.today_ms, a.waiting_today_ms, a.now, a.waiting_now), (30 * MIN, 10 * MIN, false, false));
+        // Their turns that ended don't count either (14 Nov: a reviewer's made search-llm's stretch run from the night before).
+        let mut r_done = job(102 * MIN, "t9", "Shop", "done");
+        r_done.name = Some("review web 12".into());
+        t.take(&r_done);
+        assert_eq!(of(&t, 160 * MIN, &|_| None, &[]).today_ms, 30 * MIN);
         // t2 waits on the user now, while t1 works: active, not waiting.
         t.take(&job(170 * MIN, "t2", "Shop", "blocked"));
         t.take(&job(175 * MIN, "t1", "Shop", "working"));
