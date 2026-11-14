@@ -249,6 +249,8 @@ struct Inner {
     not_users: HashMap<String, (u64, Option<u64>)>,
     /// The last turn the tower looked at, per session (kept: `Saved::turns`).
     turns: HashMap<String, Looked>,
+    /// The same as the last run left it: what `missed_turn` compares with.
+    turns_at_start: HashMap<String, Looked>,
 }
 
 impl Inner {
@@ -488,7 +490,13 @@ impl Asks {
         let Some(store) = &self.store else { return };
         let saved = Saved::load(&store.0);
         if saved.sets.is_empty() && saved.replies.is_empty() && saved.dismissed.is_empty() {
-            // No card is left: a decision that stood for one is over.
+            // No card is left: a decision that stood for one is over. The turns looked at
+            // are kept all the same (a turn that ended while the tower was down: `missed_turn`).
+            {
+                let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                i.turns_at_start = saved.turns.clone();
+                i.turns = saved.turns;
+            }
             self.publish();
             return;
         }
@@ -555,6 +563,7 @@ impl Asks {
             i.replies = replies;
             i.dismissed = dismissed;
             i.noted = saved.noted;
+            i.turns_at_start = saved.turns.clone();
             i.turns = saved.turns;
             for o in over {
                 i.noted.retain(|n| *n != o.id);
@@ -621,11 +630,14 @@ impl Asks {
     }
 
     /// A turn of `address` that ended while the tower was down: the last
-    /// turn it looked at was this terminal's, at a lower count, and lately
-    /// enough (`MISSED_TURN_MS`). Nothing known of it: no.
+    /// turn the last run looked at was this terminal's, at a lower count, and
+    /// lately enough (`MISSED_TURN_MS`). Nothing known of it: no.
     pub fn missed_turn(&self, address: &str, created_ms: Option<u64>, turn: u64, now_ms: u64) -> bool {
         let i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        i.turns.get(address).is_some_and(|l| l.created_ms == created_ms && turn > l.turn && now_ms.saturating_sub(l.at_ms) <= MISSED_TURN_MS)
+        let start = &i.turns_at_start;
+        // A look that doesn't say when its terminal was made (a row of `hc ls`) is taken to be the same terminal.
+        let same = |l: &Looked| l.created_ms.is_none() || created_ms.is_none() || l.created_ms == created_ms;
+        start.get(address).is_some_and(|l| same(l) && turn > l.turn && now_ms.saturating_sub(l.at_ms) <= MISSED_TURN_MS)
     }
 
     /// The tower looked at `address` at turn count `turn` (kept across restarts: `missed_turn`).
@@ -633,6 +645,8 @@ impl Asks {
         let changed = {
             let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let was = i.turns.get(address).copied();
+            // A look that doesn't say when its terminal was made keeps what an earlier one said.
+            let created_ms = created_ms.or_else(|| was.and_then(|w| w.created_ms));
             let now = Looked { created_ms, turn, at_ms: now_ms };
             // Kept fresh at most once a minute when nothing moved (its time says the tower looked lately).
             let moved = was.is_none_or(|w| w.created_ms != created_ms || w.turn != turn || now_ms.saturating_sub(w.at_ms) > 60_000);
@@ -2961,6 +2975,22 @@ mod tests {
         assert_eq!(b.get(&id).map(|s| s.state.decision), Some(Decision::Escalated), "its wait for the brain ran out after the start: the user's");
     }
 
+    /// Also with no card left at all (the live restart test: `restore` left
+    /// before it read the turns, so none was ever known as missed).
+    #[test]
+    fn the_turns_looked_at_come_back_with_no_card_left() {
+        let dir = tmp("turns-no-card");
+        let path = dir.0.join("questions.json");
+        let now = crate::history::now_ms();
+        {
+            let (a, _) = stored(&path);
+            a.looked_turn("tw-u1", Some(7), 3, now);
+        }
+        let (b, _) = stored(&path);
+        b.restore();
+        assert!(b.missed_turn("tw-u1", None, 4, now));
+    }
+
     /// The last turn looked at per session is kept across a restart: a turn
     /// that ended while the tower was down is known as one (`missed_turn`).
     #[test]
@@ -2984,6 +3014,10 @@ mod tests {
         assert!(!b.missed_turn("tw-t2", Some(7), 6, now), "looked at too long ago: an old turn, not news");
         assert!(!b.missed_turn("tw-t3", Some(7), 3, now), "gone: forgotten");
         assert!(!b.missed_turn("tw-new", Some(7), 9, now), "never looked at");
+        // A row of `hc ls` doesn't say when its terminal was made: the same one, and what was known stays.
+        assert!(b.missed_turn("tw-t1", None, 4, now), "a look without the terminal's time");
+        b.looked_turn("tw-t1", None, 4, now);
+        assert!(!b.missed_turn("tw-t1", Some(8), 5, now), "the terminal's time was kept: another one at that address isn't this one");
     }
 
     #[test]

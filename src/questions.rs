@@ -1747,7 +1747,13 @@ fn last_question(message: &str) -> String {
     let flat = message.split_whitespace().collect::<Vec<_>>().join(" ");
     let Some(q) = flat.rfind('?') else { return flat.chars().rev().take(160).collect::<Vec<_>>().into_iter().rev().collect() };
     let before = &flat[..q];
-    let start = before.rfind(['.', '!', '\n', ':']).map(|i| i + 1).unwrap_or(0);
+    // A sentence ends at ". ", "! " or ": ", not inside a word ("notes.md", "v2.1", "https:").
+    let start = before
+        .char_indices()
+        .filter(|(i, c)| ['.', '!', ':'].contains(c) && before[i + c.len_utf8()..].starts_with(' '))
+        .map(|(i, c)| i + c.len_utf8())
+        .last()
+        .unwrap_or(0);
     flat[start..=q].trim().to_string()
 }
 
@@ -2588,6 +2594,14 @@ mod tests {
         assert!(!asks_directly("Did the build pass? Yes: all 818 tests.\n\nIt's merged and installed."));
         assert!(!asks_directly("```\nwhat now?\n```\nDone."));
     }
+    /// A card's question is its whole last sentence: a file name's dot doesn't end one.
+    #[test]
+    fn a_cards_question_keeps_a_file_name_whole() {
+        assert_eq!(last_question("Seventh wait done. Should I delete notes.md now?"), "Should I delete notes.md now?");
+        assert_eq!(last_question("Done: all 822 pass. Bump to v2.1 and push?"), "Bump to v2.1 and push?");
+        assert_eq!(last_question("It's merged!  Want me to do both?"), "Want me to do both?");
+    }
+
 
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(format!("{}/tests/fixtures/questions/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
