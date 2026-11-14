@@ -289,6 +289,8 @@ pub fn reviewer_settings() -> Value {
             "deny": [
                 "Bash(git push:*)", "Bash(git commit:*)", "Bash(git merge:*)", "Bash(git rebase:*)", "Bash(git reset:*)",
                 "Bash(gh pr merge:*)", "Bash(gh pr close:*)", "Bash(gh pr edit:*)", "Bash(gh pr ready:*)",
+                // Its dependencies are the tower's link: an rm asks the user, and its verdict waits with it.
+                "Bash(rm:*)", "Bash(unlink:*)",
                 "Edit", "Write", "NotebookEdit"
             ]
         }
@@ -310,7 +312,7 @@ pub fn instructions(r: &Review, goal: &str, done_when: &str, checkout: bool) -> 
     };
     let place = if checkout {
         format!(
-            "You work in a checkout of the PR's head at {}, detached: it is no branch of anyone's. To see the PR as it is now: gh pr checkout {n} --repo {repo} --detach (or gh pr diff {n} --repo {repo}).",
+            "You work in a checkout of the PR's head at {}, detached: it is no branch of anyone's. To see the PR as it is now: gh pr checkout {n} --repo {repo} --detach (or gh pr diff {n} --repo {repo}). Where the repo has its dependencies installed (node_modules), the tower linked them into your checkout: run the tests with them as they are. Never link, copy or remove them yourself, and never put rm in a command (rm is refused here): the tower takes the link away with the checkout.",
             r.folder
         )
     } else {
@@ -888,6 +890,9 @@ mod tests {
             assert!(allow.contains(&a), "{a}: {allow:?}");
         }
         assert!(deny.contains(&"Bash(git push:*)") && deny.contains(&"Bash(gh pr merge:*)") && deny.contains(&"Edit"));
+        // 13 Nov: `rm node_modules && gh pr review --approve` put five reviewers' verdicts in the user's queue.
+        assert!(deny.contains(&"Bash(rm:*)"));
+        assert!(t.contains("the tower linked them into your checkout") && t.contains("never put rm in a command"));
     }
 
     #[test]

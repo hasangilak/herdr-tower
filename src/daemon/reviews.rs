@@ -275,7 +275,11 @@ impl Reviews {
         let repo = owner.as_ref().and_then(repo_of_terminal);
         let made = repo.as_ref().map(|repo| {
             let place = reviews::checkout_place(repo, &r.space, r.number);
-            crate::worktrees::pr_commit(repo, &r.repo, r.number, &r.head, &r.head_sha).and_then(|rev| crate::worktrees::add_detached(repo, &place, &rev)).map(|_| (place, repo.clone()))
+            crate::worktrees::pr_commit(repo, &r.repo, r.number, &r.head, &r.head_sha).and_then(|rev| crate::worktrees::add_detached(repo, &place, &rev)).map(|_| {
+                // Its dependencies, to run the tests with: linked by the tower, taken away with the checkout.
+                crate::worktrees::link_dependencies(repo, &place);
+                (place, repo.clone())
+            })
         });
         let (folder, of) = match made {
             Some(Ok((place, repo))) => (place, repo.to_string_lossy().into_owned()),
