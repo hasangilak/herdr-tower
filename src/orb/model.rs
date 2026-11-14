@@ -389,16 +389,13 @@ pub fn merge_title(n: usize) -> String {
     if n == 1 { "1 pull request ready to merge".into() } else { format!("{n} pull requests ready to merge") }
 }
 
-/// What the one button of a merge card says.
-pub fn merge_label(prs: &[PrRef]) -> String {
-    let staged = prs.iter().any(|p| !crate::prs::is_prod(&p.base)) && prs.iter().any(|p| crate::prs::is_prod(&p.base));
-    match prs {
-        [one] => format!("Merge #{}", one.number),
-        [_, _] if staged => "Merge both, dev first".into(),
-        [_, _] => "Merge both".into(),
-        _ if staged => format!("Merge all {}, dev first", prs.len()),
-        _ => format!("Merge all {}", prs.len()),
-    }
+/// What the one button of a merge card says: exactly the PRs it merges
+/// (`ready`, of the card's `total`), "Merge #839 and #842", or "Merge all
+/// 4" when every one of them goes (`crate::prs::merge_what`).
+pub fn merge_label(ready: &[PrRef], total: usize) -> String {
+    let staged = ready.iter().any(|p| !crate::prs::is_prod(&p.base)) && ready.iter().any(|p| crate::prs::is_prod(&p.base));
+    let numbers: Vec<u64> = ready.iter().map(|p| p.number).collect();
+    format!("Merge {}{}", crate::prs::merge_what(&numbers, total), if staged { ", dev first" } else { "" })
 }
 
 /// Today's data as decisions (not yet in queue order):
@@ -501,8 +498,8 @@ pub fn adapt(sets: &[QuestionSet], prs: &BTreeMap<String, Pr>, agents: &Value, s
             title: merge_title(refs.len()),
             detail: String::new(),
             why: "Merge".into(),
-            pick: Some(merge_label(&refs)),
-            options: vec![Opt { label: merge_label(&refs), why: String::new(), pick: true }],
+            pick: Some(merge_label(&refs, refs.len())),
+            options: vec![Opt { label: merge_label(&refs, refs.len()), why: String::new(), pick: true }],
             prs: refs,
             question_id: None,
             task: None,
@@ -1649,7 +1646,7 @@ mod tests {
             "dev before main"
         );
         assert_eq!(shop.title, "2 pull requests ready to merge");
-        assert_eq!(shop.options, [Opt { label: "Merge both, dev first".into(), why: String::new(), pick: true }]);
+        assert_eq!(shop.options, [Opt { label: "Merge #1273 and #1277, dev first".into(), why: String::new(), pick: true }]);
         assert_eq!((shop.first_ms, shop.last_ms), (5000, 9000));
         assert_eq!(shop.sessions.iter().map(|s| s.address.as_str()).collect::<Vec<_>>(), ["t1", "t2"]);
         assert_eq!(shop.waiting, 1, "only the blocked session waits");
@@ -1664,11 +1661,14 @@ mod tests {
     #[test]
     fn a_merge_card_names_what_its_button_does() {
         let r = |n: u64, base: &str| PrRef { repo: "a/b".into(), number: n, base: base.into(), checks: "pass".into(), ..Default::default() };
-        assert_eq!(merge_label(&[r(4, "dev")]), "Merge #4");
-        assert_eq!(merge_label(&[r(4, "dev"), r(5, "main")]), "Merge both, dev first");
-        assert_eq!(merge_label(&[r(4, "dev"), r(5, "dev")]), "Merge both");
-        assert_eq!(merge_label(&[r(4, "dev"), r(5, "dev"), r(6, "main")]), "Merge all 3, dev first");
-        assert_eq!(merge_label(&[r(4, "main"), r(5, "main"), r(6, "main")]), "Merge all 3");
+        assert_eq!(merge_label(&[r(4, "dev")], 1), "Merge #4");
+        assert_eq!(merge_label(&[r(4, "dev"), r(5, "main")], 2), "Merge #4 and #5, dev first");
+        assert_eq!(merge_label(&[r(4, "dev"), r(5, "dev")], 2), "Merge #4 and #5", "never \"both\": which two?");
+        assert_eq!(merge_label(&[r(4, "dev"), r(5, "dev"), r(6, "main")], 3), "Merge all 3, dev first");
+        assert_eq!(merge_label(&[r(4, "main"), r(5, "main"), r(6, "main")], 3), "Merge all 3");
+        // 14 Nov: four on the card, two of them drafts. The button said "Merge both".
+        assert_eq!(merge_label(&[r(839, "dev"), r(842, "dev")], 4), "Merge #839 and #842");
+        assert_eq!(merge_label(&[r(839, "dev"), r(840, "dev"), r(842, "dev")], 4), "Merge #839, #840 and #842");
     }
 
     fn set(id: &str, session: &str, title: &str, at: u64) -> Value {

@@ -396,6 +396,42 @@ fn capital(s: &str) -> String {
     c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
+/// PR numbers as a list in words: "#839", "#839 and #842", "#1, #2 and #3".
+pub fn numbers(ns: &[u64]) -> String {
+    let each: Vec<String> = ns.iter().map(|n| format!("#{n}")).collect();
+    match each.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// What a merge card's one button merges, named so it can't be misread:
+/// "#839 and #842" (the PRs themselves), "all 4" (every PR of the card,
+/// three or more), "5 of 7" (too many to name; the title names them).
+pub fn merge_what(ready: &[u64], total: usize) -> String {
+    match ready.len() {
+        n if n == total && n >= 3 => format!("all {n}"),
+        n if n <= 4 => numbers(ready),
+        n => format!("{n} of {total}"),
+    }
+}
+
+/// Why a PR stays out of its card's merge, in a few words ("it's a
+/// draft", "its checks fail"): what blocks it (`Gate::blocked`, its first
+/// clause), else checks that fail. None: it goes in with the others.
+pub fn held_back(blocked: Option<&str>, needs_override: bool) -> Option<String> {
+    match blocked.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(b) => {
+            let first = b.split([':', ';']).next().unwrap_or(b).trim().trim_end_matches('.');
+            // "It's a draft" reads on after a colon as "it's a draft"; a name keeps its capital.
+            Some(if first.starts_with("It") { format!("i{}", &first[1..]) } else { first.to_string() })
+        }
+        None if needs_override => Some("its checks fail".into()),
+        None => None,
+    }
+}
+
 /// Branches whose merge ships to production.
 pub fn is_prod(base: &str) -> bool {
     matches!(base.to_lowercase().as_str(), "main" | "master" | "prod" | "production" | "release" | "live")
@@ -1083,6 +1119,25 @@ fn getrandom(buf: &mut [u8]) -> std::io::Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// 14 Nov: a card of four PRs, two of them drafts, said "Merge both".
+    /// Its button names what it merges, and each left out says why.
+    #[test]
+    fn a_merge_names_its_prs_and_why_one_is_left_out() {
+        assert_eq!(numbers(&[839]), "#839");
+        assert_eq!(numbers(&[839, 842]), "#839 and #842");
+        assert_eq!(numbers(&[1, 2, 3]), "#1, #2 and #3");
+        assert_eq!(merge_what(&[839, 842], 4), "#839 and #842");
+        assert_eq!(merge_what(&[839, 842], 2), "#839 and #842", "both: named, never \"both\"");
+        assert_eq!(merge_what(&[1, 2, 3, 4], 4), "all 4");
+        assert_eq!(merge_what(&[1, 2, 3], 4), "#1, #2 and #3");
+        assert_eq!(merge_what(&[1, 2, 3, 4, 5], 7), "5 of 7");
+        assert_eq!(held_back(Some("It's a draft: mark it ready for review first."), false).as_deref(), Some("it's a draft"));
+        assert_eq!(held_back(Some("It has conflicts with dev: they need resolving first."), true).as_deref(), Some("it has conflicts with dev"));
+        assert_eq!(held_back(Some("GitHub hasn't said where it stands yet."), false).as_deref(), Some("GitHub hasn't said where it stands yet"));
+        assert_eq!(held_back(None, true).as_deref(), Some("its checks fail"));
+        assert_eq!(held_back(None, false), None);
+    }
 
     /// 13 Nov: "My PR #1398 is still waiting for your merge" became a card
     /// of its own beside #1398's merge card. A number names the PR the tower
