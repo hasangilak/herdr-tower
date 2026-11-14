@@ -466,6 +466,10 @@ pub(super) fn live_head(p: &PlanView) -> String {
 
 /// A revision in a line: "v2 · small, applied: Stage s2 delivers PR 2, PR 4 (from f1)".
 pub(super) fn revision_line(r: &crate::plans::Revision) -> String {
+    let from = if r.findings.is_empty() { String::new() } else { format!(" (from {})", r.findings.join(", ")) };
+    if r.status == "kept" {
+        return format!("Revision {} · kept: {}{from}", r.n, r.why.trim_end_matches('.'));
+    }
     let what = match r.status.as_str() {
         "proposed" => "waiting for your word".to_string(),
         "rejected" => "kept out by you".to_string(),
@@ -2852,6 +2856,8 @@ mod tests {
         assert_eq!(live_head(&lp), "Plan · version 3 · Stage 2 of 4 · 1 done");
         assert_eq!(revision_line(&lp.revisions[0]), "Revision 1 · small, applied by itself: The backfill gets its own check (from f2)");
         assert_eq!(revision_line(&lp.revisions[1]), "Revision 2 · waiting for your word: Backfill first (from f1)");
+        let kept = crate::plans::Revision { n: 3, why: "640 ms is within budget.".into(), findings: vec!["f3".into()], size: "none".into(), status: "kept".into(), ..Default::default() };
+        assert_eq!(revision_line(&kept), "Revision 3 · kept: 640 ms is within budget (from f3)");
         // The critic's read, and a stage's tasks.
         assert_eq!(critic_line(&crate::plans::Critic::default()), None);
         assert_eq!(critic_line(&crate::plans::Critic { status: "done".into(), gaps: vec!["a".into(), "b".into()], ..Default::default() }).unwrap(), "A critic read the plan first: 2 gaps sent to the planner. Its questions came to you after.");
