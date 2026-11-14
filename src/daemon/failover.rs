@@ -981,7 +981,9 @@ mod tests {
 
     #[test]
     fn the_states_board_follows_the_usage_and_a_move_at_once() {
-        let now = 1_794_590_000_000;
+        // The clock now: the board says who is out against the real clock, so a
+        // fixed day here made "resets 3pm" a time already past once that day came.
+        let now = crate::history::now_ms();
         let mut usage = BTreeMap::new();
         usage.insert("default".to_string(), Usage { five_hour: Some(crate::accounts::Window { used: 64.0, resets_ms: Some(now + 3_600_000) }), seven_day: None });
         let (f, _, _, dir) = setup(Fake { t: Mutex::new(session("t5", "fix-login")), accounts: vec![acc("default"), acc("orca")], usage, now, ..Default::default() });
@@ -1012,7 +1014,8 @@ mod tests {
 
     #[test]
     fn a_session_at_its_limit_resumes_on_the_next_account_in_its_own_terminal() {
-        let now = 1_794_580_000_000;
+        // The clock now (see the board's test).
+        let now = crate::history::now_ms();
         let (f, fake, _, dir) = setup(Fake {
             t: Mutex::new(session("t5", "fix-login")),
             accounts: vec![acc("default"), acc("orca")],
