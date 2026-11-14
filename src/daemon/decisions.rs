@@ -879,6 +879,18 @@ impl Decisions {
         self.answered(&id, with)
     }
 
+    /// A plan is closed: its cards still open (its questions, a revision) are over.
+    pub fn plan_over(&self, plan: &str) -> usize {
+        let prefix = format!("{}{}:", decisions::PLAN_KEY, plan.trim());
+        let ids: Vec<String> = lock(&self.book).open.iter().filter(|d| d.key.starts_with(&prefix)).map(|d| d.id.clone()).collect();
+        for id in &ids {
+            if let Some(d) = self.change(|b, now| b.close(id, State::Stopped, now)) {
+                record(&d);
+            }
+        }
+        ids.len()
+    }
+
     /// The card offering back what a restart closed, as it should stand
     /// now (None: nothing left, an open one stops). Its id, and whether
     /// the user is told now (the first time, as a raise is).

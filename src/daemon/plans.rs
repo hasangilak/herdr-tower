@@ -770,6 +770,15 @@ impl Plans {
     fn close(&self, id: &str, launched: Option<&str>) -> Result<Plan> {
         let p = self.change(|b| b.close(id, launched, now()))?;
         eprintln!("[plans] {id} closed{}", launched.map(|s| format!(": launched as {s}")).unwrap_or_default());
+        // Closed for good: its cards still in the queue are over.
+        if p.status == plans::Status::Closed
+            && let Some(d) = &self.decisions
+        {
+            let n = d.plan_over(id);
+            if n > 0 {
+                eprintln!("[plans] {id}: {n} card(s) of it out of the queue");
+            }
+        }
         // (A test never ends a terminal: Herdr's are the user's.)
         if cfg!(test) {
             return Ok(p);
@@ -1309,9 +1318,16 @@ mod tests {
         plans.found("p1", "risk", "The provider throttles at 50 rps", "s2", "", "t5").unwrap();
         let p = lock(&plans.book).get("p1").cloned().unwrap();
         assert!(plans::first_task(&p, "/bin/tower").contains("Findings waiting: f3 (risk): The provider throttles at 50 rps"), "{}", plans::first_task(&p, "/bin/tower"));
+        // Closed for good: a card of it still in the queue is over.
+        let mut fresh_q = v.clone();
+        fresh_q["questions"] = json!([{ "id": "q9", "text": "Which reviewer?", "theirs": true }]);
+        revise(fresh_q, "A reviewer to name", &[]);
+        assert_eq!(decisions.list(None, false)["count"], 1, "its question went out");
         // A new plan being written leaves the live one live.
         plans.change(|b| Ok(b.add(Form::Page, "Another", draft(), |id| dir.join(id), 9).0)).unwrap();
         assert_eq!((shared.get().plans_live.len(), shared.get().plan.unwrap()["id"].as_str()), (1, Some("p2")));
+        assert!(plans.request(&ask("close", "p1")).ok);
+        assert_eq!(decisions.list(None, false)["count"], 0, "closing the plan takes its cards out");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
