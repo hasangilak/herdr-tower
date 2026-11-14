@@ -46,7 +46,8 @@ struct Inner {
     declared: Declared,
     /// Each transcript read so far: where to read on, and what it said.
     transcripts: HashMap<PathBuf, (u64, Tasks)>,
-    /// Jobs told stuck (session/key): told once, until they write again.
+    /// Jobs told stuck (session/key): told once for as long as the job runs,
+    /// across restarts of the tower (`jobs-told.json`).
     stuck_told: HashSet<String>,
     /// Background shells that count as jobs (session/key, `running::counts`):
     /// once they outlived their session's turn or ran two minutes.
@@ -121,9 +122,14 @@ fn read_on(path: &PathBuf, from: u64) -> Option<(String, u64)> {
 
 impl Running {
     pub fn open(shared: Shared, tell: Tell) -> Running {
-        let path = crate::config::state_dir().join("jobs-running.json");
+        Running::open_at(shared, tell, crate::config::state_dir().join("jobs-running.json"))
+    }
+
+    /// With its files beside `path` (`jobs-running.json`, `jobs-told.json`).
+    fn open_at(shared: Shared, tell: Tell, path: PathBuf) -> Running {
         let declared: Declared = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-        Running { inner: Arc::new(Mutex::new(Inner { declared, ..Default::default() })), shared, tell, path }
+        let stuck_told: HashSet<String> = std::fs::read_to_string(path.with_file_name("jobs-told.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        Running { inner: Arc::new(Mutex::new(Inner { declared, stuck_told, ..Default::default() })), shared, tell, path }
     }
 
     pub fn start(&self) {
@@ -251,15 +257,23 @@ impl Running {
                     told.push((address.clone(), ended_line(names.get(address).map(String::as_str).unwrap_or(address), j, summary.as_deref(), now)));
                 }
             }
-            // Newly quiet: told once (again only after it wrote meanwhile).
+            // Quiet: told once for as long as it runs (not again when it wrote
+            // meanwhile and went quiet again, nor after a restart of the tower).
+            let told_before = i.stuck_told.clone();
             for (address, list) in &jobs {
                 for j in list {
-                    let k = format!("{address}/{}", key(j));
-                    if j.stuck && i.stuck_told.insert(k.clone()) {
+                    if j.stuck && i.stuck_told.insert(format!("{address}/{}", key(j))) {
                         told.push((address.clone(), stuck_line(names.get(address).map(String::as_str).unwrap_or(address), j, now)));
-                    } else if !j.stuck {
-                        i.stuck_told.remove(&k);
                     }
+                }
+            }
+            // Jobs gone: forgotten.
+            let live: HashSet<String> = jobs.iter().flat_map(|(a, l)| l.iter().map(move |j| format!("{a}/{}", key(j)))).collect();
+            i.stuck_told.retain(|k| live.contains(k));
+            if i.stuck_told != told_before {
+                let tmp = self.path.with_file_name("jobs-told.json.tmp");
+                if std::fs::write(&tmp, serde_json::to_string(&i.stuck_told).unwrap_or_default()).is_ok() {
+                    let _ = std::fs::rename(&tmp, self.path.with_file_name("jobs-told.json"));
                 }
             }
             let changed = i.jobs != jobs || i.servers != servers;
@@ -469,7 +483,13 @@ mod tests {
         let mut quiet = BTreeMap::new();
         quiet.insert("t12r".to_string(), (vec![job("Train the 1.2B LoRA", "btrain", now - 600_000, now - 40 * 60_000, true)], vec![]));
         r.settle(quiet.clone(), &names, now);
-        r.settle(quiet, &names, now + 15_000);
+        r.settle(quiet.clone(), &names, now + 15_000);
+        // It writes once more, then goes quiet again: still not told again.
+        r.settle(seen.clone(), &names, now + 30_000);
+        r.settle(quiet.clone(), &names, now + 45_000);
+        // Nor by a tower started again (what was told is kept on disk).
+        let again = Running::open_at(r.shared.clone(), r.tell.clone(), r.path.clone());
+        again.settle(quiet.clone(), &names, now + 60_000);
         let t = lock(&told).clone();
         assert_eq!(t.len(), 1, "{t:?}");
         assert!(t[0].msg.starts_with("[job] eyz search llm's job may be stuck: Train the 1.2B LoRA: nothing written and no CPU for 40 min"), "{}", t[0].msg);

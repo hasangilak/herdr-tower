@@ -692,7 +692,8 @@ doesn't. The daemon looks every 15 s (`src/running.rs`,
   command, its id: the shell's output file is `…/tasks/<id>.output`).
 - **Job, server or watcher.** A Monitor, `tail -f` and `--watch` only
   watch. A process holding a listening port, or a dev-server command
-  (`npm run dev`, `next dev`, `vite`, `uvicorn`, `python -m http.server` …),
+  (`npm run dev`, `next dev`, `vite`, `uvicorn`, `python -m http.server`,
+  `docker compose … up` without `-d` …),
   is a server left running. Neither is a job; any other finite command is,
   once it has outlived the session's turn (seen running while the session
   is done or idle, at least 15 s in) or run for 2 minutes: a short helper a
@@ -700,7 +701,10 @@ doesn't. The daemon looks every 15 s (`src/running.rs`,
   nobody's news.
 - **Progress.** Its newest write to a file it has open (its log), and
   whether it uses the CPU. Nothing written and no CPU for 30 min: possibly
-  stuck, told once.
+  stuck, told once for as long as it runs
+  (kept across restarts of the tower).
+- **Named** by its call's description, else by its command without what
+  only sets it up (`S=/tmp/x;`, `cd dir &&`).
 - **Shown** as "running a job: <what>, since 01:21, last progress 01:42"
   on the radar line the brain gets, in `tower agents`, in a space's view
   on the Mac (and its space counts as at work), and on the phone (a

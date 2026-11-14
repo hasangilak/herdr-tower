@@ -352,14 +352,28 @@ fn serves(command: &str) -> Option<Kind> {
         " npx serve ",
         " python -m http.server ",
         " manage.py runserver ",
-        " docker compose up ",
-        " docker-compose up ",
     ];
-    if SERVE.iter().any(|s| c.contains(s)) {
-        // `docker compose up -d` returns at once: no server held here.
+    if SERVE.iter().any(|s| c.contains(s)) || compose_up(&c) {
         return Some(Kind::Server);
     }
     None
+}
+
+/// `docker compose [options] up [options]` (or `docker-compose …`) without
+/// `-d`, `--detach` or `--wait`: it holds the containers in the foreground,
+/// a server left running. With them it returns at once.
+fn compose_up(c: &str) -> bool {
+    let toks: Vec<&str> = c.split_whitespace().collect();
+    (0..toks.len()).any(|i| {
+        let rest = match (toks[i], toks.get(i + 1)) {
+            ("docker-compose", _) => &toks[i + 1..],
+            ("docker", Some(&"compose")) => &toks[i + 2..],
+            _ => return false,
+        };
+        // Its own words, up to the next command.
+        let own: Vec<&str> = rest.iter().copied().take_while(|t| !matches!(*t, "&&" | "||" | ";" | "|")).collect();
+        own.contains(&"up") && !own.iter().any(|t| matches!(*t, "-d" | "--detach" | "--wait") || (t.starts_with('-') && !t.starts_with("--") && t.len() > 2 && t.contains('d') && !t.contains('=')))
+    })
 }
 
 /// What a background shell is: a Monitor or a watcher watches; a process
@@ -447,6 +461,51 @@ pub struct Shown {
 pub fn main_job(jobs: &[Job]) -> Option<&Job> {
     let fresh = |j: &&Job| j.progress_ms.unwrap_or(j.since_ms);
     jobs.iter().filter(|j| !j.stuck).max_by_key(fresh).or_else(|| jobs.iter().max_by_key(fresh))
+}
+
+/// A command as a job's name when its call has no description: without
+/// what only sets it up (`S=/tmp/x;`, `export K=v &&`, `cd dir &&`), so
+/// `S=/tmp/x; cd /w/app && npm test` is named `npm test`.
+pub fn name_of(command: &str) -> String {
+    let mut c = command.trim();
+    loop {
+        let before = c;
+        // `cd <dir>` then `&&` or `;`.
+        if let Some(rest) = c.strip_prefix("cd ") {
+            match rest.find("&&").map(|i| (i, 2)).into_iter().chain(rest.find(';').map(|i| (i, 1))).min() {
+                Some((i, n)) => c = rest[i + n..].trim_start(),
+                None => break,
+            }
+        }
+        // `[export ]NAME=value` then `;` or `&&` (the value may be quoted).
+        let a = c.strip_prefix("export ").unwrap_or(c);
+        let name_len = a.chars().take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_').count();
+        if name_len > 0 && !a.chars().next().is_some_and(|ch| ch.is_ascii_digit()) && a[name_len..].starts_with('=') {
+            let v = &a[name_len + 1..];
+            let mut end = 0;
+            let mut quote: Option<char> = None;
+            for (i, ch) in v.char_indices() {
+                match (quote, ch) {
+                    (None, '\'' | '"') => quote = Some(ch),
+                    (Some(q), ch) if ch == q => quote = None,
+                    (None, ch) if ch.is_whitespace() || ch == ';' || ch == '&' => {
+                        end = i;
+                        break;
+                    }
+                    _ => {}
+                }
+                end = i + ch.len_utf8();
+            }
+            let after = v[end..].trim_start();
+            if let Some(r) = after.strip_prefix("&&").or_else(|| after.strip_prefix(';')) {
+                c = r.trim_start();
+            }
+        }
+        if c == before || c.is_empty() {
+            break;
+        }
+    }
+    if c.is_empty() { command.trim().to_string() } else { c.to_string() }
 }
 
 pub fn clip(s: &str, n: usize) -> String {
@@ -564,7 +623,7 @@ pub fn look(claude: u32, world: &World, tasks: &Tasks, now_ms: u64) -> (Vec<Job>
         let commands: Vec<&str> = std::iter::once(command.as_str()).chain(tree.iter().skip(1).map(|p| p.command.as_str())).collect();
         let ports: Vec<u16> = tree.iter().flat_map(|p| world.listen.get(&p.pid).cloned().unwrap_or_default()).collect();
         let kind = kind_of(task, &commands, !ports.is_empty());
-        let what = task.map(|t| t.description.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| clip(&command, 80));
+        let what = task.map(|t| t.description.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| clip(&name_of(&command), 80));
         match kind {
             Kind::Watch => watches.push(task.map(|t| t.command.clone()).unwrap_or(command)),
             Kind::Server => servers.push(Server { what, pid: shell.pid, ports }),
@@ -697,6 +756,23 @@ mod tests {
         assert_eq!(kind_of(Some(&bash("tail -f data/train.log | grep val")), &[], false), Kind::Watch);
         assert_eq!(kind_of(None, &["cargo build --release"], false), Kind::Job);
         assert_eq!(kind_of(None, &["cargo test -- --watch"], false), Kind::Watch);
+        // docker compose in the foreground holds its containers: a server; detached it returns.
+        for c in ["docker compose -f docker-compose.dev.yml up --build > /tmp/x.log 2>&1", "docker-compose up", "cd app && docker compose --profile dev up web"] {
+            assert_eq!(kind_of(Some(&bash(c)), &[], false), Kind::Server, "{c}");
+        }
+        for c in ["docker compose -f x.yml up -d", "docker compose up --detach && npm test", "docker-compose up --wait", "docker compose up -dV", "docker compose build", "docker compose -f x.yml run --rm migrate"] {
+            assert_eq!(kind_of(Some(&bash(c)), &[], false), Kind::Job, "{c}");
+        }
+    }
+
+    #[test]
+    fn a_job_without_a_description_is_named_by_what_it_runs() {
+        assert_eq!(name_of("S=/private/tmp/claude-501/x/scratchpad; until [ -f \"$S/done\" ]; do sleep 5; done"), "until [ -f \"$S/done\" ]; do sleep 5; done");
+        assert_eq!(name_of("cd /Users/me/Work/app && S=/tmp/x; npm test -- --runInBand"), "npm test -- --runInBand");
+        assert_eq!(name_of("export K='a b' && cd \"/w/my app\"; make build"), "make build");
+        assert_eq!(name_of("A=1 B=2 make"), "A=1 B=2 make", "variables for the command itself stay");
+        assert_eq!(name_of("cd /w/app"), "cd /w/app", "nothing after it: as it was");
+        assert_eq!(name_of("python train.py > log 2>&1"), "python train.py > log 2>&1");
     }
 
     /// The t12r case: training (writes its log), a post-training script
