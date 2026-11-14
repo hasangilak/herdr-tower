@@ -43,7 +43,7 @@ pub struct Reader {
     items: Vec<Item>,
     /// TaskCreate calls waiting for their result (which gives the id).
     creating: HashMap<String, Item>,
-    /// Its calls without a result yet, the latest last.
+    /// Its calls without a result yet, the oldest first.
     open: Vec<Open>,
     /// When its turn started (the prompt it is working on).
     turn_ms: Option<u64>,
@@ -298,7 +298,8 @@ impl Reader {
                 _ => (None, None),
             },
         };
-        let open = self.open.last();
+        // The oldest open call is the one at work: calls made together run in turn.
+        let open = self.open.first();
         let mut p = Progress {
             step,
             steps: (steps > 0).then_some(steps),
@@ -432,7 +433,10 @@ mod tests {
         assert_eq!(p.line, "step 2 of 3: running the test suite · Bash: Run the tests for 4 min · 4 min in · last update 4 min ago");
 
         // The call ends; between items it says what is next.
-        r.read(&[result(300, "b1", "ok", Value::Null), uses(301, "u4", "TaskUpdate", serde_json::json!({ "taskId": "2", "status": "completed" }))].join("\n"));
+        // Two calls made together: the first runs, the second waits its turn.
+        r.read(&uses(43, "b2", "Bash", serde_json::json!({ "command": "wc -l src/x.rs", "description": "Count the lines" })));
+        assert_eq!(r.progress(None, ms(44)).unwrap().tool.as_deref(), Some("Bash: Run the tests"));
+        r.read(&[result(300, "b1", "ok", Value::Null), result(300, "b2", "4", Value::Null), uses(301, "u4", "TaskUpdate", serde_json::json!({ "taskId": "2", "status": "completed" }))].join("\n"));
         let p = r.progress(None, ms(310)).unwrap();
         assert_eq!((p.step, p.item.as_deref(), p.tool.as_deref()), (Some(3), Some("next: Write a one-line summary"), None));
         // A deleted item leaves the count.
