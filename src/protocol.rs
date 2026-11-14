@@ -416,6 +416,10 @@ pub enum Request {
         /// `prs`: the PRs the plan predicts, as the planner wrote them.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prs: Option<serde_json::Value>,
+        /// `stages`: the plan's structure; `answer`, `ask`, `check`: what they name
+        /// (`{"question"}`, `{"stage", "check", "status", "evidence"}`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<serde_json::Value>,
     },
     /// A screenshot was added (`tower screenshot`): the state's list is re-read.
     Screenshots,
@@ -552,7 +556,7 @@ mod tests {
         assert!(matches!(say, Request::Plan { ref action, ref id, ref who, draft: None, .. } if action == "say" && id == "p3" && who == "user"));
         let new: Request = serde_json::from_str(r#"{"cmd":"plan","action":"new","form":"page","ticket":"T","draft":{"space":"x"}}"#).unwrap();
         assert!(matches!(new, Request::Plan { ref form, draft: Some(ref d), .. } if form == "page" && d["space"] == "x"));
-        let show = Request::Plan { action: "show".into(), id: String::new(), form: String::new(), ticket: String::new(), draft: None, text: String::new(), url: String::new(), who: String::new(), launched: None, prs: None };
+        let show = Request::Plan { action: "show".into(), id: String::new(), form: String::new(), ticket: String::new(), draft: None, text: String::new(), url: String::new(), who: String::new(), launched: None, prs: None, body: None };
         assert_eq!(serde_json::to_string(&show).unwrap(), r#"{"cmd":"plan","action":"show"}"#);
         // A decision is answered through the request a question set is, with its own body.
         let answer: Request = serde_json::from_str(r#"{"cmd":"answer","target":"d0123456789ab","answers":{"choice":1}}"#).unwrap();

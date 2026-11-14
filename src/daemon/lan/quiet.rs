@@ -708,7 +708,8 @@ mod tests {
             };
             let reopen = |_: &crate::reopen::Pick| -> Result<Value> { anyhow::bail!("nothing to reopen here") };
             let accounts = |_: bool| -> Result<Value> { anyhow::bail!("no sessions wait for an account here") };
-            self.decisions.answer_with(id, body, submit, &Carry { asks: &self.asks, send: &send, agenda: &agenda, reopen: &reopen, accounts: &accounts })
+            let plan = |_: &str, _: &str, _: &str| -> Result<Value> { anyhow::bail!("no plan here") };
+            self.decisions.answer_with(id, body, submit, &Carry { asks: &self.asks, send: &send, agenda: &agenda, reopen: &reopen, accounts: &accounts, plan: &plan })
         }
         fn dismiss(&self, id: &str) -> Result<Value, Refused> {
             self.decisions.dismiss_with(id, &self.asks)

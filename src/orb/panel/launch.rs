@@ -62,7 +62,8 @@
 //!   `HERDER_TOWER_ORB_PLAN=<file>`: the plan in the file (the state's
 //!   `plan`, as `Plan::view` writes it) is the open plan, of that ticket.
 //!   `HERDER_TOWER_ORB_PLAN_SCROLL=end`: once that plan's pull requests show,
-//!   the pane goes to its end, where they are (for a screenshot).
+//!   the pane goes to its end, where they are (for a screenshot); a number:
+//!   that far down, in points (its stages, say).
 //!   `HERDER_TOWER_ORB_TALK=<file>`: its lines are said in the
 //!   conversation one after another (`talk_from_start`; `!new`, `!open
 //!   <n>`, `!delete <n>`, `!reopen [<s>]` for the drafts).
@@ -388,6 +389,58 @@ pub(super) fn pr_rows(prs: &[crate::prscore::Predicted]) -> Vec<PrRow> {
             }
         })
         .collect()
+}
+
+/// The stages' heading: "Stage 2 of 4 · 1 done", or "3 stages" before any is under way.
+pub(super) fn stages_head(p: &PlanView) -> String {
+    let n = p.stages.len();
+    match (p.progress.at, p.progress.done) {
+        (_, d) if d == n && n > 0 => format!("All {n} done"),
+        (Some(at), d) if d > 0 => format!("Stage {at} of {n} · {d} done"),
+        _ => format!("{n} stage{}", if n == 1 { "" } else { "s" }),
+    }
+}
+
+/// A check's mark and its result in words: "✓", "✗ failed", "– not run", "○" (not reported yet).
+pub(super) fn check_mark(c: &crate::prscore::Check) -> (&'static str, bool) {
+    match c.status.as_str() {
+        crate::prscore::PASSED => ("✓", false),
+        crate::prscore::FAILED => ("✗", true),
+        crate::prscore::NOT_RUN => ("–", true),
+        _ => ("○", false),
+    }
+}
+
+/// A stage's state in a word for its chip, and whether it is trouble.
+pub(super) fn stage_word(state: &str) -> (&'static str, bool) {
+    match state {
+        "done" => ("Done", false),
+        "failing" => ("Failing", true),
+        "active" => ("Under way", false),
+        "ready" => ("Pre-checks first", false),
+        "waiting" => ("Waiting", false),
+        _ => ("Planned", false),
+    }
+}
+
+/// Where a plan's question is, in a line: "In your queue", "With the
+/// tower", "Answered by you: …", "Answered by the tower: …".
+pub(super) fn question_line(q: &crate::plans::Question) -> String {
+    match q.status.as_str() {
+        crate::plans::Q_ANSWERED => format!("Answered by {}: {}", if q.by == "tower" { "the tower" } else { "you" }, q.answer.trim()),
+        crate::plans::Q_ASKED => "In your queue: answer it there, on the Mac or the phone.".into(),
+        crate::plans::Q_WITH_TOWER => "With the tower: it answers what is routine, and asks you the rest.".into(),
+        _ => "Being routed.".into(),
+    }
+}
+
+/// Why Launch waits, when the plan still has open questions.
+pub(super) fn launch_waits(p: &PlanView) -> Option<String> {
+    match p.open_questions {
+        0 => None,
+        1 => Some("1 question of the plan is open: Launch waits for its answer, so no plan goes out with questions on its page.".into()),
+        n => Some(format!("{n} questions of the plan are open: Launch waits for their answers, so no plan goes out with questions on its page.")),
+    }
 }
 
 /// The list's heading: how many, and how many need a person.
@@ -1645,6 +1698,16 @@ impl Panel {
                     .into_any_element(),
             );
         }
+        // Its stages, each with what counts as done and its checks; then its questions and assumptions.
+        if !p.stages.is_empty() {
+            items.push(self.plan_stages(p));
+        }
+        if !p.questions.is_empty() {
+            items.push(self.plan_questions(p));
+        }
+        if !p.assumptions.is_empty() {
+            items.push(self.plan_assumptions(p));
+        }
         // The PRs it predicts, each with its review score.
         if !p.prs.is_empty() {
             let auto_on = self.tower.read(cx).s("auto_merge").as_bool().unwrap_or(false);
@@ -1659,6 +1722,132 @@ impl Panel {
             items.push(div().px(px(4.0)).text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child("Talk it over in the conversation: what you say there goes to the planner, and it answers there.").into_any_element());
         }
         items
+    }
+
+    /// The plan's stages: a card each, its kind and state, what counts as
+    /// done, its pre and post checks with their results, and its PRs.
+    fn plan_stages(&self, p: &PlanView) -> AnyElement {
+        let g = glass();
+        let chip = |word: &'static str, bad: bool, done: bool| {
+            let c = if bad { 0xff8f8f } else if done { 0x7fd6a4 } else { CYAN };
+            div().flex_none().px(px(8.0)).py(px(1.0)).rounded_full().border_1().border_color(rgb(c)).text_size(px(12.0)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(c)).child(word)
+        };
+        let cards = p.stages.iter().enumerate().map(|(i, st)| {
+            let (word, bad) = stage_word(&st.state);
+            let s = &st.stage;
+            let prs: Vec<String> = s.prs.iter().map(|n| format!("PR {n}")).collect();
+            let check_row = |when: &'static str, c: &crate::prscore::Check| {
+                let (mark, bad) = check_mark(c);
+                h_flex()
+                    .gap(px(8.0))
+                    .items_start()
+                    .child(div().flex_none().w(px(14.0)).text_size(px(12.0)).text_color(if bad { gpui::Hsla::from(rgb(0xff8f8f)) } else if mark == "✓" { gpui::Hsla::from(rgb(0x7fd6a4)) } else { g.faint }).child(mark))
+                    .child(div().flex_none().w(px(52.0)).text_size(px(12.0)).text_color(g.faint).child(format!("{when} {}", c.id)))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.text).child(c.what.clone()))
+                            .child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.muted).child(c.how.clone()))
+                            .child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.faint).child(if c.proof.is_empty() { format!("Evidence: {}", c.evidence) } else { format!("{}: {}", c.status_word(), c.proof) })),
+                    )
+            };
+            v_flex()
+                .w_full()
+                .px(px(12.0))
+                .py(px(10.0))
+                .gap(px(5.0))
+                .rounded(px(12.0))
+                .bg(rgba(SOFT))
+                .border_1()
+                .border_color(if bad { rgba(0xff8f8f66) } else { rgba(LINE) })
+                .child(
+                    h_flex()
+                        .gap(px(8.0))
+                        .items_center()
+                        .child(div().flex_1().min_w_0().truncate().text_size(px(12.0)).text_color(g.faint).child(format!("Stage {} · {} · {}", i + 1, s.id, s.kind)))
+                        .child(chip(word, bad, st.state == "done")),
+                )
+                .child(div().text_size(px(14.0)).line_height(px(19.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.text).child(s.title.clone()))
+                .child(div().text_size(px(13.0)).line_height(px(18.0)).text_color(g.muted).child(format!("Done when: {}", s.done_when)))
+                .when(!prs.is_empty() || !s.after.is_empty(), |el| {
+                    let mut bits = vec![];
+                    if !prs.is_empty() {
+                        bits.push(format!("Delivers {}", prs.join(", ")));
+                    }
+                    if !s.after.is_empty() {
+                        bits.push(format!("after {}", s.after.join(", ")));
+                    }
+                    el.child(div().text_size(px(12.0)).text_color(g.faint).child(bits.join(" · ")))
+                })
+                .when(!s.pre.is_empty(), |el| {
+                    el.child(div().pt(px(4.0)).text_size(px(11.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.faint).child(format!("BEFORE IT STARTS · {}", s.pre.len()))).children(s.pre.iter().map(|c| check_row("pre", c)))
+                })
+                .child(div().pt(px(4.0)).text_size(px(11.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.faint).child(format!("DONE WHEN THESE PASS · {}", s.post.len())))
+                .children(s.post.iter().map(|c| check_row("post", c)))
+        });
+        v_flex()
+            .w_full()
+            .gap(px(8.0))
+            .child(h_flex().gap(px(8.0)).items_center().child(bay_label("Stages").px(px(0.0))).child(div().text_size(px(12.0)).text_color(g.faint).child(stages_head(p))))
+            .children(cards)
+            .child(div().px(px(4.0)).text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child("A stage is done only when every check of it passed with evidence, and the PRs it delivers passed theirs."))
+            .into_any_element()
+    }
+
+    /// The plan's questions: each with where it is, or its answer.
+    fn plan_questions(&self, p: &PlanView) -> AnyElement {
+        let g = glass();
+        let rows = p.questions.iter().map(|q| {
+            let open = q.is_open();
+            v_flex()
+                .w_full()
+                .px(px(12.0))
+                .py(px(9.0))
+                .gap(px(3.0))
+                .rounded(px(12.0))
+                .bg(rgba(SOFT))
+                .border_1()
+                .border_color(if open && q.status == crate::plans::Q_ASKED { rgba(0xffcf7059) } else { rgba(LINE) })
+                .child(div().text_size(px(13.5)).line_height(px(18.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.text).child(format!("{} · {}", q.id, q.text)))
+                .when(!q.why.is_empty(), |el| el.child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.faint).child(q.why.clone())))
+                .child(div().text_size(px(12.5)).line_height(px(17.0)).text_color(if open { rgb(AMBER) } else { rgb(0x7fd6a4) }).child(question_line(q)))
+        });
+        let open = p.open_questions;
+        let head = if open == 0 { format!("All {} answered", p.questions.len()) } else { format!("{open} open of {}", p.questions.len()) };
+        v_flex()
+            .w_full()
+            .gap(px(8.0))
+            .child(h_flex().gap(px(8.0)).items_center().child(bay_label("Questions").px(px(0.0))).child(div().text_size(px(12.0)).text_color(g.faint).child(head)))
+            .children(rows)
+            .into_any_element()
+    }
+
+    /// What the plan takes for granted: each with how it is checked, and by which stage.
+    fn plan_assumptions(&self, p: &PlanView) -> AnyElement {
+        let g = glass();
+        let rows = p.assumptions.iter().map(|a| {
+            let (mark, c) = match a.status.as_str() {
+                "holds" => ("✓", gpui::Hsla::from(rgb(0x7fd6a4))),
+                "broken" => ("✗", gpui::Hsla::from(rgb(0xff8f8f))),
+                _ => ("○", g.faint),
+            };
+            h_flex()
+                .gap(px(8.0))
+                .items_start()
+                .child(div().flex_none().w(px(14.0)).text_size(px(12.0)).text_color(c).child(mark))
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .child(div().text_size(px(12.5)).line_height(px(17.0)).text_color(g.text).child(format!("{} · {}", a.id, a.text)))
+                        .child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.faint).child(if a.by.is_empty() { format!("Checked: {}", a.check) } else { format!("Checked by {}: {}", a.by, a.check) })),
+                )
+        });
+        v_flex()
+            .w_full()
+            .gap(px(6.0))
+            .child(bay_label("Assumptions").px(px(0.0)))
+            .child(v_flex().w_full().px(px(12.0)).py(px(10.0)).gap(px(7.0)).rounded(px(12.0)).bg(rgba(SOFT)).border_1().border_color(rgba(LINE)).children(rows))
+            .into_any_element()
     }
 
     /// The PRs the plan predicts: a row each (its repo and branch, title,
@@ -1860,7 +2049,11 @@ impl Panel {
             static FRAMES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             if FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 30 {
                 if let Some(f) = self.full.as_ref() {
-                    f.launch_scroll.scroll_to_bottom();
+                    // `end`, or how far down, in points (the stages, say).
+                    match std::env::var("HERDER_TOWER_ORB_PLAN_SCROLL").ok().and_then(|v| v.trim().parse::<f32>().ok()) {
+                        Some(y) => f.launch_scroll.set_offset(gpui::point(px(0.0), px(-y))),
+                        None => f.launch_scroll.scroll_to_bottom(),
+                    }
                 }
                 window.request_animation_frame();
             }
@@ -2001,7 +2194,12 @@ impl Panel {
         let mut actions: Vec<AnyElement> = vec![];
         match (&draft, drafts) {
             (Some(_), _) if chatting => {
-                // Planned: Launch hands the sessions the plan; Start over ends it.
+                // Planned: Launch hands the sessions the plan; Start over ends it. Not while its questions are open.
+                let waits = planned.as_ref().and_then(launch_waits);
+                let can = can && waits.is_none();
+                if let Some(w) = waits {
+                    actions.push(note(w).into_any_element());
+                }
                 let m = missions.clone();
                 actions.push(
                     acts_row()
@@ -2527,6 +2725,34 @@ mod tests {
         assert_eq!(all.iter().map(|t| (t.who.as_str(), t.at)).collect::<Vec<_>>(), [("you", 10), ("tower", 20), ("you", 30), ("tower", 40), ("you", 50), ("planner", 60)]);
         assert!(all[3].text.starts_with("The plan is ready, a page on your claude.ai account: https://claude.ai/artifact/x."));
         assert_eq!(story_with(&story, None), story);
+    }
+
+    #[test]
+    fn the_plan_shows_its_stages_questions_and_why_launch_waits() {
+        let state = serde_json::json!({ "plan": {
+            "id": "p1", "status": "ready", "ticket": "T", "draft": {}, "open_questions": 1,
+            "stages": [
+                { "id": "s1", "title": "Provider spike", "kind": "spike", "done_when": "Latency known", "post": [{ "id": "c1", "what": "p95", "how": "node x.js", "evidence": "output", "status": "passed", "proof": "p95 640 ms" }], "state": "done" },
+                { "id": "s2", "title": "The API", "kind": "build", "done_when": "It answers on dev", "after": ["s1"], "prs": [1, 2], "post": [{ "id": "c1", "what": "w", "how": "h", "evidence": "e", "status": "failed" }], "state": "failing" }
+            ],
+            "questions": [
+                { "id": "q1", "text": "Cache for 30 days?", "status": "answered", "answer": "30 days", "by": "tower" },
+                { "id": "q2", "text": "Which languages first?", "status": "asked", "card": "d1" }
+            ],
+            "assumptions": [{ "id": "a1", "text": "Messages carry a language", "check": "a query", "by": "s2", "status": "open" }],
+            "progress": { "stages": 2, "done": 1, "at": 2 }
+        }});
+        let p = model::plan(&state).unwrap();
+        assert_eq!((p.stages.len(), p.stages[0].stage.post[0].proof.as_str(), p.stages[1].state.as_str(), p.stages[1].stage.prs.clone()), (2, "p95 640 ms", "failing", vec![1, 2]));
+        assert_eq!(stages_head(&p), "Stage 2 of 2 · 1 done");
+        assert_eq!(stage_word(&p.stages[1].state), ("Failing", true));
+        assert_eq!(check_mark(&p.stages[1].stage.post[0]), ("✗", true));
+        assert_eq!(question_line(&p.questions[0]), "Answered by the tower: 30 days");
+        assert!(question_line(&p.questions[1]).starts_with("In your queue"));
+        assert!(launch_waits(&p).unwrap().starts_with("1 question of the plan is open: Launch waits"));
+        // An older tower's plan has none of it.
+        let old = model::plan(&serde_json::json!({ "plan": { "id": "p1", "status": "ready" } })).unwrap();
+        assert!(old.stages.is_empty() && launch_waits(&old).is_none() && stages_head(&old) == "0 stages");
     }
 
     #[test]

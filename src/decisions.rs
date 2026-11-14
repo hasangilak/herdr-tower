@@ -53,6 +53,33 @@ pub const DETAIL: usize = 600;
 /// The card that offers back what a restart closed (`Book::reopen`): its key, and its `why`.
 pub const REOPEN_KEY: &str = "reopen";
 pub const REOPEN_WHY: &str = "reopen";
+/// A plan's question for the user (`crate::plans`): its key is
+/// `plan:<plan>:<question>`, and its answer is written into the plan.
+pub const PLAN_WHY: &str = "plan";
+pub const PLAN_KEY: &str = "plan:";
+
+/// A plan question's card key.
+pub fn plan_key(plan: &str, question: &str) -> String {
+    format!("{PLAN_KEY}{}:{}", plan.trim(), question.trim())
+}
+
+/// The plan and question a card's key names, when it is a plan question's.
+pub fn plan_of_key(key: &str) -> Option<(String, String)> {
+    let (plan, q) = key.strip_prefix(PLAN_KEY)?.split_once(':')?;
+    Some((plan.to_string(), q.to_string()))
+}
+
+/// A plan's question, as its card asks it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlanAsk {
+    pub plan: String,
+    pub question: String,
+    pub space: Option<String>,
+    pub title: String,
+    pub detail: String,
+    /// (label, why, the planner's pick).
+    pub options: Vec<(String, String, bool)>,
+}
 /// The card saying every Claude account is out of usage (`Book::accounts_out`): its key, and its `why`.
 pub const ACCOUNTS_KEY: &str = "accounts-out";
 pub const ACCOUNTS_WHY: &str = "accounts";
@@ -539,7 +566,7 @@ pub fn rule_for(kind: Kind, why: &str, title: &str, space: Option<&str>, answer:
         return None;
     }
     // What to put back after a restart, and waiting for an account's reset, are asked each time.
-    if why == REOPEN_WHY || why == ACCOUNTS_WHY {
+    if why == REOPEN_WHY || why == ACCOUNTS_WHY || why == PLAN_WHY {
         return None;
     }
     if always_yours(title) || always_yours(why) || always_yours(answer) {
@@ -1181,6 +1208,20 @@ impl Book {
         Some(Raised { id: self.add(d, now), fresh: true, folded: false, count: 1, waiting: 0 })
     }
 
+    /// A plan's question in the user's queue: one card per question (its
+    /// key), changed in place when asked again.
+    pub fn plan_question(&mut self, a: PlanAsk, now: u64) -> Raised {
+        let key = plan_key(&a.plan, &a.question);
+        let options: Vec<Opt> = a.options.into_iter().map(|(label, why, pick)| Opt { label, why, pick, ..Default::default() }).collect();
+        let detail = detail_cut(&a.detail, false);
+        if let Some(d) = self.open.iter_mut().find(|d| d.key == key) {
+            (d.title, d.detail, d.options, d.last_ms) = (a.title, detail, options, now);
+            return Raised { id: d.id.clone(), fresh: false, folded: false, count: d.count, waiting: 0 };
+        }
+        let d = Decision { key, kind: Kind::Choice, space: a.space, title: a.title, detail, why: PLAN_WHY.into(), options, ..Default::default() };
+        Raised { id: self.add(d, now), fresh: true, folded: false, count: 1, waiting: 0 }
+    }
+
     /// The card saying every Claude account is out of usage
     /// (`crate::failover::card`): one at a time, in the main queue, changed
     /// in place as what waits changes. None: nothing waits, and an open one
@@ -1611,6 +1652,8 @@ pub enum Act {
     Reopen { pick: crate::reopen::Pick, label: String },
     /// The sessions waiting for an account go on at the reset (`wait`), or are let go.
     Accounts { wait: bool, label: String },
+    /// A plan's question is answered: written into the plan.
+    Plan { plan: String, question: String, answer: String, label: String },
 }
 
 /// What answering `d` with `body` does: `{"choice": n}` (an option's index),
@@ -1688,6 +1731,20 @@ pub fn act(d: &Decision, body: &Value, submit: bool) -> Result<Act> {
                 (None, None) => bail!("give {{\"choice\": n}} or {{\"other\": \"wait\" or \"leave them stopped\"}}"),
             };
             Ok(Act::Accounts { wait, label })
+        }
+        // A plan's question: the answer goes into the plan, nothing is sent to a session.
+        Kind::Choice if d.why == PLAN_WHY => {
+            let Some((plan, question)) = plan_of_key(&d.key) else { bail!("{} names no plan question", d.id) };
+            let (answer, label) = match (choice, other) {
+                (Some(n), _) => {
+                    let o = option(n)?;
+                    let label = o.label.trim().to_string();
+                    (if o.why.trim().is_empty() { label.clone() } else { format!("{label} ({})", o.why.trim()) }, label)
+                }
+                (None, Some(text)) => (text.to_string(), text.to_string()),
+                (None, None) => bail!("give {{\"choice\": n}} or {{\"other\": \"the answer\"}}"),
+            };
+            Ok(Act::Plan { plan, question, answer, label })
         }
         Kind::Choice | Kind::Raised => {
             let about = clip(d.title.trim().trim_end_matches('.'), 240);

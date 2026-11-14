@@ -352,7 +352,17 @@ pub fn run() -> Result<()> {
     // Where each space's changes stand: open, on dev, on prod (from GitHub, never from what sessions say).
     releases::Releases::new(prs.clone(), shared.clone(), prs.gh().to_path_buf(), Some(releases::cache_path())).start();
     // A space's plan before it is launched, and its planner (`tower plan`).
-    let plans = plans::Plans::open(shared.clone(), sendq.clone());
+    let plans = {
+        // A stage sees its PRs' checks; the plan's questions go to the brain or the user's queue.
+        let store = prs.clone();
+        let pr_checks: plans::PrChecks = std::sync::Arc::new(move |key: &str| store.get(key).and_then(|p| p.validation));
+        let brain: plans::BrainNote = std::sync::Arc::new(|text: &str| {
+            if let Err(e) = brains::note_about(text, false) {
+                eprintln!("[plans] the brain can't take it: {e:#}");
+            }
+        });
+        plans::Plans::open(shared.clone(), sendq.clone()).wired(decisions.clone(), pr_checks, brain)
+    };
     plans.start();
     // A PR found from now on carries its review score: its plan's prediction, and its own files.
     {
@@ -1405,7 +1415,8 @@ impl Daemon {
                 None => anyhow::bail!("the tower isn't moving sessions between accounts"),
             }
         };
-        self.decisions.answer_with(id, body, submit, &decisions::Carry { asks: &self.asks, send: &send, agenda: &agenda, reopen: &reopen, accounts: &accounts })
+        let plan = |plan: &str, q: &str, answer: &str| self.plans.answer(plan, q, answer, "you");
+        self.decisions.answer_with(id, body, submit, &decisions::Carry { asks: &self.asks, send: &send, agenda: &agenda, reopen: &reopen, accounts: &accounts, plan: &plan })
     }
 
     fn answer_decision(&self, id: &str, body: &serde_json::Value, submit: bool) -> Response {

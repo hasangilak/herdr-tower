@@ -402,7 +402,8 @@ mod tests {
         let send = |_: &str, _: &str| -> Result<Value> { panic!("nothing is sent to a session") };
         let agenda = |_: &crate::agenda::Cmd| crate::protocol::Response { ok: true, error: None, state: None };
         let accounts = |_: bool| -> Result<Value> { panic!("no account card here") };
-        let carry = super::super::decisions::Carry { asks: &asks, send: &send, agenda: &agenda, reopen: &reopen, accounts: &accounts };
+        let plan = |_: &str, _: &str, _: &str| -> Result<Value> { panic!("no plan card here") };
+        let carry = super::super::decisions::Carry { asks: &asks, send: &send, agenda: &agenda, reopen: &reopen, accounts: &accounts, plan: &plan };
         let v = decisions.answer_with(&id, &json!({ "choice": 0 }), true, &carry).unwrap();
         assert_eq!((v["state"].as_str(), v["answer"].as_str()), (Some("answered"), Some("Reopen all")));
         assert_eq!(picked.lock().unwrap().clone(), Some(Pick::All));

@@ -1290,6 +1290,36 @@ pub struct PlanView {
     /// The pull requests it predicts, each with its review score (`tower plan prs`).
     #[serde(deserialize_with = "or_default")]
     pub prs: Vec<crate::prscore::Predicted>,
+    /// Its stages, each with where it stands (`state`), in order.
+    #[serde(deserialize_with = "or_default")]
+    pub stages: Vec<PlanStage>,
+    #[serde(deserialize_with = "or_default")]
+    pub assumptions: Vec<crate::plans::Assumption>,
+    #[serde(deserialize_with = "or_default")]
+    pub questions: Vec<crate::plans::Question>,
+    pub open_questions: usize,
+    /// How far it is: stages, done, and the one at work (from 1).
+    #[serde(deserialize_with = "or_default")]
+    pub progress: PlanProgress,
+}
+
+/// A plan's stage as the state carries it: the stage, and where it stands.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct PlanStage {
+    #[serde(flatten)]
+    pub stage: crate::plans::Stage,
+    /// `waiting`, `ready`, `active`, `failing`, `done`.
+    #[serde(deserialize_with = "or_default")]
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct PlanProgress {
+    pub stages: usize,
+    pub done: usize,
+    pub at: Option<usize>,
 }
 
 impl PlanView {

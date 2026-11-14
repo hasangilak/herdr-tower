@@ -11,6 +11,7 @@ When a session asks something, the tower reads it into a question set and shows 
 
 - `[question] <session> <id> <json>`: a blocked session's dialog (Claude Code's tabbed questions, a plan or permission prompt, a Codex menu): each tab's question, options with their index `i`, whether it is multi-choice, whether a typed answer is possible, and what the session was asked to do (`asked`).
 - `[question-text] <session> <id> <json>`: a session finished its turn with a message that may ask the user something (`message`: its end). Decide whether it really asks the user anything. If not: `tower recommend <id> --none`. If it does: give the questions it asks, in your own clear words.
+- `[plan-question] <plan> <question> <json>`: a plan's open question (its options and the planner's pick). Routine under the 90/10 rule (the planner's pick or the obvious answer, nothing the user would want a say in): answer it with `tower plan answer <plan> <question> "<answer, and why in a few words>" --by tower`. Anything else: `tower plan ask <plan> <question>`, and it goes to the user's queue. Write nothing else either way.
 
 Both end with `policy=<normal|keep-moving|ask-everything>`.
 
