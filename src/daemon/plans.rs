@@ -1279,7 +1279,13 @@ mod tests {
         let accounts = |_: bool| -> Result<Value> { panic!("no accounts") };
         let planned = |plan: &str, what: &str, a: &str| plans.from_card(plan, what, a);
         let carry = Carry { asks: &asks, send: &send, agenda: &agenda, reopen: &reopen, accounts: &accounts, plan: &planned };
+        plans.change(|b| {
+            b.plans[0].spikes_pending = vec!["s1".into()];
+            Ok(b.plans[0].clone())
+        })
+        .unwrap();
         let v3 = decisions.answer_with(&card, &json!({ "choice": 0 }), true, &carry).unwrap();
+        assert!(shared.get().plans_live[0]["spikes_pending"].as_array().is_none_or(|a| a.is_empty()), "a big revision applied takes the spike in");
         assert_eq!((v3["plan"]["applied"].as_bool(), v3["plan"]["version"].as_u64()), (Some(true), Some(3)));
         let live = shared.get().plans_live[0].clone();
         assert_eq!((live["version"].as_u64(), live["stages"][1]["done_when"].as_str(), live["revisions"][1]["status"].as_str()), (Some(3), Some("The endpoint answers on dev and every message has a language"), Some("applied")));

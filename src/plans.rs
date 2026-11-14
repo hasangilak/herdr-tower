@@ -1165,6 +1165,8 @@ impl Book {
             for f in p.findings.iter_mut().filter(|f| r.findings.iter().any(|x| x.eq_ignore_ascii_case(&f.id))) {
                 f.revision = Some(n);
             }
+            // What the spikes found is taken in: the stages after them go on.
+            p.spikes_pending.clear();
         }
         let x = p.revisions.iter_mut().find(|x| x.n == n).expect("found above");
         x.status = if apply { "applied".into() } else { "rejected".into() };
