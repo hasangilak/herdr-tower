@@ -872,6 +872,8 @@ impl SendQueue {
         if text.is_empty() {
             bail!("nothing to queue: give the instruction after the session");
         }
+        // A yes or no to a folder-trust question, in its own words (before it is signed).
+        let trust = crate::brain::trust_reply(&text);
         // A message from another session says who it is from.
         let text = match from {
             Some(f) => crate::peers::signed(f, &text),
@@ -886,12 +888,13 @@ impl SendQueue {
         if s.status == SessionStatus::Starting {
             // A first-run folder-trust question holds it (it reports no status
             // until it is past it): a yes or no to it is answered on it, by its keys.
-            if let Some(yes) = crate::brain::trust_reply(&text)
+            if let Some(yes) = trust
                 && h.answer_trust(&s.address, yes)?
             {
                 let line = format!("{} ({}): its folder-trust question answered {}", s.address, s.name, if yes { "Yes, I trust this folder" } else { "No, exit" });
                 eprintln!("[queue] {line}");
                 h.record(&s.address, &line, "sent");
+                // Id 0: pressed, not queued (no queue id is 0; the daemon's ledger skips it).
                 return Ok((Added::Sent { id: 0 }, s.address, s.name));
             }
             bail!(
@@ -2208,6 +2211,12 @@ mod tests {
         assert_eq!(h.trust.lock().unwrap()["t15m"], Some(true));
         assert!(h.sent.lock().unwrap().is_empty(), "nothing typed as a message");
         assert!(h.recorded.lock().unwrap().iter().any(|(s, t, _)| s == "t15m" && t.contains("Yes, I trust this folder")));
+        q.add_with(&h, "t15m", "no", &[], None).unwrap();
+        assert_eq!(h.trust.lock().unwrap()["t15m"], Some(false));
+        // From another session (a brain's `tower queue`): signed, still a yes.
+        let brain = crate::peers::Sender { address: "t15p".into(), name: "tower-qtest".into(), space: Some("qtest".into()) };
+        q.add_with(&h, "t15m", "yes", &[], Some(&brain)).unwrap();
+        assert_eq!(h.trust.lock().unwrap()["t15m"], Some(true));
         q.add_with(&h, "t15m", "no", &[], None).unwrap();
         assert_eq!(h.trust.lock().unwrap()["t15m"], Some(false));
         // Other words, or no trust question on screen: refused, and said why.
