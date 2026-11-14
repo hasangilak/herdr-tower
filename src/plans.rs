@@ -980,9 +980,14 @@ impl Book {
                 (q.status, q.answer, q.by, q.card, q.at_ms) = (o.status.clone(), o.answer.clone(), o.by.clone(), o.card.clone(), o.at_ms);
             }
         }
+        // A draft's structure that changes is a new version too (a live plan's change is a revision: `revise`).
+        let changed = !diff_structure(&p.stages, &p.assumptions, &stages, &assumptions, &questions, &p.questions).0.is_empty() || p.questions.len() != questions.len();
+        let first = p.stages.is_empty();
         (p.stages, p.assumptions, p.questions) = (stages, assumptions, questions);
-        if p.version == 0 {
-            p.version = 1;
+        if p.version == 0 || first {
+            p.version = p.version.max(1);
+        } else if changed && p.status != Status::Live {
+            p.version += 1;
         }
         p.updated_ms = now;
         Ok(p.clone())
@@ -1703,7 +1708,7 @@ pub fn instructions(p: &Plan, tower: &str) -> String {
     s += "## 6. A live plan\n\n";
     s += "Once the space is launched the plan stays live: its sessions report what they find (an assumption that proved wrong, a PR that has to split, a new risk, a check that can't run), and you revise the plan for it. A finding reaches you as `[plan <id>] Finding f2 …`.\n\n";
     s += &format!("- Change `stages.json` for it and run `{t} plan revise {id} --json-file stages.json --why \"<what made it change, in a sentence>\" --finding f2`. The tower compares it with the plan as it is: a small change (a check added or reworded, a PR split inside a stage, an assumption or a question added) is applied at once and noted; a big one (a stage added or removed, a stage's done-when changed, a check or an assumption dropped) goes to the user as one card with what changes, and is applied only on their yes. It says which.\n");
-    s += "- Put it in `plan.md` and republish the same artifact: the version at the top, and a \"What changed\" section, newest first, each revision with what changed, why, and the finding that caused it.\n";
+    s += "- Put it in `plan.md` and republish the same artifact: the tower's version at the top (`tower plan show` says it; never a count of your own), and a \"What changed\" section, newest first, each revision with what changed, why, and the finding that caused it.\n";
     s += &format!("- A finding that changes nothing: say why with `{t} plan keep {id} --why \"…\"` (it is noted as a revision of no change), and leave the plan as it is.\n");
     s += &format!("- A spike stage done: what it found reaches you as a finding. The stages after it wait until you take it in: `{t} plan revise …` when the plan changes, `{t} plan keep {id} --why \"…\"` when it doesn't.\n");
     s += "- Sessions end their turns on the plan's tasks with a Handoff block; what it says is uncertain, what failed or blocked, and the findings it lists reach you as findings too.\n\n";

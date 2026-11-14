@@ -541,17 +541,31 @@ impl Plans {
     /// rule) and hands on the rest, and the user gets it when the brain
     /// says nothing in time.
     pub fn route(&self, id: &str) {
+        let routed = self.route_each(id);
+        // The planner hears where each of its new questions went, so it never reads an older "none open" as now.
+        if routed.is_empty() || cfg!(test) {
+            return;
+        }
+        let Some((address, open)) = lock(&self.book).get(id).and_then(|p| Some((p.address.clone()?, p.open_questions().len()))) else { return };
+        let note = format!("[plan {id}] Your questions went out: {}. {open} question{} open now; you'll be told each answer.", routed.join("; "), if open == 1 { " is" } else { "s are" });
+        let _ = self.sendq.add_note(&address, &note);
+    }
+
+    /// Routes each question just written (see `route`): where each went, in words.
+    fn route_each(&self, id: &str) -> Vec<String> {
+        let mut routed = vec![];
         let (fresh, space) = {
             let b = lock(&self.book);
-            let Some(p) = b.get(id) else { return };
+            let Some(p) = b.get(id) else { return routed };
             (p.questions.iter().filter(|q| q.status == plans::Q_OPEN).cloned().collect::<Vec<_>>(), p.draft["space"].as_str().unwrap_or("").to_string())
         };
         for q in fresh {
             let rule = crate::questions::must_escalate(&q.as_set(id));
             if q.theirs || rule.is_some() || self.brain.is_none() {
                 let why = if q.theirs { "the planner says it is yours".to_string() } else { rule.map(|r| format!("the tower's rule: {r}")).unwrap_or_else(|| "no brain to weigh it".into()) };
-                if let Err(e) = self.ask_user(id, &q.id, &why) {
-                    eprintln!("[plans] {id} {}: couldn't ask the user: {e:#}", q.id);
+                match self.ask_user(id, &q.id, &why) {
+                    Ok(_) => routed.push(format!("{} to the user's queue", q.id)),
+                    Err(e) => eprintln!("[plans] {id} {}: couldn't ask the user: {e:#}", q.id),
                 }
                 continue;
             }
@@ -564,6 +578,7 @@ impl Plans {
                 thread::spawn(move || brain(&note));
             }
             eprintln!("[plans] {id} {}: with the brain: {}", q.id, q.text);
+            routed.push(format!("{} to the tower's brain (the user's queue if it isn't routine)", q.id));
             // No word in time: the user's.
             let (me, id, qid, wait) = (self.clone(), id.to_string(), q.id.clone(), self.brain_ms);
             thread::spawn(move || {
@@ -574,6 +589,7 @@ impl Plans {
                 }
             });
         }
+        routed
     }
 
     /// A question goes to the user's queue as a card (why: what sent it there).
