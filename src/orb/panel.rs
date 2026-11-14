@@ -141,6 +141,16 @@ pub struct Acts {
     steps: HashMap<String, prchip::Step>,
     /// The PRs whose full description is open on their merge card (by key).
     bodies: HashSet<String>,
+    /// Decisions put on hold here, on their way to the daemon: out of the
+    /// queue and every count at once, the orb's too (`Acts::held_here`).
+    held: HashSet<String>,
+}
+
+impl Acts {
+    /// Put on hold here a moment ago: it counts nowhere, before the state says so.
+    pub fn held_here(&self, id: &str) -> bool {
+        self.held.contains(id)
+    }
 }
 
 pub struct Panel {

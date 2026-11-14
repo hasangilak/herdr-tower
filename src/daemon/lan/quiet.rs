@@ -1048,6 +1048,30 @@ mod tests {
         v["error"]["code"].as_str()
     }
 
+    /// 14 Nov: a space whose only decision was on hold still showed a 1 by
+    /// its name. Held, it needs the user nowhere: not in its space's count
+    /// (the missions), the queue's, nor the state's count the tab badge
+    /// reads; it is under `on_hold` only. Let go, it is 1 everywhere again.
+    #[test]
+    fn a_space_whose_only_decision_is_on_hold_needs_nothing() {
+        let r = rig("only-held");
+        let only = r.raise("Docs", "Publish the guide?", &[]);
+        let needs = |r: &Rig| {
+            let (_, all) = r.get("/v1/missions");
+            all["spaces"].as_array().unwrap().iter().find(|s| s["name"] == "Docs").map(|s| s["needs"].as_u64().unwrap_or(0)).unwrap()
+        };
+        let counts = |r: &Rig| {
+            (needs(r), r.get("/v1/decisions").1["count"].as_u64(), r.get("/v1/decisions?space=Docs").1["count"].as_u64(), r.get("/v1/state").1["decisions_count"].as_u64())
+        };
+        assert_eq!(counts(&r), (1, Some(1), Some(1), Some(1)));
+        assert_eq!(r.post(&format!("/v1/decisions/{only}/hold"), r#"{"reason":"after the launch"}"#).0, 200);
+        assert_eq!(counts(&r), (0, Some(0), Some(0), Some(0)), "on hold: nothing needs the user");
+        let (_, q) = r.get("/v1/decisions?space=Docs");
+        assert_eq!((ids(&q), q["on_hold"][0]["id"].as_str()), (vec![], Some(only.as_str())), "listed under On hold only: {q}");
+        assert_eq!(r.post(&format!("/v1/decisions/{only}/unhold"), "{}").0, 200);
+        assert_eq!(counts(&r), (1, Some(1), Some(1), Some(1)), "let go: it needs the user again");
+    }
+
     /// The phone holds a decision with the user's words and lets it go:
     /// held, it leaves the queue and the count and is listed under `on_hold`.
     #[test]

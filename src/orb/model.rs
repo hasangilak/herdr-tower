@@ -348,7 +348,8 @@ impl Decision {
 /// (entries that can't be read are left out).
 pub fn from_state(state: &Value) -> Option<Vec<Decision>> {
     let list = state.get("decisions")?.as_array()?;
-    Some(list.iter().filter_map(|v| serde_json::from_value::<Decision>(v.clone()).ok()).filter(|d| !d.id.is_empty()).collect())
+    // One on hold is never the user's to answer now, wherever it is listed: only under On hold (`held`).
+    Some(list.iter().filter_map(|v| serde_json::from_value::<Decision>(v.clone()).ok()).filter(|d| !d.id.is_empty() && d.hold.is_none()).collect())
 }
 
 /// The question sets the tower leaves to the user, oldest first.
@@ -1612,6 +1613,27 @@ mod tests {
         assert_eq!(open(&q, Some("db")).as_deref(), Some("pick"));
         assert_eq!(yours(&q), 2);
         assert!(open_card(&[], None).is_none());
+    }
+
+    /// A decision on hold counts nowhere on the Mac: not the orb's number,
+    /// the "N need you" line nor its space's badge, even when a state lists it
+    /// among the open ones (`tower missions`, a daemon from before holds).
+    #[test]
+    fn a_decision_on_hold_counts_nowhere() {
+        let state = json!({ "decisions": [
+            { "id": "d1", "kind": "merge", "space": "Docs", "title": "Merge PR #9", "state": "open", "hold": { "reason": "after the launch", "by": "mac", "at_ms": 1 } }
+        ], "missions": { "spaces": [ { "name": "Docs", "state": "open", "needs": 1, "sessions": [] } ] } });
+        let all = from_state(&state).unwrap();
+        assert!(all.is_empty(), "held: not in the queue");
+        assert_eq!(count(&all, &HashSet::new()), 0);
+        let m = missions(&state, &Spaces::default(), &[], &[], &all);
+        assert_eq!((m.open[0].needs, m.open[0].chip()), (0, Chip::Done), "its space's badge is gone");
+        // Let go: the same decision counts, and its space shows 1.
+        let mut back = state.clone();
+        back["decisions"][0]["hold"] = Value::Null;
+        let all = from_state(&back).unwrap();
+        assert_eq!((count(&all, &HashSet::new()), missions(&back, &Spaces::default(), &[], &[], &all).open[0].chip()), (1, Chip::Yours(1)));
+        assert_eq!(status_line(count(&all, &HashSet::new()), 0).0.as_deref(), Some("1 needs you"));
     }
 
     #[test]

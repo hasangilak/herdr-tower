@@ -185,7 +185,7 @@ impl Tower {
         // what left it since the last look.
         if let Some(state) = &self.state {
             let now = crate::history::now_ms();
-            let all = model::decisions(state, &self.prs, &|_| String::new(), now);
+            let all = self.unheld(model::decisions(state, &self.prs, &|_| String::new(), now));
             model::settle_marks(&mut self.marks, state, &all, &self.follows, &self.mutes);
             self.count = model::count(&all, &model::muted_spaces(&all, state, &self.mutes, &self.marks));
             self.deck.sync(&all, now);
@@ -203,9 +203,16 @@ impl Tower {
             self.marks.remove(space);
         }
         if let Some(state) = &self.state {
-            let all = model::decisions(state, &self.prs, &|_| String::new(), crate::history::now_ms());
+            let all = self.unheld(model::decisions(state, &self.prs, &|_| String::new(), crate::history::now_ms()));
             self.count = model::count(&all, &model::muted_spaces(&all, state, &self.mutes, &self.marks));
         }
+    }
+
+    /// The decisions without those put on hold here a moment ago (the
+    /// state doesn't say so yet): on hold counts nowhere.
+    fn unheld(&self, mut all: Vec<model::Decision>) -> Vec<model::Decision> {
+        all.retain(|d| !self.acts.held_here(&d.id));
+        all
     }
 
     /// Running, by its own word and by its process (a daemon that died
