@@ -109,8 +109,11 @@ pub enum Status {
     Ready,
     /// The planner couldn't (its words in `why`), or ended before it published.
     Failed,
-    /// Ended: Start over, a launch, another plan.
+    /// Ended: Start over, another plan.
     Closed,
+    /// Launched: the plan of its space while the work goes on, revised as
+    /// the sessions learn things (`findings`, `revisions`).
+    Live,
 }
 
 impl Status {
@@ -120,6 +123,7 @@ impl Status {
             Status::Ready => "ready",
             Status::Failed => "failed",
             Status::Closed => "closed",
+            Status::Live => "live",
         }
     }
 }
@@ -203,6 +207,141 @@ pub struct Plan {
     /// What it can't decide alone: each answered by the tower or the user, and written back.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub questions: Vec<Question>,
+    /// What the sessions learned while working that bears on the plan.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<Finding>,
+    /// Every change to its structure after the first, oldest first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub revisions: Vec<Revision>,
+    /// Its version: 1 once it has stages, one more for each revision applied.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub version: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// What a finding is about.
+pub const FINDING_KINDS: &[&str] = &["assumption-wrong", "split-pr", "risk", "check-cant-run", "scope", "other"];
+
+/// Something a session learned while working that bears on the plan.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Finding {
+    /// `f1`, `f2`, …
+    pub id: String,
+    pub at_ms: u64,
+    /// One of `FINDING_KINDS`.
+    pub kind: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub stage: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub assumption: String,
+    /// The session that found it.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub session: String,
+    /// The revision that took it in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u32>,
+}
+
+/// A change to a plan's stages, assumptions or questions.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Revision {
+    /// Its number, from 1; the plan's version once applied is n + 1.
+    pub n: u32,
+    pub at_ms: u64,
+    /// `planner`, `tower` or `you`.
+    pub by: String,
+    pub why: String,
+    /// The findings it takes in.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<String>,
+    /// What changes, a line each.
+    pub changes: Vec<String>,
+    /// `small` (applied by itself, noted) or `big` (the user decides).
+    pub size: String,
+    /// `applied`, `proposed` (a card in the user's queue) or `rejected`.
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card: Option<String>,
+    /// The structure it proposes, until it is applied or rejected.
+    #[serde(skip_serializing_if = "Value::is_null")]
+    pub proposed: Value,
+}
+
+/// What changes from one structure to another, a line each, and whether
+/// any of it is big: a stage added or removed, a stage's title, kind or
+/// done-when changed, a check or an assumption removed. Small: a check
+/// added or reworded, a stage's PRs or order changed (a PR split), an
+/// assumption or a question added.
+pub fn diff_structure(old: &[Stage], old_a: &[Assumption], new: &[Stage], new_a: &[Assumption], new_q: &[Question], old_q: &[Question]) -> (Vec<String>, bool) {
+    let mut out: Vec<String> = vec![];
+    let mut big = false;
+    for st in new {
+        let Some(was) = old.iter().find(|o| o.id == st.id) else {
+            out.push(format!("Stage {} added: {} (done when: {})", st.id, st.title, st.done_when));
+            big = true;
+            continue;
+        };
+        if was.title != st.title || was.kind != st.kind {
+            out.push(format!("Stage {} is now \"{}\" ({}), was \"{}\" ({})", st.id, st.title, st.kind, was.title, was.kind));
+            big = true;
+        }
+        if was.done_when.trim() != st.done_when.trim() {
+            out.push(format!("Stage {} is done when: {} (was: {})", st.id, st.done_when, was.done_when));
+            big = true;
+        }
+        if was.prs != st.prs {
+            out.push(format!("Stage {} delivers {} (was {})", st.id, nums(&st.prs), nums(&was.prs)));
+        }
+        if was.after != st.after {
+            out.push(format!("Stage {} waits for {} (was {})", st.id, list_or_none(&st.after), list_or_none(&was.after)));
+        }
+        for (when, now_c, was_c) in [("pre", &st.pre, &was.pre), ("post", &st.post, &was.post)] {
+            for c in now_c {
+                match was_c.iter().find(|o| o.id == c.id) {
+                    None => out.push(format!("Stage {} gets a {when} check {}: {}", st.id, c.id, c.what)),
+                    Some(o) if o.what != c.what || o.how != c.how || o.evidence != c.evidence => out.push(format!("Stage {} {when} check {} now: {} (how: {})", st.id, c.id, c.what, c.how)),
+                    _ => {}
+                }
+            }
+            for o in was_c.iter().filter(|o| !now_c.iter().any(|c| c.id == o.id)) {
+                out.push(format!("Stage {} drops its {when} check {}: {}", st.id, o.id, o.what));
+                big = true;
+            }
+        }
+    }
+    for was in old.iter().filter(|o| !new.iter().any(|s| s.id == o.id)) {
+        out.push(format!("Stage {} removed: {}", was.id, was.title));
+        big = true;
+    }
+    for a in new_a {
+        match old_a.iter().find(|o| o.id == a.id) {
+            None => out.push(format!("Assumption {} added: {}", a.id, a.text)),
+            Some(o) if o.text != a.text || o.check != a.check => out.push(format!("Assumption {} now: {} (checked: {})", a.id, a.text, a.check)),
+            _ => {}
+        }
+    }
+    for o in old_a.iter().filter(|o| !new_a.iter().any(|a| a.id == o.id)) {
+        out.push(format!("Assumption {} dropped: {}", o.id, o.text));
+        big = true;
+    }
+    for q in new_q.iter().filter(|q| !old_q.iter().any(|o| o.id == q.id)) {
+        out.push(format!("Question {} added: {}", q.id, q.text));
+    }
+    (out, big)
+}
+
+fn nums(n: &[u32]) -> String {
+    if n.is_empty() { "no PR".into() } else { n.iter().map(|x| format!("PR {x}")).collect::<Vec<_>>().join(", ") }
+}
+
+fn list_or_none(v: &[String]) -> String {
+    if v.is_empty() { "nothing".into() } else { v.join(", ") }
 }
 
 /// A stage's kind: an unknown settled first, the work, or its release.
@@ -443,6 +582,9 @@ impl Plan {
             "assumptions": self.assumptions,
             "questions": self.questions,
             "open_questions": self.open_questions().len(),
+            "findings": self.findings,
+            "revisions": self.revisions,
+            "version": self.version,
         })
     }
 
@@ -492,7 +634,12 @@ fn tidy_msg(text: &str) -> String {
 impl Book {
     /// The open plan (the newest, should there be more).
     pub fn current(&self) -> Option<&Plan> {
-        self.plans.iter().rev().find(|p| p.is_open())
+        self.plans.iter().rev().find(|p| p.is_open() && p.status != Status::Live)
+    }
+
+    /// The plans launched and live, newest first.
+    pub fn live(&self) -> Vec<&Plan> {
+        self.plans.iter().rev().filter(|p| p.status == Status::Live).collect()
     }
 
     pub fn get(&self, id: &str) -> Option<&Plan> {
@@ -520,7 +667,7 @@ impl Book {
     /// back with it, for their planners to be ended.
     pub fn add(&mut self, form: Form, ticket: &str, draft: Value, dir_of: impl Fn(&str) -> PathBuf, now: u64) -> (Plan, Vec<Plan>) {
         let mut ended = vec![];
-        for p in self.plans.iter_mut().filter(|p| p.is_open()) {
+        for p in self.plans.iter_mut().filter(|p| p.is_open() && p.status != Status::Live) {
             p.status = Status::Closed;
             p.closed_ms = Some(now);
             p.updated_ms = now;
@@ -623,8 +770,150 @@ impl Book {
             }
         }
         (p.stages, p.assumptions, p.questions) = (stages, assumptions, questions);
+        if p.version == 0 {
+            p.version = 1;
+        }
         p.updated_ms = now;
         Ok(p.clone())
+    }
+
+    /// A finding reported on a plan: kept, and an assumption it says is
+    /// wrong marked broken.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finding(&mut self, id: &str, kind: &str, text: &str, stage: &str, assumption: &str, session: &str, now: u64) -> Result<Finding> {
+        let p = self.plans.iter_mut().find(|p| p.id == id && p.status != Status::Closed).ok_or_else(|| anyhow::anyhow!("no open or live plan {id}"))?;
+        let kind = kind.trim().to_lowercase();
+        if !FINDING_KINDS.contains(&kind.as_str()) {
+            bail!("a finding's kind is {}, not {kind:?}", FINDING_KINDS.join(", "));
+        }
+        let text = tidy_msg(text);
+        if text.is_empty() {
+            bail!("say what was found: tower plan finding {id} --kind {kind} \"<what>\"");
+        }
+        if !stage.trim().is_empty() && !p.stages.iter().any(|s| s.id.eq_ignore_ascii_case(stage.trim())) {
+            bail!("plan {id} has no stage {stage:?}");
+        }
+        if !assumption.trim().is_empty() {
+            let Some(a) = p.assumptions.iter_mut().find(|a| a.id.eq_ignore_ascii_case(assumption.trim())) else { bail!("plan {id} has no assumption {assumption:?}") };
+            if kind == "assumption-wrong" {
+                (a.status, a.proof) = ("broken".into(), text.clone());
+            }
+        }
+        let f = Finding {
+            id: format!("f{}", p.findings.len() + 1),
+            at_ms: now,
+            kind,
+            text,
+            stage: stage.trim().to_string(),
+            assumption: assumption.trim().to_string(),
+            session: session.trim().to_string(),
+            revision: None,
+        };
+        p.findings.push(f.clone());
+        p.updated_ms = now;
+        Ok(f)
+    }
+
+    /// An assumption checked: it holds, or it is broken (then it is a finding too).
+    pub fn assume(&mut self, id: &str, a: &str, holds: bool, proof: &str, session: &str, now: u64) -> Result<(Assumption, Option<Finding>)> {
+        if proof.trim().is_empty() {
+            bail!("give its evidence: --evidence \"<what showed it>\"");
+        }
+        if !holds {
+            let f = self.finding(id, "assumption-wrong", proof, "", a, session, now)?;
+            let p = self.plans.iter().find(|p| p.id == id).ok_or_else(|| anyhow::anyhow!("no plan {id}"))?;
+            let x = p.assumptions.iter().find(|x| x.id.eq_ignore_ascii_case(a.trim())).cloned().unwrap_or_default();
+            return Ok((x, Some(f)));
+        }
+        let p = self.plans.iter_mut().find(|p| p.id == id && p.status != Status::Closed).ok_or_else(|| anyhow::anyhow!("no open or live plan {id}"))?;
+        let x = p.assumptions.iter_mut().find(|x| x.id.eq_ignore_ascii_case(a.trim())).ok_or_else(|| anyhow::anyhow!("plan {id} has no assumption {a:?}"))?;
+        (x.status, x.proof) = ("holds".into(), tidy_msg(proof));
+        let x = x.clone();
+        p.updated_ms = now;
+        Ok((x, None))
+    }
+
+    /// A revision of the structure (`v`, as `tower plan stages` takes it),
+    /// for `why`, taking in `findings`: sized by what changes. A small one
+    /// is applied now; a big one is proposed, for the user to decide.
+    pub fn revise(&mut self, id: &str, v: &Value, why: &str, findings: &[String], by: &str, now: u64) -> Result<Revision> {
+        let p = self.plans.iter().find(|p| p.id == id && p.status != Status::Closed).ok_or_else(|| anyhow::anyhow!("no open or live plan {id}"))?;
+        if p.stages.is_empty() {
+            bail!("plan {id} has no stages yet: send them with `tower plan stages`");
+        }
+        if why.trim().is_empty() {
+            bail!("say why: --why \"<what made it change>\"");
+        }
+        for f in findings {
+            if !p.findings.iter().any(|x| x.id.eq_ignore_ascii_case(f.trim())) {
+                bail!("plan {id} has no finding {f:?}");
+            }
+        }
+        if p.revisions.iter().any(|r| r.status == "proposed") {
+            bail!("plan {id} has a revision waiting for the user's word: one at a time");
+        }
+        let (stages, assumptions, questions) = structure(v, &p.prs)?;
+        let (changes, big) = diff_structure(&p.stages, &p.assumptions, &stages, &assumptions, &questions, &p.questions);
+        if changes.is_empty() {
+            bail!("nothing changes: the stages, assumptions and questions are as they are");
+        }
+        let r = Revision {
+            n: p.revisions.len() as u32 + 1,
+            at_ms: now,
+            by: by.to_string(),
+            why: tidy_msg(why),
+            findings: findings.iter().map(|f| f.trim().to_string()).collect(),
+            changes,
+            size: if big { "big".into() } else { "small".into() },
+            status: if big { "proposed".into() } else { "applied".into() },
+            card: None,
+            proposed: if big { v.clone() } else { Value::Null },
+        };
+        if !big {
+            self.set_structure(id, v, now)?;
+        }
+        let p = self.plans.iter_mut().find(|p| p.id == id).expect("found above");
+        if !big {
+            p.version += 1;
+            for f in p.findings.iter_mut().filter(|f| r.findings.iter().any(|x| x.eq_ignore_ascii_case(&f.id))) {
+                f.revision = Some(r.n);
+            }
+        }
+        p.revisions.push(r.clone());
+        p.updated_ms = now;
+        Ok(r)
+    }
+
+    /// The user's word on a big revision: applied, or not.
+    pub fn decide_revision(&mut self, id: &str, n: u32, apply: bool, now: u64) -> Result<Revision> {
+        let p = self.plans.iter().find(|p| p.id == id).ok_or_else(|| anyhow::anyhow!("no plan {id}"))?;
+        let Some(r) = p.revisions.iter().find(|r| r.n == n).cloned() else { bail!("plan {id} has no revision {n}") };
+        if r.status != "proposed" {
+            bail!("revision {n} of plan {id} is {} already", r.status);
+        }
+        if apply {
+            self.set_structure(id, &r.proposed, now)?;
+        }
+        let p = self.plans.iter_mut().find(|p| p.id == id).expect("found above");
+        if apply {
+            p.version += 1;
+            for f in p.findings.iter_mut().filter(|f| r.findings.iter().any(|x| x.eq_ignore_ascii_case(&f.id))) {
+                f.revision = Some(n);
+            }
+        }
+        let x = p.revisions.iter_mut().find(|x| x.n == n).expect("found above");
+        x.status = if apply { "applied".into() } else { "rejected".into() };
+        x.proposed = Value::Null;
+        let x = x.clone();
+        p.updated_ms = now;
+        Ok(x)
+    }
+
+    /// A revision's card in the user's queue.
+    pub fn revision_card(&mut self, id: &str, n: u32, card: &str) {
+        if let Some(r) = self.plans.iter_mut().find(|p| p.id == id).and_then(|p| p.revisions.iter_mut().find(|r| r.n == n)) {
+            r.card = Some(card.to_string());
+        }
     }
 
     /// A question of the plan, by its id.
@@ -733,14 +1022,20 @@ impl Book {
         Ok(p.clone())
     }
 
-    /// Ended (`launched`: the space launched with it). Closing a closed plan is no error.
+    /// Ended, or launched (`launched`: the space launched with it): a
+    /// launched plan with stages stays live, the plan of its space. Closing
+    /// a closed plan is no error.
     pub fn close(&mut self, id: &str, launched: Option<&str>, now: u64) -> Result<Plan> {
         let Some(p) = self.plans.iter_mut().find(|p| p.id == id) else { bail!("no plan {id}") };
-        if p.is_open() {
+        let launched = launched.map(str::trim).filter(|s| !s.is_empty());
+        if launched.is_some() && !p.stages.is_empty() && p.status != Status::Closed {
+            p.status = Status::Live;
+            p.address = None;
+        } else if p.is_open() {
             p.status = Status::Closed;
             p.closed_ms = Some(now);
         }
-        if let Some(space) = launched.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(space) = launched {
             p.launched = Some(space.to_string());
         }
         p.updated_ms = now;
@@ -955,6 +1250,48 @@ pub fn answered_note(p: &Plan, q: &Question, tower: &str) -> String {
     )
 }
 
+/// What the planner of a live plan is told of a finding.
+pub fn finding_note(p: &Plan, f: &Finding, tower: &str) -> String {
+    let t = tower_word(tower);
+    let mut about = vec![];
+    if !f.stage.is_empty() {
+        about.push(format!("stage {}", f.stage));
+    }
+    if !f.assumption.is_empty() {
+        about.push(format!("assumption {}", f.assumption));
+    }
+    let about = if about.is_empty() { String::new() } else { format!(" (about {})", about.join(", ")) };
+    let who = if f.session.is_empty() { String::new() } else { format!(" from {}", f.session) };
+    format!(
+        "[plan {}] Finding {}{who}, {}{about}: {}\n\nRevise the plan for it as instructions.md says (\"6. A live plan\"): `{t} plan revise {} --json-file stages.json --why \"…\" --finding {}`, then plan.md and the artifact. If it changes nothing, say so with `{t} plan say {} \"…\"`.",
+        p.id, f.id, f.kind, f.text, p.id, f.id, p.id
+    )
+}
+
+/// A big revision as its card in the user's queue asks it.
+pub fn revision_card(p: &Plan, r: &Revision) -> crate::decisions::PlanAsk {
+    let space = p.launched.clone().or_else(|| p.draft["space"].as_str().map(String::from));
+    let of = space.as_deref().map(|s| format!("The plan of {s}")).unwrap_or_else(|| format!("Plan {}", p.id));
+    let mut detail = format!("{of}, version {} → {}. Why: {}\n", p.version, p.version + 1, r.why.trim_end_matches('.'));
+    for c in &r.changes {
+        detail += &format!("\n- {c}");
+    }
+    if !r.findings.is_empty() {
+        detail += &format!("\n\nFrom finding {}.", r.findings.join(", "));
+    }
+    crate::decisions::PlanAsk {
+        plan: p.id.clone(),
+        question: format!("rev:{}", r.n),
+        space,
+        title: format!("Change the plan: {}?", r.why.trim().trim_end_matches(['.', '?'])),
+        detail,
+        options: vec![
+            ("Apply it".into(), "the plan changes as listed; its sessions follow the new version".into(), false),
+            ("Keep the plan as it is".into(), "the planner is told, and finds another way".into(), false),
+        ],
+    }
+}
+
 /// A draft a plan can be made of: the receipt `tower launch --draft`
 /// prints, with its space and at least one session's repo.
 pub fn check_draft(v: &Value) -> Result<()> {
@@ -1102,6 +1439,11 @@ pub fn instructions(p: &Plan, tower: &str) -> String {
         "  - **the plan**: change `plan.md`, republish the same artifact (your Artifact tool, with its `url`), and run `{t} plan published {id} --url <its link>` again.\n"
     );
     s += &format!("  - **the pull requests**: change `prs.json`, run `{t} plan prs {id} --json-file prs.json` again, and put the new scores in `plan.md` and the artifact.\n\n");
+    s += "## 6. A live plan\n\n";
+    s += "Once the space is launched the plan stays live: its sessions report what they find (an assumption that proved wrong, a PR that has to split, a new risk, a check that can't run), and you revise the plan for it. A finding reaches you as `[plan <id>] Finding f2 …`.\n\n";
+    s += &format!("- Change `stages.json` for it and run `{t} plan revise {id} --json-file stages.json --why \"<what made it change, in a sentence>\" --finding f2`. The tower compares it with the plan as it is: a small change (a check added or reworded, a PR split inside a stage, an assumption or a question added) is applied at once and noted; a big one (a stage added or removed, a stage's done-when changed, a check or an assumption dropped) goes to the user as one card with what changes, and is applied only on their yes. It says which.\n");
+    s += "- Put it in `plan.md` and republish the same artifact: the version at the top, and a \"What changed\" section, newest first, each revision with what changed, why, and the finding that caused it.\n";
+    s += "- A finding that changes nothing: say so with `plan say`, and leave the plan as it is.\n\n";
     s += "## Never\n\n";
     s += "- Never launch the space, open or start a session, queue or send anything to a session, or open or close a space: no `tower launch`, `tower start`, `tower queue`, `tower dispatch`, `tower space`, no `hc`. The user launches it from the tower's window.\n";
     s += "- Never edit, commit or push in a repository. Write only in this folder.\n";
@@ -1109,9 +1451,21 @@ pub fn instructions(p: &Plan, tower: &str) -> String {
     s
 }
 
-/// The planner's first task: write it, publish it, say so.
+/// The planner's first task: write it, publish it, say so. For a live
+/// plan: take in the findings that wait, and revise.
 pub fn first_task(p: &Plan, tower: &str) -> String {
     let t = tower_word(tower);
+    if p.status == Status::Live {
+        let waiting: Vec<String> = p.findings.iter().filter(|f| f.revision.is_none()).map(|f| format!("{} ({}): {}", f.id, f.kind, f.text)).collect();
+        return format!(
+            "[plan {}] The plan is live: the space {} was launched with it, and its sessions are at work. Read instructions.md (\"6. A live plan\"), plan.md and stages.json. Findings waiting: {}. Revise the plan for them with `{t} plan revise {} --json-file stages.json --why \"<what made it change>\" --finding <ids>`, put it in plan.md, republish the same artifact with what changed, and run `{t} plan published {} --url <its link>`. Then wait for more.",
+            p.id,
+            p.launched.as_deref().unwrap_or("of it"),
+            if waiting.is_empty() { "none yet".to_string() } else { waiting.join("; ") },
+            p.id,
+            p.id
+        );
+    }
     let form = match p.form {
         Form::Page => "an HTML page Artifact".to_string(),
         Form::Whiteboard => format!("a Whiteboard Artifact (from the Artifact type {WHITEBOARD_TYPE})"),
@@ -1399,12 +1753,20 @@ pub struct Args {
     pub launched: Option<String>,
     /// `answer`: who answers (`tower`: the brain; else the user).
     pub by: Option<String>,
-    /// `check`: the evidence of its result.
+    /// `check`, `assume`: the evidence of its result.
     pub evidence: Option<String>,
+    /// `finding`: what it is about; its stage, assumption and session.
+    pub kind: Option<String>,
+    pub stage: Option<String>,
+    pub assumption: Option<String>,
+    pub session: Option<String>,
+    /// `revise`: why, and the findings it takes in.
+    pub why: Option<String>,
+    pub finding: Option<String>,
     pub json: bool,
 }
 
-const USAGE: &str = "tower plan new --form page|whiteboard --draft '<draft JSON>' --ticket-file <file> | say <id> \"<words>\" [--as user|planner] | draft <id> --json-file <file> | prs <id> --json-file <file> | stages <id> --json-file <file> | answer <id> <question> \"<answer>\" [--by tower|you] | ask <id> <question> | check <id> <stage> <check> passed|failed|not-run --evidence \"<…>\" | published <id> --url <link> | failed <id> \"<why>\" | show [<id>] [--json] | close [<id>] | list";
+const USAGE: &str = "tower plan finding <id> --kind <kind> \"<what was found>\" [--stage s] [--assumption a] | assume <id> <a> holds|broken --evidence \"<…>\" | revise <id> --json-file stages.json --why \"<…>\" [--finding f1] | new --form page|whiteboard --draft '<draft JSON>' --ticket-file <file> | say <id> \"<words>\" [--as user|planner] | draft <id> --json-file <file> | prs <id> --json-file <file> | stages <id> --json-file <file> | answer <id> <question> \"<answer>\" [--by tower|you] | ask <id> <question> | check <id> <stage> <check> passed|failed|not-run --evidence \"<…>\" | published <id> --url <link> | failed <id> \"<why>\" | show [<id>] [--json] | close [<id>] | list";
 
 /// Reads `tower plan …`'s words (after `plan`): the action, its flags, the id, the words.
 pub fn parse_args(raw: &[String]) -> Result<Args> {
@@ -1438,6 +1800,12 @@ pub fn parse_args(raw: &[String]) -> Result<Args> {
             "--launched" => a.launched = Some(value("--launched")?),
             "--by" => a.by = Some(value("--by")?),
             "--evidence" => a.evidence = Some(value("--evidence")?),
+            "--kind" => a.kind = Some(value("--kind")?),
+            "--stage" => a.stage = Some(value("--stage")?),
+            "--assumption" => a.assumption = Some(value("--assumption")?),
+            "--session" => a.session = Some(value("--session")?),
+            "--why" => a.why = Some(value("--why")?),
+            "--finding" => a.finding = Some(value("--finding")?),
             "--json" => a.json = true,
             f if f.starts_with("--") && f.len() > 2 => bail!("tower plan: no flag {f}: {USAGE}"),
             _ => words.push(w.clone()),
@@ -1466,10 +1834,15 @@ pub fn parse_args(raw: &[String]) -> Result<Args> {
         "check" if a.id.is_none() || a.words.split_whitespace().count() != 3 || a.evidence.is_none() => {
             bail!("tower plan check <id> <stage> <check> passed|failed|not-run --evidence \"<the test output, a screenshot's path, a log, or why it wasn't run>\"")
         }
-        "say" | "failed" | "draft" | "prs" | "stages" | "answer" | "ask" | "check" | "published" | "show" | "close" | "list" => {}
+        "finding" if a.id.is_none() || a.kind.is_none() || a.words.is_empty() => {
+            bail!("tower plan finding <id> --kind {} \"<what was found>\" [--stage <s>] [--assumption <a>]", FINDING_KINDS.join("|"))
+        }
+        "assume" if a.id.is_none() || a.words.split_whitespace().count() != 2 || a.evidence.is_none() => bail!("tower plan assume <id> <assumption> holds|broken --evidence \"<what showed it>\""),
+        "revise" if a.id.is_none() || a.json_file.is_none() || a.why.is_none() => bail!("tower plan revise <id> --json-file stages.json --why \"<what made it change>\" [--finding f1,f2]"),
+        "say" | "failed" | "draft" | "prs" | "stages" | "answer" | "ask" | "check" | "finding" | "assume" | "revise" | "published" | "show" | "close" | "list" => {}
         other => bail!("tower plan {other}: {USAGE}"),
     }
-    if !a.words.is_empty() && !matches!(a.action.as_str(), "say" | "failed" | "answer" | "ask" | "check") {
+    if !a.words.is_empty() && !matches!(a.action.as_str(), "say" | "failed" | "answer" | "ask" | "check" | "finding" | "assume") {
         bail!("tower plan {}: what is {:?}? {USAGE}", a.action, a.words);
     }
     Ok(a)
@@ -1510,6 +1883,8 @@ fn body_of(a: &Args) -> Option<Value> {
         "answer" => Some(json!({ "question": w.first().copied().unwrap_or(""), "answer": w.get(1..).map(|r| r.join(" ")).unwrap_or_default(), "by": a.by.clone().unwrap_or_default() })),
         "ask" => Some(json!({ "question": w.first().copied().unwrap_or("") })),
         "check" => Some(json!({ "stage": w.first(), "check": w.get(1), "status": w.get(2), "evidence": a.evidence.clone().unwrap_or_default() })),
+        "finding" => Some(json!({ "kind": a.kind, "text": a.words, "stage": a.stage.clone().unwrap_or_default(), "assumption": a.assumption.clone().unwrap_or_default(), "session": a.session.clone().unwrap_or_default() })),
+        "assume" => Some(json!({ "assumption": w.first(), "status": w.get(1), "evidence": a.evidence.clone().unwrap_or_default(), "session": a.session.clone().unwrap_or_default() })),
         _ => None,
     }
 }
@@ -1629,6 +2004,30 @@ pub fn cmd(raw: &[String]) -> Result<()> {
                 launched: None,
                 prs: None,
                 body: Some(v),
+            })?;
+            if !sent.ok {
+                bail!("{}", sent.error.unwrap_or_default());
+            }
+            sent.state.unwrap_or_default()
+        }
+        "revise" => {
+            let id = a.id.clone().unwrap_or_default();
+            let file = a.json_file.clone().unwrap_or_default();
+            let text = std::fs::read_to_string(&file).map_err(|e| anyhow::anyhow!("--json-file {file}: {e}"))?;
+            let v: Value = serde_json::from_str(text.trim()).map_err(|e| anyhow::anyhow!("--json-file {file}: not JSON ({e})"))?;
+            let findings: Vec<String> = a.finding.clone().unwrap_or_default().split([',', ' ']).map(str::trim).filter(|f| !f.is_empty()).map(String::from).collect();
+            let sent = crate::protocol::send(&crate::protocol::Request::Plan {
+                action: "revise".into(),
+                id,
+                form: String::new(),
+                ticket: String::new(),
+                draft: None,
+                text: a.why.clone().unwrap_or_default(),
+                url: String::new(),
+                who: a.who.map(|w| w.word().to_string()).unwrap_or_default(),
+                launched: None,
+                prs: None,
+                body: Some(json!({ "structure": v, "findings": findings })),
             })?;
             if !sent.ok {
                 bail!("{}", sent.error.unwrap_or_default());
@@ -1855,6 +2254,39 @@ mod tests {
         assert!(!text.contains("Store each message's translation"), "only its own PRs: {text}");
         // A session whose repo has no predicted PR is told nothing of checks.
         assert!(!brief_text(&b, "other-repo", &[]).contains("tower validate"));
+    }
+
+    #[test]
+    fn a_change_to_the_plan_is_sized_small_or_big() {
+        let base = json!({ "stages": [
+            { "id": "s1", "title": "Spike", "kind": "spike", "done_when": "Known", "post": [{ "id": "c1", "what": "w", "how": "h", "evidence": "e" }] },
+            { "id": "s2", "title": "Build", "after": ["s1"], "done_when": "Works", "post": [{ "id": "c1", "what": "w", "how": "h", "evidence": "e" }] } ],
+            "assumptions": [{ "id": "a1", "text": "t", "check": "c" }] });
+        let (st, asm, q) = structure(&base, &[]).unwrap();
+        let size = |v: &Value| {
+            let (s2, a2, q2) = structure(v, &[]).unwrap();
+            diff_structure(&st, &asm, &s2, &a2, &q2, &q)
+        };
+        assert_eq!(size(&base), (vec![], false), "no change");
+        let mut small = base.clone();
+        small["stages"][1]["post"].as_array_mut().unwrap().push(json!({ "id": "c2", "what": "w2", "how": "h2", "evidence": "e2" }));
+        small["stages"][1]["post"][0]["how"] = json!("h, better");
+        small["assumptions"].as_array_mut().unwrap().push(json!({ "id": "a2", "text": "t2", "check": "c2" }));
+        small["questions"] = json!([{ "id": "q1", "text": "Which?" }]);
+        let (changes, big) = size(&small);
+        assert!(!big, "{changes:?}");
+        assert_eq!(changes, ["Stage s2 post check c1 now: w (how: h, better)", "Stage s2 gets a post check c2: w2", "Assumption a2 added: t2", "Question q1 added: Which?"]);
+        for (what, f) in [
+            ("a stage added", (|v: &mut Value| v["stages"].as_array_mut().unwrap().push(json!({ "id": "s3", "title": "Release", "done_when": "Live", "post": [{ "what": "w", "how": "h", "evidence": "e" }] }))) as fn(&mut Value)),
+            ("a stage removed", |v: &mut Value| { v["stages"].as_array_mut().unwrap().pop(); }),
+            ("a done-when changed", |v: &mut Value| v["stages"][0]["done_when"] = json!("Known and priced")),
+            ("a check dropped", |v: &mut Value| v["stages"][0]["post"][0]["id"] = json!("c9")),
+            ("an assumption dropped", |v: &mut Value| v["assumptions"] = json!([])),
+        ] {
+            let mut v = base.clone();
+            f(&mut v);
+            assert!(size(&v).1, "{what} is big");
+        }
     }
 
     #[test]

@@ -646,6 +646,10 @@ impl Panel {
         if !m.standing && !m.goal.trim().is_empty() && !editing_goal {
             items.push(self.goal_card(&m, cx));
         }
+        // The plan it was launched with, while it is live: how far its stages are, and what changed.
+        if let Some(p) = self.tower.read(cx).state.as_ref().and_then(|s| model::live_plan(s, name)) {
+            items.push(self.live_plan_card(&p, cx));
+        }
         // The goal, being changed.
         if let Some(edit) = self.full.as_ref().and_then(|f| f.edit.as_ref()).filter(|e| e.space == name) {
             let standing = edit.standing;

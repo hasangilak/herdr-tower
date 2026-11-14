@@ -1415,7 +1415,7 @@ impl Daemon {
                 None => anyhow::bail!("the tower isn't moving sessions between accounts"),
             }
         };
-        let plan = |plan: &str, q: &str, answer: &str| self.plans.answer(plan, q, answer, "you");
+        let plan = |plan: &str, what: &str, answer: &str| self.plans.from_card(plan, what, answer);
         self.decisions.answer_with(id, body, submit, &decisions::Carry { asks: &self.asks, send: &send, agenda: &agenda, reopen: &reopen, accounts: &accounts, plan: &plan })
     }
 

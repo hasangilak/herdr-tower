@@ -162,6 +162,10 @@ pub struct State {
     /// dir, plan_md, url, why, thread: [{from: "user" | "planner", text,
     /// at}], created_ms, ready_ms, updated_ms, closed_ms, launched}`.
     pub plan: Option<serde_json::Value>,
+    /// The plans launched and live (`Plan::view_with`), newest first: each
+    /// with `launched` (its space), `version`, `stages` (each with `state`),
+    /// `progress: {stages, done, at}`, `findings` and `revisions`.
+    pub plans_live: Vec<serde_json::Value>,
     /// The PRs' reviews (see `crate::reviews`): every one not over, and
     /// those over in the last day, the latest first, as `Review::view`
     /// writes them (`{key, repo, number, url, space, owner, owner_name,
@@ -285,6 +289,7 @@ impl State {
             releases: serde_json::json!({}),
             acts: vec![],
             plan: None,
+            plans_live: vec![],
             reviews: vec![],
             accounts: serde_json::Value::Null,
         }
