@@ -884,7 +884,21 @@ impl SendQueue {
             Look::Unreachable(e) => bail!("can't reach {session} right now ({e}); try again in a moment"),
         };
         if s.status == SessionStatus::Starting {
-            bail!("{} ({}) runs no agent the tower can follow: use hc send for a plain program", s.address, s.name);
+            // A first-run folder-trust question holds it (it reports no status
+            // until it is past it): a yes or no to it is answered on it, by its keys.
+            if let Some(yes) = crate::brain::trust_reply(&text)
+                && h.answer_trust(&s.address, yes)?
+            {
+                let line = format!("{} ({}): its folder-trust question answered {}", s.address, s.name, if yes { "Yes, I trust this folder" } else { "No, exit" });
+                eprintln!("[queue] {line}");
+                h.record(&s.address, &line, "sent");
+                return Ok((Added::Sent { id: 0 }, s.address, s.name));
+            }
+            bail!(
+                "{} ({}) hasn't started: it shows no agent yet (a first-run question, or a plain program). A yes or no answers its folder-trust question; anything else waits until it runs (hc send types into a plain program)",
+                s.address,
+                s.name
+            );
         }
         let now = crate::history::now_ms();
         let item = {
@@ -1797,6 +1811,11 @@ trait Sessions: Sync {
     fn record(&self, session: &str, text: &str, kind: &str);
     /// Starts a session (`tower start <args>`); its address.
     fn start(&self, args: &[String]) -> Result<String>;
+    /// Answers the folder-trust question `session` shows (its yes, or its
+    /// no), by its keys. False: no such question shows.
+    fn answer_trust(&self, _session: &str, _yes: bool) -> Result<bool> {
+        Ok(false)
+    }
     /// A message between sessions arrived, or couldn't: into the history (kind `peer`).
     fn peer(&self, msg: crate::peers::Message);
     /// How much the tower tells the user now (see `tell`).
@@ -1855,6 +1874,15 @@ pub fn wire(w: Wiring) {
 struct Herdr;
 
 impl Sessions for Herdr {
+    fn answer_trust(&self, session: &str, yes: bool) -> Result<bool> {
+        let screen = hc::run(&["read", session, "--lines", "0"])?.stdout;
+        let Some(keys) = crate::brain::trust_keys(&screen, yes) else { return Ok(false) };
+        let mut args = vec!["keys", session];
+        args.extend(keys);
+        hc::run(&args)?;
+        Ok(true)
+    }
+
     fn look(&self, session: &str) -> Look {
         match hc::lookup(session) {
             hc::Lookup::Found(t) if t["state"] == "live" => Look::Live(session_of(&t, session)),
@@ -1999,6 +2027,8 @@ mod tests {
         busy_sent: Mutex<Vec<String>>,
         /// The checks of the user's words asked for.
         checks: Mutex<Vec<Check>>,
+        /// Sessions on a folder-trust question, and how each was answered.
+        trust: Mutex<BTreeMap<String, Option<bool>>>,
     }
     /// A tower that tells everything, as it always did: what these tests
     /// were written for. The quiet levels are set by the tests about them.
@@ -2024,6 +2054,7 @@ mod tests {
                 minutes: Mutex::new(10),
                 busy_sent: Default::default(),
                 checks: Default::default(),
+                trust: Default::default(),
             }
         }
         /// `s` runs `app` (`claude-code`, `codex`), its status set at `since_ms`.
@@ -2060,6 +2091,15 @@ mod tests {
         }
     }
     impl Sessions for Fake {
+        fn answer_trust(&self, session: &str, yes: bool) -> Result<bool> {
+            match self.trust.lock().unwrap().get_mut(session) {
+                Some(answer) => {
+                    *answer = Some(yes);
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
         fn look(&self, session: &str) -> Look {
             if *self.unreachable.lock().unwrap() {
                 return Look::Unreachable("ssh: timed out".into());
@@ -2152,6 +2192,30 @@ mod tests {
         assert!(crate::brain::is_note_prompt(&to_brain) && !crate::brain::is_note_prompt(&to_session), "{to_brain}");
         let two = undelivered_note(true, "tower sandbox", "t12", "it is gone", &[texts[0].clone(), "and the changelog".into()]);
         assert!(two.starts_with("[queue] Your 2 messages to tower sandbox (t12) were not delivered: it is gone. The first said:"), "{two}");
+    }
+
+    /// A session held on its first-run folder-trust question shows no
+    /// status: a yes or no to it (a card's answer) is pressed on it, not
+    /// refused; anything else still waits for it to run.
+    #[test]
+    fn a_yes_to_a_folder_trust_question_is_pressed_on_it() {
+        let (q, _d) = queue();
+        let h = Fake::default();
+        h.sessions.lock().unwrap().insert("t15m".into(), ("".into(), Some(5), None));
+        h.trust.lock().unwrap().insert("t15m".into(), None);
+        let (added, ..) = q.add_with(&h, "t15m", "Yes, trust it", &[], None).unwrap();
+        assert!(matches!(added, Added::Sent { .. }), "{added:?}");
+        assert_eq!(h.trust.lock().unwrap()["t15m"], Some(true));
+        assert!(h.sent.lock().unwrap().is_empty(), "nothing typed as a message");
+        assert!(h.recorded.lock().unwrap().iter().any(|(s, t, _)| s == "t15m" && t.contains("Yes, I trust this folder")));
+        q.add_with(&h, "t15m", "no", &[], None).unwrap();
+        assert_eq!(h.trust.lock().unwrap()["t15m"], Some(false));
+        // Other words, or no trust question on screen: refused, and said why.
+        let err = q.add_with(&h, "t15m", "summarise the notes", &[], None).unwrap_err().to_string();
+        assert!(err.contains("hasn't started"), "{err}");
+        h.sessions.lock().unwrap().insert("t9".into(), ("".into(), Some(5), None));
+        let err = q.add_with(&h, "t9", "yes", &[], None).unwrap_err().to_string();
+        assert!(err.contains("hasn't started"), "{err}");
     }
 
     /// What the user typed in a session themselves is checked against what
