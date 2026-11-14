@@ -186,6 +186,13 @@ impl Target {
     }
 }
 
+/// The tag a request carries for where it was asked: `[phone]` from a
+/// paired phone (spoken or typed there), so the brain knows the user is away
+/// from the Mac; nothing from the Mac itself.
+pub fn source_tag(source: &str) -> Option<&'static str> {
+    source.starts_with("phone:").then_some("[phone]")
+}
+
 /// Hands what the user said to the brain, with the radar's view of every
 /// agent (`radar`, may be empty), so a status question needs no lookup.
 /// `source`: `mac`, `voice` or `phone:<device id>`, for the chat.
@@ -196,7 +203,12 @@ pub fn ask(text: &str, radar: &str, source: &str) -> Result<()> {
 /// `ask`, of the brain `to`. What is asked of a space's own brain is kept
 /// in the history as that space's request.
 pub fn ask_as(to: &Target, text: &str, radar: &str, source: &str) -> Result<()> {
-    let mut msg = if radar.is_empty() { format!("[voice] {text}") } else { format!("[voice] {text} {radar}") };
+    // From the phone: the user is away from the Mac (`[phone]`, after their words, which begin the prompt).
+    let words = match source_tag(source) {
+        Some(tag) => format!("{text} {tag}"),
+        None => text.to_string(),
+    };
+    let mut msg = if radar.is_empty() { format!("[voice] {words}") } else { format!("[voice] {words} {radar}") };
     if let Some(hint) = split_hint(text, &crate::dispatch::known_projects()) {
         msg.push(' ');
         msg.push_str(&hint);
@@ -547,6 +559,16 @@ mod tests {
         assert!(!is_note_prompt("<hc from=\"tower-voice\">[voice] what did the [watch] say"));
         assert!(!is_note_prompt("[watch] t5 (api) is now done.\n[voice] what is t5 doing?"));
         assert!(!super::is_question_prompt("  [voice] answer the [question] for me"));
+    }
+
+    /// The evening of 13 Nov: the user said three times that they weren't at
+    /// the desk, because the brain couldn't tell the phone from the Mac.
+    #[test]
+    fn a_request_from_the_phone_says_so() {
+        assert_eq!(super::source_tag("phone:d_0c7c288e"), Some("[phone]"));
+        assert_eq!(super::source_tag("mac"), None);
+        assert_eq!(super::source_tag("voice"), None);
+        assert_eq!(super::source_tag("answer:t12v"), None);
     }
 
     #[test]

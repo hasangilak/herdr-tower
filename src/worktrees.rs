@@ -297,6 +297,37 @@ pub fn add_detached(repo: &Path, path: &Path, rev: &str) -> Result<()> {
     Ok(())
 }
 
+/// What a checkout needs to build and run its tests that git doesn't hold:
+/// the repo's installed dependencies, linked into it, never copied.
+pub const DEPENDENCY_LINKS: &[&str] = &["node_modules"];
+
+/// Links each of `repo`'s installed dependency folders (`DEPENDENCY_LINKS`)
+/// into the checkout at `path` that has none of its own, so a reviewer runs
+/// the PR's tests there without making a link itself, or removing one (an
+/// `rm` in its command sent its verdict to the user's queue: 13 Nov). The
+/// names linked.
+pub fn link_dependencies(repo: &Path, path: &Path) -> Vec<String> {
+    DEPENDENCY_LINKS
+        .iter()
+        .filter(|n| {
+            let (from, to) = (repo.join(n), path.join(n));
+            from.is_dir() && std::fs::symlink_metadata(&to).is_err() && std::os::unix::fs::symlink(&from, &to).is_ok()
+        })
+        .map(|n| n.to_string())
+        .collect()
+}
+
+/// Takes away the links `link_dependencies` made: only links, so a folder
+/// the checkout has of its own stays, and the repo's own is never touched.
+pub fn unlink_dependencies(path: &Path) {
+    for n in DEPENDENCY_LINKS {
+        let p = path.join(n);
+        if std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
 /// Takes a reviewer's checkout away, whatever is in it: it is a copy of a
 /// PR's head to read, and nothing in it is anyone's work.
 pub fn remove_detached(repo: &Path, path: &Path) -> Result<()> {
@@ -304,6 +335,8 @@ pub fn remove_detached(repo: &Path, path: &Path) -> Result<()> {
         let _ = git(repo, &["worktree", "prune"]);
         return Ok(());
     }
+    // The links to the repo's dependencies go first: removing the checkout never reaches into them.
+    unlink_dependencies(path);
     let out = git(repo, &["worktree", "remove", "--force", &path.to_string_lossy()])?;
     if out.code != 0 {
         bail!("git worktree remove in {}: {}", repo.display(), out.stderr.trim());
@@ -704,6 +737,36 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&wt).unwrap();
         let back = ensure(&repo, "Shop").unwrap().unwrap();
         assert!(back.fresh && wt.join("README.md").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A reviewer's checkout gets the repo's dependencies as a link the tower
+    /// made, and taking the checkout away takes only the link: the repo's own
+    /// folder and what is in it stay.
+    #[test]
+    fn a_review_checkout_links_the_repos_dependencies_and_leaves_them_when_it_goes() {
+        let base = temp("review-deps");
+        let repo = repo(&base, "shop");
+        std::fs::create_dir_all(repo.join("node_modules/left-pad")).unwrap();
+        std::fs::write(repo.join("node_modules/left-pad/index.js"), "module.exports = 1\n").unwrap();
+        let place = base.join(".tower-worktrees/fix/review-shop-12");
+        let head = sh(&repo, &["rev-parse", "HEAD"]);
+        add_detached(&repo, &place, &head).unwrap();
+        assert_eq!(link_dependencies(&repo, &place), ["node_modules"]);
+        let link = place.join("node_modules");
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(link.join("left-pad/index.js").exists(), "the tests run with them");
+        assert!(link_dependencies(&repo, &place).is_empty(), "linked once");
+        remove_detached(&repo, &place).unwrap();
+        assert!(!place.exists());
+        assert!(repo.join("node_modules/left-pad/index.js").exists(), "the repo's own dependencies stay");
+        // A checkout with a folder of its own keeps it: only a link is taken away.
+        let other = base.join(".tower-worktrees/fix/review-shop-13");
+        add_detached(&repo, &other, &head).unwrap();
+        std::fs::create_dir_all(other.join("node_modules/own")).unwrap();
+        assert!(link_dependencies(&repo, &other).is_empty());
+        unlink_dependencies(&other);
+        assert!(other.join("node_modules/own").exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -1068,6 +1068,13 @@ impl Radar {
     /// on work the user asked for goes through, marked so; other news is held.
     fn deliver_now(&self) {
         self.watches.deliver(|p| {
+            // At its usage limit, a session is no error and doesn't wait for the user: the failover moves it, and says so once.
+            if p.kind != "queue" && p.kind != "agenda" && matches!(p.status.as_str(), "error" | "blocked") && super::failover::at_limit(&p.address) {
+                eprintln!("[radar] {} ({}) is at its usage limit: the failover has it; not told", p.address, p.name);
+                let line = format!("{} hit its account's usage limit", crate::names::shown(p.space.as_deref(), &p.name));
+                self.shared.record(&p.address, &line, &p.status);
+                return true;
+            }
             let news = p.msg.trim_start_matches("[watch] ").trim_start_matches("[queue] ").trim_start_matches("[agenda] ").to_string();
             let (gate, focus) = self.gate(p.space.as_deref(), &p.status, &p.kind);
             if self.keep(gate, &focus, &p.address, &p.name, p.space.as_deref(), &news, &p.status, &p.kind) {

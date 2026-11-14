@@ -639,11 +639,7 @@ pub fn build(session: &str, name: &str, codex: bool, screen: &Screen, transcript
             q.kind = "claude-permission".into();
             q.detail = screen.detail.clone();
             q.target = hc_msg.strip_prefix("approve ").map(str::trim).unwrap_or("").to_string();
-            q.title = match hc_msg.strip_prefix("approve ") {
-                Some(m) => format!("Allow {m}?"),
-                None if screen.kind == "menu" => screen.question.clone(),
-                None => "Allow this?".into(),
-            };
+            q.title = permission_title(hc_msg, screen);
             q.tabs = vec![Tab { title: "Permission".into(), question: screen.question.clone(), options: opts(screen), ..Default::default() }];
             q.submit_state = "single".into();
         }
@@ -664,6 +660,49 @@ pub fn build(session: &str, name: &str, codex: bool, screen: &Screen, transcript
     }
     q.id = id_of(session, &q.kind, &q.tabs, &q.title, &q.detail);
     q
+}
+
+/// A permission prompt's title, as the user reads it on a card (on a phone,
+/// often without the dialog): the command (`Allow Bash: touch /tmp/x?`); a
+/// file by its name, in Claude Code's own words ("Do you want to make this
+/// edit to notes.md?"), never as a whole path; what a command is for, from
+/// the line Claude Code writes above it ("Allow: Note the work in memory?");
+/// and "Allow this?" only when the dialog says nothing more.
+fn permission_title(hc_msg: &str, screen: &Screen) -> String {
+    let asked = screen.question.trim();
+    let says_more = !asked.is_empty() && !asked.eq_ignore_ascii_case("Do you want to proceed?");
+    match hc_msg.strip_prefix("approve ").map(str::trim) {
+        Some(m) => match m.split_once(": ") {
+            Some(("Update" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit", _)) if says_more => asked.to_string(),
+            Some(("Update" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit", path)) => format!("Allow editing {}?", file_name(path)),
+            _ => format!("Allow {m}?"),
+        },
+        None if screen.kind == "menu" => screen.question.clone(),
+        None if says_more => asked.to_string(),
+        None => command_purpose(&screen.detail).map(|w| format!("Allow: {w}?")).unwrap_or_else(|| "Allow this?".into()),
+    }
+}
+
+/// A path's last part ("…/memory/notes.md" is "notes.md").
+fn file_name(path: &str) -> &str {
+    let path = path.trim().trim_end_matches('?');
+    path.rsplit('/').find(|p| !p.is_empty()).unwrap_or(path)
+}
+
+/// What a Bash prompt's command is for: the line under "Bash command" (past
+/// a tip), which Claude Code writes in words ("Create the test file in
+/// /tmp"); a dialog without one shows the command there instead.
+fn command_purpose(detail: &str) -> Option<String> {
+    let mut lines = detail.lines().map(str::trim).filter(|l| !l.is_empty());
+    if lines.next()? != "Bash command" {
+        return None;
+    }
+    let line = lines.find(|l| !l.starts_with("Tip:"))?;
+    let line = line.trim_start_matches('│').trim().trim_end_matches(['.', ':']);
+    if line.is_empty() {
+        return None;
+    }
+    Some(if line.chars().count() > 90 { format!("{}…", line.chars().take(90).collect::<String>().trim_end()) } else { line.to_string() })
 }
 
 /// What the dialog shows of the answers given already: its review lists
@@ -1471,6 +1510,11 @@ pub fn waits_for_user(message: &str) -> Option<String> {
                 Some(prev) if refers_back(s) => format!("{prev} {s}"),
                 _ => s.clone(),
             };
+            // A heading ("For you to decide:") says whose it is, not what: with what follows it.
+            let s = match sentences.get(i + 1) {
+                Some(next) if is_heading(&sentences[i]) => format!("{}: {next}", s.trim_end_matches([':', ' '])),
+                _ => s,
+            };
             // Links aren't read out: "merge it: https://…/pull/1250" says "merge it".
             let words: Vec<&str> = s.split_whitespace().filter(|w| !w.contains("://")).collect();
             let s = words.join(" ");
@@ -1550,9 +1594,16 @@ fn refers_back(sentence: &str) -> bool {
     // A link isn't said, so it doesn't name anything.
     let sentence: String = sentence.split_whitespace().filter(|w| !w.contains("://")).collect::<Vec<_>>().join(" ");
     let l = format!(" {} ", sentence.to_lowercase().replace([',', ';', ':', '.', '!', '?'], " "));
-    let pronoun = [" it ", " this ", " that ", " them ", " these ", " es ", " ihn "].iter().any(|w| l.contains(w));
+    let pronoun = [" it ", " this ", " that ", " them ", " these ", " those ", " both of ", " either of ", " es ", " ihn ", " beide "].iter().any(|w| l.contains(w));
     let concrete = sentence.contains('#') || sentence.contains('/') || l.contains(" pr ") || l.contains(" apk ");
     pronoun && !concrete
+}
+
+/// A sentence that only heads what follows: it ends on a colon ("For you
+/// to decide:"), or is a few words with no full stop ("Waiting on you").
+fn is_heading(sentence: &str) -> bool {
+    let t = sentence.trim();
+    t.ends_with(':') || (t.split_whitespace().count() <= 4 && !t.ends_with(['.', '!', '?']))
 }
 
 /// Markdown and code out of the way, links as their text, one line.
@@ -2503,6 +2554,36 @@ mod tests {
         std::fs::read_to_string(format!("{}/tests/fixtures/questions/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
     }
 
+    /// A permission card's title says what is asked, on a phone with no
+    /// dialog beside it: never "Allow this?" when the dialog says more, and
+    /// never a whole path (the evening of 13 Nov: "Asks to use Update:
+    /// /Users/…/claude-profiles/1f2995fa-2a8…").
+    #[test]
+    fn a_permission_title_says_what_is_asked() {
+        let home = crate::config::home().to_string_lossy().into_owned();
+        let title = |f: &str, msg: &str| {
+            let screen = parse_screen(&fixture(f).replace("{home}", &home)).unwrap();
+            build("t1", "s", false, &screen, None, msg, "").title
+        };
+        // A command: what it is for, in Claude Code's words.
+        assert_eq!(title("claude-permission.txt", ""), "Allow: Create the qfix-perm-test file in /tmp?");
+        assert_eq!(title("claude-permission.txt", "approve Bash: touch /tmp/qfix-perm-test"), "Allow Bash: touch /tmp/qfix-perm-test?");
+        // A file: Claude Code's own question names it.
+        assert_eq!(title("claude-edit-file.txt", ""), "Do you want to make this edit to search.rs?");
+        assert_eq!(title("claude-edit-claude-folder.txt", "approve Update: /Users/me/Library/Application Support/orca/claude-profiles/1f2995fa-2a8…"), "Do you want to make this edit to search-notes.md?");
+        // Herdr's line alone: the file by its name.
+        let bare = Screen { kind: "permission".into(), question: "Do you want to proceed?".into(), ..Default::default() };
+        assert_eq!(build("t1", "s", false, &bare, None, "approve Update: /w/app/notes/plan.md", "").title, "Allow editing plan.md?");
+        assert_eq!(build("t1", "s", false, &bare, None, "", "").title, "Allow this?", "nothing more to say");
+        // The command's own line when it has no words above it.
+        let plain = Screen { kind: "permission".into(), question: "Do you want to proceed?".into(), detail: "Bash command\n│ ls -la".into(), ..Default::default() };
+        assert_eq!(build("t1", "s", false, &plain, None, "", "").title, "Allow: ls -la?");
+        // Still a Bash prompt to the rules: its command is read as before.
+        let set = bash("touch /tmp/x", "ctx");
+        assert_eq!(set.title, "Allow: Do it?");
+        assert_eq!(shell_command(&set).as_deref(), Some("Do it\ntouch /tmp/x"));
+    }
+
     fn squash(p: &str) -> String {
         p.chars().filter(|c| !c.is_whitespace()).collect()
     }
@@ -3316,7 +3397,7 @@ mod tests {
     fn a_prompt_that_only_writes_claudes_own_memory_gets_its_plain_yes() {
         let set = memory_prompt(ASKED, |s| s);
         let home = crate::config::home().to_string_lossy().into_owned();
-        assert_eq!((set.kind.as_str(), set.title.as_str()), ("claude-permission", "Allow this?"));
+        assert_eq!((set.kind.as_str(), set.title.as_str()), ("claude-permission", "Allow: Note the work in memory?"));
         let real = format!("{}/.claude/projects/-Users-me-Work-herder-tower/memory/quiet-tower-implementation.md", home.replace(' ', ""));
         assert_eq!(sensitive_targets(&set), [real.clone(), real]);
         assert_eq!(memory_yes(&set), Some(0), "its plain Yes");
@@ -3587,6 +3668,15 @@ mod tests {
             ("Fertig auf dev. Bitte merge den PR #1250, dann prüfe ich prod.", "Bitte merge den PR #1250, dann prüfe ich prod."),
             ("The new APK is at /tmp/app.apk. You need to install it on the phone and test the header.", "The new APK is at /tmp/app.apk. You need to install it on the phone and test the header."),
             ("Fix is in. Please review PR #77 before I deploy.", "Please review PR #77 before I deploy."),
+            // The evening of 13 Nov: cards titled "For you to decide" and "Both of those need your OK."
+            (
+                "Nothing is built.\n\n**For you to decide:**\ninline mode makes every gated search wait up to 1 s for the model.",
+                "For you to decide: inline mode makes every gated search wait up to 1 s for the model.",
+            ),
+            (
+                "The real numbers need a dev deploy and access to the GPU host. Both of those need your OK.",
+                "The real numbers need a dev deploy and access to the GPU host. Both of those need your OK.",
+            ),
         ] {
             assert_eq!(waits_for_user(msg).as_deref(), Some(want), "{msg}");
         }

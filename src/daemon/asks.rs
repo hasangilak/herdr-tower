@@ -877,6 +877,8 @@ impl Asks {
                 if !had
                     && let Some(t) = blocked
                     && !super::watch::left_alone(&t)
+                    // Its usage limit's screen: the failover moves it, nothing for the user to look at.
+                    && !super::failover::at_limit(address)
                 {
                     let notice = blocked_notice(&hc::spoken_name(&t), &t["status"]);
                     let told = match self.decisions.get() {
@@ -928,7 +930,19 @@ impl Asks {
             // It only says it is ready: that hands the user nothing.
             let ready = questions::ready_only(&message);
             // PRs it opened (or ends on): chips in the chat, waiting for the user's merge.
-            let found = crate::prs::links(&format!("{message}\n{}", turn_transcript(&address, &t)));
+            let mut found = crate::prs::links(&format!("{message}\n{}", turn_transcript(&address, &t)));
+            // Its wait asks for a merge of a PR it names only by number ("My PR #1398 is still waiting for
+            // your merge"): that PR's merge card is what the user acts on, never a second card (13 Nov: six).
+            let asks_merge = waits.as_deref().filter(|_| !ready).is_some_and(|r| r.to_lowercase().contains("merg"));
+            let by_number = match (asks_merge, crate::prs::daemon()) {
+                (true, Some(store)) => crate::prs::named_in(&store.list(), waits.as_deref().unwrap_or(""), &address, space.as_deref()),
+                _ => vec![],
+            };
+            for pr in by_number {
+                if !found.contains(&pr) {
+                    found.push(pr);
+                }
+            }
             if !found.is_empty()
                 && let Some(store) = crate::prs::daemon()
             {
@@ -954,6 +968,13 @@ impl Asks {
                 return;
             }
             if let Some(request) = waits {
+                // What the brain raised about this session already is what it waits for: that card, not a second one.
+                if !own && let Some(id) = me.decisions.get().and_then(|d| d.waits_on_raised(&address)) {
+                    eprintln!("[questions] {address} ({name}) waits for the user, on {id} (raised already): {request}");
+                    let (a, r) = (address.clone(), request.clone());
+                    crate::history::later(move || crate::history::job_follow(&a, crate::history::JobState::Blocked, &r));
+                    return;
+                }
                 me.waiting_in(space, &address, &name, hc::created_ms(&t), &message, &request, &context, watched, own);
                 return;
             }
@@ -2235,7 +2256,7 @@ pub fn blocked_notice(name: &str, status: &Value) -> String {
     if let Some(rest) = msg.strip_prefix("approve ") {
         return match rest.split_once(": ") {
             Some(("Bash", cmd)) => format!("{name} asks to run {}", short(cmd, 80)),
-            Some(("Edit" | "Write" | "MultiEdit", path)) => format!("{name} asks to edit {}", short(path.rsplit('/').next().unwrap_or(path), 60)),
+            Some(("Edit" | "Update" | "Write" | "MultiEdit" | "NotebookEdit", path)) => format!("{name} asks to edit {}", edited(path)),
             Some(("WebFetch", url)) => format!("{name} asks to open {}", short(url, 60)),
             Some((tool, what)) => format!("{name} asks to use {tool}: {}", short(what, 80)),
             None => format!("{name} asks to {}", short(rest, 80)),
@@ -2245,6 +2266,20 @@ pub fn blocked_notice(name: &str, status: &Value) -> String {
         return format!("{name} has questions");
     }
     format!("{name} needs you")
+}
+
+/// The file a blocked edit names, for a card: its name, never the whole
+/// path. Herdr's status line cuts a long path short ("…/claude-profiles/
+/// 1f2995fa-2a8…"), so a cut one is said by where it is: Claude's own notes,
+/// or only "a file".
+fn edited(path: &str) -> String {
+    let path = path.trim();
+    if path.ends_with('…') || path.ends_with("...") {
+        let claude = ["/.claude/", "/.claude-accounts/", "claude-profiles/", "/memory/"].iter().any(|d| path.contains(d));
+        return if claude { "its Claude notes".into() } else { "a file".into() };
+    }
+    let name = path.rsplit('/').find(|p| !p.is_empty()).unwrap_or(path);
+    if name.chars().count() <= 60 { name.to_string() } else { format!("{}…", name.chars().take(60).collect::<String>()) }
 }
 
 /// The same as a decision's title, which names no session (its card shows
@@ -3084,6 +3119,14 @@ mod tests {
         assert_eq!(n("permission", "approve Bash: touch /tmp/x"), "The orb session asks to run touch /tmp/x");
         assert_eq!(n("permission", "approve plan"), "The orb session has a plan ready for you to approve");
         assert_eq!(n("permission", "approve Edit: /w/app/src/login.rs"), "The orb session asks to edit login.rs");
+        // Claude Code's newer name for an edit, with the path Herdr cut short (the evening of 13 Nov: a raw path on the phone).
+        assert_eq!(n("permission", "approve Update: /w/app/src/login.rs"), "The orb session asks to edit login.rs");
+        assert_eq!(
+            n("permission", "approve Update: /Users/me/Library/Application Support/orca/claude-profiles/1f2995fa-2a8…"),
+            "The orb session asks to edit its Claude notes"
+        );
+        assert_eq!(n("permission", "approve Write: /Users/me/Work/app/src/very/long/pa…"), "The orb session asks to edit a file");
+        assert_eq!(blocked_title(&json!({ "kind": "permission", "msg": "approve Update: /Users/me/.claude/projects/x/memory/notes.md" })), "Asks to edit notes.md");
         assert_eq!(n("permission", "approve mcp__x__deploy: prod"), "The orb session asks to use mcp__x__deploy: prod");
         assert_eq!(n("question", ""), "The orb session has questions");
         assert_eq!(n("", ""), "The orb session needs you", "nothing to say: the bare notice");

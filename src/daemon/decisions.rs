@@ -384,6 +384,15 @@ impl Decisions {
         self.tells(std::slice::from_ref(&raised.id), true)
     }
 
+    /// A session's turn ended waiting on the user: the open decision the
+    /// brain raised about it, if there is one, which that wait joins
+    /// (`Book::waits_on_raised`). Its id.
+    pub fn waits_on_raised(&self, address: &str) -> Option<String> {
+        let id = self.change(|b, now| b.waits_on_raised(address, now))?;
+        eprintln!("[decisions] {address} waits on {id}, the decision raised about it: no second card");
+        Some(id)
+    }
+
     /// A session as the radar sees it, blocked or not: what it was blocked
     /// on is over once it is not.
     pub fn session_blocked(&self, address: &str, blocked: bool) {

@@ -188,6 +188,31 @@ pub fn links(text: &str) -> Vec<(String, u64)> {
     out
 }
 
+/// The open PRs a message names only by number ("My PR #1398 is still
+/// waiting for your merge", "PR 1400"), among those the tower knows (`all`):
+/// one of that session's own, else one of its space's. A number two of them
+/// share there, or none has, names nothing.
+pub fn named_in(all: &[Pr], text: &str, session: &str, space: Option<&str>) -> Vec<(String, u64)> {
+    let same_space = |p: &Pr| matches!((p.space.as_deref(), space), (Some(a), Some(b)) if a.trim().eq_ignore_ascii_case(b.trim()));
+    let mut out = vec![];
+    for n in crate::decisions::pr_numbers(text) {
+        let open: Vec<&Pr> = all.iter().filter(|p| p.number == n && p.open()).collect();
+        let mine: Vec<&&Pr> = open.iter().filter(|p| p.session == session).collect();
+        let near: Vec<&&Pr> = open.iter().filter(|p| same_space(p)).collect();
+        let pick = match (mine.as_slice(), near.as_slice()) {
+            ([one], _) | ([], [one]) => Some(*one),
+            _ => None,
+        };
+        if let Some(p) = pick {
+            let pr = (p.repo.clone(), p.number);
+            if !out.contains(&pr) {
+                out.push(pr);
+            }
+        }
+    }
+    out
+}
+
 /// What a Claude Code turn said, and what its `gh pr create` printed, from
 /// its transcript: after the last prompt, every message's text and the
 /// output of each command that creates a PR (where its link is). Other
@@ -1058,6 +1083,36 @@ fn getrandom(buf: &mut [u8]) -> std::io::Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// 13 Nov: "My PR #1398 is still waiting for your merge" became a card
+    /// of its own beside #1398's merge card. A number names the PR the tower
+    /// knows: the session's own, else its space's; never a guess between two.
+    #[test]
+    fn a_pr_named_only_by_its_number_is_the_one_the_tower_knows() {
+        let pr = |repo: &str, n: u64, session: &str, space: &str, state: &str| Pr {
+            repo: repo.into(),
+            number: n,
+            session: session.into(),
+            space: Some(space.into()),
+            state: state.into(),
+            ..Default::default()
+        };
+        let all = vec![
+            pr("eyzhub/eyz-mediaroom-serverless", 1398, "t139", "ticket-phishing-audit", "open"),
+            pr("eyzhub/eyzflow", 836, "t138", "ticket-phishing-audit", "open"),
+            pr("eyzhub/eyzflow", 1398, "t7h", "b2c", "open"),
+            pr("eyzhub/eyz-mediaroom-serverless", 1392, "t12v", "search-llm", "merged"),
+            pr("acme/web", 12, "t1", "shop", "open"),
+            pr("acme/api", 12, "t2", "shop", "open"),
+        ];
+        let mr = |n: u64| ("eyzhub/eyz-mediaroom-serverless".to_string(), n);
+        assert_eq!(named_in(&all, "My PR #1398 is still waiting for your merge.", "t139", Some("ticket-phishing-audit")), [mr(1398)], "its own");
+        assert_eq!(named_in(&all, "#836 is approved and waiting for you to merge.", "t139", Some("Ticket-Phishing-Audit")), [("eyzhub/eyzflow".to_string(), 836)], "its space's");
+        assert!(named_in(&all, "Merge PR 1392 into dev", "t12v", Some("search-llm")).is_empty(), "merged: no card waits for it");
+        assert!(named_in(&all, "Please merge #12.", "t9", Some("shop")).is_empty(), "two in the space: no guess");
+        assert_eq!(named_in(&all, "Please merge #12.", "t2", Some("shop")), [("acme/api".to_string(), 12)], "but its own is its own");
+        assert!(named_in(&all, "Please merge #999.", "t139", Some("ticket-phishing-audit")).is_empty());
+    }
 
     #[test]
     fn finds_pr_links_in_what_a_session_says_and_prints() {
