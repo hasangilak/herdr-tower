@@ -361,13 +361,16 @@ struct Radar {
     /// Sessions that stopped to wait for the user (a watch's report said so):
     /// their job stays blocked until they work again or end.
     waiting: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Sessions whose turn count this run has seen: the first such look may
+    /// find a turn that ended while the tower was down (`Asks::missed_turn`).
+    counted: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 pub fn start(shared: Shared, mouth: Mouth, alerts: Alerts, watches: Watches, asks: super::asks::Asks, decisions: super::decisions::Decisions) {
     // What was known when the last run ended, before this run's first look updates it.
     let before = watches.snapshot();
     let radar =
-        Radar { shared, mouth, alerts, watches: watches.clone(), asks, decisions, seen: Arc::new(Mutex::new(HashMap::new())), waiting: Arc::default() };
+        Radar { shared, mouth, alerts, watches: watches.clone(), asks, decisions, seen: Arc::new(Mutex::new(HashMap::new())), waiting: Arc::default(), counted: Arc::default() };
     let _ = watches.radar.set(radar.clone());
     let r = radar.clone();
     radar.asks.set_notify(move |address, text| r.announce(address, text));
@@ -756,10 +759,12 @@ impl Radar {
         // A turn that ended since the last look, even if nobody saw it working.
         let before_turn = before.as_ref().and_then(|b| b.turn).or_else(|| watch.as_ref().and_then(|w| w.turn));
         let turned = matches!((before_turn, turn), (Some(a), Some(b)) if b > a) && status.ready();
-        // The first look since the tower started, at a turn that ended while it was down (it last
-        // looked at this terminal at a lower turn, lately): that turn's end is looked at now.
+        // The first look since the tower started that has its turn count (a hook's event may come
+        // first, without one), at a turn that ended while it was down (it last looked at this
+        // terminal at a lower turn, lately): that turn's end is looked at now.
         let now = crate::history::now_ms();
-        let missed = before.is_none()
+        let first_count = turn.is_some() && machine.is_none() && lock(&self.counted).insert(address.clone());
+        let missed = first_count
             && !turned
             && machine.is_none()
             && live
