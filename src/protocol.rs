@@ -262,6 +262,11 @@ pub enum Request {
         what: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pid: Option<u32>,
+        /// `wait`: what the job waits for, and for how long at most (minutes).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        until: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minutes: Option<u64>,
     },
     Failover {
         action: String,

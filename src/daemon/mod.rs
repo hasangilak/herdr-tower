@@ -925,8 +925,13 @@ impl Daemon {
                 let v = self.failover.limited(hit);
                 return Response { ok: true, error: None, state: Some(v) };
             }
-            Request::JobRunning { terminal, action, what, pid } => {
-                return match running::dispatch(Some(&self.running), &terminal, &action, &what, pid) {
+            Request::JobRunning { terminal, action, what, pid, until, minutes } => {
+                let r = if action == "wait" {
+                    self.running.wait(&terminal, &what, &until, minutes)
+                } else {
+                    running::dispatch(Some(&self.running), &terminal, &action, &what, pid)
+                };
+                return match r {
                     Ok(v) => Response { ok: true, error: None, state: Some(v) },
                     Err(e) => Response { ok: false, error: Some(format!("{e:#}")), state: None },
                 };
