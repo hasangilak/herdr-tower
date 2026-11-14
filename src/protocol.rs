@@ -188,6 +188,15 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<String>,
     },
+    /// A PR's session can't resolve its conflicts with its base (`tower pr
+    /// cant-fix <pr> "<why>"`): it goes to the user, once (`crate::fixes`).
+    CantFix {
+        pr: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        why: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+    },
     /// What only the user can decide, in queue order (`tower decisions`).
     /// No `space`: the main queue (muted spaces left out). `space`: that
     /// space's own. `all`: the last ones that closed too.
@@ -443,7 +452,7 @@ fn wait_for(req: &Request) -> Duration {
         // Ending a brain's terminal, and Herdr's answers on the way (a plan's planner too).
         Request::Model { .. } | Request::Brains { .. } | Request::Plan { .. } => Duration::from_secs(45),
         // A PR the tower doesn't know yet is looked up on GitHub first.
-        Request::Validate { .. } | Request::Impact { .. } => Duration::from_secs(30),
+        Request::Validate { .. } | Request::Impact { .. } | Request::CantFix { .. } => Duration::from_secs(30),
         _ => Duration::from_secs(10),
     }
 }

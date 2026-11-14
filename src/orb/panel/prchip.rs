@@ -498,6 +498,8 @@ impl Panel {
                     .children(l.score_shown().map(|(line, color)| div().text_size(px(12.0)).line_height(px(16.0)).text_color(rgb(color)).line_clamp(2).child(line)))
                     .children(l.validation().map(|(line, color)| div().text_size(px(12.0)).line_height(px(16.0)).text_color(rgb(color)).line_clamp(3).child(line)))
                     .children(l.impact().filter(|(_, breaks)| !*breaks).map(|(line, _)| div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.faint).line_clamp(2).child(line)))
+                    // Its conflicts came back to the user: why (its session couldn't, or nobody could be asked).
+                    .children(crate::fixes::line(&l.pr).map(|line| div().text_size(px(12.0)).line_height(px(16.0)).text_color(rgb(ROSE)).child(line)))
                     .children(crate::prscore::auto_line(&l.pr, auto_on).map(|line| div().text_size(px(12.0)).text_color(g.faint).truncate().child(line)))
                     // Where the tower's chain has it.
                     .children(running.and_then(|r| r.line(&l.key)).map(|line| {

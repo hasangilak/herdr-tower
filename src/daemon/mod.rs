@@ -26,6 +26,7 @@ pub mod reviews;
 pub mod running;
 pub mod sendq;
 mod describe;
+pub mod fixes;
 pub mod sessions;
 pub mod state;
 pub mod stt;
@@ -344,6 +345,8 @@ pub fn run() -> Result<()> {
     merges::Merges::new(shared.clone(), prs.clone(), sendq.clone()).start();
     // What each PR in the merge queue does, in words (its description summarized); one without asks its session for one.
     describe::start(prs.clone(), sendq.clone());
+    // A PR in the user's merge queue that conflicts with its base (or fell behind it): its session fixes it first.
+    fixes::start(prs.clone(), std::sync::Arc::new(fixes::Real { sendq: sendq.clone() }));
     // What the tower opened for the user lately, to show with the reply and to undo.
     let acts = acts::Acts::open(shared.clone(), hub.clone());
     // Where each space's changes stand: open, on dev, on prod (from GitHub, never from what sessions say).
@@ -807,6 +810,13 @@ impl Daemon {
             Request::Impact { pr, verdict, text, from } => {
                 return match impact_report(&self.prs, &pr, &verdict, &text, from.as_deref()) {
                     Ok(v) => Response { ok: true, error: None, state: Some(v) },
+                    Err(e) => Response::err(format!("{e:#}")),
+                };
+            }
+            Request::CantFix { pr, why, from } => {
+                let by = from.clone().unwrap_or_else(|| "cli".into());
+                return match pr_key(&self.prs, &pr, from.as_deref()).and_then(|k| fixes::cant_fix(&self.prs, &k, &why, &by)) {
+                    Ok(p) => Response { ok: true, error: None, state: Some(serde_json::json!({ "pr": p.key(), "fix": p.fix, "line": crate::fixes::line(&p) })) },
                     Err(e) => Response::err(format!("{e:#}")),
                 };
             }

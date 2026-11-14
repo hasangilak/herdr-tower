@@ -184,6 +184,15 @@ pub(super) fn closed_line(name: &str, out: &str) -> String {
     parts.join(" ")
 }
 
+/// A space's open PRs whose conflicts (or update) their sessions fix, a
+/// line each (`crate::fixes::line`): "PR #841 (eyzflow) · Being fixed by
+/// eyzflow: resolving its conflicts with dev."
+pub(super) fn fix_lines(space: &str, prs: &std::collections::BTreeMap<String, crate::prs::Pr>) -> Vec<String> {
+    let mut list: Vec<&crate::prs::Pr> = prs.values().filter(|p| p.space.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(space))).collect();
+    list.sort_by_key(|p| (p.repo.clone(), p.number));
+    list.iter().filter_map(|p| Some(format!("PR #{} ({}) · {}", p.number, crate::prscore::folder_name(&p.repo), crate::fixes::line(p)?))).collect()
+}
+
 /// The reviews of a space's open PRs, a line each: "PR #12 · Review: 2
 /// critical, round 2 · fix-login-review-app-12 · Needs review" (its score's
 /// word, when it has one).
@@ -687,6 +696,8 @@ impl Panel {
         } else {
             items.extend(review_lines(name, &self.tower.read(cx).prs).into_iter().map(eff));
         }
+        // Its PRs with conflicts that their sessions are fixing (not in the queue meanwhile), or that came back.
+        items.extend(fix_lines(name, &self.tower.read(cx).prs).into_iter().map(eff));
         // Where its changes stand, repo by repo: on prod, on dev, open; and its releases.
         if let Some(t) = self.tower.read(cx).state.as_ref().and_then(|s| model::release_track(s, name)) {
             items.push(release_card(&t, crate::history::now_ms()));
