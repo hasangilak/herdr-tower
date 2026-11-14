@@ -166,13 +166,26 @@ struct There {
 struct Waits {
     screen_ms: u64,
     words_ms: u64,
+    /// A question at the end of a turn that the brain didn't decide on in
+    /// this long goes to the user as it is (a dialog waits `DIALOG_MS`).
+    brain_ms: u64,
 }
 
 impl Default for Waits {
     fn default() -> Waits {
-        Waits { screen_ms: 700, words_ms: 6_000 }
+        Waits { screen_ms: 700, words_ms: 6_000, brain_ms: TEXT_BRAIN_MS }
     }
 }
+
+/// How long a dialog waits for the brain's recommendation before it goes to the user.
+const DIALOG_MS: u64 = 40_000;
+/// The same for a question at the end of a turn: the brain reads a whole
+/// message, and may be busy with the user. Never longer: a question nobody
+/// decides on is the user's, never nothing (14 Nov: some waited for hours).
+const TEXT_BRAIN_MS: u64 = 120_000;
+/// A turn that ended while the tower was down is looked at when it starts,
+/// if the tower last looked at that session no longer ago than this.
+const MISSED_TURN_MS: u64 = 2 * 60 * 60_000;
 
 /// A prompt this soon after the tower typed into a session is taken to be
 /// the tower's, for a question it asked at the end of its turn.
@@ -234,6 +247,8 @@ struct Inner {
     /// The latest prompt each session's hook said was not the user's: when,
     /// and at which turn count.
     not_users: HashMap<String, (u64, Option<u64>)>,
+    /// The last turn the tower looked at, per session (kept: `Saved::turns`).
+    turns: HashMap<String, Looked>,
 }
 
 impl Inner {
@@ -260,6 +275,17 @@ struct Saved {
     /// Kept by a tower that makes no card of a turn that only says its
     /// session is ready (false: an older one's file, looked through once).
     ready_checked: bool,
+    /// The last turn the tower looked at, per session (`Asks::turn_looked`).
+    turns: HashMap<String, Looked>,
+}
+
+/// A session's last turn looked at: its terminal (created), its turn count, when.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Looked {
+    pub created_ms: Option<u64>,
+    pub turn: u64,
+    pub at_ms: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -443,6 +469,7 @@ impl Asks {
                 replies: i.replies.clone(),
                 noted: i.noted.clone(),
                 ready_checked: true,
+                turns: i.turns.clone(),
             }
         };
         if let Err(e) = saved.write(&store.0) {
@@ -528,6 +555,7 @@ impl Asks {
             i.replies = replies;
             i.dismissed = dismissed;
             i.noted = saved.noted;
+            i.turns = saved.turns;
             for o in over {
                 i.noted.retain(|n| *n != o.id);
                 i.remember(o);
@@ -539,11 +567,13 @@ impl Asks {
             eprintln!("[questions] {a}: the waiting reply to {} is dropped at start", r.set);
             self.tell(&a, &format!("Your reply to {who} didn't go in: the tower restarted and {who} isn't there as it was."));
         }
-        for set in kept.into_iter().filter(|s| s.kind != "text" && s.state.phase == Phase::Open) {
+        for set in kept.into_iter().filter(|s| s.state.phase == Phase::Open) {
             match set.state.decision {
                 // The brain was told, and may never answer now: the usual wait, from when it was read.
+                // A question at the end of a turn too: never left with nobody to decide it.
                 Decision::Deciding => {
-                    let wait = 40_000u64.saturating_sub(now_ms.saturating_sub(set.at_ms)).max(5_000);
+                    let limit = if set.kind == "text" { self.waits.brain_ms } else { DIALOG_MS };
+                    let wait = limit.saturating_sub(now_ms.saturating_sub(set.at_ms)).max(5_000);
                     let (me, id) = (self.clone(), set.id.clone());
                     std::thread::spawn(move || {
                         std::thread::sleep(std::time::Duration::from_millis(wait));
@@ -588,6 +618,40 @@ impl Asks {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).policy = p.to_string();
         let p = p.to_string();
         self.shared.update(|s| s.question_policy = p);
+    }
+
+    /// A turn of `address` that ended while the tower was down: the last
+    /// turn it looked at was this terminal's, at a lower count, and lately
+    /// enough (`MISSED_TURN_MS`). Nothing known of it: no.
+    pub fn missed_turn(&self, address: &str, created_ms: Option<u64>, turn: u64, now_ms: u64) -> bool {
+        let i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        i.turns.get(address).is_some_and(|l| l.created_ms == created_ms && turn > l.turn && now_ms.saturating_sub(l.at_ms) <= MISSED_TURN_MS)
+    }
+
+    /// The tower looked at `address` at turn count `turn` (kept across restarts: `missed_turn`).
+    pub fn looked_turn(&self, address: &str, created_ms: Option<u64>, turn: u64, now_ms: u64) {
+        let changed = {
+            let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let was = i.turns.get(address).copied();
+            let now = Looked { created_ms, turn, at_ms: now_ms };
+            // Kept fresh at most once a minute when nothing moved (its time says the tower looked lately).
+            let moved = was.is_none_or(|w| w.created_ms != created_ms || w.turn != turn || now_ms.saturating_sub(w.at_ms) > 60_000);
+            if moved {
+                i.turns.insert(address.to_string(), now);
+            }
+            moved
+        };
+        if changed {
+            self.save();
+        }
+    }
+
+    /// Forgets a session that ended.
+    pub fn forget_turn(&self, address: &str) {
+        let had = self.inner.lock().unwrap_or_else(|e| e.into_inner()).turns.remove(address).is_some();
+        if had {
+            self.save();
+        }
     }
 
     pub fn list(&self) -> Vec<QuestionSet> {
@@ -1163,11 +1227,13 @@ impl Asks {
             let brain = self.brain.clone();
             std::thread::spawn(move || brain(&text));
         }
-        // No word from the brain in time: a newly shown dialog goes to the user as it is.
-        if new && set.kind != "text" && set.state.decision == Decision::Deciding {
+        // No word from the brain in time: a newly shown dialog goes to the user as it is; so does a
+        // question at the end of a turn (the brain may be busy, out of usage, or restarting).
+        if new && set.state.decision == Decision::Deciding {
             let (me, id) = (self.clone(), set.id.clone());
+            let wait = if set.kind == "text" { self.waits.brain_ms } else { DIALOG_MS };
             std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(40));
+                std::thread::sleep(std::time::Duration::from_millis(wait));
                 if me.get(&id).is_some_and(|s| s.state == card::SetState::default()) {
                     me.escalate(&id, "no recommendation came in time");
                 }
@@ -1548,8 +1614,25 @@ impl Asks {
             if set.kind != "text" {
                 bail!("--none is for a message that turned out to ask nothing; a dialog always asks");
             }
+            // It asks the user outright ("Want me to …?"): theirs, whatever the brain read in it.
+            if questions::asks_directly(if set.detail.trim().is_empty() { &set.title } else { &set.detail }) {
+                eprintln!("[questions] {id}: the brain says {} asks nothing, but it asks the user outright: theirs", set.session);
+                self.escalate(id, "it asks you directly");
+                return Ok(self.get(id).unwrap_or(set));
+            }
             self.close_where(&set.session, |s| s.id == id, |_| CloseWhy::NothingAsked, true);
             eprintln!("[questions] {id}: the brain says {} asks nothing", set.session);
+            // Written down all the same, so a question read as none is never gone without a trace.
+            (self.record)(crate::history::Entry {
+                kind: "alert".into(),
+                session: Some(set.session.clone()),
+                name: Some(set.name.clone()).filter(|n| !n.is_empty()),
+                space: set.space.clone(),
+                status: Some("nothing-asked".into()),
+                text: format!("{} ended its turn on what reads as a question; the tower found nothing for you in it: {}", if set.name.is_empty() { &set.session } else { &set.name }, crate::agenda::clip(&set.title, 200)),
+                record: true,
+                ..Default::default()
+            });
             return Ok(set);
         }
         let (tabs, recs) = if set.kind == "text" {
@@ -2317,7 +2400,7 @@ mod tests {
         // No screen is read (no hc), nothing is written, nobody waits long.
         a.screen = Arc::new(|_: &str| None);
         a.record = Arc::new(|_: crate::history::Entry| ());
-        a.waits = Waits { screen_ms: 0, words_ms: 1_500 };
+        a.waits = Waits { screen_ms: 0, words_ms: 1_500, brain_ms: 400 };
         // No model: words that open with "no" or "yes" answer the reply the tower holds.
         a.covers = Arc::new(|_: &str, words: &str, _: &str| Ok(["no", "yes"].iter().any(|w| words.to_lowercase().starts_with(w))));
         (a, told)
@@ -2803,6 +2886,98 @@ mod tests {
     fn stored(path: &std::path::Path) -> (Asks, Arc<Mutex<Vec<String>>>) {
         let (a, t) = asks();
         (a.stored_at(path.to_path_buf()), t)
+    }
+
+    /// 14 Nov: questions at the end of a turn waited on the brain with no
+    /// end, so the user saw nothing for hours. One the brain doesn't decide
+    /// on in time is the user's card; one it calls "asks nothing" that asks
+    /// the user outright is theirs too; and one it rightly drops is written
+    /// down, never gone without a trace.
+    #[test]
+    fn a_question_at_the_end_of_a_turn_is_never_left_with_nobody() {
+        let (a, d, _user, record) = recording(None);
+        // The brain is told, and says nothing (busy, out of usage, restarting): the user's card.
+        let q = a.asked_after(text_q("tw-n1", "web"), false);
+        assert_eq!(a.get(&q.id).map(|s| s.state.decision), Some(Decision::Deciding));
+        assert_eq!(open_decisions(&a), 0, "the brain reads it first");
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        assert_eq!(a.get(&q.id).map(|s| s.state.decision), Some(Decision::Escalated));
+        assert_eq!(open_decisions(&a), 1, "no word from the brain: the user's card");
+        assert!(!d.for_question(&q.id).is_empty());
+
+        // The brain says it asks nothing, but it asks the user outright: theirs all the same.
+        let direct = {
+            let mut s = questions::text_set("tw-n2", "android", "I can close 2, 3 and 4 now. A real Merge all from the phone needs a chain endpoint. Want me to do both?", "");
+            s.at_ms = crate::history::now_ms();
+            a.asked_after(s, false)
+        };
+        a.recommend(&direct.id, &json!([]), None, "", true).unwrap();
+        assert_eq!(a.get(&direct.id).map(|s| s.state.decision), Some(Decision::Escalated), "asked outright: the user's");
+        assert_eq!(open_decisions(&a), 2);
+
+        // One that only says what is left to the user, read as asking nothing: closed, and written down.
+        let aside = {
+            let mut s = questions::text_set("tw-n3", "eyzflow", "Both commits are pushed and the PR is open. Whether to build any of the options is your call.", "");
+            s.at_ms = crate::history::now_ms();
+            a.asked_after(s, false)
+        };
+        a.recommend(&aside.id, &json!([]), None, "", true).unwrap();
+        assert!(a.get(&aside.id).is_none());
+        let line = lines(&record, 1).into_iter().find(|e| e.status.as_deref() == Some("nothing-asked")).expect("a record line");
+        assert!(line.session.as_deref() == Some("tw-n3") && line.text.contains("the tower found nothing for you in it"), "{}", line.text);
+    }
+
+    /// A question at the end of a turn that waited on the brain when the
+    /// tower stopped is the user's once its wait is over after the start.
+    #[test]
+    fn a_question_waiting_on_the_brain_at_a_restart_still_reaches_the_user() {
+        let dir = tmp("restart-text");
+        let path = dir.0.join("questions.json");
+        {
+            let (a, _) = stored(&path);
+            let mut q = text_q("tw-r1", "web");
+            q.created_ms = Some(1);
+            a.asked_after(q, false);
+        }
+        let (b, _) = stored(&path);
+        let shared = b.shared.clone();
+        let b = b.with_decisions(super::super::decisions::Decisions::telling(shared, || crate::tell::Level::Decisions));
+        let mut look = |_: &str| Terminal::Live { created_ms: Some(1), status: SessionStatus::parse("done") };
+        b.restore_from(Saved::load(&path), &mut look, &|_| false, crate::history::now_ms());
+        let id = b.list()[0].id.clone();
+        assert_eq!(b.get(&id).map(|s| s.state.decision), Some(Decision::Deciding), "back as it was");
+        for _ in 0..80 {
+            if b.get(&id).is_some_and(|s| s.state.decision == Decision::Escalated) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(b.get(&id).map(|s| s.state.decision), Some(Decision::Escalated), "its wait for the brain ran out after the start: the user's");
+    }
+
+    /// The last turn looked at per session is kept across a restart: a turn
+    /// that ended while the tower was down is known as one (`missed_turn`).
+    #[test]
+    fn a_turn_that_ended_while_the_tower_was_down_is_known_at_the_start() {
+        let dir = tmp("turns");
+        let path = dir.0.join("questions.json");
+        let now = crate::history::now_ms();
+        {
+            let (a, _) = stored(&path);
+            a.looked_turn("tw-t1", Some(7), 3, now);
+            a.looked_turn("tw-t2", Some(7), 5, now - 3 * 60 * 60_000);
+            a.looked_turn("tw-t3", Some(7), 2, now);
+            a.forget_turn("tw-t3");
+        }
+        let (b, _) = stored(&path);
+        let mut look = |_: &str| Terminal::Unknown;
+        b.restore_from(Saved::load(&path), &mut look, &|_| false, now);
+        assert!(b.missed_turn("tw-t1", Some(7), 4, now), "turn 4 ended while it was down");
+        assert!(!b.missed_turn("tw-t1", Some(7), 3, now), "the turn it looked at");
+        assert!(!b.missed_turn("tw-t1", Some(8), 4, now), "another terminal at that address");
+        assert!(!b.missed_turn("tw-t2", Some(7), 6, now), "looked at too long ago: an old turn, not news");
+        assert!(!b.missed_turn("tw-t3", Some(7), 3, now), "gone: forgotten");
+        assert!(!b.missed_turn("tw-new", Some(7), 9, now), "never looked at");
     }
 
     #[test]
