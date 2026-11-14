@@ -374,6 +374,10 @@ impl Shared {
     /// News that is only written down (a finish at a quiet level, see
     /// `tell`): into the history, not into the alerts and not a chat message.
     pub fn record(&self, terminal: &str, text: &str, level: &str) {
+        // Tests never write the user's history (as they never touch the live state.json).
+        if cfg!(test) {
+            return;
+        }
         let (t, x, l) = (terminal.to_string(), text.to_string(), level.to_string());
         crate::history::later(move || crate::history::record_session_as("alert", &t, &x, Some(&l), true));
     }
