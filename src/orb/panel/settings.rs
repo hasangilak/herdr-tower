@@ -47,6 +47,15 @@ fn voice_line(voice: &str) -> &'static str {
     crate::tell::Voice::parse(voice).unwrap_or_default().says()
 }
 
+/// What the task-list switch means, in a line.
+pub(super) fn todo_tools_line(on: bool) -> &'static str {
+    if on {
+        "On: the Claude sessions the tower starts keep a task list (Claude Code's own, off for current models unless asked for), so their progress reads step 3 of 7 and what is next. For sessions started from now on."
+    } else {
+        "Off: the sessions the tower starts get Claude Code's default, and their progress shows the call at work and their latest words."
+    }
+}
+
 /// What the auto-merge switch means, in a line.
 pub(super) fn auto_merge_line(on: bool) -> &'static str {
     if on {
@@ -146,6 +155,23 @@ impl Panel {
                 && let Some(full) = this.full.as_mut()
             {
                 full.auto_merge = None;
+            }
+        });
+    }
+
+    /// `tower todo-tools on|off`: switched at once, and back if the tower refuses.
+    fn set_todo_tools(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.running("todo-tools") {
+            return;
+        }
+        if let Some(full) = self.full.as_mut() {
+            full.todo_tools = Some(on);
+        }
+        self.run("todo-tools", vec!["todo-tools".into(), if on { "on" } else { "off" }.into()], cx, |this, result, _| {
+            if result.is_err()
+                && let Some(full) = this.full.as_mut()
+            {
+                full.todo_tools = None;
             }
         });
     }
@@ -387,6 +413,27 @@ impl Panel {
             .collect(),
         );
 
+        // Sessions: whether the ones the tower starts keep a task list (step N of M).
+        let said_todo = crate::config::todo_tools();
+        if let Some(full) = self.full.as_mut()
+            && full.todo_tools == Some(said_todo)
+        {
+            full.todo_tools = None;
+        }
+        let todo_on = self.full.as_ref().and_then(|f| f.todo_tools).unwrap_or(said_todo);
+        let sessions = card(
+            "Sessions",
+            vec![
+                seg()
+                    .child(tg("todo-tools", "Give the sessions I start a task list", todo_on).on_click(cx.listener(move |this, _, _, cx| this.set_todo_tools(!todo_on, cx))))
+                    .into_any_element(),
+                para(todo_tools_line(todo_on)),
+            ]
+            .into_iter()
+            .chain(self.said("todo-tools"))
+            .collect(),
+        );
+
         // Follow and Mute, per open space.
         let mut marks: Vec<AnyElement> = vec![];
         for (i, m) in missions.open.iter().enumerate() {
@@ -451,7 +498,7 @@ impl Panel {
         // Two by two when the pane has room, else one under another.
         let cols = if self.full.as_ref().map(|f| f.pane_w).unwrap_or(900.0) >= super::window::TWO_COLS_W { 2 } else { 1 };
         let grid = |cards: Vec<AnyElement>| div().w_full().grid().grid_cols(cols).gap(px(12.0)).children(cards).into_any_element();
-        (head, vec![v_flex().w_full().gap(px(12.0)).child(grid(vec![tell, brain, voice, questions, prs, follow, behaviors])).child(phone).child(grid(vec![accounts, setups])).into_any_element()])
+        (head, vec![v_flex().w_full().gap(px(12.0)).child(grid(vec![tell, brain, voice, questions, prs, sessions, follow, behaviors])).child(phone).child(grid(vec![accounts, setups])).into_any_element()])
     }
 }
 

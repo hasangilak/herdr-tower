@@ -227,7 +227,7 @@ impl Reopen {
         let cca = crate::accounts::cca_bin().map(|p| p.to_string_lossy().into_owned());
         let default_account = crate::accounts::list().ok().and_then(|l| crate::accounts::default_of(&l));
         let refs: Vec<&Kept> = chosen.iter().collect();
-        let steps = reopen::plan(&refs, &windows, &folders, &|a| crate::hc::get(a), &|p| Path::new(p).exists(), cca.as_deref(), default_account.as_deref());
+        let steps = reopen::plan(&refs, &windows, &folders, &|a| crate::hc::get(a), &|p| Path::new(p).exists(), cca.as_deref(), default_account.as_deref(), crate::config::todo_tools());
         if dry_run {
             let rows: Vec<Value> = steps
                 .iter()

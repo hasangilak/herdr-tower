@@ -292,6 +292,15 @@ enum Cmd {
         #[arg(default_value = "status")]
         action: String,
     },
+    /// Whether the Claude sessions the tower starts keep a task list (on by default): with it, a
+    /// session's progress shows as step N of M (Claude Code gives current models its TaskCreate and
+    /// TaskUpdate tools only with CLAUDE_CODE_ENABLE_TODO_TOOLS=1). For sessions started from now on.
+    /// `[sessions] todo_tools` in config.toml.
+    TodoTools {
+        /// on, off or status (default).
+        #[arg(default_value = "status")]
+        action: String,
+    },
     /// Where each space's changes stand, repo by repo: each PR open, merged into dev, on dev
     /// (deployed) or on prod, with when, and each release to prod with what it carried. From
     /// GitHub, never from what sessions say. `tower releases [<space>]` (JSON when piped).
@@ -1031,6 +1040,7 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Automerge { action } => automerge_cmd(&action),
+        Cmd::TodoTools { action } => todo_tools_cmd(&action),
         Cmd::Releases { space, json } => releases_cmd(space.as_deref(), json),
         Cmd::Impact { pr, verdict, text, json } => impact_cmd(&pr, verdict.as_deref(), &text.join(" "), json),
         Cmd::Pr { action, pr, why } => pr_cmd(&action, &pr, &why.join(" ")),
@@ -1644,6 +1654,36 @@ fn automerge_cmd(action: &str) -> Result<()> {
     Ok(())
 }
 
+/// `tower todo-tools on|off|status`: `[sessions] todo_tools` in config.toml.
+fn todo_tools_cmd(action: &str) -> Result<()> {
+    let path = config::config_file();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let now = config::Config::from_text(&text)?.sessions.todo_tools;
+    let on = match action.trim() {
+        "on" => true,
+        "off" => false,
+        "status" | "" => now,
+        _ => bail!("tower todo-tools on|off|status"),
+    };
+    if on != now {
+        let new = config::with_table_key(&text, "sessions", "todo_tools", if on { "true" } else { "false" });
+        // Kept only once it reads back as asked.
+        if config::Config::from_text(&new)?.sessions.todo_tools != on {
+            bail!("couldn't set [sessions] todo_tools in {}", path.display());
+        }
+        std::fs::create_dir_all(config::config_dir())?;
+        std::fs::write(&path, new)?;
+    }
+    if !std::io::stdout().is_terminal() {
+        println!("{}", serde_json::json!({ "todo_tools": on, "changed": on != now }));
+    } else if on {
+        println!("Task lists are on: the sessions the tower starts keep one, and their progress shows as step N of M.");
+    } else {
+        println!("Task lists are off: the sessions the tower starts get Claude Code's default, and their progress shows the call at work.");
+    }
+    Ok(())
+}
+
 fn tell_cmd(level: Option<&str>, voice: Option<&str>) -> Result<()> {
     let level = level.map(tell::parse).transpose()?;
     let voice = voice.map(tell::parse_voice).transpose()?;
@@ -2178,7 +2218,9 @@ fn start(
         (None, _) => task.to_string(),
     };
     let cca = cca.unwrap_or_else(|| "cca".into());
-    let how = accounts::Start { name, cwd: cwd.as_deref(), on, task: &first, account: account.as_deref(), cca: &cca };
+    // Its task list on, unless turned off (`[sessions] todo_tools`): its progress shows as step N of M.
+    let todo_tools = config::todo_tools();
+    let how = accounts::Start { name, cwd: cwd.as_deref(), on, task: &first, account: account.as_deref(), cca: &cca, todo_tools };
     let (address, placed) = match (&target, &new_space) {
         (Some(sp), _) => (start_in_space(sp, &how, &spaces)?, Some(sp.name.clone())),
         (None, Some(name)) => {

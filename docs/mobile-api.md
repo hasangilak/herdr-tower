@@ -941,7 +941,8 @@ Show `line` under the session's name (the Mac shows it in amber once
 "14 min in · last update 1 min ago" true, say them from `turn_ms` and
 `last_ms` against the clock. `step`/`steps`/`items` come only from a session
 that keeps a task list (Claude Code gives current models that only with
-`CLAUDE_CODE_ENABLE_TODO_TOOLS=1`); without one, the line is the call at
+`CLAUDE_CODE_ENABLE_TODO_TOOLS=1`, which the sessions the tower starts get
+unless `[sessions] todo_tools` is off); without one, the line is the call at
 work, else its latest words.
 
 `GET /v1/progress` lists every working session's: `{"working": [{"session":

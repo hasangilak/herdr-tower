@@ -452,12 +452,26 @@ pub struct Sessions {
     /// When a Claude session joins a Herdr space that has others, tell every
     /// Claude session there who the others are (`tower introduce`).
     pub introduce: bool,
+    /// Start the Claude sessions the tower opens with their task list on
+    /// (`CLAUDE_CODE_ENABLE_TODO_TOOLS=1`: Claude Code gives current models
+    /// TaskCreate/TaskUpdate only with it), so their progress shows as step N
+    /// of M (`crate::progress`). `tower todo-tools on|off`, the panel's Settings.
+    pub todo_tools: bool,
 }
 
 impl Default for Sessions {
     fn default() -> Self {
-        Self { introduce: true }
+        Self { introduce: true, todo_tools: true }
     }
+}
+
+/// `[sessions] todo_tools` now (on when config.toml can't be read; always
+/// on in tests, which never read the user's config).
+pub fn todo_tools() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    Config::load().map(|c| c.sessions.todo_tools).unwrap_or(true)
 }
 
 /// The phone API, for the Android app (docs/mobile-api.md).

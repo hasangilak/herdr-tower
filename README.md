@@ -703,8 +703,13 @@ every 15 s: its task list (Claude Code's TaskCreate/TaskUpdate, or the older
 TodoWrite) for step N of M and the item at work, the call at work and for
 how long, when the turn started, its last write, its latest words, and a
 background job's own progress. Claude Code gives current models a task list
-only with `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`; without one, the line is the
-call at work, else its latest words.
+only with `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`, so the tower starts the Claude
+sessions it opens with it (`tower start`, a space's sessions, and those it
+reopens after a restart or moves to another account; never its own brains):
+`env CLAUDE_CODE_ENABLE_TODO_TOOLS=1 cca <account> …`. `[sessions]
+todo_tools = false` in config.toml (`tower todo-tools off`, or Sessions in
+the panel's Settings) turns that off, for sessions started from then on.
+Without a task list, the line is the call at work, else its latest words.
 
 `tower progress <session> [question]` (and How is it going? in a session's
 view, and the phone) asks the session itself without stopping it. A working
