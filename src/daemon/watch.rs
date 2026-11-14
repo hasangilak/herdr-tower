@@ -957,7 +957,9 @@ impl Radar {
     /// A new Claude Code or Codex reports no status while a first-run
     /// question (trusting its folder) holds it: treat that as needing a person.
     fn check_startup(&self, address: &str, t: &Value) {
-        let program = t["argv"][0].as_str().unwrap_or("").rsplit('/').next().unwrap_or("").to_string();
+        // (Past an `env CLAUDE_CODE_ENABLE_TODO_TOOLS=1` before it: `accounts::command`.)
+        let argv: Vec<&str> = t["argv"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        let program = crate::accounts::program_of(&argv).to_string();
         // (A brain's own first-run question is the tower's to answer: see `brain::settle`.)
         if !["claude", "codex"].contains(&program.as_str()) || brain::brain_of(t).is_some() || left_alone(t) {
             return;

@@ -83,6 +83,8 @@ pub(super) struct FullUi {
     pub voice: Option<String>,
     /// Auto-merge of low-risk PRs into dev, as just switched here, until the state says it too.
     pub auto_merge: Option<bool>,
+    /// Task lists for the sessions the tower starts, as just switched here (until config.toml says it too).
+    pub todo_tools: Option<bool>,
     /// The window is being moved by its header or the sidebar's top.
     pub drag: Option<Drag>,
     /// Whether a space can have a tower of its own to talk to (this tower's
@@ -148,6 +150,7 @@ impl FullUi {
             record: vec![],
             tell: None,
             auto_merge: None,
+            todo_tools: None,
             voice: None,
             drag: None,
             space_tower: None,

@@ -293,6 +293,24 @@ pub struct Start<'a> {
     pub account: Option<&'a str>,
     /// The `cca` to run it with (a path here, `cca` on another machine).
     pub cca: &'a str,
+    /// With its task list on (`[sessions] todo_tools`): `env
+    /// CLAUDE_CODE_ENABLE_TODO_TOOLS=1` before it.
+    pub todo_tools: bool,
+}
+
+/// What turns a session's task list on (`Start::todo_tools`).
+pub const TODO_TOOLS: &str = "CLAUDE_CODE_ENABLE_TODO_TOOLS=1";
+
+/// The program a command line runs, past an `env VAR=value …` before it:
+/// `env CLAUDE_CODE_ENABLE_TODO_TOOLS=1 claude …` runs `claude`.
+pub fn program_of<'a>(argv: &[&'a str]) -> &'a str {
+    let base = |a: &'a str| a.rsplit('/').next().unwrap_or(a);
+    let mut it = argv.iter().copied();
+    let first = it.next().map(base).unwrap_or("");
+    if first != "env" {
+        return first;
+    }
+    it.find(|a| !a.contains('=') && !a.starts_with('-')).map(base).unwrap_or("")
 }
 
 /// The `hc run` arguments that start the session.
@@ -313,10 +331,11 @@ pub fn hc_run_args(s: &Start) -> Vec<String> {
 /// (cca sets or unsets CLAUDE_CONFIG_DIR and CCA_ACCOUNT, then execs claude),
 /// or plain `claude` when there are no accounts.
 pub fn command(s: &Start) -> Vec<String> {
-    let mut a: Vec<String> = match s.account {
-        Some(acc) => vec![s.cca.into(), acc.into()],
-        None => vec!["claude".into()],
-    };
+    let mut a: Vec<String> = if s.todo_tools { vec!["env".into(), TODO_TOOLS.into()] } else { vec![] };
+    match s.account {
+        Some(acc) => a.extend([s.cca.into(), acc.into()]),
+        None => a.push("claude".into()),
+    }
     a.extend(["-n".into(), s.name.into()]);
     if !s.task.is_empty() {
         a.push(s.task.into());
@@ -390,6 +409,7 @@ mod tests {
             task: "look at the login bug",
             account: Some("work"),
             cca: "/bin/cca",
+            todo_tools: false,
         };
         assert_eq!(
             hc_run_args(&s),
@@ -411,8 +431,17 @@ mod tests {
             ]
         );
         assert_eq!(command(&s), ["/bin/cca", "work", "-n", "fix-login", "look at the login bug"], "what a tab in a space runs");
-        let s = Start { name: "x", cwd: None, on: Some("vps"), task: "", account: None, cca: "cca" };
+        let s = Start { name: "x", cwd: None, on: Some("vps"), task: "", account: None, cca: "cca", todo_tools: false };
         assert_eq!(hc_run_args(&s), ["run", "--bg", "--json", "--outlive-parent", "--name", "x", "--on", "vps", "--", "claude", "-n", "x"]);
+        // With its task list on (the default): env sets it, here and on another machine alike.
+        let s = Start { todo_tools: true, ..s };
+        assert_eq!(command(&s), ["env", "CLAUDE_CODE_ENABLE_TODO_TOOLS=1", "claude", "-n", "x"]);
+        let s = Start { account: Some("work"), cca: "/bin/cca", ..s };
+        assert_eq!(command(&s), ["env", "CLAUDE_CODE_ENABLE_TODO_TOOLS=1", "/bin/cca", "work", "-n", "x"]);
+        assert_eq!(program_of(&["env", "CLAUDE_CODE_ENABLE_TODO_TOOLS=1", "/bin/cca", "work"]), "cca");
+        assert_eq!(program_of(&["/usr/bin/env", "A=1", "-i", "claude"]), "claude");
+        assert_eq!(program_of(&["/opt/bin/claude", "-n", "x"]), "claude");
+        assert_eq!(program_of(&[]), "");
     }
 
     #[test]

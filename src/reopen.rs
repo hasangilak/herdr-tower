@@ -465,14 +465,16 @@ pub fn chosen<'a>(lost: &[&'a Kept], pick: &Pick) -> Result<Vec<&'a Kept>> {
 
 /// The command line that resumes a session's conversation: on its account
 /// through `cca` (the default one when it isn't known), else plain.
-pub fn resume_argv(k: &Kept, cca: Option<&str>, default_account: Option<&str>) -> Option<Vec<String>> {
+/// `todo_tools`: with its task list on (`[sessions] todo_tools`).
+pub fn resume_argv(k: &Kept, cca: Option<&str>, default_account: Option<&str>, todo_tools: bool) -> Option<Vec<String>> {
     match k.app.as_str() {
         "claude-code" => {
             let account = k.account.as_deref().or(default_account);
-            let mut a: Vec<String> = match (cca, account) {
-                (Some(cca), Some(acc)) => vec![cca.into(), acc.into()],
-                _ => vec!["claude".into()],
-            };
+            let mut a: Vec<String> = if todo_tools { vec!["env".into(), crate::accounts::TODO_TOOLS.into()] } else { vec![] };
+            match (cca, account) {
+                (Some(cca), Some(acc)) => a.extend([cca.into(), acc.into()]),
+                _ => a.push("claude".into()),
+            }
             if !k.name.trim().is_empty() {
                 a.extend(["-n".into(), k.name.clone()]);
             }
@@ -523,6 +525,7 @@ pub fn plan(
     exists: &dyn Fn(&str) -> bool,
     cca: Option<&str>,
     default_account: Option<&str>,
+    todo_tools: bool,
 ) -> Vec<(Kept, Result<Step, String>)> {
     let mut made: Vec<String> = vec![];
     let mut out = vec![];
@@ -534,7 +537,7 @@ pub fn plan(
             if k.app == "claude-code" && !k.transcript.is_empty() && !exists(&k.transcript) {
                 return Err("its conversation's file is gone".to_string());
             }
-            let Some(argv) = resume_argv(k, cca, default_account) else { return Err(format!("the tower can't resume a {} session", k.app)) };
+            let Some(argv) = resume_argv(k, cca, default_account, todo_tools) else { return Err(format!("the tower can't resume a {} session", k.app)) };
             // Its own terminal, kept by Herdr as a shell in the same space, still its conversation's.
             if let Some(t) = get(&k.address)
                 && kept_shell(&t)
@@ -839,7 +842,7 @@ mod tests {
         let exists = |p: &str| p != "/w/removed";
         let folders = BTreeMap::from([("zendesk".to_string(), "/w/tw".to_string())]);
         let chosen = [&kept_shell_one, &in_a_tab, &first, &second, &gone];
-        let steps = plan(&chosen, &windows, &folders, &get, &exists, Some("/bin/cca"), Some("default"));
+        let steps = plan(&chosen, &windows, &folders, &get, &exists, Some("/bin/cca"), Some("default"), false);
         assert_eq!(steps[0].1, Ok(Step::Type { address: "t7h".into(), line: "cd /w/eyzflow && /bin/cca orca -n sandbox-eyzflow --resume s-1".into() }));
         assert!(matches!(&steps[1].1, Ok(Step::Tab { space_id, argv, .. }) if space_id == "sp-sandbox" && argv[..2] == ["/bin/cca".to_string(), "default".to_string()]), "its account not known: the default one");
         assert!(matches!(&steps[2].1, Ok(Step::Space { name, folder, home, .. }) if name == "zendesk" && folder == "/w/tw" && home.as_deref() == Some("/w/.tower-worktrees/zendesk")), "{:?}", steps[2].1);

@@ -441,6 +441,11 @@ impl Failover {
         if let Some(plan) = t["labels"][crate::plans::LABEL_PLAN].as_str().filter(|p| !p.is_empty()) {
             env.push((crate::plans::ENV_PLAN.to_string(), plan.to_string()));
         }
+        // A session (not a tower's brain) keeps its task list on where it goes (`[sessions] todo_tools`).
+        if crate::brain::brain_of(&t).is_none() && crate::config::todo_tools() {
+            let (k, v) = crate::accounts::TODO_TOOLS.split_once('=').unwrap_or_default();
+            env.push((k.to_string(), v.to_string()));
+        }
         let line = failover::resume_line(&cwd, &failover::resume_argv(&cca, to, &name, &flags, &session_id, &env));
         eprintln!("[failover] {address}: {line}");
         h.type_line(address, &line)?;
@@ -1024,7 +1029,7 @@ mod tests {
             [
                 "keep t5 true".to_string(),
                 "end 77".into(),
-                "type t5 cd /w/app && exec /u/cca orca -n fix-login --model claude-opus-5-5 --resume s-1".into(),
+                "type t5 cd /w/app && exec env CLAUDE_CODE_ENABLE_TODO_TOOLS=1 /u/cca orca -n fix-login --model claude-opus-5-5 --resume s-1".into(),
                 "settle t5".into()
             ]
         );
