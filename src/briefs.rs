@@ -130,7 +130,12 @@ pub fn session(f: &SessionFacts) -> SessionBrief {
         })
         .unwrap_or_default();
     // What came of it, in its own words (its turn's end), and how it was checked.
-    let result = latest.filter(|t| matches!(t.state, TaskState::Verified | TaskState::DoneClaimed)).map(|t| outcome(t)).unwrap_or_default();
+    // (Only when it says more than the task's own title.)
+    let result = latest
+        .filter(|t| matches!(t.state, TaskState::Verified | TaskState::DoneClaimed))
+        .map(|t| outcome(t))
+        .filter(|o| latest.is_none_or(|t| !o.starts_with(&title(t))))
+        .unwrap_or_default();
     // What else it finished lately.
     let done: Vec<String> =
         tasks.iter().rev().filter(recent).filter(|t| t.state == TaskState::Verified && Some(**t) != latest).map(|t| outcome(t)).collect();
@@ -138,7 +143,9 @@ pub fn session(f: &SessionFacts) -> SessionBrief {
     let blocked = tasks.iter().rev().find(|t| t.state == TaskState::Blocked);
     let now = match (f.progress.filter(|p| !p.trim().is_empty()), f.status) {
         (Some(p), "working") => p.trim().to_string(),
+        // On what it was asked (said just above): "working on it".
         (_, "working") => match running {
+            Some(t) if latest.is_some_and(|l| std::ptr::eq(l, *t)) => "working on it".into(),
             Some(t) => format!("working on {}", lower_first(&title(t))),
             None => "working".into(),
         },
@@ -185,7 +192,8 @@ fn state_word(t: &Task) -> &'static str {
 /// end of it (its title when that says nothing), and "checked by the brain"
 /// when the brain verified it (the evidence is then the brain's, not only its word).
 fn outcome(t: &Task) -> String {
-    let said = first_sentence(&t.said);
+    // The tower's own note in its place ("(its turn ended before …)"): nothing it said.
+    let said = if t.said.trim_start().starts_with('(') { String::new() } else { first_sentence(&t.said) };
     let what = if said.split_whitespace().count() >= 4 { clip(&said, 140) } else { title(t) };
     if t.state == TaskState::Verified && t.why.trim_start().starts_with("the brain checked it") { format!("{} (checked by the brain)", end(&what)) } else { what }
 }
@@ -243,9 +251,18 @@ pub fn space(f: &SpaceFacts) -> SpaceBrief {
         .rev()
         .filter(recent)
         .filter(|t| t.state == TaskState::Verified)
-        .map(|t| if t.name.is_empty() { outcome(t) } else { format!("{}: {}", t.name, outcome(t)) })
+        .map(|t| if t.name.is_empty() { clip(&outcome(t), 110) } else { format!("{}: {}", t.name, clip(&outcome(t), 110)) })
         .collect();
-    let doing: Vec<String> = f.sessions.iter().filter(|(_, _, w)| *w).map(|(n, b, _)| format!("{n}: {}", clip(&b.now, 90))).collect();
+    // Who works on what: its task when its "now" only says it works on it.
+    let doing: Vec<String> = f
+        .sessions
+        .iter()
+        .filter(|(_, _, w)| *w)
+        .map(|(n, b, _)| {
+            let what = if b.now == "working on it" { format!("working on {}", lower_first(&b.asked)) } else { b.now.clone() };
+            format!("{n}: {}", clip(&what, 80))
+        })
+        .collect();
     let next: Vec<String> = tasks.iter().filter(|t| t.state == TaskState::Queued).map(|t| title(t)).collect();
     let mut waits = f.waits.clone();
     waits.extend(tasks.iter().rev().filter(|t| t.state == TaskState::Blocked && !t.question.is_empty()).map(|t| clip(&t.question, 120)));
@@ -493,10 +510,10 @@ mod tests {
         let f = SessionFacts { status: "working", said: None, tasks: vec![&verified, &running, &queued], waits_on: vec![], progress: None, upcoming: vec![], now: 40 * MIN };
         let b = session(&f);
         assert_eq!(b.asked, "Count open gaps in the studio column", "the latest it took up");
-        assert_eq!(b.now, "working on count open gaps in the studio column");
+        assert_eq!(b.now, "working on it", "on what it was asked, said just above");
         assert_eq!(
             b.text,
-            "Asked: Count open gaps in the studio column. Earlier today: Rename Unanswered to Knowledge gaps. Now: working on count open gaps in the studio column. Next: Draft help page."
+            "Asked: Count open gaps in the studio column. Earlier today: Rename Unanswered to Knowledge gaps. Now: working on it. Next: Draft help page."
         );
         // Done: what came of it, in its own words; checked by the brain when it was.
         let mut finished = task("a5.1", "ok go", TaskState::Verified, 39 * MIN);
