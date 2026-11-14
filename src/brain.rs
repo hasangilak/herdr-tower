@@ -158,6 +158,11 @@ fn trust_answer(screen: &str) -> Option<Vec<&'static str>> {
 /// `Some(false)` not to ("no", "No, exit", "don't"). None: no answer to it.
 pub fn trust_reply(text: &str) -> Option<bool> {
     let t = text.trim().to_lowercase();
+    // A card's answer comes framed: `About "…": the user decided: Yes, trust it.`
+    let t = ["the user decided:", "the user says:"]
+        .iter()
+        .find_map(|k| t.rfind(k).map(|i| t[i + k.len()..].trim().to_string()))
+        .unwrap_or(t);
     let t = t.trim_end_matches(['.', '!']);
     let first = t.split(|c: char| !c.is_alphanumeric() && c != '\'').find(|w| !w.is_empty()).unwrap_or("");
     match first {
@@ -664,7 +669,7 @@ mod tests {
         assert_eq!(trust_keys(screen, false), Some(vec!["enter"]));
         assert_eq!(trust_keys(" ❯ Yes, I trust this folder\n   No, exit\n Enter to confirm", false), Some(vec!["down", "enter"]));
         assert_eq!(trust_keys("no question here", true), None);
-        for (t, want) in [("yes", Some(true)), ("Yes, trust it", Some(true)), ("y", Some(true)), ("trust it.", Some(true)), ("No", Some(false)), ("No, exit", Some(false)), ("don't", Some(false)), ("archive the old notes", None)] {
+        for (t, want) in [("yes", Some(true)), ("Yes, trust it", Some(true)), ("y", Some(true)), ("trust it.", Some(true)), ("No", Some(false)), ("No, exit", Some(false)), ("don't", Some(false)), ("archive the old notes", None), ("About \"May it trust the folder?\": the user decided: Yes, trust it.", Some(true)), ("About \"Trust it?\": the user says: no, leave it", Some(false)), ("About \"Trust it?\": the user decided: Later.", None)] {
             assert_eq!(trust_reply(t), want, "{t}");
         }
         assert_eq!(trust_answer(screen), Some(vec!["down", "enter"]));
