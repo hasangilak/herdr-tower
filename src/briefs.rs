@@ -262,7 +262,7 @@ pub fn space(f: &SpaceFacts) -> SpaceBrief {
         .filter(|(_, _, w)| *w)
         .map(|(n, b, _)| {
             let what = if b.now == "working on it" { format!("working on {}", lower_first(&b.asked)) } else { b.now.clone() };
-            format!("{n}: {}", clip(&what, 80))
+            format!("{n}: {}", clip(&what, 120))
         })
         .collect();
     let next: Vec<String> = tasks.iter().filter(|t| t.state == TaskState::Queued).map(|t| title(t)).collect();

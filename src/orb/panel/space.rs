@@ -799,8 +799,10 @@ impl Panel {
                 if let Some(b) = &s.brief {
                     under.push(self.session_brief(&s.address, b, cx));
                 }
-                // Its last words: as its hooks heard them, else from the history.
-                if let Some(words) = s.last_words().or_else(|| last_words(&self.entries, &s.address)) {
+                // Its last words: as its hooks heard them, else from the history (its brief says them when it has one).
+                if s.brief.is_none()
+                    && let Some(words) = s.last_words().or_else(|| last_words(&self.entries, &s.address))
+                {
                     under.push(div().text_size(px(13.0)).line_height(px(18.0)).text_color(g.muted).line_clamp(2).child(words).into_any_element());
                 }
                 // A browser it uses now (amber when another session shares the user's).
@@ -809,7 +811,7 @@ impl Panel {
                     under.push(div().text_size(px(12.5)).line_height(px(17.0)).text_color(rgb(colour)).line_clamp(2).child(b.line.clone()).into_any_element());
                 }
                 // A job it left running: what, since when, its last progress (amber when quiet).
-                if let Some(j) = &s.job {
+                if let Some(j) = s.job.as_ref().filter(|j| !s.brief.as_ref().is_some_and(|b| b.now.starts_with(j.line.trim_end_matches('.')))) {
                     let colour = if j.stuck { AMBER } else { CYAN };
                     under.push(div().text_size(px(12.5)).line_height(px(17.0)).text_color(rgb(colour)).line_clamp(2).child(j.line.clone()).into_any_element());
                 }
@@ -855,20 +857,24 @@ impl Panel {
         let g = glass();
         let key = format!("space:{space}");
         let open = self.full.as_ref().is_some_and(|f| f.briefs_open.contains(&key));
-        let mut col = v_flex().gap(px(4.0)).w_full();
+        let mut col = v_flex().gap(px(5.0)).w_full();
         for (label, text) in crate::briefs::space_lines(b) {
+            // Its goal is in the goal card just below: here its stage.
+            let (label, text) = if label == "Goal" { ("Stage", b.stage.clone()) } else { (label, text) };
             let colour = match label {
                 "Waiting for you" => rgb(AMBER).into(),
                 "Risks" => rgb(0xff8f8f).into(),
                 _ => g.text,
             };
             col = col.child(
-                div()
+                h_flex()
+                    .w_full()
+                    .items_start()
+                    .gap(px(10.0))
                     .text_size(px(13.5))
                     .line_height(px(19.0))
-                    .text_color(colour)
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("{label} · ")).into_any_element())
-                    .child(text),
+                    .child(div().flex_none().w(px(112.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.muted).child(label))
+                    .child(div().flex_1().min_w_0().text_color(colour).child(text)),
             );
         }
         let earlier = b.history.len().saturating_sub(1);
