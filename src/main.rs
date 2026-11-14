@@ -373,6 +373,9 @@ enum Cmd {
         /// Its task's id in a dispatch plan.
         #[arg(long, hide = true)]
         plan_id: Option<String>,
+        /// The plan stage its task belongs to (`p1/s2`).
+        #[arg(long, hide = true)]
+        plan_stage: Option<String>,
         /// Not into the ledger: a queued start stands for it already.
         #[arg(long, hide = true)]
         no_track: bool,
@@ -1067,8 +1070,8 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Agents { all } => agents(all),
-        Cmd::Start { account, name, cwd, on, space, new_space, no_watch, agenda, title, plan_id, no_track, no_worktree, no_act, task } => {
-            let tag = (!no_track).then(|| agenda::Tag { agenda, title: title.unwrap_or_default(), plan_id: plan_id.unwrap_or_default(), ..Default::default() });
+        Cmd::Start { account, name, cwd, on, space, new_space, no_watch, agenda, title, plan_id, plan_stage, no_track, no_worktree, no_act, task } => {
+            let tag = (!no_track).then(|| agenda::Tag { agenda, title: title.unwrap_or_default(), plan_id: plan_id.unwrap_or_default(), stage: plan_stage.unwrap_or_default(), ..Default::default() });
             let space = space.map(|s| spaces::Asked { name: s, new: new_space });
             start(account.as_deref(), &name, cwd, on.as_deref(), space.as_ref(), no_watch, tag, &task.join(" "), no_worktree, !no_act)
         }

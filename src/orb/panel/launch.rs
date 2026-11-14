@@ -434,6 +434,22 @@ pub(super) fn question_line(q: &crate::plans::Question) -> String {
     }
 }
 
+/// The critic's read, in a line: none before it reads.
+pub(super) fn critic_line(c: &crate::plans::Critic) -> Option<String> {
+    match c.status.as_str() {
+        "reading" => Some("A critic is reading the plan before its questions go out to you.".into()),
+        "done" if c.gaps.is_empty() => Some("A critic read the plan and found no gaps.".into()),
+        "done" => Some(format!("A critic read the plan first: {} gap{} sent to the planner. Its questions came to you after.", c.gaps.len(), if c.gaps.len() == 1 { "" } else { "s" })),
+        "failed" => Some("The critic couldn't read the plan; its questions went out as they were.".into()),
+        _ => None,
+    }
+}
+
+/// A stage's tasks in a line: "a9.1 running (t5) · a9.2 verified".
+pub(super) fn tasks_line(tasks: &[model::StageTask]) -> String {
+    tasks.iter().map(|t| if t.session.is_empty() { format!("{} {}", t.id, t.state) } else { format!("{} {} ({})", t.id, t.state, t.session) }).collect::<Vec<_>>().join(" · ")
+}
+
 /// Why Launch waits, when the plan still has open questions.
 pub(super) fn launch_waits(p: &PlanView) -> Option<String> {
     match p.open_questions {
@@ -1715,6 +1731,9 @@ impl Panel {
                     .into_any_element(),
             );
         }
+        if let Some(line) = critic_line(&p.critic) {
+            items.push(div().px(px(4.0)).text_size(px(12.5)).line_height(px(17.0)).text_color(g.muted).child(line).into_any_element());
+        }
         // Its stages, each with what counts as done and its checks; then its questions and assumptions.
         if !p.stages.is_empty() {
             items.push(self.plan_stages(p));
@@ -1796,6 +1815,8 @@ impl Panel {
                     }
                     el.child(div().text_size(px(12.0)).text_color(g.faint).child(bits.join(" · ")))
                 })
+                .when(!st.tasks.is_empty(), |el| el.child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.muted).child(format!("Tasks: {}", tasks_line(&st.tasks)))))
+                .when(p.spikes_pending.contains(&s.id), |el| el.child(div().text_size(px(12.0)).text_color(rgb(AMBER)).child("Done: what it found waits for the plan's revision; the stages after it wait too.")))
                 .when(!s.pre.is_empty(), |el| {
                     el.child(div().pt(px(4.0)).text_size(px(11.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.faint).child(format!("BEFORE IT STARTS · {}", s.pre.len()))).children(s.pre.iter().map(|c| check_row("pre", c)))
                 })
@@ -1836,7 +1857,9 @@ impl Panel {
                         .flex_1()
                         .min_w_0()
                         .child(div().text_size(px(13.0)).line_height(px(18.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.text).child(st.stage.title.clone()))
-                        .child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.faint).child(format!("Done when: {} · {passed} of {all} checks passed", st.stage.done_when))),
+                        .child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.faint).child(format!("Done when: {} · {passed} of {all} checks passed", st.stage.done_when)))
+                        .when(!st.tasks.is_empty(), |el| el.child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.muted).child(format!("Tasks: {}", tasks_line(&st.tasks)))))
+                        .when(p.spikes_pending.contains(&st.stage.id), |el| el.child(div().text_size(px(12.0)).text_color(rgb(AMBER)).child("Its findings wait for the plan's revision"))),
                 )
                 .child(div().flex_none().text_size(px(12.0)).font_weight(FontWeight::SEMIBOLD).text_color(if bad { rgb(0xff8f8f) } else if st.state == "done" { rgb(0x7fd6a4) } else { rgb(CYAN) }).child(word))
         });
@@ -2829,6 +2852,11 @@ mod tests {
         assert_eq!(live_head(&lp), "Plan · version 3 · Stage 2 of 4 · 1 done");
         assert_eq!(revision_line(&lp.revisions[0]), "Revision 1 · small, applied by itself: The backfill gets its own check (from f2)");
         assert_eq!(revision_line(&lp.revisions[1]), "Revision 2 · waiting for your word: Backfill first (from f1)");
+        // The critic's read, and a stage's tasks.
+        assert_eq!(critic_line(&crate::plans::Critic::default()), None);
+        assert_eq!(critic_line(&crate::plans::Critic { status: "done".into(), gaps: vec!["a".into(), "b".into()], ..Default::default() }).unwrap(), "A critic read the plan first: 2 gaps sent to the planner. Its questions came to you after.");
+        let tasks = vec![model::StageTask { id: "a9.1".into(), state: "running".into(), session: "t5".into(), ..Default::default() }, model::StageTask { id: "a9.2".into(), state: "verified".into(), ..Default::default() }];
+        assert_eq!(tasks_line(&tasks), "a9.1 running (t5) · a9.2 verified");
         // An older tower's plan has none of it.
         let old = model::plan(&serde_json::json!({ "plan": { "id": "p1", "status": "ready" } })).unwrap();
         assert!(old.stages.is_empty() && launch_waits(&old).is_none() && stages_head(&old) == "0 stages");

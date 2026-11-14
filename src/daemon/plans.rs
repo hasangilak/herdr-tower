@@ -39,6 +39,10 @@ const BRAIN_MS: u64 = 2 * 60_000;
 pub type PrChecks = Arc<dyn Fn(&str) -> Option<crate::prscore::Validation> + Send + Sync>;
 /// Hands a note to the tower's brain.
 pub type BrainNote = Arc<dyn Fn(&str) + Send + Sync>;
+/// The critic: one headless call with its prompt, its answer back.
+pub type CriticCall = Arc<dyn Fn(&str) -> Result<String> + Send + Sync>;
+/// The agenda tasks of a plan, by stage: (stage, `{id, title, state, session}`).
+pub type StageTasks = Arc<dyn Fn(&str) -> Vec<(String, Value)> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Plans {
@@ -56,6 +60,12 @@ pub struct Plans {
     brain: Option<BrainNote>,
     /// How long the brain has before a question goes to the user.
     brain_ms: u64,
+    /// The critic that reads a draft before its questions go out (none: they go at once).
+    critic: Option<CriticCall>,
+    /// The agenda's tasks of each stage.
+    stage_tasks: Option<StageTasks>,
+    /// The last Handoff block read from each session, so one is read once.
+    handoffs: Arc<Mutex<std::collections::BTreeMap<String, String>>>,
 }
 
 
@@ -75,7 +85,7 @@ impl Plans {
 
     pub fn at(path: PathBuf, shared: Shared, sendq: SendQueue) -> Plans {
         let book: Book = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-        let plans = Plans { book: Arc::new(Mutex::new(book)), path, shared, sendq, hands: Arc::default(), decisions: None, pr_checks: None, brain: None, brain_ms: BRAIN_MS };
+        let plans = Plans { book: Arc::new(Mutex::new(book)), path, shared, sendq, hands: Arc::default(), decisions: None, pr_checks: None, brain: None, brain_ms: BRAIN_MS, critic: None, stage_tasks: None, handoffs: Arc::default() };
         plans.publish(&lock(&plans.book));
         plans
     }
@@ -84,6 +94,13 @@ impl Plans {
     /// routed, stages see their PRs.
     pub fn wired(mut self, decisions: super::decisions::Decisions, pr_checks: PrChecks, brain: BrainNote) -> Plans {
         (self.decisions, self.pr_checks, self.brain) = (Some(decisions), Some(pr_checks), Some(brain));
+        self.publish(&lock(&self.book));
+        self
+    }
+
+    /// With a critic, and the agenda's tasks of each stage.
+    pub fn reviewed(mut self, critic: CriticCall, stage_tasks: StageTasks) -> Plans {
+        (self.critic, self.stage_tasks) = (Some(critic), Some(stage_tasks));
         self.publish(&lock(&self.book));
         self
     }
@@ -100,8 +117,18 @@ impl Plans {
     pub fn start(&self) {
         let me = self.clone();
         let _ = thread::Builder::new().name("plans".into()).spawn(move || {
+            let mut n: u64 = 0;
             loop {
                 me.look();
+                // Every 10 s: a stage that became done, and each stage's tasks as they move.
+                if n % 5 == 0 {
+                    me.follow_stages();
+                    let b = lock(&me.book);
+                    if !b.live().is_empty() {
+                        me.publish(&b);
+                    }
+                }
+                n += 1;
                 thread::sleep(LOOK);
             }
         });
@@ -120,19 +147,174 @@ impl Plans {
     fn publish(&self, b: &Book) {
         let view = b.current().map(|p| self.view_of(p));
         let live: Vec<Value> = b.live().into_iter().map(|p| self.view_of(p)).collect();
+        // Nothing moved: the state isn't written again.
+        let now_s = self.shared.get();
+        if now_s.plan == view && now_s.plans_live == live {
+            return;
+        }
         self.shared.update(|s| {
             s.plan = view;
             s.plans_live = live;
         });
     }
 
-    /// A plan as the windows and the phone get it: with where its stages stand.
+    /// A plan as the windows and the phone get it: with where its stages
+    /// stand, and each stage's agenda tasks.
     fn view_of(&self, p: &Plan) -> Value {
         let none = |_: &str| None;
-        match &self.pr_checks {
+        let mut v = match &self.pr_checks {
             Some(f) => p.view_with(&|k| f(k)),
             None => p.view_with(&none),
+        };
+        let tasks = self.stage_tasks.as_ref().map(|f| f(&p.id)).unwrap_or_default();
+        if let Some(stages) = v["stages"].as_array_mut() {
+            for st in stages.iter_mut() {
+                let id = st["id"].as_str().unwrap_or("").to_string();
+                st["tasks"] = Value::Array(tasks.iter().filter(|(s, _)| *s == id).map(|(_, t)| t.clone()).collect());
+            }
         }
+        v
+    }
+
+    /// Where each stage of `id` stands now, as its view says.
+    fn states_of(&self, p: &Plan) -> Vec<(String, plans::StageState)> {
+        let none = |_: &str| None;
+        match &self.pr_checks {
+            Some(f) => p.stage_states(&|k| f(k)),
+            None => p.stage_states(&none),
+        }
+    }
+
+    /// The stages that just became done, of every open or live plan: a
+    /// spike's findings go to whoever revises the plan (the stages after it
+    /// wait for that), and the brain hears which stage may start.
+    pub fn follow_stages(&self) {
+        let plans: Vec<Plan> = lock(&self.book).plans.iter().filter(|p| p.is_open() && !p.stages.is_empty()).cloned().collect();
+        let mut changed = false;
+        for p in plans {
+            let states = self.states_of(&p);
+            let (done, now_p) = {
+                let mut b = lock(&self.book);
+                let seen = b.get(&p.id).map(|x| x.stage_seen.clone()).unwrap_or_default();
+                let done = b.stage_moves(&p.id, &states);
+                let after = b.get(&p.id).cloned().unwrap_or_default();
+                changed |= after.stage_seen != seen;
+                (done, after)
+            };
+            for sid in done {
+                let st = now_p.stages.iter().find(|s| s.id == sid).cloned().unwrap_or_default();
+                eprintln!("[plans] {} stage {sid} ({}) is done", p.id, st.kind);
+                let next: Vec<String> = now_p.stages.iter().filter(|s| s.after.contains(&sid)).map(|s| format!("{} ({})", s.id, s.title)).collect();
+                if st.kind == "spike" {
+                    self.spike_done(&now_p, &st);
+                }
+                if let Some(brain) = &self.brain {
+                    let waits = if st.kind == "spike" { " once the plan takes in what the spike found (the planner revises it, or says nothing changes)" } else { "" };
+                    let note = format!(
+                        "[plan-stage] {} {sid} done: {} ({}), every check passed with evidence. {} Tell the user in a sentence, and send the next stage's work from the plan when it may start{waits}.",
+                        p.id,
+                        st.title,
+                        st.done_when.trim_end_matches('.'),
+                        if next.is_empty() { "No stage waits for it.".to_string() } else { format!("Next: {}.", next.join(", ")) }
+                    );
+                    let brain = brain.clone();
+                    thread::spawn(move || brain(&note));
+                }
+            }
+        }
+        if changed {
+            let b = lock(&self.book);
+            self.save(&b);
+            self.publish(&b);
+        }
+    }
+
+    /// A spike is done: what it found (its checks' evidence, its findings)
+    /// goes to whoever revises the plan, before the build stages start.
+    fn spike_done(&self, p: &Plan, st: &plans::Stage) {
+        let evidence: Vec<String> = st.checks().map(|(w, c)| format!("{w} {}: {} → {}", c.id, c.what, c.proof)).collect();
+        let text = format!("Spike {} ({}) is done: {}. Take in what it found before the stages after it start: revise the plan, or say nothing changes with `tower plan keep {} --why \"…\"`.", st.id, st.title, evidence.join("; "), p.id);
+        // (The store's lock is let go before it is taken again to save.)
+        let found = lock(&self.book).finding(&p.id, "other", &text, &st.id, "", "", now());
+        if let Ok(f) = found {
+            let b = lock(&self.book);
+            self.save(&b);
+            drop(b);
+            self.tell_reviser(p, &f);
+        }
+    }
+
+    /// The end of a session's turn: a Handoff block in it, for a plan's
+    /// stage, feeds what it found into the plan (once per block).
+    pub fn handoff(&self, session: &str, said: &str) -> Option<Value> {
+        let h = plans::parse_handoff(said)?;
+        {
+            let mut seen = lock(&self.handoffs);
+            let key = said.chars().rev().take(2_000).collect::<String>();
+            if seen.get(session) == Some(&key) {
+                return None;
+            }
+            seen.insert(session.to_string(), key);
+        }
+        let known = lock(&self.book).get(&h.plan).is_some_and(|p| p.is_open() && p.stages.iter().any(|s| s.id.eq_ignore_ascii_case(&h.stage)));
+        if !known {
+            eprintln!("[plans] {session}: a Handoff for {} {} the tower doesn't have", h.plan, h.stage);
+            return None;
+        }
+        let mut found: Vec<(String, String)> = h.findings.clone();
+        if !h.uncertain.is_empty() {
+            found.push(("risk".into(), format!("Uncertain: {}", h.uncertain)));
+        }
+        if h.status == "failed" {
+            found.push(("other".into(), format!("Task {} failed: {}", h.task, if h.left.is_empty() { &h.done } else { &h.left })));
+        }
+        if h.status == "blocked" && !h.needs.is_empty() {
+            found.push(("other".into(), format!("Task {} is blocked: needs {}", h.task, h.needs)));
+        }
+        let mut ids = vec![];
+        for (kind, text) in found {
+            let dup = lock(&self.book).get(&h.plan).is_some_and(|p| p.findings.iter().any(|f| f.text == text));
+            if dup {
+                continue;
+            }
+            match self.found(&h.plan, &kind, &text, &h.stage, "", session) {
+                Ok(v) => ids.push(v["finding"]["id"].clone()),
+                Err(e) => eprintln!("[plans] {session}: a Handoff finding not kept: {e:#}"),
+            }
+        }
+        eprintln!("[plans] {session}: Handoff {} for {} {} ({}): {} finding(s)", h.task, h.plan, h.stage, h.status, ids.len());
+        Some(json!({ "plan": h.plan, "stage": h.stage, "task": h.task, "status": h.status, "findings": ids }))
+    }
+
+    /// The critic reads a draft that has its stages, once it is published:
+    /// its gaps go to the planner, and the plan's questions go out after.
+    fn criticise(&self, id: &str) {
+        let Some(critic) = self.critic.clone() else { return };
+        let Some(p) = lock(&self.book).get(id).cloned().filter(|p| p.critic.is_none() && !p.stages.is_empty() && p.status != plans::Status::Live) else { return };
+        let _ = self.change(|b| b.criticised(id, "reading", vec![], "", now()));
+        let me = self.clone();
+        let id = id.to_string();
+        thread::spawn(move || {
+            let md = std::fs::read_to_string(p.plan_md()).unwrap_or_default();
+            let out = critic(&plans::critic_prompt(&p, &md)).and_then(|o| plans::parse_critic(&o));
+            match out {
+                Ok(gaps) => {
+                    eprintln!("[plans] {id}: the critic found {} gap(s)", gaps.len());
+                    let p = me.change(|b| b.criticised(&id, "done", gaps.clone(), "", now()));
+                    if let (Ok(p), false) = (p, gaps.is_empty())
+                        && let Some(address) = p.address.clone().filter(|_| !cfg!(test))
+                    {
+                        let _ = me.sendq.add_note(&address, &plans::critic_note(&p, &gaps, &config::tower_bin().display().to_string()));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[plans] {id}: the critic couldn't read it: {e:#}");
+                    let _ = me.change(|b| b.criticised(&id, "failed", vec![], &format!("{e:#}"), now()));
+                }
+            }
+            // Its questions go out now (the planner's revision, if any, keeps their answers).
+            me.route(&id);
+        });
     }
 
     /// One change to the store: kept and shown.
@@ -174,14 +356,27 @@ impl Plans {
         };
         let view = |r: Result<Plan>| done(r.map(|p| p.view()));
         match action.as_str() {
-            "new" => view(Form::parse(form).and_then(|f| self.new_plan(f, ticket, draft.clone().unwrap_or_default()))),
+            "new" => {
+                let account = body.as_ref().and_then(|b| b["account"].as_str()).unwrap_or("").to_string();
+                view(Form::parse(form).and_then(|f| self.new_plan(f, ticket, draft.clone().unwrap_or_default(), &account)))
+            }
             "say" => view(self.pick_id(id).and_then(|id| {
                 let who = if who.trim().is_empty() { Ok(Who::User) } else { Who::parse(who) };
                 who.and_then(|w| self.say(&id, w, text))
             })),
             "draft" => view(self.pick_id(id).and_then(|id| self.revise(&id, draft.clone().unwrap_or_default()))),
             "prs" => view(self.pick_id(id).and_then(|id| self.predict(&id, prs.clone().unwrap_or_default()))),
-            "published" => view(self.pick_id(id).and_then(|id| self.change(|b| b.published(&id, url, now())))),
+            "published" => {
+                let r = self.pick_id(id).and_then(|id| self.change(|b| b.published(&id, url, now())));
+                if let Ok(p) = &r {
+                    self.criticise(&p.id);
+                }
+                view(r)
+            }
+            "keep" => done(self.pick_id(id).and_then(|id| {
+                let r = self.change(|b| b.keep(&id, text, now()).map(|_| b.get(&id).cloned().unwrap_or_default()))?;
+                Ok(json!({ "plan": id, "revision": r.revisions.last(), "version": r.version }))
+            })),
             "failed" => view(self.pick_id(id).and_then(|id| self.change(|b| b.failed(&id, text, now())))),
             "close" => view(self.pick_id(id).and_then(|id| self.close(&id, launched.as_deref()))),
             "stages" => done(self.pick_id(id).and_then(|id| self.structure(&id, body.clone().unwrap_or_default())).map(|p| self.view_of(&p))),
@@ -232,14 +427,20 @@ impl Plans {
     }
 
     /// A new plan: the open one is closed, the new one's planner started.
-    fn new_plan(&self, form: Form, ticket: &str, draft: Value) -> Result<Plan> {
+    fn new_plan(&self, form: Form, ticket: &str, draft: Value, account: &str) -> Result<Plan> {
         plans::check_draft(&draft)?;
         if ticket.trim().is_empty() {
             bail!("the plan has no ticket");
         }
         let (plan, ended) = {
             let mut b = lock(&self.book);
-            let (plan, ended) = b.add(form, ticket, draft, |id| plans::plans_dir().join(id), now());
+            let (mut plan, ended) = b.add(form, ticket, draft, |id| plans::plans_dir().join(id), now());
+            if !account.trim().is_empty() {
+                plan.account = account.trim().to_string();
+                if let Some(p) = b.plans.iter_mut().find(|p| p.id == plan.id) {
+                    p.account = plan.account.clone();
+                }
+            }
             self.save(&b);
             self.publish(&b);
             (plan, ended)
@@ -324,7 +525,12 @@ impl Plans {
         let p = self.change(|b| b.set_structure(id, &v, now()))?;
         let _ = std::fs::write(PathBuf::from(&p.dir).join("stages.json"), serde_json::to_string_pretty(&v).unwrap_or_default());
         eprintln!("[plans] {id}: {} stage(s), {} assumption(s), {} question(s) ({} open)", p.stages.len(), p.assumptions.len(), p.questions.len(), p.open_questions().len());
-        self.route(id);
+        // With a critic, a draft's questions wait for its read (the user sees the plan once, with only the real questions).
+        if self.critic.is_none() || p.critic.over() || p.status == plans::Status::Live {
+            self.route(id);
+        } else if p.url.is_some() {
+            self.criticise(id);
+        }
         Ok(lock(&self.book).get(id).cloned().unwrap_or(p))
     }
 
@@ -740,13 +946,20 @@ mod tests {
         assert_eq!((status(&shown, 0), status(&shown, 1), status(&shown, 2), status(&shown, 3)), ("with-tower".into(), "asked".into(), "asked".into(), "with-tower".into()));
         assert_eq!(shown["open_questions"], 4);
         let queue = decisions.list(None, false);
-        let cards: Vec<&str> = queue["decisions"].as_array().unwrap().iter().map(|d| d["title"].as_str().unwrap()).collect();
-        assert_eq!(cards, ["Which languages first?", "Put the provider's API key in prod's secrets now?"]);
+        let mut cards: Vec<&str> = queue["decisions"].as_array().unwrap().iter().map(|d| d["title"].as_str().unwrap()).collect();
+        cards.sort();
+        assert_eq!(cards, ["Put the provider's API key in prod's secrets now?", "Which languages first?"]);
         let q2_card = shown["questions"][1]["card"].as_str().unwrap().to_string();
         let d = decisions.get(&q2_card).unwrap();
         assert_eq!((d.why.as_str(), d.space.as_deref(), d.options.iter().filter(|o| o.pick).map(|o| o.label.as_str()).collect::<Vec<_>>()), ("plan", Some("msg-translation"), vec!["German and French"]));
         assert!(d.detail.contains("It holds up stage s3"));
-        let said = notes.lock().unwrap().clone();
+        let mut waited = 0;
+        while notes.lock().unwrap().len() < 2 && waited < 100 {
+            std::thread::sleep(Duration::from_millis(20));
+            waited += 1;
+        }
+        let mut said = notes.lock().unwrap().clone();
+        said.sort();
         assert_eq!(said.len(), 2, "q1 and q4 to the brain");
         assert!(said[0].starts_with("[plan-question] p1 q1 ") && said[0].contains("\"recommended\":\"30 days\"") && said[0].contains("plan answer p1 q1"));
 
@@ -842,6 +1055,108 @@ mod tests {
     }
 
     #[test]
+    fn a_critic_reads_the_draft_before_its_questions_go_out_a_spike_feeds_a_revision_and_handoffs_feed_findings() {
+        use crate::daemon::decisions::Decisions;
+        let dir = std::env::temp_dir().join(format!("tower-plans-s3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shared = Shared::new(State::new("off", "test", "test"));
+        let decisions = Decisions::new(shared.clone());
+        let notes: Arc<Mutex<Vec<String>>> = Arc::default();
+        let heard = notes.clone();
+        let brain: BrainNote = Arc::new(move |t: &str| heard.lock().unwrap().push(t.to_string()));
+        let read: Arc<Mutex<Vec<String>>> = Arc::default();
+        let prompts = read.clone();
+        let critic: CriticCall = Arc::new(move |prompt: &str| {
+            prompts.lock().unwrap().push(prompt.to_string());
+            Ok(r#"{"gaps": ["Stage s3's check needs a named message id", "Nobody checks the provider's EU data residency"]}"#.into())
+        });
+        let tasks: StageTasks = Arc::new(|plan: &str| if plan == "p1" { vec![("s2".into(), json!({ "id": "a9.1", "title": "The endpoint", "state": "running", "session": "t5" }))] } else { vec![] });
+        let plans = Plans::at(dir.join("plans.json"), shared.clone(), SendQueue::open()).wired(decisions.clone(), Arc::new(|_: &str| None), brain).reviewed(critic, tasks).brain_within(60_000);
+        translation_plan(&plans, &dir);
+        std::fs::write(dir.join("p1/plan.md"), "# Plan · msg-translation\n\nThe stages, the questions.").unwrap();
+        // The stages before the plan is published: its questions wait for the critic.
+        let mut st = ask("stages", "p1");
+        if let Request::Plan { body, .. } = &mut st {
+            *body = Some(structure_of());
+        }
+        assert!(plans.request(&st).ok);
+        let status = |q: usize| shared.get().plan.unwrap()["questions"][q]["status"].as_str().unwrap_or("").to_string();
+        assert_eq!((status(0), status(1)), ("open".into(), "open".into()), "nothing goes out before the critic reads it");
+        assert_eq!(decisions.list(None, false)["count"], 0);
+        // Published: the critic reads it, its gaps are kept, then the questions go out.
+        let mut published = ask("published", "p1");
+        if let Request::Plan { url, .. } = &mut published {
+            *url = "https://claude.ai/artifact/plan".into();
+        }
+        assert!(plans.request(&published).ok);
+        let mut waited = 0;
+        while status(1) != "asked" && waited < 100 {
+            std::thread::sleep(Duration::from_millis(20));
+            waited += 1;
+        }
+        let shown = shared.get().plan.unwrap();
+        assert_eq!((shown["critic"]["status"].as_str(), shown["critic"]["gaps"].as_array().map(Vec::len)), (Some("done"), Some(2)));
+        assert!(read.lock().unwrap()[0].contains("\"done_when\": \"We know the provider's latency and cost for 1,000 messages\"") && read.lock().unwrap()[0].contains("The stages, the questions."));
+        assert_eq!((status(0), status(1)), ("with-tower".into(), "asked".into()), "after the critic, as before");
+        // Read once: published again, no second read.
+        assert!(plans.request(&published).ok);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(read.lock().unwrap().len(), 1);
+        // Each stage shows its agenda tasks.
+        assert_eq!(shared.get().plan.unwrap()["stages"][1]["tasks"][0]["id"], "a9.1");
+
+        // Launched; the spike's checks pass: it is done, and the build stage waits until its findings are taken in.
+        for q in ["q1", "q2", "q3", "q4"] {
+            plans.answer("p1", q, "ok", "you").unwrap();
+        }
+        let mut close = ask("close", "p1");
+        if let Request::Plan { launched, .. } = &mut close {
+            *launched = Some("msg-translation".into());
+        }
+        assert!(plans.request(&close).ok);
+        plans.follow_stages();
+        let check = |sid: &str, c: &str| {
+            let mut r = ask("check", "p1");
+            if let Request::Plan { body, .. } = &mut r {
+                *body = Some(json!({ "stage": sid, "check": c, "status": "passed", "evidence": "p95 640 ms" }));
+            }
+            assert!(plans.request(&r).ok);
+        };
+        check("s1", "c1");
+        check("s2", "p1");
+        plans.follow_stages();
+        let live = |n: usize| shared.get().plans_live[0]["stages"][n]["state"].as_str().unwrap_or("").to_string();
+        assert_eq!((live(0), live(1)), ("done".into(), "waiting".into()), "s2 waits for the spike's findings to be taken in");
+        let v = shared.get().plans_live[0].clone();
+        assert_eq!(v["spikes_pending"], json!(["s1"]));
+        assert!(v["findings"][0]["text"].as_str().unwrap().starts_with("Spike s1 (Provider spike) is done: post c1: p95 latency under 800 ms → p95 640 ms."));
+        let mut waited = 0;
+        while !notes.lock().unwrap().iter().any(|n| n.starts_with("[plan-stage] p1 s1 done")) && waited < 100 {
+            std::thread::sleep(Duration::from_millis(20));
+            waited += 1;
+        }
+        assert!(notes.lock().unwrap().iter().any(|n| n.starts_with("[plan-stage] p1 s1 done: Provider spike") && n.contains("Next: s2 (The API translates)")));
+        // The planner says nothing changes: s2 goes on.
+        let mut keep = ask("keep", "p1");
+        if let Request::Plan { text, .. } = &mut keep {
+            *text = "640 ms is within the 800 ms budget".into();
+        }
+        assert!(plans.request(&keep).ok);
+        assert_eq!(live(1), "active");
+        assert_eq!(shared.get().plans_live[0]["revisions"][0]["status"], "kept");
+
+        // A session's turn ends with a Handoff block: its findings and what is uncertain become the plan's findings, once.
+        let said = "Done with the endpoint.\n\nHandoff a9.1 · plan p1 · stage s2\nStatus: partial\nDone: the endpoint\nEvidence: 6 tests passed\nLeft: the backfill\nUncertain: the provider's rate limit at 50 rps\nFindings:\n- split-pr: the backfill is a PR of its own\nNeeds: nothing\nNext: the backfill PR";
+        let out = plans.handoff("t5", said).unwrap();
+        assert_eq!(out["findings"].as_array().map(Vec::len), Some(2));
+        assert!(plans.handoff("t5", said).is_none(), "read once");
+        let f: Vec<(String, String, String)> = shared.get().plans_live[0]["findings"].as_array().unwrap().iter().skip(1).map(|f| (f["kind"].as_str().unwrap().into(), f["text"].as_str().unwrap().into(), f["session"].as_str().unwrap().into())).collect();
+        assert_eq!(f, [("split-pr".to_string(), "the backfill is a PR of its own".to_string(), "t5".to_string()), ("risk".into(), "Uncertain: the provider's rate limit at 50 rps".into(), "t5".into())]);
+        assert!(plans.handoff("t6", "Handoff x · plan p9 · stage s1\nStatus: done").is_none(), "a plan the tower doesn't have");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_live_plan_is_revised_from_findings_small_changes_by_themselves_big_ones_on_the_users_word() {
         use crate::daemon::decisions::{Carry, Decisions};
         let dir = std::env::temp_dir().join(format!("tower-plans-live-{}", std::process::id()));
@@ -879,7 +1194,13 @@ mod tests {
         assert!(r.ok, "{:?}", r.error);
         let v = r.state.unwrap();
         assert_eq!((v["assumption"]["status"].as_str(), v["finding"]["id"].as_str(), v["finding"]["kind"].as_str(), v["told"].as_str()), (Some("broken"), Some("f1"), Some("assumption-wrong"), Some("the brain")));
-        assert!(notes.lock().unwrap().iter().any(|n| n.starts_with("[plan-finding] p1 f1 ")));
+        // (The brain is told on a thread of its own: give it a moment.)
+        let mut waited = 0;
+        while !notes.lock().unwrap().iter().any(|n| n.starts_with("[plan-finding] p1 f1 ")) && waited < 100 {
+            std::thread::sleep(Duration::from_millis(20));
+            waited += 1;
+        }
+        assert!(notes.lock().unwrap().iter().any(|n| n.starts_with("[plan-finding] p1 f1 ")), "the brain heard of f1");
         // And a PR that has to split.
         let mut split = ask("finding", "p1");
         if let Request::Plan { body, .. } = &mut split {
@@ -954,7 +1275,8 @@ fn run_planner(p: &Plan) -> Result<String> {
     let cfg = config::Config::live();
     let tower = config::tower_bin().display().to_string();
     plans::write_folder(p, &tower)?;
-    let account = crate::accounts::default_of(&crate::accounts::list().unwrap_or_default());
+    // Its own account when it was given one, else the first not at its limit.
+    let account = Some(p.account.clone()).filter(|a| !a.trim().is_empty()).or_else(|| crate::accounts::default_of(&crate::accounts::list().unwrap_or_default()));
     let cca = crate::accounts::cca_bin().map(|c| c.to_string_lossy().into_owned());
     let argv = plans::argv(p, &cfg, cca.as_deref().filter(|_| account.is_some()), account.as_deref(), &tower, &plans::tower_env())?;
     let labels = [format!("{}=planner", plans::LABEL_ROLE), format!("{}={}", plans::LABEL_PLAN, p.id)];

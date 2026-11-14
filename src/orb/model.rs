@@ -1312,6 +1312,10 @@ pub struct PlanView {
     pub findings: Vec<crate::plans::Finding>,
     #[serde(deserialize_with = "or_default")]
     pub revisions: Vec<crate::plans::Revision>,
+    #[serde(deserialize_with = "or_default")]
+    pub critic: crate::plans::Critic,
+    #[serde(deserialize_with = "or_default")]
+    pub spikes_pending: Vec<String>,
 }
 
 /// A plan's stage as the state carries it: the stage, and where it stands.
@@ -1323,6 +1327,23 @@ pub struct PlanStage {
     /// `waiting`, `ready`, `active`, `failing`, `done`.
     #[serde(deserialize_with = "or_default")]
     pub state: String,
+    /// The agenda's tasks for it.
+    #[serde(deserialize_with = "or_default")]
+    pub tasks: Vec<StageTask>,
+}
+
+/// An agenda task sent for a plan's stage.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct StageTask {
+    #[serde(deserialize_with = "or_default")]
+    pub id: String,
+    #[serde(deserialize_with = "or_default")]
+    pub title: String,
+    #[serde(deserialize_with = "or_default")]
+    pub state: String,
+    #[serde(deserialize_with = "or_default")]
+    pub session: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]

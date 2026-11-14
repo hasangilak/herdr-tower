@@ -257,6 +257,9 @@ pub struct Task {
     /// Task ids in its agenda it waits for.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub after: Vec<String>,
+    /// The plan stage it belongs to (`p1/s2`), when it was sent from a plan.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub stage: String,
     pub state: TaskState,
     pub since_ms: u64,
     pub created_at_ms: u64,
@@ -553,6 +556,9 @@ pub struct Tag {
     /// Not for the ledger (a start whose queue item already stands for it).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub skip: bool,
+    /// The plan stage it belongs to (`p1/s2`: see `crate::plans`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stage: String,
     /// The session that sent it (the daemon's word, by who ran `tower
     /// queue`): a message from one session to another.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1143,6 +1149,7 @@ impl Ledger {
             space: reg.tag.space.clone(),
             queue_ids: vec![reg.queue_id],
             after,
+            stage: reg.tag.stage.clone(),
             from: reg.tag.from.clone(),
             state: TaskState::Queued,
             since_ms: now,

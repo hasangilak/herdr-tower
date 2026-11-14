@@ -216,6 +216,214 @@ pub struct Plan {
     /// Its version: 1 once it has stages, one more for each revision applied.
     #[serde(skip_serializing_if = "is_zero")]
     pub version: u32,
+    /// The critic's read of the draft, before its questions go out.
+    #[serde(skip_serializing_if = "Critic::is_none")]
+    pub critic: Critic,
+    /// The account its planner runs on (none: the first one not at its limit).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub account: String,
+    /// Spike stages done whose findings wait for a revision (or the
+    /// planner's word that nothing changes): the stages after them wait.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub spikes_pending: Vec<String>,
+    /// Where each stage stood when last looked at, to tell what changed.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub stage_seen: std::collections::BTreeMap<String, String>,
+}
+
+/// A separate reviewer's read of a draft plan, before the user sees it.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Critic {
+    /// "" (not yet), `reading`, `done`, `failed`.
+    pub status: String,
+    #[serde(skip_serializing_if = "is_zero_ms")]
+    pub at_ms: u64,
+    /// The gaps it found: a stage without real validation, an assumption
+    /// nobody checks, a question the plan should ask, …
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub why: String,
+}
+
+fn is_zero_ms(n: &u64) -> bool {
+    *n == 0
+}
+
+impl Critic {
+    pub fn is_none(&self) -> bool {
+        self.status.is_empty()
+    }
+
+    /// Its questions may go out: it has read the plan (or couldn't).
+    pub fn over(&self) -> bool {
+        self.status == "done" || self.status == "failed"
+    }
+}
+
+/// The prompt for the critic: the draft plan's markdown and its
+/// structure; it answers JSON only.
+pub fn critic_prompt(p: &Plan, md: &str) -> String {
+    let structure = json!({ "stages": p.stages, "assumptions": p.assumptions, "questions": p.questions, "prs": p.prs.iter().map(|x| json!({ "n": x.n, "repo": x.repo, "title": x.title, "checks": x.checks.len() })).collect::<Vec<_>>() });
+    let md: String = md.chars().take(24_000).collect();
+    format!(
+        "You review a software plan before the user sees it, as a critic: you find what is missing, you don't rewrite it. The plan has stages (each with what counts as done, pre-checks before its work and post-checks after), assumptions (each with how it is checked) and questions for the user.\n\n\
+         Find only real gaps, at most 8, most important first:\n\
+         - a stage whose checks wouldn't really show it is done (vague, untestable, no evidence);\n\
+         - risky or unknown work that should be a spike stage first and isn't;\n\
+         - an assumption the plan relies on that nobody checks, or that is missing;\n\
+         - a question the user must answer that the plan doesn't ask, or a question it asks that it could settle itself;\n\
+         - a PR no stage delivers, or a stage with no PR where code changes.\n\
+         Say each in one sentence, concretely (name the stage, check, assumption or question). No praise, no style notes. None found: an empty list.\n\n\
+         Answer with JSON only: {{\"gaps\": [\"…\"]}}\n\n## The goal\n\n{}\n\n## The structure\n\n{}\n\n## The plan\n\n{}\n",
+        p.draft["goal"].as_str().unwrap_or(&p.ticket),
+        serde_json::to_string_pretty(&structure).unwrap_or_default(),
+        md
+    )
+}
+
+/// The critic's gaps, from its answer.
+pub fn parse_critic(stdout: &str) -> Result<Vec<String>> {
+    let v = crate::ticket::parse_reply(stdout)?;
+    let Some(gaps) = v["gaps"].as_array() else { bail!("the critic's answer has no gaps list") };
+    Ok(gaps.iter().filter_map(Value::as_str).map(|g| g.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|g| !g.is_empty()).take(8).collect())
+}
+
+/// What the planner is told of the critic's gaps.
+pub fn critic_note(p: &Plan, gaps: &[String], tower: &str) -> String {
+    let t = tower_word(tower);
+    let list: String = gaps.iter().enumerate().map(|(i, g)| format!("\n{}. {g}", i + 1)).collect();
+    format!(
+        "[plan {}] A critic read the plan before the user sees it and found {} gap{}:{list}\n\nFix what is real: change plan.md, send the stages again (`{t} plan stages {} --json-file stages.json`) when they change (add a question there for one the user must answer), republish the same artifact and run `{t} plan published {} --url <its link>`. What you leave as it is, say why in a line with `{t} plan say {} \"…\"`. The questions go out to the user once you have sent the stages again, or now if nothing changes.",
+        p.id,
+        gaps.len(),
+        if gaps.len() == 1 { "" } else { "s" },
+        p.id,
+        p.id,
+        p.id
+    )
+}
+
+/// A session's Handoff block: how it reports back on a plan's task, at the
+/// end of its turn.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Handoff {
+    pub task: String,
+    pub plan: String,
+    pub stage: String,
+    /// `done`, `partial`, `blocked`, `failed`.
+    pub status: String,
+    pub done: String,
+    pub evidence: String,
+    pub left: String,
+    pub uncertain: String,
+    /// (kind, text): what it found that bears on the plan.
+    pub findings: Vec<(String, String)>,
+    pub needs: String,
+    pub next: String,
+}
+
+/// The block a session ends its turn with, as it is asked for.
+pub const HANDOFF_FORMAT: &str = "Handoff <task> · plan <plan> · stage <stage>\nStatus: done | partial | blocked | failed\nDone: <what you did>\nEvidence: <commands run and their result, test output, a PR, a screenshot's path>\nLeft: <what is left of this task>\nUncertain: <what you are not sure of; none>\nFindings: <one per line, \"- <kind>: <what>\", kind one of assumption-wrong, split-pr, risk, check-cant-run, scope, other; none>\nNeeds: <what you need from the user; nothing>\nNext: <the next action>";
+
+/// Reads a Handoff block from the end of a message, if it has one that
+/// names its plan and stage.
+pub fn parse_handoff(text: &str) -> Option<Handoff> {
+    let start = text.rfind("Handoff ")?;
+    let block = &text[start..];
+    let mut lines = block.lines();
+    let head = lines.next()?.trim().trim_matches(['*', '#', '`', ' ']);
+    let mut h = Handoff::default();
+    for part in head.trim_start_matches("Handoff").split('·') {
+        let w: Vec<&str> = part.split_whitespace().collect();
+        match w.as_slice() {
+            ["plan", p] => h.plan = p.trim_matches(['*', '`']).to_string(),
+            ["stage", st] => h.stage = st.trim_matches(['*', '`']).to_string(),
+            [t] => h.task = t.trim_matches(['*', '`']).to_string(),
+            _ => {}
+        }
+    }
+    if h.plan.is_empty() || h.stage.is_empty() {
+        return None;
+    }
+    let mut key = String::new();
+    for line in lines {
+        let l = line.trim().trim_start_matches(['*', '>']).trim();
+        if l.starts_with("```") {
+            break;
+        }
+        let none = |v: &str| matches!(v.trim().trim_end_matches('.').to_lowercase().as_str(), "" | "none" | "nothing" | "n/a" | "-");
+        if let Some((k, v)) = l.split_once(':')
+            && !k.contains(' ')
+            && ["status", "done", "evidence", "left", "uncertain", "findings", "needs", "next"].contains(&k.trim_matches('*').to_lowercase().as_str())
+        {
+            key = k.trim_matches('*').to_lowercase();
+            let v = v.trim().trim_matches('*').trim().to_string();
+            match key.as_str() {
+                "status" => h.status = v.split_whitespace().next().unwrap_or("").trim_matches(['.', ',']).to_lowercase(),
+                "done" => h.done = v,
+                "evidence" => h.evidence = v,
+                "left" => h.left = if none(&v) { String::new() } else { v },
+                "uncertain" => h.uncertain = if none(&v) { String::new() } else { v },
+                "needs" => h.needs = if none(&v) { String::new() } else { v },
+                "next" => h.next = v,
+                "findings" if !none(&v) => h.findings.push(finding_of(&v)),
+                _ => {}
+            }
+        } else if key == "findings" && l.starts_with('-') {
+            let v = l.trim_start_matches('-').trim();
+            if !v.is_empty() && !matches!(v.to_lowercase().as_str(), "none" | "nothing") {
+                h.findings.push(finding_of(v));
+            }
+        } else if l.is_empty() {
+            continue;
+        }
+    }
+    Some(h)
+}
+
+/// "split-pr: the backfill is its own PR" → (kind, text); a kind it doesn't know is `other`.
+fn finding_of(v: &str) -> (String, String) {
+    match v.split_once(':') {
+        Some((k, t)) if FINDING_KINDS.contains(&k.trim().to_lowercase().as_str()) => (k.trim().to_lowercase(), t.trim().to_string()),
+        _ => ("other".to_string(), v.trim().to_string()),
+    }
+}
+
+/// The structured handoff of a task sent from a plan: its goal, its
+/// stage and what counts as done, what is known so far, the constraints,
+/// what is uncertain, and the exact next action; then the stage's checks
+/// and how to report back.
+pub struct TaskHandoff<'a> {
+    pub task: &'a str,
+    pub goal: &'a str,
+    pub so_far: &'a str,
+    pub constraints: &'a str,
+    pub uncertain: &'a str,
+    pub next: &'a str,
+}
+
+pub fn handoff_text(p: &Plan, stage: &str, h: &TaskHandoff) -> Result<String> {
+    let Some(st) = p.stages.iter().find(|s| s.id.eq_ignore_ascii_case(stage.trim())) else {
+        bail!("plan {} has no stage {stage:?}: its stages are {}", p.id, p.stages.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join(", "));
+    };
+    let n = p.stages.iter().position(|s| s.id == st.id).unwrap_or(0) + 1;
+    let line = |k: &str, v: &str| if v.trim().is_empty() { String::new() } else { format!("{k}: {}\n", v.trim()) };
+    let goal = if h.goal.trim().is_empty() { if st.goal.is_empty() { st.title.as_str() } else { st.goal.as_str() } } else { h.goal };
+    let mut s = format!("[tower] Plan {} · stage {} of {} ({}, {}): {}{}\n", p.id, n, p.stages.len(), st.id, st.kind, st.title, if h.task.is_empty() { String::new() } else { format!(" · task {}", h.task) });
+    s += &line("Goal", goal);
+    s += &line("Done when", &st.done_when);
+    s += &line("So far", h.so_far);
+    s += &line("Constraints", h.constraints);
+    s += &line("Uncertain", h.uncertain);
+    s += &line("Next", h.next);
+    let checks: Vec<String> = st.checks().map(|(w, c)| format!("- {w} {}: {} (how: {}; evidence: {})", c.id, c.what, c.how, c.evidence)).collect();
+    if !checks.is_empty() {
+        s += &format!("\nThis stage is done when these pass, each reported with `tower plan check {} {} <check> passed|failed|not-run --evidence \"<…>\"`:\n{}\n", p.id, st.id, checks.join("\n"));
+    }
+    s += &format!("\nWhen your turn ends, end your last message with this block, filled in (it is how the tower and the plan hear what you found):\n\n{}\n", HANDOFF_FORMAT.replace("<task>", if h.task.is_empty() { "-" } else { h.task }).replace("<plan>", &p.id).replace("<stage>", &st.id));
+    Ok(s)
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -511,7 +719,7 @@ impl Plan {
     pub fn stage_states(&self, pr_checks: &dyn Fn(&str) -> Option<crate::prscore::Validation>) -> Vec<(String, StageState)> {
         let mut out: Vec<(String, StageState)> = vec![];
         for st in &self.stages {
-            let waits = st.after.iter().any(|a| out.iter().find(|(id, _)| id == a).is_none_or(|(_, s)| *s != StageState::Done));
+            let waits = st.after.iter().any(|a| out.iter().find(|(id, _)| id == a).is_none_or(|(_, s)| *s != StageState::Done) || self.spikes_pending.iter().any(|x| x == a));
             let bad = |c: &crate::prscore::Check| c.status == crate::prscore::FAILED || c.status == crate::prscore::NOT_RUN;
             let pre_ok = st.pre.iter().all(crate::prscore::Check::passed);
             let post_ok = !st.post.is_empty() && st.post.iter().all(crate::prscore::Check::passed);
@@ -585,6 +793,9 @@ impl Plan {
             "findings": self.findings,
             "revisions": self.revisions,
             "version": self.version,
+            "critic": self.critic,
+            "spikes_pending": self.spikes_pending,
+            "account": self.account,
         })
     }
 
@@ -879,9 +1090,58 @@ impl Book {
                 f.revision = Some(r.n);
             }
         }
+        // A revision takes in what the spikes found: the stages after them go on.
+        if !big {
+            p.spikes_pending.clear();
+        }
         p.revisions.push(r.clone());
         p.updated_ms = now;
         Ok(r)
+    }
+
+    /// The planner's word that a spike's findings change nothing: noted as
+    /// a revision of no change, and the stages after it go on.
+    pub fn keep(&mut self, id: &str, why: &str, now: u64) -> Result<Revision> {
+        let p = self.plans.iter_mut().find(|p| p.id == id && p.status != Status::Closed).ok_or_else(|| anyhow::anyhow!("no open or live plan {id}"))?;
+        if why.trim().is_empty() {
+            bail!("say why nothing changes: --why \"…\"");
+        }
+        let taken: Vec<String> = p.findings.iter().filter(|f| f.revision.is_none()).map(|f| f.id.clone()).collect();
+        let n = p.revisions.len() as u32 + 1;
+        for f in p.findings.iter_mut().filter(|f| f.revision.is_none()) {
+            f.revision = Some(n);
+        }
+        let r = Revision { n, at_ms: now, by: "planner".into(), why: tidy_msg(why), findings: taken, changes: vec![], size: "none".into(), status: "kept".into(), card: None, proposed: Value::Null };
+        p.spikes_pending.clear();
+        p.revisions.push(r.clone());
+        p.updated_ms = now;
+        Ok(r)
+    }
+
+    /// Where each stage of a plan stands now (`states`), against where it
+    /// stood: the stages that just became done. A spike that did waits for
+    /// its findings to be taken in (`spikes_pending`).
+    pub fn stage_moves(&mut self, id: &str, states: &[(String, StageState)]) -> Vec<String> {
+        let Some(p) = self.plans.iter_mut().find(|p| p.id == id) else { return vec![] };
+        let mut done = vec![];
+        for (sid, st) in states {
+            let was = p.stage_seen.insert(sid.clone(), st.word().to_string());
+            if *st == StageState::Done && was.as_deref() != Some("done") && was.is_some() {
+                done.push(sid.clone());
+                if p.stages.iter().any(|s| &s.id == sid && s.kind == "spike") && !p.spikes_pending.contains(sid) {
+                    p.spikes_pending.push(sid.clone());
+                }
+            }
+        }
+        done
+    }
+
+    /// The critic's read, kept.
+    pub fn criticised(&mut self, id: &str, status: &str, gaps: Vec<String>, why: &str, now: u64) -> Result<Plan> {
+        let p = self.plans.iter_mut().find(|p| p.id == id).ok_or_else(|| anyhow::anyhow!("no plan {id}"))?;
+        p.critic = Critic { status: status.to_string(), at_ms: now, gaps, why: why.to_string() };
+        p.updated_ms = now;
+        Ok(p.clone())
     }
 
     /// The user's word on a big revision: applied, or not.
@@ -1411,6 +1671,7 @@ pub fn instructions(p: &Plan, tower: &str) -> String {
     s += &format!(
         "- The answers come back to you as `[plan {id}] q2 is answered by …`: write each into `plan.md` and the artifact, change what it changes (and send `stages.json` again when the stages change), and republish.\n\n"
     );
+    s += "Once you publish, a critic reads the plan before the user sees it: its gaps reach you as `[plan <id>] A critic read the plan …`. Fix what is real and send the stages again; the questions go out to the user after that, so they see the plan once, with only the real questions.\n\n";
     s += "## 4. Publish it\n\n";
     match p.form {
         Form::Page => {
@@ -1443,7 +1704,9 @@ pub fn instructions(p: &Plan, tower: &str) -> String {
     s += "Once the space is launched the plan stays live: its sessions report what they find (an assumption that proved wrong, a PR that has to split, a new risk, a check that can't run), and you revise the plan for it. A finding reaches you as `[plan <id>] Finding f2 …`.\n\n";
     s += &format!("- Change `stages.json` for it and run `{t} plan revise {id} --json-file stages.json --why \"<what made it change, in a sentence>\" --finding f2`. The tower compares it with the plan as it is: a small change (a check added or reworded, a PR split inside a stage, an assumption or a question added) is applied at once and noted; a big one (a stage added or removed, a stage's done-when changed, a check or an assumption dropped) goes to the user as one card with what changes, and is applied only on their yes. It says which.\n");
     s += "- Put it in `plan.md` and republish the same artifact: the version at the top, and a \"What changed\" section, newest first, each revision with what changed, why, and the finding that caused it.\n";
-    s += "- A finding that changes nothing: say so with `plan say`, and leave the plan as it is.\n\n";
+    s += &format!("- A finding that changes nothing: say why with `{t} plan keep {id} --why \"…\"` (it is noted as a revision of no change), and leave the plan as it is.\n");
+    s += &format!("- A spike stage done: what it found reaches you as a finding. The stages after it wait until you take it in: `{t} plan revise …` when the plan changes, `{t} plan keep {id} --why \"…\"` when it doesn't.\n");
+    s += "- Sessions end their turns on the plan's tasks with a Handoff block; what it says is uncertain, what failed or blocked, and the findings it lists reach you as findings too.\n\n";
     s += "## Never\n\n";
     s += "- Never launch the space, open or start a session, queue or send anything to a session, or open or close a space: no `tower launch`, `tower start`, `tower queue`, `tower dispatch`, `tower space`, no `hc`. The user launches it from the tower's window.\n";
     s += "- Never edit, commit or push in a repository. Write only in this folder.\n";
@@ -1653,7 +1916,8 @@ pub fn stages_text(id: &str, stages: &[Stage], prs: &[crate::prscore::Predicted]
         return String::new();
     }
     let mut s = format!(
-        "\n\nThe plan's stages, in order. A stage is done only when every check of it passed with evidence; work on a stage starts once its pre-checks passed. Report a stage's check you ran with `tower plan check {id} <stage> <check> passed|failed|not-run --evidence \"<the test output, a screenshot's path, a log, or why it wasn't run>\"`."
+        "\n\nThe plan's stages, in order. Spike stages come first: their findings may change the plan before the build stages start, so a build stage waits until the spikes it follows are done and taken in (the tower says when). A stage is done only when every check of it passed with evidence; work on a stage starts once its pre-checks passed. Report a stage's check you ran with `tower plan check {id} <stage> <check> passed|failed|not-run --evidence \"<the test output, a screenshot's path, a log, or why it wasn't run>\"`, and what you find that bears on the plan (an assumption that proved wrong, a PR that has to split, a new risk, a check that can't run) with `tower plan finding {id} --kind <kind> \"<what>\" --stage <stage>`. End each turn on the plan's work with this block:\n\n{}",
+        HANDOFF_FORMAT.replace("<plan>", id)
     );
     for st in stages {
         let own: Vec<String> = st.prs.iter().filter_map(|n| prs.iter().find(|p| p.n == *n)).filter(|p| !mine.is_empty() && p.repo.eq_ignore_ascii_case(mine)).map(|p| format!("PR {}", p.n)).collect();
@@ -1762,6 +2026,8 @@ pub struct Args {
     pub session: Option<String>,
     /// `revise`: why, and the findings it takes in.
     pub why: Option<String>,
+    /// `new`: the account its planner runs on.
+    pub account: Option<String>,
     pub finding: Option<String>,
     pub json: bool,
 }
@@ -1805,6 +2071,7 @@ pub fn parse_args(raw: &[String]) -> Result<Args> {
             "--assumption" => a.assumption = Some(value("--assumption")?),
             "--session" => a.session = Some(value("--session")?),
             "--why" => a.why = Some(value("--why")?),
+            "--account" => a.account = Some(value("--account")?),
             "--finding" => a.finding = Some(value("--finding")?),
             "--json" => a.json = true,
             f if f.starts_with("--") && f.len() > 2 => bail!("tower plan: no flag {f}: {USAGE}"),
@@ -1839,7 +2106,8 @@ pub fn parse_args(raw: &[String]) -> Result<Args> {
         }
         "assume" if a.id.is_none() || a.words.split_whitespace().count() != 2 || a.evidence.is_none() => bail!("tower plan assume <id> <assumption> holds|broken --evidence \"<what showed it>\""),
         "revise" if a.id.is_none() || a.json_file.is_none() || a.why.is_none() => bail!("tower plan revise <id> --json-file stages.json --why \"<what made it change>\" [--finding f1,f2]"),
-        "say" | "failed" | "draft" | "prs" | "stages" | "answer" | "ask" | "check" | "finding" | "assume" | "revise" | "published" | "show" | "close" | "list" => {}
+        "keep" if a.id.is_none() || a.why.is_none() => bail!("tower plan keep <id> --why \"<why what was found changes nothing>\""),
+        "say" | "failed" | "draft" | "prs" | "stages" | "answer" | "ask" | "check" | "finding" | "assume" | "revise" | "keep" | "published" | "show" | "close" | "list" => {}
         other => bail!("tower plan {other}: {USAGE}"),
     }
     if !a.words.is_empty() && !matches!(a.action.as_str(), "say" | "failed" | "answer" | "ask" | "check" | "finding" | "assume") {
@@ -1863,7 +2131,7 @@ pub fn request(a: &Args) -> Result<Value> {
         form: a.form.map(|f| f.word().to_string()).unwrap_or_default(),
         ticket: String::new(),
         draft: None,
-        text: a.words.clone(),
+        text: if a.action == "keep" { a.why.clone().unwrap_or_default() } else { a.words.clone() },
         url: a.url.clone().unwrap_or_default(),
         who: a.who.map(|w| w.word().to_string()).unwrap_or_default(),
         launched: a.launched.clone(),
@@ -1939,7 +2207,7 @@ pub fn cmd(raw: &[String]) -> Result<()> {
                 who: String::new(),
                 launched: None,
                 prs: None,
-                body: None,
+                body: a.account.clone().map(|acc| json!({ "account": acc })),
             })?;
             if !r.ok {
                 bail!("{}", r.error.unwrap_or_default());
@@ -2254,6 +2522,42 @@ mod tests {
         assert!(!text.contains("Store each message's translation"), "only its own PRs: {text}");
         // A session whose repo has no predicted PR is told nothing of checks.
         assert!(!brief_text(&b, "other-repo", &[]).contains("tower validate"));
+    }
+
+    #[test]
+    fn a_handoff_block_is_read_from_the_end_of_a_turn() {
+        let said = "I added the endpoint and its tests.\n\n**Handoff a12.1 · plan p1 · stage s2**\nStatus: partial\nDone: POST /messages/:id/translate, with a cache\nEvidence: npm test -- translate.spec.ts: 6 passed\nLeft: the backfill\nUncertain: whether the provider's rate limit holds at 50 rps\nFindings:\n- split-pr: the backfill is a PR of its own\n- the dashboard needs the language list from the API\nNeeds: nothing\nNext: open the backfill PR";
+        let h = parse_handoff(said).unwrap();
+        assert_eq!((h.task.as_str(), h.plan.as_str(), h.stage.as_str(), h.status.as_str()), ("a12.1", "p1", "s2", "partial"));
+        assert_eq!(h.evidence, "npm test -- translate.spec.ts: 6 passed");
+        assert_eq!(h.uncertain, "whether the provider's rate limit holds at 50 rps");
+        assert_eq!(h.findings, [("split-pr".to_string(), "the backfill is a PR of its own".to_string()), ("other".into(), "the dashboard needs the language list from the API".into())]);
+        assert!(h.needs.is_empty(), "nothing is no need");
+        // One finding on its own line; none; no block, or one with no plan.
+        let one = parse_handoff("Handoff - · plan p2 · stage s1\nStatus: done\nFindings: risk: the API is slow\nUncertain: none").unwrap();
+        assert_eq!((one.findings.len(), one.uncertain.as_str()), (1, ""));
+        assert!(parse_handoff("All done, tests pass.").is_none());
+        assert!(parse_handoff("Handoff a1\nStatus: done").is_none());
+    }
+
+    #[test]
+    fn a_task_from_a_plan_goes_out_as_the_structured_handoff() {
+        let prs = crate::prscore::check(&crate::prscore::tests::two_prs(), &repos_of(&draft())).unwrap();
+        let v = json!({ "stages": [
+            { "id": "s1", "title": "Spike", "kind": "spike", "done_when": "We know the API.", "post": [{ "id": "c1", "what": "w1", "how": "h1", "evidence": "e1" }] },
+            { "id": "s2", "title": "Build", "goal": "The inbox translates", "after": ["s1"], "prs": [1], "done_when": "It works on dev", "post": [{ "id": "c1", "what": "w2", "how": "h2", "evidence": "e2" }] } ] });
+        let mut b = Book::default();
+        let (p, _) = b.add(Form::Page, "T", draft(), |id| PathBuf::from(format!("/s/{id}")), 1);
+        b.plans[0].prs = prs;
+        b.set_structure(&p.id, &v, 2).unwrap();
+        let p = b.plans[0].clone();
+        let h = TaskHandoff { task: "b", goal: "", so_far: "s1 found the API answers in 300 ms", constraints: "PRs into dev only", uncertain: "", next: "Add the endpoint" };
+        let text = handoff_text(&p, "s2", &h).unwrap();
+        assert!(text.starts_with("[tower] Plan p1 · stage 2 of 2 (s2, build): Build · task b\nGoal: The inbox translates\nDone when: It works on dev\nSo far: s1 found the API answers in 300 ms\nConstraints: PRs into dev only\nNext: Add the endpoint\n"), "{text}");
+        assert!(!text.split("\n\n").next().unwrap().contains("Uncertain:"), "an empty field is left out");
+        assert!(text.contains("`tower plan check p1 s2 <check> passed|failed|not-run") && text.contains("- post c1: w2"), "{text}");
+        assert!(text.contains("Handoff b · plan p1 · stage s2\nStatus: done | partial | blocked | failed"), "{text}");
+        assert!(handoff_text(&p, "s9", &h).unwrap_err().to_string().contains("no stage \"s9\""));
     }
 
     #[test]
