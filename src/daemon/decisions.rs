@@ -692,6 +692,8 @@ pub struct Carry<'a> {
     pub reopen: &'a dyn Fn(&crate::reopen::Pick) -> Result<Value>,
     /// The sessions waiting for an account: on at the reset (true), or let go.
     pub accounts: &'a dyn Fn(bool) -> Result<Value>,
+    /// A plan's question answered by the user (plan, question, answer): written into the plan.
+    pub plan: &'a dyn Fn(&str, &str, &str) -> Result<Value>,
 }
 
 /// Whether the answer just given can be made a rule, and the request that
@@ -839,6 +841,14 @@ impl Decisions {
                 self.answered(id, &label);
                 Ok(json!({ "ok": true, "id": id, "state": "answered", "answer": label, "reopen": done }))
             }
+            Act::Plan { plan, question, answer, label } => {
+                let done = match (with.plan)(&plan, &question, &answer) {
+                    Ok(v) => v,
+                    Err(e) => return Err(Refused::Failed(format!("{e:#}"))),
+                };
+                self.answered(id, &label);
+                Ok(json!({ "ok": true, "id": id, "state": "answered", "answer": label, "plan": done }))
+            }
             Act::Accounts { wait, label } => {
                 self.answered(id, &label);
                 let done = match (with.accounts)(wait) {
@@ -848,6 +858,25 @@ impl Decisions {
                 Ok(json!({ "ok": true, "id": id, "state": "answered", "answer": label, "accounts": done }))
             }
         }
+    }
+
+    /// A plan's question in the user's queue (`decisions::PlanAsk`): its
+    /// card's id, and whether the user is told now (the first time).
+    pub fn plan_question(&self, a: decisions::PlanAsk) -> (String, bool) {
+        let raised = self.change(|b, now| b.plan_question(a, now));
+        if raised.fresh {
+            eprintln!("[decisions] {} (plan question) for the user", raised.id);
+        }
+        let told = raised.fresh && self.tells(std::slice::from_ref(&raised.id), true);
+        (raised.id, told)
+    }
+
+    /// A plan question's card is over: answered elsewhere (the brain, the
+    /// CLI), with `with`. Nothing when it isn't open.
+    pub fn plan_answered(&self, plan: &str, question: &str, with: &str) -> Option<Decision> {
+        let key = decisions::plan_key(plan, question);
+        let id = lock(&self.book).open.iter().find(|d| d.key == key).map(|d| d.id.clone())?;
+        self.answered(&id, with)
     }
 
     /// The card offering back what a restart closed, as it should stand

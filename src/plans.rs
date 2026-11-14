@@ -194,11 +194,215 @@ pub struct Plan {
     pub launched: Option<String>,
     /// The pull requests it predicts, each with its review score (`tower plan prs`).
     pub prs: Vec<crate::prscore::Predicted>,
+    /// Its milestones, in order (`tower plan stages`: see `docs/planning-v2.md`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<Stage>,
+    /// What it takes for granted, each with how and when it is checked.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub assumptions: Vec<Assumption>,
+    /// What it can't decide alone: each answered by the tower or the user, and written back.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<Question>,
+}
+
+/// A stage's kind: an unknown settled first, the work, or its release.
+pub const STAGE_KINDS: &[&str] = &["spike", "build", "release"];
+
+/// One milestone of a plan: what it delivers, what counts as done, and how
+/// that is known before (`pre`) and after (`post`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Stage {
+    /// `s1`, `s2`, …
+    pub id: String,
+    pub title: String,
+    /// `spike`, `build` or `release`.
+    pub kind: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub goal: String,
+    pub done_when: String,
+    /// The stages it waits for.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
+    /// The plan's PRs (their `n`) it delivers.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prs: Vec<u32>,
+    /// Checked before its work starts: assumptions, access, data, environments.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pre: Vec<crate::prscore::Check>,
+    /// Checked after: the exact tests, commands and live checks, and the evidence each gives.
+    pub post: Vec<crate::prscore::Check>,
+}
+
+impl Stage {
+    /// Its pre and post checks, each with which it is.
+    pub fn checks(&self) -> impl Iterator<Item = (&'static str, &crate::prscore::Check)> {
+        self.pre.iter().map(|c| ("pre", c)).chain(self.post.iter().map(|c| ("post", c)))
+    }
+}
+
+/// Where a stage stands (computed: `Plan::stage_states`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageState {
+    /// A stage it waits for isn't done.
+    Waiting,
+    /// Its pre-checks haven't all passed: its work shouldn't start.
+    Ready,
+    /// Pre-checks passed (or none): its work goes on.
+    Active,
+    /// A check of it failed or wasn't run, or one of its PRs' checks did.
+    Failing,
+    /// Every check passed with evidence, and every PR of it that opened has all its checks passed.
+    Done,
+}
+
+impl StageState {
+    pub fn word(self) -> &'static str {
+        match self {
+            StageState::Waiting => "waiting",
+            StageState::Ready => "ready",
+            StageState::Active => "active",
+            StageState::Failing => "failing",
+            StageState::Done => "done",
+        }
+    }
+}
+
+/// Something a plan takes for granted.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Assumption {
+    /// `a1`, `a2`, …
+    pub id: String,
+    pub text: String,
+    /// How it is checked.
+    pub check: String,
+    /// The stage it must hold by.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub by: String,
+    /// `open`, `holds` or `broken`.
+    pub status: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub proof: String,
+}
+
+/// One answer a question offers, and why.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QOption {
+    pub label: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub why: String,
+}
+
+/// Where a plan's question is: just written, weighed by the tower's brain,
+/// in the user's queue, or answered.
+pub const Q_OPEN: &str = "open";
+pub const Q_WITH_TOWER: &str = "with-tower";
+pub const Q_ASKED: &str = "asked";
+pub const Q_ANSWERED: &str = "answered";
+
+/// Something a plan can't decide alone.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Question {
+    /// `q1`, `q2`, …
+    pub id: String,
+    pub text: String,
+    /// Why it matters: what turns on it.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub why: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<QOption>,
+    /// The planner's pick (an index of `options`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommended: Option<usize>,
+    /// The planner says only the user can answer it.
+    pub theirs: bool,
+    /// The stage it holds up.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub stage: String,
+    /// `open`, `with-tower`, `asked`, `answered`.
+    pub status: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub answer: String,
+    /// `you` or `tower`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub by: String,
+    /// Its card in the user's queue, once it is there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_ms: Option<u64>,
+}
+
+impl Question {
+    pub fn is_open(&self) -> bool {
+        self.status != Q_ANSWERED
+    }
+
+    /// What the question-set rules see of it (`questions::must_escalate`):
+    /// its words, its why and its options.
+    pub fn as_set(&self, plan: &str) -> crate::questions::QuestionSet {
+        let options = self.options.iter().map(|o| crate::questions::Opt { label: o.label.clone(), description: o.why.clone(), ..Default::default() }).collect();
+        crate::questions::QuestionSet {
+            id: format!("{plan}-{}", self.id),
+            kind: "plan".into(),
+            title: self.text.clone(),
+            detail: self.why.clone(),
+            tabs: vec![crate::questions::Tab { title: "Plan".into(), question: self.text.clone(), options, allows_other: true, ..Default::default() }],
+            ..Default::default()
+        }
+    }
 }
 
 impl Plan {
     pub fn is_open(&self) -> bool {
         self.status != Status::Closed
+    }
+
+    /// Its questions not answered yet.
+    pub fn open_questions(&self) -> Vec<&Question> {
+        self.questions.iter().filter(|q| q.is_open()).collect()
+    }
+
+    /// Where each stage stands, in order. `pr_checks`: a PR's planned
+    /// checks as the tower has them, by its key (`owner/name#12`), when it
+    /// opened; a stage's PR that hasn't opened yet holds it from done.
+    pub fn stage_states(&self, pr_checks: &dyn Fn(&str) -> Option<crate::prscore::Validation>) -> Vec<(String, StageState)> {
+        let mut out: Vec<(String, StageState)> = vec![];
+        for st in &self.stages {
+            let waits = st.after.iter().any(|a| out.iter().find(|(id, _)| id == a).is_none_or(|(_, s)| *s != StageState::Done));
+            let bad = |c: &crate::prscore::Check| c.status == crate::prscore::FAILED || c.status == crate::prscore::NOT_RUN;
+            let pre_ok = st.pre.iter().all(crate::prscore::Check::passed);
+            let post_ok = !st.post.is_empty() && st.post.iter().all(crate::prscore::Check::passed);
+            // Its PRs: each must have opened and passed every planned check.
+            let mut prs_ok = true;
+            let mut prs_bad = false;
+            for n in &st.prs {
+                let key = self.prs.iter().find(|p| p.n == *n).and_then(|p| p.pr.clone());
+                match key.and_then(|k| pr_checks(&k)) {
+                    Some(v) => {
+                        prs_ok &= v.checks.is_empty() || v.all_passed();
+                        prs_bad |= v.any_bad();
+                    }
+                    None => prs_ok = false,
+                }
+            }
+            let state = if st.checks().any(|(_, c)| bad(c)) || prs_bad {
+                StageState::Failing
+            } else if pre_ok && post_ok && prs_ok {
+                StageState::Done
+            } else if waits {
+                StageState::Waiting
+            } else if !pre_ok {
+                StageState::Ready
+            } else {
+                StageState::Active
+            };
+            out.push((st.id.clone(), state));
+        }
+        out
     }
 
     /// Its markdown copy, in the planner's folder.
@@ -235,7 +439,28 @@ impl Plan {
             "closed_ms": self.closed_ms,
             "launched": self.launched,
             "prs": self.prs,
+            "stages": self.stages,
+            "assumptions": self.assumptions,
+            "questions": self.questions,
+            "open_questions": self.open_questions().len(),
         })
+    }
+
+    /// `view`, with where each stage stands (`stage_states`) and how far
+    /// the plan is: `stage_states` on each stage, and `progress`.
+    pub fn view_with(&self, pr_checks: &dyn Fn(&str) -> Option<crate::prscore::Validation>) -> Value {
+        let mut v = self.view();
+        let states = self.stage_states(pr_checks);
+        if let Some(stages) = v["stages"].as_array_mut() {
+            for (st, (_, state)) in stages.iter_mut().zip(&states) {
+                st["state"] = json!(state.word());
+            }
+        }
+        let done = states.iter().filter(|(_, s)| *s == StageState::Done).count();
+        // The stage at work: the first that isn't done.
+        let at = states.iter().position(|(_, s)| *s != StageState::Done).map(|i| i + 1);
+        v["progress"] = json!({ "stages": states.len(), "done": done, "at": at });
+        v
     }
 }
 
@@ -369,6 +594,99 @@ impl Book {
         Ok(p.clone())
     }
 
+    /// The planner's structure (`tower plan stages`): its stages,
+    /// assumptions and questions, checked (`structure`). What was known of
+    /// the same ids stays: a check's result, an assumption's status, a
+    /// question's answer and where it is (unless its words changed).
+    pub fn set_structure(&mut self, id: &str, v: &Value, now: u64) -> Result<Plan> {
+        let p = self.open_mut(id)?;
+        let (mut stages, mut assumptions, mut questions) = structure(v, &p.prs)?;
+        for st in stages.iter_mut() {
+            if let Some(old) = p.stages.iter().find(|o| o.id == st.id) {
+                for (now_c, was) in [(&mut st.pre, &old.pre), (&mut st.post, &old.post)] {
+                    for c in now_c.iter_mut() {
+                        if let Some(o) = was.iter().find(|o| o.id == c.id && o.status != crate::prscore::PLANNED) {
+                            (c.status, c.proof, c.by, c.at_ms) = (o.status.clone(), o.proof.clone(), o.by.clone(), o.at_ms);
+                        }
+                    }
+                }
+            }
+        }
+        for a in assumptions.iter_mut() {
+            if let Some(o) = p.assumptions.iter().find(|o| o.id == a.id && o.text.trim() == a.text.trim()) {
+                (a.status, a.proof) = (o.status.clone(), o.proof.clone());
+            }
+        }
+        for q in questions.iter_mut() {
+            if let Some(o) = p.questions.iter().find(|o| o.id == q.id && (o.text.trim() == q.text.trim() || o.status == Q_ANSWERED)) {
+                (q.status, q.answer, q.by, q.card, q.at_ms) = (o.status.clone(), o.answer.clone(), o.by.clone(), o.card.clone(), o.at_ms);
+            }
+        }
+        (p.stages, p.assumptions, p.questions) = (stages, assumptions, questions);
+        p.updated_ms = now;
+        Ok(p.clone())
+    }
+
+    /// A question of the plan, by its id.
+    fn question_mut(&mut self, id: &str, q: &str) -> Result<&mut Question> {
+        let p = self.plans.iter_mut().find(|p| p.id == id).ok_or_else(|| anyhow::anyhow!("no plan {id}"))?;
+        let ids: Vec<String> = p.questions.iter().map(|q| q.id.clone()).collect();
+        p.questions.iter_mut().find(|x| x.id.eq_ignore_ascii_case(q.trim())).ok_or_else(|| anyhow::anyhow!("plan {id} has no question {q:?}: its questions are {}", ids.join(", ")))
+    }
+
+    /// Where a question is now (`with-tower`, `asked`), and its card.
+    pub fn question_at(&mut self, id: &str, q: &str, status: &str, card: Option<&str>, now: u64) -> Result<Question> {
+        let x = self.question_mut(id, q)?;
+        if x.status == Q_ANSWERED {
+            bail!("{q} of plan {id} is answered already: {}", x.answer);
+        }
+        x.status = status.to_string();
+        if let Some(c) = card {
+            x.card = Some(c.to_string());
+        }
+        let x = x.clone();
+        if let Some(p) = self.plans.iter_mut().find(|p| p.id == id) {
+            p.updated_ms = now;
+        }
+        Ok(x)
+    }
+
+    /// A question answered (`by`: `you` or `tower`): written into the plan.
+    pub fn answer(&mut self, id: &str, q: &str, answer: &str, by: &str, now: u64) -> Result<Question> {
+        let answer = tidy_msg(answer);
+        if answer.is_empty() {
+            bail!("give the answer: tower plan answer {id} {q} \"<the answer>\"");
+        }
+        let x = self.question_mut(id, q)?;
+        if x.status == Q_ANSWERED && x.answer == answer {
+            return Ok(x.clone());
+        }
+        (x.status, x.answer, x.by, x.at_ms) = (Q_ANSWERED.to_string(), answer, if by == "tower" { "tower".into() } else { "you".into() }, Some(now));
+        let x = x.clone();
+        if let Some(p) = self.plans.iter_mut().find(|p| p.id == id) {
+            p.updated_ms = now;
+        }
+        Ok(x)
+    }
+
+    /// A stage's check reported (`passed`, `failed`, `not-run`), with its evidence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check(&mut self, id: &str, stage: &str, check: &str, status: &str, proof: &str, by: &str, now: u64) -> Result<crate::prscore::Check> {
+        let p = self.plans.iter_mut().find(|p| p.id == id).ok_or_else(|| anyhow::anyhow!("no plan {id}"))?;
+        let ids: Vec<String> = p.stages.iter().map(|s| s.id.clone()).collect();
+        let Some(st) = p.stages.iter_mut().find(|s| s.id.eq_ignore_ascii_case(stage.trim())) else {
+            bail!("plan {id} has no stage {stage:?}: its stages are {}", ids.join(", "));
+        };
+        // The pre and post checks as one list, to report as a PR's are.
+        let mut v = crate::prscore::Validation { checks: st.pre.iter().chain(st.post.iter()).cloned().collect(), edge_cases: vec![] };
+        let c = v.report(check, status, proof, by, now)?;
+        let n = st.pre.len();
+        st.pre = v.checks[..n].to_vec();
+        st.post = v.checks[n..].to_vec();
+        p.updated_ms = now;
+        Ok(c)
+    }
+
     /// The prediction a real PR is, in the plan its space was launched
     /// with (the latest): matched once (`prscore::best_match`), and marked
     /// with the PR's key. (The plan's id, the prediction.)
@@ -467,6 +785,176 @@ impl Book {
     }
 }
 
+/// The planner's structure, checked: `{"stages": [...], "assumptions":
+/// [...], "questions": [...]}`. Every stage has an id, a title, a kind
+/// (`spike`, `build`, `release`), what counts as done and at least one
+/// post-check (each with what, how and the evidence); its PRs are the
+/// plan's; it waits only for stages before it. Every check, assumption and
+/// question has an id and words.
+pub fn structure(v: &Value, prs: &[crate::prscore::Predicted]) -> Result<(Vec<Stage>, Vec<Assumption>, Vec<Question>)> {
+    let word = |x: &Value, k: &str| x[k].as_str().unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some(raw) = v["stages"].as_array().filter(|a| !a.is_empty()) else {
+        bail!("no stages: give {{\"stages\": [{{\"id\": \"s1\", \"title\", \"kind\": \"spike|build|release\", \"done_when\", \"pre\": [checks], \"post\": [checks], \"prs\": [1], \"after\": []}}], \"assumptions\": [...], \"questions\": [...]}}");
+    };
+    let checks_of = |st: &Value, k: &str, sid: &str| -> Result<Vec<crate::prscore::Check>> {
+        let mut out: Vec<crate::prscore::Check> = vec![];
+        for (i, c) in st[k].as_array().into_iter().flatten().enumerate() {
+            let id = match word(c, "id") {
+                i if !i.is_empty() => i,
+                _ => format!("{}{}", if k == "pre" { "p" } else { "c" }, i + 1),
+            };
+            let (what, how, evidence) = (word(c, "what"), word(c, "how"), word(c, "evidence"));
+            if what.is_empty() || how.is_empty() || evidence.is_empty() {
+                bail!("stage {sid}, {k} check {id}: give what it shows, how (the test, the command or the live step) and the evidence it gives");
+            }
+            if out.iter().any(|o| o.id.eq_ignore_ascii_case(&id)) {
+                bail!("stage {sid}: two checks are called {id}");
+            }
+            out.push(crate::prscore::Check { id, what, how, evidence, status: crate::prscore::PLANNED.into(), ..Default::default() });
+        }
+        Ok(out)
+    };
+    let mut stages: Vec<Stage> = vec![];
+    for (i, st) in raw.iter().enumerate() {
+        let id = match word(st, "id") {
+            x if !x.is_empty() => x,
+            _ => format!("s{}", i + 1),
+        };
+        if stages.iter().any(|s| s.id.eq_ignore_ascii_case(&id)) {
+            bail!("two stages are called {id}");
+        }
+        let title = word(st, "title");
+        let done_when = st["done_when"].as_str().unwrap_or("").trim().to_string();
+        if title.is_empty() || done_when.is_empty() {
+            bail!("stage {id}: give its title and what counts as done (done_when)");
+        }
+        let kind = match word(st, "kind").to_lowercase() {
+            k if k.is_empty() => "build".to_string(),
+            k if STAGE_KINDS.contains(&k.as_str()) => k,
+            k => bail!("stage {id}: its kind is spike, build or release, not {k:?}"),
+        };
+        let (pre, post) = (checks_of(st, "pre", &id)?, checks_of(st, "post", &id)?);
+        if post.is_empty() {
+            bail!("stage {id}: give at least one post check (how it is known to be done, and the evidence)");
+        }
+        if let Some(dup) = pre.iter().find(|c| post.iter().any(|o| o.id.eq_ignore_ascii_case(&c.id))) {
+            bail!("stage {id}: a pre and a post check are both called {}", dup.id);
+        }
+        let mut after: Vec<String> = vec![];
+        for a in st["after"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            if !stages.iter().any(|s| s.id.eq_ignore_ascii_case(a.trim())) {
+                bail!("stage {id} waits for {a:?}: a stage waits only for one before it");
+            }
+            after.push(a.trim().to_string());
+        }
+        let mut nums: Vec<u32> = vec![];
+        for n in st["prs"].as_array().into_iter().flatten() {
+            let Some(n) = n.as_u64().map(|n| n as u32) else { bail!("stage {id}: its prs are the plan's PR numbers (1, 2, …)") };
+            if !prs.iter().any(|p| p.n == n) {
+                bail!("stage {id}: the plan has no PR {n} (run `tower plan prs` first; it has {})", if prs.is_empty() { "none".to_string() } else { prs.iter().map(|p| p.n.to_string()).collect::<Vec<_>>().join(", ") });
+            }
+            nums.push(n);
+        }
+        stages.push(Stage { id, title, kind, goal: word(st, "goal"), done_when, after, prs: nums, pre, post });
+    }
+    let mut assumptions: Vec<Assumption> = vec![];
+    for (i, a) in v["assumptions"].as_array().into_iter().flatten().enumerate() {
+        let id = match word(a, "id") {
+            x if !x.is_empty() => x,
+            _ => format!("a{}", i + 1),
+        };
+        let (text, check, by) = (word(a, "text"), word(a, "check"), word(a, "by"));
+        if text.is_empty() || check.is_empty() {
+            bail!("assumption {id}: give its text and how it is checked (check)");
+        }
+        if !by.is_empty() && !stages.iter().any(|s| s.id.eq_ignore_ascii_case(&by)) {
+            bail!("assumption {id} must hold by {by:?}: no such stage");
+        }
+        assumptions.push(Assumption { id, text, check, by, status: "open".into(), proof: String::new() });
+    }
+    let mut questions: Vec<Question> = vec![];
+    for (i, q) in v["questions"].as_array().into_iter().flatten().enumerate() {
+        let id = match word(q, "id") {
+            x if !x.is_empty() => x,
+            _ => format!("q{}", i + 1),
+        };
+        let text = word(q, "text");
+        if text.is_empty() {
+            bail!("question {id}: give its words (text)");
+        }
+        if questions.iter().any(|x| x.id.eq_ignore_ascii_case(&id)) {
+            bail!("two questions are called {id}");
+        }
+        let options: Vec<QOption> = q["options"].as_array().into_iter().flatten().map(|o| QOption { label: word(o, "label"), why: word(o, "why") }).filter(|o| !o.label.is_empty()).collect();
+        let recommended = q["recommended"].as_u64().map(|n| n as usize).filter(|n| *n < options.len());
+        let stage = word(q, "stage");
+        if !stage.is_empty() && !stages.iter().any(|s| s.id.eq_ignore_ascii_case(&stage)) {
+            bail!("question {id} holds up {stage:?}: no such stage");
+        }
+        questions.push(Question { id, text, why: word(q, "why"), options, recommended, theirs: q["theirs"] == true, stage, status: Q_OPEN.into(), ..Default::default() });
+    }
+    Ok((stages, assumptions, questions))
+}
+
+/// What the brain is told of a plan's question it may answer itself: the
+/// question, its options and the planner's pick, and the two ways out.
+pub fn question_note(plan: &str, space: &str, q: &Question, tower: &str) -> String {
+    let t = tower_word(tower);
+    let body = json!({
+        "plan": plan,
+        "space": space,
+        "question": q.id,
+        "text": q.text,
+        "why": q.why,
+        "options": q.options,
+        "recommended": q.recommended.and_then(|i| q.options.get(i)).map(|o| o.label.clone()),
+        "stage": q.stage,
+    });
+    format!(
+        "[plan-question] {plan} {} {} Answer it yourself only when it is routine (the 90/10 rule: the planner's pick or the obvious answer, nothing the user would want a say in): `{t} plan answer {plan} {} \"<the answer, and why in a few words>\" --by tower`. Otherwise give it to the user: `{t} plan ask {plan} {}`. Say nothing to the user about it either way.",
+        q.id,
+        serde_json::to_string(&body).unwrap_or_default(),
+        q.id,
+        q.id
+    )
+}
+
+/// A plan's question as its card in the user's queue asks it.
+pub fn card_of(plan: &str, space: Option<&str>, q: &Question) -> crate::decisions::PlanAsk {
+    let what = space.filter(|s| !s.trim().is_empty()).map(|s| format!("The plan of {s}")).unwrap_or_else(|| format!("Plan {plan}"));
+    let mut detail = format!("{what} asks this before its work starts.");
+    if !q.why.trim().is_empty() {
+        detail += &format!(" Why it matters: {}", q.why.trim());
+    }
+    if !q.stage.trim().is_empty() {
+        detail += &format!(" It holds up stage {}.", q.stage.trim());
+    }
+    crate::decisions::PlanAsk {
+        plan: plan.to_string(),
+        question: q.id.clone(),
+        space: space.map(String::from),
+        title: q.text.trim().to_string(),
+        detail,
+        options: q.options.iter().enumerate().map(|(i, o)| (o.label.clone(), o.why.clone(), q.recommended == Some(i))).collect(),
+    }
+}
+
+/// What the planner is told when one of its questions is answered: put it
+/// in the plan and republish, and send the stages again if it changes them.
+pub fn answered_note(p: &Plan, q: &Question, tower: &str) -> String {
+    let t = tower_word(tower);
+    let who = if q.by == "tower" { "the tower's brain, as routine" } else { "the user" };
+    let left = p.open_questions().len();
+    let rest = match left {
+        0 => "No question is open now.".to_string(),
+        n => format!("{n} question{} still open: the tower asks {}; you'll be told each answer.", if n == 1 { " is" } else { "s are" }, if n == 1 { "it" } else { "them" }),
+    };
+    format!(
+        "[plan {}] {} is answered by {who}: {}\n\nWrite it into plan.md and the artifact: the question moves to \"Answered\" with its answer, and what it changes in the plan changes with it. If it changes the stages, assumptions or checks, send them again with `{t} plan stages {} --json-file stages.json`. Then republish the same artifact and run `{t} plan published {} --url <its link>`. {rest}",
+        p.id, q.id, q.answer, p.id, p.id
+    )
+}
+
 /// A draft a plan can be made of: the receipt `tower launch --draft`
 /// prints, with its space and at least one session's repo.
 pub fn check_draft(v: &Value) -> Result<()> {
@@ -555,9 +1043,11 @@ pub fn instructions(p: &Plan, tower: &str) -> String {
     s += "1. **The sessions**: for each one, what it does, and in what order: which starts first, what waits for what, what each hands the others.\n";
     s += "2. **How the repositories fit together**: the APIs, the data and the contracts between them (endpoints, payloads, events, schemas, settings), and which repository owns each.\n";
     s += "3. **The risks.**\n";
-    s += "4. **The open questions** for the user.\n";
+    s += "4. **The open questions**: never left on the page for the user to find. Each goes to the tower (see 3), which gets it answered: by its brain when it is routine, else as a card in the user's queue, on the Mac and the phone. The page lists each question with its answer, or as \"asked in the tower\" until it has one.\n";
     s += "5. **How it will be validated, for sure**: for each session (each task) and each pull request, the exact tests to add or run (the test file and the test's name), the commands, and the live checks (run it, open it, check the deployed state on dev), and the evidence each produces (test output, screenshots, logs); then the edge cases to cover, each tied to the check that covers it. This is what gives the user the confidence to merge and release: make it concrete enough that someone else could run every check and see its evidence.\n";
-    s += "6. **The pull requests** it will open, when it changes code, each with its validation and edge cases (see 2).\n\n";
+    s += "6. **The pull requests** it will open, when it changes code, each with its validation and edge cases (see 2).\n";
+    s += "7. **The stages**: the milestones of the work, in order, each with what counts as done, how that is checked before its work starts (pre: the assumptions it rests on, access, data, environments) and after (post: the exact tests, commands and live checks, and the evidence each gives), and the PRs it delivers. What is unknown or risky comes first, as a short `spike` stage whose findings shape the rest. The last stage is the release, when there is one.\n";
+    s += "8. **The assumptions**: what the plan takes for granted, each with how it is checked and by which stage.\n\n";
     s += "In `plan.md`, put each session under a `### <its repository's folder name>` heading inside a `## Sessions` section (a launched session is handed its own part), with a `#### Validation` (each check: what it shows, how, the evidence), a `#### Edge cases` (each case, and the check that covers it) and a `#### Who depends on it` (what outside uses what it changes, and whether it still works) inside it, and the rest under `##` headings of their own.\n\n";
     s += "## 2. The pull requests\n\n";
     s += "When the plan changes code, say what the future pull requests will look like: one entry per PR. Write them to `prs.json` in this folder:\n\n";
@@ -574,22 +1064,32 @@ pub fn instructions(p: &Plan, tower: &str) -> String {
     s += &format!(
         "Then run `{t} plan prs {id} --json-file prs.json`. The tower checks each PR and gives it a review score: **Needs review** (a migration, a breaking change, or something on the escalate list, from your flags, its files and its words) or **Low risk**, and why. It refuses a PR without checks, with an edge case no check covers, or that doesn't say who depends on it. When something outside would break, it is a breaking change: say what breaks and who uses it as plainly as the score. It prints them: put a `## Pull requests` section in `plan.md` and in what you publish, one entry per PR (its repository, into which branch, its title, what it changes, roughly which files) with its score and the reason exactly as the tower printed them, then its validation (each check: what, how, the evidence) and its edge cases (each with the checks that cover it), shown as plainly as the score. Be honest in the flags: a PR scored low risk may be merged into dev by the tower without a person reading it, when the user has turned that on.\n\n"
     );
-    s += "## 3. Publish it\n\n";
+    s += "## 3. The stages, the assumptions and the questions\n\n";
+    s += "Write them to `stages.json` in this folder (after `tower plan prs`, so a stage can name its PRs by number):\n\n";
+    s += "```json\n{\"stages\": [{\"id\": \"s1\", \"title\": \"<a few words>\", \"kind\": \"spike|build|release\", \"goal\": \"<what it delivers>\", \"done_when\": \"<what counts as done, concretely>\", \"after\": [], \"prs\": [1],\n  \"pre\": [{\"id\": \"p1\", \"what\": \"<what must hold before the work starts>\", \"how\": \"<how it is checked>\", \"evidence\": \"<what shows it>\"}],\n  \"post\": [{\"id\": \"c1\", \"what\": \"<what it shows>\", \"how\": \"<the exact test, command or live step>\", \"evidence\": \"<test output, a screenshot, a log, the deployed state>\"}]}],\n \"assumptions\": [{\"id\": \"a1\", \"text\": \"<what the plan takes for granted>\", \"check\": \"<how it is checked>\", \"by\": \"s1\"}],\n \"questions\": [{\"id\": \"q1\", \"text\": \"<the question>\", \"why\": \"<what turns on it>\", \"options\": [{\"label\": \"<an answer>\", \"why\": \"<why>\"}], \"recommended\": 0, \"theirs\": false, \"stage\": \"s2\"}]}\n```\n\n";
+    s += "- Every stage has `done_when` and at least one `post` check; a stage's `prs` are the numbers `tower plan prs` gave; `after` names stages before it. A stage is done only when every check of it passed with evidence, and the PRs it delivers passed theirs.\n";
+    s += "- Spikes first: when an API, a data shape, a library, access or performance is not known, make it a `spike` stage at the start whose post-checks say what it must find out; the build stages wait for it (`after`).\n";
+    s += "- `questions`: each with two or three `options` and the one you recommend (`recommended`, an index). `theirs: true` when only the user can decide it (scope, product, money, who does what, anything they'd want a say in); else the tower's brain answers it when it is routine and passes it on when it isn't. Secrets, deploys, deletes, production data and money always go to the user.\n";
+    s += &format!("- Then run `{t} plan stages {id} --json-file stages.json`. It refuses a stage without what counts as done or a post check, a PR the plan doesn't have, or a stage waiting for one after it, and says why.\n");
+    s += &format!(
+        "- The answers come back to you as `[plan {id}] q2 is answered by …`: write each into `plan.md` and the artifact, change what it changes (and send `stages.json` again when the stages change), and republish.\n\n"
+    );
+    s += "## 4. Publish it\n\n";
     match p.form {
         Form::Page => {
             s += &format!(
-                "Publish it with your Artifact tool as an **HTML page** Artifact: one self-contained page titled \"Plan · {space}\", with the sessions in order (one card each), how the repositories fit together, the risks, the open questions, and the pull requests, each with its score, its validation (every check: what, how, the evidence) and its edge cases, as plainly as the score. It is private to the user's account. Publish one artifact only; every change later republishes this same one (its `url`).\n\n"
+                "Publish it with your Artifact tool as an **HTML page** Artifact: one self-contained page titled \"Plan · {space}\", with the stages first (stage N of M, each with its kind, what counts as done, its pre and post checks, each check's what, how and evidence, and its PRs), the sessions in order (one card each), how the repositories fit together, the assumptions (each with its check and the stage it must hold by), the risks, the questions (each answered one with its answer and who gave it; an open one as \"asked in the tower\"), and the pull requests, each with its score, its validation (every check: what, how, the evidence) and its edge cases, as plainly as the score. It is private to the user's account. Publish one artifact only; every change later republishes this same one (its `url`).\n\n"
             );
         }
         Form::Whiteboard => {
             s += &format!(
-                "Publish it with your Artifact tool as a **Whiteboard** Artifact, made from the account's Artifact type `{WHITEBOARD_TYPE}` (publish with that `type_url` and the title \"Plan · {space}\", then fill it as the type's instructions say): a block per session (its repository, what it does, its place in the order), arrows for the dependencies between them (who waits for whom, who calls whom), a section for the risks and the open questions, and a block per pull request with its score, its checks and its edge cases. It is private to the user's account. Make one whiteboard only; every change later updates this same one (its `url`).\n\n"
+                "Publish it with your Artifact tool as a **Whiteboard** Artifact, made from the account's Artifact type `{WHITEBOARD_TYPE}` (publish with that `type_url` and the title \"Plan · {space}\", then fill it as the type's instructions say): a block per session (its repository, what it does, its place in the order), arrows for the dependencies between them (who waits for whom, who calls whom), a lane of stages in order (each with what counts as done and its pre and post checks), a section for the assumptions, the risks and the questions (with their answers, or \"asked in the tower\"), and a block per pull request with its score, its checks and its edge cases. It is private to the user's account. Make one whiteboard only; every change later updates this same one (its `url`).\n\n"
             );
         }
     }
     s += &format!("Then say so: `{t} plan published {id} --url <the artifact's link>`.\n\n");
     s += &format!("If you can't publish it (no Artifact tool, an error that stays), say why and stop: `{t} plan failed {id} \"<why, in a line>\"`.\n\n");
-    s += "## 4. Then: the chat\n\n";
+    s += "## 5. Then: the chat\n\n";
     s += &format!(
         "After that you wait. What the user says about the plan reaches you as a prompt that begins `[plan {id}] The user says:`. Answer it in a few sentences with `{t} plan say {id} \"<your answer>\"`: that is the only way your answer reaches them (nobody reads this terminal). Never ask anything in this terminal; ask with `plan say`.\n\n"
     );
@@ -617,8 +1117,8 @@ pub fn first_task(p: &Plan, tower: &str) -> String {
         Form::Whiteboard => format!("a Whiteboard Artifact (from the Artifact type {WHITEBOARD_TYPE})"),
     };
     format!(
-        "[plan {}] Read instructions.md in this folder, then ticket.md and draft.json. Write the full plan of the draft into plan.md; when it changes code, list its pull requests in prs.json and score them with `{t} plan prs {} --json-file prs.json`; publish it as {form}, and say so with `{t} plan published {} --url <its link>`. Then wait for the user's messages.",
-        p.id, p.id, p.id
+        "[plan {}] Read instructions.md in this folder, then ticket.md and draft.json. Write the full plan of the draft into plan.md; when it changes code, list its pull requests in prs.json and score them with `{t} plan prs {} --json-file prs.json`; write its stages, assumptions and questions in stages.json and send them with `{t} plan stages {} --json-file stages.json`; publish it as {form}, and say so with `{t} plan published {} --url <its link>`. Then wait for the user's messages and the answers to its questions.",
+        p.id, p.id, p.id, p.id
     )
 }
 
@@ -712,6 +1212,8 @@ pub struct PlanBrief {
     pub md: String,
     /// The PRs it predicts, with their checks and edge cases.
     pub prs: Vec<crate::prscore::Predicted>,
+    /// Its stages, with what counts as done and their checks.
+    pub stages: Vec<Stage>,
 }
 
 /// A markdown heading's level and words, if the line is one.
@@ -784,6 +1286,31 @@ pub fn brief_text(b: &PlanBrief, mine: &str, others: &[String]) -> String {
         };
     }
     s += &checks_text(&b.prs, mine);
+    s += &stages_text(&b.id, &b.stages, &b.prs, mine);
+    s
+}
+
+/// What a launched session is told of the plan's stages: each with what
+/// counts as done and its checks (its own PRs marked), and how a stage's
+/// check is reported. A stage is done only when every check of it passed
+/// with evidence.
+pub fn stages_text(id: &str, stages: &[Stage], prs: &[crate::prscore::Predicted], mine: &str) -> String {
+    if stages.is_empty() {
+        return String::new();
+    }
+    let mut s = format!(
+        "\n\nThe plan's stages, in order. A stage is done only when every check of it passed with evidence; work on a stage starts once its pre-checks passed. Report a stage's check you ran with `tower plan check {id} <stage> <check> passed|failed|not-run --evidence \"<the test output, a screenshot's path, a log, or why it wasn't run>\"`."
+    );
+    for st in stages {
+        let own: Vec<String> = st.prs.iter().filter_map(|n| prs.iter().find(|p| p.n == *n)).filter(|p| !mine.is_empty() && p.repo.eq_ignore_ascii_case(mine)).map(|p| format!("PR {}", p.n)).collect();
+        s += &format!("\n\n{} ({}): {}. Done when: {}", st.id, st.kind, st.title, st.done_when.trim_end_matches('.'));
+        if !own.is_empty() {
+            s += &format!(". Yours: {}", own.join(", "));
+        }
+        for (when, c) in st.checks() {
+            s += &format!("\n- {when} {}: {} (how: {}; evidence: {})", c.id, c.what, c.how, c.evidence);
+        }
+    }
     s
 }
 
@@ -816,6 +1343,22 @@ pub fn show(id: Option<&str>) -> Result<Value> {
     Ok(book.pick(id)?.view())
 }
 
+/// No plan goes out with questions on its page: a launch with one whose
+/// questions aren't all answered is refused, and says which.
+pub fn no_open_questions(id: &str, v: &Value) -> Result<()> {
+    let open: Vec<String> = v["questions"].as_array().into_iter().flatten().filter(|q| q["status"] != Q_ANSWERED).map(|q| format!("{} ({})", q["id"].as_str().unwrap_or(""), q["text"].as_str().unwrap_or(""))).collect();
+    if open.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "--plan {id}: {} question{} still open: {}. Answer {} in the tower's queue (or `tower plan answer {id} <question> \"<answer>\"`) first",
+        open.len(),
+        if open.len() == 1 { " is" } else { "s are" },
+        open.join("; "),
+        if open.len() == 1 { "it" } else { "them" }
+    )
+}
+
 /// What a launch with the plan `id` hands its sessions: its link and its markdown.
 pub fn brief_of(id: &str) -> Result<PlanBrief> {
     let v = show(Some(id))?;
@@ -824,8 +1367,10 @@ pub fn brief_of(id: &str) -> Result<PlanBrief> {
     if md.trim().is_empty() && url.is_none() {
         bail!("--plan {id}: the plan isn't written yet (no plan.md, no link)");
     }
+    no_open_questions(id, &v)?;
     let prs = serde_json::from_value(v["prs"].clone()).unwrap_or_default();
-    Ok(PlanBrief { id: id.to_string(), url, md, prs })
+    let stages = serde_json::from_value(v["stages"].clone()).unwrap_or_default();
+    Ok(PlanBrief { id: id.to_string(), url, md, prs, stages })
 }
 
 // ---------------------------------------------------------------------------
@@ -852,10 +1397,14 @@ pub struct Args {
     pub who: Option<Who>,
     /// `close`: the space launched with it.
     pub launched: Option<String>,
+    /// `answer`: who answers (`tower`: the brain; else the user).
+    pub by: Option<String>,
+    /// `check`: the evidence of its result.
+    pub evidence: Option<String>,
     pub json: bool,
 }
 
-const USAGE: &str = "tower plan new --form page|whiteboard --draft '<draft JSON>' --ticket-file <file> | say <id> \"<words>\" [--as user|planner] | draft <id> --json-file <file> | prs <id> --json-file <file> | published <id> --url <link> | failed <id> \"<why>\" | show [<id>] [--json] | close [<id>] | list";
+const USAGE: &str = "tower plan new --form page|whiteboard --draft '<draft JSON>' --ticket-file <file> | say <id> \"<words>\" [--as user|planner] | draft <id> --json-file <file> | prs <id> --json-file <file> | stages <id> --json-file <file> | answer <id> <question> \"<answer>\" [--by tower|you] | ask <id> <question> | check <id> <stage> <check> passed|failed|not-run --evidence \"<…>\" | published <id> --url <link> | failed <id> \"<why>\" | show [<id>] [--json] | close [<id>] | list";
 
 /// Reads `tower plan …`'s words (after `plan`): the action, its flags, the id, the words.
 pub fn parse_args(raw: &[String]) -> Result<Args> {
@@ -887,6 +1436,8 @@ pub fn parse_args(raw: &[String]) -> Result<Args> {
             "--url" => a.url = Some(value("--url")?),
             "--as" => a.who = Some(Who::parse(&value("--as")?)?),
             "--launched" => a.launched = Some(value("--launched")?),
+            "--by" => a.by = Some(value("--by")?),
+            "--evidence" => a.evidence = Some(value("--evidence")?),
             "--json" => a.json = true,
             f if f.starts_with("--") && f.len() > 2 => bail!("tower plan: no flag {f}: {USAGE}"),
             _ => words.push(w.clone()),
@@ -909,10 +1460,16 @@ pub fn parse_args(raw: &[String]) -> Result<Args> {
         "draft" if a.id.is_none() || a.json_file.is_none() => bail!("tower plan draft <id> --json-file <the revised draft>"),
         "prs" if a.id.is_none() || a.json_file.is_none() => bail!("tower plan prs <id> --json-file <the predicted PRs: {{\"prs\":[{{\"repo\",\"base\",\"title\",\"changes\",\"files\",\"migration\",\"breaking\",\"escalate\",\"after\"}}]}}>"),
         "published" if a.id.is_none() || a.url.is_none() => bail!("tower plan published <id> --url <the artifact's link>"),
-        "say" | "failed" | "draft" | "prs" | "published" | "show" | "close" | "list" => {}
+        "stages" if a.id.is_none() || a.json_file.is_none() => bail!("tower plan stages <id> --json-file <the plan's stages, assumptions and questions>"),
+        "answer" if a.id.is_none() || a.words.split_whitespace().count() < 2 => bail!("tower plan answer <id> <question> \"<the answer>\" [--by tower|you]"),
+        "ask" if a.id.is_none() || a.words.split_whitespace().count() != 1 => bail!("tower plan ask <id> <question>: it goes to the user's queue"),
+        "check" if a.id.is_none() || a.words.split_whitespace().count() != 3 || a.evidence.is_none() => {
+            bail!("tower plan check <id> <stage> <check> passed|failed|not-run --evidence \"<the test output, a screenshot's path, a log, or why it wasn't run>\"")
+        }
+        "say" | "failed" | "draft" | "prs" | "stages" | "answer" | "ask" | "check" | "published" | "show" | "close" | "list" => {}
         other => bail!("tower plan {other}: {USAGE}"),
     }
-    if !a.words.is_empty() && !matches!(a.action.as_str(), "say" | "failed") {
+    if !a.words.is_empty() && !matches!(a.action.as_str(), "say" | "failed" | "answer" | "ask" | "check") {
         bail!("tower plan {}: what is {:?}? {USAGE}", a.action, a.words);
     }
     Ok(a)
@@ -938,11 +1495,23 @@ pub fn request(a: &Args) -> Result<Value> {
         who: a.who.map(|w| w.word().to_string()).unwrap_or_default(),
         launched: a.launched.clone(),
         prs: None,
+        body: body_of(a),
     })?;
     if !r.ok {
         bail!("{}", r.error.unwrap_or_else(|| "the tower said no".into()));
     }
     Ok(r.state.unwrap_or_default())
+}
+
+/// What `answer`, `ask` and `check` name, for the daemon.
+fn body_of(a: &Args) -> Option<Value> {
+    let w: Vec<&str> = a.words.split_whitespace().collect();
+    match a.action.as_str() {
+        "answer" => Some(json!({ "question": w.first().copied().unwrap_or(""), "answer": w.get(1..).map(|r| r.join(" ")).unwrap_or_default(), "by": a.by.clone().unwrap_or_default() })),
+        "ask" => Some(json!({ "question": w.first().copied().unwrap_or("") })),
+        "check" => Some(json!({ "stage": w.first(), "check": w.get(1), "status": w.get(2), "evidence": a.evidence.clone().unwrap_or_default() })),
+        _ => None,
+    }
 }
 
 /// A plan in words.
@@ -995,6 +1564,7 @@ pub fn cmd(raw: &[String]) -> Result<()> {
                 who: String::new(),
                 launched: None,
                 prs: None,
+                body: None,
             })?;
             if !r.ok {
                 bail!("{}", r.error.unwrap_or_default());
@@ -1024,6 +1594,7 @@ pub fn cmd(raw: &[String]) -> Result<()> {
                 who: String::new(),
                 launched: None,
                 prs: None,
+                body: None,
             })?;
             if !sent.ok {
                 bail!("{}", sent.error.unwrap_or_default());
@@ -1036,6 +1607,33 @@ pub fn cmd(raw: &[String]) -> Result<()> {
             let mut v = sent.state.unwrap_or_default();
             v["took"] = json!(crate::ticket::said(&r));
             v
+        }
+        "stages" => {
+            let id = a.id.clone().unwrap_or_default();
+            let file = a.json_file.clone().unwrap_or_default();
+            let text = std::fs::read_to_string(&file).map_err(|e| anyhow::anyhow!("--json-file {file}: {e}"))?;
+            let v: Value = serde_json::from_str(text.trim()).map_err(|e| anyhow::anyhow!("--json-file {file}: not JSON ({e})"))?;
+            // Checked here first, to say what's wrong before the daemon is asked.
+            let plan = show(Some(&id))?;
+            let prs: Vec<crate::prscore::Predicted> = serde_json::from_value(plan["prs"].clone()).unwrap_or_default();
+            structure(&v, &prs)?;
+            let sent = crate::protocol::send(&crate::protocol::Request::Plan {
+                action: "stages".into(),
+                id,
+                form: String::new(),
+                ticket: String::new(),
+                draft: None,
+                text: String::new(),
+                url: String::new(),
+                who: String::new(),
+                launched: None,
+                prs: None,
+                body: Some(v),
+            })?;
+            if !sent.ok {
+                bail!("{}", sent.error.unwrap_or_default());
+            }
+            sent.state.unwrap_or_default()
         }
         "prs" => {
             let id = a.id.clone().unwrap_or_default();
@@ -1056,6 +1654,7 @@ pub fn cmd(raw: &[String]) -> Result<()> {
                 who: String::new(),
                 launched: None,
                 prs: Some(v),
+                body: None,
             })?;
             if !sent.ok {
                 bail!("{}", sent.error.unwrap_or_default());
@@ -1247,7 +1846,7 @@ mod tests {
     #[test]
     fn a_launched_session_is_told_its_prs_checks_and_how_to_report_them() {
         let prs = crate::prscore::check(&crate::prscore::tests::two_prs(), &repos_of(&draft())).unwrap();
-        let b = PlanBrief { id: "p1".into(), url: Some("https://claude.ai/artifact/x".into()), md: "# Plan\n\nShort.".into(), prs };
+        let b = PlanBrief { id: "p1".into(), url: Some("https://claude.ai/artifact/x".into()), md: "# Plan\n\nShort.".into(), prs, stages: vec![] };
         let text = brief_text(&b, "eyzflow-admin-dashboard", &["eyz-customer-support".into()]);
         assert!(text.contains("tower validate <the PR's link> <check> passed|failed|not-run --evidence"), "{text}");
         assert!(text.contains("what isn't reported then counts as not run"), "{text}");
@@ -1256,6 +1855,22 @@ mod tests {
         assert!(!text.contains("Store each message's translation"), "only its own PRs: {text}");
         // A session whose repo has no predicted PR is told nothing of checks.
         assert!(!brief_text(&b, "other-repo", &[]).contains("tower validate"));
+    }
+
+    #[test]
+    fn a_launched_session_is_told_the_stages_its_prs_belong_to_and_how_to_report_a_stage_check() {
+        let prs = crate::prscore::check(&crate::prscore::tests::two_prs(), &repos_of(&draft())).unwrap();
+        let v = json!({ "stages": [
+            { "id": "s1", "title": "Spike", "kind": "spike", "done_when": "We know the API.", "post": [{ "id": "c1", "what": "w1", "how": "h1", "evidence": "e1" }] },
+            { "id": "s2", "title": "Build", "after": ["s1"], "prs": [1, 2], "done_when": "It works on dev", "pre": [{ "id": "p1", "what": "access", "how": "a call", "evidence": "its reply" }], "post": [{ "id": "c1", "what": "w2", "how": "h2", "evidence": "e2" }] } ] });
+        let (stages, _, _) = structure(&v, &prs).unwrap();
+        let b = PlanBrief { id: "p4".into(), prs, stages, ..Default::default() };
+        let text = brief_text(&b, "eyzflow-admin-dashboard", &[]);
+        assert!(text.contains("A stage is done only when every check of it passed with evidence"), "{text}");
+        assert!(text.contains("`tower plan check p4 <stage> <check> passed|failed|not-run --evidence"), "{text}");
+        assert!(text.contains("s1 (spike): Spike. Done when: We know the API\n- post c1: w1 (how: h1; evidence: e1)"), "{text}");
+        assert!(text.contains("s2 (build): Build. Done when: It works on dev. Yours: PR 2\n- pre p1: access"), "{text}");
+        assert!(!brief_text(&PlanBrief::default(), "x", &[]).contains("stages"), "no stages: nothing said");
     }
 
     #[test]
@@ -1275,8 +1890,8 @@ mod tests {
             "**Low risk**",
             "## Pull requests",
             "its score and the reason exactly as the tower printed them",
-            "## 3. Publish it",
-            "## 4. Then: the chat",
+            "## 4. Publish it",
+            "## 5. Then: the chat",
             "**the pull requests**: change `prs.json`",
             "How it will be validated, for sure",
             "the exact tests to add or run",
@@ -1364,9 +1979,26 @@ mod tests {
         for part in ["what it does, and in what order", "APIs, the data and the contracts", "risks", "open questions", "How it will be validated, for sure", "### <its repository's folder name>"] {
             assert!(text.contains(part), "{part}: {text}");
         }
+        // Stages with what counts as done and their checks; assumptions; questions that go to the tower, never left on the page.
+        for part in [
+            "## 3. The stages, the assumptions and the questions",
+            "/bin/tower plan stages p1 --json-file stages.json",
+            "Spikes first",
+            "\"pre\": [{",
+            "\"post\": [{",
+            "`theirs: true` when only the user can decide it",
+            "Secrets, deploys, deletes, production data and money always go to the user",
+            "never left on the page",
+            "\"asked in the tower\"",
+            "[plan p1] q2 is answered by",
+            "the stages first (stage N of M",
+        ] {
+            assert!(text.contains(part), "{part}: {text}");
+        }
+        assert!(first_task(&page, "/bin/tower").contains("/bin/tower plan stages p1 --json-file stages.json"));
         let (board, _) = b.add(Form::Whiteboard, "The ticket", draft(), |id| PathBuf::from(format!("/s/{id}")), 2);
         let text = instructions(&board, "/bin/tower");
-        assert!(text.contains("**Whiteboard**") && text.contains(WHITEBOARD_TYPE) && text.contains("a block per session") && text.contains("arrows") && text.contains("a section for the risks"), "{text}");
+        assert!(text.contains("**Whiteboard**") && text.contains(WHITEBOARD_TYPE) && text.contains("a block per session") && text.contains("arrows") && text.contains("a section for the assumptions, the risks and the questions") && text.contains("a lane of stages"), "{text}");
         assert!(first_task(&board, "/bin/tower").contains(WHITEBOARD_TYPE));
         let first = first_task(&page, "/bin/tower");
         assert!(first.starts_with("[plan p1] Read instructions.md") && first.contains("/bin/tower plan published p1 --url"), "{first}");
