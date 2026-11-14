@@ -29,6 +29,37 @@ use serde_json::Value;
 
 /// A job with no write and no CPU for this long may be stuck.
 pub const QUIET_MS: u64 = 30 * 60_000;
+
+/// `QUIET_MS`, or `HERDER_TOWER_JOB_QUIET_SECS` (a test tower's, to see a
+/// quiet job flagged without waiting half an hour).
+pub fn quiet_ms() -> u64 {
+    std::env::var("HERDER_TOWER_JOB_QUIET_SECS").ok().and_then(|s| s.trim().parse::<u64>().ok()).map(|s| s * 1000).unwrap_or(QUIET_MS)
+}
+
+/// Words of a finite step: a call that says one of them ends by itself.
+const FINITE: &[&str] = &[
+    "build", "builds", "rebuild", "test", "tests", "testing", "train", "training", "retrain", "migrate", "migration", "migrations", "import",
+    "export", "seed", "install", "lint", "typecheck", "bench", "benchmark", "eval", "evaluate", "deploy", "compile", "generate", "backfill",
+    "sync", "download", "upload", "convert", "score", "scan", "check", "checks", "run once",
+];
+
+fn words_of(s: &str) -> Vec<String> {
+    s.to_lowercase().split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).map(String::from).collect()
+}
+
+/// A call's description that says it serves or watches and nothing finite:
+/// "Start Postgres and dev servers in Docker", "Serve the docs", "Watch the
+/// styles", "Bring up the stack"; not "Restart v2 training", "Start the import".
+pub fn described_server(description: &str) -> bool {
+    let w = words_of(description);
+    let has = |x: &str| w.iter().any(|y| y == x);
+    let pair = |a: &str, b: &str| w.windows(2).any(|p| p[0] == a && p[1] == b);
+    let serving = ["server", "servers", "serve", "serves", "serving", "watch", "watcher", "watching", "start", "starts", "starting"].iter().any(|x| has(x))
+        || pair("dev", "server")
+        || ["bring", "spin", "compose", "stack"].iter().any(|a| pair(a, "up"));
+    let finite = FINITE.iter().any(|f| if f.contains(' ') { description.to_lowercase().contains(f) } else { has(f) });
+    serving && !finite
+}
 /// A background shell is a job once it has run this long…
 pub const MIN_JOB_MS: u64 = 2 * 60_000;
 /// …or once it is seen running while its session's turn is over (done or
@@ -359,10 +390,35 @@ fn serves(command: &str) -> Option<Kind> {
     // A command that sets the port it serves on, or runs a dev-server script, serves too.
     let sets_port = c.split_whitespace().any(|t| t.strip_prefix("port=").is_some_and(|v| !v.is_empty() && v.chars().all(|ch| ch.is_ascii_digit())));
     let dev_server = ["dev-server", "devserver", "dev_server"].iter().any(|w| c.contains(w));
-    if SERVE.iter().any(|s| c.contains(s)) || compose_up(&c) || sets_port || dev_server {
+    if SERVE.iter().any(|s| c.contains(s)) || compose_up(&c) || docker_run(&c) || sets_port || dev_server || server_script(&c) {
         return Some(Kind::Server);
     }
     None
+}
+
+/// `docker run …` in the foreground that isn't a one-off: without `--rm`
+/// (a one-off removes itself when it ends) and without `-d` (that returns
+/// at once): a container left running.
+fn docker_run(c: &str) -> bool {
+    let toks: Vec<&str> = c.split_whitespace().collect();
+    (0..toks.len()).any(|i| {
+        if !(toks[i] == "docker" && toks.get(i + 1) == Some(&"run")) {
+            return false;
+        }
+        let own: Vec<&str> = toks[i + 2..].iter().copied().take_while(|t| !matches!(*t, "&&" | "||" | ";" | "|")).collect();
+        !own.iter().any(|t| matches!(*t, "--rm" | "-d" | "--detach") || (t.starts_with('-') && !t.starts_with("--") && t.len() > 2 && t.contains('d') && !t.contains('=')))
+    })
+}
+
+/// A program named as a server (`node server.js`, `python serve.py`,
+/// `./scripts/start-server.sh`) with no finite word in the command.
+fn server_script(c: &str) -> bool {
+    let named = c.split_whitespace().any(|t| {
+        let base = t.rsplit('/').next().unwrap_or(t);
+        let stem = base.split('.').next().unwrap_or(base);
+        matches!(stem, "server" | "serve" | "start-server" | "run-server" | "devserver" | "dev-server")
+    });
+    named && !words_of(c).iter().any(|w| FINITE.contains(&w.as_str()))
 }
 
 /// `docker compose [options] up [options]` (or `docker-compose …`) without
@@ -389,6 +445,10 @@ pub fn kind_of(task: Option<&Task>, commands: &[&str], listening: bool) -> Kind 
         return Kind::Watch;
     }
     if listening {
+        return Kind::Server;
+    }
+    // Its call says it serves or watches (and nothing finite): a server left running.
+    if task.is_some_and(|t| described_server(&t.description)) {
         return Kind::Server;
     }
     let mut seen = None;
@@ -658,7 +718,7 @@ pub fn look(claude: u32, world: &World, tasks: &Tasks, now_ms: u64, turn_over: b
                     since_ms,
                     progress_ms,
                     busy,
-                    stuck: !busy && quiet > QUIET_MS,
+                    stuck: !busy && quiet > quiet_ms(),
                     pid: Some(shell.pid),
                     task: task_id.clone(),
                     source: "background".into(),
@@ -785,6 +845,21 @@ mod tests {
             assert_eq!(kind_of(Some(&bash(c)), &[], false), Kind::Server, "{c}");
         }
         assert_eq!(kind_of(Some(&bash("node scripts/report.js --port-check")), &[], false), Kind::Job);
+        // A container left running in the foreground: a server; a one-off (`--rm`) or detached: not.
+        for c in ["docker run -p 5432:5432 postgres:16", "docker run --name db -e X=1 postgres", "node server.js", "python3 serve.py --port 9000", "./scripts/start-server.sh"] {
+            assert_eq!(kind_of(Some(&bash(c)), &[], false), Kind::Server, "{c}");
+        }
+        for c in ["docker run --rm migrate/migrate up", "docker run -d postgres", "node scripts/build-server.js", "python serve_report.py"] {
+            assert_eq!(kind_of(Some(&bash(c)), &[], false), Kind::Job, "{c}");
+        }
+        // By what its call says it does.
+        let said = |d: &str, c: &str| Task { kind: TaskKind::Bash, description: d.into(), command: c.into(), ..Default::default() };
+        for (d, c) in [("Start Postgres and dev servers in Docker", "make dev > dev.log 2>&1"), ("Serve the docs locally", "mkdocs x"), ("Watch the styles", "sass a b"), ("Bring up the local stack", "./stack.sh")] {
+            assert_eq!(kind_of(Some(&said(d, c)), &[], false), Kind::Server, "{d}");
+        }
+        for (d, c) in [("Restart v2 training with gradient checkpointing", "python train.py"), ("Start the import of last week's orders", "node import.js"), ("Start the dev server build and run its tests", "npm run build && npm test"), ("Rerun query export in background with logging", "python export.py")] {
+            assert_eq!(kind_of(Some(&said(d, c)), &[], false), Kind::Job, "{d}");
+        }
         for c in ["docker compose -f x.yml up -d", "docker compose up --detach && npm test", "docker-compose up --wait", "docker compose up -dV", "docker compose build", "docker compose -f x.yml run --rm migrate"] {
             assert_eq!(kind_of(Some(&bash(c)), &[], false), Kind::Job, "{c}");
         }

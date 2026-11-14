@@ -236,7 +236,7 @@ impl Running {
                 list.retain(|j| !j.pid.is_some_and(|p| !alive(p)));
                 gone_declared |= list.len() != before;
                 for j in list.iter_mut() {
-                    j.stuck = now.saturating_sub(j.progress_ms.unwrap_or(j.since_ms)) > running::QUIET_MS && !j.pid.is_some_and(|p| cpu_busy(p));
+                    j.stuck = now.saturating_sub(j.progress_ms.unwrap_or(j.since_ms)) > running::quiet_ms() && !j.pid.is_some_and(|p| cpu_busy(p));
                 }
             }
             i.declared.retain(|_, l| !l.is_empty());
@@ -449,6 +449,9 @@ fn cpu_busy(pid: u32) -> bool {
 }
 
 fn minutes(ms: u64) -> String {
+    if ms < 60_000 {
+        return format!("{} s", ms / 1000);
+    }
     let m = ms / 60_000;
     if m >= 120 { format!("{} h {} min", m / 60, m % 60) } else { format!("{m} min") }
 }

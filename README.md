@@ -693,14 +693,18 @@ doesn't. The daemon looks every 15 s (`src/running.rs`,
 - **Job, server or watcher.** A Monitor, `tail -f` and `--watch` only
   watch. A process holding a listening port, or a dev-server command
   (`npm run dev`, `next dev`, `vite`, `uvicorn`, `python -m http.server`,
-  `docker compose … up` without `-d` …),
+  `docker compose … up` without `-d`, `docker run` without `--rm` or `-d`,
+  a `server`/`serve` script …), or a call whose description says it
+  serves, watches or starts something (with no build, test, train,
+  migrate, import … in it),
   is a server left running. Neither is a job; any other finite command is,
   once it has outlived the session's turn (seen running while the session
   is done or idle, at least 15 s in) or run for 2 minutes: a short helper a
   session runs in the background while it works is no job, and its end is
   nobody's news.
 - **Progress.** Its newest write to a file it has open (its log), and
-  whether it uses the CPU. Nothing written and no CPU for 30 min: possibly
+  whether it uses the CPU. Nothing written and no CPU for 30 min (only a finite or
+  declared job; never a server): possibly
   stuck, told once for as long as it runs
   (kept across restarts of the tower).
 - **Named** by its call's description, else by its command without what
