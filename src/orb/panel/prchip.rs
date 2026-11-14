@@ -100,6 +100,11 @@ impl Line {
         self.gate.blocked.is_none() && self.gate.needs_override.is_none()
     }
 
+    /// Why it stays out of the card's merge ("it's a draft"): what keeps it from being `clean`.
+    fn held_back(&self) -> Option<String> {
+        crate::prs::held_back(self.gate.blocked.as_deref(), self.gate.needs_override.is_some())
+    }
+
     /// Where its review stands, for its row (`crate::reviews::chip_line`)
     /// and in what colour: agreed is good news, the rest is to mind.
     fn review(&self) -> Option<(String, u32)> {
@@ -216,7 +221,7 @@ impl Run {
 
 /// A merge card's buttons as it stands, key 1 first: (label, the main one,
 /// what it does). At rest it is one button, named for the PRs it will merge
-/// ("Merge both, dev first"): those that can go cleanly.
+/// ("Merge #839 and #842, dev first"): those that can go cleanly.
 /// `chained`: the card's own button began it (several PRs: confirmed as a
 /// whole chain); `run`: the tower's chain for this card, while it merges.
 pub(super) fn merge_acts(lines: &[Line], chained: bool, run: Option<&Run>) -> Vec<(String, bool, MergeAct)> {
@@ -228,7 +233,7 @@ pub(super) fn merge_acts(lines: &[Line], chained: bool, run: Option<&Run>) -> Ve
     if let Some(l) = lines.iter().find(|l| l.step != Step::Idle) {
         let k = l.key.clone();
         if chained && l.step == Step::Confirm && clean.len() > 1 && l.clean() {
-            let label = if clean.len() == 2 { "Confirm: merge both in order".to_string() } else { format!("Confirm: merge all {} in order", clean.len()) };
+            let label = format!("Confirm: merge {} in order", crate::prs::merge_what(&numbers(&clean), lines.len()));
             return vec![(label, true, MergeAct::GoAll(clean.iter().map(|l| l.key.clone()).collect())), cancel(&l.key)];
         }
         return match (&l.step, &l.gate.needs_override) {
@@ -241,13 +246,31 @@ pub(super) fn merge_acts(lines: &[Line], chained: bool, run: Option<&Run>) -> Ve
     }
     if let Some(l) = clean.first() {
         let refs: Vec<PrRef> = clean.iter().map(|l| PrRef { repo: l.pr.repo.clone(), number: l.pr.number, base: l.pr.base.clone(), ..Default::default() }).collect();
-        return vec![(model::merge_label(&refs), true, MergeAct::Start(l.key.clone()))];
+        return vec![(model::merge_label(&refs, lines.len()), true, MergeAct::Start(l.key.clone()))];
     }
     // Nothing merges cleanly: the first that can at all, with its extra step.
     match lines.iter().find(|l| l.gate.blocked.is_none()) {
         Some(l) => vec![(format!("Review #{}: its checks fail", l.pr.number), false, MergeAct::Ask(l.key.clone()))],
         None => vec![],
     }
+}
+
+fn numbers(lines: &[&Line]) -> Vec<u64> {
+    lines.iter().map(|l| l.pr.number).collect()
+}
+
+/// The card's title from its PRs as they stand now (the decision's was
+/// written when the tower last looked): what its button merges, and only
+/// that, as the tower words it (`decisions::merge_title`). None: no PRs.
+pub(super) fn merge_heading(lines: &[Line]) -> Option<String> {
+    let repo = &lines.first()?.pr.repo;
+    let short = |l: &Line| format!("PR #{} into {}", l.pr.number, l.pr.base);
+    let ready: Vec<String> = lines.iter().filter(|l| l.clean()).map(short).collect();
+    Some(if ready.is_empty() {
+        format!("Not ready to merge: {} ({repo})", lines.iter().map(short).collect::<Vec<_>>().join(", "))
+    } else {
+        format!("Merge {} ({repo})", ready.join(", then "))
+    })
 }
 
 /// What the other PRs of the card do while `this` one is asked about:
@@ -259,7 +282,7 @@ fn others_line(this: &Line, lines: &[Line]) -> Option<String> {
         .map(|l| {
             let n = l.pr.number;
             match () {
-                _ if l.gate.blocked.is_some() => format!("#{n} can't be merged yet."),
+                _ if l.gate.blocked.is_some() => format!("#{n} isn't in this merge: {}.", l.held_back().unwrap_or_default()),
                 _ if l.gate.needs_override.is_some() => format!("#{n} is held back: its checks fail."),
                 _ if l.pr.checks.state == "pending" => format!("#{n} waits for its checks."),
                 _ => format!("#{n} is next."),
@@ -396,8 +419,12 @@ impl Panel {
         let running = run.as_ref().filter(|r| !r.over);
         let active = lines.iter().find(|l| l.step != Step::Idle).filter(|_| running.is_none());
         let mut rows = v_flex().gap(px(6.0));
+        // A PR the merge leaves out is marked so, and why; dimmed. (With none
+        // that can go, there is no merge to leave it out of: the card says why below.)
+        let some_go = lines.iter().any(Line::clean);
         for l in &lines {
             let (word, color) = l.standing();
+            let left_out = l.held_back().filter(|_| some_go);
             let (d2, key) = (d.clone(), l.key.clone());
             let can_ask = l.gate.blocked.is_none() && active.is_none();
             rows = rows.child(
@@ -409,6 +436,16 @@ impl Panel {
                     .rounded(px(10.0))
                     .bg(rgba(SOFT))
                     .text_size(px(13.0))
+                    .when(left_out.is_some(), |el| el.opacity(0.62))
+                    .children(left_out.map(|why| {
+                        div()
+                            .id(SharedString::from(format!("merge-out-{}", l.key)))
+                            .mb(px(2.0))
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(ROSE))
+                            .child(format!("NOT IN THIS MERGE · {}", why.to_uppercase()))
+                    }))
                     .child(
                         h_flex()
                             .gap(px(10.0))
@@ -489,7 +526,7 @@ impl Panel {
                     .child(meta_row(Some(tag), &d.space, &d.badge(), format!("{} · {}", d.stake(), d.waited(now_ms))).flex_1().min_w_0())
                     .child(self.hold_mark(d, cx)),
             )
-            .child(card_title(&d.title))
+            .child(card_title(&merge_heading(&lines).unwrap_or_else(|| d.title.clone())))
             .child(rows)
             .children(said)
             .when(!acts.is_empty(), |el| el.child(buttons))
@@ -556,7 +593,7 @@ mod tests {
 
     #[test]
     fn a_merge_card_asks_once_more_before_it_merges() {
-        let both = "Merge both, dev first";
+        let both = "Merge #1273 and #1277, dev first";
         // At rest: the one button, named for what it merges; it begins with the first clean PR.
         let idle = [line(1273, "dev", "passing", Step::Idle), line(1277, "main", "passing", Step::Idle)];
         assert_eq!(merge_acts(&idle, false, None), [(both.to_string(), true, MergeAct::Start("acme/shop#1273".into()))]);
@@ -588,7 +625,7 @@ mod tests {
         assert_eq!(acts[0].2, MergeAct::GoAll(vec![k(1374), k(1375), k(1376)]));
         // One that fails its checks isn't in the chain (it stays for its own row).
         let mixed = [line(1374, "dev", "none", Step::Confirm), line(1375, "dev", "failing", Step::Idle), line(1376, "dev", "passing", Step::Idle)];
-        assert_eq!(merge_acts(&mixed, true, None)[0], ("Confirm: merge both in order".to_string(), true, MergeAct::GoAll(vec![k(1374), k(1376)])));
+        assert_eq!(merge_acts(&mixed, true, None)[0], ("Confirm: merge #1374 and #1376 in order".to_string(), true, MergeAct::GoAll(vec![k(1374), k(1376)])));
         // A single PR keeps its own confirmation, merged here.
         assert_eq!(labels(&merge_acts(&[line(1374, "dev", "none", Step::Confirm)], true, None)), ["Confirm: merge #1374", "Cancel"]);
 
@@ -608,6 +645,38 @@ mod tests {
         assert_eq!(back.back.as_deref(), Some("#9 back to you: 1 check failing: test after its session's fix"));
         assert_eq!(labels(&merge_acts(&[line(9, "dev", "passing", Step::Idle)], false, Some(&back))), ["Merge #9"]);
         assert!(Run::of(&state, "d7").is_none());
+    }
+
+    /// 14 Nov: four PRs on eyzflow's card, #840 and #841 drafts, under
+    /// "Merge PR #839 into dev, then PR #840 …, then PR #842", and a button
+    /// that said "Merge both". Now the title, the button and its second step
+    /// name the same two, the chain gets exactly those, and each draft's row
+    /// says it isn't in this merge, and why.
+    #[test]
+    fn a_merge_card_with_drafts_names_the_two_it_merges() {
+        let k = |n: u64| format!("acme/shop#{n}");
+        let draft = |n: u64, step: Step| {
+            let mut l = line(n, "dev", "pending", step);
+            l.pr.draft = true;
+            l.gate = gate(&l.pr);
+            l
+        };
+        let card = |first: Step| [line(839, "dev", "passing", first), draft(840, Step::Idle), draft(841, Step::Idle), line(842, "dev", "passing", Step::Idle)];
+        let idle = card(Step::Idle);
+        assert_eq!(merge_acts(&idle, false, None), [("Merge #839 and #842".to_string(), true, MergeAct::Start(k(839)))]);
+        assert_eq!(merge_heading(&idle).as_deref(), Some("Merge PR #839 into dev, then PR #842 into dev (acme/shop)"));
+        assert_eq!(idle.iter().map(Line::held_back).collect::<Vec<_>>(), [None, Some("it's a draft".into()), Some("it's a draft".into()), None]);
+        // Its second step names them again, and the tower's chain is given those two, no more.
+        let acts = merge_acts(&card(Step::Confirm), true, None);
+        assert_eq!(labels(&acts), ["Confirm: merge #839 and #842 in order", "Cancel"]);
+        assert_eq!(acts[0].2, MergeAct::GoAll(vec![k(839), k(842)]));
+        // Every one ready: "all 4"; none: the title says they aren't ready.
+        let ready = [839, 840, 841, 842].map(|n| line(n, "dev", "passing", Step::Idle));
+        assert_eq!(merge_acts(&ready, false, None)[0].0, "Merge all 4");
+        assert_eq!(merge_heading(&ready[..2]).as_deref(), Some("Merge PR #839 into dev, then PR #840 into dev (acme/shop)"));
+        let drafts = [draft(840, Step::Idle), draft(841, Step::Idle)];
+        assert!(merge_acts(&drafts, false, None).is_empty());
+        assert_eq!(merge_heading(&drafts).as_deref(), Some("Not ready to merge: PR #840 into dev, PR #841 into dev (acme/shop)"));
     }
 
     #[test]
@@ -633,7 +702,7 @@ mod tests {
         draft.gate = gate(&draft.pr);
         assert!(merge_acts(&[draft.clone()], false, None).is_empty());
         assert_eq!(draft.standing().0, "a draft");
-        assert_eq!(others_line(&only[0], &[only[0].clone(), draft]).as_deref(), Some("#9 can't be merged yet."));
+        assert_eq!(others_line(&only[0], &[only[0].clone(), draft]).as_deref(), Some("#9 isn't in this merge: it's a draft."));
     }
 
     #[test]

@@ -243,6 +243,12 @@ impl PrRef {
     fn short(&self) -> String {
         format!("PR #{} into {}", self.number, if self.base.is_empty() { "?" } else { &self.base })
     }
+
+    /// Why it stays out of its card's merge ("it's a draft"), as the Mac's
+    /// card leaves it out: blocked, or its checks fail. None: it goes in.
+    pub fn held_back(&self) -> Option<String> {
+        crate::prs::held_back(self.merge["blocked"].as_str(), self.merge["needs_override"].as_str().is_some())
+    }
 }
 
 /// A decision the user put on hold ("wait for the ingest filters, then we
@@ -1525,18 +1531,27 @@ impl Book {
     }
 }
 
+/// What the card merges, and only that: a PR that can't go with the
+/// others (a draft, conflicts, failing checks: `PrRef::held_back`) is left
+/// out of it; its own row says why. None can go: they're named as not ready.
 fn merge_title(refs: &[PrRef]) -> String {
-    let each: Vec<String> = refs.iter().map(PrRef::short).collect();
     let repo = refs.first().map(|r| format!(" ({})", r.repo)).unwrap_or_default();
-    format!("Merge {}{repo}", each.join(", then "))
+    let ready: Vec<String> = refs.iter().filter(|r| r.held_back().is_none()).map(PrRef::short).collect();
+    if ready.is_empty() {
+        let each: Vec<String> = refs.iter().map(PrRef::short).collect();
+        return format!("Not ready to merge: {}{repo}", each.join(", "));
+    }
+    format!("Merge {}{repo}", ready.join(", then "))
 }
 
-/// One option per PR, in order. The tower's pick is the first, when it can
+/// One option per PR, in order. The tower's pick is the first that goes in the card's merge, when it can
 /// be merged, its checks pass, it doesn't ship to production (that one is
 /// the user's call alone), its score doesn't say a person must read it and
 /// its plan's checks all passed. A PR that needs review, or whose planned
 /// checks are missing, says so in its option.
 fn merge_options(refs: &[PrRef]) -> Vec<Opt> {
+    // The first that goes in (one left out comes after it, whatever its number).
+    let first = refs.iter().position(|r| r.held_back().is_none());
     refs.iter()
         .enumerate()
         .map(|(i, p)| {
@@ -1551,10 +1566,15 @@ fn merge_options(refs: &[PrRef]) -> Vec<Opt> {
             if let Some(v) = missing.filter(|_| blocked.is_none()) {
                 why += &format!("; {}", v.line());
             }
+            // Left out of the card's merge: said so, never offered as a merge.
+            let label = match p.held_back() {
+                Some(r) => format!("#{} isn't in this merge: {r}", p.number),
+                None => format!("Merge {}", p.short()),
+            };
             Opt {
-                label: format!("Merge {}", p.short()),
+                label,
                 why,
-                pick: i == 0 && blocked.is_none() && p.checks == "pass" && !crate::prs::is_prod(&p.base) && review.is_none() && missing.is_none(),
+                pick: Some(i) == first && blocked.is_none() && p.checks == "pass" && !crate::prs::is_prod(&p.base) && review.is_none() && missing.is_none(),
                 ..Default::default()
             }
         })
@@ -2286,6 +2306,39 @@ mod tests {
         assert!(b.hold("d000000000000", "", "mac", 17 * MIN).unwrap_err().to_string().contains("no decision"));
     }
 
+    /// 14 Nov: eyzflow's card in sooner-chatbot-answers, #840 and #841
+    /// drafts, was titled "Merge PR #839 into dev, then PR #840 into dev,
+    /// then PR #841 into dev, then PR #842 into dev". The title names what
+    /// merges; the drafts' answers say they aren't in it (the phone's card).
+    #[test]
+    fn a_merge_decisions_title_leaves_out_what_cant_merge() {
+        let mut b = Book::default();
+        let draft = |n| Pr { draft: true, ..pr(n, "dev", "t1", "Sooner", "pending") };
+        let prs = vec![pr(839, "dev", "t1", "Sooner", "passing"), draft(840), draft(841), pr(842, "dev", "t1", "Sooner", "passing")];
+        let id = b.sync_merges(&prs, 5 * MIN).fresh[0].clone();
+        let d = b.find(&id).unwrap();
+        assert_eq!(d.title, "Merge PR #839 into dev, then PR #842 into dev (o/app)");
+        assert_eq!(
+            d.options.iter().map(|o| (o.label.as_str(), o.pick)).collect::<Vec<_>>(),
+            [
+                ("Merge PR #839 into dev", true),
+                ("#840 isn't in this merge: it's a draft", false),
+                ("#841 isn't in this merge: it's a draft", false),
+                ("Merge PR #842 into dev", false),
+            ]
+        );
+        assert_eq!(d.options[1].why, "It's a draft: mark it ready for review first.");
+        // The first in order a draft: the pick is the first that merges.
+        let first_draft = vec![draft(838), pr(839, "dev", "t1", "Sooner", "passing")];
+        let mut b = Book::default();
+        let id = b.sync_merges(&first_draft, 5 * MIN).fresh[0].clone();
+        assert_eq!(b.find(&id).unwrap().pick().map(|o| o.label.as_str()), Some("Merge PR #839 into dev"));
+        // None can merge: named as not ready.
+        let mut b = Book::default();
+        let id = b.sync_merges(&[draft(840), draft(841)], 5 * MIN).fresh[0].clone();
+        assert_eq!(b.find(&id).unwrap().title, "Not ready to merge: PR #840 into dev, PR #841 into dev (o/app)");
+    }
+
     #[test]
     fn a_repos_waiting_prs_are_one_merge_decision_in_order() {
         let mut b = Book::default();
@@ -2310,7 +2363,9 @@ mod tests {
             d.prs.iter().map(|p| (p.number, p.base.as_str(), p.checks.as_str())).collect::<Vec<_>>(),
             [(88, "dev", "pass"), (90, "dev", "fail"), (89, "main", "pending")]
         );
-        assert_eq!(d.title, "Merge PR #88 into dev, then PR #90 into dev, then PR #89 into main (o/app)");
+        // #90's checks fail: it isn't in the card's merge, and its answer says so.
+        assert_eq!(d.title, "Merge PR #88 into dev, then PR #89 into main (o/app)");
+        assert_eq!(d.options[1].label, "#90 isn't in this merge: its checks fail");
         assert_eq!((d.waiting(), d.count, d.last_ms), (3, 2, 6 * MIN), "three sessions wait on one card");
         assert_eq!(d.pick().map(|o| o.label.as_str()), Some("Merge PR #88 into dev"), "the first in order, its checks pass");
         let v = d.view(false);
