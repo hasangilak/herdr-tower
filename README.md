@@ -677,6 +677,44 @@ Every Claude session on this Mac carries its account: `tower agents`,
 account never changes, so it's looked up once per pid and kept in
 `~/.local/state/herder-tower/accounts.json`.
 
+#### A session with a job running
+
+A session's turn can end while a job it started keeps running in the
+background: a training run, a long script, which it watches with Claude
+Code's Monitor or a background task. Its status says `done`; its work
+doesn't. The daemon looks every 15 s (`src/running.rs`,
+`src/daemon/running.rs`):
+
+- **What it sees.** The shells a session's `claude` keeps after its turn
+  (Claude Code runs each Bash call in one; those left are its background
+  tasks and Monitors), what each runs and writes (`ps`, `lsof`), and the
+  session's transcript, which names each task (its description, its
+  command, its id: the shell's output file is `…/tasks/<id>.output`).
+- **Job, server or watcher.** A Monitor, `tail -f` and `--watch` only
+  watch. A process holding a listening port, or a dev-server command
+  (`npm run dev`, `next dev`, `vite`, `uvicorn`, `python -m http.server` …),
+  is a server left running. Neither is a job; any other finite command is.
+- **Progress.** Its newest write to a file it has open (its log), and
+  whether it uses the CPU. Nothing written and no CPU for 30 min: possibly
+  stuck, told once.
+- **Shown** as "running a job: <what>, since 01:21, last progress 01:42"
+  on the radar line the brain gets, in `tower agents`, in a space's view
+  on the Mac (and its space counts as at work), and on the phone (a
+  mission's session's `job`, feature `jobs`).
+- **The agenda** leaves the session's tasks alone while the job runs (a
+  turn's end isn't the work's). When the job ends (its process is gone), or
+  goes quiet, the tower is told (agenda news, and a line in the record), so
+  the brain checks what it left.
+- **Said by the session.** For a job the tower can't see (another machine,
+  something started outside Claude Code's shells):
+
+```
+tower job-running start "Rebuild the search index" --pid 4242   # ends by itself when 4242 does
+tower job-running progress "40% of the titles"
+tower job-running end
+tower job-running look t12r       # what the tower sees under a session now (reads only)
+```
+
 #### When an account hits its usage limit
 
 A session whose turn ends on its account's usage limit ("You've hit your

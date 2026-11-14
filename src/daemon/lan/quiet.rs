@@ -1834,7 +1834,7 @@ mod tests {
 
         // What an app checks first, and the calls from before this still answer.
         let (st, hello) = r.get("/v1/hello");
-        assert_eq!((st, hello["api"].as_u64(), &hello["features"]), (200, Some(1), &json!(["quiet", "acts", "pairing", "bonjour", "reviews", "scores", "validation", "impact", "releases", "accounts"])), "{hello}");
+        assert_eq!((st, hello["api"].as_u64(), &hello["features"]), (200, Some(1), &json!(["quiet", "acts", "pairing", "bonjour", "reviews", "scores", "validation", "impact", "releases", "accounts", "jobs"])), "{hello}");
         let (_, state) = r.get("/v1/state");
         for k in [
             "version",

@@ -198,6 +198,13 @@ pub struct AgentLine {
     /// its notes, messages from other sessions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waiting: Vec<WaitingLine>,
+    /// Jobs it left running in the background, or declared (`crate::running`):
+    /// its turn may be over, its work isn't.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<crate::running::Job>,
+    /// Servers it left running (a dev server): not jobs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub servers: Vec<crate::running::Server>,
 }
 
 /// One message waiting for a session in the send queue.

@@ -900,6 +900,29 @@ session's and the tower's account, a moved one marked "moved from default
 at 15:02". The Mac's full window has it as its Accounts view and a strip in
 its sidebar.
 
+**Jobs running** (feature `jobs`). A session's turn can end while a job it
+started keeps running in the background (a training run it watches): its
+`status` says `done`, its work doesn't. The tower sees Claude Code's
+background shells and the jobs a session declares (`tower job-running`);
+servers (a dev server, a process holding a listening port) and watchers (a
+Monitor, `tail -f`) are not jobs. A mission's session (`GET /v1/missions`)
+carries, while it has one:
+
+```
+"job": { "what": "Restart v2 training with gradient checkpointing",
+         "since_ms": 1794616860000, "progress_ms": 1794618120000 | null,
+         "stuck": false,            (every job of it quiet and idle for 30 min)
+         "more": 1,                 (other jobs of it)
+         "line": "running a job: Restart v2 training …, since 01:21, last progress 01:42 (+1 more)" }
+```
+
+and each of the state's `agents` has `jobs` (each with `what`, `command`,
+`since_ms`, `progress_ms`, `busy`, `stuck`, `pid`, `task`, `source`:
+`background` | `declared`, `output`, `note`, `watched`) and `servers`
+(`what`, `pid`, `ports`), when it has any. Show a session with a `job` and
+status `done`/`idle` as "running a job" (amber "job quiet" when `stuck`),
+with its `line` under its name, and count its space as at work.
+
 **Breaking changes** (feature `impact`). A PR carries `impact`: `{things:
 [{kind: function | type | route | field | column | config | event, name,
 change: removed | renamed | signature | unread, renamed_to, file}],
@@ -1830,6 +1853,7 @@ stream's `hello` event). A tower from before there were features sends no
 | `reviews` | PR review: `review` on a PR (`GET /v1/prs`, the `pr` event, a chat chip's `pr`, a merge decision's `prs[]`), `review` on a mission, `reviews` in the state, and a review that isn't agreed among a merge's `warnings` |
 | `releases` | Each space's release track: `releases` in the state (by space) and `GET /v1/releases` (`?space=` for one) |
 | `accounts` | Each Claude account's usage and the failover's moves: `accounts` in the state, and `account` on each of the state's `brains` and on a mission's `tower` (see "Accounts and usage") |
+| `jobs` | Jobs sessions left running in the background: `job` on a mission's session, `jobs` and `servers` on each of the state's `agents` (see "Jobs running") |
 | `impact` | Who outside depends on what a PR changes: `impact` on a PR (wherever `score` is) and `dependents` / `outside` on a predicted one (`plan.prs`), and a breaking change's warning among a merge's `warnings` |
 | `validation` | A predicted PR's `checks` and `edge_cases` (`plan.prs`), and `validation` on a PR (wherever `score` is), with the missing checks among a merge's `warnings` |
 | `scores` | Review scores: `score` and `auto` on a PR (wherever `review` is), a plan's predicted PRs (`plan.prs`), `auto_merge` in the state, `merged_by: "tower"`, and a PR that needs review among a merge's `warnings` |

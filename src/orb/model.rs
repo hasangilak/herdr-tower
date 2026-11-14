@@ -609,6 +609,8 @@ pub struct Member {
     pub port: Option<u16>,
     /// Its last words, as its hooks heard them (cut by the daemon).
     pub said: Option<String>,
+    /// A job it left running (`crate::running`): its turn may be done, its work isn't.
+    pub job: Option<crate::running::Shown>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -900,6 +902,26 @@ impl Member {
     pub fn last_words(&self) -> Option<String> {
         self.said.as_deref().and_then(|s| s.lines().map(str::trim).find(|l| !l.is_empty())).map(String::from)
     }
+
+    /// A job of it runs, and isn't quiet: at work, whatever its turn says.
+    pub fn runs_job(&self) -> bool {
+        self.job.as_ref().is_some_and(|j| !j.stuck)
+    }
+
+    /// Its status as its row says it: "running a job" (or "job quiet") while
+    /// its turn is over and a job of it runs; else its own.
+    pub fn status_shown(&self) -> &str {
+        match (&self.job, self.status.as_str()) {
+            (Some(j), "done" | "idle" | "") => {
+                if j.stuck {
+                    "job quiet"
+                } else {
+                    "running a job"
+                }
+            }
+            (_, s) => s,
+        }
+    }
 }
 
 /// A space's switch as the user just set it here, until the state says the same.
@@ -963,8 +985,9 @@ impl Missions {
             all.iter().filter(|d| d.yours()).flat_map(|d| d.sessions.iter().filter(|s| s.waiting).map(|s| s.address.as_str())).collect();
         for m in &mut self.open {
             m.needs = all.iter().filter(|d| d.yours() && d.in_space(&m.name)).count();
-            m.at_work =
-                m.sessions.iter().any(|s| s.status == "working" || (s.status == "blocked" && !waiting.contains(s.address.as_str())));
+            m.at_work = m.sessions.iter().any(|s| {
+                s.status == "working" || (s.status == "blocked" && !waiting.contains(s.address.as_str())) || s.runs_job()
+            });
         }
     }
 
@@ -1044,6 +1067,11 @@ pub fn adapt_missions(spaces: &Spaces, live: &[Live], known: &[String], agents: 
                     name: name.clone(),
                     status: status.clone(),
                     account: account(address),
+                    job: agents
+                        .as_array()
+                        .and_then(|l| l.iter().find(|a| a["address"] == address.as_str()))
+                        .and_then(|a| serde_json::from_value::<Vec<crate::running::Job>>(a["jobs"].clone()).ok())
+                        .and_then(|jobs| crate::running::shown(&jobs, crate::history::now_ms())),
                     ..Default::default()
                 })
                 .collect(),

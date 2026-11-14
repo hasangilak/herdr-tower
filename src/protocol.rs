@@ -252,6 +252,17 @@ pub enum Request {
     /// `tower failover`: `status` (what is out, what moved, what waits),
     /// `move` (`target`: a session, `account`: where, or the next one with
     /// usage), `clear` (forget what is out and what waits).
+    /// `tower job-running start|progress|end '<what>' [--pid <pid>]`: a
+    /// session says it runs a job (`daemon::running`); `terminal` is its
+    /// `HC_TERMINAL_ID`.
+    JobRunning {
+        terminal: String,
+        action: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        what: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
+    },
     Failover {
         action: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]

@@ -467,6 +467,10 @@ pub struct Seen {
     pub port: Option<u16>,
     /// Its last words, when the voice heard them from its hooks.
     pub said: Option<String>,
+    /// A job it left running (`crate::running`): its status may say `done`
+    /// while its work goes on; how it shows (`line`: "running a job: …").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<crate::running::Shown>,
 }
 
 /// A terminal as a session of a space, if it is one: live, an agent, in a
@@ -504,6 +508,7 @@ pub fn seen_of(row: &Value, full: Option<&Value>, said: Option<String>) -> Optio
         branch: given.branch,
         port: given.port,
         said,
+        job: row["address"].as_str().and_then(crate::daemon::running::shown_of),
     })
 }
 

@@ -533,8 +533,10 @@ fn gather(ctx: &Ctx, probes: &[Probe]) -> BTreeMap<String, Facts> {
             agenda::QueueFact::Waiting { session, .. } if !session.is_empty() => session.clone(),
             _ => p.session.clone(),
         };
-        // Nothing to judge while its session moves to another account, or waits for one.
-        if session.is_empty() || super::failover::holds(&session) {
+        // Nothing to judge while its session moves to another account, or
+        // waits for one, or while a job it started runs (its turn's end isn't
+        // the work's; the tower is told when the job ends or goes quiet).
+        if session.is_empty() || super::failover::holds(&session) || super::running::holds(&session) {
             out.insert(p.task.clone(), Facts { queue, ..Default::default() });
             continue;
         }
