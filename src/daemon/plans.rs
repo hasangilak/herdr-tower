@@ -1160,7 +1160,7 @@ mod tests {
         assert_eq!((live(0), live(1)), ("done".into(), "waiting".into()), "s2 waits for the spike's findings to be taken in");
         let v = shared.get().plans_live[0].clone();
         assert_eq!(v["spikes_pending"], json!(["s1"]));
-        assert!(v["findings"][0]["text"].as_str().unwrap().starts_with("Spike s1 (Provider spike) is done: post c1: p95 latency under 800 ms → p95 640 ms."));
+        assert!(v["findings"][0]["text"].as_str().unwrap().starts_with("Spike s1 (Provider spike) is done. post c1: p95 640 ms. Take in what it found"));
         let mut waited = 0;
         while !notes.lock().unwrap().iter().any(|n| n.starts_with("[plan-stage] p1 s1 done")) && waited < 100 {
             std::thread::sleep(Duration::from_millis(20));
