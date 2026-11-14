@@ -1560,6 +1560,11 @@ pub fn revision_card(p: &Plan, r: &Revision) -> crate::decisions::PlanAsk {
     }
 }
 
+/// Words cut to `max` characters (`tower plan show` has the whole).
+fn clip_words_to(text: &str, max: usize) -> String {
+    crate::launch::clip_words(text.trim(), max)
+}
+
 /// A draft a plan can be made of: the receipt `tower launch --draft`
 /// prints, with its space and at least one session's repo.
 pub fn check_draft(v: &Value) -> Result<()> {
@@ -1727,7 +1732,7 @@ pub fn instructions(p: &Plan, tower: &str) -> String {
 pub fn first_task(p: &Plan, tower: &str) -> String {
     let t = tower_word(tower);
     if p.status == Status::Live {
-        let waiting: Vec<String> = p.findings.iter().filter(|f| f.revision.is_none()).map(|f| format!("{} ({}): {}", f.id, f.kind, f.text)).collect();
+        let waiting: Vec<String> = p.findings.iter().filter(|f| f.revision.is_none()).map(|f| format!("{} ({}): {}", f.id, f.kind, clip_words_to(&f.text, 400))).collect();
         return format!(
             "[plan {}] The plan is live: the space {} was launched with it, and its sessions are at work. Read instructions.md (\"6. A live plan\"), plan.md and stages.json. Findings waiting: {}. Revise the plan for them with `{t} plan revise {} --json-file stages.json --why \"<what made it change>\" --finding <ids>`, put it in plan.md, republish the same artifact with what changed, and run `{t} plan published {} --url <its link>`. Then wait for more.",
             p.id,

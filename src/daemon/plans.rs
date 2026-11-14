@@ -232,8 +232,20 @@ impl Plans {
     /// A spike is done: what it found (its checks' evidence, its findings)
     /// goes to whoever revises the plan, before the build stages start.
     fn spike_done(&self, p: &Plan, st: &plans::Stage) {
-        let evidence: Vec<String> = st.checks().map(|(w, c)| format!("{w} {}: {} → {}", c.id, c.what, c.proof)).collect();
-        let text = format!("Spike {} ({}) is done: {}. Take in what it found before the stages after it start: revise the plan, or say nothing changes with `tower plan keep {} --why \"…\"`.", st.id, st.title, evidence.join("; "), p.id);
+        // Each check by its id, and its evidence once (several checks often carry the same).
+        let mut evidence: Vec<(Vec<String>, String)> = vec![];
+        for (w, c) in st.checks() {
+            let proof = crate::launch::clip_words(c.proof.trim(), 240);
+            match evidence.iter_mut().find(|(_, p)| *p == proof) {
+                Some((ids, _)) => ids.push(format!("{w} {}", c.id)),
+                None => evidence.push((vec![format!("{w} {}", c.id)], proof)),
+            }
+        }
+        let found: Vec<String> = evidence.iter().map(|(ids, p)| format!("{}: {p}", ids.join(", "))).collect();
+        let text = crate::launch::clip_words(
+            &format!("Spike {} ({}) is done. {}. Take in what it found before the stages after it start: revise the plan, or say nothing changes with `tower plan keep {} --why \"…\"`.", st.id, st.title, found.join("; "), p.id),
+            1_500,
+        );
         // (The store's lock is let go before it is taken again to save.)
         let found = lock(&self.book).finding(&p.id, "other", &text, &st.id, "", "", now());
         if let Ok(f) = found {
