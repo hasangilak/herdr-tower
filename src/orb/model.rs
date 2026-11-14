@@ -684,6 +684,15 @@ impl GoalStep {
             _ => "set",
         }
     }
+
+    /// The same, for the version it is (`first`: the goal the space began
+    /// with): a chat's space's first goal was written from a request.
+    pub fn words(&self, first: bool) -> &'static str {
+        match (self.by.as_str(), first) {
+            ("request", true) => "written from your request",
+            _ => self.by_words(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -699,6 +708,10 @@ pub struct Mission {
     #[serde(deserialize_with = "or_default")]
     pub goal_history: Vec<GoalStep>,
     pub standing: bool,
+    /// Opened by a chat with the tower: its goal is written from the user's
+    /// requests, its sessions work in the checkout, and it isn't ready on
+    /// that goal until the user sets one (`crate::missions`).
+    pub chat: bool,
     /// Its PRs get a reviewer (`crate::reviews`): on unless the user turned
     /// it off, and on from a daemon that doesn't say.
     #[serde(default = "yes")]
@@ -723,6 +736,13 @@ pub struct Mission {
     pub ready_since_ms: Option<u64>,
     /// When a ready space closes by itself (none: it doesn't, or not yet).
     pub auto_close_ms: Option<u64>,
+}
+
+impl Mission {
+    /// The user (by hand, or the brain on their word) set its goal.
+    pub fn goal_set_by_user(&self) -> bool {
+        self.goal_history.iter().any(|s| s.by == "you" || s.by == "tower")
+    }
 }
 
 impl Request {

@@ -612,6 +612,8 @@ impl Panel {
             sub.push(div().child("A standing space: the tower never closes it and opens no worktrees here.").into_any_element());
         } else if m.goal.trim().is_empty() {
             sub.push(div().child("No goal: it has no end, and the tower opens no worktrees here.").into_any_element());
+        } else if let Some(line) = chat_line(&m) {
+            sub.push(div().child(line).into_any_element());
         }
         // The goal and what counts as done: a block of their own under the head (not while it is being changed).
         let (m1, n1, n2, n3, n4) = (m.clone(), name.to_string(), name.to_string(), name.to_string(), name.to_string());
@@ -1045,10 +1047,23 @@ fn goals_open_from_start() -> bool {
 }
 
 /// The head of the Goal card: "updated by your request at 3:55 PM" (none
-/// when how it was set isn't known).
-pub(super) fn goal_said(now: Option<&GoalStep>) -> Option<String> {
+/// when how it was set isn't known; `first`: it is the goal the space began
+/// with).
+pub(super) fn goal_said(now: Option<&GoalStep>, first: bool) -> Option<String> {
     let s = now.filter(|s| s.at_ms > 0)?;
-    Some(format!("{} at {}", s.by_words(), super::talk::when(s.at_ms)))
+    Some(format!("{} at {}", s.words(first), super::talk::when(s.at_ms)))
+}
+
+/// What a goal does to a space opened by a chat (`Mission::chat`), under
+/// its name: none for any other space.
+pub(super) fn chat_line(m: &Mission) -> Option<&'static str> {
+    if !m.chat || m.standing || m.goal.trim().is_empty() {
+        return None;
+    }
+    Some(match m.goal_set_by_user() {
+        false => "Goal written from your requests. Sessions keep working in the checkout, and it won't close on this goal until you set one.",
+        true => "Sessions here keep working in the checkout.",
+    })
 }
 
 impl Panel {
@@ -1067,7 +1082,7 @@ impl Panel {
                 .pl(px(12.0))
                 .border_l_2()
                 .border_color(rgba(LINE))
-                .child(div().text_size(px(12.0)).text_color(g.faint).child(format!("{} · {}", super::talk::when(s.at_ms), s.by_words())))
+                .child(div().text_size(px(12.0)).text_color(g.faint).child(format!("{} · {}", super::talk::when(s.at_ms), s.words(m.goal_history.first().is_some_and(|f| std::ptr::eq(f, s))))))
                 .child(div().text_size(px(13.5)).line_height(px(19.0)).text_color(g.muted).child(s.goal.clone()))
                 .when(!s.done_when.trim().is_empty(), |el| el.child(div().text_size(px(12.0)).line_height(px(17.0)).text_color(g.faint).child(format!("Done when: {}", s.done_when.trim()))))
                 .when(s.by == "request" && !s.request.trim().is_empty(), |el| {
@@ -1091,7 +1106,7 @@ impl Panel {
                     .items_center()
                     .gap(px(6.0))
                     .child(bay_label("Goal").px(px(0.0)))
-                    .children(goal_said(now).map(|said| div().text_size(px(12.0)).text_color(g.faint).child(said))),
+                    .children(goal_said(now, earlier.is_empty()).map(|said| div().text_size(px(12.0)).text_color(g.faint).child(said))),
             )
             .child(div().text_size(px(16.0)).line_height(px(23.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.text).child(m.goal.trim().to_string()))
             .children(now.filter(|s| s.by == "request" && !s.request.trim().is_empty()).map(|s| {
@@ -1157,10 +1172,10 @@ mod tests {
         let (now, earlier) = goal_versions("Export cases as PDF and CSV", "", &h);
         assert_eq!(now.map(|s| s.by.as_str()), Some("request"));
         assert_eq!(earlier.iter().map(|s| s.goal.as_str()).collect::<Vec<_>>(), ["Export cases as PDF"]);
-        assert!(goal_said(now).unwrap().starts_with("updated by your request at "));
+        assert!(goal_said(now, false).unwrap().starts_with("updated by your request at "));
         // A goal the history doesn't end with (set by an older tower): every version is an earlier one.
         let (now, earlier) = goal_versions("Something else", "", &h);
-        assert!(now.is_none() && earlier.len() == 2 && goal_said(now).is_none());
+        assert!(now.is_none() && earlier.len() == 2 && goal_said(now, false).is_none());
         assert_eq!(step("x", "you", 1).by_words(), "set by you");
     }
 
