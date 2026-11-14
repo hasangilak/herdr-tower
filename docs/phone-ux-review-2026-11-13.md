@@ -23,7 +23,7 @@ A review of one evening when the user worked with the tower only from the phone,
 ## Timeline of friction points
 
 **F1. Memory-note edits blocked sessions behind Show on Mac cards (20:30–22:40). Fixed since in `ac85fba`.**
-- There were 12 cards titled `Asks to use Update: /Users/hassangilak/Library/Application Support/orca/claude-profiles/1f2995fa-2a8…`, all from t12v (mediaroom) and t12t (sooner). Ids include dff845c13bc01 (20:30), de132d7e78aa0 (20:48), d9d0690cd16f7 (22:06), d4cf938f58c97 (22:14), d75ec3c643c26 (22:15), d7ef30fba6bca (22:23) and d0c028e1fa555 (22:36).
+- There were 12 cards titled `Asks to use Update: ~/Library/Application Support/orca/claude-profiles/<profile-id>…`, all from t12v (mediaroom) and t12t (sooner). Ids include dff845c13bc01 (20:30), de132d7e78aa0 (20:48), d9d0690cd16f7 (22:06), d4cf938f58c97 (22:14), d75ec3c643c26 (22:15), d7ef30fba6bca (22:23) and d0c028e1fa555 (22:36).
 - 20:47 screenshot: the only card in the queue is "blocked · 4 min" with a single **Show on Mac** button. The user typed "im not behind my desk. approve this for me".
 - 22:14 screenshot: the same card for **sooner** at "20 min", with the header showing "3 need you · Mac out of reach". The sooner card dcfc8ca36ce61 waited 19.4 min (count 3) and was dismissed, never answered. The brain never saw it, because blocked cards didn't reach the brain.
 - 22:15 "always approve this type of request…": the brain widened the behavior. At 22:17 the user sent a screenshot of the next card: "i still see it on the phone! havent you approved it?" It was a new prompt from the same session with the same title, so the phone couldn't show that it was new. The card came back four more times before the fix was installed at 22:40.

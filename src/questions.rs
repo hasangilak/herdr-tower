@@ -2557,7 +2557,7 @@ mod tests {
     /// A permission card's title says what is asked, on a phone with no
     /// dialog beside it: never "Allow this?" when the dialog says more, and
     /// never a whole path (the evening of 13 Nov: "Asks to use Update:
-    /// /Users/…/claude-profiles/1f2995fa-2a8…").
+    /// /Users/…/claude-profiles/4c1e9b2a-000…").
     #[test]
     fn a_permission_title_says_what_is_asked() {
         let home = crate::config::home().to_string_lossy().into_owned();
@@ -2570,7 +2570,7 @@ mod tests {
         assert_eq!(title("claude-permission.txt", "approve Bash: touch /tmp/qfix-perm-test"), "Allow Bash: touch /tmp/qfix-perm-test?");
         // A file: Claude Code's own question names it.
         assert_eq!(title("claude-edit-file.txt", ""), "Do you want to make this edit to search.rs?");
-        assert_eq!(title("claude-edit-claude-folder.txt", "approve Update: /Users/me/Library/Application Support/orca/claude-profiles/1f2995fa-2a8…"), "Do you want to make this edit to search-notes.md?");
+        assert_eq!(title("claude-edit-claude-folder.txt", "approve Update: /Users/me/Library/Application Support/orca/claude-profiles/4c1e9b2a-000…"), "Do you want to make this edit to search-notes.md?");
         // Herdr's line alone: the file by its name.
         let bare = Screen { kind: "permission".into(), question: "Do you want to proceed?".into(), ..Default::default() };
         assert_eq!(build("t1", "s", false, &bare, None, "approve Update: /w/app/notes/plan.md", "").title, "Allow editing plan.md?");

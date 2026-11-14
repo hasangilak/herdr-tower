@@ -2270,7 +2270,7 @@ pub fn blocked_notice(name: &str, status: &Value) -> String {
 
 /// The file a blocked edit names, for a card: its name, never the whole
 /// path. Herdr's status line cuts a long path short ("…/claude-profiles/
-/// 1f2995fa-2a8…"), so a cut one is said by where it is: Claude's own notes,
+/// 4c1e9b2a-000…"), so a cut one is said by where it is: Claude's own notes,
 /// or only "a file".
 fn edited(path: &str) -> String {
     let path = path.trim();
@@ -3122,7 +3122,7 @@ mod tests {
         // Claude Code's newer name for an edit, with the path Herdr cut short (the evening of 13 Nov: a raw path on the phone).
         assert_eq!(n("permission", "approve Update: /w/app/src/login.rs"), "The orb session asks to edit login.rs");
         assert_eq!(
-            n("permission", "approve Update: /Users/me/Library/Application Support/orca/claude-profiles/1f2995fa-2a8…"),
+            n("permission", "approve Update: /Users/me/Library/Application Support/orca/claude-profiles/4c1e9b2a-000…"),
             "The orb session asks to edit its Claude notes"
         );
         assert_eq!(n("permission", "approve Write: /Users/me/Work/app/src/very/long/pa…"), "The orb session asks to edit a file");
