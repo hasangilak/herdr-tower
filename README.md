@@ -704,7 +704,8 @@ doesn't. The daemon looks every 15 s (`src/running.rs`,
   nobody's news.
 - **Progress.** Its newest write to a file it has open (its log), and
   whether it uses the CPU. Nothing written and no CPU for 30 min (only a finite or
-  declared job; never a server): possibly
+  declared job; never a server; not one whose sibling job of the session is
+  at work, which it waits on, nor one said to wait): possibly
   stuck, told once for as long as it runs
   (kept across restarts of the tower).
 - **Named** by its call's description, else by its command without what
@@ -724,6 +725,7 @@ doesn't. The daemon looks every 15 s (`src/running.rs`,
 tower job-running start "Rebuild the search index" --pid 4242   # ends by itself when 4242 does
 tower job-running progress "40% of the titles"
 tower job-running end
+tower job-running wait post-train --until "the last checkpoint" [--for 120] [--session t12r]   # no stuck check until then (6 h at most)
 tower job-running look t12r       # what the tower sees under a session now (reads only)
 ```
 

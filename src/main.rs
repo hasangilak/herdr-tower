@@ -193,17 +193,27 @@ enum Cmd {
     /// A job this session runs in the background beyond its turn (a training run, a long script),
     /// said to the tower so it shows the session as running a job, not done, and tells when it ends:
     /// `start '<what>' [--pid <pid>]` (with a pid it ends by itself when that process does),
-    /// `progress ['<how far>']`, `end`. Background shells are seen without it; this is for jobs the
+    /// `progress ['<how far>']`, `end`; `wait '<job>' --until '<what>' [--for <minutes>]` (no stuck check
+    /// until then; `--session <address>` for another session's job). Background shells are seen without it; this is for jobs the
     /// tower can't see (another machine, a process started some other way). `look <session>`: what
     /// the tower sees running under a session now (it reads only).
     JobRunning {
-        /// start, progress or end.
+        /// start, progress, end, wait or look.
         action: String,
-        /// What the job is (start), how far it is (progress).
+        /// What the job is (start), how far it is (progress), which job (wait: its task id, pid or words), a session (look).
         what: Option<String>,
         /// Its process.
         #[arg(long)]
         pid: Option<u32>,
+        /// wait: what the job waits for (no stuck check meanwhile).
+        #[arg(long)]
+        until: Option<String>,
+        /// wait: for at most this many minutes (default 360).
+        #[arg(long = "for")]
+        minutes: Option<u64>,
+        /// The session the job is in (else this terminal's): for a tower speaking of another session's job.
+        #[arg(long)]
+        session: Option<String>,
     },
     /// A Claude account at its usage limit, and the work moved off it: each session or tower that hits
     /// its account's limit is resumed on the next account with usage (the default first), in its own
@@ -1081,7 +1091,9 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Reopen { action, spaces, dry_run, json } => reopen_cmd(action.as_deref().unwrap_or("list"), &spaces, dry_run, json),
         Cmd::Accounts { usage: true, json, .. } => accounts_usage(json),
         Cmd::Accounts { on, .. } => list_accounts(on.as_deref()),
-        Cmd::JobRunning { action, what, pid } => job_running(&action, what.as_deref().unwrap_or(""), pid),
+        Cmd::JobRunning { action, what, pid, until, minutes, session } => {
+            job_running(&action, what.as_deref().unwrap_or(""), pid, until.as_deref().unwrap_or(""), minutes, session.as_deref())
+        }
         Cmd::Failover { action, target, to, json } => failover_cmd(action.as_deref().unwrap_or("status"), target.as_deref().unwrap_or(""), to.as_deref().unwrap_or(""), json),
         Cmd::Project { name } => {
             let asked = name.join(" ");
@@ -2313,7 +2325,7 @@ fn agenda_do(cmd: &agenda::Cmd) -> Result<Value> {
 }
 
 /// `tower reopen [list|go|forget] [<space>…] [--dry-run]`.
-fn job_running(action: &str, what: &str, pid: Option<u32>) -> Result<()> {
+fn job_running(action: &str, what: &str, pid: Option<u32>, until: &str, minutes: Option<u64>, session: Option<&str>) -> Result<()> {
     // One look at a session now, without the daemon (it reads only).
     if action == "look" {
         print_json(&daemon::running::look_at(what.trim())?);
@@ -2322,8 +2334,8 @@ fn job_running(action: &str, what: &str, pid: Option<u32>) -> Result<()> {
     if !protocol::is_running() {
         bail!("the tower's voice isn't running (tower up): it keeps the jobs");
     }
-    let terminal = peers::caller().unwrap_or_default();
-    let r = protocol::send(&Request::JobRunning { terminal, action: action.into(), what: what.into(), pid })?;
+    let terminal = session.map(String::from).or_else(peers::caller).unwrap_or_default();
+    let r = protocol::send(&Request::JobRunning { terminal, action: action.into(), what: what.into(), pid, until: until.into(), minutes })?;
     if !r.ok {
         bail!("{}", r.error.unwrap_or_default());
     }

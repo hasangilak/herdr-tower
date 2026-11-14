@@ -497,6 +497,32 @@ pub struct Job {
     pub note: String,
     /// A Monitor of the session watches it.
     pub watched: bool,
+    /// Quiet, but another job of the session is at work: it waits on that one (`siblings`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub waits_on: String,
+    /// Said to wait (`tower job-running wait … --until`): for what, and until when at most.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub waiting: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_until_ms: Option<u64>,
+}
+
+/// A quiet job of a session whose other job is at work (its CPU, or a write
+/// within the quiet time) isn't stuck: it waits on that one (a pipeline step
+/// that sleeps until the training it follows writes its last checkpoint).
+pub fn siblings(jobs: &mut [Job], now_ms: u64) {
+    let q = quiet_ms();
+    let active: Vec<Option<String>> =
+        jobs.iter().map(|j| (j.busy || now_ms.saturating_sub(j.progress_ms.unwrap_or(j.since_ms)) <= q).then(|| j.what.clone())).collect();
+    for (i, j) in jobs.iter_mut().enumerate() {
+        if !j.stuck {
+            continue;
+        }
+        if let Some(other) = active.iter().enumerate().find_map(|(k, a)| if k != i { a.clone() } else { None }) {
+            j.stuck = false;
+            j.waits_on = other;
+        }
+    }
 }
 
 /// A server a session left running: not a job.
@@ -589,6 +615,11 @@ pub fn line(jobs: &[Job], now_ms: u64) -> Option<String> {
     }
     if !j.note.is_empty() {
         s += &format!(" ({})", clip(&j.note, 60));
+    }
+    if !j.waiting.is_empty() {
+        s += &format!(" (waits for {})", clip(&j.waiting, 60));
+    } else if !j.waits_on.is_empty() {
+        s += &format!(" (waits on {})", clip(&j.waits_on, 60));
     }
     if jobs.len() > 1 {
         s += &format!(" (+{} more)", jobs.len() - 1);
@@ -725,6 +756,7 @@ pub fn look(claude: u32, world: &World, tasks: &Tasks, now_ms: u64, turn_over: b
                     output,
                     note: String::new(),
                     watched: false,
+                    ..Default::default()
                 });
             }
         }
@@ -735,6 +767,7 @@ pub fn look(claude: u32, world: &World, tasks: &Tasks, now_ms: u64, turn_over: b
             j.watched = watches.iter().any(|w| w.contains(out.as_str()));
         }
     }
+    siblings(&mut jobs, now_ms);
     (jobs, servers)
 }
 
@@ -921,7 +954,17 @@ mod tests {
         assert_eq!((train.task.as_deref(), train.output.as_deref(), train.progress_ms, train.busy, train.stuck, train.watched), (Some("btrain"), Some("/w/train.log"), Some(NOW - 20_000), true, false, true));
         assert_eq!(train.since_ms, NOW - 700_000);
         let post = &jobs[1];
-        assert!(post.stuck && !post.busy, "quiet for 40 min and idle");
+        assert!(!post.stuck && !post.busy, "quiet for 40 min and idle, but the training it follows is at work");
+        assert_eq!(post.waits_on, "Train the 1.2B LoRA");
+        // The training stopped too (idle, its log old): then the waiter may be stuck.
+        let mut w4 = World { procs: w.procs.clone(), files: w.files.clone(), listen: w.listen.clone(), mtimes: w.mtimes.clone() };
+        for p in w4.procs.iter_mut() {
+            p.cpu = 0.0;
+        }
+        w4.mtimes.insert("/w/train.log".into(), NOW - 45 * 60_000);
+        w4.mtimes.insert("/tmp/p/tasks/btrain.output".into(), NOW - 45 * 60_000);
+        let (quiet_both, _) = look(1, &w4, &t, NOW, true);
+        assert!(quiet_both.iter().all(|j| j.stuck && j.waits_on.is_empty()), "{quiet_both:?}");
         assert_eq!(servers, [Server { what: "Start the dev server".into(), pid: 50, ports: vec![3000] }]);
         // Shown: the training (fresh), one more; not stuck while the training writes.
         let s = shown(&jobs, NOW).unwrap();

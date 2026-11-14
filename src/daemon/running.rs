@@ -55,7 +55,13 @@ struct Inner {
     /// Shells seen serving (a listening port): servers for as long as they
     /// run, even when a look misses their port.
     serving: HashSet<u32>,
+    /// Jobs said to wait (session/key: what for, until when at most): no
+    /// stuck check meanwhile. Kept in `jobs-waits.json`.
+    waits: BTreeMap<String, (String, u64)>,
 }
+
+/// How long a wait holds when no time is given.
+const WAIT_MS: u64 = 6 * 60 * 60_000;
 
 #[derive(Clone)]
 pub struct Running {
@@ -132,7 +138,8 @@ impl Running {
     fn open_at(shared: Shared, tell: Tell, path: PathBuf) -> Running {
         let declared: Declared = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
         let stuck_told: HashSet<String> = std::fs::read_to_string(path.with_file_name("jobs-told.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-        Running { inner: Arc::new(Mutex::new(Inner { declared, stuck_told, ..Default::default() })), shared, tell, path }
+        let waits: BTreeMap<String, (String, u64)> = std::fs::read_to_string(path.with_file_name("jobs-waits.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        Running { inner: Arc::new(Mutex::new(Inner { declared, stuck_told, waits, ..Default::default() })), shared, tell, path }
     }
 
     pub fn start(&self) {
@@ -279,6 +286,26 @@ impl Running {
             }
             for (address, j) in carried {
                 jobs.entry(address).or_default().push(j);
+            }
+            // A quiet job whose sibling (seen or declared) is at work waits on it;
+            // one said to wait isn't checked until its time is up.
+            let waits_before = i.waits.clone();
+            i.waits.retain(|_, (_, until)| *until > now);
+            for k in &gone_told {
+                i.waits.remove(k);
+            }
+            for (address, list) in jobs.iter_mut() {
+                running::siblings(list, now);
+                for j in list.iter_mut() {
+                    if let Some((what, until)) = i.waits.get(&format!("{address}/{}", key(j))) {
+                        j.stuck = false;
+                        j.waiting = what.clone();
+                        j.wait_until_ms = Some(*until);
+                    }
+                }
+            }
+            if i.waits != waits_before {
+                save_json(&self.path.with_file_name("jobs-waits.json"), &i.waits);
             }
             // Quiet: told once for as long as it runs (not again when it wrote
             // meanwhile and went quiet again, nor after a restart of the tower).
@@ -444,6 +471,70 @@ pub fn look_at(address: &str) -> Result<Value> {
     Ok(json!({ "session": address, "claude": pid, "line": running::line(&jobs, now), "jobs": jobs, "helpers": helpers, "servers": servers, "shells": shells }))
 }
 
+fn save_json<T: serde::Serialize>(path: &std::path::Path, v: &T) {
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, serde_json::to_string_pretty(v).unwrap_or_default()).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+impl Running {
+    /// `tower job-running wait '<job>' --until '<what>' [--for <minutes>]
+    /// [--session <address>]`: the job (its task id, pid, or words of what it
+    /// is; the session's only job when it has one) waits for something: no
+    /// stuck check until it ends or `minutes` (6 h) pass. Said again, it
+    /// holds anew, and it may be flagged again once its time is up.
+    pub fn wait(&self, terminal: &str, job: &str, until: &str, minutes: Option<u64>) -> Result<Value> {
+        let terminal = terminal.trim();
+        if terminal.is_empty() {
+            bail!("tower job-running wait runs in the session's terminal, or names it: --session <address>");
+        }
+        let until = until.trim();
+        if until.is_empty() {
+            bail!("tower job-running wait '<job>' --until '<what it waits for>' [--for <minutes>]");
+        }
+        let now = crate::history::now_ms();
+        let job = job.trim().to_lowercase();
+        let (k, what, until_ms) = {
+            let mut i = lock(&self.inner);
+            let list = i.jobs.get(terminal).cloned().unwrap_or_default();
+            let found: Vec<&Job> = list
+                .iter()
+                .filter(|j| {
+                    job.is_empty()
+                        || j.task.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(&job))
+                        || j.pid.is_some_and(|p| p.to_string() == job)
+                        || j.what.to_lowercase().contains(&job)
+                })
+                .collect();
+            let j = match found.as_slice() {
+                [one] => (*one).clone(),
+                [] => bail!("{terminal} has no job running that is {job:?} (tower job-running look {terminal} lists them)"),
+                _ => bail!("{terminal} has {} jobs that match {job:?}: name one by its task id or pid", found.len()),
+            };
+            let k = format!("{terminal}/{}", key(&j));
+            let until_ms = now + minutes.unwrap_or(WAIT_MS / 60_000).max(1) * 60_000;
+            i.waits.insert(k.clone(), (until.to_string(), until_ms));
+            // A new wait is a change: once it is up, the job may be flagged again.
+            i.stuck_told.remove(&k);
+            save_json(&self.path.with_file_name("jobs-waits.json"), &i.waits);
+            save_json(&self.path.with_file_name("jobs-told.json"), &i.stuck_told);
+            for l in i.jobs.values_mut() {
+                for x in l.iter_mut().filter(|x| key(x) == key(&j)) {
+                    x.stuck = false;
+                    x.waiting = until.to_string();
+                    x.wait_until_ms = Some(until_ms);
+                }
+            }
+            (k, j.what, until_ms)
+        };
+        eprintln!("[running] {k}: waits for {until} (until {})", crate::failover::when(until_ms, now));
+        self.publish();
+        super::missions::kick();
+        Ok(json!({ "job": what, "waits_for": until, "until": crate::failover::when(until_ms, now), "until_ms": until_ms }))
+    }
+}
+
 fn cpu_busy(pid: u32) -> bool {
     output("ps", &["-o", "pcpu=", "-p", &pid.to_string()]).trim().parse::<f32>().is_ok_and(|c| c >= 5.0)
 }
@@ -594,6 +685,34 @@ mod tests {
         r.settle(BTreeMap::new(), &names, now + 60_000);
         let t = lock(&told).clone();
         assert!(t.len() == 1 && t[0].msg.contains("job ended: Train it"), "{t:?}");
+    }
+
+    /// Said to wait: not checked until its time is up, and gone with the job.
+    #[test]
+    fn a_job_said_to_wait_is_not_flagged_until_its_time_is_up() {
+        let (r, told) = running();
+        let names: HashMap<String, String> = [("t12r".to_string(), "eyz search llm".to_string())].into();
+        let now = crate::history::now_ms();
+        let quiet = |at: u64| {
+            let mut m = BTreeMap::new();
+            m.insert("t12r".to_string(), (vec![job("Post-training pipeline", "bpost", at - 70 * 60_000, at - 69 * 60_000, true)], vec![]));
+            m
+        };
+        r.settle(quiet(now), &names, now);
+        assert_eq!(lock(&told).len(), 1, "flagged once");
+        assert!(r.wait("t12r", "nope", "x", None).is_err());
+        assert!(r.wait("t12r", "post", "", None).is_err(), "says what it waits for");
+        let v = r.wait("t12r", "post", "training writes its last checkpoint", Some(1)).unwrap();
+        assert_eq!(v["waits_for"], "training writes its last checkpoint");
+        r.settle(quiet(now + 15_000), &names, now + 15_000);
+        let j = lock(&r.inner).jobs["t12r"][0].clone();
+        assert!(!j.stuck && j.waiting == "training writes its last checkpoint", "{j:?}");
+        assert_eq!(lock(&told).len(), 1);
+        // Its time up and still quiet: flagged again, once (the wait was a change).
+        r.settle(quiet(now + 61_000), &names, now + 61_000);
+        r.settle(quiet(now + 76_000), &names, now + 76_000);
+        assert_eq!(lock(&told).len(), 2, "{:?}", lock(&told));
+        assert!(lock(&r.inner).waits.is_empty());
     }
 
     #[test]
