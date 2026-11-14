@@ -211,6 +211,15 @@ pub struct PrRef {
     /// Who outside depends on what it changes, and whether that breaks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub impact: Option<crate::impact::Impact>,
+    /// Its description on GitHub (`""`: none); None: not looked at yet (`crate::describe`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// Its description in one or two plain sentences (empty: not made yet).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+    /// It had no description and its session was asked to write one.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub asked_body: bool,
 }
 
 impl PrRef {
@@ -237,6 +246,9 @@ impl PrRef {
             score: p.score.clone(),
             validation: p.validation.clone(),
             impact: p.impact.clone(),
+            body: p.body.clone(),
+            summary: p.described.as_ref().filter(|d| p.body.as_deref().is_some_and(|b| crate::describe::hash(b) == d.of)).map(|d| d.summary.clone()).unwrap_or_default(),
+            asked_body: p.asked_body,
         }
     }
 
@@ -1051,7 +1063,8 @@ impl Book {
     /// decision whose PRs all merged or closed is over.
     pub fn sync_merges(&mut self, prs: &[Pr], now: u64) -> Changes {
         let mut ch = Changes::default();
-        let waiting: Vec<&Pr> = prs.iter().filter(|p| p.open() && p.waiting).collect();
+        // A draft, or one still under review, waits for nobody yet: in when it is ready.
+        let waiting: Vec<&Pr> = prs.iter().filter(|p| p.open() && p.waiting && p.ready_for_user()).collect();
         self.settled_prs.retain(|k, _| waiting.iter().any(|p| p.key() == *k));
         let mut groups: BTreeMap<String, Vec<&Pr>> = BTreeMap::new();
         for p in waiting.iter().filter(|p| !self.settled_prs.contains_key(&p.key())) {
@@ -2306,37 +2319,68 @@ mod tests {
         assert!(b.hold("d000000000000", "", "mac", 17 * MIN).unwrap_err().to_string().contains("no decision"));
     }
 
-    /// 14 Nov: eyzflow's card in sooner-chatbot-answers, #840 and #841
-    /// drafts, was titled "Merge PR #839 into dev, then PR #840 into dev,
-    /// then PR #841 into dev, then PR #842 into dev". The title names what
-    /// merges; the drafts' answers say they aren't in it (the phone's card).
+    /// 14 Nov: eyzflow's card in sooner-chatbot-answers listed #840 and
+    /// #841, drafts, beside #839 and #842. A draft, or a PR still under
+    /// review, waits for nobody: it is in no merge decision (nor its count)
+    /// until it is ready, then comes in, dev before main. One that can't go
+    /// with the others (checks fail) is on the card, said to be left out.
     #[test]
-    fn a_merge_decisions_title_leaves_out_what_cant_merge() {
+    fn a_merge_decision_takes_its_prs_once_they_are_ready() {
         let mut b = Book::default();
         let draft = |n| Pr { draft: true, ..pr(n, "dev", "t1", "Sooner", "pending") };
-        let prs = vec![pr(839, "dev", "t1", "Sooner", "passing"), draft(840), draft(841), pr(842, "dev", "t1", "Sooner", "passing")];
+        let reviewing = |n, base| Pr { review: Some(crate::reviews::Brief { status: "reviewing".into(), ..Default::default() }), ..pr(n, base, "t1", "Sooner", "passing") };
+        let mut prs = vec![pr(839, "dev", "t1", "Sooner", "passing"), draft(840), draft(841), reviewing(842, "dev"), reviewing(830, "main")];
         let id = b.sync_merges(&prs, 5 * MIN).fresh[0].clone();
         let d = b.find(&id).unwrap();
-        assert_eq!(d.title, "Merge PR #839 into dev, then PR #842 into dev (o/app)");
+        assert_eq!(d.prs.iter().map(|p| p.number).collect::<Vec<_>>(), [839], "drafts and PRs under review aren't the user's yet");
+        assert_eq!(d.title, "Merge PR #839 into dev (o/app)");
+        // Only drafts: no decision at all.
+        assert!(Book::default().sync_merges(&[draft(840), draft(841)], 5 * MIN).fresh.is_empty());
+        // #842's review agreed, #841 marked ready, #830 (into main) agreed: in, dev before main.
+        prs[3].review.as_mut().unwrap().status = "agreed".into();
+        prs[2].draft = false;
+        prs[4].review.as_mut().unwrap().status = "agreed".into();
+        let ch = b.sync_merges(&prs, 6 * MIN);
+        assert!(ch.fresh.is_empty(), "the same card, more on it");
+        let d = b.find(&id).unwrap();
+        assert_eq!(d.prs.iter().map(|p| p.number).collect::<Vec<_>>(), [839, 841, 842, 830]);
+        assert_eq!(d.title, "Merge PR #839 into dev, then PR #841 into dev, then PR #842 into dev, then PR #830 into main (o/app)");
+        // Checks that fail: on the card, but not in its merge, and said so.
+        prs[2].checks.state = "failing".into();
+        b.sync_merges(&prs, 7 * MIN);
+        let d = b.find(&id).unwrap();
+        assert_eq!(d.title, "Merge PR #839 into dev, then PR #842 into dev, then PR #830 into main (o/app)");
         assert_eq!(
             d.options.iter().map(|o| (o.label.as_str(), o.pick)).collect::<Vec<_>>(),
-            [
-                ("Merge PR #839 into dev", true),
-                ("#840 isn't in this merge: it's a draft", false),
-                ("#841 isn't in this merge: it's a draft", false),
-                ("Merge PR #842 into dev", false),
-            ]
+            [("Merge PR #839 into dev", true), ("#841 isn't in this merge: its checks fail", false), ("Merge PR #842 into dev", false), ("Merge PR #830 into main", false)]
         );
-        assert_eq!(d.options[1].why, "It's a draft: mark it ready for review first.");
-        // The first in order a draft: the pick is the first that merges.
-        let first_draft = vec![draft(838), pr(839, "dev", "t1", "Sooner", "passing")];
+        // The first in order failing: the pick is the first that merges.
         let mut b = Book::default();
-        let id = b.sync_merges(&first_draft, 5 * MIN).fresh[0].clone();
+        let id = b.sync_merges(&[pr(838, "dev", "t1", "Sooner", "failing"), pr(839, "dev", "t1", "Sooner", "passing")], 5 * MIN).fresh[0].clone();
         assert_eq!(b.find(&id).unwrap().pick().map(|o| o.label.as_str()), Some("Merge PR #839 into dev"));
         // None can merge: named as not ready.
         let mut b = Book::default();
-        let id = b.sync_merges(&[draft(840), draft(841)], 5 * MIN).fresh[0].clone();
-        assert_eq!(b.find(&id).unwrap().title, "Not ready to merge: PR #840 into dev, PR #841 into dev (o/app)");
+        let id = b.sync_merges(&[pr(840, "dev", "t1", "Sooner", "failing")], 5 * MIN).fresh[0].clone();
+        assert_eq!(b.find(&id).unwrap().title, "Not ready to merge: PR #840 into dev (o/app)");
+    }
+
+    /// The card's PRs carry their description and its summary (for the Mac's card and the phone's).
+    #[test]
+    fn a_merge_decisions_prs_carry_what_they_do() {
+        let mut b = Book::default();
+        let body = "Adds the Knowledge gaps column.";
+        let described = Pr {
+            body: Some(body.into()),
+            described: Some(crate::describe::Described { summary: "Support staff see open gaps.".into(), of: crate::describe::hash(body) }),
+            ..pr(839, "dev", "t1", "Sooner", "passing")
+        };
+        let stale = Pr { body: Some("Edited.".into()), ..described.clone() };
+        let empty = Pr { body: Some(String::new()), asked_body: true, ..pr(842, "dev", "t1", "Sooner", "passing") };
+        let id = b.sync_merges(&[described, Pr { number: 840, ..stale }, empty], 5 * MIN).fresh[0].clone();
+        let v = b.find(&id).unwrap().view(false);
+        assert_eq!((v["prs"][0]["body"].as_str(), v["prs"][0]["summary"].as_str()), (Some(body), Some("Support staff see open gaps.")));
+        assert_eq!(v["prs"][1]["summary"], serde_json::Value::Null, "a summary of an older text isn't passed on");
+        assert_eq!((v["prs"][2]["body"].as_str(), v["prs"][2]["asked_body"].as_bool()), (Some(""), Some(true)));
     }
 
     #[test]

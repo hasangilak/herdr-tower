@@ -166,6 +166,13 @@ pub struct PrRef {
     pub validation: Option<crate::prscore::Validation>,
     /// Who outside depends on what it changes, and whether that breaks.
     pub impact: Option<crate::impact::Impact>,
+    /// Its description on GitHub (`""`: none); None: not looked at yet.
+    pub body: Option<String>,
+    /// Its description in one or two plain sentences (empty: not made yet).
+    #[serde(deserialize_with = "or_default")]
+    pub summary: String,
+    /// It had no description and its session was asked to write one.
+    pub asked_body: bool,
 }
 
 impl PrRef {
@@ -457,7 +464,7 @@ pub fn adapt(sets: &[QuestionSet], prs: &BTreeMap<String, Pr>, agents: &Value, s
     let blocked: HashSet<&str> =
         agents.as_array().into_iter().flatten().filter(|a| a["status"] == "blocked").filter_map(|a| a["address"].as_str()).collect();
     let mut groups: BTreeMap<(String, String), Vec<&Pr>> = BTreeMap::new();
-    for pr in prs.values().filter(|p| p.open() && p.waiting) {
+    for pr in prs.values().filter(|p| p.open() && p.waiting && p.ready_for_user()) {
         groups.entry((pr.repo.clone(), pr.space.clone().unwrap_or_default())).or_default().push(pr);
     }
     for ((repo, space), mut list) in groups {
@@ -485,6 +492,9 @@ pub fn adapt(sets: &[QuestionSet], prs: &BTreeMap<String, Pr>, agents: &Value, s
                 score: p.score.clone(),
                 validation: p.validation.clone(),
                 impact: p.impact.clone(),
+                body: p.body.clone(),
+                summary: p.described.as_ref().map(|d| d.summary.clone()).unwrap_or_default(),
+                asked_body: p.asked_body,
             })
             .collect();
         let key = format!("merge:{repo}@{space}");

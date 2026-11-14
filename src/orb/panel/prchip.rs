@@ -30,6 +30,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use super::home::{LINE, SOFT, acts_row, card_box, card_title, cstat, cstat_busy, mbtn, meta_row};
 use super::{AMBER, CYAN, Panel, ROSE, glass};
 use crate::orb::model::{self, Decision, PrRef};
+use crate::describe::About;
 use crate::prs::{Gate, Pr, gate};
 
 /// Where a PR's merge stands.
@@ -312,7 +313,8 @@ impl Panel {
                 };
                 Line { step: t.acts.steps.get(&key).cloned().unwrap_or_default(), gate, pr, key }
             })
-            .filter(|l| l.pr.open())
+            // A draft, or one still under review, isn't the user's yet (as the daemon leaves it out).
+            .filter(|l| l.pr.open() && l.pr.ready_for_user())
             .collect()
     }
 
@@ -422,6 +424,7 @@ impl Panel {
         // A PR the merge leaves out is marked so, and why; dimmed. (With none
         // that can go, there is no merge to leave it out of: the card says why below.)
         let some_go = lines.iter().any(Line::clean);
+        let bodies = self.acts(cx).bodies.clone();
         for l in &lines {
             let (word, color) = l.standing();
             let left_out = l.held_back().filter(|_| some_go);
@@ -455,6 +458,27 @@ impl Panel {
                             .child(div().flex_none().text_color(rgb(color)).child(word)),
                     )
                     .when(!l.pr.title.is_empty(), |el| el.child(div().text_size(px(12.0)).text_color(g.faint).truncate().child(l.pr.title.clone())))
+                    // What it does: its description in a sentence or two, the whole of it on request.
+                    .children(about_line(&l.pr))
+                    .when(l.pr.body.as_deref().is_some_and(|b| !b.trim().is_empty()), |el| {
+                        let (open, key) = (bodies.contains(&l.key), l.key.clone());
+                        el.child(
+                            div()
+                                .id(SharedString::from(format!("merge-body-{}", l.key)))
+                                .mt(px(2.0))
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(CYAN))
+                                .cursor_pointer()
+                                .child(if open { "Hide description ▴" } else { "Full description ▾" })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    let key = key.clone();
+                                    this.act(cx, |a| if !a.bodies.remove(&key) { a.bodies.insert(key); });
+                                })),
+                        )
+                        .when(open, |el| el.child(full_body(l.pr.body.as_deref().unwrap_or(""), g.muted)))
+                    })
                     .children(l.review().map(|(line, color)| div().text_size(px(12.0)).text_color(rgb(color)).truncate().child(line)))
                     .when(!l.breaking().is_empty(), |el| {
                         el.child(
@@ -534,6 +558,32 @@ impl Panel {
     }
 }
 
+/// The line under a PR's title that says what it does (`crate::describe::about`).
+fn about_line(pr: &Pr) -> Option<AnyElement> {
+    let g = glass();
+    let el = div().text_size(px(13.0)).line_height(px(18.0));
+    Some(
+        match crate::describe::about(pr) {
+            // At most two sentences (`describe::parse` cuts one that ran on): shown whole.
+            About::Summary(s) => el.text_color(g.text).child(s),
+            About::Opening(s) => el.text_color(g.muted).line_clamp(2).child(s),
+            About::Missing { asked: true } => el.text_color(rgb(AMBER)).child("No description on GitHub. The tower asked its session to write one."),
+            About::Missing { asked: false } => el.text_color(rgb(AMBER)).child("No description on GitHub."),
+            About::Unknown => return None,
+        }
+        .into_any_element(),
+    )
+}
+
+/// A PR's description in full, as plain paragraphs (its markdown marks left out).
+fn full_body(body: &str, color: gpui::Hsla) -> AnyElement {
+    let mut col = v_flex().mt(px(4.0)).px(px(10.0)).py(px(8.0)).gap(px(4.0)).rounded(px(8.0)).bg(rgba(0x0000001f)).text_size(px(12.0)).line_height(px(17.0)).text_color(color);
+    for line in body.lines().map(crate::describe::plain).filter(|l| !l.is_empty()) {
+        col = col.child(div().child(line));
+    }
+    col.into_any_element()
+}
+
 /// A PR known only from its decision: enough to show its row.
 fn described(r: &PrRef) -> Pr {
     Pr {
@@ -559,6 +609,9 @@ fn described(r: &PrRef) -> Pr {
         score: r.score.clone(),
         validation: r.validation.clone(),
         impact: r.impact.clone(),
+        body: r.body.clone(),
+        described: r.body.as_deref().filter(|_| !r.summary.is_empty()).map(|b| crate::describe::Described { summary: r.summary.clone(), of: crate::describe::hash(b) }),
+        asked_body: r.asked_body,
         ..Default::default()
     }
 }

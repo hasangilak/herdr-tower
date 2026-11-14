@@ -23,6 +23,7 @@ mod config;
 mod covered;
 mod daemon;
 mod decisions;
+mod describe;
 mod dispatch;
 mod failover;
 mod goals;
