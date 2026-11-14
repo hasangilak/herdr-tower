@@ -393,7 +393,7 @@ pub(super) fn pr_rows(prs: &[crate::prscore::Predicted]) -> Vec<PrRow> {
 
 /// The stages' heading: "Stage 2 of 4 · 1 done", or "3 stages" before any is under way.
 pub(super) fn stages_head(p: &PlanView) -> String {
-    let n = p.stages.len();
+    let n = p.progress.stages.max(p.stages.len());
     match (p.progress.at, p.progress.done) {
         (_, d) if d == n && n > 0 => format!("All {n} done"),
         (Some(at), d) if d > 0 => format!("Stage {at} of {n} · {d} done"),
@@ -441,6 +441,23 @@ pub(super) fn launch_waits(p: &PlanView) -> Option<String> {
         1 => Some("1 question of the plan is open: Launch waits for its answer, so no plan goes out with questions on its page.".into()),
         n => Some(format!("{n} questions of the plan are open: Launch waits for their answers, so no plan goes out with questions on its page.")),
     }
+}
+
+/// A live plan's head: "Plan · version 3 · Stage 2 of 4 · 1 done".
+pub(super) fn live_head(p: &PlanView) -> String {
+    format!("Plan · version {} · {}", p.version.max(1), stages_head(p))
+}
+
+/// A revision in a line: "v2 · small, applied: Stage s2 delivers PR 2, PR 4 (from f1)".
+pub(super) fn revision_line(r: &crate::plans::Revision) -> String {
+    let what = match r.status.as_str() {
+        "proposed" => "waiting for your word".to_string(),
+        "rejected" => "kept out by you".to_string(),
+        _ if r.size == "big" => "big, applied on your yes".to_string(),
+        _ => "small, applied by itself".to_string(),
+    };
+    let from = if r.findings.is_empty() { String::new() } else { format!(" (from {})", r.findings.join(", ")) };
+    format!("Revision {} · {what}: {}{from}", r.n, r.why.trim_end_matches('.'))
 }
 
 /// The list's heading: how many, and how many need a person.
@@ -1794,6 +1811,59 @@ impl Panel {
             .into_any_element()
     }
 
+    /// A space's live plan: its version and how far it is, its stages,
+    /// the findings that wait and its revisions, newest first.
+    pub(super) fn live_plan_card(&self, p: &PlanView, cx: &mut Context<Self>) -> AnyElement {
+        let g = glass();
+        let url = p.url.clone();
+        let waiting = p.findings.iter().filter(|f| f.revision.is_none()).count();
+        let open = url.map(|u| {
+            div().id("live-plan-open").flex_none().font_weight(FontWeight::SEMIBOLD).text_color(rgb(CYAN)).cursor_pointer().hover(|s| s.underline()).child("Open").on_click(cx.listener(move |_, _, _, cx| {
+                let u = u.clone();
+                cx.background_executor().spawn(async move { std::process::Command::new("open").arg(u).status() }).detach();
+            }))
+        });
+        let stage_rows = p.stages.iter().enumerate().map(|(i, st)| {
+            let (word, bad) = stage_word(&st.state);
+            let passed = st.stage.checks().filter(|(_, c)| c.passed()).count();
+            let all = st.stage.checks().count();
+            h_flex()
+                .gap(px(8.0))
+                .items_start()
+                .child(div().flex_none().w(px(18.0)).text_size(px(12.0)).text_color(g.faint).child(format!("{}", i + 1)))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().text_size(px(13.0)).line_height(px(18.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.text).child(st.stage.title.clone()))
+                        .child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.faint).child(format!("Done when: {} · {passed} of {all} checks passed", st.stage.done_when))),
+                )
+                .child(div().flex_none().text_size(px(12.0)).font_weight(FontWeight::SEMIBOLD).text_color(if bad { rgb(0xff8f8f) } else if st.state == "done" { rgb(0x7fd6a4) } else { rgb(CYAN) }).child(word))
+        });
+        v_flex()
+            .w_full()
+            .px(px(16.0))
+            .py(px(14.0))
+            .gap(px(9.0))
+            .rounded(px(18.0))
+            .bg(rgba(0xffffff14))
+            .border_1()
+            .border_color(rgba(LINE))
+            .child(h_flex().gap(px(8.0)).items_center().child(div().flex_1().min_w_0().text_size(px(14.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.text).child(live_head(p))).children(open))
+            .children(stage_rows)
+            .when(waiting > 0, |el| el.child(div().text_size(px(12.5)).text_color(rgb(AMBER)).child(format!("{waiting} finding{} wait for the plan's revision.", if waiting == 1 { "" } else { "s" }))))
+            .when(!p.revisions.is_empty(), |el| {
+                el.child(div().pt(px(4.0)).text_size(px(11.0)).font_weight(FontWeight::SEMIBOLD).text_color(g.faint).child("WHAT CHANGED"))
+                    .children(p.revisions.iter().rev().take(4).map(|r| {
+                        v_flex()
+                            .gap(px(2.0))
+                            .child(div().text_size(px(12.5)).line_height(px(17.0)).text_color(if r.status == "proposed" { rgb(AMBER) } else { gpui::Rgba::from(g.muted) }).child(revision_line(r)))
+                            .children(r.changes.iter().take(4).map(|c| div().pl(px(10.0)).text_size(px(12.0)).line_height(px(16.0)).text_color(g.faint).child(format!("• {c}"))))
+                    }))
+            })
+            .into_any_element()
+    }
+
     /// The plan's questions: each with where it is, or its answer.
     fn plan_questions(&self, p: &PlanView) -> AnyElement {
         let g = glass();
@@ -2750,6 +2820,15 @@ mod tests {
         assert_eq!(question_line(&p.questions[0]), "Answered by the tower: 30 days");
         assert!(question_line(&p.questions[1]).starts_with("In your queue"));
         assert!(launch_waits(&p).unwrap().starts_with("1 question of the plan is open: Launch waits"));
+        // Live: the space's own, by its name.
+        let live = serde_json::json!({ "plans_live": [{ "id": "p1", "status": "live", "launched": "msg-translation", "version": 3, "stages": [], "progress": { "stages": 4, "done": 1, "at": 2 },
+            "revisions": [{ "n": 1, "why": "The backfill gets its own check", "findings": ["f2"], "changes": ["c"], "size": "small", "status": "applied" },
+                          { "n": 2, "why": "Backfill first.", "findings": ["f1"], "size": "big", "status": "proposed" }] }] });
+        let lp = model::live_plan(&live, "MSG-translation").unwrap();
+        assert!(model::live_plan(&live, "other").is_none());
+        assert_eq!(live_head(&lp), "Plan · version 3 · Stage 2 of 4 · 1 done");
+        assert_eq!(revision_line(&lp.revisions[0]), "Revision 1 · small, applied by itself: The backfill gets its own check (from f2)");
+        assert_eq!(revision_line(&lp.revisions[1]), "Revision 2 · waiting for your word: Backfill first (from f1)");
         // An older tower's plan has none of it.
         let old = model::plan(&serde_json::json!({ "plan": { "id": "p1", "status": "ready" } })).unwrap();
         assert!(old.stages.is_empty() && launch_waits(&old).is_none() && stages_head(&old) == "0 stages");

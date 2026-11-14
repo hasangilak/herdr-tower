@@ -1305,6 +1305,13 @@ pub struct PlanView {
     /// How far it is: stages, done, and the one at work (from 1).
     #[serde(deserialize_with = "or_default")]
     pub progress: PlanProgress,
+    /// The space launched with it (a live plan).
+    pub launched: Option<String>,
+    pub version: u32,
+    #[serde(deserialize_with = "or_default")]
+    pub findings: Vec<crate::plans::Finding>,
+    #[serde(deserialize_with = "or_default")]
+    pub revisions: Vec<crate::plans::Revision>,
 }
 
 /// A plan's stage as the state carries it: the stage, and where it stands.
@@ -1331,6 +1338,12 @@ impl PlanView {
     pub fn form_word(&self) -> &str {
         if self.form == "whiteboard" { "whiteboard" } else { "page" }
     }
+}
+
+/// The live plan of the space called `space` (launched with it), if any.
+pub fn live_plan(state: &Value, space: &str) -> Option<PlanView> {
+    let v = state.get("plans_live")?.as_array()?.iter().find(|p| p["launched"].as_str().is_some_and(|l| l.trim().eq_ignore_ascii_case(space.trim())))?;
+    serde_json::from_value(v.clone()).ok()
 }
 
 /// The open plan, when the state has one (an older tower's has none).

@@ -119,7 +119,11 @@ impl Plans {
 
     fn publish(&self, b: &Book) {
         let view = b.current().map(|p| self.view_of(p));
-        self.shared.update(|s| s.plan = view);
+        let live: Vec<Value> = b.live().into_iter().map(|p| self.view_of(p)).collect();
+        self.shared.update(|s| {
+            s.plan = view;
+            s.plans_live = live;
+        });
     }
 
     /// A plan as the windows and the phone get it: with where its stages stand.
@@ -142,7 +146,8 @@ impl Plans {
 
     /// The open plan's planner, as Herdr has it now.
     fn look(&self) {
-        let Some((id, address)) = lock(&self.book).current().and_then(|p| Some((p.id.clone(), p.address.clone()?))) else { return };
+        // The open plan's planner, or a live plan's (revising it).
+        let Some((id, address)) = lock(&self.book).plans.iter().rev().filter(|p| p.is_open()).find_map(|p| Some((p.id.clone(), p.address.clone()?))) else { return };
         let word = match hc::lookup(&address) {
             hc::Lookup::Found(t) if t["state"].as_str().is_none_or(|s| s == "live") => hc::status_word(&t).unwrap_or_else(|| "starting".into()),
             hc::Lookup::Found(_) | hc::Lookup::Gone => "gone".into(),
@@ -193,6 +198,27 @@ impl Plans {
                 let b = body.clone().unwrap_or_default();
                 let w = |k: &str| b[k].as_str().unwrap_or("").to_string();
                 done(self.pick_id(id).and_then(|id| self.check(&id, &w("stage"), &w("check"), &w("status"), &w("evidence"), &w("by"))))
+            }
+            "finding" => {
+                let b = body.clone().unwrap_or_default();
+                let w = |k: &str| b[k].as_str().unwrap_or("").to_string();
+                done(self.pick_id(id).and_then(|id| self.found(&id, &w("kind"), &w("text"), &w("stage"), &w("assumption"), &w("session"))))
+            }
+            "assume" => {
+                let b = body.clone().unwrap_or_default();
+                let w = |k: &str| b[k].as_str().unwrap_or("").to_string();
+                let holds = match w("status").to_lowercase().as_str() {
+                    "holds" | "hold" | "ok" | "true" => Ok(true),
+                    "broken" | "wrong" | "false" => Ok(false),
+                    other => Err(anyhow::anyhow!("an assumption holds or is broken, not {other:?}")),
+                };
+                done(holds.and_then(|holds| self.pick_id(id).and_then(|id| self.assume(&id, &w("assumption"), holds, &w("evidence"), &w("session")))))
+            }
+            "revise" => {
+                let b = body.clone().unwrap_or_default();
+                let findings: Vec<String> = b["findings"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect();
+                let by = if who.trim().is_empty() { "planner" } else { who.as_str() };
+                done(self.pick_id(id).and_then(|id| self.revise_structure(&id, &b["structure"], text, &findings, by)))
             }
             "show" | "" => done(lock(&self.book).pick(id).map(|p| self.view_of(p))),
             "list" => done(Ok(json!({ "plans": lock(&self.book).plans.iter().rev().map(|p| self.view_of(p)).collect::<Vec<_>>() }))),
@@ -380,6 +406,105 @@ impl Plans {
             }
         }
         Ok(json!({ "plan": id, "question": qx.id, "answer": qx.answer, "by": qx.by, "open_questions": x.open_questions().len() }))
+    }
+
+    /// A finding on a plan: kept, and told to whoever revises the plan.
+    fn found(&self, id: &str, kind: &str, text: &str, stage: &str, assumption: &str, session: &str) -> Result<Value> {
+        let mut f = None;
+        let p = self.change(|b| {
+            f = Some(b.finding(id, kind, text, stage, assumption, session, now())?);
+            Ok(b.get(id).cloned().unwrap_or_default())
+        })?;
+        let f = f.expect("set above");
+        eprintln!("[plans] {id} {}: {} ({})", f.id, f.text, f.kind);
+        let to = self.tell_reviser(&p, &f);
+        Ok(json!({ "plan": id, "finding": f, "told": to, "version": p.version }))
+    }
+
+    /// An assumption checked; a broken one is a finding, told as one.
+    fn assume(&self, id: &str, a: &str, holds: bool, evidence: &str, session: &str) -> Result<Value> {
+        let mut out = None;
+        let p = self.change(|b| {
+            out = Some(b.assume(id, a, holds, evidence, session, now())?);
+            Ok(b.get(id).cloned().unwrap_or_default())
+        })?;
+        let (x, f) = out.expect("set above");
+        let told = f.as_ref().map(|f| self.tell_reviser(&p, f));
+        Ok(json!({ "plan": id, "assumption": x, "finding": f, "told": told }))
+    }
+
+    /// Who revises the plan for a finding: its planner when it runs; else,
+    /// for a live plan, a planner started for it (when no other plan's
+    /// planner runs); else the brain, to start one or say it to the user.
+    fn tell_reviser(&self, p: &Plan, f: &plans::Finding) -> &'static str {
+        let tower = config::tower_bin().display().to_string();
+        if let Some(address) = &p.address {
+            match self.sendq.add_note(address, &plans::finding_note(p, f, &tower)) {
+                Ok(_) => return "the planner",
+                Err(e) => eprintln!("[plans] {}: couldn't tell its planner: {e:#}", p.id),
+            }
+        }
+        let busy = lock(&self.book).plans.iter().any(|x| x.id != p.id && x.is_open() && x.address.is_some());
+        // (A test tower never starts a real planner in the user's Herdr.)
+        if p.status == plans::Status::Live && !busy && !cfg!(test) && !super::watch::test_daemon() {
+            let (me, p) = (self.clone(), p.clone());
+            thread::spawn(move || me.start_planner(&p, &[]));
+            return "a planner started for it";
+        }
+        if let Some(brain) = &self.brain {
+            let note = format!(
+                "[plan-finding] {} {} {}: no planner can take it now. Tell the user in a sentence what was found and that the plan waits for its revision.",
+                p.id,
+                f.id,
+                serde_json::to_string(f).unwrap_or_default()
+            );
+            let brain = brain.clone();
+            thread::spawn(move || brain(&note));
+            return "the brain";
+        }
+        "nobody"
+    }
+
+    /// A revision of a plan's structure: small, applied (and new questions
+    /// routed); big, a card in the user's queue with what changes.
+    fn revise_structure(&self, id: &str, v: &Value, why: &str, findings: &[String], by: &str) -> Result<Value> {
+        let r = self.change(|b| b.revise(id, v, why, findings, by, now()).map(|_| b.get(id).cloned().unwrap_or_default()))?;
+        let rev = r.revisions.last().cloned().unwrap_or_default();
+        eprintln!("[plans] {id}: revision {} ({}, {}): {}", rev.n, rev.size, rev.status, rev.changes.join("; "));
+        if rev.status == "applied" {
+            self.route(id);
+            return Ok(json!({ "plan": id, "revision": rev, "version": r.version, "said": format!("Applied by itself (a small change): the plan is version {} now. Put it in plan.md and republish with what changed.", r.version) }));
+        }
+        let Some(decisions) = &self.decisions else { bail!("the tower has no queue to ask in") };
+        let (card, _) = decisions.plan_question(plans::revision_card(&r, &rev));
+        let _ = self.change(|b| {
+            b.revision_card(id, rev.n, &card);
+            Ok(b.get(id).cloned().unwrap_or_default())
+        });
+        Ok(json!({ "plan": id, "revision": rev, "card": card, "version": r.version, "said": "A big change: it is a card in the user's queue, applied only on their yes. You'll be told their word." }))
+    }
+
+    /// A plan's card answered by the user: a question (`q1`), or a big
+    /// revision (`rev:2`: applied when they chose to apply it).
+    pub fn from_card(&self, id: &str, what: &str, answer: &str) -> Result<Value> {
+        let Some(n) = what.strip_prefix("rev:").and_then(|n| n.parse::<u32>().ok()) else {
+            return self.answer(id, what, answer, "you");
+        };
+        let apply = answer.trim().to_lowercase().starts_with("apply");
+        let p = self.change(|b| b.decide_revision(id, n, apply, now()).map(|_| b.get(id).cloned().unwrap_or_default()))?;
+        eprintln!("[plans] {id}: revision {n} {}", if apply { "applied by the user" } else { "kept out by the user" });
+        if apply {
+            self.route(id);
+        }
+        if let Some(address) = p.address.clone().filter(|_| !cfg!(test)) {
+            let note = if apply {
+                format!("[plan {id}] The user applied revision {n}: the plan is version {} now. Put it in plan.md and republish the same artifact with what changed.", p.version)
+            } else {
+                format!("[plan {id}] The user kept the plan as it is: revision {n} is not applied ({answer}). Find another way for its findings, or say with `plan say` why there is none.")
+            };
+            let _ = self.sendq.add_note(&address, &note);
+        }
+        Ok(json!({ "plan": id, "revision": n, "applied": apply, "version": p.version }))
     }
 
     /// A stage's check reported.
@@ -713,6 +838,112 @@ mod tests {
         assert_eq!(stage(2), "failing");
         let shown = shared.get().plan.unwrap();
         assert_eq!((shown["progress"]["stages"].as_u64(), shown["progress"]["done"].as_u64(), shown["progress"]["at"].as_u64()), (Some(4), Some(1), Some(2)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_live_plan_is_revised_from_findings_small_changes_by_themselves_big_ones_on_the_users_word() {
+        use crate::daemon::decisions::{Carry, Decisions};
+        let dir = std::env::temp_dir().join(format!("tower-plans-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shared = Shared::new(State::new("off", "test", "test"));
+        let decisions = Decisions::new(shared.clone());
+        let notes: Arc<Mutex<Vec<String>>> = Arc::default();
+        let heard = notes.clone();
+        let brain: BrainNote = Arc::new(move |t: &str| heard.lock().unwrap().push(t.to_string()));
+        let plans = Plans::at(dir.join("plans.json"), shared.clone(), SendQueue::open()).wired(decisions.clone(), Arc::new(|_: &str| None), brain).brain_within(60_000);
+        translation_plan(&plans, &dir);
+        let mut st = ask("stages", "p1");
+        if let Request::Plan { body, .. } = &mut st {
+            let mut v = structure_of();
+            v["questions"] = json!([]);
+            *body = Some(v);
+        }
+        assert!(plans.request(&st).ok);
+        // Launched: the plan stays, live, as its space's.
+        let mut close = ask("close", "p1");
+        if let Request::Plan { launched, .. } = &mut close {
+            *launched = Some("msg-translation".into());
+        }
+        assert!(plans.request(&close).ok);
+        let state = shared.get();
+        assert!(state.plan.is_none(), "no plan being written");
+        assert_eq!((state.plans_live.len(), state.plans_live[0]["status"].as_str(), state.plans_live[0]["version"].as_u64()), (1, Some("live"), Some(1)));
+
+        // A session finds an assumption wrong: the assumption is broken, the finding kept and told.
+        let mut wrong = ask("assume", "p1");
+        if let Request::Plan { body, .. } = &mut wrong {
+            *body = Some(json!({ "assumption": "a1", "status": "broken", "evidence": "1,204 messages have no lang: imported tickets", "session": "t5" }));
+        }
+        let r = plans.request(&wrong);
+        assert!(r.ok, "{:?}", r.error);
+        let v = r.state.unwrap();
+        assert_eq!((v["assumption"]["status"].as_str(), v["finding"]["id"].as_str(), v["finding"]["kind"].as_str(), v["told"].as_str()), (Some("broken"), Some("f1"), Some("assumption-wrong"), Some("the brain")));
+        assert!(notes.lock().unwrap().iter().any(|n| n.starts_with("[plan-finding] p1 f1 ")));
+        // And a PR that has to split.
+        let mut split = ask("finding", "p1");
+        if let Request::Plan { body, .. } = &mut split {
+            *body = Some(json!({ "kind": "split-pr", "text": "The endpoint and the language backfill are two PRs", "stage": "s2" }));
+        }
+        assert_eq!(plans.request(&split).state.unwrap()["finding"]["id"], "f2");
+
+        // A small revision: s2 gets a check for the backfill. Applied by itself, version 2, f2 taken in.
+        let revise = |v: Value, why: &str, findings: &[&str]| {
+            let mut r = ask("revise", "p1");
+            if let Request::Plan { body, text, .. } = &mut r {
+                *body = Some(json!({ "structure": v, "findings": findings }));
+                *text = why.into();
+            }
+            plans.request(&r)
+        };
+        let mut v = structure_of();
+        v["questions"] = json!([]);
+        v["stages"][1]["post"].as_array_mut().unwrap().push(json!({ "id": "c2", "what": "Every message has a language", "how": "select count(*) from messages where lang is null", "evidence": "0" }));
+        let r = revise(v.clone(), "The backfill gets its own check", &["f2"]);
+        assert!(r.ok, "{:?}", r.error);
+        let out = r.state.unwrap();
+        assert_eq!((out["revision"]["size"].as_str(), out["revision"]["status"].as_str(), out["version"].as_u64()), (Some("small"), Some("applied"), Some(2)));
+        assert_eq!(out["revision"]["changes"][0], "Stage s2 gets a post check c2: Every message has a language");
+        let live = shared.get().plans_live[0].clone();
+        assert_eq!((live["findings"][1]["revision"].as_u64(), live["stages"][1]["post"].as_array().map(Vec::len)), (Some(1), Some(2)));
+        assert!(revise(v.clone(), "again", &[]).error.unwrap().contains("nothing changes"));
+
+        // A big one: s2's done-when grows with the backfill (f1). A card with the diff; nothing applied yet.
+        let mut big = v.clone();
+        big["stages"][1]["done_when"] = json!("The endpoint answers on dev and every message has a language");
+        let out = revise(big.clone(), "Imported tickets have no language: backfill them first", &["f1"]).state.unwrap();
+        assert_eq!((out["revision"]["size"].as_str(), out["revision"]["status"].as_str(), out["version"].as_u64()), (Some("big"), Some("proposed"), Some(2)));
+        let card = out["card"].as_str().unwrap().to_string();
+        let d = decisions.get(&card).unwrap();
+        assert_eq!(d.title, "Change the plan: Imported tickets have no language: backfill them first?");
+        assert!(d.detail.contains("version 2 → 3") && d.detail.contains("Stage s2 is done when: The endpoint answers on dev and every message has a language") && d.detail.contains("From finding f1"), "{}", d.detail);
+        assert!(revise(v.clone(), "another", &[]).error.unwrap().contains("one at a time"));
+        assert_eq!(shared.get().plans_live[0]["stages"][1]["done_when"], "POST /messages/:id/translate returns and caches a translation on dev");
+        // The user applies it on the card: version 3.
+        let asks = crate::daemon::asks::Asks::new(shared.clone(), Arc::new(crate::daemon::lan::hub::Hub::default()), "normal");
+        let send = |_: &str, _: &str| -> Result<Value> { panic!("nothing is sent to a session") };
+        let agenda = |_: &crate::agenda::Cmd| crate::protocol::Response { ok: true, error: None, state: None };
+        let reopen = |_: &crate::reopen::Pick| -> Result<Value> { panic!("no reopen") };
+        let accounts = |_: bool| -> Result<Value> { panic!("no accounts") };
+        let planned = |plan: &str, what: &str, a: &str| plans.from_card(plan, what, a);
+        let carry = Carry { asks: &asks, send: &send, agenda: &agenda, reopen: &reopen, accounts: &accounts, plan: &planned };
+        let v3 = decisions.answer_with(&card, &json!({ "choice": 0 }), true, &carry).unwrap();
+        assert_eq!((v3["plan"]["applied"].as_bool(), v3["plan"]["version"].as_u64()), (Some(true), Some(3)));
+        let live = shared.get().plans_live[0].clone();
+        assert_eq!((live["version"].as_u64(), live["stages"][1]["done_when"].as_str(), live["revisions"][1]["status"].as_str()), (Some(3), Some("The endpoint answers on dev and every message has a language"), Some("applied")));
+        assert_eq!(live["findings"][0]["revision"], 2);
+        // Another big one (dropping s4's check), kept out by the user: the plan stays at version 3.
+        let mut drop = big.clone();
+        drop["stages"][3]["post"][0]["id"] = json!("c9");
+        let out = revise(drop, "Release check by hand", &[]).state.unwrap();
+        let card = out["card"].as_str().unwrap().to_string();
+        let kept = decisions.answer_with(&card, &json!({ "choice": 1 }), true, &carry).unwrap();
+        assert_eq!((kept["plan"]["applied"].as_bool(), kept["plan"]["version"].as_u64()), (Some(false), Some(3)));
+        assert_eq!(shared.get().plans_live[0]["revisions"][2]["status"], "rejected");
+        assert_eq!(decisions.list(None, false)["count"], 0);
+        // A new plan being written leaves the live one live.
+        plans.change(|b| Ok(b.add(Form::Page, "Another", draft(), |id| dir.join(id), 9).0)).unwrap();
+        assert_eq!((shared.get().plans_live.len(), shared.get().plan.unwrap()["id"].as_str()), (1, Some("p2")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
