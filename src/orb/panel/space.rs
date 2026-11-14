@@ -608,6 +608,14 @@ impl Panel {
         // The head.
         // Its sessions, and its own tower when it has one (the daemon says so).
         let mut sub = vec![div().child(match m.tower_line() { Some(line) => format!("{} · {line}", m.sub()), None => m.sub() }).into_any_element()];
+        // How long its sessions have been at work: this stretch, today, since it opened.
+        if let Some(a) = &m.active {
+            let now = crate::history::now_ms();
+            if let Some(line) = a.head_line(now) {
+                let color = if a.at(now).now { rgb(CYAN).into() } else { glass().muted };
+                sub.push(div().text_color(color).child(line).into_any_element());
+            }
+        }
         if m.standing {
             sub.push(div().child("A standing space: the tower never closes it and opens no worktrees here.").into_any_element());
         } else if m.goal.trim().is_empty() {

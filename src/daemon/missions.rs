@@ -42,6 +42,8 @@ pub struct Missions {
     last: Arc<Mutex<Vec<missions::Seen>>>,
     /// When Herdr last answered a look (None: not yet in this run).
     looked: Arc<Mutex<Option<u64>>>,
+    /// Each space's active time, from the history's status lines (`crate::active`).
+    active: Arc<Mutex<crate::active::Tracker>>,
 }
 
 /// A session's labels are read again this long after they were read.
@@ -80,6 +82,8 @@ impl Missions {
             full: Arc::default(),
             last: Arc::default(),
             looked: Arc::default(),
+            // (Tests never read the user's history.)
+            active: Arc::new(Mutex::new(crate::active::Tracker::at(if cfg!(test) { std::path::PathBuf::from("/nonexistent/history.jsonl") } else { crate::history::path() }))),
         }
     }
 
@@ -170,7 +174,18 @@ impl Missions {
         let threads: BTreeMap<String, usize> = self.shared.with(|s| s.threads.iter().map(|(k, v)| (k.clone(), v.len())).collect());
         let ledger = self.agendas.ledger();
         let towers = super::brains::towers();
-        let src = Sources { sessions: Some(&sessions), decisions: &decisions, ledger: &ledger, threads: &threads, towers: &towers, now, auto_close_hours };
+        // What the history added since the last look (status changes), and each space's active time from it.
+        let tracker = {
+            let mut t = lock(&self.active);
+            t.read();
+            t
+        };
+        let working: HashMap<String, bool> = sessions.iter().map(|x| (x.address.clone(), x.status == "working")).collect();
+        let jobs: Vec<(String, u64)> =
+            sessions.iter().flat_map(|x| super::running::jobs_of(&x.address).into_iter().map(|j| (x.address.clone(), j.since_ms)).collect::<Vec<_>>()).collect();
+        let day = missions::day_start(now);
+        let active_of = |space: &str, opened: u64| tracker.of(space, opened, day, now, &|a: &str| working.get(a).copied(), &jobs);
+        let src = Sources { sessions: Some(&sessions), decisions: &decisions, ledger: &ledger, threads: &threads, towers: &towers, now, auto_close_hours, active: Some(&active_of) };
         // The first look of this run, or the first in a while (the Mac slept, Herdr
         // couldn't be asked, the clock moved): what wasn't watched isn't a space left alone.
         let away = asked && missions::was_away(lock(&self.looked).replace(now), now);
@@ -313,7 +328,14 @@ mod tests {
         assert_eq!(shared.json()["missions"]["spaces"][0]["sessions"][0]["address"], "t1");
         // Herdr can't be asked: nothing moves, and the missions keep their sessions.
         let blind = m.settle(None, &ui, now + 1_000, 24);
-        assert_eq!(blind, v);
+        // (The active figures carry when they were made: a second later.)
+        let undated = |mut v: serde_json::Value| {
+            for s in v["spaces"].as_array_mut().into_iter().flatten() {
+                s.as_object_mut().map(|o| o.remove("active"));
+            }
+            v
+        };
+        assert_eq!(undated(blind), undated(v.clone()));
         // Shop's last session goes.
         let v = m.settle(Some(vec![seen("Docs", "t7", "idle")]), &ui, now + 60_000, 24);
         assert_eq!((v["quiet"].clone(), v["spaces"][1]["name"].as_str(), v["spaces"][1]["state"].as_str()), (serde_json::json!(["Shop"]), Some("Shop"), Some("quiet")));

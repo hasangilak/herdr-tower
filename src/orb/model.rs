@@ -736,6 +736,8 @@ pub struct Mission {
     pub ready_since_ms: Option<u64>,
     /// When a ready space closes by itself (none: it doesn't, or not yet).
     pub auto_close_ms: Option<u64>,
+    /// How long its sessions have been at work (`crate::active`; none from a daemon that doesn't say).
+    pub active: Option<crate::active::Active>,
 }
 
 impl Mission {

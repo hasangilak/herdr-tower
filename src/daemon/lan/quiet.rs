@@ -679,6 +679,7 @@ mod tests {
                 towers: &towers,
                 now: crate::history::now_ms(),
                 auto_close_hours: 24,
+                active: None,
             };
             let view = crate::missions::view(&self.kept(), &src);
             self.shared.update(|s| s.missions = view.clone());

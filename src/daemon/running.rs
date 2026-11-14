@@ -415,6 +415,13 @@ impl Running {
                     // Over: what was told of it is forgotten.
                     gone_told.push(format!("{address}/{}", key(j)));
                     told.push((address.clone(), ended_line(names.get(address).map(String::as_str).unwrap_or(address), j, summary.as_deref(), now)));
+                    // Its run, for its space's active time (`crate::active`): not in the record.
+                    let (a, since) = (address.clone(), j.since_ms);
+                    if !cfg!(test) {
+                        crate::history::later(move || {
+                            crate::history::append(crate::history::Entry { kind: "bgjob".into(), session: Some(a), status: Some("ended".into()), since: Some(since), ..Default::default() })
+                        });
+                    }
                 }
             }
             for (address, j) in carried {
