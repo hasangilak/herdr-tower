@@ -44,6 +44,8 @@ pub struct Missions {
     looked: Arc<Mutex<Option<u64>>>,
     /// Each space's active time, from the history's status lines (`crate::active`).
     active: Arc<Mutex<crate::active::Tracker>>,
+    /// Each space's and session's brief, its versions (`crate::briefs`).
+    briefs: Arc<Mutex<crate::briefs::History>>,
 }
 
 /// A session's labels are read again this long after they were read.
@@ -84,6 +86,7 @@ impl Missions {
             looked: Arc::default(),
             // (Tests never read the user's history.)
             active: Arc::new(Mutex::new(crate::active::Tracker::at(if cfg!(test) { std::path::PathBuf::from("/nonexistent/history.jsonl") } else { crate::history::path() }))),
+            briefs: Arc::new(Mutex::new(if cfg!(test) { crate::briefs::History::default() } else { crate::briefs::History::load(crate::config::state_dir().join("briefs.json")) })),
         }
     }
 
@@ -213,9 +216,99 @@ impl Missions {
         }
         // As it stands after all that.
         let decisions = self.shared.with(|s| s.decisions.clone());
-        let view = missions::view(&s, &Sources { decisions: &decisions, ..src });
+        let mut view = missions::view(&s, &Sources { decisions: &decisions, ..src });
+        // Where each space and session is at, in a few sentences.
+        self.brief(&mut view, &ledger, &decisions, now);
         self.shared.update(|st| st.missions = view.clone());
         view
+    }
+
+    /// Each space's and each of its sessions' brief (`crate::briefs`), into
+    /// the missions as they are published: composed from the agenda, the
+    /// decisions, the PRs and the release track, a version kept when what
+    /// one says changes.
+    fn brief(&self, view: &mut Value, ledger: &crate::agenda::Ledger, decisions: &[Value], now: u64) {
+        use crate::briefs;
+        let tasks: Vec<&crate::agenda::Task> = ledger.agendas.iter().flat_map(|a| a.tasks.iter()).collect();
+        let prs = crate::prs::daemon().map(|p| p.list()).unwrap_or_default();
+        let releases = self.shared.with(|s| s.releases.clone());
+        let progress: HashMap<String, String> = progress_lines(&self.shared);
+        let mut hist = lock(&self.briefs);
+        let mut keys = std::collections::HashSet::new();
+        for m in view["spaces"].as_array_mut().into_iter().flatten() {
+            let name = m["name"].as_str().unwrap_or("").to_string();
+            let in_space = |t: &&crate::agenda::Task| t.space.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&name));
+            let waits_on = |addr: &str| -> Vec<String> {
+                decisions
+                    .iter()
+                    .filter(|d| d["sessions"].as_array().is_some_and(|ss| ss.iter().any(|s| s["address"] == addr)))
+                    .filter_map(|d| d["title"].as_str().map(String::from))
+                    .collect()
+            };
+            let mut session_briefs: Vec<(String, briefs::SessionBrief, bool)> = vec![];
+            for x in m["sessions"].as_array_mut().into_iter().flatten() {
+                let addr = x["address"].as_str().unwrap_or("").to_string();
+                let sname = x["name"].as_str().unwrap_or("").to_string();
+                let status = x["status"].as_str().unwrap_or("").to_string();
+                let mut b = briefs::session(&briefs::SessionFacts {
+                    status: &status,
+                    said: x["said"].as_str(),
+                    tasks: tasks.iter().copied().filter(|t| t.session == addr).collect(),
+                    waits_on: waits_on(&addr),
+                    progress: progress.get(&addr).map(String::as_str),
+                    now,
+                });
+                let key = format!("session:{addr}");
+                (b.history, b.changed_ms) = hist.note(&key, &briefs::session_stable(&b), &b.text, now);
+                keys.insert(key);
+                x["brief"] = serde_json::to_value(&b).unwrap_or_default();
+                session_briefs.push((sname, b, status == "working"));
+            }
+            let pr_risks: Vec<String> = prs
+                .iter()
+                .filter(|p| p.open() && !p.draft && p.space.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&name)))
+                .filter_map(|p| {
+                    let n = p.number;
+                    match () {
+                        _ if crate::fixes::line(p).is_some() => crate::fixes::line(p).map(|l| format!("PR #{n}: {}", l.trim_end_matches('.'))),
+                        _ if p.mergeable == "conflicting" => Some(format!("PR #{n} has conflicts with {}", p.base)),
+                        _ if p.checks.state == "failing" => Some(format!("PR #{n}'s checks fail")),
+                        _ if p.impact.as_ref().is_some_and(|i| i.breaks()) => Some(format!("PR #{n} breaks what others use")),
+                        _ => None,
+                    }
+                })
+                .collect();
+            let space_waits: Vec<String> = decisions
+                .iter()
+                .filter(|d| d["space"].as_str().is_some_and(|s| s.eq_ignore_ascii_case(&name)))
+                .filter_map(|d| d["title"].as_str().map(String::from))
+                .collect();
+            // Its release track in a line ("prod 14:20 · 1 on dev"), as the state has it.
+            let release = releases
+                .as_object()
+                .and_then(|all| all.iter().find(|(k, _)| k.eq_ignore_ascii_case(&name)).map(|(_, v)| v.clone()))
+                .and_then(|v| serde_json::from_value::<crate::releases::Track>(v).ok())
+                .filter(|t| !t.repos.is_empty())
+                .map(|t| t.summary(now))
+                .filter(|s| !s.is_empty());
+            let mut b = briefs::space(&briefs::SpaceFacts {
+                goal: m["goal"].as_str().unwrap_or(""),
+                state: m["state"].as_str().unwrap_or("open"),
+                standing: m["standing"].as_bool().unwrap_or(false),
+                sessions: session_briefs.iter().map(|(n, b, w)| (n.clone(), b, *w)).collect(),
+                tasks: tasks.iter().copied().filter(in_space).collect(),
+                waits: space_waits,
+                pr_risks,
+                release,
+                now,
+            });
+            let key = format!("space:{name}");
+            (b.history, b.changed_ms) = hist.note(&key, &briefs::space_stable(&b), &b.text, now);
+            keys.insert(key);
+            m["brief"] = serde_json::to_value(&b).unwrap_or_default();
+        }
+        hist.keep_only(&keys);
+        hist.save();
     }
 
     fn act(&self, effect: &Effect, ui: &Path, now: u64) {
@@ -267,6 +360,22 @@ impl Missions {
             },
         }
     }
+}
+
+/// Each working session's live progress line, by address, when the tower
+/// has one (the state's agents' `progress`: step N of M, time in, last
+/// update), for its brief's "now".
+fn progress_lines(shared: &Shared) -> HashMap<String, String> {
+    let agents = serde_json::to_value(shared.with(|s| s.agents.clone())).unwrap_or_default();
+    agents
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            let line = a["progress"]["line"].as_str().or_else(|| a["progress"].as_str())?.trim();
+            (!line.is_empty()).then(|| (a["address"].as_str().unwrap_or("").to_string(), line.to_string()))
+        })
+        .collect()
 }
 
 #[cfg(test)]

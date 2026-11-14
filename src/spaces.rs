@@ -866,6 +866,12 @@ fn agenda_tail(space: Option<&str>) {
 /// `tower digest`: one space's held news at a time, the most pressing first;
 /// what is delivered is marked read. `--list` only says which spaces have
 /// news; `--skip` passes over the next one (or `--space`).
+/// A space's brief as the daemon last published it (`crate::briefs`).
+fn brief_of(space: &str) -> Option<String> {
+    let state: serde_json::Value = std::fs::read_to_string(crate::config::ui_dir().join("state.json")).ok().and_then(|t| serde_json::from_str(&t).ok())?;
+    state["missions"]["spaces"].as_array()?.iter().find(|m| m["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(space)))?["brief"]["text"].as_str().map(String::from)
+}
+
 pub fn cmd_digest(list: bool, skip: bool, space: Option<String>, peek: bool) -> Result<()> {
     let s = load();
     let entries = history::load();
@@ -908,6 +914,10 @@ pub fn cmd_digest(list: bool, skip: bool, space: Option<String>, peek: bool) -> 
         update(|s| s.skipped_ms.insert(target.clone(), latest));
         println!("Skipped {target} for now (still unread).");
     } else {
+        // Where it stands, before its news (`tower brief`).
+        if let Some(b) = brief_of(&target) {
+            println!("Where {target} stands: {b}");
+        }
         print!("{}", digest_text(&target, &items, &s));
         agenda_tail(Some(&target));
         if !peek {

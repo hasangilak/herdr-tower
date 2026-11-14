@@ -642,6 +642,10 @@ impl Panel {
         let mut items: Vec<AnyElement> = vec![];
         // Resolve asks first, above everything else here.
         items.extend(self.resolve_card(name, cx));
+        // Where it is at, in a few lines (`crate::briefs`), and how it read before.
+        if let Some(b) = &m.brief {
+            items.push(self.brief_card(name, b, cx));
+        }
         let editing_goal = self.full.as_ref().and_then(|f| f.edit.as_ref()).is_some_and(|e| e.space == name);
         if !m.standing && !m.goal.trim().is_empty() && !editing_goal {
             items.push(self.goal_card(&m, cx));
@@ -791,6 +795,10 @@ impl Panel {
             for (i, s) in workers.iter().enumerate() {
                 let label = if s.name.is_empty() { s.address.clone() } else { s.name.clone() };
                 let mut under: Vec<AnyElement> = vec![];
+                // Its brief: its "now" always, the whole on "Brief ▾" (`crate::briefs`).
+                if let Some(b) = &s.brief {
+                    under.push(self.session_brief(&s.address, b, cx));
+                }
                 // Its last words: as its hooks heard them, else from the history.
                 if let Some(words) = s.last_words().or_else(|| last_words(&self.entries, &s.address)) {
                     under.push(div().text_size(px(13.0)).line_height(px(18.0)).text_color(g.muted).line_clamp(2).child(words).into_any_element());
@@ -841,6 +849,109 @@ impl Panel {
 }
 
 impl Panel {
+    /// "Where we are": a space's brief, a line per part (waits in amber,
+    /// risks in rose), when it last changed, and its earlier versions on request.
+    fn brief_card(&mut self, space: &str, b: &crate::briefs::SpaceBrief, cx: &mut Context<Self>) -> AnyElement {
+        let g = glass();
+        let key = format!("space:{space}");
+        let open = self.full.as_ref().is_some_and(|f| f.briefs_open.contains(&key));
+        let mut col = v_flex().gap(px(4.0)).w_full();
+        for (label, text) in crate::briefs::space_lines(b) {
+            let colour = match label {
+                "Waiting for you" => rgb(AMBER).into(),
+                "Risks" => rgb(0xff8f8f).into(),
+                _ => g.text,
+            };
+            col = col.child(
+                div()
+                    .text_size(px(13.5))
+                    .line_height(px(19.0))
+                    .text_color(colour)
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("{label} · ")).into_any_element())
+                    .child(text),
+            );
+        }
+        let earlier = b.history.len().saturating_sub(1);
+        let changed = if b.changed_ms > 0 { format!("changed {}", crate::phone::ago(b.changed_ms)) } else { String::new() };
+        let k = key.clone();
+        let foot = h_flex()
+            .gap(px(10.0))
+            .text_size(px(12.0))
+            .text_color(g.faint)
+            .child(changed)
+            .when(earlier > 0, |el| {
+                el.child(
+                    div()
+                        .id(SharedString::from(format!("brief-history-{space}")))
+                        .cursor_pointer()
+                        .text_color(rgb(CYAN))
+                        .child(if open { "Hide earlier ▴".to_string() } else { format!("{earlier} earlier ▾") })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(f) = this.full.as_mut()
+                                && !f.briefs_open.remove(&k)
+                            {
+                                f.briefs_open.insert(k.clone());
+                            }
+                            cx.notify();
+                        })),
+                )
+            });
+        let mut body = vec![col.into_any_element(), foot.into_any_element()];
+        if open {
+            for v in b.history.iter().skip(1) {
+                body.push(
+                    div()
+                        .text_size(px(12.5))
+                        .line_height(px(17.0))
+                        .text_color(g.muted)
+                        .child(format!("{}: {}", crate::phone::ago(v.at_ms), v.text))
+                        .into_any_element(),
+                );
+            }
+        }
+        bay("Where we are", vec![v_flex().gap(px(6.0)).w_full().px(px(4.0)).children(body).into_any_element()])
+    }
+
+    /// Under a session's row: its brief's "now" (what it is doing), and the
+    /// whole of it on "Brief ▾" (asked, done, next, stuck).
+    fn session_brief(&mut self, address: &str, b: &crate::briefs::SessionBrief, cx: &mut Context<Self>) -> AnyElement {
+        let g = glass();
+        let open = self.full.as_ref().is_some_and(|f| f.briefs_open.contains(address));
+        let lines = crate::briefs::session_lines(b);
+        let a = address.to_string();
+        let toggle = div()
+            .id(SharedString::from(format!("brief-{address}")))
+            .flex_none()
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .text_color(rgb(CYAN))
+            .child(if open { "Brief ▴" } else { "Brief ▾" })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                if let Some(f) = this.full.as_mut()
+                    && !f.briefs_open.remove(&a)
+                {
+                    f.briefs_open.insert(a.clone());
+                }
+                cx.notify();
+            }));
+        let now = lines.iter().find(|(l, _)| *l == "Now").map(|(_, t)| t.clone()).unwrap_or_default();
+        let mut col = v_flex().gap(px(2.0)).w_full().child(
+            h_flex()
+                .gap(px(8.0))
+                .items_start()
+                .child(div().flex_1().min_w_0().text_size(px(13.0)).line_height(px(18.0)).text_color(g.text).line_clamp(2).child(now))
+                .child(toggle),
+        );
+        if open {
+            for (label, text) in lines.into_iter().filter(|(l, _)| *l != "Now") {
+                let colour = if label == "Stuck" { rgb(AMBER).into() } else { g.muted };
+                col = col.child(div().text_size(px(12.5)).line_height(px(17.0)).text_color(colour).child(format!("{label}: {text}.")));
+            }
+        }
+        col.into_any_element()
+    }
+
     /// "Between sessions": the latest messages, newest last, each with who
     /// wrote it to whom and when. A long one shows its first lines; a click
     /// (or "Show all") shows it whole, with a way to copy it. "Earlier"
