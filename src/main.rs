@@ -785,6 +785,8 @@ enum Cmd {
     /// "the queue is empty"]` ("" clears it; `agenda` is the same; `--by you`: set by hand). A goal
     /// follows the user's requests there: one that adds scope rewrites it, and its history is kept.
     /// `tower space goal-request <space> "<words>" [--dry-run]` weighs words as such a request by hand.
+    /// A space with no goal that isn't standing (opened by a chat) gets its first goal from the
+    /// user's requests; `tower space goal-backfill <space>|all [--dry-run]` writes it from those so far.
     /// `tower space standing <space>
     /// on|off`: a space you keep (never ready, never closed by the tower, no worktrees).
     /// `tower space report <space> "<text>"`: its closing report. `tower space close <space>
@@ -798,7 +800,7 @@ enum Cmd {
     /// `tower space review <space> on|off`: whether the PRs its sessions open get a reviewer session
     /// (on by default; off ends one that is open there).
     Space {
-        /// goal | agenda | goal-request | standing | report | close | resolve | follow | unfollow | mute | unmute | review
+        /// goal | agenda | goal-request | goal-backfill | standing | report | close | resolve | follow | unfollow | mute | unmute | review
         what: String,
         space: String,
         text: Vec<String>,
@@ -811,7 +813,7 @@ enum Cmd {
         /// close, resolve: though a session there still works or waits for you.
         #[arg(long)]
         force: bool,
-        /// resolve, goal-request: say what it would do, and change nothing.
+        /// resolve, goal-request, goal-backfill: say what it would do, and change nothing.
         #[arg(long)]
         dry_run: bool,
     },
@@ -1298,6 +1300,8 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Space { what, space, text, done_when, by, force, dry_run } => match what.as_str() {
             "goal" | "agenda" => missions::cmd_goal(space, text.join(" "), done_when, by),
             "goal-request" => goals::cmd_request(&space, &text.join(" "), dry_run),
+            // The space's name may be several words; `all`: every open space with no goal.
+            "goal-backfill" => goals::cmd_backfill(&std::iter::once(space).chain(text).collect::<Vec<_>>().join(" "), dry_run),
             "report" => missions::cmd_report(space, text.join(" ")),
             // The space's name may be several words.
             "standing" => missions::cmd_standing(std::iter::once(space).chain(text).collect()),
@@ -1307,7 +1311,7 @@ fn run(cli: Cli) -> Result<()> {
             "mute" | "unmute" => spaces::cmd_mute(std::iter::once(space).chain(text).collect::<Vec<_>>().join(" "), what == "mute"),
             "review" => missions::cmd_review(std::iter::once(space).chain(text).collect()),
             other => bail!(
-                "tower space {other}: use `tower space goal <space> \"<goal>\" [--done-when \"<…>\"] [--by you]`, `goal-request <space> \"<the user's words>\" [--dry-run]`, `standing <space> on|off`, `review <space> on|off`, `report <space> \"<text>\"`, `close <space> [--force]`, `resolve <space> [--force] [--dry-run]`, or `follow|unfollow|mute|unmute <space>`"
+                "tower space {other}: use `tower space goal <space> \"<goal>\" [--done-when \"<…>\"] [--by you]`, `goal-request <space> \"<the user's words>\" [--dry-run]`, `goal-backfill <space>|all [--dry-run]`, `standing <space> on|off`, `review <space> on|off`, `report <space> \"<text>\"`, `close <space> [--force]`, `resolve <space> [--force] [--dry-run]`, or `follow|unfollow|mute|unmute <space>`"
             ),
         },
         Cmd::Review { action, pr, critical, json, text } => review_cmd(action.as_deref().unwrap_or("list"), pr.as_deref().unwrap_or(""), critical, &text.join(" "), json),

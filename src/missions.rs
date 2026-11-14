@@ -24,6 +24,15 @@
 //! A **standing** space is one the user keeps: never ready, never closed by
 //! the tower, and its sessions work in the repos themselves (no worktrees).
 //!
+//! A space opened by a **chat** with the tower (`tower start --space` /
+//! `--new-space`, not `tower launch`) gets its goal written from the user's
+//! requests there (`crate::goals`: `Mission::chat`). Its sessions already
+//! work in the checkout, so they keep doing so (no worktrees, for those
+//! running and those opened later), and a goal the tower wrote is no end
+//! the user agreed to: it is never ready on it, and so never closed by the
+//! tower, until the user (or the brain, on the user's word) sets the goal
+//! or what counts as done.
+//!
 //! `step` is the whole state machine (the daemon runs it every 20 seconds,
 //! `daemon::missions`); `view` is what `state.json`, `tower missions` and
 //! the phone carry.
@@ -146,6 +155,15 @@ pub struct Mission {
     /// goal now (`goal_by`). Empty for a goal set before the tower kept this.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub goals: Vec<GoalChange>,
+    /// Opened by a chat with the tower, its goal written from the user's
+    /// requests (`crate::goals`): its sessions work in the checkout (no
+    /// worktrees), and it is ready only on a goal the user set (`may_end`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub chat: bool,
+    /// The user cleared its goal by hand: no request writes one again until
+    /// a goal is set.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub goal_cleared: bool,
 }
 
 /// One version of a space's goal: what it became, when, and what made it so.
@@ -211,6 +229,8 @@ impl Default for Mission {
             review: true,
             achieved_ms: None,
             goals: vec![],
+            chat: false,
+            goal_cleared: false,
         }
     }
 }
@@ -229,6 +249,8 @@ impl Mission {
             setup: std::mem::take(&mut self.setup),
             review: self.review,
             goals: std::mem::take(&mut self.goals),
+            chat: self.chat,
+            goal_cleared: self.goal_cleared,
             ..Mission::born(now)
         };
     }
@@ -255,6 +277,18 @@ impl Mission {
             self.goals.drain(1..=cut);
         }
     }
+
+    /// The user (by hand, or the brain on their word) set its goal or what
+    /// counts as done: not only the tower from their requests.
+    pub fn goal_set_by_user(&self) -> bool {
+        self.goals.iter().any(|c| c.by == "you" || c.by == "tower")
+    }
+
+    /// Whether it can be ready, and so closed by the tower: it has a goal,
+    /// isn't standing, and isn't a chat's space on a goal the tower wrote.
+    pub fn may_end(&self, has_goal: bool) -> bool {
+        has_goal && !self.standing && (!self.chat || self.goal_set_by_user())
+    }
 }
 
 /// Whether the PRs of `space` get a reviewer: its mission's switch (on when
@@ -280,10 +314,47 @@ fn goal_of<'a>(s: &'a Spaces, space: &str) -> &'a str {
 /// it has a goal, or `tower launch` made it, and the user doesn't keep it.
 /// A space with no goal is the user's own: its sessions work in the repos
 /// themselves, as they always did.
+/// A chat's space (`Mission::chat`) keeps working in the checkout.
 pub fn works_in_worktrees(s: &Spaces, space: &str) -> bool {
     let m = of(s, space).map(|(_, m)| m);
     let launched = m.is_some_and(|m| !m.setup.trim().is_empty());
-    (launched || !goal_of(s, space.trim()).is_empty()) && !m.is_some_and(|m| m.standing)
+    (launched || !goal_of(s, space.trim()).is_empty()) && !m.is_some_and(|m| m.standing || (m.chat && !launched))
+}
+
+/// Whether `space` is one whose first goal the tower writes from the user's
+/// requests (`crate::goals`), and its name in `s`: it has no goal, isn't
+/// standing (under any spelling), closed or archived, `tower launch` didn't
+/// make it, and the user didn't clear its goal by hand.
+pub fn writes_first_goal(s: &Spaces, space: &str) -> Option<String> {
+    let want = space.trim();
+    if want.is_empty() || !goal_of(s, want).is_empty() {
+        return None;
+    }
+    if s.missions.iter().any(|(k, m)| m.standing && k.trim().eq_ignore_ascii_case(want)) {
+        return None;
+    }
+    match of(s, want) {
+        Some((k, m)) => {
+            let off = m.state == State::Closed || m.archived_ms.is_some() || !m.setup.trim().is_empty() || m.goal_cleared;
+            (!off).then(|| k.clone())
+        }
+        None => Some(want.to_string()),
+    }
+}
+
+/// The first goal of a chat's space (`writes_first_goal`), written by the
+/// tower from the user's requests there (`change`, by `request`): set, kept
+/// in its history, and the space marked as a chat's. `None` when it is no
+/// longer one to write it for (a goal came meanwhile, by hand or otherwise).
+pub fn first_goal_from_requests(s: &mut Spaces, space: &str, goal: &str, done_when: &str, change: &Change, now: u64) -> Option<GoalChange> {
+    let key = writes_first_goal(s, space)?;
+    if goal.trim().is_empty() {
+        return None;
+    }
+    goal_by(s, &key, Some(goal), Some(done_when), change, now);
+    let m = s.missions.get_mut(&key)?;
+    m.chat = true;
+    m.goals.last().cloned()
 }
 
 /// `works_in_worktrees`, of the spaces as they are on file now.
@@ -352,7 +423,7 @@ pub fn step(s: &mut Spaces, facts: &BTreeMap<String, Facts>, now: u64, auto_clos
                 }
                 State::Quiet if m.archived_ms.is_none() && now.saturating_sub(m.quiet_since_ms.unwrap_or(now)) >= ARCHIVE_MS => {
                     // Ready when its sessions left, and left alone since: closed as a ready one is.
-                    if m.ready_since_ms.is_some() && has_goal && !m.standing && auto_close_hours > 0 {
+                    if m.ready_since_ms.is_some() && m.may_end(has_goal) && auto_close_hours > 0 {
                         if m.wait_until_ms.is_none_or(|w| now >= w) {
                             out.push(Effect::AutoClose(name));
                         }
@@ -374,7 +445,7 @@ pub fn step(s: &mut Spaces, facts: &BTreeMap<String, Facts>, now: u64, auto_clos
             out.push(Effect::Reopened(name.clone()));
         }
         let settled = f.open_requests == 0 && f.decisions == 0;
-        let may_end = has_goal && !m.standing;
+        let may_end = m.may_end(has_goal);
         match m.state {
             State::Open if may_end && settled && f.finished_requests > 0 => {
                 m.state = State::Ready;
@@ -623,6 +694,8 @@ pub fn view(s: &Spaces, src: &Sources) -> Value {
             // How the goal came to be what it is, oldest first (the last is the goal now).
             "goal_history": m.goals,
             "standing": m.standing,
+            // Opened by a chat: its goal is written from the user's requests (`Mission::chat`).
+            "chat": m.chat,
             "review": m.review,
             "state": m.state.word(),
             "follow": spaces::followed_in(s, name),
@@ -692,7 +765,7 @@ pub fn poke() {
 
 fn brief(s: &Spaces, name: &str) -> Value {
     let m = s.missions.get(name).cloned().unwrap_or_default();
-    json!({ "space": name, "goal": goal_of(s, name), "done_when": m.done_when, "standing": m.standing, "review": m.review, "state": m.state.word(), "report": m.report, "goal_history": m.goals })
+    json!({ "space": name, "goal": goal_of(s, name), "done_when": m.done_when, "standing": m.standing, "review": m.review, "state": m.state.word(), "report": m.report, "goal_history": m.goals, "chat": m.chat })
 }
 
 /// A space's goal and what counts as done, set in `s` (each when given;
@@ -721,7 +794,12 @@ pub fn goal_by(s: &mut Spaces, name: &str, goal: Option<&str>, done_when: Option
     // Kept in its history (the goal before with the time it was set), then dated.
     if cleared {
         m.goals.clear();
+        // Cleared by hand: no request writes one again until a goal is set.
+        m.goal_cleared = change.by == "you";
     } else {
+        if set.is_some() {
+            m.goal_cleared = false;
+        }
         let goal_now = set.map(String::from).unwrap_or_else(|| was.clone());
         if !goal_now.is_empty() && (goal_now != was || m.done_when != was_done.trim()) {
             let done_now = m.done_when.clone();
@@ -1682,6 +1760,55 @@ mod tests {
     }
 
     #[test]
+    fn a_chats_space_keeps_its_checkout_and_is_ready_only_on_a_goal_the_user_set() {
+        let done = |sessions: &[&str]| Facts { finished_requests: 1, ..live(sessions) };
+        // Its first goal, written by the tower from a request: a chat's space.
+        let mut s = Spaces::default();
+        s.missions.insert("search-llm".into(), Mission { seen_ms: 1, ..Mission::born(1) });
+        assert_eq!(writes_first_goal(&s, " Search-LLM ").as_deref(), Some("search-llm"));
+        let req = Change { by: "request".into(), request: "fine tune the search for the mediaroom api".into(), why: "the work".into() };
+        let c = first_goal_from_requests(&mut s, "search-llm", "Fine-tune the search model for the MediaRoom API", "p95 under 800 ms", &req, HOUR).unwrap();
+        assert_eq!((c.by.as_str(), c.goal.as_str()), ("request", "Fine-tune the search model for the MediaRoom API"));
+        let m = &s.missions["search-llm"];
+        assert!(m.chat && m.goals.len() == 1 && m.goal_ms == HOUR);
+        assert!(writes_first_goal(&s, "search-llm").is_none(), "once");
+        assert!(first_goal_from_requests(&mut s, "search-llm", "Another", "", &req, HOUR).is_none());
+        // Its sessions work in the checkout, those running and those opened later.
+        assert!(!works_in_worktrees(&s, "search-llm"));
+        // Everything finished: not ready on a goal the tower wrote, so never closed by it.
+        assert!(step(&mut s, &at("search-llm", done(&["idle"])), 2 * HOUR, 24).is_empty());
+        assert_eq!(s.missions["search-llm"].state, State::Open);
+        // A request that grows it: still the tower's goal.
+        goal_from_request(&mut s, "search-llm", ("Fine-tune the search model for the MediaRoom API", "p95 under 800 ms"), "Fine-tune and serve it", "served", &req, 3 * HOUR);
+        assert!(step(&mut s, &at("search-llm", done(&["idle"])), 4 * HOUR, 24).is_empty());
+        // The user sets the goal: a mission with an end like any (its checkout stays).
+        goal_by(&mut s, "search-llm", None, Some("served on the GPU host"), &Change::by("you"), 5 * HOUR);
+        assert_eq!(step(&mut s, &at("search-llm", done(&["idle"])), 6 * HOUR, 24), [Effect::Ready("search-llm".into())]);
+        assert!(!works_in_worktrees(&s, "search-llm"));
+    }
+
+    #[test]
+    fn a_first_goal_is_for_a_bare_space_only() {
+        let mut s = Spaces::default();
+        assert_eq!(writes_first_goal(&s, "new-one").as_deref(), Some("new-one"), "one not known yet: made a moment ago");
+        s.missions.insert("M5 Pro".into(), Mission { standing: true, ..Mission::born(1) });
+        assert!(writes_first_goal(&s, "m5 pro").is_none(), "standing, under any spelling");
+        s.missions.insert("Shop".into(), Mission { setup: "launch".into(), ..Mission::born(1) });
+        assert!(writes_first_goal(&s, "Shop").is_none(), "launched");
+        s.missions.insert("old".into(), Mission { state: State::Closed, ..Mission::born(1) });
+        s.missions.insert("gone".into(), Mission { archived_ms: Some(2), ..Mission::born(1) });
+        assert!(writes_first_goal(&s, "old").is_none() && writes_first_goal(&s, "gone").is_none());
+        s.agendas.insert("b2c".into(), "Answer tickets".into());
+        assert!(writes_first_goal(&s, "b2c").is_none(), "it has one");
+        // Cleared by hand: none again until a goal is set.
+        goal_by(&mut s, "b2c", Some(""), None, &Change::by("you"), 3);
+        assert!(writes_first_goal(&s, "b2c").is_none());
+        goal_by(&mut s, "b2c", Some("Answer tickets"), None, &Change::by("you"), 4);
+        goal_by(&mut s, "b2c", Some(""), None, &Change::by("tower"), 5);
+        assert_eq!(writes_first_goal(&s, "b2c").as_deref(), Some("b2c"), "cleared by the brain: written again");
+    }
+
+    #[test]
     fn a_ready_space_left_alone_closes_by_itself() {
         let mut s = with_goal("Shop", "Ship the new checkout");
         let done = |sessions: &[&str]| at("Shop", Facts { finished_requests: 2, ..live(sessions) });
@@ -1867,6 +1994,7 @@ mod tests {
                 "done_when": "the checkout is live",
                 "goal_history": [],
                 "standing": false,
+                "chat": false,
                 "review": true,
                 "state": "ready",
                 "follow": true,

@@ -179,7 +179,20 @@ pub fn space_section(space: &str, name: &str, dir: &Path, mission: &Value) -> St
             if let Some(last) = mission["goal_history"].as_array().and_then(|h| h.last()).filter(|c| c["by"] == "request") {
                 s += &format!("- The goal was updated after the user's request \"{}\".\n", crate::launch::clip_words(last["request"].as_str().unwrap_or("").trim(), 200));
             }
-            s += "- This goal follows the user's requests here: when one adds to what the space is for, the tower updates the goal and its done-when by itself (and this file); one that is a step toward it leaves it. Don't rewrite the goal for that yourself. The user's own edit wins.\n";
+            let history = mission["goal_history"].as_array().cloned().unwrap_or_default();
+            let by_user = history.iter().any(|c| c["by"] == "you" || c["by"] == "tower");
+            let by_hand = history.iter().rev().find(|c| c["by"] != "request").is_some_and(|c| c["by"] == "you");
+            if mission["chat"] == true && by_hand {
+                s += "- The user set this goal by hand: requests here don't change it. Don't rewrite it yourself.\n";
+            } else {
+                s += "- This goal follows the user's requests here: when one adds to what the space is for, the tower updates the goal and its done-when by itself (and this file); one that is a step toward it leaves it. Don't rewrite the goal for that yourself. The user's own edit wins.\n";
+            }
+            if mission["chat"] == true {
+                s += match by_user {
+                    false => "- This space was opened by a chat, and the tower wrote its goal from the user's requests: sessions here work in the projects' own checkouts (no worktrees), and it is never ready to close on this goal. Don't tell the user it is done or ready to close; when the work looks finished, say so plainly and let them decide.\n",
+                    true => "- This space was opened by a chat: sessions here work in the projects' own checkouts (no worktrees).\n",
+                };
+            }
         }
     }
     if mission["standing"] == true && !word("goal").is_empty() {
@@ -996,6 +1009,13 @@ mod tests {
         let docs = space_section("Docs", "tower-docs", Path::new("/h/brains/docs"), &other);
         assert!(docs.contains("t9 \"docs site\"") && docs.contains("a9 ") && !docs.contains("t5") && !docs.contains("a7") && !docs.contains("Sandbox"), "{docs}");
         assert!(!section.contains("t9") && !section.contains("a9") && !section.contains("Docs"));
+        // A chat's space: its goal the tower's, until the user sets one by hand.
+        let chat = json!({ "name": "search-llm", "goal": "Fine-tune the search", "chat": true, "goal_history": [{ "goal": "Fine-tune the search", "by": "request" }] });
+        let said = space_section("search-llm", "tower-search-llm", Path::new("/h"), &chat);
+        assert!(said.contains("the tower wrote its goal from the user's requests") && said.contains("never ready to close on this goal") && said.contains("follows the user's requests"), "{said}");
+        let chat = json!({ "name": "search-llm", "goal": "Ship it", "chat": true, "goal_history": [{ "goal": "Fine-tune the search", "by": "request" }, { "goal": "Ship it", "by": "you" }] });
+        let said = space_section("search-llm", "tower-search-llm", Path::new("/h"), &chat);
+        assert!(said.contains("set this goal by hand: requests here don't change it") && !said.contains("never ready") && said.contains("own checkouts"), "{said}");
         // A space with no goal, a standing one, one with nothing in it yet.
         let own = space_section("M5 Pro", "tower-m5-pro", dir, &json!({ "name": "M5 Pro", "goal": "", "sessions": [], "requests": [] }));
         assert!(own.contains("It has no goal: it is the user's own place") && own.contains("Its sessions: none") && own.contains("Its requests: none open"), "{own}");

@@ -45,7 +45,7 @@ pub fn start() {
                 Ok(out) => {
                     let v = out.json(&h.space);
                     eprintln!("[goals] {} ({}): {}{}", h.space, h.from, v["outcome"].as_str().unwrap_or(""), v["why"].as_str().map(|w| format!(": {w}")).unwrap_or_default());
-                    if let crate::goals::Outcome::Updated(c) = out {
+                    if let crate::goals::Outcome::Updated(c) | crate::goals::Outcome::Written(c) = out {
                         eprintln!("[goals] {}: goal now: {}", h.space, c.goal);
                         super::missions::kick();
                     }
