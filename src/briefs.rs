@@ -94,6 +94,8 @@ pub struct SessionFacts<'a> {
     pub progress: Option<&'a str>,
     /// Its own task list's items still to do (the progress's pending items).
     pub upcoming: Vec<String>,
+    /// A background job it left running, in a line ("running a job: …, since 01:21").
+    pub job: Option<&'a str>,
     pub now: u64,
 }
 
@@ -154,8 +156,10 @@ pub fn session(f: &SessionFacts) -> SessionBrief {
             (None, Some(t)) if !t.question.is_empty() => format!("waiting for you: {}", clip(&t.question, 120)),
             _ => "waiting on a prompt in its terminal".into(),
         },
+        // Its turn is over, its job isn't: the job is what it does now.
+        _ if f.job.is_some_and(|j| !j.trim().is_empty()) => clip(f.job.unwrap_or("").trim(), 140),
         // Idle: what it last said, unless that is the result already told.
-        _ => match f.said.map(first_sentence).filter(|s| !s.is_empty() && result.is_empty()) {
+        _ => match f.said.map(first_sentence).filter(|s| !s.is_empty() && !result.starts_with(s.trim_end_matches('.'))) {
             Some(s) => format!("idle; it last said: {}", clip(&s, 140)),
             None => "idle".into(),
         },
@@ -507,7 +511,7 @@ mod tests {
         verified.why = "its last message matches: tests pass, screenshot sent".into();
         let running = task("a2.1", "Count open gaps in the studio column", TaskState::Running, 20 * MIN);
         let queued = task("a3.1", "Draft help page", TaskState::Queued, 30 * MIN);
-        let f = SessionFacts { status: "working", said: None, tasks: vec![&verified, &running, &queued], waits_on: vec![], progress: None, upcoming: vec![], now: 40 * MIN };
+        let f = SessionFacts { status: "working", said: None, tasks: vec![&verified, &running, &queued], waits_on: vec![], progress: None, upcoming: vec![], job: None, now: 40 * MIN };
         let b = session(&f);
         assert_eq!(b.asked, "Count open gaps in the studio column", "the latest it took up");
         assert_eq!(b.now, "working on it", "on what it was asked, said just above");
@@ -519,22 +523,25 @@ mod tests {
         let mut finished = task("a5.1", "ok go", TaskState::Verified, 39 * MIN);
         finished.said = "Main is pushed and equals origin/main. 16 commits went up.".into();
         finished.why = "the brain checked it: pushed, tests pass".into();
-        let d = session(&SessionFacts { status: "done", said: Some("Main is pushed and equals origin/main."), tasks: vec![&verified, &finished], waits_on: vec![], progress: None, upcoming: vec![], now: 40 * MIN });
+        let d = session(&SessionFacts { status: "done", said: Some("Main is pushed and equals origin/main."), tasks: vec![&verified, &finished], waits_on: vec![], progress: None, upcoming: vec![], job: None, now: 40 * MIN });
         assert_eq!(d.text, "Asked: ok go (done). Result: Main is pushed and equals origin/main (checked by the brain). Earlier today: Rename Unanswered to Knowledge gaps. Now: idle.");
         // Its live progress line, when the tower has one, is its "now" as it is.
         let p = session(&SessionFacts { progress: Some("step 3 of 5: running the tests · 12m in"), ..f });
         assert_eq!(p.now, "step 3 of 5: running the tests · 12m in");
         // Blocked on the user: what for. Idle: what it last said.
-        let blocked = session(&SessionFacts { status: "blocked", said: None, tasks: vec![], waits_on: vec!["Merge PR #839 into dev".into()], progress: None, upcoming: vec![], now: 40 * MIN });
+        let blocked = session(&SessionFacts { status: "blocked", said: None, tasks: vec![], waits_on: vec!["Merge PR #839 into dev".into()], progress: None, upcoming: vec![], job: None, now: 40 * MIN });
         assert_eq!(blocked.text, "Now: waiting for you: Merge PR #839 into dev.");
-        let idle = session(&SessionFacts { status: "done", said: Some("**Done.** The PR is open. Want me to merge it?"), tasks: vec![], waits_on: vec![], progress: None, upcoming: vec![], now: 40 * MIN });
+        let idle = session(&SessionFacts { status: "done", said: Some("**Done.** The PR is open. Want me to merge it?"), tasks: vec![], waits_on: vec![], progress: None, upcoming: vec![], job: None, now: 40 * MIN });
         assert_eq!(idle.now, "idle; it last said: Done.");
         // A task stalled, and a wait at the end of its turn: what it's stuck on.
         let mut stalled = task("a4.1", "Train the LoRA", TaskState::Stalled, 35 * MIN);
         stalled.why = "no progress for 2 hours".into();
-        let s = session(&SessionFacts { status: "done", said: None, tasks: vec![&stalled], waits_on: vec![], progress: None, upcoming: vec![], now: 40 * MIN });
+        let s = session(&SessionFacts { status: "done", said: None, tasks: vec![&stalled], waits_on: vec![], progress: None, upcoming: vec![], job: None, now: 40 * MIN });
+        // Its turn over, a job of it running: that is its "now".
+        let j = session(&SessionFacts { status: "done", said: Some("Stage 1 started."), tasks: vec![], waits_on: vec![], progress: None, upcoming: vec![], job: Some("running a job: Train v2, since 01:21, last progress 07:04"), now: 40 * MIN });
+        assert_eq!(j.now, "running a job: Train v2, since 01:21, last progress 07:04");
         assert_eq!(s.stuck.as_deref(), Some("Train the LoRA stalled: no progress for 2 hours"));
-        let w = session(&SessionFacts { status: "done", said: None, tasks: vec![], waits_on: vec!["Push to main?".into()], progress: None, upcoming: vec![], now: 40 * MIN });
+        let w = session(&SessionFacts { status: "done", said: None, tasks: vec![], waits_on: vec!["Push to main?".into()], progress: None, upcoming: vec![], job: None, now: 40 * MIN });
         assert_eq!(w.stuck.as_deref(), Some("waits for your answer: Push to main?"));
     }
 

@@ -257,13 +257,16 @@ impl Missions {
                     waits_on: waits_on(&addr),
                     progress: progress.get(&addr).map(|(l, _)| l.as_str()).filter(|l| !l.is_empty()),
                     upcoming: progress.get(&addr).map(|(_, u)| u.clone()).unwrap_or_default(),
+                    job: x["job"]["line"].as_str(),
                     now,
                 });
                 let key = format!("session:{addr}");
                 (b.history, b.changed_ms) = hist.note(&key, &briefs::session_stable(&b), &b.text, now);
                 keys.insert(key);
                 x["brief"] = serde_json::to_value(&b).unwrap_or_default();
-                session_briefs.push((sname, b, status == "working"));
+                // At work: its turn, or a job it left running.
+                let busy = status == "working" || x["job"]["line"].as_str().is_some_and(|l| !l.is_empty());
+                session_briefs.push((sname, b, busy));
             }
             let pr_risks: Vec<String> = prs
                 .iter()
