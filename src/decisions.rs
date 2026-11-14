@@ -1394,6 +1394,26 @@ impl Book {
         Changes { fresh: vec![], closed: over.iter().filter_map(|id| self.close(id, State::Stopped, now)).collect() }
     }
 
+    /// A session's turn ended waiting on the user while a decision the brain
+    /// raised about that session is open: that decision is what it waits for
+    /// (the brain read its screen and put it to the user), so the wait is
+    /// that decision seen once more, not a second card beside it. Two cards
+    /// for one approval got opposite answers within a minute (13 Nov). Its
+    /// id, or None: nothing raised about it is open.
+    pub fn waits_on_raised(&mut self, address: &str, now: u64) -> Option<String> {
+        let d = self
+            .open
+            .iter_mut()
+            .filter(|d| matches!(d.kind, Kind::Raised | Kind::Choice) && d.key.starts_with("raise:"))
+            .find(|d| d.sessions.iter().any(|w| w.address == address))?;
+        d.count += 1;
+        d.last_ms = now;
+        for w in d.sessions.iter_mut().filter(|w| w.address == address) {
+            w.waiting = true;
+        }
+        Some(d.id.clone())
+    }
+
     /// A session works (`waiting` false) or waits again: true when that changed a decision.
     pub fn session_waits(&mut self, address: &str, waiting: bool) -> bool {
         let mut changed = false;
@@ -1846,6 +1866,28 @@ mod tests {
 
     fn who(address: &str) -> Option<Who> {
         Some(Who::new(address, &format!("s-{address}")))
+    }
+
+    /// 13 Nov: the brain raised "build the search layer?" for t12v, then
+    /// t12v's turn ended waiting for the same approval and became a second
+    /// card; the user said yes on one and "Not yet" on the other. A wait from
+    /// a session the brain raised something about is that decision again.
+    #[test]
+    fn a_wait_from_a_session_with_a_raised_decision_joins_it() {
+        let mut b = Book::default();
+        let options = vec![Opt { label: "Yes, build it".into(), ..Default::default() }, Opt { label: "Not yet".into(), ..Default::default() }];
+        let r = b.raise(Raise { space: Some("search-llm".into()), who: who("t12v"), why: "data".into(), text: "Build the search layer?".into(), options, ..Default::default() }, MIN);
+        assert_eq!(b.waits_on_raised("t12v", 2 * MIN), Some(r.id.clone()));
+        let d = b.find(&r.id).unwrap();
+        assert_eq!((d.count, d.last_ms, b.open.len()), (2, 2 * MIN, 1));
+        assert!(d.sessions[0].waiting);
+        assert_eq!(b.waits_on_raised("t9", 2 * MIN), None, "nothing raised about it: its own card");
+        // Over once answered: the next wait is a card of its own.
+        b.answered(&r.id, "Yes, build it", 3 * MIN);
+        assert_eq!(b.waits_on_raised("t12v", 4 * MIN), None);
+        // Only what the brain raised: a blocked session's decision isn't one.
+        b.blocked(Some("search-llm".into()), Who::new("t12t", "sooner"), "Asks to edit its Claude notes", 5 * MIN);
+        assert_eq!(b.waits_on_raised("t12t", 5 * MIN), None);
     }
 
     #[test]

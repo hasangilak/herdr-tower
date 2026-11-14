@@ -928,7 +928,19 @@ impl Asks {
             // It only says it is ready: that hands the user nothing.
             let ready = questions::ready_only(&message);
             // PRs it opened (or ends on): chips in the chat, waiting for the user's merge.
-            let found = crate::prs::links(&format!("{message}\n{}", turn_transcript(&address, &t)));
+            let mut found = crate::prs::links(&format!("{message}\n{}", turn_transcript(&address, &t)));
+            // Its wait asks for a merge of a PR it names only by number ("My PR #1398 is still waiting for
+            // your merge"): that PR's merge card is what the user acts on, never a second card (13 Nov: six).
+            let asks_merge = waits.as_deref().filter(|_| !ready).is_some_and(|r| r.to_lowercase().contains("merg"));
+            let by_number = match (asks_merge, crate::prs::daemon()) {
+                (true, Some(store)) => crate::prs::named_in(&store.list(), waits.as_deref().unwrap_or(""), &address, space.as_deref()),
+                _ => vec![],
+            };
+            for pr in by_number {
+                if !found.contains(&pr) {
+                    found.push(pr);
+                }
+            }
             if !found.is_empty()
                 && let Some(store) = crate::prs::daemon()
             {
@@ -954,6 +966,13 @@ impl Asks {
                 return;
             }
             if let Some(request) = waits {
+                // What the brain raised about this session already is what it waits for: that card, not a second one.
+                if !own && let Some(id) = me.decisions.get().and_then(|d| d.waits_on_raised(&address)) {
+                    eprintln!("[questions] {address} ({name}) waits for the user, on {id} (raised already): {request}");
+                    let (a, r) = (address.clone(), request.clone());
+                    crate::history::later(move || crate::history::job_follow(&a, crate::history::JobState::Blocked, &r));
+                    return;
+                }
                 me.waiting_in(space, &address, &name, hc::created_ms(&t), &message, &request, &context, watched, own);
                 return;
             }
