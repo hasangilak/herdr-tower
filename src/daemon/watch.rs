@@ -756,6 +756,26 @@ impl Radar {
         // A turn that ended since the last look, even if nobody saw it working.
         let before_turn = before.as_ref().and_then(|b| b.turn).or_else(|| watch.as_ref().and_then(|w| w.turn));
         let turned = matches!((before_turn, turn), (Some(a), Some(b)) if b > a) && status.ready();
+        // The first look since the tower started, at a turn that ended while it was down (it last
+        // looked at this terminal at a lower turn, lately): that turn's end is looked at now.
+        let now = crate::history::now_ms();
+        let missed = before.is_none()
+            && !turned
+            && machine.is_none()
+            && live
+            && status.ready()
+            && turn.is_some_and(|n| self.asks.missed_turn(&address, created_ms, n, now));
+        if missed {
+            eprintln!("[radar] {address} ended a turn while the tower was down: its end is looked at now");
+        }
+        // Each turn looked at, kept for the next start.
+        if machine.is_none()
+            && live
+            && status.ready()
+            && let Some(n) = turn
+        {
+            self.asks.looked_turn(&address, created_ms, n, now);
+        }
         // A watch on another terminal that had this address: that one ended.
         if let Some(w) = &watch
             && matches!((w.created_ms, created_ms), (Some(a), Some(b)) if a != b)
@@ -763,11 +783,11 @@ impl Radar {
             self.fire_watch(&address, &name, space.clone(), &SessionStatus::Exited, "");
             return;
         }
-        if was == status && !turned {
+        if was == status && !turned && !missed {
             return;
         }
         let working = SessionStatus::Working;
-        let stopped_working = (was == working && status != working) || (turned && was != working);
+        let stopped_working = (was == working && status != working) || (turned && was != working) || missed;
         // A turn ended: its last message may ask the user something.
         if stopped_working && status.ready() {
             self.asks.finished(&address, t, self.waiting.clone());
@@ -981,6 +1001,7 @@ impl Radar {
         // A decision all of whose sessions are gone is over.
         self.decisions.session_gone(address);
         super::sessions::registry().forget(address);
+        self.asks.forget_turn(address);
         let removed = lock(&self.seen).remove(address);
         if (address == brain::NAME || removed.as_ref().is_some_and(|_| hc::get(brain::NAME).is_none()))
             && hc::get(brain::NAME).filter(|t| t["state"] == "live").is_none()

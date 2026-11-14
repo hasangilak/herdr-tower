@@ -1458,6 +1458,30 @@ pub fn chosen_on_screen(set: &QuestionSet, screen: &str) -> Option<String> {
 
 /// Worth asking the brain: the message's end asks the user something.
 /// Cheap and generous; the brain decides.
+/// Whether a message's end asks the user outright: its last paragraph ends
+/// on a question, or offers or asks with "want me to", "should I", "do you
+/// want" and a question mark ("Want me to do both?"). Such a turn end is
+/// the user's to answer, never read as asking nothing.
+pub fn asks_directly(message: &str) -> bool {
+    let mut plain = String::new();
+    let mut in_code = false;
+    for part in message.split("```") {
+        if !in_code {
+            plain.push_str(part);
+        }
+        in_code = !in_code;
+    }
+    let last = plain.split("\n\n").map(str::trim).filter(|p| !p.is_empty()).last().unwrap_or("");
+    let last: String = last.split('`').enumerate().filter(|(i, _)| i % 2 == 0).map(|(_, p)| p).collect::<Vec<_>>().join(" ");
+    let lower = last.to_lowercase();
+    let end = lower.trim_end_matches(|c: char| c.is_whitespace() || c == '*' || c == '_' || c == ')' || c == '"' || c == '\'');
+    if end.ends_with('?') {
+        return true;
+    }
+    let offers = ["want me to", "should i ", "shall i ", "do you want", "would you like", "may i ", "ok to ", "okay to ", "which do you", "which one do", "soll ich", "möchtest du", "willst du"];
+    lower.contains('?') && offers.iter().any(|o| lower.contains(o))
+}
+
 pub fn looks_like_question(message: &str) -> bool {
     // A `?` in code or a link isn't a question.
     let mut plain = String::new();
@@ -2549,6 +2573,21 @@ pub fn picked_line(set: &QuestionSet) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A turn end that asks the user outright is theirs, never "asks nothing"
+    /// (the eight of 14 Nov's audit, and the Android session's "Want me to do both?").
+    #[test]
+    fn a_message_that_asks_the_user_outright() {
+        assert!(asks_directly("I can close 2, 3 and 4 now.\n\nThat's the herder-tower session's code (`t12w`), so I'd ask it to add one rather than edit its repo. Want me to do both?"));
+        assert!(asks_directly("Screenshots are on the tower. Should I commit and push this, and build a release?"));
+        assert!(asks_directly("**Decision:** should t7r push `18964a3` to origin main?\n\nShould I merge, push and install this branch? Installing it needs the phone."));
+        assert!(asks_directly("Which do you prefer, A or B?**"));
+        // It says what is left to the user, or asks along the way: not outright.
+        assert!(!asks_directly("The MediaRoom session agrees with the workaround; whether to build any of the options is your call."));
+        assert!(!asks_directly("Merging is your call.\n\n#840 and #841 stay drafts until MediaRoom confirms the field names."));
+        assert!(!asks_directly("Did the build pass? Yes: all 818 tests.\n\nIt's merged and installed."));
+        assert!(!asks_directly("```\nwhat now?\n```\nDone."));
+    }
 
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(format!("{}/tests/fixtures/questions/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
