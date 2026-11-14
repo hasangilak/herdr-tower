@@ -741,9 +741,11 @@ impl Panel {
                 Some(r) => format!("{} · {r}", m.side_line()),
                 None => m.side_line(),
             };
-            // How long it has been at work: "at work 12m", "1h 12m today".
+            // How long it has been at work: "at work 12m" first (the row is cut at its end), else "1h 12m today" after.
+            let at_work = m.active.as_ref().is_some_and(|a| a.at(now).now);
             let line = match m.active.as_ref().and_then(|a| a.side_word(now)) {
                 Some(w) if line.is_empty() => w,
+                Some(w) if at_work => format!("{w} · {line}"),
                 Some(w) => format!("{line} · {w}"),
                 None => line,
             };
