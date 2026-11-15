@@ -72,6 +72,30 @@ pub fn answers_question(name: &str, question: &str, users: &str, message: &str) 
     }
 }
 
+/// Whether `words`, which the user typed into a session's (`name`) own
+/// terminal, settle `card`: what the tower showed them about that session
+/// (its title, what it said, its answers). They did what it asked, decided
+/// it, or made it moot. Words about something else, or that only start on
+/// it, don't. One headless call, as `judge`'s.
+pub fn settles_card(name: &str, card: &str, words: &str) -> Result<bool> {
+    let prompt = format!(
+        "A tower that runs coding agents' terminal sessions showed the user a card about one session (\"{}\"), waiting for them. \
+         Then the user typed something into that session's own terminal.\n\
+         Decide whether what they typed settles the card: they say they did what it asked, they decide it, or they make it moot. \
+         Words about something else, a question back, or words that only start on it do NOT settle it. When unsure, they do NOT.\n\n\
+         <card>{}</card>\n<typed_in_the_session>{}</typed_in_the_session>\n\n\
+         Answer with JSON only, no other words: {{\"settles\": true}} or {{\"settles\": false}}.",
+        if name.is_empty() { "the session" } else { name },
+        clip(card, 3000),
+        clip(words, 2000)
+    );
+    let v: Value = crate::ticket::parse_reply(&ask(&prompt)?)?;
+    match v["settles"].as_bool() {
+        Some(b) => Ok(b),
+        None => bail!("the answer has no \"settles\""),
+    }
+}
+
 /// What the model is asked by `answers_question`.
 fn question_prompt(name: &str, question: &str, users: &str, message: &str) -> String {
     format!(
@@ -312,5 +336,19 @@ mod live {
         let other = answers_held("eyzflow", "no, don't open the release PR yet, I want to test more on dev first", reply).unwrap();
         eprintln!("link answers it: {link}; another answer: {other}");
         assert!(!link && other);
+    }
+}
+
+#[cfg(test)]
+mod live_card {
+    /// One real call each (`--ignored`): the card from 15 Nov, settled or not.
+    #[test]
+    #[ignore]
+    fn settles_card_live() {
+        let card = "Check 4 fresh search labels (group F) on the labelling page, about 2 minutes; your answers set the fresh real-query test for v3 and the 2.6B model\nGroup F: schimanski, pfaffen, pfaffer, thank. Page: the labelling page, chip F.\nAnswers: I will label them / Later";
+        let yes = super::settles_card("eyz search llm", card, "i labeled all").unwrap();
+        let no = super::settles_card("eyz search llm", card, "also rerun the v2 eval tonight").unwrap();
+        println!("SETTLES yes={yes} no={no}");
+        assert!(yes && !no);
     }
 }

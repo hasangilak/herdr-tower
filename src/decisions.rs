@@ -1475,6 +1475,36 @@ impl Book {
     }
 
     /// A session works (`waiting` false) or waits again: true when that changed a decision.
+    /// The open cards a brain raised that the session at `address` waits on
+    /// (a choice, a raised decision: not a dialog of its own, not a merge):
+    /// the ones what the user types in its terminal may settle.
+    pub fn raised_for(&self, address: &str) -> Vec<Decision> {
+        self.open
+            .iter()
+            .filter(|d| matches!(d.kind, Kind::Choice | Kind::Raised) && d.hold.is_none())
+            .filter(|d| d.sessions.iter().any(|w| w.address == address && w.question_id.is_none()))
+            .cloned()
+            .collect()
+    }
+
+    /// The user settled the card `id` in the terminal of `address` with
+    /// `words` (they did what it asked, or decided it there): that session
+    /// leaves it, and a card nobody else waits on is over, answered with
+    /// their words. None: it isn't open (or that session isn't on it); else
+    /// whether it is over.
+    pub fn settled_in_terminal(&mut self, id: &str, address: &str, words: &str, now: u64) -> Option<bool> {
+        let d = self.open.iter_mut().find(|d| d.id == id)?;
+        if !d.sessions.iter().any(|w| w.address == address) {
+            return None;
+        }
+        d.sessions.retain(|w| w.address != address);
+        let over = !d.sessions.iter().any(|w| w.waiting);
+        if over {
+            self.answered(id, &format!("in its terminal: {}", words.trim()), now);
+        }
+        Some(over)
+    }
+
     pub fn session_waits(&mut self, address: &str, waiting: bool) -> bool {
         let mut changed = false;
         // One that asks is blocked on its question for as long as it shows it.
