@@ -38,6 +38,18 @@ use crate::prs::Pr;
 use crate::questions::QuestionSet;
 use crate::tell::Level;
 
+/// A card as it showed: its title, what it said, its answers.
+pub fn card_text(d: &Decision) -> String {
+    let mut s = d.title.trim().to_string();
+    if !d.detail.trim().is_empty() {
+        s.push_str(&format!("\n{}", d.detail.trim()));
+    }
+    if !d.options.is_empty() {
+        s.push_str(&format!("\nAnswers: {}", d.options.iter().map(|o| o.label.trim()).collect::<Vec<_>>().join(" / ")));
+    }
+    s
+}
+
 /// How a decision back from hold is said (`Decisions::on_back`).
 type Say = Box<dyn Fn(&Decision, &str) + Send + Sync>;
 
@@ -462,6 +474,42 @@ impl Decisions {
         if let Some(d) = self.get(id).filter(|d| d.closed_ms.is_some()) {
             record(&d);
         }
+    }
+
+    /// The user typed `words` in the terminal of `address`: each card a
+    /// brain raised that it waits on is weighed (`settles`: do the words
+    /// settle it?), and one they settle closes, answered there, and is
+    /// written down. Off the caller's thread: the weighing is a model call.
+    pub fn typed_in(&self, address: &str, name: &str, words: &str) {
+        if lock(&self.book).raised_for(address).is_empty() {
+            return;
+        }
+        let (me, address, name, words) = (self.clone(), address.to_string(), name.to_string(), words.to_string());
+        std::thread::spawn(move || {
+            me.typed_in_with(&address, &words, &|d: &Decision, w: &str| crate::covered::settles_card(&name, &card_text(d), w));
+        });
+    }
+
+    /// `typed_in`, weighed by `settles`. The cards it closed.
+    pub fn typed_in_with(&self, address: &str, words: &str, settles: &dyn Fn(&Decision, &str) -> anyhow::Result<bool>) -> Vec<String> {
+        let mut closed = vec![];
+        // (Taken first: the book is locked again to close one.)
+        let cards = lock(&self.book).raised_for(address);
+        for d in cards {
+            match settles(&d, words) {
+                Ok(true) => {
+                    let over = self.change(|b, now| b.settled_in_terminal(&d.id, address, words, now));
+                    eprintln!("[decisions] {}: {address} answered it in its terminal (\"{}\"){}", d.id, crate::agenda::clip(words, 80), if over == Some(true) { "; the card is over" } else { "" });
+                    if over == Some(true) {
+                        self.record_closed(&d.id);
+                        closed.push(d.id.clone());
+                    }
+                }
+                Ok(false) => eprintln!("[decisions] {}: what the user typed in {address} doesn't settle it", d.id),
+                Err(e) => eprintln!("[decisions] {}: couldn't tell whether what the user typed in {address} settles it ({e:#}): it stays", d.id),
+            }
+        }
+        closed
     }
 
     /// A session as the radar sees it: working on something else (`waiting`
@@ -1072,6 +1120,46 @@ mod tests {
             text: text.into(),
             options: vec![],
         }
+    }
+
+    /// 15 Nov: the search-llm brain raised "Check 4 fresh search labels
+    /// (group F)…" for t12r; the user labelled them and typed "i labeled all"
+    /// in t12r itself; the card stayed in the queue.
+    #[test]
+    fn a_raised_card_the_user_settles_in_the_sessions_terminal_closes() {
+        let s = shared();
+        let d = Decisions::new(s.clone());
+        let mut r = raise("search-llm", "t12r", "Check 4 fresh search labels (group F) on the labelling page");
+        r.why = "waiting".into();
+        r.options = vec![crate::decisions::Opt { label: "I will label them".into(), pick: true, ..Default::default() }, crate::decisions::Opt { label: "Later".into(), ..Default::default() }];
+        let (card, ..) = d.raise(r);
+        let (other, ..) = d.raise(raise("search-llm", "t12t", "Ship the ranker to 10% first?"));
+        assert_eq!(card_text(&d.get(&card.id).unwrap()), "Check 4 fresh search labels (group F) on the labelling page\nAnswers: I will label them / Later");
+        // Words about something else: it stays.
+        let asked = std::sync::Mutex::new(vec![]);
+        let judge = |c: &Decision, w: &str| -> anyhow::Result<bool> {
+            asked.lock().unwrap().push((c.id.clone(), w.to_string()));
+            Ok(w.contains("labeled"))
+        };
+        assert!(d.typed_in_with("t12r", "also rerun the eval tonight", &judge).is_empty());
+        assert_eq!(d.get(&card.id).map(|c| c.state), Some(State::Open));
+        // "i labeled all": settled there, answered with their words; only t12r's card was weighed.
+        assert_eq!(d.typed_in_with("t12r", "i labeled all", &judge), [card.id.clone()]);
+        let closed = d.get(&card.id).unwrap();
+        assert_eq!((closed.state, closed.answer.as_str()), (State::Answered, "in its terminal: i labeled all"));
+        assert!(asked.lock().unwrap().iter().all(|(id, _)| *id == card.id));
+        assert_eq!(d.get(&other.id).map(|c| c.state), Some(State::Open), "another session's card is untouched");
+        assert!(!s.get().decisions.iter().any(|v| v["id"] == card.id.as_str()), "out of the queue the windows show");
+        // Nothing to weigh, or a judge that fails: nothing closes.
+        assert!(d.typed_in_with("t12r", "i labeled all", &judge).is_empty());
+        assert!(d.typed_in_with("t12t", "yes", &|_, _| anyhow::bail!("no model")).is_empty());
+        assert_eq!(d.get(&other.id).map(|c| c.state), Some(State::Open));
+        // A merge card (or a dialog of the session's own) is never weighed here.
+        let prs = vec![pr(7, "dev", "t9")];
+        d.sync_prs(&prs);
+        let merge = d.for_prs(&prs)[0].clone();
+        assert!(d.typed_in_with("t9", "merged it", &|_, _| Ok(true)).is_empty());
+        assert_eq!(d.get(&merge).map(|c| c.state), Some(State::Open));
     }
 
     fn pr(n: u64, base: &str, session: &str) -> Pr {

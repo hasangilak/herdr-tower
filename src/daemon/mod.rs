@@ -504,6 +504,8 @@ impl Daemon {
         eprintln!("[terminal] {address} ({name}): the user typed in its terminal: {}", crate::agenda::clip(&words, 120));
         // What the tower has waiting for it may say what the user just did: checked before it goes.
         self.sendq.user_said(address, &words, ev.at_ms);
+        // A card a brain raised that it waits on may be settled by these words ("i labeled all").
+        self.decisions.typed_in(address, &name, &words);
         if self.asks.typed_there(address, &words, ev.at_ms) {
             // An answer to its question, not new work: no agenda, but what the
             // user said there is written down (their conversation with it shows it).
