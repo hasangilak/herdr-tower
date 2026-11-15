@@ -257,6 +257,11 @@ impl Reopen {
                 for d in done.iter().filter(|d| d.how != "failed") {
                     if let Some(k) = book.sessions.iter_mut().find(|k| k.session_id == d.session_id) {
                         k.reopened_ms = Some(now);
+                        // In a new terminal: what waits for it, and what the others send its old address, follows it.
+                        if !k.address.is_empty() && k.address != d.address {
+                            let n = super::sendq::follow(&k.address, &d.address);
+                            eprintln!("[reopen] {} went on at {} (was {}): {n} waiting message(s) follow it", d.name, d.address, k.address);
+                        }
                         k.address = d.address.clone();
                     }
                 }

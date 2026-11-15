@@ -110,13 +110,20 @@ impl Introducer {
 
     /// Every space's Claude sessions here, as members (None: Herdr couldn't be asked).
     fn scan(&self) -> Option<BTreeMap<String, Vec<Member>>> {
-        let list = match crate::hc::list_on(None) {
+        let mut list = match crate::hc::list_on(None) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("[introduce] hc ls: {e:#}");
                 return None;
             }
         };
+        // And the other machines' sessions (a machine out of reach is left out this time).
+        for m in crate::hc::machines() {
+            match crate::hc::list_on(Some(&m)) {
+                Ok(l) => list.extend(l),
+                Err(e) => eprintln!("[introduce] {m}: {e:#}"),
+            }
+        }
         let mut full = lock(&self.full);
         let here: std::collections::HashSet<String> = list.iter().filter_map(|t| t["address"].as_str().map(String::from)).collect();
         full.retain(|a, _| here.contains(a));

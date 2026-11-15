@@ -130,6 +130,19 @@ pub fn signed(from: &Sender, text: &str) -> String {
     if text.starts_with("From ") || text.starts_with(TO_BRAIN) { text.to_string() } else { format!("{}{text}", header(from)) }
 }
 
+/// A message without Herdr's own wrapper around what one terminal typed
+/// into another (`<hc from="t12w">…</hc>`).
+pub fn unwrapped(text: &str) -> &str {
+    let t = text.trim();
+    if t.starts_with("<hc ")
+        && let Some(end) = t.find('>')
+    {
+        let inner = &t[end + 1..];
+        return inner.strip_suffix("</hc>").unwrap_or(inner).trim();
+    }
+    t
+}
+
 /// Starts a session's message to a brain: a note from that session, not
 /// something the user said.
 pub const TO_BRAIN: &str = "[session] ";
@@ -143,7 +156,7 @@ pub const TO_BRAIN: &str = "[session] ";
 /// `[session] `) in front is passed over. None: it opens no such way (the
 /// user's own words, a brain's instruction, "From the orb session: …").
 pub fn sender_in(text: &str) -> Option<String> {
-    let mut t = text.trim_start();
+    let mut t = unwrapped(text).trim_start();
     t = t.strip_prefix(TO_BRAIN).unwrap_or(t).trim_start();
     // An agent's own message from another session: `<cross-session-message from="…" from-name="web" …>`.
     if let Some(name) = cross_session_sender(t) {
