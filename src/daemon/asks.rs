@@ -356,6 +356,9 @@ impl Terminal {
 #[derive(Clone)]
 pub struct Asks {
     inner: Arc<Mutex<Inner>>,
+    /// The user's answers by kind of question, and where they are kept
+    /// (`learning.json` beside `questions.json`): what moves the confidence.
+    learning: Arc<Mutex<(crate::scoring::Learned, Option<std::path::PathBuf>)>>,
     /// `questions.json`, when the cards are kept (the daemon's; tests keep none).
     store: Option<Arc<(std::path::PathBuf, Mutex<()>)>>,
     shared: Shared,
@@ -398,6 +401,7 @@ impl Asks {
         });
         let me = Asks {
             inner: Arc::new(Mutex::new(Inner::default())),
+            learning: Arc::new(Mutex::new((crate::scoring::Learned::default(), None))),
             store: None,
             shared,
             hub,
@@ -427,8 +431,37 @@ impl Asks {
 
     /// Keeps the cards in `path` from now on (`restore` reads them back).
     pub fn stored_at(mut self, path: std::path::PathBuf) -> Asks {
+        let learned_at = path.with_file_name("learning.json");
+        let learned: crate::scoring::Learned = std::fs::read_to_string(&learned_at).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        self.learning = Arc::new(Mutex::new((learned, Some(learned_at))));
         self.store = Some(Arc::new((path, Mutex::new(()))));
         self
+    }
+
+    /// The user's answers by kind of question (`tower scoring`).
+    pub fn learned(&self) -> crate::scoring::Learned {
+        self.learning.lock().unwrap_or_else(|e| e.into_inner()).0.clone()
+    }
+
+    /// The user answered `set` (`answers`) on its card: with the tower's
+    /// first pick (agreed), or another (overrode it). Kept by its kind.
+    fn learn(&self, set: &QuestionSet, answers: &[Answer]) {
+        let (Some(first), Some(_)) = (questions::first_picks(set), set.recommendations.as_ref()) else { return };
+        let agreed = answers.iter().all(|a| first.iter().any(|f| f.tab == a.tab && f.choice == a.choice));
+        let recommended = questions::picked_line(set);
+        let chose = answers
+            .iter()
+            .map(|a| set.tabs.get(a.tab).and_then(|t| a.choice.as_u64().and_then(|n| t.options.get(n as usize)).map(|o| o.label.clone())).unwrap_or_else(|| a.choice.to_string()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let key = set.scores.as_ref().map(|s| s.kind.clone()).filter(|k| !k.is_empty()).unwrap_or_else(|| questions::learn_key(set));
+        let seen = crate::scoring::Seen { at_ms: crate::history::now_ms(), agreed, question: crate::agenda::clip(&set.title, 160), recommended, chose };
+        eprintln!("[questions] {}: the user {} the tower's pick ({key})", set.id, if agreed { "chose" } else { "overrode" });
+        let mut l = self.learning.lock().unwrap_or_else(|e| e.into_inner());
+        l.0.learn(&key, seen);
+        if let Some(p) = l.1.clone() {
+            let _ = std::fs::write(&p, serde_json::to_string_pretty(&l.0).unwrap_or_default());
+        }
     }
 
     pub fn path() -> std::path::PathBuf {
@@ -1157,6 +1190,7 @@ impl Asks {
                     let o = &i.sets[k];
                     set.recommendations = o.recommendations.clone();
                     set.reason = o.reason.clone();
+                    set.scores = o.scores.clone();
                     set.answered_with = o.answered_with.clone();
                     set.replaces = set.replaces.take().or_else(|| o.replaces.clone());
                     set.created_ms = set.created_ms.or(o.created_ms);
@@ -1190,6 +1224,7 @@ impl Asks {
                         if old.state.decision == Decision::Escalated {
                             set.state.decision = Decision::Escalated;
                             set.reason = old.reason.clone();
+                            set.scores = old.scores.clone();
                         }
                         set.recommendations = old.recommendations.as_ref().map(|recs| {
                             recs.iter().filter(|r| matches!((old.tabs.get(r.tab), set.tabs.get(r.tab)), (Some(a), Some(b)) if questions::same_tab(a, b))).cloned().collect()
@@ -1618,6 +1653,12 @@ impl Asks {
     /// its decision (`auto` or `escalate`, with why). For a text question
     /// set the brain also says what it asks; `none`: it asks nothing.
     pub fn recommend(&self, id: &str, v: &Value, decision: Option<&str>, reason: &str, none: bool) -> Result<QuestionSet> {
+        self.recommend_scored(id, v, decision, reason, none, &questions::Said::default())
+    }
+
+    /// `recommend`, with the brain's risk and confidence (`said`): scored,
+    /// floored by the tower, decided by `[scoring]` (`questions::decide_scored`).
+    pub fn recommend_scored(&self, id: &str, v: &Value, decision: Option<&str>, reason: &str, none: bool, said: &questions::Said) -> Result<QuestionSet> {
         let Some(set) = self.get(id) else {
             match self.past(id) {
                 Some(p) => bail!("{id} is over: {}", late_of(&p)),
@@ -1667,7 +1708,10 @@ impl Asks {
                 s.tabs = t;
             }
             s.recommendations = Some(recs);
-            let (d, why) = questions::decide(s, decision, reason, &policy);
+            let learned = self.learning.lock().unwrap_or_else(|e| e.into_inner()).0.clone();
+            let (d, why, scores) = questions::decide_scored(s, decision, reason, &policy, said, &thresholds(), &learned, cwd_of(&s.session).as_deref());
+            eprintln!("[questions] {id}: {} ({}): {d}, {why}", scores.line, scores.risk_why);
+            s.scores = Some(scores);
             card::apply(s, &Ev::Decide { auto: d == "auto" }).map_err(|e| anyhow::anyhow!("{id}: {e}"))?;
             s.reason = why;
             s.clone()
@@ -1734,8 +1778,8 @@ impl Asks {
         };
         match self.answer_as(id, &answers, true, true) {
             Ok(now) => {
-                let line =
-                    format!("answered for you: {picked}, because {}", if set.reason.is_empty() { "it's routine" } else { &set.reason });
+                let scored = set.scores.as_ref().map(|s| format!(" ({}; risk: {})", s.line, s.risk_why)).unwrap_or_default();
+                let line = format!("answered for you: {picked}, because {}{scored}", if set.reason.is_empty() { "it's routine" } else { &set.reason });
                 eprintln!("[questions] {}: {line}", set.session);
                 let (a, l) = (set.session.clone(), line.clone());
                 // A routine answer is written down, not told, unless the tower tells everything.
@@ -1924,6 +1968,10 @@ impl Asks {
                     Refused::AnsweredAlready => anyhow::Error::new(Late(format!("already answered: {} is answered already", k.id))),
                     e => anyhow::Error::new(e).context(k.id.clone()),
                 });
+            }
+            // The user's own answer: with the tower's pick, or another (the confidence learns).
+            if !auto {
+                self.learn(k, answers);
             }
             if k.kind == "text" {
                 return self.reply(k, answers);
@@ -2375,6 +2423,23 @@ pub fn blocked_notice(name: &str, status: &Value) -> String {
 /// path. Herdr's status line cuts a long path short ("…/claude-profiles/
 /// 4c1e9b2a-000…"), so a cut one is said by where it is: Claude's own notes,
 /// or only "a file".
+/// `[scoring]` as config.toml says now (the defaults in tests, which never read it).
+fn thresholds() -> crate::scoring::Thresholds {
+    if cfg!(test) {
+        return crate::scoring::Thresholds::default();
+    }
+    crate::config::Config::load().map(|c| c.scoring).unwrap_or_default()
+}
+
+/// The folder a session works in (its risk floor's project), when Herdr says.
+fn cwd_of(session: &str) -> Option<String> {
+    if cfg!(test) {
+        return None;
+    }
+    let t = crate::hc::get(session)?;
+    t["foreground"]["cwd"].as_str().or(t["cwd"].as_str()).map(String::from)
+}
+
 fn edited(path: &str) -> String {
     let path = path.trim();
     if path.ends_with('…') || path.ends_with("...") {
@@ -2843,6 +2908,59 @@ mod tests {
         let again = a.upsert(set.clone());
         assert_eq!((again.status.as_str(), again.error.as_deref()), ("failed", Some("the dialog moved")), "still failed: try again");
         assert_eq!(a.start_answering(&set.id, Answerer::User), Ok(true), "and it may be tried again");
+    }
+
+    /// Risk and confidence decide (`crate::scoring`): low risk the tower is
+    /// sure of is answered even when the brain called it the user's; the
+    /// escalate list stays the user's whatever the brain scores; the floor
+    /// raises what reaches beyond the project; without scores, as before.
+    #[test]
+    fn scores_decide_and_the_escalate_list_stays_strict() {
+        use crate::scoring::Risk;
+        let (a, _) = asks();
+        let said = |r: &str, c: f64| questions::Said { risk: Risk::parse(r), risk_why: "the brain's why".into(), confidence: Some(c), confidence_why: "routine for this repo".into() };
+        let recs = json!([{"tab": 0, "options": [{"label": "Yes", "why": "", "choice": 0}]}]);
+        let n = std::cell::Cell::new(60);
+        let run = |msg: &str, decision: &str, sd: &questions::Said| {
+            n.set(n.get() + 1);
+            let screen = questions::parse_screen(&fixture("claude-permission.txt")).unwrap();
+            let set = questions::build(&format!("t{}", n.get()), "qfix scored", false, &screen, None, msg, "");
+            a.upsert(set.clone());
+            a.recommend_scored(&set.id, &recs, Some(decision), "the brain's reason", false, sd).unwrap()
+        };
+        // Low risk, 0.8 sure: answered for the user, though the brain said escalate.
+        let s = run("approve Bash: npm test", "escalate", &said("low", 0.8));
+        let sc = s.scores.clone().unwrap();
+        assert_eq!((s.decision.as_deref(), sc.risk, sc.line.as_str()), (Some("auto"), Risk::Low, "risk low · confidence 0.80"), "{sc:?}");
+        assert!(sc.decided_why.starts_with("low risk, confidence 0.80"), "{sc:?}");
+        // On the escalate list: the user's, whatever the brain scored.
+        let s = run("approve Bash: git push origin main", "auto", &said("low", 1.0));
+        let sc = s.scores.clone().unwrap();
+        assert_eq!((s.decision.as_deref(), sc.risk, sc.floor), (Some("escalate"), Risk::High, Risk::High), "{sc:?}");
+        // The floor raises it: a remote call is medium, and 0.8 is under the medium threshold.
+        let s = run("approve Bash: curl -s https://api.example.com/health", "auto", &said("low", 0.8));
+        assert_eq!((s.decision.as_deref(), s.scores.as_ref().unwrap().risk), (Some("escalate"), Risk::Medium));
+        let s = run("approve Bash: curl -s https://api.example.com/version", "escalate", &said("medium", 0.9));
+        assert_eq!(s.decision.as_deref(), Some("auto"));
+        // Low risk, but unsure: the user's.
+        let s = run("approve Bash: npm run lint", "auto", &said("low", 0.4));
+        assert_eq!(s.decision.as_deref(), Some("escalate"));
+        // No scores: the brain's word, as before (scored for its card all the same).
+        let s = run("approve Bash: npm run build", "escalate", &questions::Said::default());
+        assert_eq!((s.decision.as_deref(), s.scores.as_ref().unwrap().brain_confidence), (Some("escalate"), None));
+        // Read again (the radar sees the same dialog): its scores stay.
+        let again = a.upsert(a.get(&s.id).map(|x| QuestionSet { scores: None, recommendations: None, ..x }).unwrap());
+        assert!(again.scores.is_some(), "kept on a re-read");
+        // Its card in the user's queue carries the scores (the state's view too).
+        let d = crate::daemon::decisions::Decisions::new(a.shared.clone());
+        let _ = a.decisions.set(d.clone());
+        a.publish();
+        let card = d.list(None, false)["decisions"].as_array().unwrap().iter().find(|c| c["question_id"].as_str() == Some(s.id.as_str())).cloned().unwrap_or_default();
+        assert_eq!(card["scores"]["risk"], "low", "{card}");
+        // The user answers it with the tower's pick: that kind's confidence learns.
+        let _ = a.answer(&s.id, &[Answer { tab: 0, choice: json!(0), attachments: vec![] }], true);
+        let key = s.scores.unwrap().kind;
+        assert_eq!(a.learned().kinds.get(&key).map(|k| (k.agreed, k.overridden)), Some((1, 0)), "{key}");
     }
 
     #[test]

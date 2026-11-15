@@ -123,6 +123,26 @@ pub(super) fn card_title(text: &str) -> AnyElement {
 }
 
 /// A line of how it stands, under a card's title; `bad`: something went wrong.
+/// A question's scores on its card: "Risk medium (it reaches a remote
+/// service) · confidence 0.62 · yours: …" (amber when high).
+pub(super) fn scores_stat(s: &crate::scoring::Scores) -> AnyElement {
+    cstat(scores_text(s), s.risk == crate::scoring::Risk::High)
+}
+
+pub(super) fn scores_text(s: &crate::scoring::Scores) -> String {
+    let mut out = format!("Risk {}", s.risk.word());
+    if !s.risk_why.trim().is_empty() {
+        out.push_str(&format!(" ({})", s.risk_why.trim()));
+    }
+    if s.brain_confidence.is_some() {
+        out.push_str(&format!(" · confidence {:.2}", s.confidence));
+    }
+    if s.decided == "escalate" && !s.decided_why.trim().is_empty() && s.decided_why.trim() != s.risk_why.trim() {
+        out.push_str(&format!(" · yours: {}", s.decided_why.trim()));
+    }
+    out
+}
+
 pub(super) fn cstat(text: impl Into<SharedString>, bad: bool) -> AnyElement {
     div()
         .text_size(px(13.0))
@@ -1248,6 +1268,7 @@ impl Panel {
             .child(card_title(&d.title))
             .when(!who.is_empty(), |el| el.child(div().text_size(px(12.0)).text_color(g.faint).truncate().child(who.join(", "))))
             .children(d.reason().map(|why| cstat(why, false)))
+            .children(d.scores.as_ref().map(scores_stat))
             // What it is about (the command, the plan), as a question's card shows its dialog's.
             .when(!d.detail.trim().is_empty(), |el| el.child(detail_block(&d.detail, 6)))
             .children(d.options.iter().find(|o| o.pick && !o.why.is_empty()).map(|o| cstat(format!("The tower would pick {}: {}", o.label, o.why), false)))

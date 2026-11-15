@@ -85,6 +85,8 @@ pub(super) struct FullUi {
     pub auto_merge: Option<bool>,
     /// Task lists for the sessions the tower starts, as just switched here (until config.toml says it too).
     pub todo_tools: Option<bool>,
+    /// The scoring preset just picked here (until config.toml says it too).
+    pub scoring: Option<String>,
     /// The window is being moved by its header or the sidebar's top.
     pub drag: Option<Drag>,
     /// Whether a space can have a tower of its own to talk to (this tower's
@@ -151,6 +153,7 @@ impl FullUi {
             tell: None,
             auto_merge: None,
             todo_tools: None,
+            scoring: None,
             voice: None,
             drag: None,
             space_tower: None,

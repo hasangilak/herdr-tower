@@ -362,6 +362,9 @@ pub struct Decision {
     /// them, `merge`, the category `tower raise` gave, how a task failed.
     pub why: String,
     pub options: Vec<Opt>,
+    /// A question's risk and confidence, and what they decided (`crate::scoring`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scores: Option<crate::scoring::Scores>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub prs: Vec<PrRef>,
     /// The question set to answer (its first session's), for one that stands for question sets.
@@ -486,6 +489,7 @@ impl Decision {
             "detail": self.detail,
             "why": self.why,
             "options": options,
+            "scores": self.scores,
             "pick": self.pick().map(|o| o.label.clone()),
             "prs": self.prs,
             "question_id": self.question_id,
@@ -674,6 +678,8 @@ pub fn failed_key(space: Option<&str>, task: &str) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Asked {
     pub key: String,
+    /// Its risk and confidence (`crate::scoring`), shown on its card.
+    pub scores: Option<crate::scoring::Scores>,
     pub kind: Kind,
     pub space: Option<String>,
     /// Its session, with the set's id.
@@ -784,6 +790,7 @@ pub fn asked(set: &QuestionSet) -> Option<Asked> {
     };
     Some(Asked {
         key: ask_key(set.space.as_deref(), &question_text(set)),
+        scores: set.scores.clone(),
         kind,
         space: set.space.clone(),
         who: Who { address: set.session.clone(), name: set.name.clone(), waiting: true, question_id: Some(set.id.clone()) },
@@ -1071,6 +1078,7 @@ impl Book {
                 d.detail = lead.detail.clone();
                 d.why = lead.why.clone();
                 d.options = lead.options.clone();
+                d.scores = lead.scores.clone();
                 d.tabs = lead.tabs;
                 d.question_id = lead.who.question_id.clone();
             }

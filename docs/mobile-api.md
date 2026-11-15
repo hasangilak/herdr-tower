@@ -971,6 +971,34 @@ with `status` `asked:<who>` for the question (`asked:user`, `asked:phone`,
 `asked:brain`), and `btw` or `transcript` for the answer. The Mac shows them
 in the session's thread.
 
+**Risk and confidence** (feature `scoring`). A question set (`questions`
+in the state) and its decision carry `scores` once the tower's brain has
+recommended an answer:
+
+```
+"scores": { "risk": "low" | "medium" | "high", "risk_why": "stays in its project and can be undone",
+            "floor": "low", "floor_why": "…",            (the tower's own floor, from the question and command)
+            "confidence": 0.82, "confidence_why": "the brain said 0.75; you chose its pick 3 of 3 times for this kind",
+            "brain_confidence": 0.75,                    (absent: the brain gave none, its word decided)
+            "decided": "auto" | "escalate", "decided_why": "low risk, confidence 0.82 (answered from 0.60)",
+            "kind": "search-llm|bash:npm test",          (what the user's answers are learned by)
+            "line": "risk low · confidence 0.82" }
+```
+
+Show `line` (or risk and its why) on a question's card, in amber when the
+risk is high, and `decided_why` when it came to the user. High risk, and
+everything on the escalate list, always comes to the user; low risk is
+answered for them from `scoring.low` confidence, medium from
+`scoring.medium`. The user's answers on cards move the confidence for that
+`kind`: choosing the tower's pick raises it, another lowers it.
+
+`GET /v1/answered` lists what the tower answered for the user, newest first
+(`?limit=`): `{"answered": [{"at", "session", "name", "space", "text"}],
+"scoring": {"low": 0.6, "medium": 0.85, "learn": true}, "preset":
+"balanced" | "fewer" | "careful" | null}`. `text` is the line the history
+keeps: "answered for you: <question> -> <answer>, because <why> (risk low ·
+confidence 0.82; risk: <why>)".
+
 **Jobs running** (feature `jobs`). A session's turn can end while a job it
 started keeps running in the background (a training run it watches): its
 `status` says `done`, its work doesn't. The tower sees Claude Code's
@@ -1926,6 +1954,7 @@ stream's `hello` event). A tower from before there were features sends no
 | `accounts` | Each Claude account's usage and the failover's moves: `accounts` in the state, and `account` on each of the state's `brains` and on a mission's `tower` (see "Accounts and usage") |
 | `browsers` | A session using a browser: `browser` on a mission's session, `browsers` on each of the state's `agents` (see "Browsers in use") |
 | `progress` | How a working session's turn goes: `progress` on a mission's session and on each of the state's `agents`, `GET /v1/progress`, `POST /v1/sessions/{t}/progress`, and history entries of `kind: "progress"` (see "Progress of working sessions") |
+| `scoring` | Risk and confidence: `scores` on question sets and their decisions, and `GET /v1/answered` (see "Risk and confidence") |
 | `jobs` | Jobs sessions left running in the background: `job` on a mission's session, `jobs` and `servers` on each of the state's `agents` (see "Jobs running") |
 | `impact` | Who outside depends on what a PR changes: `impact` on a PR (wherever `score` is) and `dependents` / `outside` on a predicted one (`plan.prs`), and a breaking change's warning among a merge's `warnings` |
 | `validation` | A predicted PR's `checks` and `edge_cases` (`plan.prs`), and `validation` on a PR (wherever `score` is), with the missing checks among a merge's `warnings` |

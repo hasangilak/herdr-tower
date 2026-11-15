@@ -116,6 +116,9 @@ pub struct QuestionSet {
     pub reason: String,
     /// What the tower answered for the user, when it did.
     pub answered_with: String,
+    /// Its risk and confidence, and what they decided (`crate::scoring`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scores: Option<crate::scoring::Scores>,
     /// The set this one replaces: the same dialog, read again (its question
     /// on a tab is known now, say). Its card carries on as this one.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2556,6 +2559,95 @@ pub fn decide(set: &QuestionSet, brain: Option<&str>, brain_reason: &str, policy
     }
 }
 
+/// What the brain said of a recommendation's risk and confidence (`tower recommend --risk --confidence`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Said {
+    pub risk: Option<crate::scoring::Risk>,
+    pub risk_why: String,
+    pub confidence: Option<f64>,
+    pub confidence_why: String,
+}
+
+/// The kind of question `set` is, for learning (`scoring::kind_of`), with its space.
+pub fn learn_key(set: &QuestionSet) -> String {
+    let q = set.tabs.first().map(|t| t.question.as_str()).filter(|q| !q.trim().is_empty()).unwrap_or(&set.title);
+    format!("{}|{}", set.space.as_deref().unwrap_or(""), crate::scoring::kind_of(&set.kind, &set.target, q))
+}
+
+/// `decide`, with scores. The hard rules first, as strict as ever (the user
+/// decides everything; the escalate list). Then, when the brain scored it:
+/// the risk that counts is the brain's or the tower's floor, whichever is
+/// higher; the confidence, the brain's moved by the user's own answers to
+/// this kind (`learned`); and those decide by `t`, whatever the brain called
+/// it. Without scores, the brain's word decides, as before. Every set
+/// carries its scores either way (shown on its card).
+pub fn decide_scored(
+    set: &QuestionSet,
+    brain: Option<&str>,
+    brain_reason: &str,
+    policy: &str,
+    said: &Said,
+    t: &crate::scoring::Thresholds,
+    learned: &crate::scoring::Learned,
+    cwd: Option<&str>,
+) -> (String, String, crate::scoring::Scores) {
+    use crate::scoring::{Risk, Scores, decide as by_scores, floor, line};
+    let hard = must_escalate(set);
+    let mut text = format!("{}\n{}", set.title, set.detail);
+    for tab in &set.tabs {
+        text.push('\n');
+        text.push_str(&tab.question);
+    }
+    let command = shell_command(set).map(|c| without_data(&c));
+    let (floor_risk, floor_why) = floor(hard, &text, command.as_deref(), cwd);
+    let risk = said.risk.unwrap_or(floor_risk).max(floor_risk);
+    let risk_why = if said.risk.is_some_and(|r| r >= floor_risk) && !said.risk_why.trim().is_empty() { said.risk_why.trim().to_string() } else { floor_why.clone() };
+    let kind = learn_key(set);
+    let (confidence, confidence_why) = match said.confidence {
+        Some(c) => {
+            let (c, why) = learned.confidence(&kind, c, t.learn);
+            (c, if said.confidence_why.trim().is_empty() { why } else { format!("{}; {why}", said.confidence_why.trim()) })
+        }
+        None => (0.0, "the brain gave none".to_string()),
+    };
+    let mut scores = Scores {
+        risk,
+        risk_why,
+        floor: floor_risk,
+        floor_why,
+        confidence,
+        confidence_why,
+        brain_confidence: said.confidence,
+        kind,
+        line: line(risk, said.confidence.map(|_| confidence)),
+        ..Default::default()
+    };
+    let (d, why) = if policy == "ask-everything" {
+        ("escalate".to_string(), "you asked to decide everything yourself".to_string())
+    } else if let Some(why) = hard {
+        ("escalate".into(), why.into())
+    } else if said.confidence.is_some() {
+        // Keep moving: answered a little sooner (still never high risk).
+        let t = if policy == "keep-moving" { crate::scoring::Thresholds { low: (t.low - 0.1).max(0.0), medium: (t.medium - 0.1).max(0.0), learn: t.learn } } else { t.clone() };
+        let (auto, why) = by_scores(risk, confidence, &t);
+        let safe = first_picks(set).map(|a| safe_auto(set, &a).map(|_| ()));
+        match (auto, safe) {
+            (true, Some(Err(e))) => ("escalate".into(), e),
+            (true, _) => ("auto".into(), why),
+            (false, _) => ("escalate".into(), why),
+        }
+    } else {
+        decide(set, brain, brain_reason, policy)
+    };
+    scores.decided = d.clone();
+    scores.decided_why = why.clone();
+    if risk == Risk::High && d == "auto" {
+        // Never: high risk is always the user's (a guard, should a rule above change).
+        return ("escalate".into(), "high risk: always yours".into(), Scores { decided: "escalate".into(), decided_why: "high risk: always yours".into(), ..scores });
+    }
+    (d, why, scores)
+}
+
 /// The answers the tower gives by itself: recommendation 1 for every question
 /// (on a menu, checked with `safe_auto` before it is typed).
 pub fn first_picks(set: &QuestionSet) -> Option<Vec<Answer>> {
@@ -3941,5 +4033,100 @@ mod tests {
         drive(&mut sim, &now, &[], true).unwrap();
         assert!(sim.submitted);
         assert_eq!(sim.log, ["enter"], "Submit, nothing else: {:?}", sim.log);
+    }
+}
+
+#[cfg(test)]
+mod scoring_replay {
+    use super::*;
+    use crate::scoring::{Learned, Risk, Seen, Thresholds, decide, floor, kind_of};
+
+    /// `HERDER_TOWER_REPLAY_DECISIONS=<decisions.json> HERDER_TOWER_REPLAY_HISTORY=<history.jsonl>`:
+    /// the past question cards (escalated) and "answered for you" entries
+    /// (auto), decided again by risk and confidence. The brain's confidence
+    /// on an escalated card is unknown: `HERDER_TOWER_REPLAY_PRIOR` (0.5).
+    #[test]
+    #[ignore]
+    fn replay_past_questions_by_scores() {
+        let (Ok(dp), Ok(hp)) = (std::env::var("HERDER_TOWER_REPLAY_DECISIONS"), std::env::var("HERDER_TOWER_REPLAY_HISTORY")) else { return };
+        let prior: f64 = std::env::var("HERDER_TOWER_REPLAY_PRIOR").ok().and_then(|p| p.parse().ok()).unwrap_or(0.5);
+        let t = Thresholds::default();
+        let d: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dp).unwrap()).unwrap();
+        let mut cards: Vec<serde_json::Value> =
+            d["open"].as_array().into_iter().chain(d["closed"].as_array()).flatten().filter(|x| matches!(x["kind"].as_str(), Some("question" | "permission"))).cloned().collect();
+        cards.sort_by_key(|x| x["first_ms"].as_u64().unwrap_or(0));
+        let set_of = |kind: &str, title: &str, detail: &str, options: Vec<(String, String)>, space: Option<String>| QuestionSet {
+            kind: kind.into(),
+            title: title.into(),
+            detail: detail.into(),
+            tabs: vec![Tab { question: title.into(), options: options.into_iter().map(|(label, description)| Opt { label, description, key: String::new() }).collect(), ..Default::default() }],
+            space,
+            ..Default::default()
+        };
+        let mut learned = Learned::default();
+        let (mut esc, mut esc_high, mut esc_now_auto, mut answered, mut agreed_n, mut hard) = (0, 0, 0, 0, 0, 0);
+        let mut by_risk = std::collections::BTreeMap::new();
+        for c in &cards {
+            let kind = if c["kind"] == "permission" { "claude-permission" } else { "claude-ask" };
+            let opts: Vec<(String, String)> = c["options"].as_array().into_iter().flatten().map(|o| (o["label"].as_str().unwrap_or("").to_string(), o["why"].as_str().unwrap_or("").to_string())).collect();
+            let set = set_of(kind, c["title"].as_str().unwrap_or(""), c["detail"].as_str().unwrap_or(""), opts.clone(), c["space"].as_str().map(String::from));
+            let text = format!("{}\n{}", set.title, set.detail);
+            hard += must_escalate(&set).is_some() as u32;
+            let (risk, _) = floor(must_escalate(&set), &text, None, None);
+            *by_risk.entry(risk.word()).or_insert(0) += 1;
+            let key = format!("{}|{}", set.space.as_deref().unwrap_or(""), kind_of(kind, "", &set.title));
+            let (conf, _) = learned.confidence(&key, prior, true);
+            let (auto, _) = decide(risk, conf, &t);
+            esc += 1;
+            if risk == Risk::High {
+                esc_high += 1;
+                assert!(!auto, "an escalate-list card would be answered: {}", set.title);
+            }
+            if auto {
+                esc_now_auto += 1;
+                println!("NOW-AUTO\t{}\t{conf:.2}\t{}", risk.word(), crate::agenda::clip(&set.title, 110));
+            }
+            let answer = c["answer"].as_str().unwrap_or("").trim().to_string();
+            if !answer.is_empty() {
+                let rec = c["options"].as_array().into_iter().flatten().find(|o| o["pick"].as_bool() == Some(true)).and_then(|o| o["label"].as_str()).unwrap_or("").to_string();
+                let agreed = !rec.is_empty() && answer.eq_ignore_ascii_case(&rec);
+                answered += 1;
+                agreed_n += agreed as u32;
+                learned.learn(&key, Seen { at_ms: c["first_ms"].as_u64().unwrap_or(0), agreed, question: set.title.clone(), recommended: rec, chose: answer });
+            }
+        }
+        // What was answered for the user before.
+        let (mut auto_n, mut auto_high, mut auto_medium, mut auto_memory) = (0, 0, 0, 0);
+        for l in std::fs::read_to_string(hp).unwrap().lines() {
+            let Ok(e) = serde_json::from_str::<serde_json::Value>(l) else { continue };
+            if e["kind"] != "answered" || e["status"] != "auto" {
+                continue;
+            }
+            auto_n += 1;
+            let body = e["text"].as_str().unwrap_or("").trim_start_matches("answered for you: ");
+            let (q, _) = body.split_once(" -> ").unwrap_or((body, ""));
+            // Claude's own memory and notes are answered by their rule before any scoring.
+            if body.contains("only writes Claude's own memory") {
+                auto_memory += 1;
+                continue;
+            }
+            let set = set_of("claude-permission", q, body, vec![], e["space"].as_str().map(String::from));
+            match floor(must_escalate(&set), body, None, None).0 {
+                Risk::High => {
+                    auto_high += 1;
+                    println!("AUTO-WAS-HIGH\t{}", crate::agenda::clip(body, 140));
+                }
+                Risk::Medium => {
+                    auto_medium += 1;
+                    println!("AUTO-MEDIUM\t{}", crate::agenda::clip(body, 140));
+                }
+                Risk::Low => {}
+            }
+        }
+        println!(
+            "REPLAY prior={prior} | escalated before: {esc} (risk {by_risk:?}; high: {esc_high}, of them on the hard escalate list: {hard}, the rest ask you to act); answered by you: {answered}, your pick = the tower's: {agreed_n} | escalated now: {} ({} would now be answered for you; high ones answered: 0) | answered for you before: {auto_n} ({auto_memory} by the memory rule, unchanged): high now: {auto_high}, medium (answered only at confidence 0.85+): {auto_medium}",
+            esc - esc_now_auto,
+            esc_now_auto
+        );
     }
 }

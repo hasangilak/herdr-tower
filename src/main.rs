@@ -22,6 +22,7 @@ mod brains;
 mod browsers;
 mod progress;
 mod relay;
+mod scoring;
 mod chat;
 mod choices;
 mod config;
@@ -292,6 +293,24 @@ enum Cmd {
         /// on, off or status (default).
         #[arg(default_value = "status")]
         action: String,
+    },
+    /// Risk and confidence: when the tower answers a session's question for you. Low risk is answered
+    /// from confidence `low`, medium from `medium`, high never (and the escalate list never).
+    /// No action: the thresholds, what your answers taught it per kind of question, and what it
+    /// answered for you lately. `preset fewer|balanced|careful`, `set --low 0.6 --medium 0.85`,
+    /// `learn on|off`, `answered` (what it answered for you, and why). `[scoring]` in config.toml.
+    Scoring {
+        /// show (default), preset, set, learn or answered.
+        #[arg(default_value = "show")]
+        action: String,
+        /// The preset (fewer, balanced, careful), or on/off for learn.
+        value: Option<String>,
+        #[arg(long)]
+        low: Option<f64>,
+        #[arg(long)]
+        medium: Option<f64>,
+        #[arg(long)]
+        json: bool,
     },
     /// Whether the Claude sessions the tower starts keep a task list (on by default): with it, a
     /// session's progress shows as step N of M (Claude Code gives current models its TaskCreate and
@@ -669,6 +688,19 @@ enum Cmd {
         /// A finished message that asks the user nothing after all.
         #[arg(long)]
         none: bool,
+        /// How far the answer reaches: low (stays in the project, can be undone), medium (beyond the
+        /// project, shared or remote state, hard to undo) or high. The tower's own floor wins when higher.
+        #[arg(long)]
+        risk: Option<String>,
+        /// Why that risk, in a few words.
+        #[arg(long, default_value = "")]
+        risk_why: String,
+        /// 0 to 1: how sure you are that recommendation 1 is what the user would choose.
+        #[arg(long)]
+        confidence: Option<f64>,
+        /// Why that confidence, in a few words.
+        #[arg(long, default_value = "")]
+        confidence_why: String,
     },
     /// Dismiss a question set, or a decision (it shows no more; nothing is sent).
     Dismiss { id: String },
@@ -1042,6 +1074,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Automerge { action } => automerge_cmd(&action),
         Cmd::TodoTools { action } => todo_tools_cmd(&action),
+        Cmd::Scoring { action, value, low, medium, json } => scoring_cmd(&action, value.as_deref(), low, medium, json),
         Cmd::Releases { space, json } => releases_cmd(space.as_deref(), json),
         Cmd::Impact { pr, verdict, text, json } => impact_cmd(&pr, verdict.as_deref(), &text.join(" "), json),
         Cmd::Pr { action, pr, why } => pr_cmd(&action, &pr, &why.join(" ")),
@@ -1209,7 +1242,15 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Recommend { id, json, decision, reason, none } => {
+        Cmd::Recommend { id, json, decision, reason, none, risk, risk_why, confidence, confidence_why } => {
+            if let Some(r) = &risk
+                && scoring::Risk::parse(r).is_none()
+            {
+                bail!("--risk is low, medium or high");
+            }
+            if confidence.is_some_and(|c| !(0.0..=1.0).contains(&c)) {
+                bail!("--confidence is between 0 and 1");
+            }
             let recs: Value = if none || json.trim().is_empty() { Value::Null } else { serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("--json: {e}"))? };
             if !none && recs.is_null() {
                 bail!("give --json with the recommendations, or --none");
@@ -1220,15 +1261,15 @@ fn run(cli: Cli) -> Result<()> {
             {
                 bail!("--decision is auto or escalate");
             }
-            let r = protocol::send(&Request::Recommend { id: id.clone(), recs, decision, reason, none })?;
+            let r = protocol::send(&Request::Recommend { id: id.clone(), recs, decision, reason, none, risk, risk_why, confidence, confidence_why })?;
             if !r.ok {
                 bail!("{}", r.error.unwrap_or_default());
             }
             let v = r.state.unwrap_or_default();
             match (none, v["decision"].as_str()) {
                 (true, _) => println!("{id}: closed, it asks nothing."),
-                (_, Some("auto")) => println!("{id}: answering it for the user ({}).", v["reason"].as_str().unwrap_or("")),
-                (_, d) => println!("{id}: for the user to decide ({}).", if d.is_some() { v["reason"].as_str().unwrap_or("") } else { "" }),
+                (_, Some("auto")) => println!("{id}: answering it for the user ({}; {}).", v["reason"].as_str().unwrap_or(""), v["scores"]["line"].as_str().unwrap_or("")),
+                (_, d) => println!("{id}: for the user to decide ({}; {}).", if d.is_some() { v["reason"].as_str().unwrap_or("") } else { "" }, v["scores"]["line"].as_str().unwrap_or("")),
             }
             Ok(())
         }
@@ -1653,6 +1694,118 @@ fn automerge_cmd(action: &str) -> Result<()> {
         println!("Auto-merge is off: every PR is yours to merge.");
     }
     Ok(())
+}
+
+/// `tower scoring [show|preset|set|learn|answered]`: `[scoring]` in config.toml.
+fn scoring_cmd(action: &str, value: Option<&str>, low: Option<f64>, medium: Option<f64>, json_out: bool) -> Result<()> {
+    let path = config::config_file();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let now = config::Config::from_text(&text)?.scoring;
+    let write = |set: &[(&str, String)]| -> Result<scoring::Thresholds> {
+        let mut new = text.clone();
+        for (k, v) in set {
+            new = config::with_table_key(&new, "scoring", k, v);
+        }
+        let read = config::Config::from_text(&new)?.scoring;
+        std::fs::create_dir_all(config::config_dir())?;
+        std::fs::write(&path, new)?;
+        Ok(read)
+    };
+    let plain = json_out || !std::io::stdout().is_terminal();
+    let said = |t: &scoring::Thresholds| {
+        format!(
+            "Low risk is answered for you from confidence {:.2}, medium from {:.2}, high never{}; learning from your answers is {}.",
+            t.low,
+            t.medium,
+            t.preset_name().map(|p| format!(" ({p})")).unwrap_or_default(),
+            if t.learn { "on" } else { "off" }
+        )
+    };
+    let changed = match action {
+        "preset" => {
+            let name = value.unwrap_or("").trim();
+            let Some(p) = scoring::Thresholds::preset(name) else { bail!("tower scoring preset fewer|balanced|careful") };
+            Some(write(&[("low", format!("{}", p.low)), ("medium", format!("{}", p.medium))])?)
+        }
+        "set" => {
+            if low.is_none() && medium.is_none() {
+                bail!("tower scoring set --low <0..1> --medium <0..1>");
+            }
+            if [low, medium].iter().flatten().any(|v| !(0.0..=1.0).contains(v)) {
+                bail!("a threshold is between 0 and 1");
+            }
+            let mut set = vec![];
+            if let Some(l) = low {
+                set.push(("low", format!("{l}")));
+            }
+            if let Some(m) = medium {
+                set.push(("medium", format!("{m}")));
+            }
+            Some(write(&set)?)
+        }
+        "learn" => {
+            let on = match value.unwrap_or("").trim() {
+                "on" => true,
+                "off" => false,
+                _ => bail!("tower scoring learn on|off"),
+            };
+            Some(write(&[("learn", on.to_string())])?)
+        }
+        "answered" => {
+            let entries = history::load_tail(4 << 20);
+            let rows: Vec<Value> = entries
+                .iter()
+                .rev()
+                .filter(|e| e.kind == "answered" && e.status.as_deref() == Some("auto"))
+                .take(30)
+                .map(|e| json!({ "at": e.at, "session": e.session, "name": e.name, "space": e.space, "text": e.text }))
+                .collect();
+            if plain {
+                print_json(&json!({ "answered": rows }));
+            } else if rows.is_empty() {
+                println!("Nothing was answered for you lately.");
+            } else {
+                for r in &rows {
+                    let at = r["at"].as_u64().map(|ms| chrono_hm(ms)).unwrap_or_default();
+                    println!("{at}  {} ({}): {}", r["name"].as_str().unwrap_or(""), r["session"].as_str().unwrap_or(""), r["text"].as_str().unwrap_or(""));
+                }
+            }
+            return Ok(());
+        }
+        "show" | "" => None,
+        other => bail!("tower scoring {other}: show, preset, set, learn or answered"),
+    };
+    let t = changed.clone().unwrap_or(now);
+    let learned: scoring::Learned = std::fs::read_to_string(config::state_dir().join("learning.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    if plain {
+        print_json(&json!({ "scoring": t, "preset": t.preset_name(), "changed": changed.is_some(), "learned": learned }));
+        return Ok(());
+    }
+    println!("{}", said(&t));
+    if changed.is_none() {
+        if learned.kinds.is_empty() {
+            println!("No answers of yours learned from yet.");
+        } else {
+            println!("What your answers taught it (agreed with its pick / overrode it):");
+            for (k, v) in &learned.kinds {
+                println!("  {:<60} {} / {}", k, v.agreed, v.overridden);
+            }
+        }
+        println!("What it answered for you lately: tower scoring answered");
+    }
+    Ok(())
+}
+
+/// "14:05" in local time.
+fn chrono_hm(ms: u64) -> String {
+    let secs = (ms / 1000) as libc::time_t;
+    // SAFETY: localtime_r fills the struct we own.
+    let tm = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&secs, &mut tm);
+        tm
+    };
+    format!("{:02}-{:02} {:02}:{:02}", tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min)
 }
 
 /// `tower todo-tools on|off|status`: `[sessions] todo_tools` in config.toml.
