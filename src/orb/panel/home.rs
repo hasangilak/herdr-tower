@@ -137,7 +137,7 @@ pub(super) fn scores_text(s: &crate::scoring::Scores) -> String {
     if s.brain_confidence.is_some() {
         out.push_str(&format!(" · confidence {:.2}", s.confidence));
     }
-    if s.decided == "escalate" && !s.decided_why.trim().is_empty() {
+    if s.decided == "escalate" && !s.decided_why.trim().is_empty() && s.decided_why.trim() != s.risk_why.trim() {
         out.push_str(&format!(" · yours: {}", s.decided_why.trim()));
     }
     out

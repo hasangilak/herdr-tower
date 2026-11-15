@@ -1190,6 +1190,7 @@ impl Asks {
                     let o = &i.sets[k];
                     set.recommendations = o.recommendations.clone();
                     set.reason = o.reason.clone();
+                    set.scores = o.scores.clone();
                     set.answered_with = o.answered_with.clone();
                     set.replaces = set.replaces.take().or_else(|| o.replaces.clone());
                     set.created_ms = set.created_ms.or(o.created_ms);
@@ -1223,6 +1224,7 @@ impl Asks {
                         if old.state.decision == Decision::Escalated {
                             set.state.decision = Decision::Escalated;
                             set.reason = old.reason.clone();
+                            set.scores = old.scores.clone();
                         }
                         set.recommendations = old.recommendations.as_ref().map(|recs| {
                             recs.iter().filter(|r| matches!((old.tabs.get(r.tab), set.tabs.get(r.tab)), (Some(a), Some(b)) if questions::same_tab(a, b))).cloned().collect()
@@ -2946,6 +2948,15 @@ mod tests {
         // No scores: the brain's word, as before (scored for its card all the same).
         let s = run("approve Bash: npm run build", "escalate", &questions::Said::default());
         assert_eq!((s.decision.as_deref(), s.scores.as_ref().unwrap().brain_confidence), (Some("escalate"), None));
+        // Read again (the radar sees the same dialog): its scores stay.
+        let again = a.upsert(a.get(&s.id).map(|x| QuestionSet { scores: None, recommendations: None, ..x }).unwrap());
+        assert!(again.scores.is_some(), "kept on a re-read");
+        // Its card in the user's queue carries the scores (the state's view too).
+        let d = crate::daemon::decisions::Decisions::new(a.shared.clone());
+        let _ = a.decisions.set(d.clone());
+        a.publish();
+        let card = d.list(None, false)["decisions"].as_array().unwrap().iter().find(|c| c["question_id"].as_str() == Some(s.id.as_str())).cloned().unwrap_or_default();
+        assert_eq!(card["scores"]["risk"], "low", "{card}");
         // The user answers it with the tower's pick: that kind's confidence learns.
         let _ = a.answer(&s.id, &[Answer { tab: 0, choice: json!(0), attachments: vec![] }], true);
         let key = s.scores.unwrap().kind;

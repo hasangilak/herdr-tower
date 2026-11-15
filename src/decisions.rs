@@ -489,6 +489,7 @@ impl Decision {
             "detail": self.detail,
             "why": self.why,
             "options": options,
+            "scores": self.scores,
             "pick": self.pick().map(|o| o.label.clone()),
             "prs": self.prs,
             "question_id": self.question_id,

@@ -122,6 +122,8 @@ pub fn kind_of(kind: &str, target: &str, question: &str) -> String {
         let tool = tool.trim().to_lowercase();
         if tool == "bash" {
             let cmd = crate::running::name_of(rest.trim());
+            // Herdr's token saver runs commands as `rtk <command>`: the command is what counts.
+            let cmd = cmd.strip_prefix("rtk ").map(str::to_string).unwrap_or(cmd);
             let program = cmd.split_whitespace().next().unwrap_or("").rsplit('/').next().unwrap_or("").to_lowercase();
             // `npm test` and `npm install` are different kinds; `git status` and `git push` too.
             let sub = cmd.split_whitespace().nth(1).filter(|w| !w.starts_with('-')).map(|w| w.to_lowercase()).filter(|_| matches!(program.as_str(), "npm" | "pnpm" | "yarn" | "bun" | "cargo" | "git" | "gh" | "docker" | "make" | "uv" | "pip" | "python" | "python3" | "node"));
@@ -393,6 +395,7 @@ mod tests {
         assert_eq!(kind_of("claude-permission", "Bash: npm test -- --watch=false", ""), "bash:npm test");
         assert_eq!(kind_of("claude-permission", "Bash: cd /w/app && cargo build --release", ""), "bash:cargo build");
         assert_eq!(kind_of("claude-permission", "Bash: ls -la", ""), "bash:ls");
+        assert_eq!(kind_of("claude-permission", "Bash: rtk git push --dry-run origin x", ""), "bash:git push");
         assert_eq!(kind_of("claude-permission", "Update: /w/app/src/x.ts", ""), "edit");
         assert_eq!(kind_of("claude-ask", "", "Which database should the app use?"), "claude-ask:which database should the");
         assert_eq!(Risk::parse("Medium"), Some(Risk::Medium));
