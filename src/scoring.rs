@@ -152,6 +152,10 @@ pub fn floor(escalate: Option<&str>, text: &str, command: Option<&str>, cwd: Opt
     if let Some(why) = escalate {
         return (Risk::High, why.to_string());
     }
+    // It asks the user to do something themselves: no answer of the tower's can be theirs.
+    if let Some(why) = asks_the_user_to_act(text) {
+        return (Risk::High, why);
+    }
     if let Some(why) = medium_signal(text, command, cwd) {
         return (Risk::Medium, why);
     }
@@ -187,11 +191,51 @@ fn medium_signal(text: &str, command: Option<&str>, cwd: Option<&str>) -> Option
     if let Some(w) = has(&cmd, &[" rm ", " mv ", " reset --hard", " checkout -- ", " restore ", " clean -", " truncate ", " dd ", "> /"]) {
         return Some(format!("it is hard to undo ({w})"));
     }
+    // Long or costly work started on a go-ahead: a training run, a judge, an export.
+    if let Some(w) = has(&t, &[" fine-tune", " finetune", " retrain", " training run", " train the ", " start the training", " judge", " start the export", " the export", " backfill", " re-run all", " rerun all", " full run", " gpu ", " batch job"]) {
+        return Some(format!("it starts long or costly work ({w})"));
+    }
     // In words: a question about shared or remote things.
     if let Some(w) = has(&t, &[" database ", " schema ", " api key", " shared ", " other team", " customers ", " users' ", " billing ", " dns ", " email them", " send an email", " slack "]) {
         return Some(format!("it touches shared state ({w})"));
     }
     None
+}
+
+/// A question that asks the user to act ("your turn: answer group E",
+/// "will you check the labels by hand", "review #1422 and choose"): what
+/// they must do or judge themselves, which no answer of the tower's does.
+fn asks_the_user_to_act(text: &str) -> Option<String> {
+    let t = format!(" {} ", text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" "));
+    let phrases = [
+        " your turn",
+        " will you check",
+        " will you review",
+        " will you label",
+        " can you check",
+        " can you review",
+        " could you check",
+        " please check",
+        " please review",
+        " please label",
+        " by hand",
+        " yourself",
+        " tell me when you're done",
+        " tell me when you are done",
+        " when you have a minute",
+        " answer group",
+        " label them",
+        " log in",
+        " sign in",
+        " approve it in",
+        " your answers set",
+        " needs your answer",
+        " and choose",
+        " review #",
+        " your go",
+        " your call",
+    ];
+    phrases.iter().find(|p| t.contains(*p)).map(|p| format!("it asks you to do something yourself ({})", p.trim()))
 }
 
 /// The user's answers on cards, by kind (`space|kind`): agreed with the
@@ -298,6 +342,14 @@ mod tests {
         assert_eq!(floor(None, "Write /w/app/src/x.ts?", None, Some("/w/app")).0, Risk::Low, "inside the project");
         assert_eq!(floor(None, "Which database should the app use?", None, None).0, Risk::Medium);
         assert_eq!(floor(None, "Read /tmp/out.log?", Some("cat /tmp/out.log"), Some("/w/app")).0, Risk::Low, "scratch is no reach");
+        // 15 Nov's replay: what asks the user to act is theirs; costly runs are medium.
+        assert_eq!(floor(None, "Your turn: answer group E (four items) whenever you have a minute", None, None).0, Risk::High);
+        assert_eq!(floor(None, "Will you check about 30 labels by hand before I rescore?", None, None).0, Risk::High);
+        assert_eq!(floor(None, "The 5-hour checker fine-tune is still waiting for your go.", None, None).0, Risk::High, "your go");
+        assert_eq!(floor(None, "Start the 5-hour checker fine-tune?", None, None).0, Risk::Medium);
+        assert_eq!(floor(None, "Review #1422 and choose fail open or closed?", None, None).0, Risk::High);
+        assert_eq!(floor(None, "Shall I go ahead with the 24B-A2B judge?", None, None).0, Risk::Medium);
+        assert_eq!(floor(None, "Show 'at work now' instead of 'at work 0m' when a stretch is under a minute?", None, None).0, Risk::Low);
     }
 
     #[test]
