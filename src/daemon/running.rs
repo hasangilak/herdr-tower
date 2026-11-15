@@ -223,9 +223,26 @@ impl Running {
             .into_iter()
             .filter_map(|(a, n)| crate::hc::get(&a).filter(|t| !super::watch::left_alone(t)).as_ref().and_then(crate::accounts::claude_pid).map(|p| (a, n, p)))
             .collect();
-        let gpu_before = lock(&self.inner).gpu.clone();
-        let world = world_for(&claudes.iter().map(|c| c.2).collect::<Vec<_>>(), Some(gpu_before));
-        lock(&self.inner).gpu = world.gpu.clone();
+        let (gpu_before, declared) = {
+            let i = lock(&self.inner);
+            (i.gpu.clone(), i.declared.values().flatten().filter_map(|j| j.pid).collect::<Vec<u32>>())
+        };
+        let world = world_for(&claudes.iter().map(|c| c.2).collect::<Vec<_>>(), &declared, Some(gpu_before));
+        {
+            // Declared jobs with a process: at work on its CPU or GPU, and
+            // moving when its tree writes (`settle` ages them).
+            let mut i = lock(&self.inner);
+            i.gpu = world.gpu.clone();
+            for j in i.declared.values_mut().flatten() {
+                if let Some(p) = j.pid.filter(|p| world.procs.iter().any(|x| x.pid == *p)) {
+                    let (busy, progress) = running::activity(&world, p);
+                    j.busy = busy;
+                    if let Some(at) = progress.filter(|at| *at > j.progress_ms.unwrap_or(0)) {
+                        j.progress_ms = Some(at);
+                    }
+                }
+            }
+        }
         let mut seen: BTreeMap<String, (Vec<Job>, Vec<Server>)> = BTreeMap::new();
         let mut names: HashMap<String, String> = HashMap::new();
         let mut browser_uses: BTreeMap<String, Vec<crate::browsers::Use>> = BTreeMap::new();
@@ -433,7 +450,8 @@ impl Running {
                 list.retain(|j| !j.pid.is_some_and(|p| !alive(p)));
                 gone_declared |= list.len() != before;
                 for j in list.iter_mut() {
-                    j.stuck = now.saturating_sub(j.progress_ms.unwrap_or(j.since_ms)) > running::quiet_ms() && !j.pid.is_some_and(|p| cpu_busy(p));
+                    // Busy: as the look saw its tree (CPU or GPU), else its own CPU now.
+                    j.stuck = now.saturating_sub(j.progress_ms.unwrap_or(j.since_ms)) > running::quiet_ms() && !j.busy && !j.pid.is_some_and(|p| cpu_busy(p));
                 }
             }
             i.declared.retain(|_, l| !l.is_empty());
@@ -633,7 +651,8 @@ impl Running {
 ///
 /// `gpu_before`: each process's GPU time at the look before (the daemon's);
 /// None (a single look) takes two readings a second apart.
-fn world_for(claudes: &[u32], gpu_before: Option<HashMap<u32, u64>>) -> World {
+/// `declared`: the processes of jobs said with a pid, looked at the same way.
+fn world_for(claudes: &[u32], declared: &[u32], gpu_before: Option<HashMap<u32, u64>>) -> World {
     let mut world = World { procs: running::parse_ps(&output("ps", &["-axww", "-o", "pid=,ppid=,etime=,pcpu=,command="])), ..Default::default() };
     let shells: Vec<(u32, String)> =
         claudes.iter().flat_map(|p| world.shells(*p).into_iter().map(|s| (s.pid, running::shell_command(&s.command).unwrap_or_default())).collect::<Vec<_>>()).collect();
@@ -642,6 +661,9 @@ fn world_for(claudes: &[u32], gpu_before: Option<HashMap<u32, u64>>) -> World {
     for (s, command) in &shells {
         let own: Vec<u32> = world.subtree(*s).iter().map(|p| p.pid).collect();
         pids.extend(world.waited_on(command, &own));
+    }
+    for d in declared {
+        pids.extend(world.subtree(*d).iter().map(|p| p.pid));
     }
     pids.sort();
     pids.dedup();
@@ -661,7 +683,12 @@ fn world_for(claudes: &[u32], gpu_before: Option<HashMap<u32, u64>>) -> World {
         }
     };
     world.gpu = gpu();
-    let named: Vec<String> = shells.iter().flat_map(|(s, c)| running::reach(&world, *s, c).named).collect();
+    let mut named: Vec<String> = shells.iter().flat_map(|(s, c)| running::reach(&world, *s, c).named).collect();
+    for d in declared {
+        for p in world.subtree(*d) {
+            named.extend(running::named_files(&p.command).iter().filter_map(|n| running::resolve(n, world.cwd_of(p.pid))));
+        }
+    }
     let paths: Vec<String> = world.files.values().flatten().map(|o| o.name.clone()).chain(named).collect();
     for p in paths {
         if let Ok(m) = std::fs::metadata(&p)
@@ -680,7 +707,7 @@ fn world_for(claudes: &[u32], gpu_before: Option<HashMap<u32, u64>>) -> World {
 pub fn look_at(address: &str) -> Result<Value> {
     let t = crate::hc::get(address).with_context(|| format!("no terminal {address}"))?;
     let pid = crate::accounts::claude_pid(&t).with_context(|| format!("{address} runs no Claude Code session on this machine"))?;
-    let world = world_for(&[pid], None);
+    let world = world_for(&[pid], &[], None);
     let mut tasks = Tasks::default();
     let mut calls = crate::browsers::Calls::default();
     if let Some(path) = crate::questions::transcript_path_of(pid)

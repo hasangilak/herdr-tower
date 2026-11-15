@@ -897,6 +897,24 @@ pub fn reach(world: &World, shell: u32, command: &str) -> Reach {
     Reach { waited, named }
 }
 
+/// A declared job's process (`tower job-running start --pid`) at work now:
+/// its tree on the CPU or the GPU; and the last write of the files its tree
+/// has open for writing or names in its commands (`--log`).
+pub fn activity(world: &World, pid: u32) -> (bool, Option<u64>) {
+    let tree = world.subtree(pid);
+    let busy = tree.iter().any(|p| p.cpu >= BUSY_CPU || world.on_gpu(p.pid));
+    let progress = tree
+        .iter()
+        .flat_map(|p| {
+            let open = world.files.get(&p.pid).into_iter().flatten().filter(|o| written(o)).map(|o| o.name.clone());
+            let named = named_files(&p.command).into_iter().filter_map(|n| resolve(&n, world.cwd_of(p.pid)));
+            open.chain(named).collect::<Vec<_>>()
+        })
+        .filter_map(|n| world.mtimes.get(&n).copied())
+        .max();
+    (busy, progress)
+}
+
 /// What a waiter waits on: a process by its command line, or by its pid.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Waited {
@@ -1601,6 +1619,9 @@ mod tests {
         // No GPU, no CPU, its log 50 minutes old: possibly stuck after all.
         w2.mtimes.insert("/w/data/review/v5/train.log".into(), NOW - 50 * 60_000);
         assert!(look(5, &w2, &t, NOW, true).0[0].stuck);
+        // A job declared with the guard's pid: idle at its own CPU, at work on the GPU below it, its --log read.
+        assert_eq!(activity(&w, 200), (true, Some(NOW - 60_000)));
+        assert_eq!(activity(&w2, 200), (false, Some(NOW - 50 * 60_000)), "no GPU, no CPU: its log says how long it has been quiet");
         // The training is gone (the waiter should have ended): quiet for 70 minutes, stuck.
         let mut w3 = gpu_world().0;
         w3.procs.retain(|p| p.pid != 200 && p.pid != 201);
