@@ -159,6 +159,23 @@ impl Panel {
         });
     }
 
+    /// `tower scoring preset <name>`: picked at once, and back if the tower refuses.
+    fn set_scoring(&mut self, preset: &'static str, cx: &mut Context<Self>) {
+        if self.running("scoring") {
+            return;
+        }
+        if let Some(full) = self.full.as_mut() {
+            full.scoring = Some(preset.to_string());
+        }
+        self.run("scoring", vec!["scoring".into(), "preset".into(), preset.into()], cx, |this, result, _| {
+            if result.is_err()
+                && let Some(full) = this.full.as_mut()
+            {
+                full.scoring = None;
+            }
+        });
+    }
+
     /// `tower todo-tools on|off`: switched at once, and back if the tower refuses.
     fn set_todo_tools(&mut self, on: bool, cx: &mut Context<Self>) {
         if self.running("todo-tools") {
@@ -434,6 +451,36 @@ impl Panel {
             .collect(),
         );
 
+        // Risk and confidence: when the tower answers a question for you.
+        let t = crate::config::Config::load().map(|c| c.scoring).unwrap_or_default();
+        let said_preset = t.preset_name().map(String::from);
+        if let Some(full) = self.full.as_mut()
+            && full.scoring.is_some()
+            && full.scoring == said_preset
+        {
+            full.scoring = None;
+        }
+        let preset_now = self.full.as_ref().and_then(|f| f.scoring.clone()).or(said_preset);
+        let mut presets = seg();
+        for (p, label) in [("fewer", "Fewer prompts"), ("balanced", "Balanced"), ("careful", "Careful")] {
+            presets = presets.child(tg(SharedString::from(format!("scoring-{p}")), label, preset_now.as_deref() == Some(p)).on_click(cx.listener(move |this, _, _, cx| this.set_scoring(p, cx))));
+        }
+        let lately: Vec<String> = self.entries.iter().rev().filter(|e| e.kind == "answered" && e.status.as_deref() == Some("auto")).take(3).map(|e| format!("{}: {}", e.name.clone().unwrap_or_default(), e.text.trim_start_matches("answered for you: "))).collect();
+        let mut scoring_items = vec![
+            presets.into_any_element(),
+            para(format!(
+                "Low risk is answered for you from confidence {:.2}, medium from {:.2}; high risk, and anything on the escalate list (deploys, pushes, merges, deletes, secrets, infrastructure, money), always comes to you. Your answers on cards {} the confidence for that kind of question.",
+                t.low,
+                t.medium,
+                if t.learn { "move" } else { "don't move" }
+            )),
+        ];
+        if !lately.is_empty() {
+            scoring_items.push(para(format!("Answered for you lately: {}", lately.join(" · "))));
+        }
+        scoring_items.push(para("All of it, with why: tower scoring answered."));
+        let scoring = card("Risk and confidence", scoring_items.into_iter().chain(self.said("scoring")).collect());
+
         // Follow and Mute, per open space.
         let mut marks: Vec<AnyElement> = vec![];
         for (i, m) in missions.open.iter().enumerate() {
@@ -498,7 +545,7 @@ impl Panel {
         // Two by two when the pane has room, else one under another.
         let cols = if self.full.as_ref().map(|f| f.pane_w).unwrap_or(900.0) >= super::window::TWO_COLS_W { 2 } else { 1 };
         let grid = |cards: Vec<AnyElement>| div().w_full().grid().grid_cols(cols).gap(px(12.0)).children(cards).into_any_element();
-        (head, vec![v_flex().w_full().gap(px(12.0)).child(grid(vec![tell, brain, voice, questions, prs, sessions, follow, behaviors])).child(phone).child(grid(vec![accounts, setups])).into_any_element()])
+        (head, vec![v_flex().w_full().gap(px(12.0)).child(grid(vec![tell, brain, voice, questions, scoring, prs, sessions, follow, behaviors])).child(phone).child(grid(vec![accounts, setups])).into_any_element()])
     }
 }
 

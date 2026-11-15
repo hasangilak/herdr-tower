@@ -59,7 +59,7 @@ pub const API: u32 = 1;
 /// `impact`: who outside depends on what a PR changes (`impact` on a PR,
 /// `dependents` and `outside` on a predicted one), and a breaking change's warning.
 /// `releases`: each space's release track (`releases` in the state, `GET /v1/releases`).
-pub const FEATURES: &[&str] = &["quiet", "acts", "pairing", "bonjour", "reviews", "scores", "validation", "impact", "releases", "accounts", "jobs", "browsers", "progress"];
+pub const FEATURES: &[&str] = &["quiet", "acts", "pairing", "bonjour", "reviews", "scores", "validation", "impact", "releases", "accounts", "jobs", "browsers", "progress", "scoring"];
 const MAX_CONNECTIONS: usize = 32;
 /// Connections open at once from one address.
 const MAX_PER_IP: usize = 8;
@@ -1537,6 +1537,19 @@ impl Lan {
                     }
                 }
             }
+            // What the tower answered for the user, newest first, with why and its scores (`crate::scoring`).
+            ("GET", ["answered"]) => {
+                let rows: Vec<Value> = self
+                    .entries()
+                    .into_iter()
+                    .rev()
+                    .filter(|e| e.kind == "answered" && e.status.as_deref() == Some("auto"))
+                    .take(limit(50))
+                    .map(|e| json!({ "at": e.at, "session": e.session, "name": e.name, "space": e.space, "text": e.text }))
+                    .collect();
+                let t = crate::config::Config::load().map(|c| c.scoring).unwrap_or_default();
+                Response::json(200, &json!({ "answered": rows, "scoring": t, "preset": t.preset_name() }))
+            }
             // Every working session's progress line, as the tower read it last (every 15 s).
             ("GET", ["progress"]) => {
                 let (rows, _) = crate::agent_rows_for_phone();
@@ -2702,6 +2715,8 @@ mod tests {
         assert_eq!(call(addr, &fp, "POST", "/v1/sessions/a%3Bb/progress", Some(&token), "{}").unwrap().0, 400);
         assert_eq!(call(addr, &fp, "POST", "/v1/sessions/vps%2Ft3/progress", Some(&token), "{}").unwrap().0, 400);
         assert_eq!(call(addr, &fp, "POST", "/v1/sessions/t1/progress", None, "{}").unwrap().0, 401);
+        let (st, v) = call(addr, &fp, "GET", "/v1/answered", Some(&token), "").unwrap();
+        assert!(st == 200 && v["answered"].is_array() && v["scoring"]["low"].is_number(), "{v}");
         let (st, v) = call(addr, &fp, "GET", "/v1/progress", Some(&token), "").unwrap();
         assert!(st == 200 && v["working"].is_array(), "{v}");
         // Screenshots: by id, never by path; the token is needed as everywhere.

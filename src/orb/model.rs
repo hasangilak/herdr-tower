@@ -203,6 +203,8 @@ pub struct Decision {
     #[serde(deserialize_with = "or_default")]
     pub why: String,
     pub options: Vec<Opt>,
+    /// A question's risk and confidence, and what they decided (`crate::scoring`).
+    pub scores: Option<crate::scoring::Scores>,
     /// The label of the option the tower would pick.
     pub pick: Option<String>,
     pub prs: Vec<PrRef>,
@@ -443,6 +445,7 @@ pub fn adapt(sets: &[QuestionSet], prs: &BTreeMap<String, Pr>, agents: &Value, s
             detail: crate::decisions::detail_of(set),
             why: why_of(&set.kind, set.tabs.len()).into(),
             pick: options.first().map(|o: &Opt| o.label.clone()),
+            scores: set.scores.clone(),
             options,
             prs: vec![],
             question_id: Some(set.id.clone()),
@@ -510,6 +513,7 @@ pub fn adapt(sets: &[QuestionSet], prs: &BTreeMap<String, Pr>, agents: &Value, s
             detail: String::new(),
             why: "Merge".into(),
             pick: Some(merge_label(&refs, refs.len())),
+            scores: None,
             options: vec![Opt { label: merge_label(&refs, refs.len()), why: String::new(), pick: true }],
             prs: refs,
             question_id: None,

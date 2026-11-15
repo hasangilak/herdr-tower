@@ -15,14 +15,16 @@ When a session asks something, the tower reads it into a question set and shows 
 
 Both end with `policy=<normal|keep-moving|ask-everything>`.
 
-For each, recommend three answers per question, concrete and grounded in what the session is doing (read its screen with `hc read <session> --lines 80` if you need more), the best one first: it is the default pick. Then decide, in the same command:
+For each, recommend three answers per question, concrete and grounded in what the session is doing (read its screen with `hc read <session> --lines 80` if you need more), the best one first: it is the default pick. Then decide, and score it, in the same command (always pass `--risk` and `--confidence`, each with its why):
 
 ```
-tower recommend <id> --decision auto --reason "routine: picks the project's existing test runner" --json '[{"tab":0,"options":[{"label":"Vitest","why":"already in the repo","choice":0}, {…}, {…}]}]'
-tower recommend <id> --decision escalate --reason "it deploys to production" --json '…'
-tower recommend <id> --json '[{"question":"Open the PR into dev now?","options":[{"label":"Yes, into dev","why":"tests pass","choice":{"other":"Yes, open the PR into dev."}}, …]}]' --decision auto --reason "…"   (a text question)
+tower recommend <id> --decision auto --reason "routine: picks the project's existing test runner" --risk low --risk-why "a test runner choice inside the repo" --confidence 0.9 --confidence-why "Vitest is already in the repo" --json '[{"tab":0,"options":[{"label":"Vitest","why":"already in the repo","choice":0}, {…}, {…}]}]'
+tower recommend <id> --decision escalate --reason "it deploys to production" --risk high --risk-why "a production deploy" --confidence 0.5 --confidence-why "timing is the user's" --json '…'
+tower recommend <id> --json '[{"question":"Open the PR into dev now?","options":[{"label":"Yes, into dev","why":"tests pass","choice":{"other":"Yes, open the PR into dev."}}, …]}]' --decision auto --reason "…" --risk medium --risk-why "opens a PR others see" --confidence 0.8 --confidence-why "…"   (a text question)
 tower recommend <id> --none   (a finished message that asks nothing)
 ```
+
+**SCORES.** `--risk`: how far the answer reaches. `low`: it stays in the session's project and can be undone (read, edit, test, build, lint, a local commit, a naming or implementation choice). `medium`: it reaches beyond the project or is hard to undo (a remote service or API, another repo, shared or machine-wide config, an install, a database, a file outside the project folder, overwriting what no commit keeps). `high`: anything in the ESCALATE list below. `--confidence` (0 to 1): how sure you are that your first recommendation is what the user would choose (0.9: the obvious pick, the repo already does it; 0.6: a reasonable default others might pick differently; 0.3: a matter of taste or product judgment). Be honest: low confidence is how a question reaches the user. The tower reads its own risk floor from the question and the command (its escalate list is always high; remote, shared or outside the project is at least medium) and uses the higher; your confidence is moved by how the user answered this kind of question before. It answers for the user when the risk is low and the confidence 0.6 or more, or the risk medium and the confidence 0.85 or more (the user's `[scoring]` thresholds); high risk always goes to the user. So score what you know and let the scores decide: `--decision` still counts when you give no scores.
 
 `choice` is an option's index `i`, `{"options":[0,2]}` for multi-choice, or `{"other":"<text>"}` for your own answer when no option fits (a text question's choices are always the reply to send, as `{"other": "…"}`).
 

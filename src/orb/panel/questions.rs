@@ -731,6 +731,7 @@ impl Panel {
             out.push(div().text_size(px(12.0)).text_color(g.faint).truncate().child(line).into_any_element());
             // Why it came to the user, when that takes more than the card's word for it.
             out.extend(d.reason().map(|why| cstat(sentence(&why), false)));
+            out.extend(set.scores.as_ref().or(d.scores.as_ref()).map(super::home::scores_stat));
             if !set.detail.is_empty() {
                 out.push(
                     div().px_2().py_1().rounded(px(8.0)).bg(rgba(0x0000002e)).font_family("Menlo").text_xs().line_clamp(if short { 4 } else { 8 }).child(set.detail.clone()).into_any_element(),

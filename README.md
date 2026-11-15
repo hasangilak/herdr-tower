@@ -65,7 +65,11 @@ flowchart LR
   behaviors and the question policy) and puts the rest in one **decisions
   queue** across every space: permissions, questions, merges, failures, what
   a brain raised. Each card says who waits and for how long and recommends
-  an answer; hold one with your reason, or make an answer a rule.
+  an answer; hold one with your reason, or make an answer a rule. Every
+  recommendation carries a **risk** (how far it reaches, whether it can be
+  undone) and a **confidence** (how sure the tower is of its pick), with
+  why: low risk it is sure of is answered for you, high risk never is, and
+  your answers on cards teach it per kind of question (`tower scoring`).
 
 ## Spaces and briefs
 
@@ -224,6 +228,7 @@ picks up a change). The main settings:
 |---|---|
 | `brain`, `[brains] model`, `effort` | The brains' agent (`claude` or `codex`), model and effort (`tower model`) |
 | `question_policy` | `normal` (it answers routine questions), `keep-moving`, `ask-everything` |
+| `[scoring] low`, `medium`, `learn` | The confidence it needs to answer for you, by risk (0.6 and 0.85; high risk never), and whether your answers teach it (`tower scoring preset fewer\|balanced\|careful`, Settings) |
 | `[tell] level` | How much it tells you: `decisions`, `results`, `everything` |
 | `[spaces]` | Worktrees per space, dev ports, when a quiet space closes |
 | `[sessions] introduce`, `todo_tools` | Sessions in a space introduced to each other; a task list for the sessions it starts |
