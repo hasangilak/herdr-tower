@@ -549,6 +549,9 @@ pub struct Seen {
     /// running the test suite · 14 min in · last update 1 min ago".
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub progress: Option<crate::progress::Progress>,
+    /// Its task list, whatever its status: "3 of 6 done · now: …" and its items.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tasks: Option<crate::progress::TaskList>,
 }
 
 /// A terminal as a session of a space, if it is one: live, an agent, in a
@@ -590,6 +593,7 @@ pub fn seen_of(row: &Value, full: Option<&Value>, said: Option<String>) -> Optio
         job: row["address"].as_str().and_then(crate::daemon::running::shown_of),
         browser: row["address"].as_str().and_then(|a| crate::daemon::running::browsers_of(a).into_iter().next()),
         progress: row["address"].as_str().and_then(crate::daemon::running::progress_of).filter(|_| working),
+        tasks: row["address"].as_str().and_then(crate::daemon::running::tasks_of),
     })
 }
 

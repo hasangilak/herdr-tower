@@ -971,6 +971,24 @@ with `status` `asked:<who>` for the question (`asked:user`, `asked:phone`,
 `asked:brain`), and `btw` or `transcript` for the answer. The Mac shows them
 in the session's thread.
 
+**Task lists** (feature `tasks`). A Claude session that keeps a task list
+(Claude Code's TaskCreate/TaskUpdate, or the older TodoWrite) carries it,
+whatever its status (done or working), on each of the state's `agents` and
+on a mission's session, read from its transcript every 15 s:
+
+```
+"tasks": { "done": 3, "total": 6,
+           "now": "Running the 5-hour LoRA training",      (the task at work, in its own words; absent when none is)
+           "line": "3 of 6 done · now: Running the 5-hour LoRA training",
+           "items": [ { "id": "1", "subject": "Label the fresh queries", "active": "Labelling the fresh queries",
+                        "status": "completed" | "in_progress" | "pending" } ] }
+```
+
+Show `line` under the session's name, collapsed, and the `items` when it is
+opened: done (✓), at work (◼, with `active` when it has one), open (◻).
+`line` is "all 6 done" when every task is, "… · next: <subject>" when none
+is at work. Absent: the session keeps no task list.
+
 **Risk and confidence** (feature `scoring`). A question set (`questions`
 in the state) and its decision carry `scores` once the tower's brain has
 recommended an answer:
@@ -1954,6 +1972,7 @@ stream's `hello` event). A tower from before there were features sends no
 | `accounts` | Each Claude account's usage and the failover's moves: `accounts` in the state, and `account` on each of the state's `brains` and on a mission's `tower` (see "Accounts and usage") |
 | `browsers` | A session using a browser: `browser` on a mission's session, `browsers` on each of the state's `agents` (see "Browsers in use") |
 | `progress` | How a working session's turn goes: `progress` on a mission's session and on each of the state's `agents`, `GET /v1/progress`, `POST /v1/sessions/{t}/progress`, and history entries of `kind: "progress"` (see "Progress of working sessions") |
+| `tasks` | A session's task list: `tasks` on each of the state's `agents` and on a mission's session (see "Task lists") |
 | `scoring` | Risk and confidence: `scores` on question sets and their decisions, and `GET /v1/answered` (see "Risk and confidence") |
 | `jobs` | Jobs sessions left running in the background: `job` on a mission's session, `jobs` and `servers` on each of the state's `agents` (see "Jobs running") |
 | `impact` | Who outside depends on what a PR changes: `impact` on a PR (wherever `score` is) and `dependents` / `outside` on a predicted one (`plan.prs`), and a breaking change's warning among a merge's `warnings` |

@@ -167,6 +167,14 @@ impl Panel {
                     .into_any_element(),
             );
         }
+        // Its task list, working or not: a line, a click opens it whole.
+        let tasks = member
+            .as_ref()
+            .and_then(|m| m.tasks.clone())
+            .or_else(|| agent.as_ref().and_then(|a| serde_json::from_value::<crate::progress::TaskList>(a["tasks"].clone()).ok()));
+        if let Some(t) = tasks {
+            lines.push(self.tasks_block(addr, &t, cx));
+        }
         let head = whead(&title, lines, back);
 
         let said = |text: String| div().px(px(4.0)).text_size(px(13.0)).line_height(px(19.0)).text_color(g.muted).child(text);

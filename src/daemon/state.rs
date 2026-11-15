@@ -217,6 +217,10 @@ pub struct AgentLine {
     /// the call at work, time in, last update, in `line`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub progress: Option<crate::progress::Progress>,
+    /// Its task list, whatever its status (`crate::progress::TaskList`):
+    /// "3 of 6 done · now: …" and its items.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tasks: Option<crate::progress::TaskList>,
 }
 
 /// One message waiting for a session in the send queue.
