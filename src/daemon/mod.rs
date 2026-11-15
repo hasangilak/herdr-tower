@@ -496,6 +496,40 @@ impl Daemon {
         });
     }
 
+    /// The tower as the relay (`crate::relay`): the `To <address>: …` lines
+    /// of a session's final message go to those sessions of its space, and
+    /// the answer to a question another session sent it goes back to that
+    /// session when it wrote it nothing itself. Off the hook's thread.
+    fn relay_turn(&self, address: &str, t: Option<&serde_json::Value>, said: &str) {
+        let Some(t) = t.filter(|t| !watch::left_alone(t) && brain::brain_of(t).is_none()) else { return };
+        let Some(me) = crate::peers::sender_of(t) else { return };
+        if said.trim().is_empty() {
+            return;
+        }
+        let turn = sessions::registry().get(address).filter(|s| s.prompt_ms > 0).map(|s| (s.prompt.clone(), s.prompt_ms));
+        let (d, address, said) = (self.clone(), address.to_string(), said.to_string());
+        thread::spawn(move || {
+            let mut sent_to: Vec<String> = vec![];
+            for (who, msg) in crate::relay::to_lines(&said) {
+                let Some(to) = relay_target(me.space.as_deref(), &who, &address) else { continue };
+                let r = d.queue("add", &to, &msg, None, &[], None, Some(&address));
+                eprintln!("[relay] {address} ({}) → {to}: \"{}\" {}", me.name, crate::agenda::clip(&msg, 80), if r.ok { "queued" } else { r.error.as_deref().unwrap_or("refused") });
+                if r.ok {
+                    sent_to.push(to);
+                }
+            }
+            let Some((prompt, since)) = turn else { return };
+            let Some((asker, _, _)) = crate::relay::started_by(&prompt) else { return };
+            let wrote_back = sent_to.contains(&asker)
+                || d.sendq.wrote_to_since(&address, &asker, since)
+                || crate::history::load_tail(1 << 20).iter().any(|e| e.kind == "peer" && e.at >= since && e.from.as_deref() == Some(address.as_str()) && e.session.as_deref() == Some(asker.as_str()));
+            if let Some((to, text)) = crate::relay::answer_back(&prompt, &said, wrote_back) {
+                let r = d.queue("add", &to, &text, None, &[], None, Some(&address));
+                eprintln!("[relay] {address} ({}) answered {to} at its turn's end: {}", me.name, if r.ok { "carried back" } else { r.error.as_deref().unwrap_or("refused") });
+            }
+        });
+    }
+
     /// What the user typed in a session's own terminal (`prompted`).
     fn typed_there(&self, ev: &sessions::AgentEvent, t: &serde_json::Value) {
         let address = ev.terminal.as_str();
@@ -948,6 +982,8 @@ impl Daemon {
                 // A turn that a message of the user's or the tower's started: its reply, paired with it.
                 if let sessions::Change::Stopped(said) = &change {
                     self.replied(&event.terminal, terminal.as_ref(), said);
+                    // Where a session can't reach another itself, the tower carries it (`crate::relay`).
+                    self.relay_turn(&event.terminal, terminal.as_ref(), said);
                     // A Handoff block on a plan's task: what it found feeds the plan.
                     self.plans.handoff(&event.terminal, said);
                 }
@@ -1539,4 +1575,23 @@ fn with_agenda(mut v: serde_json::Value, r: Option<crate::agenda::Registered>) -
 
 fn ack_delay(cfg: &Config) -> Option<Duration> {
     (!cfg.ack.is_empty()).then(|| Duration::from_millis(cfg.ack_delay_ms))
+}
+
+/// The session `who` names for a relayed message from `me` in `space`: an
+/// address (here, or `machine/t2`), or the name of a session in that space.
+/// None: nobody it can be (`To do: …`), or `me` itself.
+fn relay_target(space: Option<&str>, who: &str, me: &str) -> Option<String> {
+    let who = who.trim();
+    let address = |w: &str| w.starts_with('t') && w.len() > 1 && w[1..].chars().all(|c| c.is_ascii_alphanumeric());
+    let found = if address(who) || who.split_once('/').is_some_and(|(m, a)| !m.is_empty() && address(a)) {
+        crate::hc::get(who).and_then(|t| t["address"].as_str().map(String::from)).or_else(|| who.contains('/').then(|| who.to_string()))
+    } else {
+        let list = crate::hc::list_on(None).ok()?;
+        list.iter().find(|t| {
+            let in_space = space.is_none_or(|s| crate::spaces::space_of(t).as_deref() == Some(s));
+            let name = crate::hc::name(t).unwrap_or("");
+            in_space && (name.eq_ignore_ascii_case(who) || crate::hc::spoken_name(t).eq_ignore_ascii_case(who))
+        }).and_then(|t| t["address"].as_str().map(String::from))
+    };
+    found.filter(|a| a != me)
 }

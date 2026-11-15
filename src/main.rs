@@ -21,6 +21,7 @@ mod brain;
 mod brains;
 mod browsers;
 mod progress;
+mod relay;
 mod chat;
 mod choices;
 mod config;

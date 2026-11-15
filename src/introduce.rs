@@ -42,9 +42,25 @@ pub struct Member {
     pub task: String,
     /// That task is over: it is what the user last asked it for.
     pub task_done: bool,
+    /// Its agent: `claude-code` or `codex`.
+    pub app: String,
+    /// The machine it runs on (`hc machine add`), when not this Mac.
+    pub machine: Option<String>,
+    /// The Claude account it runs on, when known.
+    pub account: Option<String>,
 }
 
 impl Member {
+    /// What runs it, and where: "Claude Code on orca", "Codex", "Claude Code on vps".
+    pub fn runs(&self) -> String {
+        let agent = if self.app == "codex" { "Codex" } else { "Claude Code" };
+        match (&self.machine, &self.account) {
+            (Some(m), _) => format!("{agent} on {m}"),
+            (None, Some(a)) if self.app != "codex" => format!("{agent} on the {a} account"),
+            _ => agent.to_string(),
+        }
+    }
+
     /// Who it is, for the book: the address and its terminal.
     pub fn key(&self) -> String {
         match self.created_ms {
@@ -78,11 +94,12 @@ pub fn is_tower(name: &str) -> bool {
 /// creation time), when known.
 pub fn member_of(listed: &Value, full: Option<&Value>) -> Option<Member> {
     let t = full.unwrap_or(listed);
-    if listed["state"].as_str().is_some_and(|s| s != "live") || listed["address"].as_str()?.contains('/') {
+    if listed["state"].as_str().is_some_and(|s| s != "live") {
         return None;
     }
+    // Claude Code (on any account) and Codex, here or on another machine.
     let app = crate::hc::agent_app(listed).or_else(|| listed["agent"].as_str().map(String::from)).or_else(|| crate::hc::agent_app(t))?;
-    if app != "claude-code" {
+    if app != "claude-code" && app != "codex" {
         return None;
     }
     let name = crate::hc::name(t).or_else(|| crate::hc::name(listed)).unwrap_or("").to_string();
@@ -97,7 +114,10 @@ pub fn member_of(listed: &Value, full: Option<&Value>) -> Option<Member> {
     if crate::brains::is_brain_folder(&folder) {
         return None;
     }
-    Some(Member { address: listed["address"].as_str()?.to_string(), name, folder, space, created_ms: crate::hc::created_ms(t), task: String::new(), task_done: false })
+    let address = listed["address"].as_str()?.to_string();
+    let machine = listed["machine"].as_str().map(String::from).or_else(|| address.split_once('/').map(|(m, _)| m.to_string()));
+    let account = if app == "claude-code" && machine.is_none() { full.and_then(crate::accounts::of_terminal) } else { None };
+    Some(Member { address, name, folder, space, created_ms: crate::hc::created_ms(t), task: String::new(), task_done: false, app, machine, account })
 }
 
 /// Members by space, each space's in address order.
@@ -329,7 +349,7 @@ fn clip(s: &str, n: usize) -> String {
 
 /// An introduction (ours), whatever wraps it: never anyone's task.
 pub fn is_introduction(text: &str) -> bool {
-    text.contains("[tower] You are ") && text.contains("in the Herdr space") && text.contains("Claude session")
+    text.contains("[tower] You are ") && text.contains("in the Herdr space") && (text.contains("other session") || text.contains("Claude session"))
 }
 
 /// What a session is on, from its latest prompt: the text without what
@@ -429,7 +449,7 @@ impl Book {
 pub fn compose(space: &str, to: &Member, members: &[Member]) -> String {
     let others: Vec<&Member> = members.iter().filter(|m| m.address != to.address).collect();
     let mut out = format!(
-        "[tower] You are {} ({}) in the Herdr space \"{space}\". {} other Claude session{} open in this space:\n",
+        "[tower] You are {} ({}) in the Herdr space \"{space}\". {} other session{} open in this space:\n",
         to.label(),
         to.address,
         others.len(),
@@ -443,11 +463,21 @@ pub fn compose(space: &str, to: &Member, members: &[Member]) -> String {
         } else {
             format!("working on: {}", clip(&m.task, 160))
         };
-        out += &format!("- {} ({}), in {}: {task}\n", m.label(), m.address, tilde(&m.folder));
+        out += &format!("- {} ({}), {}, in {}: {task}\n", m.label(), m.address, m.runs(), tilde(&m.folder));
     }
-    out += "Talk to them when you need their help, and ask for changes in their layer instead of editing their repos. \
-        To hand one a message: tower queue <address> \"<complete message>\" (the tower adds your name to it, so don't write who it is from; \
-        it waits until that session is free). To look at one: hc read <address> --lines 60. \
+    out += "Talk to them when you need their help, and ask for changes in their layer instead of editing their repos. ";
+    if let Some(machine) = &to.machine {
+        out += &format!(
+            "You run on {machine}: the others can message you through the tower (it reaches you there), but you can't message them from that machine. \
+             Nothing to answer here: carry on with your work."
+        );
+        return out;
+    }
+    out += "To hand one a message: tower queue <address> \"<complete message>\" (the tower adds your name to it, so don't write who it is from; \
+        it waits until that session is free, whatever its account or agent, and it reaches one on another machine too). \
+        If you can't run tower (a sandbox), end your turn with a line To <address>: <complete message> and the tower delivers it. \
+        When one asks you something and you don't write back yourself, your final message goes back to it as your answer. \
+        To look at one here: hc read <address> --lines 60. \
         Nothing to answer here: carry on with your work.";
     out
 }
@@ -466,6 +496,9 @@ mod tests {
             created_ms: Some(100),
             task: String::new(),
             task_done: false,
+            app: "claude-code".into(),
+            machine: None,
+            account: None,
         }
     }
 
@@ -671,12 +704,12 @@ mod tests {
         assert_eq!(g["B2C"][0].task, "", "no task reported yet, rather than another session's message");
         assert_eq!(g["B2C"][1].task, "commit everything and push. then give me the release");
         assert!(!book.tasks.contains_key(&a.key()));
-        assert!(compose("B2C", &b, &g["B2C"]).contains("(t1), in /w/t1: no task reported yet"));
+        assert!(compose("B2C", &b, &g["B2C"]).contains("(t1), Claude Code, in /w/t1: no task reported yet"));
         // The kept one is what the user last asked; one it is on now is what it is working on.
-        assert!(compose("B2C", &a, &g["B2C"]).contains("(t2), in /w/t2: last asked for: commit everything and push."));
+        assert!(compose("B2C", &a, &g["B2C"]).contains("(t2), Claude Code, in /w/t2: last asked for: commit everything and push."));
         let mut g = groups(&[a.clone(), b.clone()]);
         book.tasks_for(&mut g, |m| (m.address == "t2").then(|| "port the billing page".to_string()));
-        assert!(compose("B2C", &a, &g["B2C"]).contains("(t2), in /w/t2: working on: port the billing page"));
+        assert!(compose("B2C", &a, &g["B2C"]).contains("(t2), Claude Code, in /w/t2: working on: port the billing page"));
     }
 
     #[test]
@@ -693,12 +726,16 @@ mod tests {
         };
         let a = member_of(&listed("t5", "claude-code", Some("B2C support / mediaroom"), Some("b2c-mediaroom")), None).unwrap();
         assert_eq!((a.space.as_str(), a.name.as_str(), a.folder.as_str()), ("B2C support", "b2c-mediaroom", "/w/app"));
-        assert!(member_of(&listed("t6", "codex", Some("B2C support / x"), None), None).is_none(), "Codex isn't introduced");
+        // Codex is introduced too, and named so.
+        let codex = member_of(&listed("t6", "codex", Some("B2C support / x"), None), None).unwrap();
+        assert_eq!((codex.app.as_str(), codex.runs()), ("codex", "Codex".to_string()));
         assert!(member_of(&listed("t7", "zsh", Some("B2C support / x"), None), None).is_none());
         assert!(member_of(&listed("t8", "claude-code", None, None), None).is_none(), "in no space");
         assert!(member_of(&listed("t9", "claude-code", Some("B2C / x"), Some("tower")), None).is_none(), "the brain");
         assert!(member_of(&listed("ta", "tower", Some("B2C / x"), Some("tower-voice")), None).is_none());
-        assert!(member_of(&listed("vps/t2", "claude-code", Some("B2C / x"), None), None).is_none(), "another machine");
+        // On another machine: a member, on that machine.
+        let remote = member_of(&listed("vps/t2", "claude-code", Some("B2C / x"), None), None).unwrap();
+        assert_eq!((remote.machine.as_deref(), remote.runs()), (Some("vps"), "Claude Code on vps".to_string()));
         let mut ended = listed("tb", "claude-code", Some("B2C / x"), None);
         ended["state"] = json!("finished");
         assert!(member_of(&ended, None).is_none());
@@ -749,9 +786,20 @@ mod tests {
         let c = Member { name: String::new(), folder: "/w/eyzflow".into(), ..m("t3", "B2C") };
         let text = compose("B2C", &a, &[a.clone(), b.clone(), c.clone()]);
         // Each as it is called everywhere else: its name within the space, or the project it works on.
-        assert!(text.starts_with("[tower] You are mediaroom (t1) in the Herdr space \"B2C\". 2 other Claude sessions are open"), "{text}");
-        assert!(text.contains("- sdk (t2), in /w/t2: working on: Add the chat widget's new event to the SDK"), "{text}");
-        assert!(text.contains("- eyzflow (t3), in /w/eyzflow: no task reported yet"), "{text}");
+        assert!(text.starts_with("[tower] You are mediaroom (t1) in the Herdr space \"B2C\". 2 other sessions are open"), "{text}");
+        assert!(text.contains("- sdk (t2), Claude Code, in /w/t2: working on: Add the chat widget's new event to the SDK"), "{text}");
+        assert!(text.contains("- eyzflow (t3), Claude Code, in /w/eyzflow: no task reported yet"), "{text}");
+        assert!(text.contains("To <address>: <complete message>") && text.contains("goes back to it as your answer"), "{text}");
+        // Every kind of session, each with what runs it; one on another machine hears it can't write back.
+        let orca = Member { account: Some("orca".into()), ..m("t4", "B2C") };
+        let codex = Member { app: "codex".into(), ..m("t5", "B2C") };
+        let far = Member { machine: Some("vps".into()), ..m("vps/t2", "B2C") };
+        let all = [a.clone(), orca.clone(), codex.clone(), far.clone()];
+        let mixed = compose("B2C", &a, &all);
+        assert!(mixed.contains("(t4), Claude Code on the orca account,") && mixed.contains("(t5), Codex,") && mixed.contains("(vps/t2), Claude Code on vps,"), "{mixed}");
+        let there = compose("B2C", &far, &all);
+        assert!(there.contains("You run on vps: the others can message you through the tower") && !there.contains("tower queue <address>"), "{there}");
+        assert!(is_introduction(&there) && is_introduction(&mixed));
         assert!(!text.contains("Claude in "), "{text}");
         let unnamed = Member { name: String::new(), folder: "/Users/me/Work/eyz/eyz-mediaroom-serverless".into(), ..m("t4", "B2C") };
         assert_eq!((unnamed.label(), Member { name: String::new(), folder: String::new(), ..m("t5", "B2C") }.label()), ("mediaroom serverless".to_string(), "the session at t5".to_string()));
@@ -759,6 +807,6 @@ mod tests {
         assert!(text.contains("tower queue <address> \"<complete message>\"") && text.contains("hc read <address> --lines 60"));
         assert!(text.contains("the tower adds your name to it"), "{text}");
         assert!(text.contains("ask for changes in their layer instead of editing their repos"));
-        assert!(compose("B2C", &a, &[a.clone(), b]).contains("1 other Claude session is open"));
+        assert!(compose("B2C", &a, &[a.clone(), b]).contains("1 other session is open"));
     }
 }

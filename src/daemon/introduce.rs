@@ -110,13 +110,20 @@ impl Introducer {
 
     /// Every space's Claude sessions here, as members (None: Herdr couldn't be asked).
     fn scan(&self) -> Option<BTreeMap<String, Vec<Member>>> {
-        let list = match crate::hc::list_on(None) {
+        let mut list = match crate::hc::list_on(None) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("[introduce] hc ls: {e:#}");
                 return None;
             }
         };
+        // And the other machines' sessions (a machine out of reach is left out this time).
+        for m in crate::hc::machines() {
+            match crate::hc::list_on(Some(&m)) {
+                Ok(l) => list.extend(l),
+                Err(e) => eprintln!("[introduce] {m}: {e:#}"),
+            }
+        }
         let mut full = lock(&self.full);
         let here: std::collections::HashSet<String> = list.iter().filter_map(|t| t["address"].as_str().map(String::from)).collect();
         full.retain(|a, _| here.contains(a));
@@ -227,7 +234,7 @@ impl Introducer {
             self.save(&b);
             let named = |ms: &[&Member]| ms.iter().map(|m| format!("{} ({})", m.label(), m.address)).collect::<Vec<_>>().join(", ");
             let text = if reached.len() == members.len() {
-                format!("Introduced the Claude sessions in {space} to each other: {}", named(&members.iter().collect::<Vec<_>>()))
+                format!("Introduced the sessions in {space} to each other: {}", named(&members.iter().collect::<Vec<_>>()))
             } else {
                 let others: Vec<&Member> = members.iter().filter(|m| !reached.iter().any(|r| r.address == m.address)).collect();
                 format!("Introduced {} to the other Claude sessions in {space}: {}", named(&reached.iter().collect::<Vec<_>>()), named(&others))

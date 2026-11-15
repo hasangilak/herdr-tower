@@ -408,6 +408,10 @@ pub struct Check {
 struct Book {
     next_id: u64,
     items: Vec<Item>,
+    /// Sessions that went on in another terminal (reopened after a restart):
+    /// its old address, its new one. What is sent to the old one goes there.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    moved: BTreeMap<String, String>,
     /// Notes an earlier version kept for the brain (handed to the outbox at start).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     notes: Vec<String>,
@@ -879,7 +883,14 @@ impl SendQueue {
             Some(f) => crate::peers::signed(f, &text),
             None => text,
         };
-        let s = match h.look(session) {
+        let mut look = h.look(session);
+        // Its session went on in another terminal (reopened after a restart): there.
+        if matches!(look, Look::Finished | Look::Gone)
+            && let Some(now_at) = self.moved_to(session)
+        {
+            look = h.look(&now_at);
+        }
+        let s = match look {
             Look::Live(s) => s,
             Look::Finished => bail!("{session} has ended: start a session, or queue it for another one"),
             Look::Gone => bail!("no session {session}"),
@@ -1244,6 +1255,45 @@ impl SendQueue {
             return Err(e);
         }
         Ok(item)
+    }
+
+    /// Where the session last at `address` went on (followed through every
+    /// move), if it moved.
+    pub fn moved_to(&self, address: &str) -> Option<String> {
+        let b = self.lock();
+        let mut at = b.moved.get(address)?.clone();
+        for _ in 0..8 {
+            match b.moved.get(&at) {
+                Some(next) if *next != at => at = next.clone(),
+                _ => break,
+            }
+        }
+        Some(at)
+    }
+
+    /// The session at `old` goes on at `new` (reopened in a new terminal):
+    /// what waits for it there follows it, and what is sent to `old` later
+    /// goes to `new`. How many waiting followed.
+    pub fn follow(&self, old: &str, new: &str) -> usize {
+        if old == new || old.is_empty() || new.is_empty() {
+            return 0;
+        }
+        let mut b = self.lock();
+        let mut n = 0;
+        for i in b.items.iter_mut().filter(|i| i.session == old) {
+            i.session = new.to_string();
+            i.created_ms = None;
+            i.gone_told = false;
+            n += 1;
+        }
+        b.moved.insert(old.to_string(), new.to_string());
+        let _ = self.save(&b);
+        n
+    }
+
+    /// A message from `from` to `to` waits in the queue, queued since `since_ms`.
+    pub fn wrote_to_since(&self, from: &str, to: &str, since_ms: u64) -> bool {
+        self.lock().items.iter().any(|i| i.session == to && i.at_ms >= since_ms && i.from.as_ref().is_some_and(|f| f.address == from))
     }
 
     /// Sends a waiting (or parked) instruction to another session instead.
@@ -1855,6 +1905,11 @@ pub fn typed_in_while_working(session: &str) -> bool {
 }
 
 /// How many instructions wait for each session (not parked).
+/// The daemon's queue: what follows a session to its new terminal (`SendQueue::follow`).
+pub fn follow(old: &str, new: &str) -> usize {
+    RUNNING.get().map(|q| q.follow(old, new)).unwrap_or(0)
+}
+
 pub fn waiting_counts() -> BTreeMap<String, usize> {
     let mut out = BTreeMap::new();
     if let Some(q) = RUNNING.get() {
@@ -2195,6 +2250,33 @@ mod tests {
         assert!(crate::brain::is_note_prompt(&to_brain) && !crate::brain::is_note_prompt(&to_session), "{to_brain}");
         let two = undelivered_note(true, "tower sandbox", "t12", "it is gone", &[texts[0].clone(), "and the changelog".into()]);
         assert!(two.starts_with("[queue] Your 2 messages to tower sandbox (t12) were not delivered: it is gone. The first said:"), "{two}");
+    }
+
+    /// A session reopened after a restart in a new terminal (t5 → t9): what
+    /// waits for it follows it, and what the others still send its old
+    /// address goes to the new one. A message from one session to another
+    /// that still waits counts as written back.
+    #[test]
+    fn messages_follow_a_session_to_its_new_terminal() {
+        let (q, _d) = queue();
+        let h = Fake::default();
+        h.sessions.lock().unwrap().insert("t5".into(), ("working".into(), Some(5), Some(1)));
+        h.sessions.lock().unwrap().insert("t9".into(), ("working".into(), Some(90), Some(1)));
+        let api = crate::peers::Sender { address: "t2".into(), name: "api".into(), space: Some("Shop".into()) };
+        let (Added::Queued { id, .. }, ..) = q.add_with(&h, "t5", "which port?", &[], Some(&api)).unwrap() else { panic!("waits: it works") };
+        assert!(q.wrote_to_since("t2", "t5", 0) && !q.wrote_to_since("t2", "t9", 0) && !q.wrote_to_since("t7", "t5", 0));
+        // Reopened at t9: the waiting message is t9's now.
+        assert_eq!(q.follow("t5", "t9"), 1);
+        assert!(q.items().iter().any(|i| i.id == id && i.session == "t9"));
+        assert_eq!(q.moved_to("t5").as_deref(), Some("t9"));
+        // The old terminal is gone; a message to t5 goes to t9.
+        h.sessions.lock().unwrap().remove("t5");
+        let (_, at, _) = q.add_with(&h, "t5", "and the base URL?", &[], Some(&api)).unwrap();
+        assert_eq!(at, "t9");
+        // Moved again (t9 → t11): followed all the way.
+        assert_eq!(q.follow("t9", "t11"), 2);
+        assert_eq!(q.moved_to("t5").as_deref(), Some("t11"));
+        assert_eq!(q.follow("t11", "t11"), 0, "no move");
     }
 
     /// A session held on its first-run folder-trust question shows no
