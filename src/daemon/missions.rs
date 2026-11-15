@@ -329,8 +329,9 @@ impl Missions {
             Effect::Reopened(space) => eprintln!("[missions] {space} is open again"),
             Effect::Ready(space) => {
                 eprintln!("[missions] {space} is ready to close: every request there is finished");
-                record(space, "ready", format!("{space} is ready to close: every request there is finished."));
-                // Asked once each time it becomes ready.
+                // Said and asked once for its goal: ready again after a small
+                // request or a question there is no news, and its report (filed
+                // or asked for) stands (a new goal asks again).
                 let note = spaces::update_in(ui, |s| {
                     let goal = s.agendas.get(space).cloned().unwrap_or_default();
                     let m = s.missions.get_mut(space)?;
@@ -340,6 +341,9 @@ impl Missions {
                     m.report_asked_ms = now;
                     Some(missions::report_note(space, &goal, &m.done_when))
                 });
+                if note.is_some() {
+                    record(space, "ready", format!("{space} is ready to close: every request there is finished."));
+                }
                 if let Some(msg) = note {
                     (self.tell)(crate::agenda::Note { space: Some(space.clone()), msg, ..Default::default() });
                 }
@@ -508,14 +512,23 @@ mod tests {
         spaces::update_in(&ui, |s| s.missions.get_mut("Shop").unwrap().report = "The checkout is live.".into());
         let v = m.settle(Some(vec![seen("Shop", "t1", "idle")]), &ui, now + 240_000, 24);
         assert_eq!(v["spaces"][0]["report"], "The checkout is live.");
-        // A decision there: open again, the report dropped; settled again: ready, and asked again.
-        let d = m.decisions.raise(Raise { detail: String::new(), space: Some("Shop".into()), who: None, why: "deploy".into(), text: "Deploy it?".into(), options: vec![] }).0.id;
-        let v = m.settle(Some(vec![seen("Shop", "t1", "idle")]), &ui, now + 300_000, 24);
-        assert_eq!((v["spaces"][0]["state"].as_str(), v["spaces"][0]["report"].as_str(), v["spaces"][0]["needs"].as_u64()), (Some("open"), Some(""), Some(1)));
-        m.decisions.answered(&d, "yes");
-        let v = m.settle(Some(vec![seen("Shop", "t1", "idle")]), &ui, now + 360_000, 24);
-        assert_eq!(v["spaces"][0]["state"], "ready");
-        assert_eq!(lock(&told).len(), 2);
+        // search-llm, 15 Nov: after its report was filed, the space went open
+        // and ready again (a question, a small request), and each time the
+        // report was dropped and the note came again: three times. Now a
+        // decision there opens it, the report stays, and settled again it is
+        // ready without a second note; the brief shows the report throughout.
+        let mut t = now + 300_000;
+        for round in 0..3 {
+            let d = m.decisions.raise(Raise { detail: String::new(), space: Some("Shop".into()), who: None, why: "deploy".into(), text: format!("Deploy it ({round})?"), options: vec![] }).0.id;
+            let v = m.settle(Some(vec![seen("Shop", "t1", "idle")]), &ui, t, 24);
+            assert_eq!((v["spaces"][0]["state"].as_str(), v["spaces"][0]["report"].as_str(), v["spaces"][0]["needs"].as_u64()), (Some("open"), Some("The checkout is live."), Some(1)));
+            m.decisions.answered(&d, "yes");
+            let v = m.settle(Some(vec![seen("Shop", "t1", "idle")]), &ui, t + 60_000, 24);
+            assert_eq!((v["spaces"][0]["state"].as_str(), v["spaces"][0]["report"].as_str()), (Some("ready"), Some("The checkout is live.")));
+            assert_eq!(spaces::load_from(&ui).missions["Shop"].report, "The checkout is live.", "kept where `tower space report` writes it (the brief reads it there)");
+            t += 120_000;
+        }
+        assert_eq!(lock(&told).len(), 1, "the ready note went out once: {:?}", lock(&told));
         // Closed (`tower space close`): out of the missions, in today's closed ones.
         spaces::update_in(&ui, |s| {
             let x = s.missions.get_mut("Shop").unwrap();

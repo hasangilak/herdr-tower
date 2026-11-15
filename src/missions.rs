@@ -455,9 +455,10 @@ pub fn step(s: &mut Spaces, facts: &BTreeMap<String, Facts>, now: u64, auto_clos
             State::Ready if !(may_end && settled) => {
                 m.state = State::Open;
                 (m.ready_since_ms, m.idle_since_ms, m.wait_until_ms) = (None, None, None);
-                // Its report was for what is no longer finished.
-                m.report.clear();
-                (m.report_ms, m.report_asked_ms) = (0, 0);
+                // Its report stays, and so does the ask: a question or a small
+                // request after it doesn't make the space's work another one,
+                // and asking again each time it settles repeats the note (only
+                // a new goal clears them: `goal_from_request`).
                 out.push(Effect::Reopened(name.clone()));
             }
             _ => {}
@@ -1759,10 +1760,10 @@ mod tests {
         // Its report is written.
         s.missions.get_mut("Shop").unwrap().report = "The checkout shipped.".into();
         s.missions.get_mut("Shop").unwrap().report_asked_ms = t;
-        // A new decision there: open again, and the report no longer stands.
+        // A new decision there: open again, its report and the ask kept.
         assert_eq!(step(&mut s, &at("Shop", Facts { decisions: 1, ..done(&["idle"]) }), t + 2 * MIN, 24), [Effect::Reopened("Shop".into())]);
         let m = &s.missions["Shop"];
-        assert_eq!((m.state, m.ready_since_ms, m.idle_since_ms, m.report.as_str(), m.report_asked_ms), (State::Open, None, None, "", 0));
+        assert_eq!((m.state, m.ready_since_ms, m.idle_since_ms, m.report.as_str(), m.report_asked_ms), (State::Open, None, None, "The checkout shipped.", t));
         // Settled: ready again; a new request: open again.
         assert_eq!(step(&mut s, &at("Shop", done(&["idle"])), t + 3 * MIN, 24), [Effect::Ready("Shop".into())]);
         assert_eq!(step(&mut s, &at("Shop", Facts { open_requests: 1, ..done(&["working"]) }), t + 4 * MIN, 24), [Effect::Reopened("Shop".into())]);
@@ -1778,6 +1779,36 @@ mod tests {
         step(&mut s, &at("Shop", done(&["idle"])), HOUR, 24);
         s.missions.get_mut("Shop").unwrap().standing = true;
         assert_eq!(step(&mut s, &at("Shop", done(&["idle"])), HOUR + MIN, 24), [Effect::Reopened("Shop".into())]);
+    }
+
+    /// `HERDER_TOWER_SPACES_COPY=<a copy of ui/spaces.json>`, `…_SPACE=<name>`:
+    /// a space of the live record, settled and its report filed, reopened and
+    /// settled three times: ready again each time, no second ask, the report kept.
+    #[test]
+    #[ignore]
+    fn replay_reopen_on_a_live_copy() {
+        let (Ok(path), Ok(name)) = (std::env::var("HERDER_TOWER_SPACES_COPY"), std::env::var("HERDER_TOWER_SPACES_SPACE")) else { return };
+        let mut s: Spaces = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let done = |sessions: &[&str]| Facts { finished_requests: 1, ..live(sessions) };
+        let mut t = history::now_ms();
+        // As it is now; settled: ready, asked once; its report filed.
+        let first = step(&mut s, &at(&name, done(&["idle"])), t, 24);
+        let m = s.missions.get_mut(&name).unwrap();
+        assert_eq!(m.state, State::Ready, "{first:?}");
+        m.report_asked_ms = t;
+        let asked = t;
+        m.report = "Filed closing report.".into();
+        t += MIN;
+        let mut t = history::now_ms();
+        let mut effects = vec![];
+        for _ in 0..3 {
+            effects.extend(step(&mut s, &at(&name, Facts { decisions: 1, ..done(&["idle"]) }), t, 24));
+            effects.extend(step(&mut s, &at(&name, done(&["idle"])), t + MIN, 24));
+            t += 2 * MIN;
+        }
+        let m = &s.missions[&name];
+        println!("REPLAY {name}: effects {effects:?}; state {:?}; report {:?}; asked {} (was {asked})", m.state, m.report, m.report_asked_ms);
+        assert_eq!((m.state, m.report.as_str(), m.report_asked_ms), (State::Ready, "Filed closing report.", asked));
     }
 
     #[test]
