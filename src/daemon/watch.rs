@@ -1288,6 +1288,7 @@ impl Radar {
                 servers: super::running::servers_of(a),
                 browsers: super::running::browsers_of(a),
                 progress: super::running::progress_of(a).filter(|_| s.status.word() == "working"),
+                tasks: super::running::tasks_of(a),
             })
             .filter(|a| !a.name.starts_with("tower"))
             .collect();

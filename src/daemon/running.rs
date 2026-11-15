@@ -75,6 +75,8 @@ struct Inner {
     readers: HashMap<PathBuf, crate::progress::Reader>,
     /// Each working session's progress now.
     progress: BTreeMap<String, crate::progress::Progress>,
+    /// Each session's task list, whatever its status (Claude Code's own).
+    tasks: BTreeMap<String, crate::progress::TaskList>,
 }
 
 /// A sharing that has not been seen for this long is over.
@@ -110,6 +112,11 @@ pub fn reader_of(address: &str) -> Option<crate::progress::Reader> {
         let i = lock(&r.inner);
         i.paths.get(address).and_then(|p| i.readers.get(p)).cloned()
     })
+}
+
+/// `address`'s task list (Claude Code's TaskCreate/TaskUpdate or TodoWrite), if it keeps one.
+pub fn tasks_of(address: &str) -> Option<crate::progress::TaskList> {
+    get().and_then(|r| lock(&r.inner).tasks.get(address).cloned())
 }
 
 /// How `address`'s turn goes now (None: it isn't working, or nothing read yet).
@@ -322,10 +329,13 @@ impl Running {
                 r.progress(job, now).map(|p| (a.clone(), p))
             })
             .collect();
+        // Each session's task list, done or working: what it shows under its name.
+        let tasks: BTreeMap<String, crate::progress::TaskList> = readers.iter().filter_map(|(a, r)| crate::progress::task_list(r.items()).map(|t| (a.clone(), t))).collect();
         let moved = {
             let mut i = lock(&self.inner);
-            let moved = i.progress != progress;
+            let moved = i.progress != progress || i.tasks != tasks;
             i.progress = progress;
+            i.tasks = tasks;
             moved
         };
         if moved {
@@ -534,14 +544,15 @@ impl Running {
             let i = lock(&self.inner);
             (i.jobs.clone(), i.servers.clone())
         };
-        let (browsers, progress) = {
+        let (browsers, progress, tasks) = {
             let i = lock(&self.inner);
-            (i.browsers.clone(), i.progress.clone())
+            (i.browsers.clone(), i.progress.clone(), i.tasks.clone())
         };
         self.shared.update(|s| {
             for a in s.agents.iter_mut() {
                 // Only while it works: a turn that ended has no progress to show.
                 a.progress = progress.get(&a.address).filter(|_| a.status == "working").cloned();
+                a.tasks = tasks.get(&a.address).cloned();
                 a.jobs = jobs.get(&a.address).cloned().unwrap_or_default();
                 a.servers = servers.get(&a.address).cloned().unwrap_or_default();
                 a.browsers = browsers.get(&a.address).cloned().unwrap_or_default();

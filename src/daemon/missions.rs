@@ -380,8 +380,10 @@ fn progress_lines(shared: &Shared) -> HashMap<String, (String, Vec<String>)> {
             let p = &a["progress"];
             let line = p["line"].as_str().or_else(|| p.as_str()).unwrap_or("").trim().to_string();
             // Its own task list's items still to do: what's next.
+            // Its task list's open items (from its progress while it works, else its list).
+            let items = if p["items"].is_array() { &p["items"] } else { &a["tasks"]["items"] };
             let upcoming: Vec<String> =
-                p["items"].as_array().into_iter().flatten().filter(|i| i["status"] == "pending").filter_map(|i| i["subject"].as_str().map(String::from)).collect();
+                items.as_array().into_iter().flatten().filter(|i| i["status"] == "pending").filter_map(|i| i["subject"].as_str().map(String::from)).collect();
             (!line.is_empty() || !upcoming.is_empty()).then(|| (a["address"].as_str().unwrap_or("").to_string(), (line, upcoming)))
         })
         .collect()

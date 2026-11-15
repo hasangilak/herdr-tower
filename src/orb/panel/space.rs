@@ -813,6 +813,10 @@ impl Panel {
                 if let Some(p) = s.progress.as_ref().filter(|_| s.status == "working") {
                     under.push(progress_line(p, now));
                 }
+                // Its task list, working or not: a line, a click opens it whole.
+                if let Some(t) = s.tasks.clone() {
+                    under.push(self.tasks_block(&s.address, &t, cx));
+                }
                 // A browser it uses now (amber when another session shares the user's).
                 if let Some(b) = &s.browser {
                     let colour = if b.shared_with.is_empty() { CYAN } else { AMBER };
@@ -928,6 +932,52 @@ impl Panel {
 
     /// Under a session's row: its brief's "now" (what it is doing), and the
     /// whole of it on "Brief ▾" (asked, done, next, stuck).
+    /// A session's task list (Claude Code's own): one line collapsed ("3 of
+    /// 6 done · now: Running the training"), a click opens it whole: each
+    /// task done (✓), at work (◼, in its own words) or open (◻).
+    pub(super) fn tasks_block(&mut self, address: &str, t: &crate::progress::TaskList, cx: &mut Context<Self>) -> AnyElement {
+        let g = glass();
+        let open = self.full.as_ref().is_some_and(|f| f.tasks_open.contains(address));
+        let a = address.to_string();
+        let head = div()
+            .id(SharedString::from(format!("tasks-{address}")))
+            .cursor_pointer()
+            .text_size(px(12.5))
+            .line_height(px(17.0))
+            .text_color(rgb(CYAN))
+            .line_clamp(2)
+            .child(format!("{} Tasks: {}", if open { "▾" } else { "▸" }, t.line))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                if let Some(f) = this.full.as_mut()
+                    && !f.tasks_open.remove(&a)
+                {
+                    f.tasks_open.insert(a.clone());
+                }
+                cx.notify();
+            }));
+        if !open {
+            return head.into_any_element();
+        }
+        let rows = t.items.iter().map(|i| {
+            let (mark, colour, words) = match i.status.as_str() {
+                "completed" => ("✓", g.faint, i.subject.clone()),
+                "in_progress" => ("◼", rgb(CYAN).into(), if i.active.trim().is_empty() { i.subject.clone() } else { i.active.clone() }),
+                _ => ("◻", g.muted, i.subject.clone()),
+            };
+            h_flex()
+                .gap(px(8.0))
+                .items_start()
+                .text_size(px(12.5))
+                .line_height(px(17.0))
+                .text_color(colour)
+                .child(div().flex_none().w(px(14.0)).child(mark))
+                .child(div().flex_1().min_w_0().line_clamp(2).child(words))
+                .into_any_element()
+        });
+        v_flex().gap(px(2.0)).child(head).child(v_flex().pl(px(4.0)).gap(px(2.0)).children(rows)).into_any_element()
+    }
+
     fn session_brief(&mut self, address: &str, b: &crate::briefs::SessionBrief, cx: &mut Context<Self>) -> AnyElement {
         let g = glass();
         let open = self.full.as_ref().is_some_and(|f| f.briefs_open.contains(address));

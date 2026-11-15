@@ -629,6 +629,8 @@ pub struct Member {
     pub brief: Option<crate::briefs::SessionBrief>,
     /// How its turn goes, while it works (`crate::progress`).
     pub progress: Option<crate::progress::Progress>,
+    /// Its task list, whatever its status (`crate::progress::TaskList`).
+    pub tasks: Option<crate::progress::TaskList>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1124,6 +1126,10 @@ pub fn adapt_missions(spaces: &Spaces, live: &[Live], known: &[String], agents: 
                         .and_then(|l| l.iter().find(|a| a["address"] == address.as_str()))
                         .and_then(|a| serde_json::from_value::<crate::progress::Progress>(a["progress"].clone()).ok())
                         .filter(|_| status == "working"),
+                    tasks: agents
+                        .as_array()
+                        .and_then(|l| l.iter().find(|a| a["address"] == address.as_str()))
+                        .and_then(|a| serde_json::from_value::<crate::progress::TaskList>(a["tasks"].clone()).ok()),
                     ..Default::default()
                 })
                 .collect(),

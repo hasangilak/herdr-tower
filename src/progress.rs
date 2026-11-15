@@ -319,6 +319,39 @@ impl Reader {
     }
 }
 
+/// A session's task list as the tower shows it (whatever the session's
+/// status): how many are done, the whole list, and one line for it
+/// collapsed: "3 of 6 done · now: Running the 5-hour LoRA training".
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TaskList {
+    pub done: u32,
+    pub total: u32,
+    /// The item at work, in its own words (its activeForm), if one is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub now: Option<String>,
+    pub line: String,
+    pub items: Vec<Item>,
+}
+
+/// The task list of `items`; None when the session keeps none.
+pub fn task_list(items: &[Item]) -> Option<TaskList> {
+    let items: Vec<Item> = items.iter().filter(|i| i.status != "deleted").cloned().collect();
+    if items.is_empty() {
+        return None;
+    }
+    let total = items.len() as u32;
+    let done = items.iter().filter(|i| i.status == "completed").count() as u32;
+    let now = items.iter().find(|i| i.status == "in_progress").map(|i| if i.active.trim().is_empty() { i.subject.clone() } else { i.active.clone() });
+    let line = match (&now, items.iter().find(|i| i.status == "pending")) {
+        _ if done == total => format!("all {total} done"),
+        (Some(n), _) => format!("{done} of {total} done · now: {}", clip(n, 80)),
+        (None, Some(next)) => format!("{done} of {total} done · next: {}", clip(&next.subject, 80)),
+        (None, None) => format!("{done} of {total} done"),
+    };
+    Some(TaskList { done, total, now, line, items })
+}
+
 /// "14 min", "40 s", "2 h 5 min".
 pub fn span(ms: u64) -> String {
     let s = ms / 1000;
@@ -479,6 +512,39 @@ mod tests {
         r.read(&[uses(311, "s1", "ToolSearch", serde_json::json!({})), result(312, "s1", "…", Value::Null)].join("\n"));
         assert_eq!(r.progress(None, ms(313)).unwrap().turn_ms, Some(ms(300)));
         assert_eq!(r.progress(None, ms(313)).unwrap().tool, None);
+    }
+
+    /// The list the tower shows, collapsed to a line (15 Nov: t17h's six,
+    /// three done, one at work, two open).
+    #[test]
+    fn a_task_list_is_one_line_collapsed_and_its_items() {
+        let item = |id: &str, subject: &str, active: &str, status: &str| Item { id: id.into(), subject: subject.into(), active: active.into(), status: status.into() };
+        let six = vec![
+            item("1", "Label the fresh queries", "Labelling the fresh queries", "completed"),
+            item("2", "Rescore v3", "Rescoring v3", "completed"),
+            item("3", "Build the training set", "Building the training set", "completed"),
+            item("4", "Run the 5-hour LoRA training", "Running the 5-hour LoRA training", "in_progress"),
+            item("5", "Evaluate on real queries", "Evaluating", "pending"),
+            item("6", "Write the report", "", "pending"),
+        ];
+        let t = task_list(&six).unwrap();
+        assert_eq!((t.done, t.total, t.now.as_deref()), (3, 6, Some("Running the 5-hour LoRA training")));
+        assert_eq!(t.line, "3 of 6 done · now: Running the 5-hour LoRA training");
+        // None at work: what is next.
+        let mut idle = six.clone();
+        idle[3].status = "completed".into();
+        assert_eq!(task_list(&idle).unwrap().line, "4 of 6 done · next: Evaluate on real queries");
+        // All done; deleted ones don't count; none at all is no list.
+        let all: Vec<Item> = six.iter().map(|i| Item { status: "completed".into(), ..i.clone() }).collect();
+        assert_eq!(task_list(&all).unwrap().line, "all 6 done");
+        let mut gone = six.clone();
+        gone[5].status = "deleted".into();
+        assert_eq!(task_list(&gone).unwrap().total, 5);
+        assert_eq!(task_list(&[]), None);
+        // Read from a transcript with no task tools: none.
+        let mut r = Reader::default();
+        r.read(&[prompt(0, "fix it"), says(3, "Done.")].join("\n"));
+        assert_eq!(task_list(r.items()), None);
     }
 
     #[test]

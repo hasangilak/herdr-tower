@@ -109,6 +109,8 @@ pub(super) struct FullUi {
     pub thread_open: HashSet<String>,
     /// The briefs opened whole here: a session's (its address), a space's history (`space:<name>`).
     pub briefs_open: HashSet<String>,
+    /// Sessions whose task list shows whole (collapsed to a line otherwise).
+    pub tasks_open: HashSet<String>,
     /// The spaces whose Goal card shows its earlier versions.
     pub goals_open: HashSet<String>,
     /// How wide the pane is, in points, as last drawn (the window less the
@@ -164,6 +166,8 @@ impl FullUi {
             to_phone: None,
             thread_open: HashSet::new(),
             briefs_open: HashSet::new(),
+            // `HERDER_TOWER_ORB_TASKS_OPEN=<address>,…`: those sessions' task lists open from the start (a screenshot).
+            tasks_open: std::env::var("HERDER_TOWER_ORB_TASKS_OPEN").ok().map(|v| v.split(',').map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect()).unwrap_or_default(),
             goals_open: HashSet::new(),
             pane_w: 900.0,
             talk_w: 0.0,
