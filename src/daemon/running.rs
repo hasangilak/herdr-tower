@@ -40,6 +40,8 @@ type Tell = Arc<dyn Fn(Note) + Send + Sync>;
 
 #[derive(Default)]
 struct Inner {
+    /// Each process's GPU time at the look before (`World::gpu_before`).
+    gpu: HashMap<u32, u64>,
     /// Seen and declared, by session.
     jobs: BTreeMap<String, Vec<Job>>,
     servers: BTreeMap<String, Vec<Server>>,
@@ -221,7 +223,9 @@ impl Running {
             .into_iter()
             .filter_map(|(a, n)| crate::hc::get(&a).filter(|t| !super::watch::left_alone(t)).as_ref().and_then(crate::accounts::claude_pid).map(|p| (a, n, p)))
             .collect();
-        let world = world_for(&claudes.iter().map(|c| c.2).collect::<Vec<_>>());
+        let gpu_before = lock(&self.inner).gpu.clone();
+        let world = world_for(&claudes.iter().map(|c| c.2).collect::<Vec<_>>(), Some(gpu_before));
+        lock(&self.inner).gpu = world.gpu.clone();
         let mut seen: BTreeMap<String, (Vec<Job>, Vec<Server>)> = BTreeMap::new();
         let mut names: HashMap<String, String> = HashMap::new();
         let mut browser_uses: BTreeMap<String, Vec<crate::browsers::Use>> = BTreeMap::new();
@@ -626,21 +630,46 @@ impl Running {
 /// What the system says now of these `claude`s' shells: every process,
 /// and for their shells' trees the files they have open, the ports they
 /// listen on, and when those files were last written.
-fn world_for(claudes: &[u32]) -> World {
+///
+/// `gpu_before`: each process's GPU time at the look before (the daemon's);
+/// None (a single look) takes two readings a second apart.
+fn world_for(claudes: &[u32], gpu_before: Option<HashMap<u32, u64>>) -> World {
     let mut world = World { procs: running::parse_ps(&output("ps", &["-axww", "-o", "pid=,ppid=,etime=,pcpu=,command="])), ..Default::default() };
-    let pids: Vec<String> = claudes.iter().flat_map(|p| world.shells(*p).into_iter().flat_map(|s| world.subtree(s.pid)).map(|p| p.pid.to_string()).collect::<Vec<_>>()).collect();
+    let shells: Vec<(u32, String)> =
+        claudes.iter().flat_map(|p| world.shells(*p).into_iter().map(|s| (s.pid, running::shell_command(&s.command).unwrap_or_default())).collect::<Vec<_>>()).collect();
+    // Their trees, and what they wait on (a detached training a `pgrep` loop waits for).
+    let mut pids: Vec<u32> = shells.iter().flat_map(|(s, _)| world.subtree(*s).into_iter().map(|p| p.pid)).collect();
+    for (s, command) in &shells {
+        let own: Vec<u32> = world.subtree(*s).iter().map(|p| p.pid).collect();
+        pids.extend(world.waited_on(command, &own));
+    }
+    pids.sort();
+    pids.dedup();
     if pids.is_empty() {
         return world;
     }
-    world.files = running::parse_lsof(&output("lsof", &["-nP", "-Fpfan", "-a", "-p", &pids.join(",")]));
+    let list: Vec<String> = pids.iter().map(u32::to_string).collect();
+    world.files = running::parse_lsof(&output("lsof", &["-nP", "-Fpfan", "-a", "-p", &list.join(",")]));
     world.listen = running::parse_listen(&output("lsof", &["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"]));
-    for o in world.files.values().flatten() {
-        if let Ok(m) = std::fs::metadata(&o.name)
+    let gpu = || running::parse_gpu(&output("ioreg", &["-l", "-w0", "-r", "-c", "AGXDeviceUserClient"]));
+    world.gpu_before = match gpu_before {
+        Some(b) => b,
+        None => {
+            let b = gpu();
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            b
+        }
+    };
+    world.gpu = gpu();
+    let named: Vec<String> = shells.iter().flat_map(|(s, c)| running::reach(&world, *s, c).named).collect();
+    let paths: Vec<String> = world.files.values().flatten().map(|o| o.name.clone()).chain(named).collect();
+    for p in paths {
+        if let Ok(m) = std::fs::metadata(&p)
             && m.is_file()
             && let Ok(t) = m.modified()
             && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
         {
-            world.mtimes.insert(o.name.clone(), d.as_millis() as u64);
+            world.mtimes.insert(p, d.as_millis() as u64);
         }
     }
     world
@@ -651,7 +680,7 @@ fn world_for(claudes: &[u32]) -> World {
 pub fn look_at(address: &str) -> Result<Value> {
     let t = crate::hc::get(address).with_context(|| format!("no terminal {address}"))?;
     let pid = crate::accounts::claude_pid(&t).with_context(|| format!("{address} runs no Claude Code session on this machine"))?;
-    let world = world_for(&[pid]);
+    let world = world_for(&[pid], None);
     let mut tasks = Tasks::default();
     let mut calls = crate::browsers::Calls::default();
     if let Some(path) = crate::questions::transcript_path_of(pid)

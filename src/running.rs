@@ -417,7 +417,8 @@ pub fn is_tool_shell(command: &str) -> bool {
     command.contains("/shell-snapshots/snapshot-") && command.contains(" -c ")
 }
 
-/// The command a tool shell runs: what follows its `eval '`, unquoted.
+/// The command a tool shell runs: what follows its `eval '`, unquoted (a
+/// quote inside written `'\''` or `'"'"'`).
 pub fn shell_command(command: &str) -> Option<String> {
     let from = command.find(" eval '")? + " eval '".len();
     let mut out = String::new();
@@ -429,6 +430,12 @@ pub fn shell_command(command: &str) -> Option<String> {
             if rest[i..].starts_with("'\\''") {
                 out.push('\'');
                 i += 4;
+                continue;
+            }
+            // Claude Code's own way: `'"'"'`.
+            if rest[i..].starts_with("'\"'\"'") {
+                out.push('\'');
+                i += 5;
                 continue;
             }
             return Some(out.trim().to_string());
@@ -808,8 +815,265 @@ pub struct World {
     pub files: HashMap<u32, Vec<Open>>,
     /// Listening ports, by pid.
     pub listen: HashMap<u32, Vec<u16>>,
-    /// A path's last write (Unix ms), when it can be read.
+    /// A path's last write (Unix ms), when it can be read (the files open for
+    /// writing, and those `named_in` a job's commands).
     pub mtimes: HashMap<String, u64>,
+    /// GPU time each process has used so far (ns, Metal: `ioreg`'s
+    /// AGXDeviceUserClient), now and at the look before: a job on the GPU
+    /// shows little CPU.
+    pub gpu: HashMap<u32, u64>,
+    pub gpu_before: HashMap<u32, u64>,
+}
+
+impl World {
+    /// A process used the GPU since the look before.
+    pub fn on_gpu(&self, pid: u32) -> bool {
+        match (self.gpu.get(&pid), self.gpu_before.get(&pid)) {
+            (Some(now), Some(before)) => now > before,
+            _ => false,
+        }
+    }
+
+    /// A process's working folder, when lsof said it.
+    pub fn cwd_of(&self, pid: u32) -> Option<&str> {
+        self.files.get(&pid)?.iter().find(|o| o.fd == "cwd").map(|o| o.name.as_str())
+    }
+
+    /// The processes a waiter waits on (`waited_in`), here, and everything
+    /// that runs with them: from the topmost of their parents that isn't
+    /// the system's (a detached `guard_train.py` and the training under it).
+    /// Never the waiter's own (`own`), nor a `pgrep` looking.
+    pub fn waited_on(&self, command: &str, own: &[u32]) -> Vec<u32> {
+        let mut out: Vec<u32> = vec![];
+        for w in waited_in(command) {
+            let found: Vec<&Proc> = match &w {
+                Waited::Pid(p) => self.procs.iter().filter(|x| x.pid == *p).collect(),
+                Waited::Pattern(parts) => self
+                    .procs
+                    .iter()
+                    .filter(|x| !own.contains(&x.pid) && !x.command.contains("pgrep") && !is_tool_shell(&x.command) && fragments_in(parts, &x.command))
+                    .collect(),
+            };
+            for p in found {
+                // Up to its topmost parent short of the system (pid 1) or a session's own shell.
+                let mut root = p;
+                for _ in 0..16 {
+                    match self.procs.iter().find(|x| x.pid == root.ppid) {
+                        Some(up) if up.pid > 1 && !is_tool_shell(&up.command) && !up.command.contains("claude") => root = up,
+                        _ => break,
+                    }
+                }
+                for q in self.subtree(root.pid) {
+                    if !out.contains(&q.pid) && !own.contains(&q.pid) {
+                        out.push(q.pid);
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// How far a job reaches beyond its shell's tree: the processes it waits on
+/// (`waited_on`), and the files its command and theirs name as where they
+/// write (`named_files`, resolved from each one's folder).
+#[derive(Debug, Default)]
+pub struct Reach {
+    pub waited: Vec<u32>,
+    pub named: Vec<String>,
+}
+
+pub fn reach(world: &World, shell: u32, command: &str) -> Reach {
+    let own: Vec<u32> = world.subtree(shell).iter().map(|p| p.pid).collect();
+    let waited = world.waited_on(command, &own);
+    let mut named: Vec<String> = named_files(command).iter().filter_map(|n| resolve(n, world.cwd_of(shell))).collect();
+    for pid in own.iter().skip(1).chain(&waited) {
+        if let Some(p) = world.procs.iter().find(|p| p.pid == *pid) {
+            named.extend(named_files(&p.command).iter().filter_map(|n| resolve(n, world.cwd_of(*pid))));
+        }
+    }
+    named.sort();
+    named.dedup();
+    Reach { waited, named }
+}
+
+/// What a waiter waits on: a process by its command line, or by its pid.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Waited {
+    /// The parts of a `pgrep -f` pattern that must show, in order (`[m]lx_lm lora -c .*v5.yaml`
+    /// is `mlx_lm lora -c`, `v5.yaml`).
+    Pattern(Vec<String>),
+    Pid(u32),
+}
+
+/// The processes a command waits on: `pgrep [-f] '<pattern>'`, `pidof
+/// <name>`, `kill -0 <pid>`, `wait <pid>`, `tail --pid=<pid>`, `lsof -p <pid>`.
+pub fn waited_in(command: &str) -> Vec<Waited> {
+    let toks = shell_words(command);
+    let mut out = vec![];
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i].as_str();
+        match t {
+            "pgrep" | "pidof" => {
+                // Its pattern: the first word that isn't a flag.
+                let mut j = i + 1;
+                while j < toks.len() && toks[j].starts_with('-') {
+                    j += 1;
+                }
+                if let Some(p) = toks.get(j) {
+                    let parts: Vec<String> = p
+                        .replace(['[', ']', '^', '$', '\\'], "")
+                        .split(".*")
+                        .flat_map(|s| s.split(".+"))
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| s.len() >= 3)
+                        .collect();
+                    if !parts.is_empty() {
+                        out.push(Waited::Pattern(parts));
+                    }
+                }
+                i = j;
+            }
+            "kill" if toks.get(i + 1).map(String::as_str) == Some("-0") => {
+                if let Some(p) = toks.get(i + 2).and_then(|p| p.parse().ok()) {
+                    out.push(Waited::Pid(p));
+                }
+                i += 2;
+            }
+            "wait" => {
+                if let Some(p) = toks.get(i + 1).and_then(|p| p.parse().ok()) {
+                    out.push(Waited::Pid(p));
+                }
+            }
+            _ if t.starts_with("--pid=") => {
+                if let Ok(p) = t["--pid=".len()..].parse() {
+                    out.push(Waited::Pid(p));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The parts all show in `command`, in order.
+fn fragments_in(parts: &[String], command: &str) -> bool {
+    let mut at = 0;
+    for p in parts {
+        match command[at..].find(p.as_str()) {
+            Some(i) => at += i + p.len(),
+            None => return false,
+        }
+    }
+    true
+}
+
+/// A command's words, its quotes taken off (`pgrep -f '[m]lx lora'` is `pgrep`, `-f`, `[m]lx lora`).
+fn shell_words(command: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for c in command.chars() {
+        match (quote, c) {
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, c) if c.is_whitespace() || c == ';' || c == '|' || c == '&' || c == '(' || c == ')' => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            (_, c) => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The files a command names as where it writes: `--log X`, `--log-file X`,
+/// `--output X`, `-o X`, `> X`, `>> X`, `tee X` (its progress can show there
+/// though no process holds them open), as written (maybe relative).
+pub fn named_files(command: &str) -> Vec<String> {
+    let toks = shell_words(command);
+    let mut out = vec![];
+    for (i, t) in toks.iter().enumerate() {
+        // `tee -a X`: past its flags.
+        let next = if t == "tee" { toks[i + 1..].iter().find(|n| !n.starts_with('-')) } else { toks.get(i + 1) };
+        let named = match t.as_str() {
+            "--log" | "--log-file" | "--logfile" | "--log_file" | "--output" | "--out" | "-o" | "--save-log" | "tee" | ">" | ">>" | "2>" | "&>" => next.cloned(),
+            _ => ["--log=", "--log-file=", "--logfile=", "--output=", "--out="].iter().find_map(|p| t.strip_prefix(p).map(String::from)),
+        };
+        if let Some(n) = named.filter(|n| !n.is_empty() && !n.starts_with('-') && n != "/dev/null") {
+            out.push(n);
+        }
+        // `>file` written without a space.
+        if let Some(n) = t.strip_prefix(">>").or_else(|| t.strip_prefix('>')).filter(|n| !n.is_empty() && !n.starts_with('&') && *n != "/dev/null") {
+            out.push(n.to_string());
+        }
+    }
+    out
+}
+
+/// A named file's path: as it is when absolute, else from `cwd`.
+pub fn resolve(name: &str, cwd: Option<&str>) -> Option<String> {
+    if name.starts_with('/') {
+        return Some(name.to_string());
+    }
+    if let Some(rest) = name.strip_prefix("~/") {
+        return std::env::var("HOME").ok().map(|h| format!("{h}/{rest}"));
+    }
+    cwd.map(|c| format!("{}/{name}", c.trim_end_matches('/')))
+}
+
+/// `ioreg -l -w0 -r -c AGXDeviceUserClient`: the GPU time each process has
+/// used (ns), summed over its Metal clients. Each client is a block (`+-o
+/// AGXDeviceUserClient …`) whose `AppUsage` may come before its
+/// `IOUserClientCreator` ("pid 94550, python3.12").
+pub fn parse_gpu(text: &str) -> HashMap<u32, u64> {
+    let mut out: HashMap<u32, u64> = HashMap::new();
+    for block in text.split("+-o ").skip(1) {
+        let Some(pid) = block.split("\"IOUserClientCreator\" = \"pid ").nth(1).and_then(|r| r.split(',').next()).and_then(|p| p.trim().parse::<u32>().ok()) else { continue };
+        let used: u64 = block
+            .lines()
+            .filter(|l| l.contains("\"AppUsage\""))
+            .flat_map(|l| l.split("\"accumulatedGPUTime\"=").skip(1))
+            .filter_map(|r| r.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u64>().ok())
+            .sum();
+        *out.entry(pid).or_insert(0) += used;
+    }
+    out
+}
+
+/// A short name for a process: `mlx_lm lora` for `python -I -m mlx_lm lora -c …`,
+/// `guard_train.py` for `python -I scripts/review/guard_train.py --config …`.
+pub fn short_name(command: &str) -> String {
+    let toks = shell_words(command);
+    let base = |t: &str| t.rsplit('/').next().unwrap_or(t).to_string();
+    let Some(first) = toks.first() else { return String::new() };
+    let interp = ["python", "python3", "node", "bash", "sh", "zsh", "ruby", "uv", "deno", "bun"];
+    let b = base(first);
+    if !interp.iter().any(|i| b == *i || b.starts_with("python3.")) {
+        return b;
+    }
+    let mut i = 1;
+    while i < toks.len() {
+        let t = toks[i].as_str();
+        if t == "-m" || t == "run" {
+            let module = toks.get(i + 1).cloned().unwrap_or_default();
+            return match toks.get(i + 2).filter(|n| !n.starts_with('-') && !n.contains('/') && !n.contains('.')) {
+                Some(sub) => format!("{module} {sub}"),
+                None => module,
+            };
+        }
+        if !t.starts_with('-') {
+            return base(t);
+        }
+        i += 1;
+    }
+    b
 }
 
 impl World {
@@ -904,12 +1168,31 @@ pub fn look(claude: u32, world: &World, tasks: &Tasks, now_ms: u64, turn_over: b
             Kind::Watch => watches.push(task.map(|t| t.command.clone()).unwrap_or(command)),
             Kind::Server => servers.push(Server { what, pid: shell.pid, ports }),
             Kind::Job => {
+                // Its reach: what it waits on (a `pgrep` loop until a detached
+                // training ends) runs for it, and the files named in its
+                // commands (`--log train.log`) show its progress.
+                let reach = reach(world, shell.pid, &command);
+                let waited: Vec<&Proc> = reach.waited.iter().filter_map(|w| world.procs.iter().find(|p| p.pid == *w)).collect();
+                let tree: Vec<&Proc> = tree.iter().copied().chain(waited.iter().copied()).collect();
                 let writes: Vec<&Open> = tree.iter().flat_map(|p| world.files.get(&p.pid).map(|f| f.iter().filter(|o| written(o)).collect::<Vec<_>>()).unwrap_or_default()).collect();
-                // Its log over its task output (often empty when the command redirects).
-                let output = writes.iter().find(|o| !o.name.contains("/tasks/")).or(writes.first()).map(|o| o.name.clone());
-                let progress_ms = writes.iter().filter_map(|o| world.mtimes.get(&o.name).copied()).max();
+                // Its log over its task output (often empty when the command
+                // redirects): of the files it writes or names, the one written last.
+                let logs: Vec<&String> = writes.iter().map(|o| &o.name).chain(&reach.named).filter(|n| !n.contains("/tasks/")).collect();
+                let output = logs
+                    .iter()
+                    .max_by_key(|n| world.mtimes.get(n.as_str()).copied().unwrap_or(0))
+                    .map(|n| n.to_string())
+                    .or_else(|| writes.first().map(|o| o.name.clone()));
+                let progress_ms = writes.iter().map(|o| &o.name).chain(&reach.named).filter_map(|n| world.mtimes.get(n).copied()).max();
                 let since_ms = now_ms.saturating_sub(shell.secs * 1000);
-                let busy = tree.iter().any(|p| p.cpu >= BUSY_CPU);
+                // Work on the CPU, or on the GPU (an MLX or Metal training shows little CPU).
+                let busy = tree.iter().any(|p| p.cpu >= BUSY_CPU || world.on_gpu(p.pid));
+                // What it waits on, by the process at work there (the training, not its guard).
+                let waits_on = waited
+                    .iter()
+                    .max_by_key(|p| (world.on_gpu(p.pid), (p.cpu * 10.0) as u64))
+                    .map(|p| clip(&short_name(&p.command), 60))
+                    .unwrap_or_default();
                 let quiet = now_ms.saturating_sub(progress_ms.unwrap_or(since_ms));
                 jobs.push(Job {
                     what,
@@ -924,6 +1207,7 @@ pub fn look(claude: u32, world: &World, tasks: &Tasks, now_ms: u64, turn_over: b
                     output,
                     note: String::new(),
                     watched: false,
+                    waits_on,
                     ..Default::default()
                 });
             }
@@ -1272,6 +1556,110 @@ mod tests {
         }
     }
 
+    /// t17h (search-llm, 15 Nov): a background `until ! pgrep -f …; do sleep
+    /// 30; done` waits on a v5 LoRA training a detached `guard_train.py` runs
+    /// (parent: the system). The training works on the GPU at 4% CPU and
+    /// writes the log its guard's `--log` names; the waiter wrote nothing for
+    /// 70 minutes. It was called stuck.
+    fn gpu_world() -> (World, Tasks) {
+        let mut w = World::default();
+        let cmd = "until ! pgrep -f '[m]lx_lm lora -c .*lora_1.2b_v5.yaml' >/dev/null; do sleep 30; done; ls models/lora-1.2b-v5";
+        w.procs = vec![
+            Proc { pid: 5, ppid: 1, secs: 9000, cpu: 1.0, command: "claude".into() },
+            shell(100, 5, 70 * 60, cmd),
+            Proc { pid: 101, ppid: 100, secs: 10, cpu: 0.0, command: "sleep 30".into() },
+            Proc { pid: 102, ppid: 100, secs: 0, cpu: 0.0, command: "pgrep -f [m]lx_lm lora -c .*lora_1.2b_v5.yaml".into() },
+            Proc { pid: 200, ppid: 1, secs: 80 * 60, cpu: 0.0, command: ".venv/bin/python -I scripts/review/guard_train.py --config train/lora_1.2b_v5.yaml --log data/review/v5/train.log --min-free-gb 8".into() },
+            Proc { pid: 201, ppid: 200, secs: 80 * 60, cpu: 4.0, command: "/w/.venv/bin/python -I -m mlx_lm lora -c /w/train/lora_1.2b_v5.yaml".into() },
+            Proc { pid: 300, ppid: 1, secs: 80 * 60, cpu: 0.0, command: "/w/.venv/bin/python -m mlx_lm lora -c /w/train/lora_1.2b_v4.yaml".into() },
+        ];
+        w.files.insert(100, vec![open("1", "w", "/tmp/p/tasks/bwait.output")]);
+        w.files.insert(200, vec![open("cwd", "", "/w")]);
+        w.mtimes.insert("/tmp/p/tasks/bwait.output".into(), NOW - 70 * 60_000);
+        w.mtimes.insert("/w/data/review/v5/train.log".into(), NOW - 60_000);
+        w.gpu_before.insert(201, 1_000);
+        w.gpu.insert(201, 2_000);
+        let mut t = Tasks::default();
+        t.by_id.insert("bwait".into(), Task { id: "bwait".into(), kind: TaskKind::Bash, description: "Wait for the v5 training to end".into(), command: cmd.into(), at_ms: 0, said_serving: false });
+        (w, t)
+    }
+
+    #[test]
+    fn a_job_waiting_on_a_gpu_training_is_not_stuck() {
+        let (w, t) = gpu_world();
+        let (jobs, servers) = look(5, &w, &t, NOW, true);
+        assert!(servers.is_empty());
+        let j = &jobs[0];
+        assert_eq!((j.busy, j.stuck, j.waits_on.as_str()), (true, false, "mlx_lm lora"), "on the GPU: at work, though at 4% CPU");
+        assert_eq!(j.progress_ms, Some(NOW - 60_000), "the guard's --log, resolved from its folder, shows the progress");
+        assert_eq!(j.output.as_deref(), Some("/w/data/review/v5/train.log"));
+        // The GPU paused a moment (an eval, a checkpoint): the log written a minute ago still says it moves.
+        let mut w2 = gpu_world().0;
+        w2.gpu.insert(201, 1_000);
+        let j = &look(5, &w2, &t, NOW, true).0[0];
+        assert_eq!((j.busy, j.stuck), (false, false));
+        // No GPU, no CPU, its log 50 minutes old: possibly stuck after all.
+        w2.mtimes.insert("/w/data/review/v5/train.log".into(), NOW - 50 * 60_000);
+        assert!(look(5, &w2, &t, NOW, true).0[0].stuck);
+        // The training is gone (the waiter should have ended): quiet for 70 minutes, stuck.
+        let mut w3 = gpu_world().0;
+        w3.procs.retain(|p| p.pid != 200 && p.pid != 201);
+        let j = &look(5, &w3, &t, NOW, true).0[0];
+        assert!(j.stuck && j.waits_on.is_empty(), "{j:?}");
+        // Only what the pattern names: the v4 training (another config) isn't waited on, nor the pgrep looking.
+        assert_eq!(w.waited_on(&t.by_id["bwait"].command, &[100, 101, 102]), [200, 201]);
+    }
+
+    #[test]
+    fn what_a_waiter_waits_on_and_where_a_command_writes() {
+        assert_eq!(waited_in("until ! pgrep -f '[m]lx_lm lora -c .*v5.yaml' >/dev/null; do sleep 30; done"), [Waited::Pattern(vec!["mlx_lm lora -c".into(), "v5.yaml".into()])]);
+        assert_eq!(waited_in("while kill -0 4242 2>/dev/null; do sleep 5; done; tail --pid=77 -f x"), [Waited::Pid(4242), Waited::Pid(77)]);
+        assert_eq!(waited_in("wait 991 && echo done"), [Waited::Pid(991)]);
+        assert!(waited_in("python train.py --epochs 3").is_empty());
+        assert_eq!(
+            named_files("python guard.py --log data/train.log --out=run/x.json | tee -a eval.log > out.txt 2>/dev/null; echo hi >>notes.md"),
+            ["data/train.log", "run/x.json", "eval.log", "out.txt", "notes.md"]
+        );
+        assert!(named_files("python train.py -c t.yaml > /dev/null").is_empty());
+        assert_eq!(resolve("data/train.log", Some("/w/")), Some("/w/data/train.log".into()));
+        assert_eq!(resolve("/abs/x.log", None), Some("/abs/x.log".into()));
+        assert_eq!(resolve("x.log", None), None);
+        assert_eq!(short_name("/w/.venv/bin/python -I -m mlx_lm lora -c /w/t.yaml"), "mlx_lm lora");
+        assert_eq!(short_name(".venv/bin/python -I scripts/review/guard_train.py --config t.yaml"), "guard_train.py");
+        assert_eq!(short_name("/usr/local/bin/ollama serve"), "ollama");
+        // Claude Code writes a quote inside its eval as '"'"'.
+        let ps = "/bin/zsh -c source /h/.claude/shell-snapshots/snapshot-zsh-1-x.sh 2>/dev/null || true && eval 'until ! pgrep -f '\"'\"'[m]lx lora'\"'\"' >/dev/null; do sleep 30; done' < /dev/null && pwd -P >| /tmp/cwd";
+        assert_eq!(shell_command(ps).as_deref(), Some("until ! pgrep -f '[m]lx lora' >/dev/null; do sleep 30; done"));
+    }
+
+    #[test]
+    fn gpu_time_is_read_per_client_block() {
+        let text = r#"+-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x1>
+    {
+      "AppUsage" = ({"API"="Metal","lastSubmittedTime"=1,"accumulatedGPUTime"=906013044375},{"API"="Metal","accumulatedGPUTime"=5})
+      "IOUserClientCreator" = "pid 419, WindowServer"
+    }
++-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x2>
+    {
+      "AppUsage" = ()
+      "IOUserClientCreator" = "pid 757, AccessibilityVis"
+    }
++-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x3>
+    {
+      "AppUsage" = ({"API"="Metal","lastSubmittedTime"=13145109996041,"accumulatedGPUTime"=143190186250})
+      "IOUserClientCreator" = "pid 94550, python3.12"
+    }
++-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x4>
+    {
+      "IOUserClientCreator" = "pid 94550, python3.12"
+      "AppUsage" = ({"API"="Metal","accumulatedGPUTime"=750})
+    }"#;
+        let g = parse_gpu(text);
+        assert_eq!((g[&419], g[&757], g[&94550]), (906013044380, 0, 143190187000));
+        let w = World { gpu: g.clone(), gpu_before: [(94550, 143190186250u64), (419, 906013044380)].into(), ..Default::default() };
+        assert!(w.on_gpu(94550) && !w.on_gpu(419) && !w.on_gpu(757), "on the GPU: its time grew since the look before");
+    }
+
     /// A script with nothing written yet ("No output available") is a job,
     /// quiet but not stuck until the threshold.
     #[test]
@@ -1302,7 +1690,7 @@ mod tests {
         assert!(!post.stuck && !post.busy, "quiet for 40 min and idle, but the training it follows is at work");
         assert_eq!(post.waits_on, "Train the 1.2B LoRA");
         // The training stopped too (idle, its log old): then the waiter may be stuck.
-        let mut w4 = World { procs: w.procs.clone(), files: w.files.clone(), listen: w.listen.clone(), mtimes: w.mtimes.clone() };
+        let mut w4 = World { procs: w.procs.clone(), files: w.files.clone(), listen: w.listen.clone(), mtimes: w.mtimes.clone(), ..Default::default() };
         for p in w4.procs.iter_mut() {
             p.cpu = 0.0;
         }
@@ -1330,7 +1718,7 @@ mod tests {
         assert_eq!(jobs[0].what, "python train.py > /w/train.log 2>&1");
         // A command that redirects itself whole: its stdout is its log, not the
         // task's file; known by its command instead.
-        let mut w2 = World { procs: w.procs.clone(), files: w.files.clone(), listen: w.listen.clone(), mtimes: w.mtimes.clone() };
+        let mut w2 = World { procs: w.procs.clone(), files: w.files.clone(), listen: w.listen.clone(), mtimes: w.mtimes.clone(), ..Default::default() };
         w2.files.insert(10, vec![open("1", "w", "/w/train.log")]);
         let (jobs, _) = look(1, &w2, &t, NOW, true);
         assert_eq!((jobs[0].what.as_str(), jobs[0].task.as_deref()), ("Train the 1.2B LoRA", Some("btrain")));
@@ -1338,7 +1726,7 @@ mod tests {
         // While the session works: its foreground call (a tool shell the
         // transcript has no background task for, its output in a task file
         // all the same) is nothing.
-        let mut w3 = World { procs: w.procs.clone(), files: w.files.clone(), listen: w.listen.clone(), mtimes: w.mtimes.clone() };
+        let mut w3 = World { procs: w.procs.clone(), files: w.files.clone(), listen: w.listen.clone(), mtimes: w.mtimes.clone(), ..Default::default() };
         w3.procs.push(shell(60, 1, 150, "cargo build --release && ./target/release/tower install"));
         w3.files.insert(60, vec![open("1", "w", "/tmp/p/tasks/bfore.output")]);
         let names = |turn_over: bool| look(1, &w3, &t, NOW, turn_over).0.into_iter().map(|j| j.what).collect::<Vec<_>>();
