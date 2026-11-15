@@ -42,6 +42,14 @@ flowchart LR
   introduced to each other and write to each other through the tower
   (`tower queue` from one to another), and every message is kept in the
   space's thread.
+- **Across accounts, agents and machines.** Claude Code on any account,
+  Codex, and sessions on other machines are introduced to each other with
+  how to reach each one, and the tower carries what they can't send
+  themselves: a `To <address>: …` line in a session's final message is
+  delivered for it (a Codex sandbox that can't run `tower`), and the answer
+  to a question one session asked another goes back to the asker by itself.
+  A session moved to another account, or reopened in a new terminal after a
+  restart, keeps its messages.
 - **A brain per space.** The main brain (a Claude Code or Codex session of the
   tower's) takes your requests; each space gets a tower of its own that
   follows only that space's sessions. A daemon underneath watches every

@@ -12,14 +12,16 @@
 //! - **Answers go back by themselves.** A turn that a message from another
 //!   session started, which asked something (a `?`), and in which the
 //!   session wrote nothing back to its sender: its final message goes back
-//!   to the sender as the answer (`ANSWER` before it). One hop: an answer
+//!   to the sender as the answer, with the question it answers before it
+//!   (`[answer to "Which port?"] 3001`: two answers alike to two questions
+//!   are two messages, never a repeat the queue drops). One hop: an answer
 //!   that came back this way is never answered back by itself, so two
 //!   sessions can't keep each other going.
 //!
 //! This file is the reading (pure); the daemon delivers (`daemon::relay_turn`).
 
-/// Before an answer the tower carried back.
-pub const ANSWER: &str = "[answer] ";
+/// How an answer the tower carried back starts (`[answer to "…"] `).
+pub const ANSWER: &str = "[answer";
 
 /// The longest answer carried back whole.
 const ANSWER_CHARS: usize = 3000;
@@ -56,7 +58,7 @@ pub fn to_lines(said: &str) -> Vec<(String, String)> {
 pub fn started_by(prompt: &str) -> Option<(String, String, bool)> {
     let from = crate::peers::sender_in(prompt)?;
     let body = body_of(prompt);
-    let answer = body.trim_start().starts_with(ANSWER.trim_end());
+    let answer = body.trim_start().starts_with(ANSWER);
     Some((from, body, answer))
 }
 
@@ -81,7 +83,9 @@ pub fn answer_back(prompt: &str, said: &str, wrote_back: bool) -> Option<(String
         return None;
     }
     let text: String = if said.chars().count() > ANSWER_CHARS { format!("{}…", said.chars().take(ANSWER_CHARS).collect::<String>()) } else { said.to_string() };
-    Some((from, format!("{ANSWER}{text}")))
+    let asked: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let asked = if asked.chars().count() > 80 { format!("{}…", asked.chars().take(80).collect::<String>().trim_end()) } else { asked };
+    Some((from, format!("[answer to \"{}\"] {text}", asked.replace('"', "'"))))
 }
 
 #[cfg(test)]
@@ -107,17 +111,20 @@ mod tests {
     #[test]
     fn an_answer_goes_back_once_and_only_to_a_question() {
         let asked = "From qfix-mix › api (t17k): What is 6 times 7? Answer me with tower queue t17k.";
-        assert_eq!(answer_back(asked, "42", false), Some(("t17k".into(), "[answer] 42".into())));
+        assert_eq!(answer_back(asked, "42", false), Some(("t17k".into(), "[answer to \"What is 6 times 7? Answer me with tower queue t17k.\"] 42".into())));
+        // The same answer to another question is another message.
+        let again = answer_back("From qfix-mix › api (t17k): What did you answer me earlier?", "42", false).unwrap();
+        assert_eq!(again.1, "[answer to \"What did you answer me earlier?\"] 42");
         // It wrote back itself: nothing more.
         assert_eq!(answer_back(asked, "42", true), None);
         // Only told something: no answer goes back.
         assert_eq!(answer_back("From qfix-mix › api (t17k): FYI the vault is on dev.", "Noted.", false), None);
         // An answer carried back is never answered back by itself (no ping-pong).
-        assert_eq!(answer_back("From qfix-mix › web (t17m): [answer] 42, and what about you?", "fine", false), None);
+        assert_eq!(answer_back("From qfix-mix › web (t17m): [answer to \"What is 6 times 7?\"] 42, and you?", "fine", false), None);
         // Not from a session (the user, the tower): nothing.
         assert_eq!(answer_back("What is 6 times 7?", "42", false), None);
         // Herdr's own wrapper around a message it typed is seen through.
         let wrapped = "<hc from=\"t12w\">From qfix-mix › api (t17k): Which port?</hc>";
-        assert_eq!(answer_back(wrapped, "3001", false), Some(("t17k".into(), "[answer] 3001".into())));
+        assert_eq!(answer_back(wrapped, "3001", false), Some(("t17k".into(), "[answer to \"Which port?\"] 3001".into())));
     }
 }

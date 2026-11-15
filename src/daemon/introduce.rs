@@ -234,7 +234,7 @@ impl Introducer {
             self.save(&b);
             let named = |ms: &[&Member]| ms.iter().map(|m| format!("{} ({})", m.label(), m.address)).collect::<Vec<_>>().join(", ");
             let text = if reached.len() == members.len() {
-                format!("Introduced the Claude sessions in {space} to each other: {}", named(&members.iter().collect::<Vec<_>>()))
+                format!("Introduced the sessions in {space} to each other: {}", named(&members.iter().collect::<Vec<_>>()))
             } else {
                 let others: Vec<&Member> = members.iter().filter(|m| !reached.iter().any(|r| r.address == m.address)).collect();
                 format!("Introduced {} to the other Claude sessions in {space}: {}", named(&reached.iter().collect::<Vec<_>>()), named(&others))
