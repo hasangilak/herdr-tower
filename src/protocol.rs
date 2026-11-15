@@ -326,6 +326,16 @@ pub enum Request {
         /// A text question set that asks nothing after all.
         #[serde(default)]
         none: bool,
+        /// The brain's scores (`crate::scoring`): low, medium or high, and why.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        risk: Option<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        risk_why: String,
+        /// 0 to 1: how sure it is that its first pick is the user's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confidence: Option<f64>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        confidence_why: String,
     },
     /// The behaviors changed (`change`: `behaviors::Change::view`; `by`:
     /// user or brain; `from`: the terminal the command ran in, so the

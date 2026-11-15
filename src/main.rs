@@ -22,6 +22,7 @@ mod brains;
 mod browsers;
 mod progress;
 mod relay;
+mod scoring;
 mod chat;
 mod choices;
 mod config;
@@ -669,6 +670,19 @@ enum Cmd {
         /// A finished message that asks the user nothing after all.
         #[arg(long)]
         none: bool,
+        /// How far the answer reaches: low (stays in the project, can be undone), medium (beyond the
+        /// project, shared or remote state, hard to undo) or high. The tower's own floor wins when higher.
+        #[arg(long)]
+        risk: Option<String>,
+        /// Why that risk, in a few words.
+        #[arg(long, default_value = "")]
+        risk_why: String,
+        /// 0 to 1: how sure you are that recommendation 1 is what the user would choose.
+        #[arg(long)]
+        confidence: Option<f64>,
+        /// Why that confidence, in a few words.
+        #[arg(long, default_value = "")]
+        confidence_why: String,
     },
     /// Dismiss a question set, or a decision (it shows no more; nothing is sent).
     Dismiss { id: String },
@@ -1209,7 +1223,15 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Recommend { id, json, decision, reason, none } => {
+        Cmd::Recommend { id, json, decision, reason, none, risk, risk_why, confidence, confidence_why } => {
+            if let Some(r) = &risk
+                && scoring::Risk::parse(r).is_none()
+            {
+                bail!("--risk is low, medium or high");
+            }
+            if confidence.is_some_and(|c| !(0.0..=1.0).contains(&c)) {
+                bail!("--confidence is between 0 and 1");
+            }
             let recs: Value = if none || json.trim().is_empty() { Value::Null } else { serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("--json: {e}"))? };
             if !none && recs.is_null() {
                 bail!("give --json with the recommendations, or --none");
@@ -1220,15 +1242,15 @@ fn run(cli: Cli) -> Result<()> {
             {
                 bail!("--decision is auto or escalate");
             }
-            let r = protocol::send(&Request::Recommend { id: id.clone(), recs, decision, reason, none })?;
+            let r = protocol::send(&Request::Recommend { id: id.clone(), recs, decision, reason, none, risk, risk_why, confidence, confidence_why })?;
             if !r.ok {
                 bail!("{}", r.error.unwrap_or_default());
             }
             let v = r.state.unwrap_or_default();
             match (none, v["decision"].as_str()) {
                 (true, _) => println!("{id}: closed, it asks nothing."),
-                (_, Some("auto")) => println!("{id}: answering it for the user ({}).", v["reason"].as_str().unwrap_or("")),
-                (_, d) => println!("{id}: for the user to decide ({}).", if d.is_some() { v["reason"].as_str().unwrap_or("") } else { "" }),
+                (_, Some("auto")) => println!("{id}: answering it for the user ({}; {}).", v["reason"].as_str().unwrap_or(""), v["scores"]["line"].as_str().unwrap_or("")),
+                (_, d) => println!("{id}: for the user to decide ({}; {}).", if d.is_some() { v["reason"].as_str().unwrap_or("") } else { "" }, v["scores"]["line"].as_str().unwrap_or("")),
             }
             Ok(())
         }

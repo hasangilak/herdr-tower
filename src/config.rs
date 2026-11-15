@@ -135,6 +135,9 @@ pub struct Config {
     pub lan: Lan,
     /// The agent sessions themselves (`[sessions]`).
     pub sessions: Sessions,
+    /// Risk and confidence: the confidence the tower needs to answer a
+    /// question for the user, by risk (`[scoring]`, `crate::scoring`).
+    pub scoring: crate::scoring::Thresholds,
     /// How session questions are handled (`tower policy`): `normal` (the
     /// tower answers routine ones itself, the user decides the rest),
     /// `keep-moving` (it answers more), `ask-everything`.
@@ -411,6 +414,7 @@ impl Default for Config {
             alerts: Alerts::default(),
             lan: Lan::default(),
             sessions: Sessions::default(),
+            scoring: crate::scoring::Thresholds::default(),
             question_policy: "normal".into(),
             max_spoken_chars: 900,
             ack: ["Got it.", "Okay.", "Sure."].map(String::from).to_vec(),

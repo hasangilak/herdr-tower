@@ -116,6 +116,9 @@ pub struct QuestionSet {
     pub reason: String,
     /// What the tower answered for the user, when it did.
     pub answered_with: String,
+    /// Its risk and confidence, and what they decided (`crate::scoring`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scores: Option<crate::scoring::Scores>,
     /// The set this one replaces: the same dialog, read again (its question
     /// on a tab is known now, say). Its card carries on as this one.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2554,6 +2557,95 @@ pub fn decide(set: &QuestionSet, brain: Option<&str>, brain_reason: &str, policy
         }
         _ => ("escalate".into(), if brain_reason.is_empty() { "it needs your call".into() } else { brain_reason.to_string() }),
     }
+}
+
+/// What the brain said of a recommendation's risk and confidence (`tower recommend --risk --confidence`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Said {
+    pub risk: Option<crate::scoring::Risk>,
+    pub risk_why: String,
+    pub confidence: Option<f64>,
+    pub confidence_why: String,
+}
+
+/// The kind of question `set` is, for learning (`scoring::kind_of`), with its space.
+pub fn learn_key(set: &QuestionSet) -> String {
+    let q = set.tabs.first().map(|t| t.question.as_str()).filter(|q| !q.trim().is_empty()).unwrap_or(&set.title);
+    format!("{}|{}", set.space.as_deref().unwrap_or(""), crate::scoring::kind_of(&set.kind, &set.target, q))
+}
+
+/// `decide`, with scores. The hard rules first, as strict as ever (the user
+/// decides everything; the escalate list). Then, when the brain scored it:
+/// the risk that counts is the brain's or the tower's floor, whichever is
+/// higher; the confidence, the brain's moved by the user's own answers to
+/// this kind (`learned`); and those decide by `t`, whatever the brain called
+/// it. Without scores, the brain's word decides, as before. Every set
+/// carries its scores either way (shown on its card).
+pub fn decide_scored(
+    set: &QuestionSet,
+    brain: Option<&str>,
+    brain_reason: &str,
+    policy: &str,
+    said: &Said,
+    t: &crate::scoring::Thresholds,
+    learned: &crate::scoring::Learned,
+    cwd: Option<&str>,
+) -> (String, String, crate::scoring::Scores) {
+    use crate::scoring::{Risk, Scores, decide as by_scores, floor, line};
+    let hard = must_escalate(set);
+    let mut text = format!("{}\n{}", set.title, set.detail);
+    for tab in &set.tabs {
+        text.push('\n');
+        text.push_str(&tab.question);
+    }
+    let command = shell_command(set).map(|c| without_data(&c));
+    let (floor_risk, floor_why) = floor(hard, &text, command.as_deref(), cwd);
+    let risk = said.risk.unwrap_or(floor_risk).max(floor_risk);
+    let risk_why = if said.risk.is_some_and(|r| r >= floor_risk) && !said.risk_why.trim().is_empty() { said.risk_why.trim().to_string() } else { floor_why.clone() };
+    let kind = learn_key(set);
+    let (confidence, confidence_why) = match said.confidence {
+        Some(c) => {
+            let (c, why) = learned.confidence(&kind, c, t.learn);
+            (c, if said.confidence_why.trim().is_empty() { why } else { format!("{}; {why}", said.confidence_why.trim()) })
+        }
+        None => (0.0, "the brain gave none".to_string()),
+    };
+    let mut scores = Scores {
+        risk,
+        risk_why,
+        floor: floor_risk,
+        floor_why,
+        confidence,
+        confidence_why,
+        brain_confidence: said.confidence,
+        kind,
+        line: line(risk, said.confidence.map(|_| confidence)),
+        ..Default::default()
+    };
+    let (d, why) = if policy == "ask-everything" {
+        ("escalate".to_string(), "you asked to decide everything yourself".to_string())
+    } else if let Some(why) = hard {
+        ("escalate".into(), why.into())
+    } else if said.confidence.is_some() {
+        // Keep moving: answered a little sooner (still never high risk).
+        let t = if policy == "keep-moving" { crate::scoring::Thresholds { low: (t.low - 0.1).max(0.0), medium: (t.medium - 0.1).max(0.0), learn: t.learn } } else { t.clone() };
+        let (auto, why) = by_scores(risk, confidence, &t);
+        let safe = first_picks(set).map(|a| safe_auto(set, &a).map(|_| ()));
+        match (auto, safe) {
+            (true, Some(Err(e))) => ("escalate".into(), e),
+            (true, _) => ("auto".into(), why),
+            (false, _) => ("escalate".into(), why),
+        }
+    } else {
+        decide(set, brain, brain_reason, policy)
+    };
+    scores.decided = d.clone();
+    scores.decided_why = why.clone();
+    if risk == Risk::High && d == "auto" {
+        // Never: high risk is always the user's (a guard, should a rule above change).
+        return ("escalate".into(), "high risk: always yours".into(), Scores { decided: "escalate".into(), decided_why: "high risk: always yours".into(), ..scores });
+    }
+    (d, why, scores)
 }
 
 /// The answers the tower gives by itself: recommendation 1 for every question

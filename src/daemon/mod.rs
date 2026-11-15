@@ -1085,8 +1085,9 @@ impl Daemon {
                 }
                 self.asks.set_policy(&policy);
             }
-            Request::Recommend { id, recs, decision, reason, none } => {
-                return match self.asks.recommend(&id, &recs, decision.as_deref(), &reason, none) {
+            Request::Recommend { id, recs, decision, reason, none, risk, risk_why, confidence, confidence_why } => {
+                let said = crate::questions::Said { risk: risk.as_deref().and_then(crate::scoring::Risk::parse), risk_why, confidence, confidence_why };
+                return match self.asks.recommend_scored(&id, &recs, decision.as_deref(), &reason, none, &said) {
                     Ok(set) => Response { ok: true, error: None, state: Some(serde_json::to_value(set).unwrap_or_default()) },
                     Err(e) => Response::err(format!("{e:#}")),
                 };
