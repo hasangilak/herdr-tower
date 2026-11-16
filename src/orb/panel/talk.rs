@@ -363,9 +363,113 @@ pub(super) fn said_row_with(s: &Said, who: &str, top: Option<AnyElement>, extra:
     message_row(bar, bg, head, if s.at > 0 { when(s.at) } else { String::new() }, how, s.text.clone(), extra)
 }
 
+/// Words that can be selected and copied, as in any Mac app: a drag selects
+/// (across several messages too: the window has one selection, its root's
+/// `TextSelectionLayer`), Cmd+C copies (the root's Copy), and a right-click
+/// offers Copy: the selection, else these words whole. A press on them
+/// starts a selection, never a move of the window (only the grips move it).
+/// `key` keeps their id apart from other words alike (the head, the time).
+pub(super) fn words(key: &str, text: String) -> AnyElement {
+    use gpui_kit::base::SelectableText;
+    use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+    let id = words_id(key, &text);
+    let whole = text.clone();
+    // Copied in the order they show: the order they are drawn in this frame.
+    let order = WORDS_DRAWN.with(|n| {
+        n.set(n.get() + 1);
+        n.get()
+    });
+    let shown = div().w_full().child(SelectableText::new(SharedString::from(id.clone()), text.clone()).document_order(order).selection_color(gpui::Hsla::from(faded(CYAN, 0x66))));
+    // `HERDER_TOWER_ORB_SELECT` (see `crate::orb`): where these words are drawn.
+    let shown = if select_hook() {
+        use gpui_kit::base::ElementExt as _;
+        shown.on_prepaint(move |bounds, _, _| WORDS_AT.with(|w| w.borrow_mut().push((text.clone(), bounds))))
+    } else {
+        shown
+    };
+    div()
+        .id(SharedString::from(format!("{id}-box")))
+        .w_full()
+        .child(shown)
+        .context_menu(move |menu, _, _| {
+            let whole = whole.clone();
+            menu.item(PopupMenuItem::new("Copy").on_click(move |_, window, cx| {
+                if !copy_words(window, cx) {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(whole.clone()));
+                }
+            }))
+        })
+        .into_any_element()
+}
+
+/// Copies the words selected in the window (`words`, across messages), if
+/// any: true when it did.
+pub(super) fn copy_words(window: &mut Window, cx: &mut gpui::App) -> bool {
+    use gpui_kit::base::TextSelection;
+    // (Asked first: reading the selected text before anything was ever
+    // selected in a window keeps its first drag from selecting.)
+    if !TextSelection::has_selection(window, cx) {
+        return false;
+    }
+    let picked = TextSelection::selected_text(window, cx);
+    if picked.trim().is_empty() {
+        return false;
+    }
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string(picked.trim().to_string()));
+    true
+}
+
+/// Cmd+C copies the words selected, whichever field has the keyboard: taken
+/// before it (the message field's own Copy would put its empty selection on
+/// the clipboard over them). With no words selected, the field copies as ever.
+pub(super) fn on_copy<E: InteractiveElement>(el: E) -> E {
+    el.capture_action(|_: &gpui_kit::base::input::Copy, window, cx| {
+        if copy_words(window, cx) {
+            cx.stop_propagation();
+        }
+    })
+}
+
+thread_local! {
+    /// How many `words` this frame has drawn so far (`words_frame`).
+    static WORDS_DRAWN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Where each of this frame's `words` is, in the window (only for `HERDER_TOWER_ORB_SELECT`).
+    static WORDS_AT: std::cell::RefCell<Vec<(String, gpui::Bounds<gpui::Pixels>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `HERDER_TOWER_ORB_SELECT` is set: `words` say where they are drawn.
+fn select_hook() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("HERDER_TOWER_ORB_SELECT").is_some())
+}
+
+/// `HERDER_TOWER_ORB_SELECT`: where the words holding `words` were drawn
+/// last, in the window (the latest frame's).
+pub(crate) fn words_at(words: &str) -> Option<gpui::Bounds<gpui::Pixels>> {
+    WORDS_AT.with(|w| w.borrow().iter().rev().find(|(t, _)| t.contains(words)).map(|(_, b)| *b))
+}
+
+/// A new frame of the panel: its `words` are numbered from the top again
+/// (the same messages keep the same numbers, so nothing changes between frames).
+pub(super) fn words_frame() {
+    WORDS_DRAWN.with(|n| n.set(0));
+    if select_hook() {
+        WORDS_AT.with(|w| w.borrow_mut().clear());
+    }
+}
+
+/// A stable id for `words`: the same message keeps it from one frame to the next.
+pub(super) fn words_id(key: &str, text: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (key, text).hash(&mut h);
+    format!("words-{:016x}", h.finish())
+}
+
 /// A row: a colored bar, its head (and the time), a line on how it went, the words.
 fn message_row(bar: gpui::Rgba, bg: gpui::Rgba, head: String, time: String, how: Option<gpui::Div>, text: String, extra: Vec<AnyElement>) -> AnyElement {
     let g = glass();
+    let key = format!("{head}|{time}");
     h_flex()
         .w_full()
         .items_start()
@@ -387,7 +491,7 @@ fn message_row(bar: gpui::Rgba, bg: gpui::Rgba, head: String, time: String, how:
                         .child(div().flex_none().text_size(px(12.0)).text_color(g.faint).child(time)),
                 )
                 .children(how)
-                .child(div().w_full().text_size(px(13.5)).line_height(px(20.0)).text_color(g.text).child(text))
+                .child(div().w_full().text_size(px(13.5)).line_height(px(20.0)).text_color(g.text).child(words(&key, text)))
                 .children(extra),
         )
         .into_any_element()
@@ -1002,3 +1106,79 @@ mod tests {
         assert_eq!(conversation(&entries, Some("support-translation"), 2).iter().map(|x| x.at).collect::<Vec<_>>(), [6, 7]);
     }
 }
+
+/// The chat's words can be selected and copied: in a window as the panel's
+/// (`gpui_kit::open_window`'s root), a drag across two messages selects
+/// both bodies (their heads and times stay out), and Cmd+C puts them on the
+/// clipboard.
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use gpui::{IntoElement, Modifiers, MouseButton, Render, TestAppContext, point};
+
+    /// Two messages and, as in the panel, the message field below them.
+    struct Chat {
+        field: gpui::Entity<gpui_kit::component::input::TextareaState>,
+    }
+
+    impl Render for Chat {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            words_frame();
+            on_copy(v_flex().id("chat"))
+                .size_full()
+                .p(px(10.0))
+                .gap(px(10.0))
+                .child(message_row(rgb(CYAN).into(), rgba(SOFT), "The tower".into(), "7:50 PM".into(), None, "The radar no longer calls the training stuck.".into(), vec![]))
+                .child(message_row(rgb(AMBER).into(), rgba(0xffffff24), "You".into(), "7:51 PM".into(), None, "Thanks, merge it into main.".into(), vec![]))
+                .child(div().w(px(400.0)).child(gpui_kit::component::input::Textarea::new(&self.field)))
+        }
+    }
+
+    #[gpui::test]
+    fn message_text_is_selected_across_messages_and_copied(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let field = cx.new(|cx| gpui_kit::component::input::TextareaState::new(window, cx));
+            let chat = cx.new(|_| Chat { field });
+            gpui_kit::base::Root::new(chat, window, cx)
+        });
+        // The message field has the keyboard, as in the panel.
+        let chat = root.read_with(cx, |r, _| r.view().clone().downcast::<Chat>().unwrap());
+        let field = chat.read_with(cx, |c, _| c.field.clone());
+        cx.update(|window, cx| field.update(cx, |f, cx| f.focus(window, cx)));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        // A drag from the first message's first word (its words start 25 px
+        // in and 38 px down in the row: bar, gaps, the head) to below the second.
+        cx.simulate_mouse_down(point(px(36.0), px(50.0)), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(point(px(780.0), px(400.0)), Some(MouseButton::Left), Modifiers::default());
+        cx.simulate_mouse_up(point(px(780.0), px(400.0)), MouseButton::Left, Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let picked = cx.update(|window, cx| gpui_kit::base::TextSelection::selected_text(window, cx));
+        assert!(picked.contains("The radar no longer calls the training stuck.") && picked.contains("Thanks, merge it into main."), "{picked:?}");
+        assert!(picked.find("The radar") < picked.find("Thanks"), "in reading order: {picked:?}");
+        // Cmd+C: the root's Copy puts the selection on the clipboard.
+        cx.simulate_keystrokes("cmd-c");
+        cx.run_until_parked();
+        let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap_or_default();
+        assert!(copied.contains("The radar no longer calls the training stuck.") && copied.contains("Thanks, merge it into main."), "{copied:?}");
+        // No words selected: the field copies its own, as ever.
+        cx.update(|window, cx| gpui_kit::base::TextSelection::clear(window, cx));
+        cx.update(|window, cx| field.update(cx, |f, cx| f.focus(window, cx)));
+        cx.simulate_input("ship it");
+        cx.simulate_keystrokes("cmd-a cmd-c");
+        cx.run_until_parked();
+        assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some("ship it"));
+    }
+
+    #[test]
+    fn a_message_keeps_its_words_id_and_two_alike_differ_by_their_head() {
+        assert_eq!(words_id("The tower|7:50 PM", "Hi"), words_id("The tower|7:50 PM", "Hi"));
+        assert_ne!(words_id("The tower|7:50 PM", "Hi"), words_id("You|7:51 PM", "Hi"));
+    }
+}
+

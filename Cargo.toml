@@ -44,6 +44,13 @@ metal = "0.29"
 objc = "0.2"
 raw-window-handle = "0.6"
 
+[dev-dependencies]
+# GPUI's test window (a headless one), for the panel's own tests: text selection and copy.
+# (GPUI's own feature: gpui-kit's, gpui-base's or gpui-component's would also resolve their
+# optional gpui-fast, whose pins clash with the lock.)
+gpui-pre = { version = "=0.3.11", features = ["test-support"] }
+gpui-pre-platform = { version = "=0.3.11", features = ["test-support"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 4

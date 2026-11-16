@@ -737,7 +737,7 @@ impl Panel {
                     .border_1()
                     .border_color(rgba(LINE))
                     .child(div().text_size(px(15.0)).font_weight(FontWeight::SEMIBOLD).child("Closing report"))
-                    .child(div().text_size(px(13.0)).line_height(px(19.0)).text_color(g.muted).child(if report.is_empty() { "Its goal is met. Its tower hasn’t written the report yet.".to_string() } else { report.to_string() }))
+                    .child(div().text_size(px(13.0)).line_height(px(19.0)).text_color(g.muted).child(super::talk::words("closing-report", if report.is_empty() { "Its goal is met. Its tower hasn’t written the report yet.".to_string() } else { report.to_string() })))
                     .child(div().text_size(px(13.0)).line_height(px(19.0)).text_color(g.muted).child(closing_line(m.workers().len(), closes.as_deref())))
                     .child(
                         acts_row()
