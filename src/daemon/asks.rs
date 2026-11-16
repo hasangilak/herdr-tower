@@ -1060,7 +1060,7 @@ impl Asks {
             if !found.is_empty()
                 && let Some(store) = crate::prs::daemon()
             {
-                let open = store.found(&found, &address, &name, space.as_deref(), true);
+                let open = store.mentioned(&found, &address, &name, space.as_deref(), true);
                 // Its wait is the merge (or it just ended on the PR): the chip is what the user acts on.
                 let on_merge = waits.as_deref().filter(|_| !ready).is_none_or(|r| r.to_lowercase().contains("merg"));
                 if !open.is_empty() && on_merge {
@@ -2281,21 +2281,27 @@ fn turn_transcript(address: &str, t: &Value) -> String {
 }
 
 /// What is said of a session's turn that ended on open PRs: they wait for
-/// the user's merge (from the chip in the chat).
+/// the user's merge (from the chip in the chat). Each is said to be opened
+/// by its own session (`name` only for one whose session isn't known), not
+/// by the one whose turn mentioned it.
 pub fn pr_line(name: &str, open: &[crate::prs::Pr]) -> String {
-    let each: Vec<String> = open
-        .iter()
-        .map(|p| {
-            let trouble = match (p.checks.state.as_str(), p.mergeable.as_str()) {
-                (_, "conflicting") => ", but it has conflicts".to_string(),
-                ("failing", _) => format!(", but {}", p.checks_line()),
-                _ => String::new(),
-            };
-            format!("PR #{} into {}{trouble}", p.number, if p.base.is_empty() { "?" } else { &p.base })
-        })
-        .collect();
+    let mut by: Vec<(String, Vec<String>)> = vec![];
+    for p in open {
+        let trouble = match (p.checks.state.as_str(), p.mergeable.as_str()) {
+            (_, "conflicting") => ", but it has conflicts".to_string(),
+            ("failing", _) => format!(", but {}", p.checks_line()),
+            _ => String::new(),
+        };
+        let one = format!("PR #{} into {}{trouble}", p.number, if p.base.is_empty() { "?" } else { &p.base });
+        let who = if p.name.is_empty() { name.to_string() } else { p.name.clone() };
+        match by.iter_mut().find(|(w, _)| *w == who) {
+            Some((_, each)) => each.push(one),
+            None => by.push((who, vec![one])),
+        }
+    }
     let it = if open.len() == 1 { "it waits" } else { "they wait" };
-    format!("{name} opened {}: {it} for your merge, in the chat", each.join(" and "))
+    let said: Vec<String> = by.iter().map(|(who, each)| format!("{who} opened {}", each.join(" and "))).collect();
+    format!("{}: {it} for your merge, in the chat", said.join("; "))
 }
 
 fn last_message(address: &str, t: &Value) -> Option<String> {
@@ -2552,6 +2558,13 @@ mod tests {
         assert_eq!(
             pr_line("sdk", &[pr(88, "dev", "failing", "mergeable"), pr(89, "main", "pending", "conflicting")]),
             "sdk opened PR #88 into dev, but 1 check failing: lint and PR #89 into main, but it has conflicts: they wait for your merge, in the chat"
+        );
+        // The orchestrator's turn ends on eyzflow's PR: eyzflow opened it, not the orchestrator.
+        let owned = |n: u64, name: &str| crate::prs::Pr { name: name.into(), ..pr(n, "dev", "passing", "mergeable") };
+        assert_eq!(pr_line("orchestrator", &[owned(884, "eyzflow")]), "eyzflow opened PR #884 into dev: it waits for your merge, in the chat");
+        assert_eq!(
+            pr_line("orchestrator", &[owned(879, "eyzflow"), owned(1479, "mediaroom"), owned(880, "eyzflow")]),
+            "eyzflow opened PR #879 into dev and PR #880 into dev; mediaroom opened PR #1479 into dev: they wait for your merge, in the chat"
         );
     }
 

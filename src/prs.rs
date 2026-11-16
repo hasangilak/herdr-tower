@@ -2,8 +2,13 @@
 //!
 //! - **Found** at a session's turn end: a `github.com/<owner>/<repo>/pull/<n>`
 //!   link in what it said, or in what its turn printed (`gh pr create`
-//!   prints the link). Tied to the session and its space. Only a PR that is
-//!   open when first looked at becomes a chip.
+//!   prints the link). Tied to the session that opened it and its space:
+//!   the one whose `gh pr create` opened it, else the one working on its
+//!   branch in its repo (`opener`), never one that only mentions it (a
+//!   session telling another about a PR, an orchestrator reporting on
+//!   others' PRs). A PR mentioned that no session here opened is no chip
+//!   (unless the session that mentions it can't be read: a remote one).
+//!   Only a PR that is open when first looked at becomes a chip.
 //! - **Polled** with `gh pr view --json …` while open (every 30 s while
 //!   checks run or while it waits for the user's merge, 90 s otherwise, 15
 //!   min once it's days old), again at once when the queue is looked at
@@ -288,6 +293,89 @@ pub fn turn_text(jsonl: &str) -> String {
 fn creates_pr(input: &Value) -> bool {
     let cmd = input["command"].as_str().unwrap_or("");
     cmd.contains("gh pr create") || cmd.contains("hub pull-request") || input.get("head").is_some() && input.get("base").is_some() && input.get("title").is_some()
+}
+
+/// The PRs a transcript opened (`gh pr create` or GitHub's own tool, and the
+/// link its output printed), read a line at a time (the daemon feeds it
+/// what a transcript grew by).
+#[derive(Debug, Clone, Default)]
+pub struct Creates {
+    ids: Vec<String>,
+    pub made: Vec<(String, u64)>,
+}
+
+impl Creates {
+    pub fn line(&mut self, line: &str) {
+        // Most lines can't be either: no JSON parsed for them.
+        let call = line.contains("\"tool_use\"") && (line.contains("gh pr create") || line.contains("hub pull-request") || line.contains("\"head\""));
+        let result = !self.ids.is_empty() && line.contains("tool_use_id") && line.contains("/pull/");
+        if !call && !result {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else { return };
+        for b in v["message"]["content"].as_array().into_iter().flatten() {
+            match b["type"].as_str() {
+                Some("tool_use") if creates_pr(&b["input"]) => self.ids.push(b["id"].as_str().unwrap_or("").to_string()),
+                Some("tool_result") if self.ids.iter().any(|id| b["tool_use_id"].as_str() == Some(id)) => {
+                    let text = match &b["content"] {
+                        Value::String(s) => s.clone(),
+                        Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n"),
+                        _ => String::new(),
+                    };
+                    for pr in links(&text) {
+                        if !self.made.contains(&pr) {
+                            self.made.push(pr);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// What PRs a whole transcript opened.
+pub fn created_in(jsonl: &str) -> Vec<(String, u64)> {
+    let mut c = Creates::default();
+    jsonl.lines().for_each(|l| c.line(l));
+    c.made
+}
+
+/// A session, as far as who opened a PR goes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Claimant {
+    pub address: String,
+    pub name: String,
+    pub space: Option<String>,
+    /// The repo it works in (its folder, the main checkout's for a worktree) and its branch now.
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    /// The PRs its transcript opened; None: it can't be read (a remote session, Codex).
+    pub created: Option<Vec<(String, u64)>>,
+}
+
+/// Who opened `pr`: of the session that mentions it (when one does) and the
+/// others here, the one whose `gh pr create` opened it, else the one working
+/// on its branch in its repo. Nobody shown to: the one that mentions it only
+/// if it can't be read (nothing says it didn't); else nobody, it only
+/// mentions it.
+pub fn opener<'a>(pr: &Pr, mentions: Option<&'a Claimant>, others: &'a [Claimant]) -> Option<&'a Claimant> {
+    let me = (pr.repo.clone(), pr.number);
+    let all = || mentions.into_iter().chain(others.iter());
+    if let Some(c) = all().find(|c| c.created.as_ref().is_some_and(|m| m.contains(&me))) {
+        return Some(c);
+    }
+    let name = crate::prscore::folder_name(&pr.repo).to_lowercase();
+    let on_branch = |c: &&Claimant| {
+        !pr.head.is_empty()
+            && pr.head != pr.base
+            && c.branch.as_deref() == Some(pr.head.as_str())
+            && c.repo.as_deref().and_then(|r| Path::new(r).file_name()).is_some_and(|f| f.to_string_lossy().to_lowercase() == name)
+    };
+    if let Some(c) = all().find(on_branch) {
+        return Some(c);
+    }
+    mentions.filter(|c| c.created.is_none())
 }
 
 // ---- what GitHub says ----
@@ -645,6 +733,10 @@ pub type OnScore = Box<dyn Fn(&Pr) -> crate::prscore::Scored + Send + Sync>;
 /// Its session finished its turn on a PR without reporting these planned
 /// checks (now marked not run): the daemon tells the session.
 pub type OnUnreported = Box<dyn Fn(&Pr, &[crate::prscore::Check]) + Send + Sync>;
+/// Who opened a PR (`opener` over the sessions here), given the one that
+/// mentions it (empty: none). `only_it`: whether that one's own `gh pr create`
+/// opened it, nobody else looked at (Some(it) if so).
+pub type OnOwner = Box<dyn Fn(&Pr, &str, bool) -> Option<Claimant> + Send + Sync>;
 
 /// A phone's confirmation: the PR's key, the device, the head commit, until when.
 type Token = (String, String, String, u64);
@@ -660,6 +752,7 @@ pub struct Prs {
     on_merged: Arc<OnceLock<OnMerged>>,
     on_score: Arc<OnceLock<OnScore>>,
     on_unreported: Arc<OnceLock<OnUnreported>>,
+    on_owner: Arc<OnceLock<OnOwner>>,
     /// Phone confirmations: token → (key, device, head sha, until).
     tokens: Arc<Mutex<BTreeMap<String, Token>>>,
     /// Chat entries are written to the history (the daemon's; tests keep none).
@@ -720,6 +813,7 @@ impl Prs {
             on_merged: Arc::default(),
             on_score: Arc::default(),
             on_unreported: Arc::default(),
+            on_owner: Arc::default(),
             tokens: Arc::default(),
             chat: false,
         }
@@ -744,6 +838,11 @@ impl Prs {
     /// How a PR found from now on is scored, before it is shown.
     pub fn on_score(&self, f: OnScore) {
         let _ = self.on_score.set(f);
+    }
+
+    /// How the session that opened a PR is found (else it is the one that names it).
+    pub fn on_owner(&self, f: OnOwner) {
+        let _ = self.on_owner.set(f);
     }
 
     /// Who is told when a session finished its turn on a PR with planned checks unreported.
@@ -929,14 +1028,61 @@ impl Prs {
     /// line said to the user). `waiting`: the session finished its turn on
     /// them (or asked to merge).
     pub fn found(&self, found: &[(String, u64)], session: &str, name: &str, space: Option<&str>, waiting: bool) -> Vec<Pr> {
+        self.found_as(found, session, name, space, waiting, false)
+    }
+
+    /// `found`, for PRs a session's turn mentions (what it said, what it
+    /// printed): each one's session is the one that opened it (`on_owner`),
+    /// not the one that mentions it; a known one a session here was shown to
+    /// open is moved to it. One nobody here opened is no chip.
+    pub fn mentioned(&self, found: &[(String, u64)], session: &str, name: &str, space: Option<&str>, waiting: bool) -> Vec<Pr> {
+        self.found_as(found, session, name, space, waiting, true)
+    }
+
+    /// Open PRs whose session is not the one that opened them (`opener`
+    /// over `sessions` shows another, by its `gh pr create` or its branch):
+    /// moved to it. Their keys. A closed one is left as it was (its
+    /// conversation may since go on in another terminal and space: what it
+    /// was then stays).
+    pub fn reown(&self, sessions: &[Claimant]) -> Vec<String> {
+        let mut moved = vec![];
+        for pr in self.list().into_iter().filter(Pr::open) {
+            if let Some(o) = opener(&pr, None, sessions).filter(|o| o.address != pr.session) {
+                moved.push(pr.key());
+                self.own(pr, o);
+            }
+        }
+        moved
+    }
+
+    fn own(&self, mut pr: Pr, o: &Claimant) {
+        eprintln!("[prs] {}: opened by {} ({}), not {} ({})", pr.key(), o.address, o.name, pr.session, pr.name);
+        (pr.session, pr.name) = (o.address.clone(), o.name.clone());
+        if o.space.is_some() {
+            pr.space = o.space.clone();
+        }
+        self.store(pr, "update", true);
+    }
+
+    fn found_as(&self, found: &[(String, u64)], session: &str, name: &str, space: Option<&str>, waiting: bool, mention: bool) -> Vec<Pr> {
         let now = crate::history::now_ms();
+        let owner = self.on_owner.get().filter(|_| mention);
         let mut open = vec![];
         for (repo, n) in found {
             let k = key(repo, *n);
             if let Some(mut pr) = self.get(&k) {
+                // Another's (as far as the tower knew): moved to this one if its own `gh pr create` opened it.
+                if pr.open()
+                    && pr.session != session
+                    && let Some(o) = owner.and_then(|f| f(&pr, session, true))
+                {
+                    self.own(pr.clone(), &o);
+                    pr = self.get(&k).unwrap_or(pr);
+                }
                 if pr.open() {
-                    // Its session finished its turn on it: what it didn't report is not run.
-                    let unreported = if waiting { pr.validation.as_mut().map(|v| v.finished(now)).unwrap_or_default() } else { vec![] };
+                    // Its session finished its turn on it: what it didn't report is not run (another's
+                    // mention of it isn't that).
+                    let unreported = if waiting && pr.session == session { pr.validation.as_mut().map(|v| v.finished(now)).unwrap_or_default() } else { vec![] };
                     if waiting && (!pr.waiting || !unreported.is_empty()) {
                         pr.waiting = true;
                         self.store(pr.clone(), "update", true);
@@ -968,6 +1114,17 @@ impl Prs {
             if !pr.open() {
                 continue;
             }
+            // Its session is the one that opened it; one that only mentions it: no chip.
+            if let Some(f) = owner {
+                let Some(o) = f(&pr, session, false) else {
+                    eprintln!("[prs] {k}: {session} ({name}) mentions it, but no session here opened it: not shown");
+                    continue;
+                };
+                if o.address != session {
+                    eprintln!("[prs] {k}: mentioned by {session} ({name}), opened by {} ({})", o.address, o.name);
+                }
+                (pr.session, pr.name, pr.space) = (o.address.clone(), o.name.clone(), o.space.clone().or(pr.space));
+            }
             // Its review score, from the start (its plan's prediction, its own files).
             if let Some(f) = self.on_score.get() {
                 let found = f(&pr);
@@ -976,7 +1133,9 @@ impl Prs {
             // Found as its session finished its turn on it: none of its checks was reported.
             let unreported = if waiting { pr.validation.as_mut().map(|v| v.finished(now)).unwrap_or_default() } else { vec![] };
             eprintln!(
-                "[prs] {k} by {session} ({name}): {} into {}, {}{}",
+                "[prs] {k} by {} ({}): {} into {}, {}{}",
+                pr.session,
+                pr.name,
                 pr.title,
                 pr.base,
                 pr.checks_line(),
@@ -986,9 +1145,9 @@ impl Prs {
                 crate::history::append(crate::history::Entry {
                     kind: "pr".into(),
                     id: Some(k.clone()),
-                    session: Some(session.into()),
-                    name: Some(name.into()).filter(|n: &String| !n.is_empty()),
-                    space: space.map(String::from),
+                    session: Some(pr.session.clone()),
+                    name: Some(pr.name.clone()).filter(|n: &String| !n.is_empty()),
+                    space: pr.space.clone(),
                     text: pr.title.clone(),
                     ..Default::default()
                 });
@@ -1493,5 +1652,113 @@ esac
         let m = prs.merged("o/app#12", "mac").unwrap();
         assert_eq!((m.state.as_str(), m.merged_by.as_deref()), ("merged", Some("mac")));
         assert_eq!(prs.merged("o/app#12", "phone:d_phone"), None, "told once");
+    }
+
+    /// The sessions of the sandbox space on 16 Nov: eyzflow (t7h) opened
+    /// #879, #880 and #884 with `gh pr create`; the orchestrator (t18f), in
+    /// its own worktree, only told it about them (and once checked #884's
+    /// branch out to merge dev in).
+    fn sandbox() -> Vec<Claimant> {
+        let made = |ns: &[u64]| Some(ns.iter().map(|n| ("eyzhub/eyzflow".to_string(), *n)).collect::<Vec<_>>());
+        vec![
+            Claimant { address: "t18f".into(), name: "orchestrator".into(), space: Some("sandbox".into()), repo: Some("/w/eyz/eyzflow".into()), branch: Some("feat/live-editor-switch".into()), created: made(&[]) },
+            Claimant { address: "t7h".into(), name: "eyzflow".into(), space: Some("sandbox".into()), repo: Some("/w/eyz/eyzflow".into()), branch: Some("test/theme-settings".into()), created: made(&[879, 880, 884]) },
+        ]
+    }
+
+    fn eyzflow(n: u64, head: &str) -> Pr {
+        Pr { repo: "eyzhub/eyzflow".into(), number: n, head: head.into(), base: "dev".into(), state: "open".into(), ..Default::default() }
+    }
+
+    #[test]
+    fn a_pr_is_its_openers_never_one_that_mentions_it() {
+        let all = sandbox();
+        let (t18f, rest) = (Some(&all[0]), &all[1..]);
+        // The orchestrator names #879 first: it is still eyzflow's, whose gh pr create opened it.
+        assert_eq!(opener(&eyzflow(879, "test/content-block-body"), t18f, rest).map(|c| c.address.as_str()), Some("t7h"));
+        // Its gh pr create beats the orchestrator having #884's branch checked out.
+        assert_eq!(opener(&eyzflow(884, "feat/live-editor-switch"), t18f, rest).map(|c| c.address.as_str()), Some("t7h"));
+        // None here opened it, but one works on its branch in its repo: that one.
+        assert_eq!(opener(&eyzflow(899, "test/theme-settings"), t18f, rest).map(|c| c.address.as_str()), Some("t7h"));
+        // The same branch name in another repo is not it.
+        assert_eq!(opener(&Pr { repo: "eyzhub/other".into(), ..eyzflow(899, "test/theme-settings") }, t18f, rest), None);
+        // Nobody opened it and it only mentions it: nobody's.
+        assert_eq!(opener(&eyzflow(900, "someone/else"), t18f, rest), None);
+        // One that can't be read (a remote session) names it: nothing says it didn't open it.
+        let remote = Claimant { address: "vps/t2".into(), created: None, ..Default::default() };
+        assert_eq!(opener(&eyzflow(900, "someone/else"), Some(&remote), &all).map(|c| c.address.as_str()), Some("vps/t2"));
+        // Looked at without anyone mentioning it (the daemon's start): only what shows who opened it.
+        assert_eq!(opener(&eyzflow(900, "someone/else"), None, &[remote]), None);
+    }
+
+    #[test]
+    fn what_a_transcript_opened_is_its_gh_pr_create_output_only() {
+        let lines = [
+            json!({"type":"user","message":{"content":"open the PRs"}}),
+            json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"a","name":"Bash","input":{"command":"git push -u origin test/content-block-body && gh pr create --base dev --fill"}}]}}),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a","content":"https://github.com/eyzhub/eyzflow/pull/879\n"}]}}),
+            json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"b","name":"Bash","input":{"command":"gh pr list --repo eyzhub/eyzflow"}}]}}),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b","content":"https://github.com/eyzhub/eyzflow/pull/870 https://github.com/eyzhub/eyzflow/pull/871"}]}}),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"t7h: #884 https://github.com/eyzhub/eyzflow/pull/884 passes"}]}}),
+            json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"c","name":"mcp__github__create_pull_request","input":{"owner":"eyzhub","repo":"eyzflow","head":"test/content-page-layout","base":"dev","title":"Layout"}}]}}),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"c","content":[{"type":"text","text":"{\"html_url\":\"https://github.com/eyzhub/eyzflow/pull/880\"}"}]}]}}),
+        ];
+        let jsonl: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        assert_eq!(created_in(&jsonl), [("eyzhub/eyzflow".to_string(), 879), ("eyzhub/eyzflow".to_string(), 880)]);
+    }
+
+    fn serve_eyzflow(gh: &Path, n: u64, head: &str) {
+        let mut v = gh_json("OPEN", "MERGEABLE", passing());
+        v["number"] = json!(n);
+        v["url"] = json!(format!("https://github.com/eyzhub/eyzflow/pull/{n}"));
+        v["headRefName"] = json!(head);
+        v["baseRefName"] = json!("dev");
+        std::fs::write(gh.with_file_name(format!("pr-{n}.json")), serde_json::to_string(&v).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_session_messaging_another_with_a_pr_link_doesnt_take_it() {
+        let gh = fake_gh("owner");
+        for (n, head) in [(879, "test/content-block-body"), (880, "test/content-page-layout"), (900, "someone/else")] {
+            serve_eyzflow(&gh, n, head);
+        }
+        let prs = Prs::at(gh.with_file_name("prs.json"), gh.clone());
+        let all = sandbox();
+        prs.on_owner(Box::new(move |pr, mentions, only_it| {
+            let first = all.iter().find(|c| c.address == mentions);
+            if only_it {
+                return first.filter(|c| c.created.as_ref().is_some_and(|m| m.contains(&(pr.repo.clone(), pr.number)))).cloned();
+            }
+            let rest: Vec<Claimant> = all.iter().filter(|c| c.address != mentions).cloned().collect();
+            opener(pr, first, &rest).cloned()
+        }));
+        let link = |n: u64| ("eyzhub/eyzflow".to_string(), n);
+        // The orchestrator's turn ends on "t7h: #879 and #880 seen", with their links: they are eyzflow's chips.
+        let open = prs.mentioned(&[link(879), link(880)], "t18f", "orchestrator", Some("sandbox"), true);
+        assert_eq!(open.iter().map(|p| (p.number, p.session.as_str(), p.name.as_str())).collect::<Vec<_>>(), [(879, "t7h", "eyzflow"), (880, "t7h", "eyzflow")]);
+        assert_eq!(prs.get("eyzhub/eyzflow#879").unwrap().session, "t7h");
+        // Mentioned again by it, known now: still eyzflow's.
+        prs.mentioned(&[link(879)], "t18f", "orchestrator", Some("sandbox"), true);
+        assert_eq!(prs.get("eyzhub/eyzflow#879").unwrap().session, "t7h");
+        // A PR nobody here opened, only mentioned: no chip.
+        assert!(prs.mentioned(&[link(900)], "t18f", "orchestrator", Some("sandbox"), true).is_empty());
+        assert!(prs.get("eyzhub/eyzflow#900").is_none());
+
+        // What the tower had wrong before: #880 the orchestrator's. Its opener mentioning it takes it back.
+        let mut wrong = prs.get("eyzhub/eyzflow#880").unwrap();
+        (wrong.session, wrong.name) = ("t18f".into(), "orchestrator".into());
+        prs.put(wrong.clone(), "update");
+        prs.mentioned(&[link(880)], "t7h", "eyzflow", Some("sandbox"), true);
+        assert_eq!(prs.get("eyzhub/eyzflow#880").unwrap().session, "t7h");
+        // And at the daemon's start, every known one is checked.
+        prs.put(wrong, "update");
+        assert_eq!(prs.reown(&sandbox()), ["eyzhub/eyzflow#880"]);
+        assert_eq!(prs.get("eyzhub/eyzflow#880").unwrap().name, "eyzflow");
+        assert!(prs.reown(&sandbox()).is_empty(), "once");
+        // A closed one stays as it was.
+        let mut closed = prs.get("eyzhub/eyzflow#879").unwrap();
+        (closed.session, closed.state) = ("t18f".into(), "merged".into());
+        prs.put(closed, "update");
+        assert!(prs.reown(&sandbox()).is_empty());
     }
 }
