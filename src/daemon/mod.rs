@@ -18,6 +18,7 @@ pub mod merges;
 pub mod mic;
 pub mod missions;
 pub mod narrate;
+pub mod owners;
 pub mod plans;
 pub mod progress;
 pub mod queue;
@@ -385,6 +386,16 @@ pub fn run() -> Result<()> {
     {
         let (plans, gh) = (plans.clone(), prs.gh().to_path_buf());
         prs.on_score(Box::new(move |pr| score_found(&plans, &gh, pr, &crate::impact::roots())));
+        // A PR's session is the one that opened it, never one that only mentions it; those the
+        // tower took for another's are moved to it (in the background: every transcript is read once).
+        let owners = std::sync::Arc::new(owners::Owners::default());
+        let o = owners.clone();
+        prs.on_owner(Box::new(move |pr, mentions, only_it| o.opener(pr, mentions, only_it)));
+        let p = prs.clone();
+        let _ = std::thread::Builder::new().name("pr-owners".into()).spawn(move || {
+            let moved = p.reown(&owners.everyone());
+            eprintln!("[prs] owners checked: {} moved to the session that opened them", moved.len());
+        });
         // A session that finished its turn on a PR without reporting its planned checks: told once, quietly.
         let sendq = sendq.clone();
         prs.on_unreported(Box::new(move |pr, missing| {
