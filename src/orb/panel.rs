@@ -110,6 +110,7 @@ mod session;
 mod settings;
 mod space;
 mod talk;
+pub(crate) use talk::words_at;
 mod typed;
 mod viewer;
 mod window;
@@ -815,6 +816,12 @@ impl Panel {
 
     /// A peek that was clicked (it, or the orb): it takes the keyboard and
     /// stays until Esc or a click on the orb.
+    /// The message field takes the keyboard (as when the user clicks into the
+    /// window): for `HERDER_TOWER_ORB_SELECT`, whose Cmd+C goes where theirs would.
+    pub(crate) fn focus_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.text.update(cx, |s, cx| s.focus(window, cx));
+    }
+
     pub fn pin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.peek {
             return;
@@ -874,6 +881,8 @@ impl Drop for Panel {
 
 impl Render for Panel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Its selectable words are numbered from the top again (`talk::words`).
+        talk::words_frame();
         // The message field is the input of the view showing: its own kept text.
         self.follow_draft(window, cx);
         self.sync_hold(window, cx);
@@ -893,8 +902,7 @@ impl Render for Panel {
             let (header, list, foot) = (self.home_header(&all, &missions, cx), self.home_view(&all, &missions, cx), self.home_foot(None, cx));
             v_flex().size_full().child(header).child(list).children(foot).child(self.input(window, cx)).into_any_element()
         };
-        div()
-            .id("tower-panel")
+        talk::on_copy(div().id("tower-panel"))
             .size_full()
             .rounded(px(RADIUS))
             .bg(g.tint)

@@ -965,6 +965,18 @@ fn click_from_start() -> Option<Vec<String>> {
     (!all.is_empty()).then_some(all)
 }
 
+/// `HERDER_TOWER_ORB_SELECT=<words>`: a moment after the start, the
+/// window's message field takes the keyboard, and the words in the
+/// conversation that hold `words` are selected with a drag of the window's
+/// own mouse events (the pointer stays where it is), and copied with Cmd+C
+/// (a key press of the window's own). What the clipboard holds is said, and
+/// eight seconds later the clipboard is given back what it held. Then the
+/// same words get a right-click and its menu's Copy, said and given back
+/// the same way. For checking selection and copy without the pointer.
+fn select_from_start() -> Option<String> {
+    std::env::var("HERDER_TOWER_ORB_SELECT").ok().map(|w| w.trim().to_string()).filter(|w| !w.is_empty())
+}
+
 /// What `HERDER_TOWER_ORB_KEYS` types: each run (what it is, for the log) and its key presses.
 type KeySteps = Vec<(String, Vec<gpui::Keystroke>)>;
 
@@ -1257,6 +1269,83 @@ fn open_full(tower: &Entity<Tower>, to: Option<nav::Scope>, anchor: Option<mac::
                         eprintln!("[orb] HERDER_TOWER_ORB_CLICK: no row to click holds {words:?}");
                         return;
                     }
+                })
+                .detach();
+            }
+            // `HERDER_TOWER_ORB_SELECT`: words selected and copied, as a drag and Cmd+C would.
+            static SELECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if let Some(words) = select_from_start().filter(|_| !focus && !SELECTED.swap(true, std::sync::atomic::Ordering::SeqCst)) {
+                let view = view.clone();
+                cx.spawn(async move |cx: &mut AsyncApp| {
+                    let exec = cx.background_executor().clone();
+                    let wait = |ms| exec.timer(Duration::from_millis(ms));
+                    wait(2500).await;
+                    let mut found = None;
+                    for _ in 0..40 {
+                        found = panel::words_at(&words);
+                        if found.is_some() {
+                            break;
+                        }
+                        wait(250).await;
+                    }
+                    let Some(b) = found else {
+                        eprintln!("[orb] HERDER_TOWER_ORB_SELECT: no words hold {words:?}");
+                        return;
+                    };
+                    let before = cx.update(|cx| cx.read_from_clipboard());
+                    let modifiers = gpui::Modifiers::default();
+                    let (from, to) = (gpui::point(b.left() + px(1.0), b.top() + px(6.0)), gpui::point(b.right() - px(2.0), b.bottom() - px(6.0)));
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = view.update(cx, |p, cx| p.focus_field(window, cx));
+                        window.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent { position: from, pressed_button: None, modifiers }), cx);
+                        window.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { button: gpui::MouseButton::Left, position: from, modifiers, click_count: 1, first_mouse: false }), cx);
+                    });
+                    for i in 1..=10 {
+                        let f = i as f32 / 10.0;
+                        let at = gpui::point(from.x + (to.x - from.x) * f, from.y + (to.y - from.y) * f);
+                        let _ = handle.update(cx, |_, window, cx| window.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent { position: at, pressed_button: Some(gpui::MouseButton::Left), modifiers }), cx));
+                        wait(16).await;
+                    }
+                    let _ = handle.update(cx, |_, window, cx| {
+                        window.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { button: gpui::MouseButton::Left, position: to, modifiers, click_count: 1 }), cx);
+                    });
+                    wait(300).await;
+                    let _ = handle.update(cx, |_, window, cx| {
+                        if let Ok(k) = gpui::Keystroke::parse("cmd-c") {
+                            window.dispatch_keystroke(k, cx);
+                        }
+                    });
+                    wait(200).await;
+                    let got = cx.update(|cx| cx.read_from_clipboard().and_then(|c| c.text()));
+                    eprintln!("[orb] HERDER_TOWER_ORB_SELECT: dragged ({:.0}, {:.0}) to ({:.0}, {:.0}); Cmd+C: the clipboard holds {got:?}", f32::from(from.x), f32::from(from.y), f32::from(to.x), f32::from(to.y));
+                    wait(8000).await;
+                    let give_back = |cx: &mut AsyncApp, before: &Option<gpui::ClipboardItem>| {
+                        let _ = cx.update(|cx| cx.write_to_clipboard(before.clone().unwrap_or_else(|| gpui::ClipboardItem::new_string(String::new()))));
+                    };
+                    give_back(cx, &before);
+                    eprintln!("[orb] HERDER_TOWER_ORB_SELECT: clipboard given back");
+                    // A right-click on the words, nothing selected: its menu's Copy copies them whole.
+                    let mid = gpui::point(b.left() + px(20.0), b.top() + px(6.0));
+                    let _ = handle.update(cx, |_, window, cx| {
+                        gpui_kit::base::TextSelection::clear(window, cx);
+                        window.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent { position: mid, pressed_button: None, modifiers }), cx);
+                        window.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { button: gpui::MouseButton::Right, position: mid, modifiers, click_count: 1, first_mouse: false }), cx);
+                        window.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { button: gpui::MouseButton::Right, position: mid, modifiers, click_count: 1 }), cx);
+                    });
+                    eprintln!("[orb] HERDER_TOWER_ORB_SELECT: right-clicked at ({:.0}, {:.0})", f32::from(mid.x), f32::from(mid.y));
+                    wait(4000).await;
+                    let item = gpui::point(mid.x + px(30.0), mid.y + px(18.0));
+                    let _ = handle.update(cx, |_, window, cx| {
+                        window.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent { position: item, pressed_button: None, modifiers }), cx);
+                        window.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { button: gpui::MouseButton::Left, position: item, modifiers, click_count: 1, first_mouse: false }), cx);
+                        window.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { button: gpui::MouseButton::Left, position: item, modifiers, click_count: 1 }), cx);
+                    });
+                    wait(200).await;
+                    let got = cx.update(|cx| cx.read_from_clipboard().and_then(|c| c.text()));
+                    eprintln!("[orb] HERDER_TOWER_ORB_SELECT: menu Copy at ({:.0}, {:.0}): the clipboard holds {got:?}", f32::from(item.x), f32::from(item.y));
+                    wait(8000).await;
+                    give_back(cx, &before);
+                    eprintln!("[orb] HERDER_TOWER_ORB_SELECT: clipboard given back");
                 })
                 .detach();
             }

@@ -177,7 +177,7 @@ impl Panel {
         }
         let head = whead(&title, lines, back);
 
-        let said = |text: String| div().px(px(4.0)).text_size(px(13.0)).line_height(px(19.0)).text_color(g.muted).child(text);
+        let said = |text: String| div().px(px(4.0)).text_size(px(13.0)).line_height(px(19.0)).text_color(g.muted).child(super::talk::words(&addr, text));
         let mut items: Vec<AnyElement> = vec![];
         // A decision that waits on it: named, with the way to its card.
         if let Some(d) = all.iter().find(|d| d.yours() && d.sessions.iter().any(|s| s.address == addr && s.waiting)) {
