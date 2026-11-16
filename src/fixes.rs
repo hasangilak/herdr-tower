@@ -6,14 +6,20 @@
 //!   conflicts keeping what both sides meant, run its checks again, push.
 //!   A session that is gone: another of the space in the PR's repo, else one
 //!   started there (the daemon's `fixes`).
+//! - **Only while it is true, once per head**: GitHub's "unknown" (still
+//!   working out whether it merges) is no conflict. A notice still waiting
+//!   in the session's queue when the PR merges cleanly again is taken back,
+//!   and a push made before the session read it (another session's, or its
+//!   own fix) is no failed try: the waiting notice stands for the new head
+//!   too, and nothing more is sent. A head is asked about once.
 //! - **Meanwhile it is not the user's**: in no merge decision
 //!   (`Pr::ready_for_user`), its chip says who is fixing it (`line`). Once
 //!   GitHub says it merges cleanly again, it comes to the user as any PR
 //!   that waits for a merge.
 //! - **Back to the user, once**: the session says it can't (`tower pr
 //!   cant-fix`), or two tries didn't fix it (it pushed and it still
-//!   conflicts, or it pushed nothing within `FIX_MS`); or nobody could be
-//!   asked. Then it is on its merge card, with why.
+//!   conflicts), or it pushed nothing within `FIX_MS` of reading it; or
+//!   nobody could be asked. Then it is on its merge card, with why.
 //!
 //! A PR the user's "Merge all N" is merging is the chain's (`crate::merges`,
 //! which asks its session itself): left alone here.
@@ -38,16 +44,21 @@ pub struct Fix {
     pub to_name: String,
     /// Its head commit when asked: a new one is its push.
     pub head_asked: String,
+    /// When it was asked (when the notice reached the session, once it waited in its queue).
     pub asked_ms: u64,
     pub tries: u32,
     /// It came back to the user (why): it is theirs now, and isn't asked again for this conflict.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub back: Option<String>,
+    /// The notice's id in the session's queue while it waits there, unread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queued: Option<u64>,
 }
 
 /// What keeps it from merging that its session fixes: `conflicts` or `behind`.
 pub fn trouble(pr: &Pr) -> Option<&'static str> {
-    if !pr.open() || pr.draft {
+    // GitHub still working it out (after a push, or a change of its base) is no conflict yet.
+    if !pr.open() || pr.draft || unknown(pr) {
         return None;
     }
     if pr.mergeable == "conflicting" || pr.merge_state == "dirty" {
@@ -85,14 +96,17 @@ pub enum Act {
     Nothing,
     /// Ask its session (this many tries now).
     Ask { what: &'static str, tries: u32 },
-    /// It merges cleanly again: the fix is done.
+    /// It merges cleanly again: the fix is done (and a notice still queued is taken back).
     Clear,
+    /// A new head that still conflicts, pushed before its session read the
+    /// notice: the notice stands for it (no failed try, nothing sent).
+    Follow,
     /// It is the user's (why), once.
     Back(String),
 }
 
-/// What to do about `pr` at `now`.
-pub fn step(pr: &Pr, now: u64) -> Act {
+/// What to do about `pr` at `now`. `unread`: the notice still waits in its session's queue.
+pub fn step(pr: &Pr, now: u64, unread: bool) -> Act {
     let trouble = trouble(pr);
     let Some(f) = &pr.fix else {
         return match trouble {
@@ -112,21 +126,22 @@ pub fn step(pr: &Pr, now: u64) -> Act {
         return Act::Nothing;
     }
     let pushed = pr.head_sha != f.head_asked;
-    let failed = if pushed {
-        Some(match what {
+    if unread {
+        // Nothing its session did failed yet: it hasn't read the notice.
+        return if pushed { Act::Follow } else { Act::Nothing };
+    }
+    if pushed {
+        let why = match what {
             "conflicts" => format!("it still conflicts with {} after its session's update", pr.base),
             _ => format!("it is still behind {} after its session's update", pr.base),
-        })
-    } else if now.saturating_sub(f.asked_ms) >= FIX_MS {
-        Some(format!("its session didn't push a fix within {} minutes", FIX_MS / 60_000))
-    } else {
-        None
-    };
-    match failed {
-        None => Act::Nothing,
-        Some(why) if f.tries >= TRIES => Act::Back(why),
-        Some(_) => Act::Ask { what, tries: f.tries + 1 },
+        };
+        return if f.tries >= TRIES { Act::Back(why) } else { Act::Ask { what, tries: f.tries + 1 } };
     }
+    // Once per head: nothing pushed in time is no reason to say it again, it is the user's.
+    if now.saturating_sub(f.asked_ms) >= FIX_MS {
+        return Act::Back(format!("its session didn't push a fix within {} minutes", FIX_MS / 60_000));
+    }
+    Act::Nothing
 }
 
 /// What its session is told (`tries`: this is the second time).
@@ -171,31 +186,31 @@ mod tests {
     }
 
     fn asked(p: Pr, tries: u32, at: u64) -> Pr {
-        let fix = Fix { what: "conflicts".into(), to: "t13y".into(), to_name: "eyzflow".into(), head_asked: p.head_sha.clone(), asked_ms: at, tries, back: None };
+        let fix = Fix { what: "conflicts".into(), to: "t13y".into(), to_name: "eyzflow".into(), head_asked: p.head_sha.clone(), asked_ms: at, tries, ..Default::default() };
         Pr { fix: Some(fix), ..p }
     }
 
     #[test]
     fn a_conflict_is_its_sessions_to_fix_once_and_the_user_sees_it_only_when_it_merges() {
         let clean = pr("mergeable", "clean", "a1");
-        assert_eq!((trouble(&clean), step(&clean, 0), with_user(&clean)), (None, Act::Nothing, true));
+        assert_eq!((trouble(&clean), step(&clean, 0, false), with_user(&clean)), (None, Act::Nothing, true));
         // It conflicts: its session is asked; the user isn't shown it.
         let dirty = pr("conflicting", "dirty", "a1");
-        assert_eq!((trouble(&dirty), step(&dirty, 0), with_user(&dirty)), (Some("conflicts"), Act::Ask { what: "conflicts", tries: 1 }, false));
+        assert_eq!((trouble(&dirty), step(&dirty, 0, false), with_user(&dirty)), (Some("conflicts"), Act::Ask { what: "conflicts", tries: 1 }, false));
         assert_eq!(trouble(&pr("mergeable", "behind", "a1")), Some("behind"));
         // Asked: nothing more while it works on it (no second message).
         let p = asked(dirty, 1, 1_000);
-        assert_eq!(step(&p, 1_000 + 30 * 60_000), Act::Nothing);
+        assert_eq!(step(&p, 1_000 + 30 * 60_000, false), Act::Nothing);
         assert_eq!(line(&p).as_deref(), Some("Being fixed by eyzflow: resolving its conflicts with dev."));
         // It pushed; GitHub works it out again: wait.
         let pushed = Pr { head_sha: "a2".into(), mergeable: "unknown".into(), merge_state: "unknown".into(), ..p.clone() };
-        assert_eq!((step(&pushed, 2_000), with_user(&pushed)), (Act::Nothing, false), "not the user's until GitHub says it merges");
+        assert_eq!((step(&pushed, 2_000, false), with_user(&pushed)), (Act::Nothing, false), "not the user's until GitHub says it merges");
         // Clean now: the fix is done, and it is the user's to merge.
         let fixed = Pr { mergeable: "mergeable".into(), merge_state: "clean".into(), ..pushed };
-        assert_eq!((step(&fixed, 3_000), with_user(&fixed), line(&fixed)), (Act::Clear, true, None));
+        assert_eq!((step(&fixed, 3_000, false), with_user(&fixed), line(&fixed)), (Act::Clear, true, None));
         // A new conflict later is asked anew.
         let again = Pr { fix: None, mergeable: "conflicting".into(), ..fixed };
-        assert_eq!(step(&again, 4_000), Act::Ask { what: "conflicts", tries: 1 });
+        assert_eq!(step(&again, 4_000, false), Act::Ask { what: "conflicts", tries: 1 });
         // A draft or a closed PR is nobody's to fix.
         assert_eq!(trouble(&Pr { draft: true, ..pr("conflicting", "dirty", "a1") }), None);
         assert_eq!(trouble(&Pr { state: "closed".into(), ..pr("conflicting", "dirty", "a1") }), None);
@@ -206,20 +221,45 @@ mod tests {
         // Pushed, and still conflicting: a second try.
         let first = asked(pr("conflicting", "dirty", "a1"), 1, 0);
         let still = Pr { head_sha: "a2".into(), ..first.clone() };
-        assert_eq!(step(&still, 5 * 60_000), Act::Ask { what: "conflicts", tries: 2 });
+        assert_eq!(step(&still, 5 * 60_000, false), Act::Ask { what: "conflicts", tries: 2 });
         // The second fails too: the user's, with why.
         let second = asked(still, 2, 5 * 60_000);
         let again = Pr { head_sha: "a3".into(), ..second.clone() };
-        assert_eq!(step(&again, 10 * 60_000), Act::Back("it still conflicts with dev after its session's update".into()));
-        // Nothing pushed within the hour counts as a failed try.
-        assert_eq!(step(&first, FIX_MS - 1), Act::Nothing);
-        assert_eq!(step(&first, FIX_MS), Act::Ask { what: "conflicts", tries: 2 });
-        assert_eq!(step(&second, 5 * 60_000 + FIX_MS), Act::Back("its session didn't push a fix within 60 minutes".into()));
+        assert_eq!(step(&again, 10 * 60_000, false), Act::Back("it still conflicts with dev after its session's update".into()));
+        // Nothing pushed within the hour: the user's (the same head is never asked about twice).
+        assert_eq!(step(&first, FIX_MS - 1, false), Act::Nothing);
+        assert_eq!(step(&first, FIX_MS, false), Act::Back("its session didn't push a fix within 60 minutes".into()));
+        assert_eq!(step(&second, 5 * 60_000 + FIX_MS, false), Act::Back("its session didn't push a fix within 60 minutes".into()));
         // Back with the user: on their queue, said so, never asked again for it.
         let mut back = again;
         back.fix.as_mut().unwrap().back = Some("it can't keep both: the column was removed on dev".into());
-        assert_eq!((step(&back, 20 * 60_000), with_user(&back)), (Act::Nothing, true));
+        assert_eq!((step(&back, 20 * 60_000, false), with_user(&back)), (Act::Nothing, true));
         assert_eq!(line(&back).as_deref(), Some("Not fixed: it can't keep both: the column was removed on dev. Yours to look at."));
+    }
+
+    #[test]
+    fn githubs_unknown_is_no_conflict() {
+        // Right after a push or a change of its base GitHub says UNKNOWN, with whatever state it had: nothing to ask.
+        for state in ["unknown", "dirty", "blocked"] {
+            let p = pr("unknown", state, "a2");
+            assert_eq!((trouble(&p), step(&p, 0, false), line(&p)), (None, Act::Nothing, None), "{state}");
+        }
+        // Asked about a1, a new head still unknown: wait, neither a failed try nor done.
+        let p = Pr { head_sha: "a2".into(), mergeable: "unknown".into(), merge_state: "dirty".into(), ..asked(pr("conflicting", "dirty", "a1"), 1, 0) };
+        assert_eq!((step(&p, 60_000, false), with_user(&p)), (Act::Nothing, false));
+    }
+
+    #[test]
+    fn a_notice_unread_in_the_queue_is_no_try_and_is_taken_back_once_resolved() {
+        // eyzflow #884: asked at a1 while its session was busy; another session pushes a2, still conflicting.
+        let first = asked(pr("conflicting", "dirty", "a1"), 1, 0);
+        let moved = Pr { head_sha: "a2".into(), ..first.clone() };
+        assert_eq!(step(&moved, 60_000, true), Act::Follow, "no second notice for a push the session never asked for");
+        assert_eq!(step(&first, 2 * FIX_MS, true), Act::Nothing, "no hour runs out while it waits unread");
+        // Then the conflict is resolved on a new head before the notice is read: taken back, nothing sent.
+        let resolved = Pr { head_sha: "448ee669".into(), mergeable: "mergeable".into(), merge_state: "clean".into(), ..first };
+        assert_eq!(step(&resolved, 120_000, true), Act::Clear);
+        assert_eq!(step(&Pr { fix: None, ..resolved }, 130_000, false), Act::Nothing);
     }
 
     #[test]
