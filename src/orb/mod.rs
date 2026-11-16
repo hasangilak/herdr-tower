@@ -1395,8 +1395,12 @@ fn open_full(tower: &Entity<Tower>, to: Option<nav::Scope>, anchor: Option<mac::
     }
 }
 
-/// Where the full window was last put (beside `orb.json`).
+/// Where the full window was last put (beside `orb.json`). Under test, a
+/// scratch file of the test run's own: the tests never write the user's.
 fn window_position_file() -> PathBuf {
+    if cfg!(test) {
+        return std::env::temp_dir().join(format!("herder-tower-test-window-{}.json", std::process::id()));
+    }
     config::state_dir().join("window.json")
 }
 
@@ -1966,7 +1970,8 @@ mod tests {
 
     #[test]
     fn the_window_file_keeps_the_frame_and_the_mode_apart() {
-        // The tests' state folder is a scratch one (HERDER_TOWER_STATE); this file is this test's alone.
+        // A scratch file of this run's (never the user's window.json), and this test's alone.
+        assert!(window_position_file().starts_with(std::env::temp_dir()));
         let _ = std::fs::remove_file(window_position_file());
         assert!(!saved_full_mode(), "no file: the floating panel, as before");
         save_window_frame(10.0, 20.0, 1200.0, 760.0);
@@ -1997,6 +2002,7 @@ mod tests {
         // Nonsense in the file is no width.
         write_window_file(&serde_json::json!({ "side_w": -3, "chat_w": "wide" }));
         assert_eq!(saved_columns(), (None, None));
+        let _ = std::fs::remove_file(window_position_file());
         let _ = std::fs::remove_file(window_position_file());
     }
 }
