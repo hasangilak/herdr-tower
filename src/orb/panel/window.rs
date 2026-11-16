@@ -40,8 +40,15 @@ use crate::history;
 use crate::orb::model::{self, Decision, Missions};
 use crate::orb::nav::{Scope, Side};
 
-/// The sidebar's width, in points.
+/// The sidebar's width, in points, until the user drags it (`widths`).
 const SIDE_W: f32 = 236.0;
+/// The least and the most the sidebar is dragged to.
+const SIDE_MIN_W: f32 = 200.0;
+const SIDE_MAX_W: f32 = 360.0;
+/// The least the conversation's column is dragged to.
+const TALK_MIN_W: f32 = 280.0;
+/// The pane's padding beside its content.
+const PANE_PAD: f32 = 36.0;
 /// The queue's column beside the missions (of the 688 the pane has).
 const QUEUE_W: f32 = 350.0;
 /// The pane is laid out in two columns from this width (All spaces' queue
@@ -54,8 +61,70 @@ const PANE_MIN_W: f32 = 420.0;
 /// of what the sidebar leaves (300 to 460), never so wide the pane gets less
 /// than `PANE_MIN_W`, and never under 280.
 pub(super) fn talk_width(win_w: f32) -> f32 {
-    let room = win_w - SIDE_W;
-    (room * 0.38).clamp(300.0, 460.0).min(room - PANE_MIN_W - 36.0).max(280.0)
+    talk_default(win_w, SIDE_W)
+}
+
+fn talk_default(win_w: f32, side: f32) -> f32 {
+    let room = win_w - side;
+    (room * 0.38).clamp(300.0, 460.0).min(room - PANE_MIN_W - PANE_PAD).max(TALK_MIN_W)
+}
+
+/// The sidebar's and the conversation column's widths in a window `win_w`
+/// wide, from what the user dragged them to (`None`: never, or reset):
+/// the sidebar 200 to 360, the column from 280 to what leaves the pane its
+/// 420. A window too narrow for all three takes it from the sidebar first,
+/// then the column, never under their least.
+pub(super) fn widths(win_w: f32, side: Option<f32>, talk: Option<f32>) -> (f32, f32) {
+    let side = side.unwrap_or(SIDE_W).clamp(SIDE_MIN_W, SIDE_MAX_W).min(win_w - TALK_MIN_W - PANE_MIN_W - PANE_PAD).max(SIDE_MIN_W);
+    let talk = match talk {
+        Some(t) => t.min(win_w - side - PANE_MIN_W - PANE_PAD).max(TALK_MIN_W),
+        None => talk_default(win_w, side),
+    };
+    (side, talk)
+}
+
+/// Which border is being dragged: the sidebar's (between it and the
+/// conversation, or the pane in a view without one) or the conversation's
+/// (between it and the pane).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum Edge {
+    Side,
+    Talk,
+}
+
+/// A column's border being dragged: where the press was (x, in the
+/// window) and the widths then.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Resize {
+    edge: Edge,
+    x0: f32,
+    side0: f32,
+    talk0: f32,
+    /// The view has a conversation: the sidebar's border moves it along (its right border stays put).
+    with_talk: bool,
+    moved: bool,
+}
+
+/// The widths `r` gives with the pointer at `x` in a window `win_w` wide
+/// (both dragged, as `FullUi::side_w`/`talk_w`, kept within `widths`). The
+/// conversation's border moves its column's right; the sidebar's moves the
+/// border between the two, the column's right staying where it is.
+pub(super) fn dragged(r: &Resize, x: f32, win_w: f32) -> (f32, f32) {
+    let dx = x - r.x0;
+    match r.edge {
+        Edge::Talk => (r.side0, widths(win_w, Some(r.side0), Some(r.talk0 + dx)).1),
+        Edge::Side => {
+            let (side, _) = widths(win_w, Some(r.side0 + dx), Some(r.talk0));
+            if !r.with_talk {
+                return (side, r.talk0);
+            }
+            // The column gives (or takes) what the sidebar took, its right border staying, never under its least.
+            let talk = (r.talk0 - (side - r.side0)).max(TALK_MIN_W);
+            let side = r.side0 + r.talk0 - talk;
+            let (side, talk) = widths(win_w, Some(side), Some(talk));
+            (side, talk)
+        }
+    }
 }
 
 /// What the full window keeps of its own.
@@ -89,6 +158,12 @@ pub(super) struct FullUi {
     pub scoring: Option<String>,
     /// The window is being moved by its header or the sidebar's top.
     pub drag: Option<Drag>,
+    /// The widths the user dragged the sidebar and the conversation's
+    /// column to (`None`: the default), kept in `window.json`; and the drag
+    /// under way.
+    pub side_w: Option<f32>,
+    pub chat_w: Option<f32>,
+    pub resize: Option<Resize>,
     /// Whether a space can have a tower of its own to talk to (this tower's
     /// `ask` takes `--space`); `None` until asked. Without one, what is
     /// typed in a space's view goes to the main tower with the space named.
@@ -143,6 +218,7 @@ pub(super) struct FullUi {
 impl FullUi {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Panel>) -> Self {
         let scroll = gpui::ScrollHandle::new();
+        let cols = crate::orb::saved_columns();
         Self {
             shown: None,
             launch: launch::LaunchUi::new(),
@@ -158,6 +234,9 @@ impl FullUi {
             scoring: None,
             voice: None,
             drag: None,
+            side_w: cols.0,
+            chat_w: cols.1,
+            resize: None,
             space_tower: None,
             model: None,
             settings_scroll: scroll.clone(),
@@ -222,6 +301,89 @@ impl Panel {
         if let Some(full) = self.full.as_mut() {
             full.drag = None;
         }
+    }
+
+    /// A press on a column's border: a drag of it starts (a double click
+    /// puts that border back where it was at first, and keeps that).
+    fn resize_start(&mut self, edge: Edge, e: &gpui::MouseDownEvent, window: &Window, cx: &mut Context<Self>) {
+        let win_w = f32::from(window.viewport_size().width);
+        let Some(f) = self.full.as_mut() else { return };
+        if e.click_count >= 2 {
+            f.resize = None;
+            match edge {
+                Edge::Side => f.side_w = None,
+                Edge::Talk => f.chat_w = None,
+            }
+            crate::orb::save_columns(f.side_w, f.chat_w);
+            cx.notify();
+            return;
+        }
+        let (side0, talk0) = widths(win_w, f.side_w, f.chat_w);
+        let with_talk = f.talk_w > 0.0;
+        f.resize = Some(Resize { edge, x0: f32::from(e.position.x), side0, talk0, with_talk, moved: false });
+        cx.notify();
+    }
+
+    /// The pointer moved while a border is held: the columns follow it.
+    /// A move with the button up (let go outside the window) ends it.
+    fn resize_moved(&mut self, e: &gpui::MouseMoveEvent, window: &Window, cx: &mut Context<Self>) {
+        let Some(r) = self.full.as_ref().and_then(|f| f.resize) else { return };
+        if e.pressed_button != Some(gpui::MouseButton::Left) {
+            self.resize_end(cx);
+            return;
+        }
+        let (side, talk) = dragged(&r, f32::from(e.position.x), f32::from(window.viewport_size().width));
+        if let Some(f) = self.full.as_mut() {
+            f.side_w = Some(side);
+            if r.with_talk {
+                f.chat_w = Some(talk);
+            }
+            if let Some(r) = f.resize.as_mut() {
+                r.moved = true;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Let go of a border: the widths it left are kept for next time.
+    fn resize_end(&mut self, cx: &mut Context<Self>) {
+        let Some(f) = self.full.as_mut() else { return };
+        let Some(r) = f.resize.take() else { return };
+        if r.moved {
+            crate::orb::save_columns(f.side_w, f.chat_w);
+        }
+        cx.notify();
+    }
+
+    /// A column's border, `x` from the window's left: an 8-point strip the
+    /// pointer drags it by (a resize cursor; a line shows on hover and while dragged).
+    fn border_handle(&mut self, edge: Edge, x: f32, cx: &mut Context<Self>) -> AnyElement {
+        let held = self.full.as_ref().and_then(|f| f.resize).is_some_and(|r| r.edge == edge);
+        let id = match edge {
+            Edge::Side => "side-border",
+            Edge::Talk => "talk-border",
+        };
+        div()
+            .id(id)
+            .group(id)
+            .absolute()
+            .top_0()
+            .h_full()
+            .left(px(x - 4.0))
+            .w(px(8.0))
+            .flex()
+            .justify_center()
+            .cursor(gpui::CursorStyle::ResizeColumn)
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
+                    // Not a move of the window, nor a click on what is under it.
+                    cx.stop_propagation();
+                    this.resize_start(edge, e, window, cx);
+                }),
+            )
+            .child(div().w(px(2.0)).h_full().when(held, |el| el.bg(rgba(0xffffff40))).when(!held, |el| el.group_hover(id, |s| s.bg(rgba(0xffffff26)))))
+            .into_any_element()
     }
 
     /// The user moved or resized it: where it is and its size are kept for next time.
@@ -566,8 +728,11 @@ impl Panel {
         // The widths, from the window's as it is now: the conversation's
         // column (All spaces, a space) and what is left for the pane, which
         // every view lays itself out to (`FullUi::pane_w`).
-        let talk_w = matches!(scope, Scope::All | Scope::Space(_) | Scope::New).then(|| talk_width(f32::from(window.viewport_size().width)));
-        let pane_w = f32::from(window.viewport_size().width) - SIDE_W - talk_w.unwrap_or(0.0) - 36.0;
+        // The sidebar and the column are as wide as the user dragged them (`widths`).
+        let win_w = f32::from(window.viewport_size().width);
+        let (side_w, chat_w) = self.full.as_ref().map(|f| widths(win_w, f.side_w, f.chat_w)).unwrap_or((SIDE_W, talk_width(win_w)));
+        let talk_w = matches!(scope, Scope::All | Scope::Space(_) | Scope::New).then_some(chat_w);
+        let pane_w = win_w - side_w - talk_w.unwrap_or(0.0) - PANE_PAD;
         if let Some(f) = self.full.as_mut() {
             f.pane_w = pane_w;
             f.talk_w = talk_w.unwrap_or(0.0);
@@ -637,7 +802,13 @@ impl Panel {
             Some(space) => self.foot_items(space.as_deref(), cx),
             None => vec![],
         };
-        let side = self.sidebar(&scope, &all, &missions, cx);
+        let side = self.sidebar(&scope, side_w, &all, &missions, cx);
+        // The columns' borders, dragged to resize them (on top of what is beside them).
+        let mut borders = vec![self.border_handle(Edge::Side, side_w, cx)];
+        if let Some(t) = talk_w.filter(|_| chat.is_some()) {
+            borders.push(self.border_handle(Edge::Talk, side_w + t, cx));
+        }
+        let resizing = self.full.as_ref().is_some_and(|f| f.resize.is_some());
         // The window is moved by its header strip (and the sidebar's top).
         let head = self.grip("head-grip", head, cx);
         let me = cx.entity().downgrade();
@@ -685,16 +856,26 @@ impl Panel {
                 gpui::canvas(
                     |_, _, _| {},
                     move |_, _, window, _| {
+                        // A border held: the resize cursor wherever the pointer goes.
+                        if resizing {
+                            window.set_window_cursor_style(gpui::CursorStyle::ResizeColumn);
+                        }
                         let m = me.clone();
-                        window.on_mouse_event(move |_: &gpui::MouseMoveEvent, phase, window, cx| {
+                        window.on_mouse_event(move |e: &gpui::MouseMoveEvent, phase, window, cx| {
                             if phase == gpui::DispatchPhase::Bubble {
-                                let _ = m.update(cx, |this, _| this.drag_moved(window));
+                                let _ = m.update(cx, |this, cx| {
+                                    this.drag_moved(window);
+                                    this.resize_moved(e, window, cx);
+                                });
                             }
                         });
                         let m = me.clone();
                         window.on_mouse_event(move |e: &gpui::MouseUpEvent, phase, window, cx| {
                             if phase == gpui::DispatchPhase::Bubble && e.button == gpui::MouseButton::Left {
-                                let _ = m.update(cx, |this, _| this.drag_end(window));
+                                let _ = m.update(cx, |this, cx| {
+                                    this.drag_end(window);
+                                    this.resize_end(cx);
+                                });
                             }
                         });
                     },
@@ -702,11 +883,12 @@ impl Panel {
                 .absolute()
                 .size_full(),
             )
+            .children(borders)
             .into_any_element()
     }
 
     /// The sidebar: where the window can go, and how each space stands.
-    fn sidebar(&mut self, scope: &Scope, all: &[Decision], missions: &Missions, cx: &mut Context<Self>) -> AnyElement {
+    fn sidebar(&mut self, scope: &Scope, width: f32, all: &[Decision], missions: &Missions, cx: &mut Context<Self>) -> AnyElement {
         let g = glass();
         let here = scope.side();
         let status = self.status_el(all, missions, cx);
@@ -863,7 +1045,7 @@ impl Panel {
                 .on_click(cx.listener(move |this, _, _, cx| this.nav_to(to.clone(), cx)))
         };
         v_flex()
-            .w(px(SIDE_W))
+            .w(px(width))
             .h_full()
             .flex_none()
             .px(px(10.0))
@@ -1019,6 +1201,44 @@ impl Panel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dragged_columns_keep_every_column_its_least() {
+        // Never dragged: the sidebar's 236 and the column's default.
+        assert_eq!(widths(1400.0, None, None), (236.0, talk_width(1400.0)));
+        // Dragged: as wide as asked, within its bounds.
+        assert_eq!(widths(1400.0, Some(280.0), Some(600.0)), (280.0, 600.0));
+        assert_eq!(widths(1400.0, Some(100.0), Some(100.0)), (SIDE_MIN_W, TALK_MIN_W), "never under their least");
+        assert_eq!(widths(1400.0, Some(900.0), None).0, SIDE_MAX_W);
+        // Too wide for the window: the pane keeps its 420.
+        let (s, t) = widths(1400.0, Some(236.0), Some(1200.0));
+        assert_eq!(1400.0 - s - t - PANE_PAD, PANE_MIN_W);
+        // The window made narrower after: the column gives way, the pane still keeps its own.
+        for w in [960.0_f32, 1000.0, 1150.0, 1400.0, 1728.0, 2400.0] {
+            for (side, talk) in [(None, None), (Some(360.0), Some(2000.0)), (Some(200.0), Some(280.0))] {
+                let (s, t) = widths(w, side, talk);
+                assert!((SIDE_MIN_W..=SIDE_MAX_W).contains(&s) && t >= TALK_MIN_W, "{w} {side:?} {talk:?}: {s} {t}");
+                assert!(w - s - t - PANE_PAD >= PANE_MIN_W - 0.01 || (s, t) == (SIDE_MIN_W, TALK_MIN_W), "{w}: the pane keeps room ({s} {t})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_border_follows_the_pointer_and_stops_at_the_least() {
+        let talk = Resize { edge: Edge::Talk, x0: 600.0, side0: 236.0, talk0: 364.0, with_talk: true, moved: false };
+        assert_eq!(dragged(&talk, 800.0, 1500.0), (236.0, 564.0), "wider by what it moved");
+        assert_eq!(dragged(&talk, 500.0, 1500.0), (236.0, 280.0), "narrower, never under 280");
+        assert_eq!(dragged(&talk, 1500.0, 1500.0), (236.0, 1500.0 - 236.0 - PANE_MIN_W - PANE_PAD), "the pane keeps its 420");
+        // The sidebar's border: the column gives what the sidebar takes, its right border staying.
+        let side = Resize { edge: Edge::Side, x0: 236.0, side0: 236.0, talk0: 364.0, with_talk: true, moved: false };
+        assert_eq!(dragged(&side, 200.0, 1500.0), (200.0, 400.0));
+        assert_eq!(dragged(&side, 300.0, 1500.0), (300.0, 300.0));
+        assert_eq!(dragged(&side, 340.0, 1500.0), (320.0, 280.0), "stops where the column has its least");
+        assert_eq!(dragged(&side, 100.0, 1500.0), (200.0, 400.0), "and at the sidebar's");
+        // A view without a conversation: the sidebar alone.
+        let alone = Resize { with_talk: false, ..side };
+        assert_eq!(dragged(&alone, 340.0, 1500.0), (340.0, 364.0));
+    }
 
     #[test]
     fn each_view_scrolls_by_itself() {
