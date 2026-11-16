@@ -34,6 +34,7 @@ mod dispatch;
 mod failover;
 mod goals;
 mod draft;
+mod findings;
 mod fixes;
 mod hc;
 mod history;
@@ -335,6 +336,44 @@ enum Cmd {
     /// what compiling, type-checking or running the dependents' tests showed: `tower impact <pr>
     /// breaks "<what breaks, and who uses it: repo, file, function>"` or `tower impact <pr> clean
     /// "<what you compiled or ran>"`. A break makes it a breaking change, for the user to review.
+    /// A bug found off its space's goal, spun out to a space of its own (a space's tower runs
+    /// it when a session reports one): `tower finding report --from <session> --title "<what is
+    /// wrong>" --what "<what was found>" [--repo <folder>] [--place <file:lines>]… [--repro
+    /// "<how>"] [--evidence "<what shows it>"] [--off-goal]` judges it against the space's goal
+    /// and files it once (the same bug found again is told where it went); then publish its
+    /// write-up as an artifact and `tower finding published <id> --url <link>` opens its space
+    /// and tells the session that found it and the user. `tower finding list|show <id>`.
+    Finding {
+        /// report, published, list or show.
+        action: String,
+        /// The finding (published, show): f1.
+        id: Option<String>,
+        /// The session that found it (its address).
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        what: Option<String>,
+        /// The repo's folder (default: the session's).
+        #[arg(long)]
+        repo: Option<String>,
+        /// A file and its lines: src/auth.rs:120-140 (again for more).
+        #[arg(long = "place")]
+        places: Vec<String>,
+        #[arg(long)]
+        repro: Option<String>,
+        #[arg(long)]
+        evidence: Option<String>,
+        /// The artifact's link (published).
+        #[arg(long)]
+        url: Option<String>,
+        /// Judged off its space's goal by the tower, whatever words it shares with it.
+        #[arg(long)]
+        off_goal: bool,
+        #[arg(long)]
+        json: bool,
+    },
     Impact {
         /// The PR: owner/repo#12, its link, or #12.
         pr: String,
@@ -1076,6 +1115,9 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::TodoTools { action } => todo_tools_cmd(&action),
         Cmd::Scoring { action, value, low, medium, json } => scoring_cmd(&action, value.as_deref(), low, medium, json),
         Cmd::Releases { space, json } => releases_cmd(space.as_deref(), json),
+        Cmd::Finding { action, id, from, title, what, repo, places, repro, evidence, url, off_goal, json } => {
+            findings::cmd(findings::Args { action, id, from, title, what, repo, places, repro, evidence, url, off_goal, json })
+        }
         Cmd::Impact { pr, verdict, text, json } => impact_cmd(&pr, verdict.as_deref(), &text.join(" "), json),
         Cmd::Pr { action, pr, why } => pr_cmd(&action, &pr, &why.join(" ")),
         Cmd::Validate { pr, check, status, evidence, json } => validate_cmd(&pr, check.as_deref(), status.as_deref(), evidence.as_deref(), json),
