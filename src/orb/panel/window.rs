@@ -103,6 +103,30 @@ pub(super) struct Resize {
     /// The view has a conversation: the sidebar's border moves it along (its right border stays put).
     with_talk: bool,
     moved: bool,
+    /// Where the conversation was read (`ChatAt`): kept there as its text wraps anew.
+    at: ChatAt,
+}
+
+/// Where the conversation's column is read: at its end, or at a message
+/// (its top row): a new width wraps the text anew, and it stays there
+/// rather than at the same distance from the top.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum ChatAt {
+    End,
+    Item(usize),
+}
+
+impl ChatAt {
+    fn of(s: &gpui::ScrollHandle) -> Self {
+        if f32::from(-s.offset().y) >= f32::from(s.max_offset().y) - 4.0 { ChatAt::End } else { ChatAt::Item(s.logical_scroll_top().0) }
+    }
+
+    fn keep(self, s: &gpui::ScrollHandle) {
+        match self {
+            ChatAt::End => s.scroll_to_bottom(),
+            ChatAt::Item(ix) => s.scroll_to_top_of_item(ix),
+        }
+    }
 }
 
 /// The widths `r` gives with the pointer at `x` in a window `win_w` wide
@@ -308,8 +332,10 @@ impl Panel {
     fn resize_start(&mut self, edge: Edge, e: &gpui::MouseDownEvent, window: &Window, cx: &mut Context<Self>) {
         let win_w = f32::from(window.viewport_size().width);
         let Some(f) = self.full.as_mut() else { return };
+        let at = ChatAt::of(&f.chat_scroll);
         if e.click_count >= 2 {
             f.resize = None;
+            at.keep(&f.chat_scroll);
             match edge {
                 Edge::Side => f.side_w = None,
                 Edge::Talk => f.chat_w = None,
@@ -320,7 +346,7 @@ impl Panel {
         }
         let (side0, talk0) = widths(win_w, f.side_w, f.chat_w);
         let with_talk = f.talk_w > 0.0;
-        f.resize = Some(Resize { edge, x0: f32::from(e.position.x), side0, talk0, with_talk, moved: false });
+        f.resize = Some(Resize { edge, x0: f32::from(e.position.x), side0, talk0, with_talk, moved: false, at });
         cx.notify();
     }
 
@@ -341,6 +367,7 @@ impl Panel {
             if let Some(r) = f.resize.as_mut() {
                 r.moved = true;
             }
+            r.at.keep(&f.chat_scroll);
         }
         cx.notify();
     }
@@ -1225,12 +1252,12 @@ mod tests {
 
     #[test]
     fn a_border_follows_the_pointer_and_stops_at_the_least() {
-        let talk = Resize { edge: Edge::Talk, x0: 600.0, side0: 236.0, talk0: 364.0, with_talk: true, moved: false };
+        let talk = Resize { edge: Edge::Talk, x0: 600.0, side0: 236.0, talk0: 364.0, with_talk: true, moved: false, at: ChatAt::End };
         assert_eq!(dragged(&talk, 800.0, 1500.0), (236.0, 564.0), "wider by what it moved");
         assert_eq!(dragged(&talk, 500.0, 1500.0), (236.0, 280.0), "narrower, never under 280");
         assert_eq!(dragged(&talk, 1500.0, 1500.0), (236.0, 1500.0 - 236.0 - PANE_MIN_W - PANE_PAD), "the pane keeps its 420");
         // The sidebar's border: the column gives what the sidebar takes, its right border staying.
-        let side = Resize { edge: Edge::Side, x0: 236.0, side0: 236.0, talk0: 364.0, with_talk: true, moved: false };
+        let side = Resize { edge: Edge::Side, x0: 236.0, side0: 236.0, talk0: 364.0, with_talk: true, moved: false, at: ChatAt::End };
         assert_eq!(dragged(&side, 200.0, 1500.0), (200.0, 400.0));
         assert_eq!(dragged(&side, 300.0, 1500.0), (300.0, 300.0));
         assert_eq!(dragged(&side, 340.0, 1500.0), (320.0, 280.0), "stops where the column has its least");
