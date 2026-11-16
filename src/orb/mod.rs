@@ -1330,6 +1330,40 @@ pub(crate) fn save_window_frame(x: f64, y: f64, w: f64, h: f64) {
     write_window_file(&v);
 }
 
+/// The widths the user dragged the full window's sidebar and conversation
+/// column to (`None`: never, or put back with a double click).
+pub(crate) fn saved_columns() -> (Option<f32>, Option<f32>) {
+    columns_of(&window_file())
+}
+
+/// The full window's columns were dragged (or one put back): kept for next time.
+pub(crate) fn save_columns(side: Option<f32>, chat: Option<f32>) {
+    let mut v = window_file();
+    set_columns(&mut v, side, chat);
+    write_window_file(&v);
+}
+
+/// What `window.json` says of the columns' widths (`side_w`, `chat_w`).
+fn columns_of(v: &Value) -> (Option<f32>, Option<f32>) {
+    let w = |k: &str| v[k].as_f64().filter(|n| n.is_finite() && *n > 0.0).map(|n| n as f32);
+    (w("side_w"), w("chat_w"))
+}
+
+/// The columns' widths into `window.json`'s object, the rest of it kept (`None` leaves a width out).
+fn set_columns(v: &mut Value, side: Option<f32>, chat: Option<f32>) {
+    let Some(o) = v.as_object_mut() else { return };
+    for (k, n) in [("side_w", side), ("chat_w", chat)] {
+        match n {
+            Some(n) => {
+                o.insert(k.into(), serde_json::json!(n.round()));
+            }
+            None => {
+                o.remove(k);
+            }
+        }
+    }
+}
+
 /// Which of the two the orb opens: the full window (`true`) or the floating panel.
 fn saved_full_mode() -> bool {
     window_file()["mode"].as_str() == Some("full")
@@ -1859,6 +1893,21 @@ mod tests {
         write_window_file(&serde_json::json!({ "x": 1.0, "y": 2.0 }));
         assert!(!saved_full_mode());
         assert_eq!(saved_window(), Some((1.0, 2.0, panel::FULL_W as f64, panel::FULL_H as f64)));
+        // The columns' widths: none kept at first, kept when dragged, beside the frame and the mode.
+        write_window_file(&serde_json::json!({ "x": 1.0, "y": 2.0, "mode": "full" }));
+        assert_eq!(saved_columns(), (None, None));
+        save_columns(Some(250.4), Some(612.0));
+        assert_eq!(saved_columns(), (Some(250.0), Some(612.0)));
+        save_window_frame(5.0, 6.0, 1500.0, 900.0);
+        assert_eq!(saved_columns(), (Some(250.0), Some(612.0)), "moving the window keeps them");
+        assert!(saved_full_mode() && saved_window() == Some((5.0, 6.0, 1500.0, 900.0)), "and they keep the rest");
+        // A double click puts one back: it is left out, the other kept.
+        save_columns(Some(250.0), None);
+        assert_eq!(saved_columns(), (Some(250.0), None));
+        assert!(window_file().get("chat_w").is_none());
+        // Nonsense in the file is no width.
+        write_window_file(&serde_json::json!({ "side_w": -3, "chat_w": "wide" }));
+        assert_eq!(saved_columns(), (None, None));
         let _ = std::fs::remove_file(window_position_file());
     }
 }
