@@ -27,25 +27,52 @@ pub trait Hands: Send + Sync {
     fn find(&self, space: &str, repo: &str) -> Option<(String, String)>;
     /// A session started in `space` in `repo`'s folder, with `task`: its address and name.
     fn start(&self, space: &str, repo: &str, task: &str) -> Result<(String, String)>;
-    /// `text` into the session's queue.
-    fn tell(&self, address: &str, text: &str) -> Result<()>;
+    /// `text` into the session's queue: its id there if it waits (the session is busy).
+    fn tell(&self, address: &str, text: &str) -> Result<Option<u64>>;
+    /// The queued notice `id` still waits there, unread.
+    fn waits(&self, id: u64) -> bool;
+    /// Takes the queued notice `id` back (it is no longer true).
+    fn withdraw(&self, id: u64);
     /// The user's "Merge all N" is merging it (and asks its session itself).
     fn in_chain(&self, key: &str) -> bool;
 }
 
 /// One look at every PR: what each needs, done.
 pub fn tick(prs: &Prs, hands: &dyn Hands, now: u64) {
-    for pr in prs.list() {
-        // Only those handed to the user (another is still its session's work), and none a chain merges.
-        if !pr.waiting || pr.session.is_empty() && pr.fix.is_none() || hands.in_chain(&pr.key()) {
+    for mut pr in prs.list() {
+        let k = pr.key();
+        // A notice that waited in its session's queue and left it: read from now on.
+        if let Some(f) = pr.fix.as_mut()
+            && let Some(id) = f.queued
+            && !hands.waits(id)
+        {
+            f.queued = None;
+            f.asked_ms = now;
+            prs.set_fix(&k, Some(f.clone()));
+        }
+        let queued = pr.fix.as_ref().and_then(|f| f.queued);
+        let act = fixes::step(&pr, now, queued.is_some());
+        // Only those handed to the user (another is still its session's work), and none a chain
+        // merges: of the others, only a notice no longer true is taken back.
+        let skip = !pr.waiting || pr.session.is_empty() && pr.fix.is_none() || hands.in_chain(&k);
+        if skip && act != Act::Clear {
             continue;
         }
-        let k = pr.key();
-        match fixes::step(&pr, now) {
+        match act {
             Act::Nothing => {}
             Act::Clear => {
                 eprintln!("[fixes] {k} merges cleanly again");
+                if let Some(id) = queued {
+                    eprintln!("[fixes] {k}: its notice #{id} hadn't reached its session, taken back");
+                    hands.withdraw(id);
+                }
                 prs.set_fix(&k, None);
+            }
+            Act::Follow => {
+                eprintln!("[fixes] {k}: new head {} still conflicts, its notice still waits: nothing more sent", pr.head_sha);
+                let mut f = pr.fix.clone().unwrap_or_default();
+                f.head_asked = pr.head_sha.clone();
+                prs.set_fix(&k, Some(f));
             }
             Act::Back(why) => {
                 eprintln!("[fixes] {k} is the user's: {why}");
@@ -70,14 +97,16 @@ fn ask(pr: &Pr, what: &str, tries: u32, hands: &dyn Hands, now: u64) -> Fix {
     let space = pr.space.clone().unwrap_or_default();
     let there = asked_before.into_iter().chain(own).find(|(a, _)| hands.alive(a)).or_else(|| (!space.is_empty()).then(|| hands.find(&space, &pr.repo)).flatten());
     let told = match there {
-        Some((address, name)) => hands.tell(&address, &text).map(|_| (address, name)),
+        Some((address, name)) => hands.tell(&address, &text).map(|q| (address, name, q)),
         None if space.is_empty() => Err(anyhow::anyhow!("it has no space to start a session in")),
-        None => hands.start(&space, &pr.repo, &format!("You take over PR #{n}: check out its branch first (`gh pr checkout {n} --repo {repo}`). {text}", n = pr.number, repo = pr.repo)),
+        None => hands
+            .start(&space, &pr.repo, &format!("You take over PR #{n}: check out its branch first (`gh pr checkout {n} --repo {repo}`). {text}", n = pr.number, repo = pr.repo))
+            .map(|(a, n)| (a, n, None)),
     };
     match told {
-        Ok((address, name)) => {
-            eprintln!("[fixes] {k} {}: asked {address} to fix it (try {tries})", if what == "conflicts" { "conflicts" } else { "is behind" });
-            (fix.to, fix.to_name) = (address, name);
+        Ok((address, name, queued)) => {
+            eprintln!("[fixes] {k} {} at {}: asked {address} to fix it (try {tries}{})", if what == "conflicts" { "conflicts" } else { "is behind" }, pr.head_sha, if queued.is_some() { ", queued" } else { "" });
+            (fix.to, fix.to_name, fix.queued) = (address, name, queued);
         }
         Err(e) => {
             eprintln!("[fixes] {k}: nobody could be asked to fix it: {e:#}");
@@ -146,8 +175,22 @@ impl Hands for Real {
         Ok((address.to_string(), name))
     }
 
-    fn tell(&self, address: &str, text: &str) -> Result<()> {
-        self.sendq.add(address, text, &[]).map(|_| ())
+    fn tell(&self, address: &str, text: &str) -> Result<Option<u64>> {
+        Ok(match self.sendq.add(address, text, &[])?.0 {
+            super::sendq::Added::Queued { id, .. } => Some(id),
+            super::sendq::Added::Sent { .. } => None,
+        })
+    }
+
+    fn waits(&self, id: u64) -> bool {
+        // Being typed in right now counts as read.
+        self.sendq.items().iter().any(|i| i.id == id && !matches!(i.state(), super::sendq::ItemState::Claimed { .. }))
+    }
+
+    fn withdraw(&self, id: u64) {
+        if let Err(e) = self.sendq.cancel(id) {
+            eprintln!("[fixes] couldn't take back #{id}: {e:#}");
+        }
     }
 
     fn in_chain(&self, key: &str) -> bool {
@@ -185,6 +228,7 @@ pub fn start(prs: Prs, hands: Arc<dyn Hands>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixes::FIX_MS;
     use std::sync::Mutex;
 
     /// Sessions that are there or not, and what each was told.
@@ -195,6 +239,11 @@ mod tests {
         can_start: bool,
         chain: Vec<String>,
         told: Mutex<Vec<(String, String)>>,
+        /// Sessions busy: what they are told waits in their queue (ids from 100).
+        busy: Vec<String>,
+        /// Queued notices still unread.
+        queue: Mutex<Vec<u64>>,
+        withdrawn: Mutex<Vec<u64>>,
         started: Mutex<Vec<(String, String, String)>>,
     }
 
@@ -212,9 +261,22 @@ mod tests {
             self.started.lock().unwrap().push((space.into(), repo.into(), task.into()));
             Ok(("t77".into(), "sooner-eyzflow-fix".into()))
         }
-        fn tell(&self, a: &str, text: &str) -> Result<()> {
-            self.told.lock().unwrap().push((a.into(), text.into()));
-            Ok(())
+        fn tell(&self, a: &str, text: &str) -> Result<Option<u64>> {
+            let mut told = self.told.lock().unwrap();
+            told.push((a.into(), text.into()));
+            if !self.busy.iter().any(|b| b == a) {
+                return Ok(None);
+            }
+            let id = 99 + told.len() as u64;
+            self.queue.lock().unwrap().push(id);
+            Ok(Some(id))
+        }
+        fn waits(&self, id: u64) -> bool {
+            self.queue.lock().unwrap().contains(&id)
+        }
+        fn withdraw(&self, id: u64) {
+            self.queue.lock().unwrap().retain(|&i| i != id);
+            self.withdrawn.lock().unwrap().push(id);
         }
         fn in_chain(&self, key: &str) -> bool {
             self.chain.iter().any(|k| k == key)
@@ -346,6 +408,86 @@ mod tests {
         serve("MERGEABLE", "CLEAN", "a2");
         assert_eq!(look(9 * 60_000), [841]);
         assert_eq!((prs.get(k).unwrap().fix, hands.told.lock().unwrap().len()), (None, 1));
+    }
+
+    /// eyzflow #884 on 16 Nov, replayed with a stubbed `gh`: #883 merged and
+    /// #884 conflicted while its session was busy, so the notice waited in its
+    /// queue; another session pushed a commit (still conflicting), then merged
+    /// dev in and resolved it (448ee669), all before the notice was read. Then
+    /// two stale notices went in; now: one notice, taken back unread, nothing
+    /// for GitHub's "unknown" on the way, and the card comes.
+    #[test]
+    fn a_conflict_resolved_on_a_new_head_before_its_notice_is_read_sends_nothing() {
+        let gh = crate::prs::tests::fake_gh("fix-884");
+        let serve = |mergeable: &str, state: &str, sha: &str| {
+            let v = serde_json::json!({
+                "number": 884, "title": "Live editor switch", "url": "https://github.com/eyzhub/eyzflow/pull/884", "state": "OPEN",
+                "isDraft": false, "mergeable": mergeable, "mergeStateStatus": state, "baseRefName": "dev", "headRefName": "live-editor-switch",
+                "headRefOid": sha, "body": "The switch.",
+                "statusCheckRollup": [{"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+            });
+            std::fs::write(gh.with_file_name("pr-884.json"), v.to_string()).unwrap();
+        };
+        let prs = Prs::at(gh.with_file_name("prs.json"), gh.clone());
+        let hands = Fake { alive: vec!["t7h".into()], busy: vec!["t7h".into()], ..Default::default() };
+        let k = "eyzhub/eyzflow#884";
+        let look = |now: u64| {
+            prs.poll(k);
+            tick(&prs, &hands, now);
+        };
+        serve("MERGEABLE", "CLEAN", "1a1");
+        prs.found(&[("eyzhub/eyzflow".to_string(), 884)], "t7h", "eyzflow", Some("sandbox"), true);
+        look(60_000);
+        // GitHub still working it out after #883 merged, whatever state it shows: nothing.
+        serve("UNKNOWN", "DIRTY", "1a1");
+        look(2 * 60_000);
+        assert!(hands.told.lock().unwrap().is_empty(), "unknown is no conflict");
+        // It conflicts: told once; the session is busy, so it waits in its queue.
+        serve("CONFLICTING", "DIRTY", "1a1");
+        look(3 * 60_000);
+        assert_eq!(prs.get(k).unwrap().fix.unwrap().queued, Some(100));
+        // Another session pushes 441a4d82, still conflicting: no second notice ("your last update didn't fix it").
+        serve("CONFLICTING", "DIRTY", "441a4d82");
+        for i in 4..10 {
+            look(i * 60_000);
+        }
+        let f = prs.get(k).unwrap().fix.unwrap();
+        assert_eq!((hands.told.lock().unwrap().len(), f.head_asked.as_str(), f.tries), (1, "441a4d82", 1));
+        // dev merged in, resolved at 448ee669: GitHub works it out, then clean. The unread notice is taken back.
+        serve("UNKNOWN", "UNKNOWN", "448ee669");
+        look(10 * 60_000);
+        assert_eq!(*hands.withdrawn.lock().unwrap(), Vec::<u64>::new(), "not before GitHub says it merges");
+        serve("MERGEABLE", "CLEAN", "448ee669");
+        look(11 * 60_000);
+        assert_eq!(*hands.withdrawn.lock().unwrap(), [100]);
+        assert!(hands.queue.lock().unwrap().is_empty() && prs.get(k).unwrap().fix.is_none() && prs.get(k).unwrap().ready_for_user());
+        for i in 12..20 {
+            look(i * 60_000);
+        }
+        assert_eq!(hands.told.lock().unwrap().len(), 1, "nothing more sent");
+    }
+
+    #[test]
+    fn a_read_notice_is_asked_again_once_per_new_head_only() {
+        let prs = store("per-head");
+        prs.put(pr("conflicting", "dirty", "a1"), "found");
+        let hands = Fake { alive: vec!["t13y".into()], busy: vec!["t13y".into()], ..Default::default() };
+        tick(&prs, &hands, 1_000);
+        // Read at 5 min (it left the queue): the hour counts from then.
+        hands.queue.lock().unwrap().clear();
+        tick(&prs, &hands, 5 * 60_000);
+        let f = prs.get("eyzhub/eyzflow#841").unwrap().fix.unwrap();
+        assert_eq!((f.queued, f.asked_ms), (None, 5 * 60_000));
+        tick(&prs, &hands, 5 * 60_000 + FIX_MS - 1);
+        assert_eq!(hands.told.lock().unwrap().len(), 1);
+        // Its push still conflicts: asked once for that head, however often it is looked at.
+        prs.put(pr("conflicting", "dirty", "a2"), "update");
+        for i in 0..5 {
+            tick(&prs, &hands, 70 * 60_000 + i * 10_000);
+        }
+        let told = hands.told.lock().unwrap().clone();
+        assert_eq!(told.len(), 2, "{told:?}");
+        assert!(told[1].1.contains("Your last update didn't fix it"));
     }
 
     #[test]
