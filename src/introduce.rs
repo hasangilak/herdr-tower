@@ -161,7 +161,16 @@ pub struct Book {
     /// another joins: only the newcomer is. Forgotten an hour after its
     /// terminal is no longer seen.
     pub introduced: BTreeMap<String, Intro>,
+    /// Who has had the bug rule (`BUG_RULE`, by key), and when its terminal
+    /// was last seen: in an introduction, or alone (`rule_note`). Each hears
+    /// it once; forgotten an hour after its terminal is no longer seen.
+    pub ruled: BTreeMap<String, u64>,
+    /// The sessions open when the rule began were taken as having it (nobody is told it late).
+    pub rules_seeded: bool,
 }
+
+/// What every Claude session here is told once, in its introduction or alone.
+pub const BUG_RULE: &str = "If you find a bug that isn't part of your goal, don't fix it or chase it: report it to the tower with tower queue tower \"Found a bug: <what is wrong>, in <repo> <file:lines>; to reproduce: <how>; evidence: <what shows it>\", then carry on with your own work (the tower gives it a space of its own). ";
 
 /// A session's introduction: to which space, when, and since when its
 /// terminal has not been seen (None: it is there).
@@ -237,7 +246,56 @@ impl Book {
         );
         for m in reached {
             self.introduced.insert(m.key(), Intro { space: space.to_string(), at_ms: now, gone_ms: None });
+            // Its introduction told it the bug rule (on this Mac: a remote one's has no tower to run).
+            if m.machine.is_none() {
+                self.ruled.insert(m.key(), now);
+            }
         }
+    }
+
+    /// It has heard the bug rule.
+    pub fn has_rule(&self, m: &Member) -> bool {
+        self.ruled.contains_key(&m.key())
+    }
+
+    /// Those that are due the bug rule on its own now: a Claude session on
+    /// this Mac, in a space with a goal (`has_goal`), that hasn't heard it,
+    /// in a space whose introduction isn't on its way (`settling`). The
+    /// first look takes everyone open then as having it. Who is still seen
+    /// keeps it (and the book says when it was seen); one gone an hour loses it.
+    pub fn rules_due(&mut self, groups: &BTreeMap<String, Vec<Member>>, settling: &BTreeMap<String, Settling>, has_goal: impl Fn(&str) -> bool, now: u64) -> (Vec<Member>, bool) {
+        let mut changed = false;
+        let here: Vec<&Member> = groups.values().flatten().filter(|m| m.machine.is_none() && m.app == "claude-code").collect();
+        for m in &here {
+            if let Some(seen) = self.ruled.get_mut(&m.key())
+                && now.saturating_sub(*seen) >= 60_000
+            {
+                *seen = now;
+                changed = true;
+            }
+        }
+        let before = self.ruled.len();
+        let present: BTreeSet<String> = here.iter().map(|m| m.key()).collect();
+        self.ruled.retain(|k, seen| present.contains(k) || now.saturating_sub(*seen) <= INTRODUCED_KEEP_MS);
+        changed |= self.ruled.len() != before;
+        if !self.rules_seeded {
+            for m in &here {
+                self.ruled.insert(m.key(), now);
+            }
+            self.rules_seeded = true;
+            return (vec![], true);
+        }
+        let due: Vec<Member> = here
+            .into_iter()
+            .filter(|m| !self.has_rule(m) && !settling.contains_key(&m.space) && has_goal(&m.space))
+            .cloned()
+            .collect();
+        (due, changed)
+    }
+
+    /// `m` was told the bug rule now.
+    pub fn ruled_now(&mut self, m: &Member, now: u64) {
+        self.ruled.insert(m.key(), now);
     }
 
     /// `space` has `members` now, and nobody needed an introduction (they all had one).
@@ -349,7 +407,13 @@ fn clip(s: &str, n: usize) -> String {
 
 /// An introduction (ours), whatever wraps it: never anyone's task.
 pub fn is_introduction(text: &str) -> bool {
-    text.contains("[tower] You are ") && text.contains("in the Herdr space") && (text.contains("other session") || text.contains("Claude session"))
+    text.contains("[tower] You are ") && text.contains("in the Herdr space") && (text.contains("other session") || text.contains("Claude session") || text.contains("report it to the tower"))
+}
+
+/// The bug rule for a session on its own (`Book::rules_due`): its space and goal, the rule.
+pub fn rule_note(space: &str, goal: &str, to: &Member) -> String {
+    let goal = clip(goal, 200);
+    format!("[tower] You are {} ({}) in the Herdr space \"{space}\", whose goal is: {goal}. {BUG_RULE}Nothing to answer here: carry on with your work.", to.label(), to.address)
 }
 
 /// What a session is on, from its latest prompt: the text without what
@@ -447,6 +511,11 @@ impl Book {
 /// The message for `to`: the other Claude sessions in its space, what each
 /// is on, and how to reach them.
 pub fn compose(space: &str, to: &Member, members: &[Member]) -> String {
+    compose_for(space, to, members, false)
+}
+
+/// `compose`, without the bug rule for one that has heard it (`ruled`).
+pub fn compose_for(space: &str, to: &Member, members: &[Member], ruled: bool) -> String {
     let others: Vec<&Member> = members.iter().filter(|m| m.address != to.address).collect();
     let mut out = format!(
         "[tower] You are {} ({}) in the Herdr space \"{space}\". {} other session{} open in this space:\n",
@@ -477,9 +546,11 @@ pub fn compose(space: &str, to: &Member, members: &[Member]) -> String {
         it waits until that session is free, whatever its account or agent, and it reaches one on another machine too). \
         If you can't run tower (a sandbox), end your turn with a line To <address>: <complete message> and the tower delivers it. \
         When one asks you something and you don't write back yourself, your final message goes back to it as your answer. \
-        To look at one here: hc read <address> --lines 60. \
-        If you find a bug that isn't part of your goal, don't fix it or chase it: report it to the tower with tower queue tower \"Found a bug: <what is wrong>, in <repo> <file:lines>; to reproduce: <how>; evidence: <what shows it>\", then carry on with your own work (the tower gives it a space of its own). \
-        Nothing to answer here: carry on with your work.";
+        To look at one here: hc read <address> --lines 60. ";
+    if !ruled {
+        out += BUG_RULE;
+    }
+    out += "Nothing to answer here: carry on with your work.";
     out
 }
 
@@ -505,6 +576,49 @@ mod tests {
 
     fn groups(ms: &[Member]) -> BTreeMap<String, Vec<Member>> {
         group(ms.to_vec())
+    }
+
+    #[test]
+    fn a_lone_session_in_a_goal_space_hears_the_bug_rule_once_and_an_introduced_one_not_again() {
+        let goal = |s: &str| s == "Shop" || s == "B2C";
+        let none = BTreeMap::new();
+        let mut b = Book { seeded: true, ..Default::default() };
+        // The first look: those open then are taken as having it, nobody is told late.
+        let (due, changed) = b.rules_due(&groups(&[m("t0", "Shop")]), &none, goal, 1_000);
+        assert!(due.is_empty() && changed && b.has_rule(&m("t0", "Shop")));
+        // A session starts alone in a space with a goal: it is due, once.
+        let lone = m("t1", "Shop");
+        let g = groups(&[m("t0", "Shop"), lone.clone()]);
+        let (due, _) = b.rules_due(&g, &none, goal, 2_000);
+        assert_eq!(due.iter().map(|m| m.address.as_str()).collect::<Vec<_>>(), ["t1"]);
+        let note = rule_note("Shop", "Ship the checkout", &due[0]);
+        assert!(note.contains("\"Shop\", whose goal is: Ship the checkout.") && note.contains(BUG_RULE) && is_introduction(&note), "{note}");
+        assert_eq!(task_from_prompt(&note), None, "never its task");
+        b.ruled_now(&lone, 2_000);
+        assert!(b.rules_due(&g, &none, goal, 3_000).0.is_empty(), "told once");
+        // Then another joins it: the introduction it gets leaves the rule out; the newcomer's has it.
+        let other = m("t2", "Shop");
+        assert!(!compose_for("Shop", &lone, &[lone.clone(), other.clone()], b.has_rule(&lone)).contains("If you find a bug"));
+        assert!(compose_for("Shop", &other, &[lone.clone(), other.clone()], b.has_rule(&other)).contains(BUG_RULE));
+        // Introduced sessions heard it there: never again on its own.
+        let (a, c) = (m("t5", "B2C"), m("t6", "B2C"));
+        b.sent("B2C", &[a.clone(), c.clone()], 4_000);
+        assert!(b.rules_due(&groups(&[m("t0", "Shop"), lone.clone(), a.clone(), c.clone()]), &none, goal, 5_000).0.is_empty());
+        // A space waiting for its introduction: that brings it.
+        let mut settling = BTreeMap::new();
+        settling.insert("Shop".to_string(), Settling { members: BTreeSet::new(), since_ms: 5_000 });
+        assert!(b.rules_due(&groups(&[m("t7", "Shop")]), &settling, goal, 5_000).0.is_empty());
+        // No goal (a plain space), another machine, or Codex: not told.
+        let mut remote = m("t8", "Shop");
+        remote.machine = Some("vps".into());
+        let mut codex = m("t9", "Shop");
+        codex.app = "codex".into();
+        assert!(b.rules_due(&groups(&[m("t3", "Notes"), remote, codex]), &none, goal, 6_000).0.is_empty());
+        // Gone an hour, the book forgets it; back sooner, it keeps it.
+        b.rules_due(&groups(&[]), &none, goal, 6_000);
+        assert!(b.has_rule(&lone), "kept a while");
+        b.rules_due(&groups(&[]), &none, goal, 6_000 + INTRODUCED_KEEP_MS + 1);
+        assert!(!b.has_rule(&lone));
     }
 
     /// One look, settled: a first look, then the same again past the settle time.
