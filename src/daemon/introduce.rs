@@ -196,6 +196,35 @@ impl Introducer {
                 self.send(&space, ms, true);
             }
         }
+        self.rule(&groups);
+    }
+
+    /// The bug rule for those that haven't heard it (a session alone in its
+    /// space, or one no introduction reaches): once each, queued as a note.
+    fn rule(&self, groups: &BTreeMap<String, Vec<Member>>) {
+        let spaces = crate::spaces::load();
+        let goal = |space: &str| crate::missions::of(&spaces, space).map(|(k, _)| crate::missions::goal_of(&spaces, k).trim().to_string()).unwrap_or_default();
+        let now = crate::history::now_ms();
+        let due = {
+            let mut b = lock(&self.book);
+            let (due, changed) = b.rules_due(groups, &lock(&self.settling), |s| !goal(s).is_empty(), now);
+            if changed {
+                self.save(&b);
+            }
+            due
+        };
+        for m in due {
+            let text = introduce::rule_note(&m.space, &goal(&m.space), &m);
+            match self.sendq.add_note(&m.address, &text) {
+                Ok(_) => {
+                    let mut b = lock(&self.book);
+                    b.ruled_now(&m, now);
+                    self.save(&b);
+                    eprintln!("[introduce] {}: told {} ({}) the bug rule", m.space, m.label(), m.address);
+                }
+                Err(e) => eprintln!("[introduce] {}: couldn't queue the bug rule for {}: {e:#}", m.space, m.address),
+            }
+        }
     }
 
     /// Hands the introduction to the members (queued: each gets it once it's
@@ -212,7 +241,7 @@ impl Introducer {
         let mut out = vec![];
         let mut reached = vec![];
         for m in &to {
-            let text = introduce::compose(space, m, members);
+            let text = introduce::compose_for(space, m, members, lock(&self.book).has_rule(m));
             match self.sendq.add_note(&m.address, &text) {
                 Ok((added, ..)) => {
                     let (id, sent) = match added {
