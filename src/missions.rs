@@ -306,7 +306,7 @@ pub fn of<'a>(s: &'a Spaces, space: &str) -> Option<(&'a String, &'a Mission)> {
     s.missions.get_key_value(want).or_else(|| s.missions.iter().find(|(k, _)| k.eq_ignore_ascii_case(want)))
 }
 
-fn goal_of<'a>(s: &'a Spaces, space: &str) -> &'a str {
+pub(crate) fn goal_of<'a>(s: &'a Spaces, space: &str) -> &'a str {
     s.agendas.get(space).or_else(|| s.agendas.iter().find(|(k, _)| k.eq_ignore_ascii_case(space)).map(|(_, v)| v)).map(|g| g.trim()).unwrap_or("")
 }
 

@@ -478,6 +478,7 @@ pub fn compose(space: &str, to: &Member, members: &[Member]) -> String {
         If you can't run tower (a sandbox), end your turn with a line To <address>: <complete message> and the tower delivers it. \
         When one asks you something and you don't write back yourself, your final message goes back to it as your answer. \
         To look at one here: hc read <address> --lines 60. \
+        If you find a bug that isn't part of your goal, don't fix it or chase it: report it to the tower with tower queue tower \"Found a bug: <what is wrong>, in <repo> <file:lines>; to reproduce: <how>; evidence: <what shows it>\", then carry on with your own work (the tower gives it a space of its own). \
         Nothing to answer here: carry on with your work.";
     out
 }
@@ -805,6 +806,8 @@ mod tests {
         assert_eq!((unnamed.label(), Member { name: String::new(), folder: String::new(), ..m("t5", "B2C") }.label()), ("mediaroom serverless".to_string(), "the session at t5".to_string()));
         assert!(!text.contains("(t1),"), "not itself");
         assert!(text.contains("tower queue <address> \"<complete message>\"") && text.contains("hc read <address> --lines 60"));
+        // A bug off its goal goes to the tower, not into its own work.
+        assert!(text.contains("If you find a bug that isn't part of your goal, don't fix it or chase it: report it to the tower with tower queue tower"), "{text}");
         assert!(text.contains("the tower adds your name to it"), "{text}");
         assert!(text.contains("ask for changes in their layer instead of editing their repos"));
         assert!(compose("B2C", &a, &[a.clone(), b]).contains("1 other session is open"));
