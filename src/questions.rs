@@ -96,6 +96,10 @@ pub struct QuestionSet {
     pub target: String,
     /// What the session was asked to do (its open job), for context.
     pub context: String,
+    /// A Bash prompt's whole command, from the session's transcript (its
+    /// pending call), when the screen shows it with its start scrolled away.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub command: String,
     pub tabs: Vec<Tab>,
     /// The tab the dialog shows (`tabs.len()`: the review/submit tab).
     pub current_tab: usize,
@@ -1897,25 +1901,19 @@ pub fn compose_reply(set: &QuestionSet, answers: &[Answer]) -> Result<String> {
 /// (`shell_command`) pushes or merges only by a real `git push`, `git
 /// merge`, `gh pr merge` in it (`pushes_or_merges`): not by the words of
 /// what it writes (a heredoc into `cat` or `tee`, `echo` and `printf`),
-/// nor by what the session was asked. A prompt that only writes Claude's
-/// own memory or notes (`memory_yes`) is none of these.
+/// nor by what the session was asked. The other rules read a shell prompt
+/// the same way (`prompt_text`): its title and its command, its data left
+/// out; never Claude Code's own notices about it ("Dangerous rm operation
+/// not ruled out"), nor the session's task. A command whose start the screen
+/// cut, while Claude Code can't rule out a removal, stays the user's unless
+/// the transcript gave it whole. A prompt that only writes Claude's own
+/// memory or notes (`memory_yes`) is none of these.
 pub fn must_escalate(set: &QuestionSet) -> Option<&'static str> {
     if memory_yes(set).is_some() {
         return None;
     }
-    let mut text = format!("{}\n{}\n{}", set.title, set.detail, set.context);
-    for t in &set.tabs {
-        text.push('\n');
-        text.push_str(&t.question);
-        for o in &t.options {
-            text.push('\n');
-            text.push_str(&o.label);
-            text.push(' ');
-            text.push_str(&o.description);
-        }
-    }
-    let command = shell_command(set).map(|c| without_data(&c));
-    reason_of(&text, command.as_deref())
+    let (text, command) = prompt_text(set, true, true);
+    reason_of(&text, command.as_deref()).or_else(|| cut_with_rm_warning(set).then_some("Claude Code can't rule out an rm, and the command's start isn't shown"))
 }
 
 /// The 90/10 rule over `text`; `command`: the shell command it asks to run
@@ -2123,14 +2121,17 @@ const SENSITIVE: &str = "Claude requested permissions to ";
 /// (`Allow Bash: <cmd>?`, `Run <cmd>?`) and the detail's, out of the `│`
 /// gutter, up to Claude Code's reason. None for any other prompt.
 pub fn shell_command(set: &QuestionSet) -> Option<String> {
-    let bash = set.kind == "claude-permission" && (set.title.starts_with("Allow Bash") || set.detail.lines().next().is_some_and(|l| l.trim() == "Bash command"));
+    if set.kind == "claude-permission" && !set.command.is_empty() {
+        return Some(set.command.clone());
+    }
+    let bash = set.kind == "claude-permission" && (shows_command_start(set) || set.detail.lines().any(shell_notice));
     if !bash && set.kind != "codex-menu" {
         return None;
     }
     let title = set.title.strip_prefix("Allow Bash:").or_else(|| set.title.strip_prefix("Run ")).map(|c| c.trim().trim_end_matches('?').to_string());
     let mut lines: Vec<String> = title.into_iter().collect();
     for l in set.detail.lines().map(ungutter) {
-        if l.starts_with(SENSITIVE) {
+        if l.starts_with(SENSITIVE) || claude_notice(l) {
             break;
         }
         if l != "Bash command" {
@@ -2138,6 +2139,126 @@ pub fn shell_command(set: &QuestionSet) -> Option<String> {
         }
     }
     Some(lines.join("\n"))
+}
+
+/// Claude Code's own words in a permission prompt: its warnings about the
+/// command and its countdown. What it says of a command, never the command
+/// ("Dangerous rm operation not ruled out" holds no rm).
+const CLAUDE_NOTICES: &[&str] = &[
+    "operation not ruled out",
+    "the shell may read this command differently",
+    "can't be sure it read this command",
+    "can't rule out a dangerous",
+    "read the command, and don't go ahead",
+    "will automatically block this request",
+];
+
+/// Its notices that it can't rule out a removal.
+const RM_NOTICES: &[&str] = &["rm operation not ruled out", "can't rule out a dangerous removal"];
+
+fn notice_text(line: &str) -> String {
+    ungutter(line).to_lowercase().replace('\u{2019}', "'")
+}
+
+/// A line of Claude Code's own (`CLAUDE_NOTICES`, or its `⚠` lines).
+pub fn claude_notice(line: &str) -> bool {
+    let l = notice_text(line);
+    l.starts_with('⚠') || CLAUDE_NOTICES.iter().any(|n| l.contains(n))
+}
+
+/// A notice Claude Code gives a shell command only (not its countdown).
+fn shell_notice(line: &str) -> bool {
+    claude_notice(line) && !notice_text(line).contains("will automatically block this request")
+}
+
+/// The prompt shows its command from the start: Claude Code's "Bash
+/// command" header, or the command in its title (`Allow Bash: …?`).
+fn shows_command_start(set: &QuestionSet) -> bool {
+    set.title.starts_with("Allow Bash") || set.detail.lines().next().is_some_and(|l| l.trim() == "Bash command")
+}
+
+/// A Bash prompt whose command's start has scrolled away (no header, no
+/// whole command from the transcript) while Claude Code warns it can't rule
+/// out a removal: the rm may be in what isn't shown.
+fn cut_with_rm_warning(set: &QuestionSet) -> bool {
+    set.kind == "claude-permission"
+        && set.command.is_empty()
+        && !shows_command_start(set)
+        && set.detail.lines().any(|l| {
+            let l = notice_text(l);
+            RM_NOTICES.iter().any(|n| l.contains(n))
+        })
+}
+
+/// What a question asks, to read the rules from, and its shell command
+/// (its data left out, `without_data`) when it has one. A shell prompt: its
+/// title (what Claude Code says the command is for) and its command, not
+/// Claude Code's notices about it, nor the session's task. Any other
+/// permission prompt: its title and detail without the notices. A question
+/// in words: its title and detail and, with `context`, what the session was
+/// asked. With `options`, its options' labels and descriptions.
+fn prompt_text(set: &QuestionSet, context: bool, options: bool) -> (String, Option<String>) {
+    let command = shell_command(set).map(|c| without_data(&c));
+    let permission = matches!(set.kind.as_str(), "claude-permission" | "codex-menu");
+    let mut text = set.title.clone();
+    text.push('\n');
+    match &command {
+        Some(c) => text.push_str(c),
+        None => text.push_str(&set.detail.lines().filter(|l| !claude_notice(l)).collect::<Vec<_>>().join("\n")),
+    }
+    if context && !permission {
+        text.push('\n');
+        text.push_str(&set.context);
+    }
+    for t in &set.tabs {
+        text.push('\n');
+        text.push_str(&t.question);
+        if options {
+            for o in &t.options {
+                text.push('\n');
+                text.push_str(&o.label);
+                text.push(' ');
+                text.push_str(&o.description);
+            }
+        }
+    }
+    (text, command)
+}
+
+/// The command of the latest Bash call in a transcript that has no result
+/// yet: the one a permission prompt waits on.
+pub fn pending_bash(jsonl: &str) -> Option<String> {
+    let mut pending: Option<(String, String)> = None;
+    for line in jsonl.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let Some(content) = v["message"]["content"].as_array() else { continue };
+        for c in content {
+            match c["type"].as_str() {
+                Some("tool_use") => {
+                    pending = (c["name"] == "Bash").then(|| (c["id"].as_str().unwrap_or("").to_string(), c["input"]["command"].as_str().unwrap_or("").to_string()));
+                }
+                Some("tool_result") if pending.as_ref().is_some_and(|(id, _)| c["tool_use_id"].as_str() == Some(id)) => pending = None,
+                _ => {}
+            }
+        }
+    }
+    pending.map(|(_, c)| c).filter(|c| !c.is_empty())
+}
+
+/// The transcript's `command` is the one a prompt's detail shows: each
+/// command line on screen (wrapped, so spaces don't count; a cut `…` taken
+/// off) is in it.
+pub fn command_shown(detail: &str, command: &str) -> bool {
+    let flat = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let whole = flat(command);
+    let shown: Vec<String> = detail
+        .lines()
+        .take_while(|l| !claude_notice(l) && !ungutter(l).starts_with(SENSITIVE))
+        .filter(|l| l.trim_start().starts_with('│'))
+        .map(|l| flat(ungutter(l).trim_end_matches('…')))
+        .filter(|l| !l.is_empty())
+        .collect();
+    !shown.is_empty() && shown.iter().all(|l| whole.contains(l.as_str()))
 }
 
 /// Whether a heredoc's `<<` (at byte `at` of `line`) feeds what is only
@@ -2593,12 +2714,7 @@ pub fn decide_scored(
 ) -> (String, String, crate::scoring::Scores) {
     use crate::scoring::{Risk, Scores, decide as by_scores, floor, line};
     let hard = must_escalate(set);
-    let mut text = format!("{}\n{}", set.title, set.detail);
-    for tab in &set.tabs {
-        text.push('\n');
-        text.push_str(&tab.question);
-    }
-    let command = shell_command(set).map(|c| without_data(&c));
+    let (text, command) = prompt_text(set, false, false);
     let (floor_risk, floor_why) = floor(hard, &text, command.as_deref(), cwd);
     let risk = said.risk.unwrap_or(floor_risk).max(floor_risk);
     let risk_why = if said.risk.is_some_and(|r| r >= floor_risk) && !said.risk_why.trim().is_empty() { said.risk_why.trim().to_string() } else { floor_why.clone() };
@@ -3531,8 +3647,9 @@ mod tests {
         // A question in words is read as it was: no command to read instead.
         let words = QuestionSet { kind: "claude-ask".into(), tabs: vec![Tab { question: "Want me to merge this into main?".into(), ..Default::default() }], ..Default::default() };
         assert_eq!(must_escalate(&words), Some("it pushes or merges to a shared branch"));
-        // The other rules still read the whole prompt.
-        assert_eq!(must_escalate(&bash("echo hi > /tmp/x", "Deploy the dashboard to production")), Some("it deploys or releases"));
+        // The other rules read the command too, not what the session was asked (`risk_floor` below).
+        assert_eq!(must_escalate(&bash("echo hi > /tmp/x", "Deploy the dashboard to production")), None);
+        assert_eq!(must_escalate(&bash("vercel deploy --prod", "Fix the footer")), Some("it deploys or releases"));
     }
 
     /// (2) A permission prompt whose only sensitive target is Claude's own
@@ -4130,3 +4247,138 @@ mod scoring_replay {
         );
     }
 }
+
+/// The risk floor reads what a prompt runs. The four sandbox prompts of
+/// 2026-11-17 (q8545a444cee7, q56da41652fd1: a reviewer's eslint and git
+/// diff; q6fab9782c26d, q962bb1656414: a Python heredoc editing one file)
+/// reached the user as high risk: Claude Code's own warning ("Dangerous rm
+/// operation not ruled out") read as an rm, and the reviewer's task ("…
+/// ships from draft and preview to publish", "never put rm in a command")
+/// as a deploy. Their commands do neither. Trimmed, names changed.
+#[cfg(test)]
+mod risk_floor {
+    use super::*;
+    use crate::scoring::{Learned, Risk, Thresholds};
+
+    const REVIEW_BRIEF: &str = "[tower] You are the reviewer of PR #908 in acme/shop. It is done when: a tab walks hop by hop how a click becomes a change and ships from draft and preview to publish; a tab explains how GitHub, CI/CD and Vercel are used.\n\nNever link, copy or remove them yourself, and never put rm in a command (rm is refused here).\n- a breaking change: something outside this PR uses what it removes, renames or changes.\nNever merge, close or push; never edit, commit or change the owner's code or branch.";
+
+    const REVIEW_LINES: &str = "│ S=/private/tmp/claude-501/-Users-me-Work-review-shop-908/af033ede/scratchpad; files=(${(f)\"$(git diff --name-only 8b4df183...HEAD -- 'src/**/*.ts'\n│ 'src/**/*.tsx')\"}); ./node_modules/.bin/eslint -f json -o $S/lint.json $files; git diff -U0 8b4df183...HEAD --\n│ $files > $S/diff.txt; node -e '\n│ const fs=require(\"fs\");const [lint,diff]=process.argv.slice(1);\n│ let total=0;for(const r of JSON.parse(fs.readFileSync(lint,\"utf8\"))){total+=r.warningCount;}\n│ console.log(\"checked, warnings in changed files:\",total);' $S/lint.json $S/diff.txt";
+
+    const RM_WARNING: &str = "│ Claude Code can't be sure it read this command the way the shell will, so it can't rule out a dangerous removal.\n│ Read the command, and don't go ahead if you can't tell what it does.";
+
+    /// The mediaroom command as its transcript has it; the screen showed only its end.
+    const EDIT_COMMAND: &str = "cd /Users/me/Work/shop-api/src/core/published-copy && python3 - <<'EOF'\np='published-copy-shadow.service.ts'\ns=open(p).read()\nnew_head = \"\"\"import { Injectable, Logger } from '@nestjs/common';\n\"\"\"\ncls = '''\n@Injectable()\nexport class PublishedCopyShadowService {\n  private async shadow(kind: CopyKind, rows: Row[]): Promise<void> {\n    try {\n      const diffs = compareWithCopy(rows, await this.copies());\n      for (const diff of diffs.slice(0, SHADOW_DIFF_LINES_PER_READ)) {\n        this.logger.warn(JSON.stringify({ event: 'published_copy_shadow_diff', id: diff.id }));\n      }\n    } catch (error) {\n      this.logger.warn(JSON.stringify({ event: 'published_copy_shadow_failed' }));\n    }\n  }\n}\n'''\nopen(p,'w').write(new_head+'\\n'+cls)\nprint('ok')\nEOF\ngrep -n \"^export\\|^@Injectable\\|constructor\" published-copy-shadow.service.ts";
+
+    fn proceed() -> Vec<Tab> {
+        vec![Tab {
+            title: "Permission".into(),
+            question: "Do you want to proceed?".into(),
+            options: vec![Opt { label: "Yes".into(), key: "1".into(), ..Default::default() }, Opt { label: "No".into(), key: "2".into(), ..Default::default() }],
+            ..Default::default()
+        }]
+    }
+
+    fn prompt(id: &str, title: &str, detail: String, context: &str) -> QuestionSet {
+        QuestionSet { id: id.into(), session: "t1".into(), kind: "claude-permission".into(), title: title.into(), detail, context: context.into(), tabs: proceed(), space: Some("sandbox".into()), ..Default::default() }
+    }
+
+    /// q8545a444cee7 and q56da41652fd1 (the same prompt, its countdown at 2:00 and 0:37).
+    fn review(id: &str, countdown: &str) -> QuestionSet {
+        let detail = format!("Bash command\nFind lint warnings on lines the PR added\n{REVIEW_LINES}\n{RM_WARNING}\n⚠ Claude Code will automatically block this request in {countdown}, to avoid holding up an unattended session");
+        prompt(id, "Allow: Find lint warnings on lines the PR added?", detail, REVIEW_BRIEF)
+    }
+
+    /// The screen's last lines of a command: its start scrolled away.
+    fn tail_of(command: &str, n: usize) -> String {
+        let lines: Vec<&str> = command.lines().collect();
+        lines[lines.len().saturating_sub(n)..].iter().map(|l| format!("│ {l}")).collect::<Vec<_>>().join("\n")
+    }
+
+    /// q6fab9782c26d and q962bb1656414 (the same prompt, read twice): only the
+    /// end of the heredoc on screen, then Claude Code's warning.
+    fn edit(id: &str, countdown: &str, from_transcript: bool) -> QuestionSet {
+        let detail = format!(
+            "{}\n│ Dangerous rm operation not ruled out — the shell may read this command differently than it was parsed\n⚠ Claude Code will automatically block this request in {countdown}, to avoid holding up an unattended session",
+            tail_of(EDIT_COMMAND, 14)
+        );
+        let mut set = prompt(id, "Allow this?", detail, "Make the shadow read follow the published_copy setting");
+        if from_transcript {
+            assert!(command_shown(&set.detail, EDIT_COMMAND), "the screen shows the transcript's pending call");
+            set.command = EDIT_COMMAND.into();
+        }
+        set
+    }
+
+    /// Scored as the space's tower scored it: low risk, routine, auto.
+    fn scored(set: &QuestionSet, confidence: f64) -> (String, String, crate::scoring::Scores) {
+        let said = Said { risk: Some(Risk::Low), risk_why: "stays in its checkout".into(), confidence: Some(confidence), confidence_why: "routine".into() };
+        decide_scored(set, Some("auto"), "routine", "normal", &said, &Thresholds::default(), &Learned::default(), Some("/Users/me/Work"))
+    }
+
+    #[test]
+    fn claudes_own_warnings_and_the_sessions_task_dont_floor_a_harmless_command() {
+        for (set, confidence) in [(review("q8545a444cee7", "2:00"), 0.9), (review("q56da41652fd1", "0:37"), 0.9), (edit("q6fab9782c26d", "2:00", true), 0.85), (edit("q962bb1656414", "1:16", true), 0.85)] {
+            assert_eq!(must_escalate(&set), None, "{}", set.id);
+            let (decision, why, scores) = scored(&set, confidence);
+            assert_eq!((decision.as_str(), scores.floor, scores.risk), ("auto", Risk::Low, Risk::Low), "{}: {why} / {}", set.id, scores.floor_why);
+        }
+        // The command, as read: the prompt's own line and what it runs; no warning, no task.
+        let (text, command) = prompt_text(&review("q8545a444cee7", "2:00"), true, true);
+        assert!(command.is_some() && !text.contains("rule out") && !text.contains("publish") && text.contains("eslint -f json"), "{text}");
+        // The edit's screen without its transcript (a remote session): its start, cut, may hold an rm. Still the user's.
+        let cut = edit("q6fab9782c26d", "2:00", false);
+        assert_eq!(must_escalate(&cut), Some("Claude Code can't rule out an rm, and the command's start isn't shown"));
+        assert_eq!(scored(&cut, 0.85).0, "escalate");
+        // Another pending call than the one on screen isn't taken.
+        assert!(!command_shown(&cut.detail, "python3 other.py"));
+    }
+
+    #[test]
+    fn a_real_rm_reset_deploy_or_push_still_floors_high() {
+        for (command, why) in [
+            ("rm -rf build dist", "it deletes or overwrites"),
+            ("./node_modules/.bin/eslint . -o /tmp/l.json && rm -f lint.json", "it deletes or overwrites"),
+            ("git reset --hard HEAD~1", "it deletes or overwrites"),
+            ("git clean -fdx", "it deletes or overwrites"),
+            ("vercel deploy --prod", "it deploys or releases"),
+            ("npm publish --access public", "it deploys or releases"),
+            ("git push origin main", "it pushes or merges to a shared branch"),
+            ("gh pr merge 908 --squash", "it pushes or merges to a shared branch"),
+        ] {
+            // With Claude Code's warning and the reviewer's task around it, as the examples had.
+            let detail = format!("Bash command\nRun it\n│ {command}\n{RM_WARNING}\n⚠ Claude Code will automatically block this request in 2:00, to avoid holding up an unattended session");
+            let set = prompt("q0", "Allow: Run it?", detail, REVIEW_BRIEF);
+            assert_eq!(must_escalate(&set), Some(why), "{command}");
+            let (decision, _, scores) = scored(&set, 0.95);
+            assert_eq!((decision.as_str(), scores.risk), ("escalate", Risk::High), "{command}");
+        }
+        // The heredoc edit that also removes a file, its whole command from the transcript: high.
+        let mut set = edit("q6fab9782c26d", "2:00", true);
+        set.command = format!("{EDIT_COMMAND}\nrm published-copy-shadow.service.ts.bak");
+        assert_eq!(must_escalate(&set), Some("it deletes or overwrites"));
+        // What Claude Code says the command is for counts: it is the prompt's own line.
+        let set = prompt("q1", "Allow: Deploy the dashboard to production?", format!("Bash command\nDeploy the dashboard to production\n│ ./ship.sh\n{RM_WARNING}"), "");
+        assert_eq!(must_escalate(&set), Some("it deploys or releases"));
+        // A question in words still reads what the session was asked.
+        let words = QuestionSet { kind: "claude-ask".into(), context: "Deploy the dashboard to production".into(), tabs: vec![Tab { question: "Go ahead?".into(), ..Default::default() }], ..Default::default() };
+        assert_eq!(must_escalate(&words), Some("it deploys or releases"));
+    }
+
+    #[test]
+    fn a_permission_prompts_command_is_its_pending_bash_call() {
+        let jsonl = [
+            r#"{"message":{"content":[{"type":"tool_use","id":"a","name":"Bash","input":{"command":"ls"}}]}}"#,
+            r#"{"message":{"content":[{"type":"tool_result","tool_use_id":"a","content":"x"}]}}"#,
+            r#"{"message":{"content":[{"type":"text","text":"Now the edit."},{"type":"tool_use","id":"b","name":"Bash","input":{"command":"python3 - <<'EOF'\nprint(1)\nEOF"}}]}}"#,
+        ]
+        .join("\n");
+        assert_eq!(pending_bash(&jsonl).as_deref(), Some("python3 - <<'EOF'\nprint(1)\nEOF"));
+        assert_eq!(pending_bash(&format!("{jsonl}\n{}", r#"{"message":{"content":[{"type":"tool_result","tool_use_id":"b","content":"1"}]}}"#)), None);
+        // A wrapped line on screen is still the transcript's.
+        assert!(command_shown("│ grep -n \"^export\" published-copy-\n│ shadow.service.ts\n│ Dangerous rm operation not ruled out", "grep -n \"^export\" published-copy-shadow.service.ts"));
+        assert!(claude_notice("│ Dangerous rm operation not ruled out — the shell may read this command differently than it was parsed"));
+        assert!(claude_notice("│ Claude Code can’t be sure it read this command the way the shell will"));
+        assert!(!claude_notice("│ rm -rf build"));
+    }
+}
+

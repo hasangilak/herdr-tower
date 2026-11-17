@@ -2345,6 +2345,15 @@ pub fn detect(address: &str) -> Option<QuestionSet> {
     let context = crate::history::jobs(&crate::history::load()).into_iter().find(|j| j.session == addr && j.open()).map(|j| j.title).unwrap_or_default();
     let msg = t["status"]["msg"].as_str().unwrap_or("");
     let mut set = questions::build(&addr, &hc::spoken_name(&t), app == "codex", &screen, transcript, msg, &context);
+    // A Bash prompt: its whole command from the transcript (the screen may
+    // have scrolled its start away), when it is the one the screen shows.
+    if set.kind == "claude-permission"
+        && app == "claude-code"
+        && let Some(command) = t["foreground"]["pid"].as_u64().and_then(|p| questions::transcript_of(p as u32)).and_then(|j| questions::pending_bash(&j))
+        && questions::command_shown(&set.detail, &command)
+    {
+        set.command = command;
+    }
     set.at_ms = read_ms;
     set.created_ms = hc::created_ms(&t);
     set.space = crate::spaces::space_of(&t);
