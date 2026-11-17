@@ -1906,11 +1906,18 @@ pub fn compose_reply(set: &QuestionSet, answers: &[Answer]) -> Result<String> {
 /// out; never Claude Code's own notices about it ("Dangerous rm operation
 /// not ruled out"), nor the session's task. A command whose start the screen
 /// cut, while Claude Code can't rule out a removal, stays the user's unless
-/// the transcript gave it whole. A prompt that only writes Claude's own
-/// memory or notes (`memory_yes`) is none of these.
+/// the transcript gave it whole. A file prompt is read by its files alone
+/// (`file_write`, `file_hard`): a secret, deploy or infrastructure config,
+/// Claude's settings, hooks or plugins; never the text it writes. A prompt
+/// that only writes Claude's own memory or notes (`memory_yes`) is none of
+/// these.
 pub fn must_escalate(set: &QuestionSet) -> Option<&'static str> {
     if memory_yes(set).is_some() {
         return None;
+    }
+    // A file prompt: by the files it writes, never by their text.
+    if let Some(f) = file_write(set) {
+        return file_hard(&f);
     }
     let (text, command) = prompt_text(set, true, true);
     reason_of(&text, command.as_deref()).or_else(|| cut_with_rm_warning(set).then_some("Claude Code can't rule out an rm, and the command's start isn't shown"))
@@ -2441,6 +2448,232 @@ pub fn pushes_or_merges(command: &str) -> bool {
     })
 }
 
+// ---- a file prompt: what it writes, never what the file says ----
+
+/// What a file prompt does to its file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileAction {
+    Edit,
+    Create,
+    Overwrite,
+}
+
+/// A file prompt (Claude Code's Edit, Update, Write: "Do you want to make
+/// this edit to x?", "… create x?", "… overwrite x?"), read for what it
+/// does: its action and the files it writes (the one asked for, in full
+/// from Herdr's line, else as the screen shows it, maybe relative to the
+/// session's folder; where a symlink leads; what a sensitive-file reason
+/// names). Never the text being written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileWrite {
+    pub action: FileAction,
+    pub paths: Vec<String>,
+}
+
+pub fn file_write(set: &QuestionSet) -> Option<FileWrite> {
+    if set.kind != "claude-permission" {
+        return None;
+    }
+    let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let question = set.tabs.first().map(|t| t.question.trim()).unwrap_or("");
+    let lines: Vec<&str> = set.detail.lines().map(ungutter).filter(|l| !l.is_empty()).collect();
+    let header = lines.first().copied().unwrap_or("");
+    let tool = set.target.split_once(": ").filter(|(t, _)| matches!(t.trim(), "Update" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit"));
+    let by_header = matches!(header, "Edit file" | "Create file" | "Write file" | "Overwrite file" | "Update file" | "Edit notebook");
+    const ASKS: [&str; 4] = ["Do you want to make this edit to ", "Do you want to create ", "Do you want to overwrite ", "Do you want to write "];
+    let named = ASKS.iter().find_map(|p| question.strip_prefix(p)).map(|n| squash(n.trim_end_matches('?')));
+    if tool.is_none() && !by_header && named.is_none() {
+        return None;
+    }
+    let action = if header.starts_with("Overwrite") || question.starts_with("Do you want to overwrite") {
+        FileAction::Overwrite
+    } else if header.starts_with("Create") || header.starts_with("Write") || question.starts_with("Do you want to create") || question.starts_with("Do you want to write") {
+        FileAction::Create
+    } else {
+        FileAction::Edit
+    };
+    let mut paths = vec![];
+    if let Some((_, p)) = tool {
+        paths.push(squash(p.trim().trim_end_matches('?')));
+    } else if by_header && let Some(p) = lines.get(1) {
+        paths.push(squash(p));
+    } else if let Some(n) = named {
+        paths.push(n);
+    }
+    let detail = lines.join(" ");
+    for part in detail.split("This will modify ").skip(1) {
+        let end = [" (outside", " via a symlink", ". "].iter().filter_map(|m| part.find(m)).min().unwrap_or(part.len());
+        paths.push(squash(&part[..end]));
+    }
+    paths.extend(sensitive_targets(set));
+    paths.retain(|p| !p.is_empty());
+    paths.dedup();
+    Some(FileWrite { action, paths })
+}
+
+/// What a file is, by its path alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    /// `.env`, keys, credentials, `~/.ssh`, `~/.aws`…
+    Secret,
+    /// How the project deploys or releases: `vercel.json`, a deploy or release workflow, `serverless.yml`…
+    Deploy,
+    /// Terraform, Kubernetes, Helm.
+    Infra,
+    /// What decides what a Claude session may do or runs code: its settings, hooks, plugins, `.mcp.json`.
+    ClaudeGrants,
+    /// Shared CI or build config: other workflows, `.gitlab-ci.yml`, a Dockerfile…
+    Ci,
+    /// Anything else.
+    Plain,
+}
+
+/// A path's parts, lower-cased, its file name last.
+fn path_parts(path: &str) -> Vec<String> {
+    path.to_lowercase().split('/').filter(|p| !p.is_empty() && *p != ".").map(String::from).collect()
+}
+
+/// A name's stem and extension (`deploy.prod.yml`: `deploy.prod`, `yml`).
+fn stem_ext(name: &str) -> (&str, &str) {
+    match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, e),
+        _ => (name, ""),
+    }
+}
+
+/// The words of a stem (`deploy-prod_web`: deploy, prod, web).
+fn stem_words(stem: &str) -> Vec<&str> {
+    stem.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect()
+}
+
+/// What a file is by its path (`FileKind`): its name, its folders, its extension.
+pub fn file_kind(path: &str) -> FileKind {
+    let parts = path_parts(path);
+    let Some(name) = parts.last().map(String::as_str) else { return FileKind::Plain };
+    let dirs = &parts[..parts.len() - 1];
+    let in_dir = |d: &str| dirs.iter().any(|x| x == d);
+    let (stem, ext) = stem_ext(name);
+    let config_ext = matches!(ext, "" | "json" | "yaml" | "yml" | "toml" | "ini" | "txt" | "conf" | "cfg" | "xml" | "csv" | "properties");
+    // Secrets and credentials.
+    let env_file = name == ".env" || (name.starts_with(".env.") && !["example", "sample", "template", "dist", "defaults", "schema"].iter().any(|s| name.ends_with(s)));
+    let key_file = matches!(ext, "pem" | "key" | "p12" | "pfx" | "keystore" | "jks" | "ppk") || ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"].iter().any(|k| name.starts_with(k));
+    let named_secret = config_ext && stem_words(stem).iter().any(|w| matches!(*w, "credentials" | "credential" | "secret" | "secrets" | "serviceaccount"));
+    let dotfile_secret = matches!(name, ".npmrc" | ".pypirc" | ".netrc" | ".git-credentials" | ".htpasswd" | ".credentials.json" | ".dockercfg") || name.ends_with(".tfstate");
+    if env_file || key_file || named_secret || dotfile_secret || [".ssh", ".aws", ".gnupg", ".kube", ".docker"].iter().any(|d| in_dir(d)) {
+        return FileKind::Secret;
+    }
+    // Claude's own grants: right in a Claude config folder (`.claude/`,
+    // `.claude-accounts/<name>/`, a profile's `claude-profiles/<id>/home/`),
+    // its `settings*.json`, its `hooks/` and `plugins/`; and MCP servers. Not
+    // a repo's own `plugins/` source, nor a worktree under `.claude/worktrees/`.
+    let grants = (0..parts.len()).any(|i| {
+        let start = match parts[i].as_str() {
+            ".claude" => i + 1,
+            ".claude-accounts" => i + 2,
+            "claude-profiles" if parts.get(i + 2).is_some_and(|h| h == "home") => i + 3,
+            _ => return false,
+        };
+        match parts.get(start..).unwrap_or(&[]) {
+            [f] => f.starts_with("settings") && f.ends_with(".json"),
+            [d, _, ..] => d == "hooks" || d == "plugins",
+            _ => false,
+        }
+    });
+    if grants || name == ".mcp.json" || name.starts_with(".claude.json") {
+        return FileKind::ClaudeGrants;
+    }
+    // Infrastructure.
+    if matches!(ext, "tf" | "tfvars" | "hcl") || ["terraform", "k8s", "kubernetes", "helm", "kustomize"].iter().any(|d| in_dir(d)) || stem.starts_with("pulumi") || name == "cdk.json" {
+        return FileKind::Infra;
+    }
+    // Deploy config.
+    let workflow = dirs.windows(2).any(|w| w[0] == ".github" && w[1] == "workflows");
+    let deploy_word = stem_words(stem).iter().any(|w| matches!(*w, "deploy" | "deployment" | "deploys" | "release" | "releases" | "publish" | "prod" | "production" | "cd"));
+    let platform = matches!(
+        name,
+        "vercel.json" | "now.json" | "netlify.toml" | "fly.toml" | "render.yaml" | "railway.json" | "railway.toml" | "wrangler.toml" | "wrangler.json" | "wrangler.jsonc" | "amplify.yml" | "cloudbuild.yaml" | "cloudbuild.yml" | "appspec.yml" | "procfile" | "firebase.json" | ".firebaserc"
+    ) || stem == "serverless"
+        || in_dir(".vercel");
+    let deploy_script = deploy_word && matches!(ext, "sh" | "yml" | "yaml" | "toml" | "json" | "bash" | "zsh");
+    if platform || (workflow && deploy_word) || deploy_script || (stem.starts_with("docker-compose") && deploy_word) {
+        return FileKind::Deploy;
+    }
+    // Shared CI and build config.
+    if workflow || dirs.windows(2).any(|w| w[0] == ".github" && w[1] == "actions") || in_dir(".circleci") || in_dir(".buildkite") || matches!(name, ".gitlab-ci.yml" | "jenkinsfile" | "bitbucket-pipelines.yml" | "azure-pipelines.yml" | ".travis.yml") || stem.starts_with("dockerfile") || name == "dockerfile" || stem.starts_with("docker-compose") || stem == "compose" {
+        return FileKind::Ci;
+    }
+    FileKind::Plain
+}
+
+/// The 90/10 rule for a file prompt, by its files alone: a secret, deploy
+/// or infrastructure config, or what grants a Claude session its powers.
+fn file_hard(f: &FileWrite) -> Option<&'static str> {
+    f.paths.iter().map(|p| file_kind(p)).find_map(|k| match k {
+        FileKind::Secret => Some("it involves secrets or credentials"),
+        FileKind::Deploy => Some("it changes deploy config"),
+        FileKind::Infra => Some("it touches infrastructure"),
+        FileKind::ClaudeGrants => Some("it changes what a Claude session may do (its settings, hooks or plugins)"),
+        _ => None,
+    })
+}
+
+/// `path` as an absolute path, from `cwd` when relative (`..` taken up).
+fn absolute(path: &str, cwd: Option<&str>) -> Option<String> {
+    let joined = if path.starts_with('/') {
+        path.to_string()
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        format!("{}/{rest}", crate::config::home().to_string_lossy())
+    } else {
+        format!("{}/{path}", cwd?.trim_end_matches('/'))
+    };
+    let mut out: Vec<&str> = vec![];
+    for p in joined.split('/') {
+        match p {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            p => out.push(p),
+        }
+    }
+    Some(format!("/{}", out.join("/")))
+}
+
+/// A file prompt's floor: high by `file_hard`; medium when a file is outside
+/// the session's folder (`cwd`; not scratch, not a Claude folder's own
+/// files), shared CI or build config, or a whole file overwritten; low
+/// otherwise. Never by the text being written.
+pub fn file_floor(f: &FileWrite, cwd: Option<&str>) -> (crate::scoring::Risk, String) {
+    use crate::scoring::Risk;
+    if let Some(why) = file_hard(f) {
+        return (Risk::High, why.to_string());
+    }
+    if f.paths.is_empty() {
+        return (Risk::Medium, "it writes a file the prompt doesn't name".into());
+    }
+    let home = crate::config::home().to_string_lossy().into_owned();
+    let scratch = |p: &str| ["/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/"].iter().any(|t| p.starts_with(t));
+    for p in &f.paths {
+        let Some(abs) = absolute(p, cwd) else { continue };
+        let inside = cwd.is_some_and(|c| {
+            let c = c.trim_end_matches('/').to_lowercase();
+            let a = abs.to_lowercase();
+            a == c || a.starts_with(&format!("{c}/"))
+        });
+        if cwd.is_some() && !inside && !scratch(&abs) && !claude_folder_file(&abs, &home) {
+            return (Risk::Medium, format!("it writes outside its project folder ({abs})"));
+        }
+    }
+    if f.paths.iter().any(|p| file_kind(p) == FileKind::Ci) {
+        return (Risk::Medium, "it changes shared CI or build config".into());
+    }
+    if f.action == FileAction::Overwrite {
+        return (Risk::Medium, "it overwrites a whole file".into());
+    }
+    let verb = if f.action == FileAction::Create { "creates" } else { "edits" };
+    (Risk::Low, format!("it {verb} a file in its project, by its path"))
+}
+
 // ---- Claude's own memory and notes ----
 
 /// What a prompt's sensitive-file reason names: each file it asks to touch
@@ -2714,8 +2947,18 @@ pub fn decide_scored(
 ) -> (String, String, crate::scoring::Scores) {
     use crate::scoring::{Risk, Scores, decide as by_scores, floor, line};
     let hard = must_escalate(set);
-    let (text, command) = prompt_text(set, false, false);
-    let (floor_risk, floor_why) = floor(hard, &text, command.as_deref(), cwd);
+    let (floor_risk, floor_why) = match file_write(set) {
+        // A file prompt: by its paths and action (`file_floor`).
+        Some(f) => match hard {
+            Some(why) => (Risk::High, why.to_string()),
+            None if memory_yes(set).is_some() => (Risk::Low, "it writes Claude's own files".into()),
+            None => file_floor(&f, cwd),
+        },
+        None => {
+            let (text, command) = prompt_text(set, false, false);
+            floor(hard, &text, command.as_deref(), cwd)
+        }
+    };
     let risk = said.risk.unwrap_or(floor_risk).max(floor_risk);
     let risk_why = if said.risk.is_some_and(|r| r >= floor_risk) && !said.risk_why.trim().is_empty() { said.risk_why.trim().to_string() } else { floor_why.clone() };
     let kind = learn_key(set);
@@ -4379,6 +4622,150 @@ mod risk_floor {
         assert!(claude_notice("│ Dangerous rm operation not ruled out — the shell may read this command differently than it was parsed"));
         assert!(claude_notice("│ Claude Code can’t be sure it read this command the way the shell will"));
         assert!(!claude_notice("│ rm -rf build"));
+    }
+}
+
+
+/// A file prompt is judged on what it does: its file's path and its action,
+/// never the text it writes. A README edit that says "deploy" and "rm" is
+/// an edit of a README; `.env`, a deploy workflow or a file outside the
+/// project is what it is whatever it says.
+#[cfg(test)]
+mod file_risk {
+    use super::*;
+    use crate::scoring::{Learned, Risk, Thresholds};
+
+    const CWD: &str = "/Users/Me/Work/shop";
+
+    /// Claude Code's file prompt as the screen shows it (`header`: "Edit file",
+    /// "Create file"…), the file as shown (relative) and, when Herdr says it,
+    /// in full (`target`: "Update: /…"). The session was asked to ship a release.
+    fn prompt(header: &str, shown: &str, target: &str, diff: &[&str], question: &str) -> QuestionSet {
+        let (bar, dash) = ("─".repeat(80), "╌".repeat(80));
+        let body: String = diff.iter().map(|l| format!(" {l}\n")).collect();
+        let text = format!(
+            "⏺ Writing it.\n\n{bar}\n {header}\n {shown}\n{dash}\n{body}{dash}\n {question}\n ❯ 1. Yes\n   2. Yes, allow all edits during this session (shift+tab)\n   3. No, and tell Claude what to do differently (esc)\n\n Esc to cancel · Tab to amend\n"
+        );
+        let screen = parse_screen(&text).unwrap();
+        let msg = if target.is_empty() { String::new() } else { format!("approve {target}") };
+        build("t1", "web", false, &screen, None, &msg, "Ship the release to production and push it")
+    }
+
+    fn edit(path: &str, diff: &[&str]) -> QuestionSet {
+        let name = path.rsplit('/').next().unwrap();
+        prompt("Edit file", path, &format!("Update: {CWD}/{path}"), diff, &format!("Do you want to make this edit to {name}?"))
+    }
+
+    fn scored(set: &QuestionSet) -> (String, crate::scoring::Scores) {
+        let said = Said { risk: Some(Risk::Low), risk_why: "a docs edit".into(), confidence: Some(0.9), confidence_why: "routine".into() };
+        let (d, _, s) = decide_scored(set, Some("auto"), "routine", "normal", &said, &Thresholds::default(), &Learned::default(), Some(CWD));
+        (d, s)
+    }
+
+    const LOUD: &[&str] = &[
+        "12 -Run the tests.",
+        "12 +Deploy with `vercel deploy --prod`, then `git push origin main`.",
+        "13 +Clean up with `rm -rf dist` and `git reset --hard` if the build breaks; keep the .env secrets out.",
+    ];
+
+    #[test]
+    fn a_readme_edit_that_says_deploy_and_rm_is_low() {
+        for set in [edit("README.md", LOUD), edit("docs/deploy.md", LOUD), edit("src/release-notes.ts", LOUD)] {
+            // The words that floored it before: the text being written (and the session's task).
+            assert!(reason_of(&format!("{}\n{}\n{}", set.title, set.detail, set.context), None).is_some(), "{}", set.title);
+            assert_eq!(must_escalate(&set), None, "{}", set.title);
+            let (d, s) = scored(&set);
+            assert_eq!((d.as_str(), s.floor, s.risk), ("auto", Risk::Low, Risk::Low), "{}: {}", set.title, s.floor_why);
+            assert_eq!(s.floor_why, "it edits a file in its project, by its path");
+        }
+        // The prompt as read: an edit, the README in full.
+        assert_eq!(file_write(&edit("README.md", LOUD)), Some(FileWrite { action: FileAction::Edit, paths: vec![format!("{CWD}/README.md")] }));
+        // A new file; a file in scratch; an example env file: low too.
+        let create = prompt("Create file", "docs/runbook.md", &format!("Write: {CWD}/docs/runbook.md"), LOUD, "Do you want to create runbook.md?");
+        assert_eq!((scored(&create).1.floor, scored(&create).1.floor_why.as_str()), (Risk::Low, "it creates a file in its project, by its path"));
+        assert_eq!(scored(&prompt("Edit file", "/tmp/notes.txt", "Update: /tmp/notes.txt", LOUD, "Do you want to make this edit to notes.txt?")).1.floor, Risk::Low);
+        assert_eq!(scored(&edit(".env.example", LOUD)).1.floor, Risk::Low);
+    }
+
+    #[test]
+    fn a_secret_deploy_infra_or_outside_file_is_not_low() {
+        // High, whatever the text says (here: nothing of note).
+        let quiet = &["3 -PORT=3000", "3 +PORT=3001"];
+        for (path, why) in [
+            (".env", "it involves secrets or credentials"),
+            (".env.local", "it involves secrets or credentials"),
+            ("config/credentials.json", "it involves secrets or credentials"),
+            (".github/workflows/deploy.yml", "it changes deploy config"),
+            (".github/workflows/release-web.yml", "it changes deploy config"),
+            ("vercel.json", "it changes deploy config"),
+            ("serverless.yml", "it changes deploy config"),
+            ("infra/main.tf", "it touches infrastructure"),
+            ("k8s/web.yaml", "it touches infrastructure"),
+            (".claude/settings.local.json", "it changes what a Claude session may do (its settings, hooks or plugins)"),
+            (".mcp.json", "it changes what a Claude session may do (its settings, hooks or plugins)"),
+        ] {
+            let set = edit(path, quiet);
+            assert_eq!(must_escalate(&set), Some(why), "{path}");
+            let (d, s) = scored(&set);
+            assert_eq!((d.as_str(), s.risk), ("escalate", Risk::High), "{path}");
+        }
+        // Medium: outside the project (in full from Herdr, or relative on screen), shared CI, a whole file overwritten.
+        let zshrc = prompt("Edit file", "../../.zshrc", "Update: /Users/Me/.zshrc", quiet, "Do you want to make this edit to .zshrc?");
+        let other = prompt("Edit file", "../billing/src/plan.ts", "", quiet, "Do you want to make this edit to plan.ts?");
+        let ci = edit(".github/workflows/ci.yml", quiet);
+        let docker = edit("Dockerfile", quiet);
+        let over = prompt("Overwrite file", "src/app.ts", &format!("Write: {CWD}/src/app.ts"), quiet, "Do you want to overwrite app.ts?");
+        for (set, why) in [
+            (&zshrc, "it writes outside its project folder (/Users/Me/.zshrc)"),
+            (&other, "it writes outside its project folder (/Users/Me/Work/billing/src/plan.ts)"),
+            (&ci, "it changes shared CI or build config"),
+            (&docker, "it changes shared CI or build config"),
+            (&over, "it overwrites a whole file"),
+        ] {
+            assert_eq!(must_escalate(set), None, "{why}");
+            let s = scored(set).1;
+            assert_eq!((s.floor, s.risk, s.floor_why.as_str()), (Risk::Medium, Risk::Medium, why));
+        }
+        // A sensitive-file reason names the file too.
+        let mut named = edit("src/config.ts", quiet);
+        named.detail.push_str(&format!("\nClaude requested permissions to edit {CWD}/.env which is a sensitive file."));
+        assert_eq!(must_escalate(&named), Some("it involves secrets or credentials"));
+    }
+
+    #[test]
+    fn what_a_file_is_by_its_path() {
+        for (p, k) in [
+            ("/w/.env", FileKind::Secret),
+            ("/w/.env.production", FileKind::Secret),
+            ("/w/.env.sample", FileKind::Plain),
+            ("/Users/me/.ssh/config", FileKind::Secret),
+            ("/w/certs/server.pem", FileKind::Secret),
+            ("/w/src/auth/credentials.ts", FileKind::Plain),
+            ("/w/design/tokens.json", FileKind::Plain),
+            ("/w/.github/workflows/cd.yml", FileKind::Deploy),
+            ("/w/.github/workflows/test.yml", FileKind::Ci),
+            ("/w/scripts/deploy.sh", FileKind::Deploy),
+            ("/w/docs/deploy.md", FileKind::Plain),
+            ("/w/docker-compose.prod.yml", FileKind::Deploy),
+            ("/w/docker-compose.yml", FileKind::Ci),
+            ("/w/wrangler.toml", FileKind::Deploy),
+            ("/w/terraform/vars.tfvars", FileKind::Infra),
+            ("/Users/me/.claude/settings.json", FileKind::ClaudeGrants),
+            ("/Users/me/.claude/hooks/pre.sh", FileKind::ClaudeGrants),
+            ("/Users/me/.claude/projects/x/memory/notes.md", FileKind::Plain),
+            ("/w/src/hooks/useCart.ts", FileKind::Plain),
+            ("/w/plugins/genui/.claude-plugin/plugin.json", FileKind::Plain),
+            ("/w/.claude/worktrees/wt-a/plugins/genui/skills/push/SKILL.md", FileKind::Plain),
+            ("/w/.claude/worktrees/wt-a/.claude/settings.json", FileKind::ClaudeGrants),
+            ("/Users/me/.claude/plugins/cache/x/hooks/hooks.json", FileKind::ClaudeGrants),
+            ("/Users/me/Library/Application Support/orca/claude-profiles/1f/home/settings.json", FileKind::ClaudeGrants),
+            ("/Users/me/.claude-accounts/work/hooks/stop.sh", FileKind::ClaudeGrants),
+            ("/w/README.md", FileKind::Plain),
+        ] {
+            assert_eq!(file_kind(p), k, "{p}");
+        }
+        assert_eq!(absolute("../billing/x.ts", Some("/w/shop")).as_deref(), Some("/w/billing/x.ts"));
+        assert_eq!(absolute("src/x.ts", None), None);
     }
 }
 
