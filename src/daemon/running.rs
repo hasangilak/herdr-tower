@@ -51,6 +51,8 @@ struct Inner {
     /// Jobs told stuck (session/key): told once for as long as the job runs,
     /// across restarts of the tower (`jobs-told.json`).
     stuck_told: HashSet<String>,
+    /// Waiters whose process is gone (session/key): since when, seen so.
+    gone_since: HashMap<String, u64>,
     /// Background shells that count as jobs (session/key, `running::counts`):
     /// once they outlived their session's turn or ran two minutes.
     counted: HashSet<String>,
@@ -532,6 +534,27 @@ impl Running {
                     }
                 }
             }
+            // A job that only waits is never stuck. One whose process has been
+            // gone an hour, or whose condition nothing moved for 6 h, gets one
+            // soft note (told once, as a stuck one), unless said to wait.
+            let mut gone_now: HashSet<String> = HashSet::new();
+            for (address, list) in &jobs {
+                for (n, j) in list.iter().enumerate() {
+                    let k = format!("{address}/{}", key(j));
+                    if j.target_gone {
+                        i.gone_since.entry(k.clone()).or_insert(now);
+                        gone_now.insert(k.clone());
+                    }
+                    let since = i.gone_since.get(&k).copied();
+                    if let Some(o) = running::overdue(list, n, since, now)
+                        && j.waiting.is_empty()
+                        && i.stuck_told.insert(k)
+                    {
+                        told.push((address.clone(), wait_line(names.get(address).map(String::as_str).unwrap_or(address), j, o)));
+                    }
+                }
+            }
+            i.gone_since.retain(|k, _| gone_now.contains(k));
             // Jobs that ended: forgotten (only then: a look that saw nothing, as
             // the first one after a restart may, forgets nothing).
             for k in &gone_told {
@@ -829,6 +852,24 @@ fn stuck_line(name: &str, j: &Job, now: u64) -> String {
     format!("{name}'s job may be stuck: {}: nothing written and no CPU for {}.", running::clip(&j.what, 80), minutes(quiet))
 }
 
+/// A waiter's soft note: "fable's job still waits on guard_train.py, which
+/// ended 1 h 5 min ago: Wait for the r1 training run to end. …"
+fn wait_line(name: &str, j: &Job, o: running::Overdue) -> String {
+    let what = running::clip(&j.what, 80);
+    match o {
+        running::Overdue::Gone(ms) => format!(
+            "{name}'s job still waits on {}, which ended {} ago: {what}. Its loop may not see the end; check whether it can stop.",
+            j.waiter,
+            minutes(ms)
+        ),
+        running::Overdue::Long(ms) => format!(
+            "{name}'s job has waited {} for {} and nothing it watches changed: {what}. Likely fine; check that what it waits for still comes.",
+            minutes(ms),
+            j.waiter
+        ),
+    }
+}
+
 pub(super) fn dispatch(running: Option<&Running>, terminal: &str, action: &str, what: &str, pid: Option<u32>) -> Result<Value> {
     let r = running.context("the tower's daemon has no job watch yet")?;
     r.declare(terminal, action, what, pid)
@@ -843,7 +884,10 @@ mod tests {
         let shared = Shared::new(State::new("ptt", "test", "test"));
         let told = Arc::new(Mutex::new(vec![]));
         let t = told.clone();
-        let dir = std::env::temp_dir().join(format!("tower-running-{}-{}", std::process::id(), crate::history::now_ms()));
+        // Its own folder: tests run at once in the same millisecond share no jobs-told.json.
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("tower-running-{}-{}-{n}", std::process::id(), crate::history::now_ms()));
         let _ = std::fs::create_dir_all(&dir);
         let r = Running {
             inner: Arc::default(),
@@ -1002,5 +1046,46 @@ mod tests {
         assert!(t.len() == 1 && t[0].msg.contains("job ended: Rebuild the search index"), "{t:?}");
         assert!(r.declare("t5", "progress", "", None).is_err(), "nothing running");
         assert!(r.declare("t5", "start", "Wait on it", Some(999_999_999)).is_err(), "no such process");
+    }
+
+    /// The t17h case, told: a wait loop is never "may be stuck"; its target
+    /// gone, one soft note an hour on if it still waits, then its end.
+    #[test]
+    fn a_wait_loop_is_never_told_stuck_and_its_gone_target_once_an_hour_later() {
+        let (r, told) = running();
+        let names: HashMap<String, String> = [("t17h".to_string(), "fable".to_string())].into();
+        let now = 1_794_881_359_426;
+        let night = 6 * 3600_000 + 31 * 60_000;
+        let waiter = |gone: bool| Job {
+            what: "Wait for the r1 training run to end, then show its validation losses".into(),
+            since_ms: now - night,
+            progress_ms: Some(now - night),
+            task: Some("bx4zxs5ge".into()),
+            source: "background".into(),
+            wait: Some(running::Wait::Process),
+            waiter: "guard_train.py".into(),
+            waits_on: if gone { String::new() } else { "guard_train.py".into() },
+            target_gone: gone,
+            ..Default::default()
+        };
+        let seen = |gone: bool| BTreeMap::from([("t17h".to_string(), (vec![waiter(gone)], vec![]))]);
+        r.settle(seen(false), &names, now);
+        // Its training ends: the loop has a minute to see it. Nothing told.
+        r.settle(seen(true), &names, now + 15_000);
+        r.settle(seen(true), &names, now + 30 * 60_000);
+        assert!(lock(&told).is_empty(), "{:?}", lock(&told));
+        // Still waiting an hour after: one soft note, not again.
+        r.settle(seen(true), &names, now + 15_000 + 61 * 60_000);
+        r.settle(seen(true), &names, now + 15_000 + 62 * 60_000);
+        let t = lock(&told).clone();
+        assert_eq!(t.len(), 1, "{t:?}");
+        assert!(t[0].msg.starts_with("[job] fable's job still waits on guard_train.py, which ended 61 min ago: Wait for the r1 training run to end"), "{}", t[0].msg);
+        assert!(!t[0].msg.contains("stuck"));
+        // A target seen again (a new run) starts the hour again; its end is told as any job's.
+        r.settle(seen(false), &names, now + 63 * 60_000);
+        assert!(lock(&r.inner).gone_since.is_empty());
+        r.settle(BTreeMap::new(), &names, now + 64 * 60_000);
+        let t = lock(&told).clone();
+        assert!(t.len() == 2 && t[1].msg.starts_with("[job] fable's job ended: Wait for the r1 training"), "{t:?}");
     }
 }
