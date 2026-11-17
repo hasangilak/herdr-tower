@@ -17,6 +17,12 @@
 //! - **Progress.** The newest write to a file its processes have open for
 //!   writing (its log, its task output), and whether any of them uses the
 //!   CPU now (`busy`). Quiet for `QUIET_MS` and idle: possibly stuck.
+//! - **Waiters.** A job that only waits now (an `until`/`while` loop that
+//!   sleeps, a leading `sleep`, `wait <pid>`; nothing but its `sleep` and
+//!   short checks running: `waits_only`, `only_waiting`) is never stuck:
+//!   what it waits on may take the night. Waiting on a process gone for an
+//!   hour, or on a condition nothing moved for 6 h, it is worth a soft note
+//!   (`overdue`); a timer ends by itself.
 //! - **Said so.** A session can also say it itself: `tower job-running
 //!   start|progress|end '<what>' [--pid <pid>]` (`declared`).
 //!
@@ -667,6 +673,209 @@ pub struct Job {
     pub waiting: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_until_ms: Option<u64>,
+    /// It only waits now (`waits_only`, `only_waiting`): on what kind of
+    /// thing, and on what in words (`after_training.sh`, `data/run.log`,
+    /// `sleep 3600`). Never stuck: at most a later, softer note (`overdue`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait: Option<Wait>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub waiter: String,
+    /// It waits on a process that is gone: its loop should end within its next sleep.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub target_gone: bool,
+}
+
+/// What a job that only waits waits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Wait {
+    /// A process (`until ! pgrep -f x`, `while kill -0 <pid>`, `wait <pid>`, `tail --pid`).
+    Process,
+    /// A condition: a file it polls (`until grep -q DONE run.log`, `until [ -f done ]`), a reply, a port.
+    Condition,
+    /// Time only (`sleep 3600; …`): it ends by itself.
+    Timer,
+}
+
+/// A waiter's process gone for this long (its loop should have ended within
+/// a sleep): a soft note. Twice the quiet time (an hour).
+pub fn wait_gone_ms() -> u64 {
+    2 * quiet_ms()
+}
+
+/// A waiter on a condition whose files haven't changed for this long, with
+/// no other job of its session at work: a soft note. Twelve times the quiet
+/// time (6 h, as long as a said wait holds).
+pub fn wait_long_ms() -> u64 {
+    12 * quiet_ms()
+}
+
+/// Why a waiter is worth a soft note now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overdue {
+    /// What it waits on has been gone this long (ms), and it still waits.
+    Gone(u64),
+    /// It has waited this long (ms) on a condition that nothing moved.
+    Long(u64),
+}
+
+/// A waiter of `jobs` (at `i`) worth a soft note: what it waits on gone
+/// since `gone_since` for `wait_gone_ms`; or waiting on a condition with
+/// nothing it watches written for `wait_long_ms` while no other job of the
+/// session is at work. A timer ends by itself, and a live target is no news.
+pub fn overdue(jobs: &[Job], i: usize, gone_since: Option<u64>, now_ms: u64) -> Option<Overdue> {
+    let j = jobs.get(i)?;
+    match j.wait? {
+        Wait::Process => {
+            let gone = now_ms.saturating_sub(gone_since.filter(|_| j.target_gone)?);
+            (gone > wait_gone_ms()).then_some(Overdue::Gone(gone))
+        }
+        Wait::Condition => {
+            let quiet = now_ms.saturating_sub(j.progress_ms.unwrap_or(j.since_ms));
+            let other_at_work = jobs.iter().enumerate().any(|(k, o)| k != i && (o.busy || now_ms.saturating_sub(o.progress_ms.unwrap_or(o.since_ms)) <= quiet_ms()));
+            (quiet > wait_long_ms() && !other_at_work).then_some(Overdue::Long(quiet))
+        }
+        Wait::Timer => None,
+    }
+}
+
+/// A command line's simple commands, split outside quotes at `;`, `&`,
+/// `|`, `(`, `)`, newlines and backquotes (`$(` opens one too): the `|` in
+/// `grep -qE 'DONE|FAILED' run.log` stays in its pattern.
+fn simple_commands(c: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut push = |cur: &mut String| {
+        let t = cur.trim().trim_end_matches('$').trim().to_string();
+        if !t.is_empty() {
+            out.push(t);
+        }
+        cur.clear();
+    };
+    for ch in c.chars() {
+        match (quote, ch) {
+            (None, '\'' | '"') => {
+                quote = Some(ch);
+                cur.push(ch);
+            }
+            (Some(q), ch) if ch == q => {
+                quote = None;
+                cur.push(ch);
+            }
+            (None, ';' | '&' | '|' | '(' | ')' | '\n' | '`') => push(&mut cur),
+            _ => cur.push(ch),
+        }
+    }
+    push(&mut cur);
+    out
+}
+
+/// A simple command without the shell words that lead it (`do`, `then`,
+/// `until`, `while`, `!`, `{`): `do sleep 30` is `sleep 30`. And whether
+/// one of them opened a loop.
+fn bare(segment: &str) -> (bool, &str) {
+    let mut s = segment.trim();
+    let mut looped = false;
+    loop {
+        let before = s;
+        for k in ["do ", "then ", "else ", "elif ", "if ", "until ", "while ", "! ", "{ "] {
+            if let Some(r) = s.strip_prefix(k) {
+                looped |= k == "until " || k == "while ";
+                s = r.trim_start();
+            }
+        }
+        if s == before {
+            return (looped, s);
+        }
+    }
+}
+
+/// A command that only waits, at least at first: an `until`/`while` loop
+/// that sleeps (`until ! pgrep -f x; do sleep 60; done; tail log`), one
+/// that starts with a `sleep`, or a `wait <pid>` / `tail --pid` /
+/// `caffeinate -w`. What it runs after the wait is work again; the look
+/// tells the two apart by what runs now (`only_waiting`).
+pub fn waits_only(command: &str) -> bool {
+    let segs = simple_commands(command);
+    let bares: Vec<(bool, &str)> = segs.iter().map(|s| bare(s)).collect();
+    let sleeps = bares.iter().any(|(_, s)| s.split_whitespace().next() == Some("sleep"));
+    let looped = bares.iter().any(|(l, _)| *l);
+    let first_sleep = bares.first().is_some_and(|(_, s)| s.split_whitespace().next() == Some("sleep"));
+    let pid_wait = bares.iter().any(|(_, s)| {
+        let w: Vec<&str> = s.split_whitespace().collect();
+        (w.first() == Some(&"wait") && w.get(1).is_some_and(|p| p.parse::<u32>().is_ok() || p.starts_with('$')))
+            || (w.first() == Some(&"tail") && w.iter().any(|a| a.starts_with("--pid")))
+            || (w.first() == Some(&"caffeinate") && w.contains(&"-w"))
+            || w.first() == Some(&"pwait")
+    });
+    (looped && sleeps) || first_sleep || pid_wait
+}
+
+/// A process that waits for a long time by itself: `sleep`, `tail --pid`, `caffeinate -w`, `pwait`.
+fn waits_long(command: &str) -> bool {
+    let w = shell_words(command);
+    let base = w.first().map(|f| f.rsplit('/').next().unwrap_or(f)).unwrap_or("");
+    matches!(base, "sleep" | "gsleep" | "pwait") || (base == "tail" && w.iter().any(|a| a.starts_with("--pid"))) || (base == "caffeinate" && w.iter().any(|a| a == "-w"))
+}
+
+/// A check run inside a wait loop lives seconds; one that runs this long is work.
+const CHECK_SECS: u64 = 60;
+
+/// A shell's tree (the shell first) that only waits now: besides copies of
+/// the shell (its subshells), only what waits by itself (`sleep`) and the
+/// loop's short checks (`pgrep`, `grep -q`, `curl`, `tower thread`…).
+pub fn only_waiting(tree: &[&Proc]) -> bool {
+    let Some(shell) = tree.first() else { return false };
+    tree.iter().skip(1).all(|p| p.command == shell.command || is_tool_shell(&p.command) || waits_long(&p.command) || p.secs < CHECK_SECS)
+}
+
+/// The files a wait loop polls: `grep [-q…] <pattern> <file>`, `[ -f <file> ]`,
+/// `test -s <file>`, `ls`/`stat <file>`, as written (maybe relative).
+pub fn polled_files(command: &str) -> Vec<String> {
+    let mut out = vec![];
+    let keep = |t: &str| !t.is_empty() && !t.starts_with('-') && !t.contains(['>', '<', '$', '*', ']']) && !t.starts_with("/dev/");
+    for seg in simple_commands(command) {
+        let (_, s) = bare(&seg);
+        let w = shell_words(s);
+        let Some(first) = w.first().map(String::as_str) else { continue };
+        match first {
+            "grep" | "egrep" | "fgrep" | "rg" => {
+                // Its pattern: `-e X`, else the first word that isn't a flag; the rest are its files.
+                let mut pattern_given = false;
+                let mut args = vec![];
+                let mut i = 1;
+                while i < w.len() {
+                    let a = w[i].as_str();
+                    if a == "-e" || a == "-f" || a == "--regexp" {
+                        pattern_given = true;
+                        i += 2;
+                        continue;
+                    }
+                    if matches!(a, "-m" | "-A" | "-B" | "-C" | "--max-count") {
+                        i += 2;
+                        continue;
+                    }
+                    if !a.starts_with('-') {
+                        args.push(a);
+                    }
+                    i += 1;
+                }
+                out.extend(args.into_iter().skip(usize::from(!pattern_given)).filter(|t| keep(t)).map(String::from));
+            }
+            "[" | "[[" | "test" => {
+                for p in w.windows(2) {
+                    if matches!(p[0].as_str(), "-f" | "-e" | "-s" | "-r") && keep(&p[1]) {
+                        out.push(p[1].clone());
+                    }
+                }
+            }
+            "ls" | "stat" => out.extend(w.iter().skip(1).filter(|t| keep(t)).cloned()),
+            _ => {}
+        }
+    }
+    out.dedup();
+    out
 }
 
 /// A quiet job of a session whose other job is at work (its CPU, or a write
@@ -782,6 +991,10 @@ pub fn line(jobs: &[Job], now_ms: u64) -> Option<String> {
         s += &format!(" (waits for {})", clip(&j.waiting, 60));
     } else if !j.waits_on.is_empty() {
         s += &format!(" (waits on {})", clip(&j.waits_on, 60));
+    } else if j.target_gone {
+        s += &format!(" (waits on {}, which has ended)", clip(&j.waiter, 60));
+    } else if !j.waiter.is_empty() {
+        s += &format!(" (waits for {})", clip(&j.waiter, 60));
     }
     if jobs.len() > 1 {
         s += &format!(" (+{} more)", jobs.len() - 1);
@@ -887,6 +1100,10 @@ pub fn reach(world: &World, shell: u32, command: &str) -> Reach {
     let own: Vec<u32> = world.subtree(shell).iter().map(|p| p.pid).collect();
     let waited = world.waited_on(command, &own);
     let mut named: Vec<String> = named_files(command).iter().filter_map(|n| resolve(n, world.cwd_of(shell))).collect();
+    // A wait loop's polled files (`until grep -q DONE run.log`): written, they move what it waits for.
+    if waits_only(command) {
+        named.extend(polled_files(command).iter().filter_map(|n| resolve(n, world.cwd_of(shell))));
+    }
     for pid in own.iter().skip(1).chain(&waited) {
         if let Some(p) = world.procs.iter().find(|p| p.pid == *pid) {
             named.extend(named_files(&p.command).iter().filter_map(|n| resolve(n, world.cwd_of(*pid))));
@@ -1191,6 +1408,18 @@ pub fn look(claude: u32, world: &World, tasks: &Tasks, now_ms: u64, turn_over: b
                 // commands (`--log train.log`) show its progress.
                 let reach = reach(world, shell.pid, &command);
                 let waited: Vec<&Proc> = reach.waited.iter().filter_map(|w| world.procs.iter().find(|p| p.pid == *w)).collect();
+                // It only waits now (a loop's `sleep`, a `wait <pid>`): on a
+                // process its command names, a file it polls, or time.
+                let wait = (waits_only(&command) && only_waiting(&tree)).then(|| {
+                    let targets = waited_in(&command);
+                    if !targets.is_empty() {
+                        Wait::Process
+                    } else if polled_files(&command).is_empty() && !simple_commands(&command).iter().any(|s| bare(s).0) {
+                        Wait::Timer
+                    } else {
+                        Wait::Condition
+                    }
+                });
                 let tree: Vec<&Proc> = tree.iter().copied().chain(waited.iter().copied()).collect();
                 let writes: Vec<&Open> = tree.iter().flat_map(|p| world.files.get(&p.pid).map(|f| f.iter().filter(|o| written(o)).collect::<Vec<_>>()).unwrap_or_default()).collect();
                 // Its log over its task output (often empty when the command
@@ -1208,17 +1437,44 @@ pub fn look(claude: u32, world: &World, tasks: &Tasks, now_ms: u64, turn_over: b
                 // What it waits on, by the process at work there (the training, not its guard).
                 let waits_on = waited
                     .iter()
+                    // (Of equals, the first: the topmost, `after_training.sh` over its `sleep`.)
+                    .rev()
                     .max_by_key(|p| (world.on_gpu(p.pid), (p.cpu * 10.0) as u64))
                     .map(|p| clip(&short_name(&p.command), 60))
                     .unwrap_or_default();
                 let quiet = now_ms.saturating_sub(progress_ms.unwrap_or(since_ms));
+                // A waiter in words: its live target, else what its command
+                // names (the pattern, the pid, the file), else its sleep.
+                let waiter = match wait {
+                    None => String::new(),
+                    Some(Wait::Process) if !waits_on.is_empty() => waits_on.clone(),
+                    Some(Wait::Process) => waited_in(&command)
+                        .iter()
+                        .map(|w| match w {
+                            Waited::Pattern(parts) => parts.join(" … "),
+                            Waited::Pid(p) => format!("process {p}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    Some(Wait::Condition) => polled_files(&command).first().cloned().unwrap_or_else(|| "its condition".into()),
+                    Some(Wait::Timer) => simple_commands(&command).iter().map(|s| bare(s).1.to_string()).find(|s| s.starts_with("sleep")).unwrap_or_default(),
+                };
                 jobs.push(Job {
                     what,
                     command: clip(&command, 300),
                     since_ms,
                     progress_ms,
                     busy,
-                    stuck: !busy && quiet > quiet_ms(),
+                    // One that only waits is never stuck: what it waits on may
+                    // take the night (an `overdue` note at most, much later).
+                    // Only the work it waits on can be: a training under its
+                    // guard at no CPU and no GPU, its log quiet (not a script
+                    // that itself only sleeps until its turn).
+                    stuck: match wait {
+                        None => !busy && quiet > quiet_ms(),
+                        Some(Wait::Process) if !waited.is_empty() && !only_waiting(&waited) => !busy && quiet > quiet_ms(),
+                        Some(_) => false,
+                    },
                     pid: Some(shell.pid),
                     task: task_id.clone(),
                     source: "background".into(),
@@ -1226,6 +1482,9 @@ pub fn look(claude: u32, world: &World, tasks: &Tasks, now_ms: u64, turn_over: b
                     note: String::new(),
                     watched: false,
                     waits_on,
+                    target_gone: wait == Some(Wait::Process) && waited.is_empty(),
+                    wait,
+                    waiter: clip(&waiter, 60),
                     ..Default::default()
                 });
             }
@@ -1622,11 +1881,11 @@ mod tests {
         // A job declared with the guard's pid: idle at its own CPU, at work on the GPU below it, its --log read.
         assert_eq!(activity(&w, 200), (true, Some(NOW - 60_000)));
         assert_eq!(activity(&w2, 200), (false, Some(NOW - 50 * 60_000)), "no GPU, no CPU: its log says how long it has been quiet");
-        // The training is gone (the waiter should have ended): quiet for 70 minutes, stuck.
+        // The training is gone (the waiter ends within its sleep): not stuck, its target gone.
         let mut w3 = gpu_world().0;
         w3.procs.retain(|p| p.pid != 200 && p.pid != 201);
         let j = &look(5, &w3, &t, NOW, true).0[0];
-        assert!(j.stuck && j.waits_on.is_empty(), "{j:?}");
+        assert!(!j.stuck && j.target_gone && j.waits_on.is_empty() && j.waiter == "mlx_lm lora -c … lora_1.2b_v5.yaml", "{j:?}");
         // Only what the pattern names: the v4 training (another config) isn't waited on, nor the pgrep looking.
         assert_eq!(w.waited_on(&t.by_id["bwait"].command, &[100, 101, 102]), [200, 201]);
     }
@@ -1753,5 +2012,138 @@ mod tests {
         let names = |turn_over: bool| look(1, &w3, &t, NOW, turn_over).0.into_iter().map(|j| j.what).collect::<Vec<_>>();
         assert_eq!(names(false), ["Train the 1.2B LoRA", "Post-training pipeline"], "the background tasks only");
         assert_eq!(names(true).len(), 3, "its turn over: a shell left is a background one");
+    }
+
+    /// A session's background loop that has waited `secs`, its `sleep` a
+    /// child, and other processes of the machine; its task output untouched since.
+    fn wait_world(cmd: &str, secs: u64, child: &str, others: Vec<Proc>) -> (World, Tasks) {
+        let mut w = World::default();
+        w.procs = vec![
+            Proc { pid: 5, ppid: 1, secs: secs + 600, cpu: 1.0, command: "claude".into() },
+            shell(100, 5, secs, cmd),
+            Proc { pid: 101, ppid: 100, secs: 40, cpu: 0.0, command: child.into() },
+        ];
+        w.procs.extend(others);
+        w.files.insert(100, vec![open("1", "w", "/tmp/p/tasks/bwait.output"), open("cwd", "", "/w")]);
+        w.mtimes.insert("/tmp/p/tasks/bwait.output".into(), NOW - secs * 1000);
+        let mut t = Tasks::default();
+        t.by_id.insert("bwait".into(), Task { id: "bwait".into(), kind: TaskKind::Bash, description: "Wait for it".into(), command: cmd.into(), at_ms: 0, said_serving: false });
+        (w, t)
+    }
+
+    /// The t17h case (search-llm, 2026-11-17 03:09): two background loops
+    /// waited all night, one on the r1 training's guard, one on the scoring
+    /// chain after it (a script that itself sleeps until the training ends).
+    /// Nothing written and no CPU for 6 h 30: both were called stuck, the
+    /// first as the training ended (its loop had a minute left to see it).
+    #[test]
+    fn a_sleep_loop_isnt_stuck_and_a_wait_loop_whose_target_is_gone_is_noted_later() {
+        let night = 6 * 3600 + 30 * 60;
+        let chain = "until ! pgrep -f '[a]fter_training.sh' >/dev/null; do sleep 60; done; date +%H:%M:%S; grep -E '^===|FAILED|chosen' data/review/reasons/after_training.log | tail -30";
+        let script = vec![
+            Proc { pid: 200, ppid: 1, secs: night, cpu: 0.0, command: "bash data/review/reasons/after_training.sh".into() },
+            Proc { pid: 201, ppid: 200, secs: 20, cpu: 0.0, command: "sleep 60".into() },
+        ];
+        let (w, t) = wait_world(chain, night, "sleep 60", script);
+        let (jobs, _) = look(5, &w, &t, NOW, true);
+        let j = &jobs[0];
+        assert_eq!((j.stuck, j.wait, j.target_gone), (false, Some(Wait::Process), false), "{j:?}");
+        assert_eq!((j.waits_on.as_str(), j.waiter.as_str()), ("after_training.sh", "after_training.sh"));
+        assert_eq!(overdue(&jobs, 0, None, NOW), None);
+        assert!(line(&jobs, NOW).unwrap().contains("(waits on after_training.sh)"), "{:?}", line(&jobs, NOW));
+        assert!(!shown(&jobs, NOW).unwrap().stuck);
+
+        // The r1 loop as the training ended: its target gone, it ends within its sleep. Not stuck;
+        // a soft note only if it still waits an hour later.
+        let r1 = "until ! pgrep -f '[g]uard_train.py' >/dev/null; do sleep 60; done; date +%H:%M:%S; tail -3 data/review/reasons/guard.out";
+        let (w, t) = wait_world(r1, night + 60, "sleep 60", vec![]);
+        let (jobs, _) = look(5, &w, &t, NOW, true);
+        let j = &jobs[0];
+        assert_eq!((j.stuck, j.wait, j.target_gone, j.waiter.as_str()), (false, Some(Wait::Process), true, "guard_train.py"), "{j:?}");
+        assert_eq!(overdue(&jobs, 0, Some(NOW - 2 * 60_000), NOW), None, "gone two minutes: its loop is about to see it");
+        assert_eq!(overdue(&jobs, 0, Some(NOW - 61 * 60_000), NOW), Some(Overdue::Gone(61 * 60_000)), "gone an hour and still waiting");
+        assert!(line(&jobs, NOW).unwrap().contains("(waits on guard_train.py, which has ended)"));
+
+        // While the training ran: the guard and the training under it, on the GPU.
+        let training = vec![
+            Proc { pid: 300, ppid: 1, secs: night, cpu: 0.0, command: ".venv/bin/python -I scripts/review/guard_train.py --config train/r1.yaml --log data/review/reasons/train.log".into() },
+            Proc { pid: 301, ppid: 300, secs: night, cpu: 3.0, command: ".venv/bin/python -I -m mlx_lm lora -c train/r1.yaml".into() },
+        ];
+        let (mut w, t) = wait_world(r1, night, "sleep 60", training);
+        w.gpu_before.insert(301, 1);
+        w.gpu.insert(301, 2);
+        let j = &look(5, &w, &t, NOW, true).0[0];
+        assert_eq!((j.stuck, j.busy, j.waits_on.as_str()), (false, true, "mlx_lm lora"));
+        // The training itself hung (no GPU, no CPU, its log quiet): that is no wait, it may be stuck.
+        w.gpu.insert(301, 1);
+        w.procs[4].cpu = 0.0;
+        w.files.insert(300, vec![open("cwd", "", "/w")]);
+        w.mtimes.insert("/w/data/review/reasons/train.log".into(), NOW - 50 * 60_000);
+        assert!(look(5, &w, &t, NOW, true).0[0].stuck, "a hung training under the guard is still told");
+
+        // Not a waiter: the same shell running real work for hours, idle and quiet, is stuck.
+        let (w, t) = wait_world("python score.py --all", night, "/w/.venv/bin/python score.py --all", vec![]);
+        let mut w = w;
+        w.procs[2].secs = night;
+        let j = &look(5, &w, &t, NOW, true).0[0];
+        assert!(j.stuck && j.wait.is_none(), "{j:?}");
+    }
+
+    #[test]
+    fn a_timer_and_a_condition_wait_are_no_stuck_jobs() {
+        // `sleep 7200; …`: a timer while it sleeps, never noted; the work after it is checked again.
+        let timer = "sleep 7200; .venv/bin/python -I scripts/score.py --log s.log";
+        let (w, t) = wait_world(timer, 6000, "sleep 7200", vec![]);
+        let jobs = look(5, &w, &t, NOW, true).0;
+        assert_eq!((jobs[0].stuck, jobs[0].wait, jobs[0].waiter.as_str()), (false, Some(Wait::Timer), "sleep 7200"));
+        assert_eq!(overdue(&jobs, 0, None, NOW + 10 * 3600_000), None);
+        let (mut w, t) = wait_world(timer, 3 * 3600, ".venv/bin/python -I scripts/score.py --log s.log", vec![]);
+        w.procs[2].secs = 3 * 3600 - 7200;
+        let j = &look(5, &w, &t, NOW, true).0[0];
+        assert!(j.stuck && j.wait.is_none(), "the score run after the sleep, idle for an hour: {j:?}");
+
+        // A loop polling a log: its writes are its progress; quiet 7 h with nothing else at work, a soft note.
+        let cond = "until grep -qE 'SERVED DONE|FAILED|not up' data/eval/served.log; do sleep 5; done; tail -2 data/eval/served.log";
+        let (mut w, t) = wait_world(cond, 7 * 3600, "sleep 5", vec![]);
+        w.mtimes.insert("/w/data/eval/served.log".into(), NOW - 10 * 60_000);
+        let jobs = look(5, &w, &t, NOW, true).0;
+        assert_eq!((jobs[0].stuck, jobs[0].wait, jobs[0].progress_ms, jobs[0].waiter.as_str()), (false, Some(Wait::Condition), Some(NOW - 10 * 60_000), "data/eval/served.log"));
+        assert_eq!(overdue(&jobs, 0, None, NOW), None);
+        w.mtimes.insert("/w/data/eval/served.log".into(), NOW - 7 * 3600_000);
+        let mut jobs = look(5, &w, &t, NOW, true).0;
+        assert!(!jobs[0].stuck);
+        assert_eq!(overdue(&jobs, 0, None, NOW), Some(Overdue::Long(7 * 3600_000)));
+        // Another job of the session at work: it waits on that one.
+        jobs.push(Job { what: "Serve check".into(), since_ms: NOW - 3600_000, busy: true, ..Default::default() });
+        assert_eq!(overdue(&jobs, 0, None, NOW), None);
+    }
+
+    #[test]
+    fn what_only_waits_and_what_a_wait_loop_polls() {
+        for c in [
+            "until ! pgrep -f '[g]uard_train.py' >/dev/null; do sleep 60; done; date; tail -3 guard.out",
+            "(i=0; until [ \"$(ls data/answers 2>/dev/null | grep -c '^V')\" -ge 35 ] || [ $i -ge 120 ]; do sleep 5; i=$((i+1)); done; echo done)",
+            "while kill -0 4242 2>/dev/null; do sleep 5; done",
+            "while true; do grep -q DONE run.log && break; sleep 30; done",
+            "sleep 600 && npm test",
+            "wait 991 && echo done",
+            "tail --pid=77 -f /dev/null",
+        ] {
+            assert!(waits_only(c), "{c}");
+        }
+        for c in ["python train.py --epochs 3", "npm test; sleep 5", "until curl -sf localhost:8090/health; do echo .; done", "echo 'until x; do sleep 1; done'"] {
+            assert!(!waits_only(c), "{c}");
+        }
+        let p = |pid: u32, secs: u64, command: &str| Proc { pid, ppid: 100, secs, cpu: 0.0, command: command.into() };
+        let sh = shell(100, 5, 9000, "until ! pgrep -f x; do sleep 60; done");
+        let clone = Proc { pid: 102, ..sh.clone() };
+        assert!(only_waiting(&[&sh, &p(101, 50, "sleep 60")]));
+        assert!(only_waiting(&[&sh, &clone, &p(103, 0, "pgrep -f x"), &p(104, 900, "/bin/sleep 3600")]));
+        assert!(only_waiting(&[&sh, &p(101, 9000, "tail --pid=77 -f /dev/null")]));
+        assert!(!only_waiting(&[&sh, &p(101, 600, "/w/.venv/bin/python score.py")]), "work that runs ten minutes isn't a check");
+        assert_eq!(polled_files("until grep -qE 'SERVED DONE|FAILED|not up' data/x.log 2>/dev/null; do sleep 5; done"), ["data/x.log"]);
+        assert_eq!(polled_files("until [ -f out/done.flag ] || [ -s err.txt ]; do sleep 1; done"), ["out/done.flag", "err.txt"]);
+        assert_eq!(polled_files("until grep -q -e DONE -m 1 a.log b.log; do sleep 2; done; ls -la models/x"), ["a.log", "b.log", "models/x"]);
+        assert!(polled_files("until ! pgrep -f '[g]uard_train.py' >/dev/null; do sleep 60; done").is_empty());
     }
 }
