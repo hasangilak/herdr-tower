@@ -180,10 +180,13 @@ fn medium_signal(text: &str, command: Option<&str>, cwd: Option<&str>) -> Option
         return Some(format!("it changes shared or machine-wide state ({w})"));
     }
     // A file outside the project folder.
-    if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
+    // (The command and the text are lower-cased here: the folder is too.)
+    if let Some(cwd) = cwd.filter(|c| !c.is_empty()).map(str::to_lowercase) {
         let outside = c.split_whitespace().chain(t.split_whitespace()).any(|w| {
             let w = w.trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == ',' || ch == ')' || ch == '(');
-            (w.starts_with('/') || w.starts_with("~/")) && !w.starts_with(cwd) && !w.starts_with("/tmp") && !w.starts_with("/private/tmp") && !w.starts_with("/dev/") && w.len() > 2
+            // A path: `/` then a name (not `/**` of a doc comment, nor `//`).
+            let path = w.starts_with("~/") || w.strip_prefix('/').and_then(|r| r.chars().next()).is_some_and(|c| c.is_alphanumeric() || "._-".contains(c));
+            path && !w.starts_with(&cwd) && !w.starts_with("/tmp") && !w.starts_with("/private/tmp") && !w.starts_with("/dev/") && w.len() > 2
         });
         if outside {
             return Some("it reaches outside its project folder".into());
@@ -344,6 +347,11 @@ mod tests {
         assert_eq!(floor(None, "Write /w/app/src/x.ts?", None, Some("/w/app")).0, Risk::Low, "inside the project");
         assert_eq!(floor(None, "Which database should the app use?", None, None).0, Risk::Medium);
         assert_eq!(floor(None, "Read /tmp/out.log?", Some("cat /tmp/out.log"), Some("/w/app")).0, Risk::Low, "scratch is no reach");
+        // A folder with capitals is inside itself (the command is read lower-cased).
+        assert_eq!(floor(None, "Allow this?", Some("cd /Users/Me/Work/shop && python3 x.py"), Some("/Users/Me/Work/shop")).0, Risk::Low);
+        assert_eq!(floor(None, "Allow this?", Some("cat /Users/Me/.zshrc"), Some("/Users/Me/Work/shop")).0, Risk::Medium);
+        // Code it writes isn't a path: `/**` opens a doc comment, `//` a line comment.
+        assert_eq!(floor(None, "Allow this?", Some("python3 - <<'EOF'\ns = '''/** The copy */\n// x'''\nEOF"), Some("/Users/Me/Work/shop")).0, Risk::Low);
         // 15 Nov's replay: what asks the user to act is theirs; costly runs are medium.
         assert_eq!(floor(None, "Your turn: answer group E (four items) whenever you have a minute", None, None).0, Risk::High);
         assert_eq!(floor(None, "Will you check about 30 labels by hand before I rescore?", None, None).0, Risk::High);
