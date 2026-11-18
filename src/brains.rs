@@ -167,6 +167,9 @@ pub fn space_section(space: &str, name: &str, dir: &Path, mission: &Value) -> St
         "You are not the main tower. You are the tower of one space, \"{space}\": your terminal is `{name}`, and everything above holds for you inside this space only. Where this part and the text above disagree, this part wins.\n\n"
     );
     s += "## What this space is\n\n";
+    if let Some(from) = mission["spun_from"].as_str().map(str::trim).filter(|f| !f.is_empty()) {
+        s += &format!("- It was spun out of the space \"{from}\": a session there found a bug off that space's goal, and the tower opened this space for it. What you learn here that matters to \"{from}\", put in this space's report.\n");
+    }
     match (word("goal").is_empty(), mission["standing"] == true) {
         (_, true) => s += "- A standing space: the user keeps it. It is never ready to close, and sessions opened here work in the projects' own checkouts.\n",
         (true, false) => s += "- It has no goal: it is the user's own place, with no end.\n",

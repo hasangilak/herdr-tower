@@ -258,12 +258,58 @@ pub fn goal_of(f: &Finding) -> (String, String) {
     (format!("Fix: {title}"), "The bug is fixed with a test that reproduces it, and the fix is committed on this space's branch".to_string())
 }
 
-/// The new space's name: `bug-` and two words of its title (`bug-stats-mean`),
-/// never one there is.
+/// The new space's name: the space it was found in, then `bug-` and two
+/// words of its title (`support › bug-stats-mean`), never one there is.
+/// Herdr has no fork of a space: the name says where it comes from, and
+/// it is placed right after that space (`fork_position`).
 pub fn space_for(f: &Finding, taken: &[String]) -> String {
     let base = crate::launch::space_name(f.report.title.trim());
     let base = if base.is_empty() { "bug".to_string() } else { format!("bug-{base}") };
+    let from = f.report.space.trim();
+    let base = if from.is_empty() { base } else { format!("{from} {FORK_MARK} {base}") };
     crate::launch::unique(&base, taken)
+}
+
+/// Between a spun-out space's source and its own name.
+pub const FORK_MARK: &str = "\u{203a}";
+
+/// Where `new` goes in Herdr's list of spaces (`order`, as `herdr-app ls`
+/// has them) to sit right after `source`: its position (1 = first) for
+/// `space.move`. None: either isn't there, or it is there already.
+pub fn fork_position(order: &[String], source: &str, new: &str) -> Option<usize> {
+    let at = |n: &str| order.iter().position(|s| s.eq_ignore_ascii_case(n.trim()));
+    let (src, me) = (at(source)?, at(new)?);
+    if me == src + 1 {
+        return None;
+    }
+    // (Taken out first: a source after it moves up by one.)
+    Some(if me < src { src + 1 } else { src + 2 })
+}
+
+/// The spun-out space `new` right after `source` in Herdr's window, and the
+/// link kept on its mission (`Mission::spun_from`). Says what it did.
+fn place_after(source: &str, new: &str) -> String {
+    let source = source.trim();
+    if source.is_empty() {
+        return String::new();
+    }
+    crate::spaces::update(|s| {
+        if let Some(m) = s.missions.get_mut(new) {
+            m.spun_from = Some(source.to_string());
+        }
+    });
+    let Some(list) = crate::spaces::windows_open() else { return "Herdr's window didn't answer: not placed".into() };
+    let order: Vec<String> = list.iter().map(|w| w.name.clone()).collect();
+    let (Some(to), Some(me)) = (fork_position(&order, source, new), list.iter().find(|w| w.name.eq_ignore_ascii_case(new))) else {
+        return format!("right after {source}");
+    };
+    let index = to.to_string();
+    let ok = std::process::Command::new(crate::config::herdr_app_bin())
+        .args(["do", "space.move", "--id", &me.id, "--index", &index])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if ok { format!("right after {source}") } else { format!("not moved after {source}: herdr-app space.move failed") }
 }
 
 /// What the new space's session is asked first (`tower launch`'s goal): the finding, its link.
@@ -489,6 +535,8 @@ pub fn published(id: &str, url: &str) -> Result<Value> {
     if space.is_empty() || !opened {
         bail!("its space didn't open: {}", r);
     }
+    // As a fork of the space it was found in would be: right after it, linked to it.
+    let placed = place_after(&f.report.space, &space);
     let f = update_at(&path(), |b| {
         let f = b.findings.iter_mut().find(|f| f.id == id)?;
         (f.state, f.spun_to) = ("spun-out".into(), space.clone());
@@ -498,9 +546,12 @@ pub fn published(id: &str, url: &str) -> Result<Value> {
     // The write-up kept with the link, for whoever reads it from the folder.
     let _ = std::fs::write(dir().join(format!("{}.md", f.id)), format!("{}\nArtifact: {}\n", writeup(&f), f.url));
     let told = queue_to(&f.report.session, &told_finder(&f, false));
-    say(&told_user(&f));
+    // Said, unless where it was found is muted (what happens there isn't said).
+    if !crate::spaces::muted_in(&crate::spaces::load(), &f.report.space) {
+        say(&told_user(&f));
+    }
     history::append(history::Entry { kind: "finding".into(), space: Some(f.report.space.clone()), session: Some(f.report.session.clone()), text: told_user(&f), record: true, ..Default::default() });
-    Ok(json!({ "id": f.id, "space": space, "url": f.url, "finder_told": told.is_ok(), "launch": r }))
+    Ok(json!({ "id": f.id, "space": space, "spun_from": f.report.space, "placed": placed, "url": f.url, "finder_told": told.is_ok(), "launch": r }))
 }
 
 pub fn cmd(a: Args) -> Result<()> {
@@ -584,6 +635,27 @@ mod tests {
     }
 
     #[test]
+    fn a_spun_out_space_goes_right_after_the_one_it_came_from() {
+        let order = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // Made last, as a new space is: moved to just after its source.
+        let now = order(&["sandbox", "search-llm", "support", "M5 Pro", "support \u{203a} bug-x"]);
+        assert_eq!(fork_position(&now, "support", "support \u{203a} bug-x"), Some(4));
+        // Its source is the last one, or it is right after it already: nothing to move.
+        assert_eq!(fork_position(&order(&["a", "support", "support \u{203a} bug-x"]), "support", "support \u{203a} bug-x"), None);
+        // Before its source (moved by hand): its source moves up once it is taken out.
+        assert_eq!(fork_position(&order(&["support \u{203a} bug-x", "a", "support", "b"]), "Support", "support \u{203a} bug-x"), Some(3));
+        // Either not in the window: nothing.
+        assert_eq!(fork_position(&now, "gone", "support \u{203a} bug-x"), None);
+        assert_eq!(fork_position(&now, "support", "bug-y"), None);
+        // Its tower is told where it was spun out of; its mission keeps the link through a reopen.
+        let section = crate::brains::space_section("support \u{203a} bug-x", "tower-support-bug-x", std::path::Path::new("/b"), &serde_json::json!({ "goal": "Fix: x", "spun_from": "support" }));
+        assert!(section.contains("spun out of the space \"support\""), "{section}");
+        let mut m = crate::missions::Mission { spun_from: Some("support".into()), ..crate::missions::Mission::born(1) };
+        m.reopen(2);
+        assert_eq!(m.spun_from.as_deref(), Some("support"));
+    }
+
+    #[test]
     fn its_writeup_says_what_where_how_and_who() {
         let mut r = rep("Video upload times out", "Retries forever.", "/w/eyz-mediaroom-serverless", &["src/upload/multipart.ts:88-120"]);
         (r.repro, r.evidence, r.session_name) = ("Upload a 2 GB file on dev.".into(), "Lambda log: Task timed out after 30.00 seconds".into(), "kb".into());
@@ -593,11 +665,18 @@ mod tests {
             assert!(w.contains(part), "{part:?} in {w}");
         }
         assert_eq!(goal_of(&f).0, "Fix: Video upload times out");
-        assert_eq!(space_for(&f, &[]), "bug-video-upload");
-        assert_eq!(space_for(&f, &["bug-video-upload".to_string()]), "bug-video-upload-2", "never one there is");
+        // Named after the space it was found in (Herdr has no fork of a space), never one there is.
+        assert_eq!(space_for(&f, &[]), "kb-refresh \u{203a} bug-video-upload");
+        assert_eq!(space_for(&f, &["kb-refresh \u{203a} bug-video-upload".to_string()]), "kb-refresh \u{203a} bug-video-upload-2", "never one there is");
         let mut odd = f.clone();
         odd.report.title = "stats.mean([]) raises ZeroDivisionError on an empty list".into();
-        assert_eq!(space_for(&odd, &[]), "bug-stats-mean");
+        assert_eq!(space_for(&odd, &[]), "kb-refresh \u{203a} bug-stats-mean");
+        // Found where no space is known: as before.
+        let mut nowhere = odd.clone();
+        nowhere.report.space = String::new();
+        assert_eq!(space_for(&nowhere, &[]), "bug-stats-mean");
+        // Its slug (worktrees, branches, its tower's name) stays plain.
+        assert_eq!(crate::worktrees::slug(&space_for(&f, &[])), "kb-refresh-bug-video-upload");
         assert!(ticket(&f).contains("https://claude.ai/artifact/x") && ticket(&f).contains("## Evidence"));
         assert!(told_finder(&f, false).contains("carry on with your own goal") && told_finder(&f, false).contains("\"fix-video\""));
         let line = told_user(&f);
