@@ -771,7 +771,8 @@ impl Radar {
             // Blocked on what the tower couldn't read: over once it isn't blocked.
             self.decisions.session_blocked(&address, status == SessionStatus::Blocked);
         } else {
-            self.decisions.session_gone(&address);
+            // (After a while: its conversation may go on in another terminal, `Decisions::carry_over`.)
+            self.decisions.session_gone_later(&address);
         }
         // First sight of a watched session (a machine just reached, a start):
         // how it stood when the watch was set.
@@ -1016,8 +1017,9 @@ impl Radar {
     fn gone(&self, address: &str) {
         super::brains::gone(address);
         self.asks.seen(address, &Value::Null, &SessionStatus::Gone);
-        // A decision all of whose sessions are gone is over.
-        self.decisions.session_gone(address);
+        // A decision all of whose sessions are gone is over, once it has been
+        // gone a while: its conversation may go on in another terminal.
+        self.decisions.session_gone_later(address);
         super::sessions::registry().forget(address);
         self.asks.forget_turn(address);
         let removed = lock(&self.seen).remove(address);

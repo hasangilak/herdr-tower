@@ -69,6 +69,11 @@ pub struct Decisions {
     /// Whether a PR that merged is what a hold's words wait for (the
     /// daemon's: one model call, see `judge_merged`); none in tests.
     judge: Option<fn(&str, &Pr) -> Option<bool>>,
+    /// Sessions seen gone, and since when (`session_gone_later`): their
+    /// decisions wait `gone_grace_ms` for the conversation to go on in
+    /// another terminal (`carry_over`) before they leave them.
+    gone: Arc<Mutex<std::collections::HashMap<String, u64>>>,
+    gone_grace_ms: u64,
 }
 
 fn in_muted(d: &Decision, muted: &[String]) -> bool {
@@ -78,7 +83,17 @@ fn in_muted(d: &Decision, muted: &[String]) -> bool {
 impl Decisions {
     /// Decisions kept nowhere, with no space muted.
     pub fn new(shared: Shared) -> Decisions {
-        Decisions { book: Arc::default(), path: None, shared, muted: Arc::new(Vec::new), level: crate::tell::level, back: Arc::default(), judge: None }
+        Decisions {
+            book: Arc::default(),
+            path: None,
+            shared,
+            muted: Arc::new(Vec::new),
+            level: crate::tell::level,
+            back: Arc::default(),
+            judge: None,
+            gone: Arc::default(),
+            gone_grace_ms: crate::reopen::GRACE_MS,
+        }
     }
 
     /// The daemon's: `decisions.json` in the state folder, as the last run left it.
@@ -370,6 +385,34 @@ impl Decisions {
             .any(|d| !d.kind.asks() && d.sessions.iter().any(|w| w.address == address && (d.kind != decisions::Kind::Merge || w.waiting)));
         if about {
             self.round("a session gone", |b, now| b.session_gone(address, now));
+        }
+    }
+
+    /// A session was seen gone: its decisions leave it once it has been gone
+    /// `gone_grace_ms` (asked again by each look), unless its conversation
+    /// went on in another terminal meanwhile (`carry_over`): a move to
+    /// another space's tab, a reopen after a restart.
+    pub fn session_gone_later(&self, address: &str) {
+        let now = crate::history::now_ms();
+        let since = *lock(&self.gone).entry(address.to_string()).or_insert(now);
+        if now.saturating_sub(since) >= self.gone_grace_ms {
+            lock(&self.gone).remove(address);
+            self.session_gone(address);
+        }
+    }
+
+    /// The conversation of the session at `from` goes on at `to`: its
+    /// decisions are `to`'s (`decisions::Book::carry_over`), and `from`
+    /// leaves none when it is gone.
+    pub fn carry_over(&self, from: &str, to: &str) {
+        lock(&self.gone).remove(from);
+        if lock(&self.book).open.iter().any(|d| !d.kind.asks() && d.sessions.iter().any(|w| w.address == from)) {
+            self.change(|b, _| {
+                if b.carry_over(from, to) {
+                    eprintln!("[decisions] {from}'s decisions are {to}'s: its conversation went on there");
+                }
+                Changes::default()
+            });
         }
     }
 
@@ -704,8 +747,11 @@ impl Decisions {
         sessions.dedup();
         for a in sessions {
             match hc::lookup(&a) {
-                hc::Lookup::Found(t) if t["state"] == "live" => self.session_seen(&a, hc::status(&t) != hc::SessionStatus::Working),
-                hc::Lookup::Found(_) | hc::Lookup::Gone => self.session_gone(&a),
+                hc::Lookup::Found(t) if t["state"] == "live" => {
+                    lock(&self.gone).remove(&a);
+                    self.session_seen(&a, hc::status(&t) != hc::SessionStatus::Working)
+                }
+                hc::Lookup::Found(_) | hc::Lookup::Gone => self.session_gone_later(&a),
                 hc::Lookup::Unreachable(_) => {}
             }
         }
@@ -1407,6 +1453,40 @@ mod tests {
         loud.sync_prs(&prs);
         assert!(loud.tells_merge(&prs[..1], true) && loud.tells_merge(&prs[1..], true) && !loud.tells_merge(&prs, false));
         assert_eq!(loud.shared.get().decisions.len(), 1);
+    }
+
+    /// A session moved by resuming its conversation in another terminal
+    /// (another space's tab, a reopen): its decisions wait for it a while,
+    /// and are the new terminal's once it goes on there.
+    #[test]
+    fn a_resumed_session_keeps_its_decisions() {
+        let s = shared();
+        let d = Decisions::new(s.clone());
+        let (raised, ..) = d.raise(raise("Shop", "t1", "Deploy dev now or wait for tonight?"));
+        let prs = [pr(88, "dev", "t1")];
+        d.sync_prs(&prs);
+        let merge = d.for_prs(&prs)[0].clone();
+        // Its terminal is gone: nothing closes at once.
+        d.session_gone_later("t1");
+        assert_eq!(d.get(&raised.id).map(|d| d.state), Some(State::Open));
+        // Its conversation goes on in t9: the raise and the merge are t9's, waiting as before.
+        d.carry_over("t1", "t9");
+        let r = d.get(&raised.id).unwrap();
+        assert_eq!((r.state, r.sessions.iter().map(|w| w.address.as_str()).collect::<Vec<_>>()), (State::Open, vec!["t9"]));
+        assert!(d.get(&merge).unwrap().sessions.iter().all(|w| w.address == "t9"));
+        // t1 isn't asked about again; and once the grace is over a gone t1 closes nothing of t9's.
+        let d = Decisions { gone_grace_ms: 0, ..d };
+        d.session_gone_later("t1");
+        assert_eq!(d.get(&raised.id).map(|d| d.state), Some(State::Open));
+        // A session that really ended: its raise closes once the grace is over.
+        let (other, ..) = d.raise(raise("Docs", "t5", "Rename the guide?"));
+        d.session_gone_later("t5");
+        assert_eq!(d.get(&other.id).map(|d| d.state), Some(State::Stopped));
+        // Twice in one decision (both terminals were in it): one entry.
+        let (both, ..) = d.raise(raise("Shop", "t2", "Tabs or a sidebar?"));
+        d.raise(raise("Shop", "t3", "Tabs or a sidebar?"));
+        d.carry_over("t2", "t3");
+        assert_eq!(d.get(&both.id).unwrap().sessions.iter().map(|w| w.address.as_str()).collect::<Vec<_>>(), ["t3"]);
     }
 
     /// A space goes quiet: what was raised there is over, the PR that waits

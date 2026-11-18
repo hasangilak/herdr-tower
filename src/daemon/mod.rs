@@ -481,6 +481,30 @@ impl Daemon {
     /// (`reply`, `reply_to` naming that message: `history::message_for_turn`),
     /// once, so the conversation pairs them. Not for the tower's own
     /// terminals or a test session.
+    /// The conversation of the session at `from` goes on at `to` (`t`: its
+    /// terminal now): resumed in another space's tab, or put back after a
+    /// restart. It is the same session: its open PRs, the reviews of them
+    /// and its decisions are `to`'s, and none of them ends for `from`
+    /// having gone. Not while `from` still runs (two terminals on one
+    /// conversation: which one is it is not known, so nothing moves).
+    fn carry_over(&self, from: &str, to: &str, t: Option<&serde_json::Value>) {
+        if from == to || crate::hc::get(from).is_some_and(|f| f["state"] == "live") {
+            return;
+        }
+        let name = t.map(crate::hc::spoken_name).unwrap_or_default();
+        let space = t.and_then(crate::spaces::space_of);
+        let prs = self.prs.carry_over(from, to, &name, space.as_deref());
+        let reviews = self.reviews.carry_over(from, to, t.and_then(crate::hc::created_ms));
+        self.decisions.carry_over(from, to);
+        sessions::registry().moved(from, to);
+        eprintln!(
+            "[sessions] {to} goes on with {from}'s conversation: {} PR(s) and {} review(s) are its now{}",
+            prs.len(),
+            reviews.len(),
+            if prs.is_empty() { String::new() } else { format!(" ({})", prs.join(", ")) }
+        );
+    }
+
     fn replied(&self, address: &str, t: Option<&serde_json::Value>, said: &str) {
         let Some(t) = t else { return };
         if said.trim().is_empty() || watch::left_alone(t) || brain::brain_of(t).is_some() {
@@ -971,7 +995,12 @@ impl Daemon {
                 if event.event == "stop-failed" && crate::failover::limit_of(&event.error, &event.text, crate::history::now_ms()).is_some() {
                     event.event = "limited".into();
                 }
+                // The same conversation resumed in another terminal: where it was before.
+                let before = sessions::registry().predecessor(&event);
                 let change = sessions::registry().apply(&event);
+                if let Some(from) = before {
+                    self.carry_over(&from, &event.terminal, terminal.as_ref());
+                }
                 if let sessions::Change::Limited(text) = &change {
                     let hit = failover::Hit {
                         terminal: event.terminal.clone(),

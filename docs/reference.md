@@ -643,7 +643,15 @@ not only the terminal server's. The towers themselves (`tower`,
 `tower-<space>`) and the planner start the same way; a tower still running
 from before (its terminal runs its program itself) is started again once,
 the new way, by the daemon the next time it is idle, never in a turn (it
-starts a new conversation, as `tower restart --brain` does). An account cca doesn't know is an
+starts a new conversation, as `tower restart --brain` does).
+
+A session whose conversation is resumed in another terminal (moved to
+another space's tab, put back after a restart) is the same session: when
+its hooks report the start of a conversation (session id) last seen in a
+terminal that is gone, the daemon gives the new terminal the old one's open
+PRs, their reviews and its open decisions (`[sessions] tN goes on with
+tM's conversation` in its log). For that, a gone session's decisions and a
+review whose PR's session is gone wait three minutes before they end. An account cca doesn't know is an
 error that lists the ones it does. Without the mod, sessions start as plain
 `claude` and accounts show as unknown.
 

@@ -1055,6 +1055,19 @@ impl Prs {
         moved
     }
 
+    /// The conversation of the session at `from` goes on at `to` (`name`, in
+    /// `space`): its open PRs are `to`'s. A closed one stays as it was
+    /// (what it was then stays, as in `reown`). Their keys.
+    pub fn carry_over(&self, from: &str, to: &str, name: &str, space: Option<&str>) -> Vec<String> {
+        let mut moved = vec![];
+        for pr in self.list().into_iter().filter(|p| p.open() && p.session == from) {
+            moved.push(pr.key());
+            let o = Claimant { address: to.into(), name: if name.is_empty() { pr.name.clone() } else { name.into() }, space: space.map(String::from), ..Default::default() };
+            self.own(pr, &o);
+        }
+        moved
+    }
+
     fn own(&self, mut pr: Pr, o: &Claimant) {
         eprintln!("[prs] {}: opened by {} ({}), not {} ({})", pr.key(), o.address, o.name, pr.session, pr.name);
         (pr.session, pr.name) = (o.address.clone(), o.name.clone());
@@ -1760,5 +1773,12 @@ esac
         (closed.session, closed.state) = ("t18f".into(), "merged".into());
         prs.put(closed, "update");
         assert!(prs.reown(&sandbox()).is_empty());
+        // Its session moves: t7h's conversation goes on in t20, a tab of another space. Its open
+        // PRs are t20's there; the merged one stays as it was.
+        assert_eq!(prs.carry_over("t7h", "t20", "eyzflow", Some("support")), ["eyzhub/eyzflow#880"]);
+        let moved = prs.get("eyzhub/eyzflow#880").unwrap();
+        assert_eq!((moved.session.as_str(), moved.name.as_str(), moved.space.as_deref()), ("t20", "eyzflow", Some("support")));
+        assert_eq!(prs.get("eyzhub/eyzflow#879").unwrap().session, "t18f");
+        assert!(prs.carry_over("t7h", "t20", "eyzflow", Some("support")).is_empty(), "once");
     }
 }
