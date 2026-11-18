@@ -388,6 +388,8 @@ pub struct Started {
 /// What a command line starts a brain with (the last word wins, as the
 /// programs read them).
 pub fn started_with(argv: &[String]) -> Started {
+    // Past the login shell it is started in (`brain::hc_run_args`).
+    let argv = crate::accounts::past_shell(argv);
     let program = argv.first().map(|p| p.rsplit('/').next().unwrap_or(p).to_string()).unwrap_or_default();
     let rest = argv.get(1..).unwrap_or_default();
     match program.as_str() {

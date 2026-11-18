@@ -55,17 +55,29 @@ pub fn write_files() -> Result<()> {
     Ok(())
 }
 
+/// The `hc run` arguments that start a brain's program (a space's, the
+/// main one, the planner) in a hidden terminal called `name`, in its folder,
+/// with its `labels`: in the user's login, interactive `shell`, as a
+/// session is started (`accounts::in_login_shell`), so its hooks find what
+/// the user's own terminals find (nvm's `node`), not only what the daemon
+/// was started with.
+pub fn hc_run_args(name: &str, dir: &str, argv: &[String], labels: &[String], shell: &str) -> Vec<String> {
+    let mut args: Vec<String> = ["run", "--bg", "--json", "--name", name, "--no-notify", "--no-parent", "--cwd", dir].map(String::from).to_vec();
+    for l in labels {
+        args.extend(["--label".to_string(), l.clone()]);
+    }
+    args.push("--".into());
+    args.extend(crate::accounts::in_login_shell(shell, argv.to_vec()));
+    args
+}
+
 /// Starts a brain's program in a hidden Herdr terminal called `name`, in
 /// its folder. Returns its address.
 fn run(name: &str, dir: &str, argv: &[String], labels: &[String]) -> Result<String> {
     // A finished brain keeps its name until removed.
     let _ = hc::run(&["rm", name]);
-    let mut args: Vec<&str> = vec!["run", "--bg", "--json", "--name", name, "--no-notify", "--no-parent", "--cwd", dir];
-    for l in labels {
-        args.extend(["--label", l.as_str()]);
-    }
-    args.push("--");
-    args.extend(argv.iter().map(String::as_str));
+    let args = hc_run_args(name, dir, argv, labels, &crate::accounts::login_shell());
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let out = hc::run(&args)?;
     if out.code != 0 {
         bail!("starting the brain: {}{}", out.stderr.trim(), out.stdout.trim());
@@ -536,6 +548,29 @@ pub fn brain_dir_exists() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{trust_answer, trust_keys, trust_reply};
+
+    #[test]
+    fn a_brain_starts_in_the_users_login_shell() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let argv = s(&["claude", "-n", "tower-support", "--model", "claude-opus-5-5", "--effort", "high"]);
+        let args = super::hc_run_args("tower-support", "/b/support", &argv, &s(&["tower.space=support"]), "/bin/zsh");
+        assert_eq!(
+            args,
+            s(&[
+                "run", "--bg", "--json", "--name", "tower-support", "--no-notify", "--no-parent", "--cwd", "/b/support", "--label", "tower.space=support", "--",
+                "/bin/zsh", "-lic", "exec \"$@\"", "/bin/zsh", "claude", "-n", "tower-support", "--model", "claude-opus-5-5", "--effort", "high",
+            ])
+        );
+        // What it was started with is still read off its command line, past the shell.
+        let started = crate::brains::started_with(&args[12..]);
+        assert_eq!((started.program.as_str(), started.model.as_deref(), started.effort.as_deref()), ("claude", Some("claude-opus-5-5"), Some("high")));
+        let ran: Vec<&str> = args[12..].iter().map(String::as_str).collect();
+        assert_eq!(crate::accounts::program_of(&ran), "claude");
+        // The main brain and the planner, no labels; on another account through cca.
+        let cca = s(&["/bin/cca", "work", "-n", "tower"]);
+        assert_eq!(super::hc_run_args("tower", "/b/brain", &cca, &[], "/bin/bash")[9..], s(&["--", "/bin/bash", "-lic", "exec \"$@\"", "/bin/bash", "/bin/cca", "work", "-n", "tower"]));
+        assert_eq!(crate::accounts::past_shell(&cca), &cca[..], "a command line with no shell is as it is");
+    }
 
     #[test]
     fn a_brain_is_known_by_its_own_name_never_by_a_sessions_label() {

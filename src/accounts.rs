@@ -324,6 +324,19 @@ pub fn program_of<'a>(argv: &[&'a str]) -> &'a str {
     it.find(|a| !a.contains('=') && !a.starts_with('-')).map(base).unwrap_or("")
 }
 
+/// `argv` past the shell it was started in (`in_login_shell`, or Herdr's
+/// own for a tab), when it was: what that shell runs.
+pub fn past_shell(argv: &[String]) -> &[String] {
+    let base = |a: &str| a.rsplit('/').next().unwrap_or(a).to_string();
+    match argv {
+        [sh, flags, _script, rest @ ..] if SHELLS.contains(&base(sh).as_str()) && flags.starts_with('-') && flags.contains('c') => {
+            let rest = if base(sh) == "fish" { rest } else { rest.get(1..).unwrap_or(&[]) };
+            past_shell(rest)
+        }
+        _ => argv,
+    }
+}
+
 /// The shells a command line may be started in (`program_of`).
 const SHELLS: [&str; 4] = ["zsh", "bash", "sh", "fish"];
 
