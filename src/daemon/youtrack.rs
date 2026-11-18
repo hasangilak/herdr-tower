@@ -28,13 +28,20 @@ fn line(key: &str, what: &str) -> Value {
 
 /// What each PR due now needs, done. `summarize`: the merge card's summary
 /// of a description that has none yet (a model call). `force`: failed ones
-/// too, now.
+/// too, now. `only`: that PR alone.
 pub fn pass(prs: &Prs, cfg: &YoutrackCfg, remote: &dyn Remote, summarize: &dyn Fn(&crate::prs::Pr) -> Option<String>, force: bool) -> Vec<Value> {
+    pass_of(prs, cfg, remote, summarize, force, None)
+}
+
+pub fn pass_of(prs: &Prs, cfg: &YoutrackCfg, remote: &dyn Remote, summarize: &dyn Fn(&crate::prs::Pr) -> Option<String>, force: bool, only: Option<&str>) -> Vec<Value> {
     let mut guard = PASS.lock().unwrap_or_else(|e| e.into_inner());
     let failed = guard.get_or_insert_with(HashMap::new);
     let now = crate::history::now_ms();
     let mut out = vec![];
     for (k, need) in youtrack::due(&prs.list(), cfg, now) {
+        if only.is_some_and(|o| o != k) {
+            continue;
+        }
         if !force && failed.get(&k).is_some_and(|until| *until > now) {
             continue;
         }
@@ -106,6 +113,36 @@ pub fn now(prs: &Prs) -> Result<Vec<Value>, String> {
     let cfg = crate::config::Config::live().youtrack;
     let token = ready(&cfg)?;
     Ok(pass(prs, &cfg, &youtrack::Real::new(&cfg, token), &summarize, true))
+}
+
+/// One PR's ticket now, with tickets on or off (`tower youtrack try <PR>
+/// [--no-link]`): to see it work before switching it on.
+pub fn try_one(prs: &Prs, what: &str, link: bool) -> Result<Vec<Value>, String> {
+    let mut cfg = crate::config::Config::live().youtrack;
+    cfg.enabled = true;
+    cfg.link_pr = cfg.link_pr && link;
+    let token = ready(&cfg)?;
+    let all = prs.list();
+    let key = crate::prs::links(what).first().map(|(r, n)| crate::prs::key(r, *n)).unwrap_or_else(|| what.trim().to_string());
+    let pr = all.iter().find(|p| p.key().eq_ignore_ascii_case(&key)).ok_or_else(|| format!("the tower doesn't know {what} (owner/name#12 or its link)"))?;
+    if !youtrack::owner_wanted(&cfg, &pr.repo) {
+        return Err(format!("{} isn't in {}'s repos", pr.key(), cfg.github_owners.join(", ")));
+    }
+    if pr.ticket.as_ref().is_some_and(|t| !t.id.is_empty() && (t.comment != 0 || !cfg.link_pr)) {
+        return Ok(vec![line(&pr.key(), &format!("has {} already", pr.ticket.as_ref().map(|t| t.id.as_str()).unwrap_or("")))]);
+    }
+    if !pr.open() {
+        return Err(format!("{} is {}: only an open PR gets a ticket", pr.key(), pr.state));
+    }
+    let k = pr.key();
+    // Its description not looked at yet: taken as it is.
+    let mut cfg_now = cfg.clone();
+    cfg_now.github_owners = vec![k.split('/').next().unwrap_or("").to_string()];
+    let did = pass_of(prs, &cfg_now, &youtrack::Real::new(&cfg, token), &summarize, true, Some(&k));
+    if did.is_empty() {
+        return Err(format!("{k} isn't due a ticket yet (the tower hasn't read its description: try again in a minute)"));
+    }
+    Ok(did)
 }
 
 /// Takes back a ticket the tower made (`tower youtrack remove <id>`): the

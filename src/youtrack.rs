@@ -84,6 +84,19 @@ pub fn missing(cfg: &YoutrackCfg, token: bool) -> Option<String> {
     (!m.is_empty()).then(|| m.join(", "))
 }
 
+/// The project a repo's tickets go into: `repo_projects`' (by `owner/name`,
+/// else by name, either case), else `project`.
+pub fn project_for(cfg: &YoutrackCfg, repo: &str) -> String {
+    let name = repo.rsplit('/').next().unwrap_or(repo);
+    cfg.repo_projects
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(repo))
+        .or_else(|| cfg.repo_projects.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)))
+        .map(|(_, p)| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| cfg.project.trim().to_string())
+}
+
 /// A PR in a repo of the owners tickets are for.
 pub fn owner_wanted(cfg: &YoutrackCfg, repo: &str) -> bool {
     let owner = repo.split('/').next().unwrap_or("");
@@ -215,9 +228,10 @@ pub fn linked_on_youtrack(issues: &[Value], url: &str) -> Option<String> {
     issues.iter().find(|i| names_pr(i["description"].as_str().unwrap_or(""), url)).and_then(|i| i["idReadable"].as_str()).map(String::from)
 }
 
-/// The search for a PR's ticket on YouTrack: in its project, by its link.
-pub fn search_query(cfg: &YoutrackCfg, pr: &Pr) -> String {
-    format!("project: {{{}}} \"{}\"", cfg.project.trim(), pr.url)
+/// The search for a PR's ticket on YouTrack: by its link, in every project
+/// (its repo's project may have changed since it was made).
+pub fn search_query(pr: &Pr) -> String {
+    format!("\"{}\"", pr.url)
 }
 
 /// What the tower asks of YouTrack and GitHub (`Real`; the tests' fake).
@@ -249,11 +263,11 @@ pub fn ensure(pr: &Pr, cfg: &YoutrackCfg, remote: &dyn Remote, changes: &str, no
     {
         return Ok(Ticket { made_ms: now, ..t });
     }
-    let found = remote.search(&search_query(cfg, pr)).context("looking for its ticket on YouTrack")?;
+    let found = remote.search(&search_query(pr)).context("looking for its ticket on YouTrack")?;
     if let Some(id) = linked_on_youtrack(&found, &pr.url) {
         return Ok(Ticket { url: url_of(&id), id, made_ms: now, how: "found on YouTrack".into(), comment: 0 });
     }
-    let project = remote.project_id(&cfg.project).context("finding the project")?;
+    let project = remote.project_id(&project_for(cfg, &pr.repo)).context("finding the project")?;
     let id = remote.create(&issue_body(cfg, &project, pr, changes)).context("making the ticket")?;
     Ok(Ticket { url: url_of(&id), id, made_ms: now, how: "made".into(), comment: 0 })
 }
@@ -499,7 +513,11 @@ mod tests {
 
     impl Remote for Fake {
         fn project_id(&self, project: &str) -> Result<String> {
-            if project == "EYZ" { Ok("0-7".into()) } else { bail!("no project") }
+            match project {
+                "EYZ" => Ok("0-7".into()),
+                "SOO" => Ok("0-19".into()),
+                _ => bail!("no project"),
+            }
         }
         fn search(&self, _: &str) -> Result<Vec<Value>> {
             if self.search_fails {
@@ -510,7 +528,7 @@ mod tests {
         fn create(&self, body: &Value) -> Result<String> {
             *self.created.borrow_mut() += 1;
             let id = format!("EYZ-{}", 10 + self.issues.borrow().len());
-            self.issues.borrow_mut().push(json!({ "idReadable": id, "description": body["description"], "summary": body["summary"] }));
+            self.issues.borrow_mut().push(json!({ "idReadable": id, "description": body["description"], "summary": body["summary"], "project": body["project"]["id"] }));
             Ok(id)
         }
         fn delete(&self, id: &str) -> Result<()> {
@@ -562,6 +580,12 @@ mod tests {
         assert_eq!(missing(&cfg(), true), None);
         assert_eq!(missing(&YoutrackCfg::default(), false).unwrap().matches("tower youtrack").count(), 3);
         assert_eq!(base(&YoutrackCfg { url: "https://x.youtrack.cloud/api/".into(), ..cfg() }), "https://x.youtrack.cloud");
+        // Each repo's project, else the default.
+        let mapped = YoutrackCfg { repo_projects: [("sooner-app-web".to_string(), "SOO".to_string()), ("eyzhub/eyzplay-storefronts-web".to_string(), "EYM".to_string())].into(), ..cfg() };
+        assert_eq!(project_for(&mapped, "eyzhub/sooner-app-web"), "SOO");
+        assert_eq!(project_for(&mapped, "EyzHub/Sooner-App-Web"), "SOO");
+        assert_eq!(project_for(&mapped, "eyzhub/eyzplay-storefronts-web"), "EYM");
+        assert_eq!(project_for(&mapped, "eyzhub/eyz-mediaroom-serverless"), "EYZ");
     }
 
     #[test]
@@ -629,6 +653,10 @@ mod tests {
         assert!(names_pr("[x](https://github.com/eyzhub/eyzflow/pull/7)", &p.url));
         let t70 = ensure(&p70, &c, &fake, "x", 10).unwrap();
         assert_eq!((t70.id.as_str(), t70.how.as_str()), ("EYZ-11", "made"));
+        // A repo with a project of its own: its ticket goes there.
+        let soo = ensure(&pr("eyzhub/sooner-app-web", 3), &YoutrackCfg { repo_projects: [("sooner-app-web".to_string(), "SOO".to_string())].into(), ..c.clone() }, &fake, "x", 11).unwrap();
+        assert_eq!(soo.how, "made");
+        assert_eq!(fake.issues.borrow().last().unwrap()["project"], "0-19");
         // A ticket's id finds its PR (what `tower youtrack remove` takes back).
         let all = [kept, Pr { ticket: Some(t70), ..p70 }];
         assert_eq!(pr_of_ticket(&all, "EYZ-11").map(|p| p.number), Some(70));

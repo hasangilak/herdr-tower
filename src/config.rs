@@ -218,8 +218,13 @@ pub struct YoutrackCfg {
     pub enabled: bool,
     /// The YouTrack instance (`https://acme.youtrack.cloud`).
     pub url: String,
-    /// The project tickets go into, by its short name (`EYZ`) or its name.
+    /// The project tickets go into, by its short name (`EYF`) or its name,
+    /// when `repo_projects` names none for the PR's repo.
     pub project: String,
+    /// The project of each repo's tickets, by the repo's name (`sooner-app-web
+    /// = "SOO"`) or `owner/name` (`[youtrack.repo_projects]`).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub repo_projects: std::collections::BTreeMap<String, String>,
     /// Their type (`Task`); empty: the project's default.
     pub issue_type: String,
     /// The GitHub owners whose repos' PRs get a ticket.
@@ -230,7 +235,7 @@ pub struct YoutrackCfg {
 
 impl Default for YoutrackCfg {
     fn default() -> Self {
-        Self { enabled: false, url: String::new(), project: String::new(), issue_type: String::new(), github_owners: vec!["eyzhub".into()], link_pr: true }
+        Self { enabled: false, url: String::new(), project: String::new(), repo_projects: Default::default(), issue_type: String::new(), github_owners: vec!["eyzhub".into()], link_pr: true }
     }
 }
 
