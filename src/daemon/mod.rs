@@ -36,6 +36,7 @@ pub mod timing;
 pub mod tts;
 pub mod typed;
 pub mod watch;
+pub mod youtrack;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -347,6 +348,8 @@ pub fn run() -> Result<()> {
     merges::Merges::new(shared.clone(), prs.clone(), sendq.clone()).start();
     // What each PR in the merge queue does, in words (its description summarized); one without asks its session for one.
     describe::start(prs.clone(), sendq.clone());
+    // A YouTrack ticket for each PR sessions open in the owners' repos (`[youtrack]`, off unless turned on).
+    youtrack::start(prs.clone());
     // A PR in the user's merge queue that conflicts with its base (or fell behind it): its session fixes it first.
     fixes::start(prs.clone(), std::sync::Arc::new(fixes::Real { sendq: sendq.clone() }));
     // What the tower opened for the user lately, to show with the reply and to undo.
@@ -916,6 +919,17 @@ impl Daemon {
                 return match pr_key(&self.prs, &pr, from.as_deref()).and_then(|k| fixes::cant_fix(&self.prs, &k, &why, &by)) {
                     Ok(p) => Response { ok: true, error: None, state: Some(serde_json::json!({ "pr": p.key(), "fix": p.fix, "line": crate::fixes::line(&p) })) },
                     Err(e) => Response::err(format!("{e:#}")),
+                };
+            }
+            Request::Youtrack { action, id } => {
+                let r = match action.as_str() {
+                    "now" => youtrack::now(&self.prs).map(|did| serde_json::json!({ "did": did })),
+                    "remove" => youtrack::remove(&self.prs, &id),
+                    _ => Err(format!("no youtrack action {action}")),
+                };
+                return match r {
+                    Ok(v) => Response { ok: true, error: None, state: Some(v) },
+                    Err(e) => Response::err(e),
                 };
             }
             Request::Validate { pr, check, status, evidence, from } => {

@@ -160,6 +160,14 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<String>,
     },
+    /// YouTrack tickets (`tower youtrack now|remove`): `now` makes the
+    /// tickets due now; `remove` takes back the one with id `id` that the
+    /// tower made (deleted, its PR comment too, forgotten).
+    Youtrack {
+        action: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        id: String,
+    },
     /// A planned check of a PR, reported by its session (`tower validate`):
     /// `pr` (its key, its link, or `#12`: the caller's own), `check` (its id;
     /// empty: show the PR's checks), `status` (`passed`, `failed`,
@@ -484,6 +492,7 @@ fn wait_for(req: &Request) -> Duration {
         Request::Model { .. } | Request::Brains { .. } | Request::Plan { .. } => Duration::from_secs(45),
         // A PR the tower doesn't know yet is looked up on GitHub first.
         Request::Validate { .. } | Request::Impact { .. } | Request::CantFix { .. } => Duration::from_secs(30),
+        Request::Youtrack { .. } => Duration::from_secs(180),
         _ => Duration::from_secs(10),
     }
 }

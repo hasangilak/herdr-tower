@@ -136,6 +136,9 @@ pub struct Pr {
     /// It conflicts with its base (or fell behind it) and its session was asked to fix that (`crate::fixes`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<crate::fixes::Fix>,
+    /// Its YouTrack ticket (`crate::youtrack`): made once, never twice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<crate::youtrack::Ticket>,
 }
 
 impl Pr {
@@ -952,6 +955,16 @@ impl Prs {
         self.store(pr, "update", true);
     }
 
+    /// Its YouTrack ticket (`crate::youtrack`); None: forgotten (`tower youtrack remove`).
+    pub fn set_ticket(&self, k: &str, ticket: Option<crate::youtrack::Ticket>) {
+        let Some(mut pr) = self.get(k) else { return };
+        if pr.ticket == ticket {
+            return;
+        }
+        pr.ticket = ticket;
+        self.store(pr, "update", true);
+    }
+
     /// The tower's own merge of it, as it went.
     pub fn set_auto(&self, k: &str, auto: Option<crate::prscore::Auto>) {
         let Some(mut pr) = self.get(k) else { return };
@@ -1326,6 +1339,7 @@ fn keep_own(pr: &mut Pr, old: &Pr) {
     pr.described = old.described.clone();
     pr.asked_body = old.asked_body;
     pr.fix = old.fix.clone();
+    pr.ticket = old.ticket.clone();
 }
 
 /// A PR without when and whether it is looked at: what the chip shows.
