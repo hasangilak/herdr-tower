@@ -1419,6 +1419,8 @@ impl Panel {
     /// Runs `tower launch` with `args`; its receipt names the space, whose view opens with what it did.
     fn launch_args(&mut self, goal: &str, mut args: Vec<String>, missions: &Missions, cx: &mut Context<Self>) {
         let before: Vec<String> = missions.open.iter().map(|m| m.name.clone()).chain(missions.quiet.iter().cloned()).collect();
+        // Where Launch was pressed: the new space opens there only if the window is still there.
+        let pressed_in = self.tower.read(cx).nav.scope.clone();
         let taken: Vec<&str> = before.iter().map(String::as_str).collect();
         let expected = args.iter().position(|a| a == "--name").and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| slug(goal, &taken));
         // The conversation that made it goes with it: the new space keeps it, at its top.
@@ -1482,7 +1484,7 @@ impl Panel {
             // What it opened is an act the tower keeps: Undo shows with what it said, as with a reply.
             let act = receipt["act"].as_str().map(String::from);
             this.tower.update(cx, |t, cx| {
-                t.nav.launched(&space, before, text, history::now_ms());
+                t.nav.launched_from(&pressed_in, &space, before, text, history::now_ms());
                 t.nav.receipt_of(act);
                 cx.notify();
             });

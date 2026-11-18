@@ -598,6 +598,12 @@ impl Panel {
     /// own words, opened as a click on it does, with the keyboard.
     /// `hold-<id>`: its Hold's field instead, as a click on Hold opens it.
     pub(crate) fn keys_open(&mut self, id: &str, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        // `input`: the message field itself, as a click in it gives it the keyboard.
+        if id == "input" {
+            self.text.update(cx, |s, cx| s.focus(window, cx));
+            eprintln!("[orb] HERDER_TOWER_ORB_KEYS: input: the message field is open");
+            return;
+        }
         if let Some(held) = id.strip_prefix("hold-") {
             self.keys_hold(held, window, cx);
             return;
@@ -612,6 +618,11 @@ impl Panel {
 
     /// `HERDER_TOWER_ORB_KEYS`: what the card's field holds now, and whether its answer went.
     pub(crate) fn keys_report(&mut self, id: &str, after: &str, cx: &mut Context<Self>) {
+        if id == "input" {
+            let scope = self.tower.read(cx).nav.scope.clone();
+            eprintln!("[orb] HERDER_TOWER_ORB_KEYS: input after {after}: field {:?}, the window shows {scope:?}", self.text.read(cx).value().to_string());
+            return;
+        }
         if let Some(held) = id.strip_prefix("hold-") {
             let (field, on_hold) = self.hold_report(held, cx);
             eprintln!("[orb] HERDER_TOWER_ORB_KEYS: {id} after {after}: field {:?}, on hold: {on_hold}", field.as_deref().unwrap_or("(closed)"));
