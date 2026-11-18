@@ -72,6 +72,7 @@ mod unsent;
 mod usage;
 mod ticket;
 mod worktrees;
+mod youtrack;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -295,6 +296,18 @@ enum Cmd {
         /// on, off or status (default).
         #[arg(default_value = "status")]
         action: String,
+    },
+    /// YouTrack tickets for the PRs sessions open in the `[youtrack] github_owners` repos (eyzhub):
+    /// `status` (default), `on`, `off`, `set url|project|type|owners|link-pr <value>`, `token`
+    /// (keeps your API token in the Keychain: typed at its prompt, or piped in; never shown),
+    /// `token clear`, `check` (asks YouTrack who the token is and whether the project is there),
+    /// `now` (makes the tickets due now) and `remove <ID>` (deletes a ticket the tower made, and
+    /// its comment on the PR; from a shell only).
+    Youtrack {
+        #[arg(default_value = "status")]
+        action: String,
+        /// What `set` sets and to what, or `remove`'s ticket id, or `token clear`.
+        args: Vec<String>,
     },
     /// Risk and confidence: when the tower answers a session's question for you. Low risk is answered
     /// from confidence `low`, medium from `medium`, high never (and the escalate list never).
@@ -1115,6 +1128,7 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Automerge { action } => automerge_cmd(&action),
+        Cmd::Youtrack { action, args } => youtrack_cmd(&action, &args),
         Cmd::TodoTools { action } => todo_tools_cmd(&action),
         Cmd::Scoring { action, value, low, medium, json } => scoring_cmd(&action, value.as_deref(), low, medium, json),
         Cmd::Releases { space, json } => releases_cmd(space.as_deref(), json),
@@ -1742,6 +1756,152 @@ fn automerge_cmd(action: &str) -> Result<()> {
         println!("Auto-merge is off: every PR is yours to merge.");
     }
     Ok(())
+}
+
+/// `tower youtrack …`: `[youtrack]` in config.toml (read by the daemon as it
+/// goes), its token in the Keychain, and the daemon's tickets.
+fn youtrack_cmd(action: &str, args: &[String]) -> Result<()> {
+    use anyhow::Context as _;
+    let path = config::config_file();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let now = config::Config::from_text(&text)?.youtrack;
+    let write = |key: &str, value: String| -> Result<config::YoutrackCfg> {
+        let new = config::with_table_key(&text, "youtrack", key, &value);
+        let read = config::Config::from_text(&new).with_context(|| format!("setting [youtrack] {key}"))?.youtrack;
+        std::fs::create_dir_all(config::config_dir())?;
+        std::fs::write(&path, new)?;
+        Ok(read)
+    };
+    let quoted = |v: &str| toml::Value::String(v.trim().to_string()).to_string();
+    let status = |c: &config::YoutrackCfg| {
+        let token = youtrack::token().is_some();
+        println!("YouTrack tickets: {}", if c.enabled { "on" } else { "off" });
+        println!("  url:      {}", if c.url.trim().is_empty() { "(not set)" } else { c.url.trim() });
+        println!("  project:  {}", if c.project.trim().is_empty() { "(not set)" } else { c.project.trim() });
+        println!("  type:     {}", if c.issue_type.trim().is_empty() { "(the project's default)" } else { c.issue_type.trim() });
+        println!("  for PRs in: {}", c.github_owners.join(", "));
+        println!("  link on the PR: {}", if c.link_pr { "yes (a comment with the ticket's link)" } else { "no" });
+        println!("  token:    {}", if token { "in the Keychain" } else { "none (tower youtrack token)" });
+        let made = prs::load_from(&config::ui_dir()).into_values().filter(|p| p.ticket.is_some()).count();
+        println!("  PRs with a ticket: {made}");
+        if let Some(m) = youtrack::missing(c, token) {
+            println!("Missing: {m}");
+        }
+    };
+    match (action.trim(), args.iter().map(String::as_str).collect::<Vec<_>>().as_slice()) {
+        ("status" | "", _) => status(&now),
+        ("on", _) => {
+            if let Some(m) = youtrack::missing(&now, youtrack::token().is_some()) {
+                bail!("not yet: set {m} first");
+            }
+            status(&write("enabled", "true".into())?);
+        }
+        ("off", _) => {
+            write("enabled", "false".into())?;
+            println!("YouTrack tickets are off: none are made (the ones made are kept).");
+        }
+        ("set", [key, value @ ..]) if !value.is_empty() => {
+            let v = value.join(" ");
+            let c = match *key {
+                "url" => {
+                    if !v.trim().starts_with("https://") && !v.trim().starts_with("http://") {
+                        bail!("the URL starts with https://");
+                    }
+                    write("url", quoted(&v))?
+                }
+                "project" => write("project", quoted(&v))?,
+                "type" | "issue_type" => write("issue_type", quoted(&v))?,
+                "owners" | "github_owners" => {
+                    let list: Vec<toml::Value> = v.split([',', ' ']).filter(|o| !o.trim().is_empty()).map(|o| toml::Value::String(o.trim().into())).collect();
+                    write("github_owners", toml::Value::Array(list).to_string())?
+                }
+                "link-pr" | "link_pr" => write("link_pr", (matches!(v.trim(), "on" | "yes" | "true")).to_string())?,
+                _ => bail!("tower youtrack set url|project|type|owners|link-pr <value>"),
+            };
+            status(&c);
+        }
+        ("token", ["clear"]) => {
+            println!("{}", if youtrack::forget_token()? { "The YouTrack token is out of the Keychain." } else { "There was no YouTrack token in the Keychain." });
+        }
+        ("token", []) => {
+            let t = if std::io::stdin().is_terminal() {
+                eprint!("YouTrack permanent token (not shown): ");
+                read_hidden()?
+            } else {
+                let mut s = String::new();
+                std::io::stdin().read_line(&mut s)?;
+                s
+            };
+            youtrack::store_token(t.trim())?;
+            println!("Kept in the Keychain ({} / {}). Check it with `tower youtrack check`.", youtrack::KEYCHAIN_SERVICE, youtrack::KEYCHAIN_ACCOUNT);
+        }
+        ("check", _) => {
+            let token = youtrack::token().context("no token: tower youtrack token")?;
+            if let Some(m) = youtrack::missing(&now, true) {
+                bail!("set {m} first");
+            }
+            let real = youtrack::Real::new(&now, token);
+            println!("YouTrack {}: the token is {}", youtrack::base(&now), real.me()?);
+            use youtrack::Remote as _;
+            let id = real.project_id(&now.project)?;
+            println!("Project {}: there ({id})", now.project.trim());
+            let types = real.types(&id);
+            match now.issue_type.trim() {
+                "" if !types.is_empty() => println!("Type: the project's default (it has {})", types.join(", ")),
+                "" => println!("Type: the project's default"),
+                t if types.is_empty() => println!("Type {t}: the project's types couldn't be read; YouTrack says when a ticket is made"),
+                t if types.iter().any(|x| x.eq_ignore_ascii_case(t)) => println!("Type {t}: there"),
+                t => bail!("the project has no type {t} (it has {})", types.join(", ")),
+            }
+        }
+        ("now", _) => {
+            let r = protocol::send(&Request::Youtrack { action: "now".into(), id: String::new() })?;
+            if !r.ok {
+                bail!("{}", r.error.unwrap_or_default());
+            }
+            let did = r.state.unwrap_or_default()["did"].as_array().cloned().unwrap_or_default();
+            if did.is_empty() {
+                println!("Nothing due: every open PR in {} has its ticket.", now.github_owners.join(", "));
+            }
+            for d in did {
+                println!("{}: {}", d["pr"].as_str().unwrap_or(""), d["did"].as_str().unwrap_or(""));
+            }
+        }
+        ("remove", [id]) => {
+            if home::caller() != home::Caller::Other {
+                bail!("only from a shell: a session or a tower doesn't take back tickets");
+            }
+            let r = protocol::send(&Request::Youtrack { action: "remove".into(), id: id.to_string() })?;
+            if !r.ok {
+                bail!("{}", r.error.unwrap_or_default());
+            }
+            let v = r.state.unwrap_or_default();
+            println!("Deleted {} (of {}); {}.", v["deleted"].as_str().unwrap_or(""), v["pr"].as_str().unwrap_or(""), v["comment"].as_str().unwrap_or(""));
+        }
+        _ => bail!("tower youtrack [status|on|off|set <key> <value>|token [clear]|check|now|remove <ID>]"),
+    }
+    Ok(())
+}
+
+/// A line typed at the terminal, not echoed.
+fn read_hidden() -> Result<String> {
+    use std::os::fd::AsRawFd as _;
+    let fd = std::io::stdin().as_raw_fd();
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    let got = unsafe { libc::tcgetattr(fd, &mut t) } == 0;
+    if got {
+        let mut quiet = t;
+        quiet.c_lflag &= !libc::ECHO;
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
+    }
+    let mut s = String::new();
+    let r = std::io::stdin().read_line(&mut s);
+    if got {
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &t) };
+    }
+    eprintln!();
+    r?;
+    Ok(s)
 }
 
 /// `tower scoring [show|preset|set|learn|answered]`: `[scoring]` in config.toml.

@@ -178,6 +178,8 @@ pub struct Config {
     pub brains: Brains,
     /// The PRs sessions open (`[prs]`): whether the tower merges low-risk ones into dev itself.
     pub prs: PrsCfg,
+    /// YouTrack tickets for the PRs sessions open (`[youtrack]`, `tower youtrack`): off unless turned on.
+    pub youtrack: YoutrackCfg,
     /// What `tower launch` opens (`[[setups]]`, `tower setups`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub setups: Vec<Setup>,
@@ -203,6 +205,32 @@ pub struct PrsCfg {
 impl Default for PrsCfg {
     fn default() -> Self {
         Self { auto_merge_low_risk: false, impact_roots: vec!["~/Work".into()] }
+    }
+}
+
+/// `[youtrack]` in config.toml: a YouTrack ticket for each PR a session
+/// opens in a repo of these GitHub owners (`crate::youtrack`). The token is
+/// never here: it is in the macOS Keychain (`tower youtrack token`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct YoutrackCfg {
+    /// Tickets are made (off: none, and nothing is asked of YouTrack).
+    pub enabled: bool,
+    /// The YouTrack instance (`https://acme.youtrack.cloud`).
+    pub url: String,
+    /// The project tickets go into, by its short name (`EYZ`) or its name.
+    pub project: String,
+    /// Their type (`Task`); empty: the project's default.
+    pub issue_type: String,
+    /// The GitHub owners whose repos' PRs get a ticket.
+    pub github_owners: Vec<String>,
+    /// The PR gets a comment with its ticket's link (the link back).
+    pub link_pr: bool,
+}
+
+impl Default for YoutrackCfg {
+    fn default() -> Self {
+        Self { enabled: false, url: String::new(), project: String::new(), issue_type: String::new(), github_owners: vec!["eyzhub".into()], link_pr: true }
     }
 }
 
@@ -431,6 +459,7 @@ impl Default for Config {
             queue: Queue::default(),
             brains: Brains::default(),
             prs: PrsCfg::default(),
+            youtrack: YoutrackCfg::default(),
             setups: vec![],
         }
     }
