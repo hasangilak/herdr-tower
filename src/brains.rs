@@ -388,6 +388,8 @@ pub struct Started {
 /// What a command line starts a brain with (the last word wins, as the
 /// programs read them).
 pub fn started_with(argv: &[String]) -> Started {
+    // Past the login shell it is started in (`brain::hc_run_args`).
+    let argv = crate::accounts::past_shell(argv);
     let program = argv.first().map(|p| p.rsplit('/').next().unwrap_or(p).to_string()).unwrap_or_default();
     let rest = argv.get(1..).unwrap_or_default();
     match program.as_str() {
@@ -741,6 +743,31 @@ pub struct Known {
     pub created_ms: Option<u64>,
     /// The Claude account it runs on (`crate::accounts`), when known.
     pub account: Option<String>,
+    /// What its terminal was started with (`hc get`'s `argv`, not its
+    /// agent's own): in the user's login shell, or not (`old_start`).
+    pub launched: Vec<String>,
+}
+
+impl Known {
+    /// It was started the old way, without the user's login shell
+    /// (`brain::hc_run_args`), so its hooks may not find `node`: its
+    /// terminal runs its program itself. One whose terminal is a shell (the
+    /// login shell, or the one Herdr kept that a failover typed it into) is
+    /// started right. Not known (a look with no command line): not old.
+    pub fn old_start(&self) -> bool {
+        self.launched.first().is_some_and(|p| !["zsh", "bash", "sh", "fish", "dash"].contains(&p.rsplit('/').next().unwrap_or(p)))
+    }
+}
+
+/// The brains to restart once, so they run in the user's login shell: live,
+/// started the old way (`Known::old_start`), and idle or done, never in a
+/// turn; none already restarted so (`done`, by name).
+pub fn to_restart_for_shell(known: &[Known], done: &std::collections::BTreeSet<String>) -> Vec<Known> {
+    known
+        .iter()
+        .filter(|k| k.live && k.old_start() && matches!(k.status, SessionStatus::Idle | SessionStatus::Done) && !done.contains(&k.name))
+        .cloned()
+        .collect()
 }
 
 impl Known {
@@ -1167,6 +1194,40 @@ mod tests {
 
     fn known(name: &str, space: Option<&str>, status: &str, live: bool) -> Known {
         Known { name: name.into(), space: space.map(String::from), address: format!("t-{name}"), live, status: SessionStatus::parse(status), ..Default::default() }
+    }
+
+    #[test]
+    fn a_brain_started_without_the_login_shell_is_restarted_once_when_idle() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let with = |k: Known, launched: &[&str]| Known { launched: s(launched), ..k };
+        let old = &["claude", "-n", "tower-support", "--model", "claude-opus-5-5"];
+        let shell = &["/bin/zsh", "-lic", "exec \"$@\"", "/bin/zsh", "claude", "-n", "tower-shop"];
+        let known = vec![
+            with(known("tower-support", Some("support"), "idle", true), old),
+            with(known("tower-busy", Some("busy"), "working", true), old),
+            with(known("tower-shop", Some("shop"), "done", true), shell),
+            // Moved to another account by typing into the shell Herdr kept: a shell, started right.
+            with(known("tower-moved", Some("moved"), "idle", true), &["/bin/zsh", "-l"]),
+            with(known("tower-off", Some("off"), "idle", false), old),
+            // A look with no command line says nothing: left alone.
+            known("tower-unknown", Some("unknown"), "idle", true),
+            with(known("tower", None, "done", true), &["/bin/cca", "work", "-n", "tower"]),
+        ];
+        let names = |v: Vec<Known>| v.into_iter().map(|k| k.name).collect::<Vec<_>>();
+        // The idle or done ones started the old way: never one in a turn, one off, or one started in a shell.
+        assert_eq!(names(to_restart_for_shell(&known, &Default::default())), ["tower-support", "tower"]);
+        // Each once: one already restarted so isn't again.
+        let done: std::collections::BTreeSet<String> = ["tower-support".to_string()].into();
+        assert_eq!(names(to_restart_for_shell(&known, &done)), ["tower"]);
+        // The busy one, once its turn ends.
+        let later: Vec<Known> = known.iter().map(|k| if k.name == "tower-busy" { Known { status: SessionStatus::parse("idle"), ..k.clone() } } else { k.clone() }).collect();
+        assert!(names(to_restart_for_shell(&later, &done)).contains(&"tower-busy".to_string()));
+        // What its terminal was started with comes from `hc get`'s argv, not its agent's own; a look without it keeps it.
+        let t = serde_json::json!({ "address": "t9", "name": "tower-shop", "state": "live", "argv": shell, "foreground": { "argv": ["claude", "-n", "tower-shop"] } });
+        let k = crate::daemon::brains::known_of("tower-shop", &t, None);
+        assert_eq!((k.argv[0].as_str(), k.old_start()), ("claude", false));
+        let row = serde_json::json!({ "address": "t9", "name": "tower-shop" });
+        assert_eq!(crate::daemon::brains::known_of("tower-shop", &row, Some(&k)).launched, k.launched);
     }
 
     #[test]

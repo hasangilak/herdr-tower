@@ -639,7 +639,11 @@ space the session went to, and why (`space_why`). A session it starts
 here outside a space's tab (`hc run`) runs in the user's login, interactive
 shell (`$SHELL -lic 'exec "$@"'`), as Herdr runs a tab's agent, so it has the
 PATH the user's own terminals have (nvm's `node` for its hooks, Homebrew, bun),
-not only the terminal server's. An account cca doesn't know is an
+not only the terminal server's. The towers themselves (`tower`,
+`tower-<space>`) and the planner start the same way; a tower still running
+from before (its terminal runs its program itself) is started again once,
+the new way, by the daemon the next time it is idle, never in a turn (it
+starts a new conversation, as `tower restart --brain` does). An account cca doesn't know is an
 error that lists the ones it does. Without the mod, sessions start as plain
 `claude` and accounts show as unknown.
 

@@ -1343,12 +1343,9 @@ fn run_planner(p: &Plan) -> Result<String> {
     let cca = crate::accounts::cca_bin().map(|c| c.to_string_lossy().into_owned());
     let argv = plans::argv(p, &cfg, cca.as_deref().filter(|_| account.is_some()), account.as_deref(), &tower, &plans::tower_env())?;
     let labels = [format!("{}=planner", plans::LABEL_ROLE), format!("{}={}", plans::LABEL_PLAN, p.id)];
-    let mut args: Vec<&str> = vec!["run", "--bg", "--json", "--name", plans::PLANNER, "--no-notify", "--no-parent", "--cwd", &p.dir];
-    for l in &labels {
-        args.extend(["--label", l.as_str()]);
-    }
-    args.push("--");
-    args.extend(argv.iter().map(String::as_str));
+    // In the user's login shell, as a brain is (`brain::hc_run_args`).
+    let args = crate::brain::hc_run_args(plans::PLANNER, &p.dir, &argv, &labels, &crate::accounts::login_shell());
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let out = hc::run(&args)?;
     if out.code != 0 {
         bail!("hc run: {}{}", out.stderr.trim(), out.stdout.trim());

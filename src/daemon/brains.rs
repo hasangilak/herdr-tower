@@ -43,6 +43,9 @@ struct Inner {
     lives: BTreeMap<String, Life>,
     /// The spaces that are due a brain of their own, as of the last look.
     wanted: BTreeSet<String>,
+    /// The brains this daemon restarted to run them in the user's login
+    /// shell (`brains::to_restart_for_shell`): each once.
+    reshelled: BTreeSet<String>,
 }
 
 static RUNNING: OnceLock<Brains> = OnceLock::new();
@@ -95,6 +98,10 @@ pub fn known_of(name: &str, t: &Value, before: Option<&Known>) -> Known {
         created_ms: hc::created_ms(t).or_else(|| before.and_then(|b| b.created_ms)),
         // Its claude's own (a look with no pid, or while cca starts it: as it was).
         account: t["state"].as_str().is_none_or(|s| s == "live").then(|| crate::accounts::of_terminal(t)).flatten().or_else(|| before.and_then(|b| b.account.clone())),
+        launched: match t["argv"].as_array() {
+            Some(a) if !a.is_empty() => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+            _ => before.map(|b| b.launched.clone()).unwrap_or_default(),
+        },
     }
 }
 
@@ -517,6 +524,11 @@ impl Brains {
                 }
             }
         }
+        // A brain started the old way (no login shell: its hooks may not find
+        // node) is started again the new way once it is idle, never in a turn.
+        if !super::watch::test_daemon() {
+            self.restart_for_shell(&cfg);
+        }
         // Each running brain's instructions say how its space stands now (it reads them when told to).
         for k in self.known().iter().filter(|k| k.live) {
             if let Some(space) = &k.space
@@ -526,6 +538,48 @@ impl Brains {
             }
         }
         self.publish();
+    }
+
+    /// Restarts each brain `brains::to_restart_for_shell` names, once: a
+    /// space's own is stopped and the next look starts it again at once; the
+    /// main one is stopped and started here. Each starts a new conversation,
+    /// as `tower restart --brain` has it.
+    fn restart_for_shell(&self, cfg: &Config) {
+        let todo = {
+            let inner = lock(&self.inner);
+            brains::to_restart_for_shell(&inner.known.values().cloned().collect::<Vec<_>>(), &inner.reshelled)
+        };
+        for k in todo {
+            lock(&self.inner).reshelled.insert(k.name.clone());
+            eprintln!("[brains] restarting {} ({}): it was started without the user's login shell, so its hooks may not find node", k.name, k.address);
+            brain::stop(&k.address);
+            self.gone(&k.address);
+            match &k.space {
+                Some(space) => {
+                    let mut inner = lock(&self.inner);
+                    if let Some(l) = inner.lives.iter_mut().find(|(s, _)| s.eq_ignore_ascii_case(space)).map(|(_, l)| l) {
+                        (l.tries, l.next_try_ms, l.up_since_ms) = (0, 0, None);
+                    }
+                }
+                None => {
+                    let which = match brains::started_with(&k.argv).program.as_str() {
+                        p @ ("claude" | "codex") => p.to_string(),
+                        _ => cfg.brain.clone(),
+                    };
+                    // (Started, and seen past its first-run question, beside the look.)
+                    let (me, cfg) = (self.clone(), cfg.clone());
+                    thread::spawn(move || match brain::launch(&cfg, &which) {
+                        Ok(address) => {
+                            eprintln!("[brains] {} runs again as {address}", brain::NAME);
+                            if let Some(t) = hc::get(&address) {
+                                me.seen(brain::NAME, &t);
+                            }
+                        }
+                        Err(e) => eprintln!("[brains] the main brain didn't start again: {e:#}"),
+                    });
+                }
+            }
+        }
     }
 
     /// A space is being closed (`tower space close`): its brain is ended
