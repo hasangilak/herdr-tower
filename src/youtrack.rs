@@ -180,7 +180,7 @@ pub fn description(pr: &Pr, changes: &str) -> String {
          **Repo:** {repo}{branches}\n\
          **Made in:** space {space}, session {session}\n\n\
          **What it changes:** {changes}\n\n\
-         _Opened by Herder Tower for this PR (one ticket per PR): {url}_",
+         _Opened by Herder Tower for this PR (one ticket per PR)._",
         repo = pr.repo,
         n = pr.number,
         url = pr.url,
@@ -601,6 +601,8 @@ mod tests {
             assert!(d.contains(part), "{part} in {d}");
         }
         assert!(!d.contains("Tested on staging"), "the opening paragraph only: {d}");
+        // No link runs into the markdown around it (`…/pull/42_`).
+        assert!(!d.contains("/pull/42_") && d.ends_with("(one ticket per PR)._"), "{d}");
         // Its type, when one is set.
         let body = issue_body(&cfg(), "0-7", &p, "x");
         assert_eq!((body["project"]["id"].as_str(), body["customFields"][0]["value"]["name"].as_str()), (Some("0-7"), Some("Task")));

@@ -307,7 +307,8 @@ enum Cmd {
     Youtrack {
         #[arg(default_value = "status")]
         action: String,
-        /// What `set` sets and to what, or `remove`'s ticket id, or `token clear`.
+        /// What `set` sets and to what, `try`'s PR (and `--no-link`), `remove`'s ticket id, or `token clear`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Risk and confidence: when the tower answers a session's question for you. Low risk is answered
