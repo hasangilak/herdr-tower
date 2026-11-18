@@ -495,7 +495,7 @@ impl Daemon {
         let space = t.and_then(crate::spaces::space_of);
         let prs = self.prs.carry_over(from, to, &name, space.as_deref());
         let reviews = self.reviews.carry_over(from, to, t.and_then(crate::hc::created_ms));
-        self.decisions.carry_over(from, to);
+        self.decisions.carry_over(from, to, space.as_deref());
         sessions::registry().moved(from, to);
         eprintln!(
             "[sessions] {to} goes on with {from}'s conversation: {} PR(s) and {} review(s) are its now{}",
