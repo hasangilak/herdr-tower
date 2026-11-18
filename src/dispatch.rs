@@ -149,6 +149,14 @@ pub struct Live {
 
 pub fn run(json_text: &str, dry_run: bool) -> Result<()> {
     let mut plan: Plan = serde_json::from_str(json_text).context("the plan: {\"tasks\":[{\"id\",\"project\",\"instruction\",\"after\"}]}")?;
+    // A task that names no space (nor a session) is for the space of whoever
+    // runs it: a space's tower's own, never the one the window shows.
+    if plan.tasks.iter().any(|t| t.space.is_none() && t.session.is_none() && t.on.is_none()) {
+        let names: Vec<String> = crate::spaces::windows().into_iter().map(|w| w.name).collect();
+        if let Some(h) = crate::home::home(&names).filter(|h| names.iter().any(|n| n.eq_ignore_ascii_case(&h.space))) {
+            fill_home(&mut plan, &h.space);
+        }
+    }
     let stages = with_handoffs(&mut plan)?;
     let order = check(&plan)?;
     let live = live_sessions();
@@ -276,6 +284,13 @@ pub fn check(plan: &Plan) -> Result<Vec<usize>> {
 }
 
 /// Where each task goes (see the module's rules).
+/// Each task that names no space, no session and no machine is for `space`.
+pub fn fill_home(plan: &mut Plan, space: &str) {
+    for t in plan.tasks.iter_mut().filter(|t| t.space.is_none() && t.session.is_none() && t.on.is_none()) {
+        t.space = Some(space.to_string());
+    }
+}
+
 pub fn route(plan: &Plan, order: &[usize], live: &[Live]) -> Result<BTreeMap<String, Route>> {
     let mut out = BTreeMap::new();
     let mut names: BTreeSet<String> = live.iter().map(|l| l.name.clone()).collect();
@@ -364,7 +379,8 @@ fn queue(session: &str, text: &str, after: &[u64], tag: crate::agenda::Tag) -> R
     Ok((line, id, v["task"].clone()))
 }
 
-fn start(t: &Task, name: &str, cwd: &str, own_worktree: bool, after: &[u64], tag: crate::agenda::Tag) -> Result<(String, u64, Value)> {
+/// `tower start`'s arguments for a new session for `t`: its name, folder, space, account, machine.
+fn start_args(t: &Task, name: &str, cwd: &str, own_worktree: bool) -> Vec<String> {
     let mut args: Vec<String> = vec!["--name".into(), name.into(), "--cwd".into(), cwd.into()];
     // It has a worktree of its own already: not the space's as well.
     if own_worktree {
@@ -375,6 +391,11 @@ fn start(t: &Task, name: &str, cwd: &str, own_worktree: bool, after: &[u64], tag
             args.extend([flag.to_string(), v.clone()]);
         }
     }
+    args
+}
+
+fn start(t: &Task, name: &str, cwd: &str, own_worktree: bool, after: &[u64], tag: crate::agenda::Tag) -> Result<(String, u64, Value)> {
+    let mut args = start_args(t, name, cwd, own_worktree);
     // Its place in the agenda (a start held back is the queue's item already: `--no-track`).
     if let Some(a) = &tag.agenda {
         args.extend(["--agenda".into(), a.clone()]);
@@ -631,6 +652,22 @@ mod tests {
         assert_eq!(route(&plan(Some("Billing")), &[0], &live).unwrap()["a"], Route::Queue { session: "t1".into() });
         assert!(matches!(route(&plan(Some("Billing")), &[0], &live[1..]).unwrap()["a"], Route::Start { worktree: false, .. }));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_spaces_towers_tasks_stay_in_its_space() {
+        let mut named = task("b", "/w/api", &[]);
+        named.space = Some("search-llm".into());
+        let mut given = task("c", "/w/api", &[]);
+        given.session = Some("t7".into());
+        let mut plan = Plan { request: String::new(), agenda: None, tasks: vec![task("a", "/w/api", &[]), named, given] };
+        fill_home(&mut plan, "support");
+        let spaces: Vec<Option<&str>> = plan.tasks.iter().map(|t| t.space.as_deref()).collect();
+        // Its own space for what names none; a space it names, and a session it names, as named.
+        assert_eq!(spaces, [Some("support"), Some("search-llm"), None]);
+        // A new session for it is started in that space (`tower start --space`).
+        let args = start_args(&plan.tasks[0], "api-a", "/w/api", false);
+        assert!(args.windows(2).any(|w| w[0] == "--space" && w[1] == "support"), "{args:?}");
     }
 
     #[test]

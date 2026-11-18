@@ -628,8 +628,14 @@ takes the best-matching folder under `~/Work` and one level below
 (`HERDER_TOWER_PROJECTS` for other roots), preferring a project's own
 checkout over a `wt-…` worktree copy, and says what it took in `chose`.
 `--account` takes a name, part of one, or a place ("second"). Without
-`--space` it gets a tab in the space the window shows. Either way it says which
-space the session went to. An account cca doesn't know is an
+`--space` it goes to the space of whoever runs it: a space's own tower's
+space (`tower-<space>`), a session's own space, or the space the main tower's
+request names in front ("In support: …"); `tower dispatch` gives its tasks
+that space too, and `tower launch` run by a space's tower with no `--name`
+joins its space, leaving the space's goal as it is (a finding spun out still
+opens a new space: it names it). Only when no space is known that way does it
+get a tab in the space the window shows. Either way it says which
+space the session went to, and why (`space_why`). An account cca doesn't know is an
 error that lists the ones it does. Without the mod, sessions start as plain
 `claude` and accounts show as unknown.
 

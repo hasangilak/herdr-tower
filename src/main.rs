@@ -38,6 +38,7 @@ mod findings;
 mod fixes;
 mod hc;
 mod history;
+mod home;
 mod hooks;
 mod impact;
 mod install;
@@ -439,7 +440,9 @@ enum Cmd {
         #[arg(long)]
         on: Option<String>,
         /// The Herdr space to put it in, by its name or a part of it; made when
-        /// none has that name (default: a new tab in the space the window shows).
+        /// none has that name (default: the space of who runs it: a space's tower's own,
+        /// a session's own, the one the main tower's request names; else a new tab in
+        /// the space the window shows).
         #[arg(long)]
         space: Option<String>,
         /// The user asked for a new space: --space is its name, made unless a
@@ -1189,6 +1192,7 @@ fn run(cli: Cli) -> Result<()> {
                     (_, true) => Some(false),
                     _ => None,
                 };
+                let home_space = if name.is_none() { home::launch_home(&home::caller()) } else { None };
                 let ask = launch::Ask {
                     setup: setup.as_deref(),
                     name: name.as_deref(),
@@ -1199,6 +1203,8 @@ fn run(cli: Cli) -> Result<()> {
                     plan: plan.as_deref(),
                     review,
                     story: story_file.as_deref(),
+                    // Run by a space's own tower with no --name: into its space, never a new one by accident.
+                    home: home_space.as_deref(),
                 };
                 launch::cmd(&goal, &ask, dry_run, json)
             }
@@ -2294,17 +2300,34 @@ fn start(
     let asked_account = account.map(str::trim).filter(|a| !a.is_empty()).map(String::from);
     // The space first: it may say which machine the session runs on. One
     // that doesn't exist yet is made below; of several, the closest is taken.
-    let spaces = if space.is_some() { spaces::windows() } else { vec![] };
+    let spaces = if space.is_some() || on.is_none() { spaces::windows() } else { vec![] };
     let mut notes: Vec<String> = vec![];
+    // None named: the space of whoever runs it (a space's tower: its own,
+    // never the one the window happens to show), else the window's.
+    let home = match (space, on) {
+        (None, None) => home::home(&spaces.iter().map(|w| w.name.clone()).collect::<Vec<_>>()),
+        _ => None,
+    };
+    // Exactly that space: one only like it is never taken, and one Herdr
+    // closed (its last tab ended) is made again, never the window's instead.
+    let home_asked = home.as_ref().map(|h| spaces::Asked { name: h.space.clone(), new: true });
+    let space = space.or(home_asked.as_ref());
     let mut space_why = "the one the window shows: none was named".to_string();
     let (target, new_space) = match space {
         Some(want) => match spaces::best_window(want, &spaces) {
             spaces::Placing::One(w) | spaces::Placing::Closest(w, _) if want.new && !w.name.eq_ignore_ascii_case(want.name.trim()) => {
-                space_why = "made: a new space was asked for".into();
+                space_why = match &home {
+                    Some(h) => format!("{} (made again: Herdr had closed it)", h.why),
+                    None => "made: a new space was asked for".into(),
+                };
                 (None, Some(want.name.trim().to_string()))
             }
             spaces::Placing::One(w) => {
-                space_why = if w.name.eq_ignore_ascii_case(want.name.trim()) { "as asked".into() } else { format!("the one \"{}\" names", want.name.trim()) };
+                space_why = match &home {
+                    Some(h) => h.why.clone(),
+                    None if w.name.eq_ignore_ascii_case(want.name.trim()) => "as asked".into(),
+                    None => format!("the one \"{}\" names", want.name.trim()),
+                };
                 (Some(w.clone()), None)
             }
             spaces::Placing::Closest(w, others) => {
@@ -2313,7 +2336,10 @@ fn start(
                 (Some(w.clone()), None)
             }
             spaces::Placing::New(name) => {
-                space_why = "made: no space had that name".into();
+                space_why = match &home {
+                    Some(h) => format!("{} (made again: Herdr had closed it)", h.why),
+                    None => "made: no space had that name".into(),
+                };
                 (None, Some(name))
             }
         },
