@@ -635,7 +635,11 @@ that space too, and `tower launch` run by a space's tower with no `--name`
 joins its space, leaving the space's goal as it is (a finding spun out still
 opens a new space: it names it). Only when no space is known that way does it
 get a tab in the space the window shows. Either way it says which
-space the session went to, and why (`space_why`). An account cca doesn't know is an
+space the session went to, and why (`space_why`). A session it starts
+here outside a space's tab (`hc run`) runs in the user's login, interactive
+shell (`$SHELL -lic 'exec "$@"'`), as Herdr runs a tab's agent, so it has the
+PATH the user's own terminals have (nvm's `node` for its hooks, Homebrew, bun),
+not only the terminal server's. An account cca doesn't know is an
 error that lists the ones it does. Without the mod, sessions start as plain
 `claude` and accounts show as unknown.
 
