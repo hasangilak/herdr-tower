@@ -164,6 +164,12 @@ pub struct Mission {
     /// a goal is set.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub goal_cleared: bool,
+    /// The space it was spun out of: opened for a bug a session found
+    /// there, off that space's goal (`crate::findings`). Herdr has no fork
+    /// of a space: the tower keeps the link, the space is named after its
+    /// source and placed right after it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spun_from: Option<String>,
 }
 
 /// One version of a space's goal: what it became, when, and what made it so.
@@ -231,6 +237,7 @@ impl Default for Mission {
             goals: vec![],
             chat: false,
             goal_cleared: false,
+            spun_from: None,
         }
     }
 }
@@ -251,6 +258,7 @@ impl Mission {
             goals: std::mem::take(&mut self.goals),
             chat: self.chat,
             goal_cleared: self.goal_cleared,
+            spun_from: self.spun_from.take(),
             ..Mission::born(now)
         };
     }
@@ -714,6 +722,8 @@ pub fn view(s: &Spaces, src: &Sources) -> Value {
             // Opened by a chat: its goal is written from the user's requests (`Mission::chat`).
             "chat": m.chat,
             "review": m.review,
+            // Spun out of that space, for a bug found there (`crate::findings`).
+            "spun_from": m.spun_from,
             "state": m.state.word(),
             "follow": spaces::followed_in(s, name),
             "mute": spaces::muted_in(s, name),
@@ -787,7 +797,7 @@ pub fn poke() {
 
 fn brief(s: &Spaces, name: &str) -> Value {
     let m = s.missions.get(name).cloned().unwrap_or_default();
-    json!({ "space": name, "goal": goal_of(s, name), "done_when": m.done_when, "standing": m.standing, "review": m.review, "state": m.state.word(), "report": m.report, "goal_history": m.goals, "chat": m.chat })
+    json!({ "space": name, "goal": goal_of(s, name), "done_when": m.done_when, "standing": m.standing, "review": m.review, "state": m.state.word(), "report": m.report, "goal_history": m.goals, "chat": m.chat, "spun_from": m.spun_from })
 }
 
 /// A space's goal and what counts as done, set in `s` (each when given;
@@ -2048,6 +2058,7 @@ mod tests {
                 "standing": false,
                 "chat": false,
                 "review": true,
+                "spun_from": null,
                 "state": "ready",
                 "follow": true,
                 "mute": false,

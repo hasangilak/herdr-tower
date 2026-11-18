@@ -635,7 +635,11 @@ that space too, and `tower launch` run by a space's tower with no `--name`
 joins its space, leaving the space's goal as it is (a finding spun out still
 opens a new space: it names it). Only when no space is known that way does it
 get a tab in the space the window shows. Either way it says which
-space the session went to, and why (`space_why`). A session it starts
+space the session went to, and why (`space_why`). An account cca doesn't
+know is an error that lists the ones it does. Without the mod, sessions start
+as plain `claude` and accounts show as unknown.
+
+A session `tower start` starts
 here outside a space's tab (`hc run`) runs in the user's login, interactive
 shell (`$SHELL -lic 'exec "$@"'`), as Herdr runs a tab's agent, so it has the
 PATH the user's own terminals have (nvm's `node` for its hooks, Homebrew, bun),
@@ -651,9 +655,14 @@ its hooks report the start of a conversation (session id) last seen in a
 terminal that is gone, the daemon gives the new terminal the old one's open
 PRs, their reviews and its open decisions (`[sessions] tN goes on with
 tM's conversation` in its log). For that, a gone session's decisions and a
-review whose PR's session is gone wait three minutes before they end. An account cca doesn't know is an
-error that lists the ones it does. Without the mod, sessions start as plain
-`claude` and accounts show as unknown.
+review whose PR's session is gone wait three minutes before they end.
+
+A bug found off a space's goal and spun out (`tower finding published`)
+opens a space named after the one it was found in (`support › bug-x`),
+placed right after it in Herdr's list, and linked to it: its mission keeps
+`spun_from`, which the missions and its own tower's instructions show.
+Herdr has no fork of a space; this is the closest it allows. A finding from
+a muted space isn't said.
 
 Every Claude session on this Mac carries its account: `tower agents`,
 `tower spaces`, `tower history` and jobs, and the `agents` in the daemon's
