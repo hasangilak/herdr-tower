@@ -65,6 +65,9 @@ pub struct Plan {
     pub space: String,
     /// A space of that name is there already (`--name`): the sessions join it.
     pub joins: bool,
+    /// Its sessions join the space of the tower that launched it (`Ask::home`,
+    /// no `--name`): that space keeps its goal, done-when and reviewer as they are.
+    pub keeps_goal: bool,
     pub setup: Setup,
     /// The account as the claude-accounts mod knows it (None: no accounts, plain `claude`).
     pub account: Option<String>,
@@ -102,6 +105,9 @@ pub struct Ask<'a> {
     /// `--story-file`: the conversation that made it (`Told`), kept as the
     /// space's own once it is launched (`record_story`).
     pub story: Option<&'a str>,
+    /// The space of the tower that runs it (`crate::home`: a space's own
+    /// tower): with no `--name`, its sessions join it, and it keeps its goal.
+    pub home: Option<&'a str>,
 }
 
 /// One message of the conversation that made a space (the full window's
@@ -602,7 +608,10 @@ pub fn plan_with(goal: &str, ask: &Ask, w: &World) -> Result<Plan> {
         bail!("the setup \"{}\" has no repos: tower setup add \"{}\" --account <account> --repo <folder>", setup.name, setup.name);
     }
     let repo_words: Vec<String> = named.iter().map(|(w, _)| w.clone()).collect();
+    let home = given(ask.home).filter(|_| given(ask.name).is_none()).and_then(|h| w.open.iter().find(|s| s.eq_ignore_ascii_case(&h)).cloned());
+    let keeps_goal = home.is_some();
     let (space, name_why, joins) = match given(ask.name) {
+        None if let Some(h) = home => (h, "its tower's own: none was named".to_string(), true),
         Some(n) => {
             let there = w.open.iter().find(|s| s.eq_ignore_ascii_case(&n));
             (there.cloned().unwrap_or_else(|| n.to_string()), "as given".to_string(), there.is_some())
@@ -673,7 +682,7 @@ pub fn plan_with(goal: &str, ask: &Ask, w: &World) -> Result<Plan> {
         "name": space, "name_why": name_why,
         "worktrees": sessions.iter().any(|s| s.worktree.is_some()), "worktrees_why": worktrees_why,
     });
-    Ok(Plan { goal, done_when, ticket, repos_from, space, joins, setup: setup.clone(), account, sessions, assumed, plan: None, review })
+    Ok(Plan { goal, done_when, ticket, repos_from, space, joins, keeps_goal, setup: setup.clone(), account, sessions, assumed, plan: None, review })
 }
 
 /// What a session of the plan is asked first: the whole ticket (with its
@@ -845,6 +854,13 @@ pub fn open(p: &Plan, by: Option<&str>, each: &mut dyn FnMut(&Value)) -> Result<
     // The space is a mission from now on, with its goal: its sessions get worktrees.
     // Its goal is the title, and what counts as done is set as `tower space goal --done-when` sets it.
     crate::spaces::update(|s| {
+        // Launched by its own tower into its space: the space stays what it is for.
+        if p.keeps_goal {
+            if let Some(m) = s.missions.get_mut(&p.space).filter(|m| m.state == crate::missions::State::Closed || m.archived_ms.is_some()) {
+                m.reopen(now);
+            }
+            return;
+        }
         let was = s.agendas.get(&p.space).cloned().unwrap_or_default();
         s.agendas.insert(p.space.clone(), p.goal.clone());
         let m = s.missions.entry(p.space.clone()).or_insert_with(|| crate::missions::Mission::born(now));
@@ -1135,6 +1151,16 @@ mod tests {
         assert_eq!(p.sessions[0].name, "login-fix-eyzflow");
         let p = plan("Fix the login", None, Some("m5 pro"), &w).unwrap();
         assert_eq!((p.space.as_str(), p.joins, p.sessions[0].worktree.clone()), ("M5 Pro", true, None));
+        // Launched by a space's own tower (`home`) with no name: its sessions join that space, which keeps its goal.
+        let mine = plan_with("Fix the login", &Ask { home: Some("m5 PRO"), ..Default::default() }, &w).unwrap();
+        assert_eq!((mine.space.as_str(), mine.joins, mine.keeps_goal, mine.assumed["name_why"].as_str()), ("M5 Pro", true, true, Some("its tower's own: none was named")));
+        // A finding spun out names its new space: that one, made, whoever runs it.
+        let spun = plan_with("Fix the login", &Ask { home: Some("M5 Pro"), name: Some("login-bug"), ..Default::default() }, &w).unwrap();
+        assert_eq!((spun.space.as_str(), spun.joins, spun.keeps_goal), ("login-bug", false, false));
+        // Anyone else (no home), or a home that isn't open: a new space named from the goal, as before.
+        let fresh = plan_with("Fix the login", &Ask::default(), &w).unwrap();
+        assert_eq!((fresh.space.as_str(), fresh.joins, fresh.keeps_goal), ("fix-login-2", false, false));
+        assert_eq!(plan_with("Fix the login", &Ask { home: Some("gone"), ..Default::default() }, &w).unwrap().space, "fix-login-2");
         assert!(p.assumed["worktrees_why"].as_str().unwrap().contains("standing space"));
         // Worktrees off: the repos themselves.
         let off = World { worktrees: false, ..w.clone() };
@@ -1189,7 +1215,7 @@ mod tests {
         let w = World { setups: vec![project, setup("other", "default", &["/w"])], accounts: accounts(&["default", "orca"]), worktrees: true, spaces: vec!["msg".into()], ..Default::default() };
         let ticket = "EYZFlow Support – Enable Automatic Message and Reply Translation\n\nAcceptance criteria:\n- Messages show translated";
         let repos = vec![s(&room)];
-        let ask = Ask { repos: &repos, name: Some("msg-translation"), title: Some("Translate support messages"), done_when: Some("both languages show"), account: None, setup: Some("EYZFlow"), plan: None, review: None, story: None };
+        let ask = Ask { repos: &repos, name: Some("msg-translation"), title: Some("Translate support messages"), done_when: Some("both languages show"), account: None, setup: Some("EYZFlow"), plan: None, review: None, story: None, home: None };
         let p = plan_with(ticket, &ask, &w).unwrap();
         // Only the repo asked for, though the project has two; its account and its role come with the project.
         assert_eq!((p.sessions.len(), p.sessions[0].folder.as_str(), p.sessions[0].why.as_str()), (1, s(&room).as_str(), "the media backend"));
