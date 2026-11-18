@@ -1426,13 +1426,23 @@ impl Book {
     /// there): the decisions `from` was in are `to`'s now, waiting as it
     /// was. Not those that stand for its question sets: a question on its
     /// old screen is no longer on any. Whether any moved.
-    pub fn carry_over(&mut self, from: &str, to: &str) -> bool {
+    /// One that is about that session alone goes with it to its space now
+    /// (`space`: the one it went on in), as a raise is in its session's space.
+    pub fn carry_over(&mut self, from: &str, to: &str, space: Option<&str>) -> bool {
         let mut moved = false;
         for d in self.open.iter_mut().filter(|d| !d.kind.asks()) {
             let had_to = d.sessions.iter().any(|w| w.address == to);
+            let mut this = false;
             for w in d.sessions.iter_mut().filter(|w| w.address == from) {
                 w.address = to.to_string();
-                moved = true;
+                (moved, this) = (true, true);
+            }
+            if this
+                && d.kind != Kind::Merge
+                && let Some(sp) = space.filter(|s| !s.trim().is_empty())
+                && d.sessions.iter().all(|w| w.address == to)
+            {
+                d.space = Some(sp.to_string());
             }
             // (Both in it already: one entry.)
             if had_to {

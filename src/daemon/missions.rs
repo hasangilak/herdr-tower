@@ -46,6 +46,10 @@ pub struct Missions {
     active: Arc<Mutex<crate::active::Tracker>>,
     /// Each space's and session's brief, its versions (`crate::briefs`).
     briefs: Arc<Mutex<crate::briefs::History>>,
+    /// How long a space that went quiet keeps what was open there: its
+    /// last session may have moved to another space's tab, its decisions
+    /// going with it once its conversation goes on there (`Decisions::carry_over`).
+    quiet_grace_ms: u64,
 }
 
 /// A session's labels are read again this long after they were read.
@@ -87,6 +91,8 @@ impl Missions {
             // (Tests never read the user's history.)
             active: Arc::new(Mutex::new(crate::active::Tracker::at(if cfg!(test) { std::path::PathBuf::from("/nonexistent/history.jsonl") } else { crate::history::path() }))),
             briefs: Arc::new(Mutex::new(if cfg!(test) { crate::briefs::History::default() } else { crate::briefs::History::load(crate::config::state_dir().join("briefs.json")) })),
+            // (Tests see what a quiet space closes at once.)
+            quiet_grace_ms: if cfg!(test) { 0 } else { crate::reopen::GRACE_MS },
         }
     }
 
@@ -318,9 +324,23 @@ impl Missions {
     fn act(&self, effect: &Effect, ui: &Path, now: u64) {
         match effect {
             Effect::Quiet(space) => {
-                let closed = self.decisions.space_over(space, false);
-                eprintln!("[missions] {space} is quiet: no session left ({closed} decision(s) over)");
                 record(space, "quiet", format!("{space} is quiet: no session left there."));
+                if self.quiet_grace_ms == 0 {
+                    let closed = self.decisions.space_over(space, false);
+                    eprintln!("[missions] {space} is quiet: no session left ({closed} decision(s) over)");
+                    return;
+                }
+                // What was open there is over once it has stayed quiet a while (what moved on with its
+                // session to another space is that space's by then).
+                eprintln!("[missions] {space} is quiet: no session left (what was open there closes in {} s if it stays so)", self.quiet_grace_ms / 1000);
+                let (decisions, space, ui, wait) = (self.decisions.clone(), space.clone(), ui.to_path_buf(), self.quiet_grace_ms);
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(wait));
+                    if spaces::load_from(&ui).missions.get(&space).is_some_and(|m| m.state == State::Quiet) {
+                        let closed = decisions.space_over(&space, false);
+                        eprintln!("[missions] {space} stayed quiet: {closed} decision(s) over");
+                    }
+                });
             }
             Effect::Archived(space) => {
                 self.decisions.space_over(space, true);

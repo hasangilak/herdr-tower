@@ -404,11 +404,11 @@ impl Decisions {
     /// The conversation of the session at `from` goes on at `to`: its
     /// decisions are `to`'s (`decisions::Book::carry_over`), and `from`
     /// leaves none when it is gone.
-    pub fn carry_over(&self, from: &str, to: &str) {
+    pub fn carry_over(&self, from: &str, to: &str, space: Option<&str>) {
         lock(&self.gone).remove(from);
         if lock(&self.book).open.iter().any(|d| !d.kind.asks() && d.sessions.iter().any(|w| w.address == from)) {
             self.change(|b, _| {
-                if b.carry_over(from, to) {
+                if b.carry_over(from, to, space) {
                     eprintln!("[decisions] {from}'s decisions are {to}'s: its conversation went on there");
                 }
                 Changes::default()
@@ -1470,9 +1470,13 @@ mod tests {
         d.session_gone_later("t1");
         assert_eq!(d.get(&raised.id).map(|d| d.state), Some(State::Open));
         // Its conversation goes on in t9: the raise and the merge are t9's, waiting as before.
-        d.carry_over("t1", "t9");
+        d.carry_over("t1", "t9", Some("Support"));
         let r = d.get(&raised.id).unwrap();
         assert_eq!((r.state, r.sessions.iter().map(|w| w.address.as_str()).collect::<Vec<_>>()), (State::Open, vec!["t9"]));
+        assert_eq!(r.space.as_deref(), Some("Support"), "with its session, to the space it went on in");
+        // Its old space going quiet now leaves it alone; a merge stays in the space it was raised in.
+        assert_eq!(d.space_over("Shop", false), 0);
+        assert_eq!(d.get(&merge).unwrap().space.as_deref(), Some("Shop"));
         assert!(d.get(&merge).unwrap().sessions.iter().all(|w| w.address == "t9"));
         // t1 isn't asked about again; and once the grace is over a gone t1 closes nothing of t9's.
         let d = Decisions { gone_grace_ms: 0, ..d };
@@ -1485,7 +1489,7 @@ mod tests {
         // Twice in one decision (both terminals were in it): one entry.
         let (both, ..) = d.raise(raise("Shop", "t2", "Tabs or a sidebar?"));
         d.raise(raise("Shop", "t3", "Tabs or a sidebar?"));
-        d.carry_over("t2", "t3");
+        d.carry_over("t2", "t3", None);
         assert_eq!(d.get(&both.id).unwrap().sessions.iter().map(|w| w.address.as_str()).collect::<Vec<_>>(), ["t3"]);
     }
 
