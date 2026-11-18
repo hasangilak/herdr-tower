@@ -302,9 +302,20 @@ pub struct Start<'a> {
 pub const TODO_TOOLS: &str = "CLAUDE_CODE_ENABLE_TODO_TOOLS=1";
 
 /// The program a command line runs, past an `env VAR=value …` before it:
-/// `env CLAUDE_CODE_ENABLE_TODO_TOOLS=1 claude …` runs `claude`.
+/// `env CLAUDE_CODE_ENABLE_TODO_TOOLS=1 claude …` runs `claude`. Past the
+/// login shell it is started in, too (`in_login_shell`, or Herdr's own for
+/// a tab: `/bin/zsh -lic '"$@"; exec "$0" -li' /bin/zsh claude …`).
 pub fn program_of<'a>(argv: &[&'a str]) -> &'a str {
     let base = |a: &'a str| a.rsplit('/').next().unwrap_or(a);
+    if let [sh, flags, _script, rest @ ..] = argv
+        && SHELLS.contains(&base(sh))
+        && flags.starts_with('-')
+        && flags.contains('c')
+    {
+        // (zsh, bash, sh: the word after the script is its `$0`; fish has none.)
+        let rest = if base(sh) == "fish" { rest } else { rest.get(1..).unwrap_or(&[]) };
+        return program_of(rest);
+    }
     let mut it = argv.iter().copied();
     let first = it.next().map(base).unwrap_or("");
     if first != "env" {
@@ -313,8 +324,40 @@ pub fn program_of<'a>(argv: &[&'a str]) -> &'a str {
     it.find(|a| !a.contains('=') && !a.starts_with('-')).map(base).unwrap_or("")
 }
 
-/// The `hc run` arguments that start the session.
+/// The shells a command line may be started in (`program_of`).
+const SHELLS: [&str; 4] = ["zsh", "bash", "sh", "fish"];
+
+/// The shell a person's own terminals start in: `$SHELL`, else zsh.
+pub fn login_shell() -> String {
+    std::env::var("SHELL").ok().filter(|s| s.starts_with('/')).unwrap_or_else(|| "/bin/zsh".into())
+}
+
+/// `argv`, run as a terminal the person opens runs it: in their login,
+/// interactive `shell` (`-lic`), so it has the PATH their shell's profile
+/// and rc files set (nvm's node, Homebrew, bun…), as Herdr runs a tab's
+/// agent. Not run so, it has only what the terminal server started with,
+/// and a session's hooks that need `node` fail ("Executable not found in
+/// $PATH"). The shell execs it: none is left behind once it ends.
+pub fn in_login_shell(shell: &str, argv: Vec<String>) -> Vec<String> {
+    let fish = shell.rsplit('/').next() == Some("fish");
+    let mut a: Vec<String> = vec![shell.into(), "-lic".into()];
+    if fish {
+        a.push("exec $argv".into());
+    } else {
+        a.extend(["exec \"$@\"".into(), shell.into()]);
+    }
+    a.extend(argv);
+    a
+}
+
+/// The `hc run` arguments that start the session, in the person's login
+/// shell (`login_shell`) here; on another machine, as that machine runs it.
 pub fn hc_run_args(s: &Start) -> Vec<String> {
+    hc_run_args_in(s, s.on.is_none().then(login_shell).as_deref())
+}
+
+/// `hc_run_args`, with the session started in `shell` (None: as it is).
+pub fn hc_run_args_in(s: &Start, shell: Option<&str>) -> Vec<String> {
     let mut a: Vec<String> = ["run", "--bg", "--json", "--outlive-parent", "--name", s.name].map(String::from).to_vec();
     if let Some(cwd) = s.cwd {
         a.extend(["--cwd".into(), cwd.into()]);
@@ -323,7 +366,10 @@ pub fn hc_run_args(s: &Start) -> Vec<String> {
         a.extend(["--on".into(), m.into()]);
     }
     a.push("--".into());
-    a.extend(command(s));
+    match shell {
+        Some(sh) => a.extend(in_login_shell(sh, command(s))),
+        None => a.extend(command(s)),
+    }
     a
 }
 
@@ -412,7 +458,7 @@ mod tests {
             todo_tools: false,
         };
         assert_eq!(
-            hc_run_args(&s),
+            hc_run_args_in(&s, None),
             [
                 "run",
                 "--bg",
@@ -431,6 +477,19 @@ mod tests {
             ]
         );
         assert_eq!(command(&s), ["/bin/cca", "work", "-n", "fix-login", "look at the login bug"], "what a tab in a space runs");
+        // Here, in the person's login shell: the PATH their own terminals have (node for its hooks).
+        let here = hc_run_args_in(&s, Some("/bin/zsh"));
+        assert_eq!(
+            here[8..],
+            ["--", "/bin/zsh", "-lic", "exec \"$@\"", "/bin/zsh", "/bin/cca", "work", "-n", "fix-login", "look at the login bug"],
+            "{here:?}"
+        );
+        let here: Vec<&str> = here.iter().map(String::as_str).collect();
+        assert_eq!(program_of(&here[9..]), "cca", "the program behind the shell");
+        assert_eq!(hc_run_args(&s)[9..11], [login_shell(), "-lic".to_string()], "hc_run_args starts it so");
+        let fish = in_login_shell("/opt/homebrew/bin/fish", vec!["claude".into(), "-n".into(), "x".into()]);
+        assert_eq!(fish, ["/opt/homebrew/bin/fish", "-lic", "exec $argv", "claude", "-n", "x"]);
+        // On another machine: as that machine runs it, no shell of this one's.
         let s = Start { name: "x", cwd: None, on: Some("vps"), task: "", account: None, cca: "cca", todo_tools: false };
         assert_eq!(hc_run_args(&s), ["run", "--bg", "--json", "--outlive-parent", "--name", "x", "--on", "vps", "--", "claude", "-n", "x"]);
         // With its task list on (the default): env sets it, here and on another machine alike.
@@ -442,6 +501,10 @@ mod tests {
         assert_eq!(program_of(&["/usr/bin/env", "A=1", "-i", "claude"]), "claude");
         assert_eq!(program_of(&["/opt/bin/claude", "-n", "x"]), "claude");
         assert_eq!(program_of(&[]), "");
+        // Past a shell it was started in: Herdr's for a tab, or `in_login_shell`.
+        assert_eq!(program_of(&["/bin/zsh", "-lic", "\"$@\"; exec \"$0\" -li", "/bin/zsh", "env", "A=1", "/bin/claude", "-n", "x"]), "claude");
+        assert_eq!(program_of(&["/bin/zsh", "-l"]), "zsh", "a shell itself");
+        assert_eq!(program_of(&["fish", "-lic", "exec $argv", "codex"]), "codex");
     }
 
     #[test]
