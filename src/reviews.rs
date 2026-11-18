@@ -526,6 +526,19 @@ impl Book {
         Ok(())
     }
 
+    /// The conversation of the PR's session at `from` goes on at `to`
+    /// (made at `created_ms`): the reviews not over that `from` owns are
+    /// `to`'s, so what the reviewer finds reaches it there. Their keys.
+    pub fn carry_over(&mut self, from: &str, to: &str, created_ms: Option<u64>, now: u64) -> Vec<String> {
+        let mut moved = vec![];
+        for r in self.reviews.iter_mut().filter(|r| !r.status.over() && r.owner == from) {
+            (r.owner, r.owner_created_ms) = (to.to_string(), created_ms);
+            r.step("owner", "", None, &format!("its session went on in {to} (it was {from})"), now);
+            moved.push(r.key.clone());
+        }
+        moved
+    }
+
     /// A review begins for `pr` (its owner's account and terminal): kept before its reviewer opens.
     pub fn begin(&mut self, pr: &Pr, account: Option<String>, owner_created_ms: Option<u64>, now: u64) -> Review {
         let mut r = Review {

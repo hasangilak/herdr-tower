@@ -131,10 +131,17 @@ const KEEP_CHARS: usize = 2000;
 /// Sessions not heard from in this long are forgotten.
 const FORGET_MS: u64 = 7 * 24 * 3600 * 1000;
 
+/// How long the terminal a conversation ended in is remembered, for its resume (`predecessor`).
+const ENDED_KEEP_MS: u64 = 24 * 3600 * 1000;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Book {
     /// By terminal address.
     sessions: BTreeMap<String, AgentSession>,
+    /// The terminal each conversation was last in, once that terminal is
+    /// gone (`forget`): by session id, the terminal and when it went.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    ended: BTreeMap<String, (String, u64)>,
 }
 
 pub struct Sessions {
@@ -168,6 +175,48 @@ impl Sessions {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Book> {
         self.book.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The terminal a conversation was in before the one `ev` comes from,
+    /// when `ev` is its start in another terminal: the same conversation
+    /// (session id) resumed elsewhere (moved to another space's tab, put
+    /// back after a restart). That terminal's work is this one's now
+    /// (`daemon::Daemon::carry_over`). None: a new conversation, or one
+    /// going on in the same terminal (a failover types its resume into the
+    /// terminal it was in). Asked before `apply` takes the event in.
+    pub fn predecessor(&self, ev: &AgentEvent) -> Option<String> {
+        if ev.event != "start" || ev.session_id.is_empty() || ev.terminal.is_empty() {
+            return None;
+        }
+        let b = self.lock();
+        if b.sessions.get(&ev.terminal).is_some_and(|s| s.session_id == ev.session_id) {
+            return None;
+        }
+        // Still listed under another terminal (its end not seen yet), else gone from one lately.
+        b.sessions
+            .values()
+            .filter(|s| s.session_id == ev.session_id && s.terminal != ev.terminal)
+            .max_by_key(|s| s.event_ms)
+            .map(|s| s.terminal.clone())
+            .or_else(|| b.ended.get(&ev.session_id).filter(|(t, _)| *t != ev.terminal).map(|(t, _)| t.clone()))
+    }
+
+    /// A conversation went on in `to`: the terminal it was in (`from`) is no
+    /// longer its own (its entry goes, so it is never taken for it again).
+    pub fn moved(&self, from: &str, to: &str) {
+        let mut b = self.lock();
+        let id = b.sessions.get(to).map(|s| s.session_id.clone()).unwrap_or_default();
+        let mut changed = false;
+        if b.sessions.get(from).is_some_and(|s| id.is_empty() || s.session_id == id) {
+            b.sessions.remove(from);
+            changed = true;
+        }
+        if !id.is_empty() && b.ended.remove(&id).is_some() {
+            changed = true;
+        }
+        if changed {
+            self.save(&b);
+        }
     }
 
     /// Takes in one event; says what changed.
@@ -282,7 +331,13 @@ impl Sessions {
     /// terminal that later gets the same address starts clean.
     pub fn forget(&self, terminal: &str) {
         let mut b = self.lock();
-        if b.sessions.remove(terminal).is_some() {
+        if let Some(s) = b.sessions.remove(terminal) {
+            // Its conversation may go on in another terminal: where it was is kept a while.
+            let now = crate::history::now_ms();
+            if !s.session_id.is_empty() {
+                b.ended.insert(s.session_id.clone(), (terminal.to_string(), now));
+            }
+            b.ended.retain(|_, (_, at)| now.saturating_sub(*at) < ENDED_KEEP_MS);
             self.save(&b);
         }
     }
@@ -352,6 +407,33 @@ mod tests {
         let p = std::env::temp_dir().join(format!("tower-sessions-{}-{n}.json", std::process::id()));
         let _ = std::fs::remove_file(&p);
         (Sessions::at(p.clone()), p)
+    }
+
+    #[test]
+    fn a_conversation_resumed_in_another_terminal_knows_where_it_was() {
+        let (r, p) = reg();
+        let at = |e: &str, terminal: &str, session: &str, t: u64| AgentEvent { terminal: terminal.into(), session_id: session.into(), ..ev(e, "", t) };
+        r.apply(&at("start", "t5", "s1", 100));
+        r.apply(&at("stop", "t5", "s1", 200));
+        // Its terminal ended (moved to another space's tab), then it is resumed in t9.
+        r.forget("t5");
+        let resumed = at("start", "t9", "s1", 300);
+        assert_eq!(r.predecessor(&resumed).as_deref(), Some("t5"));
+        r.apply(&resumed);
+        r.moved("t5", "t9");
+        assert_eq!(r.predecessor(&resumed), None, "taken once: t9 is its terminal now");
+        // Still listed under its old terminal (its end not seen yet): that one.
+        r.apply(&at("start", "t6", "s2", 400));
+        assert_eq!(r.predecessor(&at("start", "t7", "s2", 500)).as_deref(), Some("t6"));
+        // A failover types the resume into the terminal it was in: nothing moved. A new conversation: none.
+        assert_eq!(r.predecessor(&at("start", "t6", "s2", 600)), None);
+        assert_eq!(r.predecessor(&at("start", "t8", "s3", 600)), None);
+        // Only a start is a resume: a prompt from a terminal that took over isn't.
+        assert_eq!(r.predecessor(&at("prompt", "t7", "s2", 700)), None);
+        // Where an ended conversation was is kept in the file.
+        r.forget("t6");
+        assert_eq!(Sessions::at(p.clone()).predecessor(&at("start", "t7", "s2", 800)).as_deref(), Some("t6"));
+        let _ = std::fs::remove_file(&p);
     }
 
     /// Where a session works (its worktree, its dev port) is its

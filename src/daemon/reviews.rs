@@ -77,6 +77,11 @@ pub struct Reviews {
     hands: Arc<dyn Hands>,
     /// Reviews whose reviewer is being opened right now.
     opening: Arc<Mutex<HashSet<String>>>,
+    /// Reviews whose PR's session was seen gone, and since when: each waits
+    /// `owner_grace_ms` for that conversation to go on in another terminal
+    /// (`carry_over`) before it ends.
+    owner_gone: Arc<Mutex<std::collections::HashMap<String, u64>>>,
+    owner_grace_ms: u64,
     /// The heavy parts (opening, ending) run on threads of their own; tests run them in place.
     background: bool,
 }
@@ -145,6 +150,8 @@ impl Reviews {
             shared,
             hands,
             opening: Arc::default(),
+            owner_gone: Arc::default(),
+            owner_grace_ms: crate::reopen::GRACE_MS,
             background: false,
         }
     }
@@ -408,8 +415,12 @@ impl Reviews {
                 _ if sp.closed => Some(format!("the space {} was closed", r.space)),
                 _ if !sp.review => Some(format!("review was turned off for {}", r.space)),
                 _ if opening.contains(&r.key) => None,
-                // Nobody is left to fix what it finds (the PR stays the user's to merge).
-                _ if self.hands.alive(&r.owner, r.owner_created_ms) == Some(false) => Some("the PR's own session ended".to_string()),
+                // Nobody is left to fix what it finds (the PR stays the user's to merge),
+                // once it has been gone a while: its conversation may go on in another terminal.
+                _ if self.hands.alive(&r.owner, r.owner_created_ms) == Some(false) => {
+                    let since = *lock(&self.owner_gone).entry(r.key.clone()).or_insert(now);
+                    (now.saturating_sub(since) >= self.owner_grace_ms).then(|| "the PR's own session ended".to_string())
+                }
                 _ if r.reviewer.is_empty() => self.unopened(&r, now),
                 _ => match self.hands.alive(&r.reviewer, r.reviewer_created_ms) {
                     Some(false) => Some("its reviewer session ended".to_string()),
@@ -423,6 +434,25 @@ impl Reviews {
             }
         }
         ended
+    }
+
+    /// The conversation of the PR session at `from` goes on at `to` (made at
+    /// `created_ms`): the reviews it owns are `to`'s, and none ends for
+    /// `from` having gone. Their keys.
+    pub fn carry_over(&self, from: &str, to: &str, created_ms: Option<u64>) -> Vec<String> {
+        let mut b = lock(&self.book);
+        let moved = b.carry_over(from, to, created_ms, crate::history::now_ms());
+        if moved.is_empty() {
+            return moved;
+        }
+        self.save(&b);
+        drop(b);
+        for k in &moved {
+            lock(&self.owner_gone).remove(k);
+            eprintln!("[reviews] {k}: its owner's conversation went on in {to} (it was {from})");
+            self.publish(k);
+        }
+        moved
     }
 
     /// A review with no reviewer and none opening (the tower restarted while
@@ -852,14 +882,29 @@ mod tests {
         lock(&hands.gone).insert("t9".into());
         reviews.sweep();
         assert_eq!(reviews.get("o/app#12").unwrap().line, "its reviewer session ended");
-        // The PR's own session ends: nobody is left to fix it, and its reviewer ends.
-        let (reviews, hands, prs, base5) = setup("owner");
+        // The PR's own session ends: nobody is left to fix it, and its reviewer ends,
+        // once it has been gone a while (its conversation may go on in another terminal).
+        let (mut reviews, hands, prs, base5) = setup("owner");
         found(&prs, &reviews, "t3", "fix-login");
         lock(&hands.gone).insert("t3".into());
+        assert!(reviews.sweep().is_empty(), "not at once");
+        assert!(!reviews.get("o/app#12").unwrap().status.over());
+        reviews.owner_grace_ms = 0;
         assert_eq!(reviews.sweep(), ["o/app#12"]);
         assert_eq!(reviews.get("o/app#12").unwrap().line, "the PR's own session ended");
         assert!(lock(&hands.calls).contains(&"end t9".to_string()));
-        for b in [base, base2, base3, base4, base5] {
+        // Moved: the same conversation goes on in t12 (another space's tab). Its review goes on, t12's.
+        let (mut reviews, hands, prs, base6) = setup("moved");
+        found(&prs, &reviews, "t3", "fix-login");
+        lock(&hands.gone).insert("t3".into());
+        reviews.owner_grace_ms = 0;
+        assert_eq!(reviews.carry_over("t3", "t12", Some(900)), ["o/app#12"]);
+        assert!(reviews.sweep().is_empty(), "t12 runs: the review goes on");
+        let r = reviews.get("o/app#12").unwrap();
+        assert_eq!((r.owner.as_str(), r.owner_created_ms, r.status.over()), ("t12", Some(900), false));
+        assert!(!lock(&hands.calls).contains(&"end t9".to_string()), "its reviewer keeps going");
+        assert!(reviews.carry_over("t3", "t12", Some(900)).is_empty(), "once");
+        for b in [base, base2, base3, base4, base5, base6] {
             let _ = std::fs::remove_dir_all(b);
         }
     }
