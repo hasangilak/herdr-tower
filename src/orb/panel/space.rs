@@ -464,11 +464,13 @@ impl Panel {
         if force {
             args.push("--force".into());
         }
+        // (Where it was pressed: the window goes to every space only if it is still there.)
+        let from = self.tower.read(cx).nav.scope.clone();
         self.run(&format!("space:{space}"), args, cx, move |this, result, cx| {
             let Ok(out) = result else { return };
             let text = closed_line(&name, out);
             this.tower.update(cx, |t, cx| {
-                t.nav.say(Scope::All, text);
+                t.nav.said_from(&from, Scope::All, text);
                 cx.notify();
             });
         });
@@ -502,6 +504,7 @@ impl Panel {
         if force {
             args.push("--force".into());
         }
+        let from = self.tower.read(cx).nav.scope.clone();
         self.run(&format!("space:{space}"), args, cx, move |this, result, cx| {
             let Ok(out) = result else { return };
             if let Some(full) = this.full.as_mut() {
@@ -509,7 +512,7 @@ impl Panel {
             }
             let text = closed_line(&name, out);
             this.tower.update(cx, |t, cx| {
-                t.nav.say(Scope::All, text);
+                t.nav.said_from(&from, Scope::All, text);
                 cx.notify();
             });
         });

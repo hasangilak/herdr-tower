@@ -2414,3 +2414,21 @@ mod tests {
         assert!(release_track(&serde_json::json!({}), "checkout").is_none(), "an older daemon's state");
     }
 }
+
+#[cfg(test)]
+mod live_parse {
+    /// Which missions of a copy of the real state the panel can't read:
+    /// `HERDER_TOWER_STATE_COPY=<copy> cargo test missions_on_a_live_copy -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn missions_on_a_live_copy() {
+        let Some(copy) = std::env::var_os("HERDER_TOWER_STATE_COPY") else { return };
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(copy).unwrap()).unwrap();
+        for m in v["missions"]["spaces"].as_array().unwrap() {
+            match serde_json::from_value::<super::Mission>(m.clone()) {
+                Ok(p) => println!("ok   {} ({:?})", p.name, p.state),
+                Err(e) => println!("FAIL {}: {e}", m["name"]),
+            }
+        }
+    }
+}

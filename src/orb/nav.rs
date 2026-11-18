@@ -183,6 +183,20 @@ impl Nav {
         self.go(at);
     }
 
+    /// What came of something done in `from`, a while after (a space closed
+    /// or resolved, a launch, a question that couldn't be asked): `text` is
+    /// said at `at`, and the window goes there only while it still shows
+    /// `from`. A view the user left meanwhile is theirs: the window stays
+    /// where they went (and what they type there with it), and the line
+    /// waits at `at` for when they go there.
+    pub fn said_from(&mut self, from: &Scope, at: Scope, text: String) {
+        if self.scope == *from {
+            self.say(at, text);
+        } else {
+            (self.notice, self.notice_act) = (Some((at, text)), None);
+        }
+    }
+
     /// What is said at the top of the view showing.
     pub fn notice(&self) -> Option<&str> {
         self.notice.as_ref().filter(|(at, _)| *at == self.scope).map(|(_, text)| text.as_str())
@@ -202,9 +216,11 @@ impl Nav {
     /// A space was launched: its view opens under the name the launcher
     /// expects (`before`: the spaces there were), and stays while Herdr
     /// doesn't list it yet.
-    pub fn launched(&mut self, name: &str, before: Vec<String>, text: String, now_ms: u64) {
+    /// Pressed in `from`: the window goes to the new space only while it
+    /// still shows `from` (`said_from`).
+    pub fn launched_from(&mut self, from: &Scope, name: &str, before: Vec<String>, text: String, now_ms: u64) {
         self.launched = Some(Launched { name: name.to_string(), at: now_ms, before });
-        self.say(Scope::Space(name.to_string()), text);
+        self.said_from(from, Scope::Space(name.to_string()), text);
     }
 
     /// The space the launcher made that isn't listed yet.
@@ -300,6 +316,69 @@ pub fn keep_on(screens: &[Rect], x: f64, y: f64, w: f64, h: f64) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window's place as the panel finds it each second: the open
+    /// missions of `state` (as the panel reads them), and `settle` over them.
+    fn settled(nav: &mut Nav, state: &serde_json::Value, now: u64) -> bool {
+        let all = crate::orb::model::decisions(state, &Default::default(), &|_| String::new(), now);
+        let m = crate::orb::model::missions(state, &Default::default(), &[], &[], &all);
+        let names: Vec<&str> = m.open.iter().map(|m| m.name.as_str()).collect();
+        nav.settle(&names, now)
+    }
+
+    #[test]
+    fn a_new_decision_leaves_the_space_the_window_shows() {
+        let now = 1_000_000;
+        let mission = |name: &str, state: &str, mute: bool| serde_json::json!({ "name": name, "state": state, "mute": mute, "sessions": [{ "address": "t1", "name": "api", "status": "idle" }] });
+        let card = |id: &str, space: &str, muted: bool| {
+            serde_json::json!({ "id": id, "key": format!("question::{id}"), "kind": "question", "space": space, "muted": muted, "sessions": [{ "address": "t9", "name": "x", "waiting": true }], "waiting": 1, "title": "Ship it?", "first_ms": now, "last_ms": now, "count": 1, "state": "open" })
+        };
+        // The user has bug-three-specs open (ready to close), with nothing in the queue.
+        let mut nav = Nav::default();
+        nav.go(Scope::Space("bug-three-specs".into()));
+        let mut state = serde_json::json!({ "running": true, "missions": { "spaces": [mission("bug-three-specs", "ready", false), mission("support", "open", false)] }, "decisions": [] });
+        assert!(!settled(&mut nav, &state, now));
+        // A card comes in elsewhere (1 needs you), and one in a muted test space that just opened: it stays.
+        state["decisions"] = serde_json::json!([card("d1", "support", false)]);
+        assert!(!settled(&mut nav, &state, now + 1000));
+        state["missions"]["spaces"].as_array_mut().unwrap().push(mission("zz-muted", "open", true));
+        state["decisions"].as_array_mut().unwrap().push(card("d2", "zz-muted", true));
+        assert!(!settled(&mut nav, &state, now + 2000));
+        assert_eq!(nav.scope, Scope::Space("bug-three-specs".into()));
+        // A card in the space it shows changes nothing either.
+        state["decisions"].as_array_mut().unwrap().push(card("d3", "bug-three-specs", false));
+        assert!(!settled(&mut nav, &state, now + 3000));
+        assert_eq!(nav.scope, Scope::Space("bug-three-specs".into()));
+    }
+
+    #[test]
+    fn what_comes_of_a_view_the_user_left_doesnt_take_the_window_back() {
+        let now = 1_000_000;
+        // Resolve pressed in bug-ticket-link; the user goes on to bug-three-specs and types there.
+        let mut nav = Nav::default();
+        nav.go(Scope::Space("bug-ticket-link".into()));
+        let pressed = nav.scope.clone();
+        nav.go(Scope::Space("bug-three-specs".into()));
+        // Twelve seconds on, the resolve is done: the window stays where the user is, the line waits at every space.
+        nav.said_from(&pressed, Scope::All, "bug-ticket-link is resolved.".into());
+        assert_eq!(nav.scope, Scope::Space("bug-three-specs".into()));
+        assert_eq!(nav.notice(), None, "not said over what the user is reading");
+        nav.go(Scope::All);
+        assert_eq!(nav.notice(), Some("bug-ticket-link is resolved."), "said where it belongs, once the user goes there");
+        // Still in the space it was pressed in: every space, as before.
+        nav.go(Scope::Space("docs".into()));
+        let pressed = nav.scope.clone();
+        nav.said_from(&pressed, Scope::All, "docs is closed.".into());
+        assert_eq!((nav.scope.clone(), nav.notice()), (Scope::All, Some("docs is closed.")));
+        // A launch from New space: the new space opens only if the window is still on New space.
+        nav.go(Scope::New);
+        nav.go(Scope::Space("support".into()));
+        nav.launched_from(&Scope::New, "fix-login", vec![], "Launched fix-login.".into(), now);
+        assert_eq!(nav.scope, Scope::Space("support".into()));
+        nav.go(Scope::New);
+        nav.launched_from(&Scope::New, "fix-signup", vec![], "Launched fix-signup.".into(), now);
+        assert_eq!(nav.scope, Scope::Space("fix-signup".into()));
+    }
 
     #[test]
     fn a_window_dropped_off_the_edge_comes_back_on() {
@@ -403,7 +482,7 @@ mod tests {
         assert!(nav.settle(&["isa"], now));
         assert_eq!(nav.scope, Scope::All);
         // Just launched: its view waits for Herdr to list it.
-        nav.launched("case-exports", vec!["isa".into()], "Launched case-exports.".into(), now);
+        nav.launched_from(&nav.scope.clone(), "case-exports", vec!["isa".into()], "Launched case-exports.".into(), now);
         assert_eq!((nav.scope.clone(), nav.starting(now + 5000)), (Scope::Space("case-exports".into()), Some("case-exports")));
         assert!(!nav.settle(&["isa"], now + 5000));
         assert_eq!(nav.notice(), Some("Launched case-exports."));
@@ -416,17 +495,17 @@ mod tests {
         assert_eq!(nav.starting(now + 6000), None);
         assert!(nav.settle(&["isa"], now + 7000), "and gone like any other once it closes");
         // Never listed: it gives up.
-        nav.launched("ghost", vec![], String::new(), now);
+        nav.launched_from(&nav.scope.clone(), "ghost", vec![], String::new(), now);
         assert!(!nav.settle(&[], now + LAUNCH_GRACE_MS - 1));
         assert!(nav.settle(&[], now + LAUNCH_GRACE_MS));
         // The tower gave it another name: the one new space is it, notice and all.
-        nav.launched("case-exports", vec!["isa".into(), "anna".into()], "Launched.".into(), now);
+        nav.launched_from(&nav.scope.clone(), "case-exports", vec!["isa".into(), "anna".into()], "Launched.".into(), now);
         assert!(!nav.settle(&["isa", "anna"], now + 1000), "not there yet");
         assert!(nav.settle(&["isa", "anna", "case-exports-pdf"], now + 2000));
         assert_eq!((nav.scope.clone(), nav.notice()), (Scope::Space("case-exports-pdf".into()), Some("Launched.")));
         assert_eq!(nav.starting(now + 2000), None);
         // Two new spaces at once: no guessing which.
-        nav.launched("x", vec!["isa".into()], String::new(), now);
+        nav.launched_from(&nav.scope.clone(), "x", vec!["isa".into()], String::new(), now);
         assert!(!nav.settle(&["isa", "a", "b"], now + 1000));
         assert_eq!(nav.scope, Scope::Space("x".into()));
         nav.go(Scope::All);

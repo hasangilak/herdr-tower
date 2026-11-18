@@ -316,7 +316,7 @@ impl Panel {
             if let Err(e) = result {
                 let text = format!("It couldn't be asked: {}", e.trim());
                 this.tower.update(cx, |t, cx| {
-                    t.nav.say(at.clone(), text);
+                    t.nav.said_from(&at, at.clone(), text);
                     cx.notify();
                 });
             }

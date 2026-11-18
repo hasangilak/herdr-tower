@@ -194,6 +194,9 @@ pub(super) struct FullUi {
     pub space_tower: Option<bool>,
     /// The brains' model and effort as just chosen here, until the state says them too.
     pub model: Option<(Option<String>, Option<String>)>,
+    /// The sidebar's open spaces in the order they keep while the window is
+    /// up (`side_order`): a card or a session at work doesn't move a row.
+    pub side_order: Vec<String>,
     /// Settings' pane, scrolled to its Phone card when `Scope::Phone` is asked for.
     pub settings_scroll: gpui::ScrollHandle,
     /// New space's pane: a new line in the chat about a plan scrolls it to its end.
@@ -263,6 +266,7 @@ impl FullUi {
             resize: None,
             space_tower: None,
             model: None,
+            side_order: vec![],
             settings_scroll: scroll.clone(),
             launch_scroll: gpui::ScrollHandle::new(),
             phone_anchor: gpui::ScrollAnchor::for_handle(scroll),
@@ -596,8 +600,9 @@ impl Panel {
         // (Not before Herdr's spaces were read: a window that has just opened knows none.)
         let known = !names.is_empty() || self.live_read;
         let (scope, to_phone) = self.tower.update(cx, |t, _| {
-            if known {
-                t.nav.settle(&names, now);
+            let was = t.nav.scope.clone();
+            if known && t.nav.settle(&names, now) {
+                eprintln!("[orb] the window's view moved from {was:?} to {:?}: its space isn't among the open ones ({names:?})", t.nav.scope);
             }
             // The phone is a card of Settings: asked for, Settings opens there.
             let to_phone = t.nav.scope == Scope::Phone;
@@ -617,6 +622,7 @@ impl Panel {
             return;
         }
         let from = full.shown.replace(scope.clone());
+        eprintln!("[orb] the window shows {scope:?} (it showed {from:?})");
         // What a command said belongs to the view it was asked in.
         full.notes.clear();
         full.edit = None;
@@ -722,6 +728,19 @@ impl Panel {
 
 // ---------------------------------------------------------------------------
 // Drawing it.
+
+/// The sidebar's open spaces in a lasting order: those it listed before
+/// (`kept`) where they were, those gone left out, new ones (as `now` lists
+/// them) after.
+pub(super) fn side_order(kept: &[String], now: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = kept.iter().filter(|k| now.contains(&k.as_str())).cloned().collect();
+    for n in now {
+        if !out.iter().any(|k| k == n) {
+            out.push(n.to_string());
+        }
+    }
+    out
+}
 
 /// A scope as a word, for the element that scrolls it (each view keeps its
 /// own place).
@@ -954,8 +973,16 @@ impl Panel {
             list = list.child(bay_label("Open spaces").px(px(8.0)).pt(px(10.0)).pb(px(3.0)));
         }
         let now = crate::history::now_ms();
-        for (i, m) in missions.open.iter().enumerate() {
+        // In the order the rows had when the window opened, a new space at the end: a row the
+        // user has open stays where it is when a card comes in or a session starts working.
+        let order = side_order(self.full.as_ref().map(|f| f.side_order.as_slice()).unwrap_or(&[]), &missions.open.iter().map(|m| m.name.as_str()).collect::<Vec<_>>());
+        if let Some(f) = self.full.as_mut() {
+            f.side_order = order.clone();
+        }
+        let rows: Vec<&model::Mission> = order.iter().filter_map(|n| missions.open.iter().find(|m| &m.name == n)).collect();
+        for m in rows {
             let name = m.name.clone();
+            let i = crate::worktrees::slug(&m.name);
             // Where its changes stand: "prod 14:20 · 1 on dev".
             let released = self.tower.read(cx).state.as_ref().and_then(|s| model::release_track(s, &m.name)).map(|t| t.summary(now)).filter(|s| !s.is_empty());
             let line = match released {
@@ -1228,6 +1255,19 @@ impl Panel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sidebar_keeps_its_rows_where_they_are() {
+        let kept = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // The window opened on them in the state's order.
+        let first = side_order(&[], &["bug-nightly-build", "bug-three-specs", "M5 Pro", "support"]);
+        assert_eq!(first, kept(&["bug-nightly-build", "bug-three-specs", "M5 Pro", "support"]));
+        // A card in zz-panel-check (a new space) and in support puts them first in the state: the rows stay, the new one at the end.
+        let now = side_order(&first, &["zz-panel-check", "support", "bug-nightly-build", "bug-three-specs", "M5 Pro"]);
+        assert_eq!(now, kept(&["bug-nightly-build", "bug-three-specs", "M5 Pro", "support", "zz-panel-check"]));
+        // One closed: gone, the others where they were.
+        assert_eq!(side_order(&now, &["support", "M5 Pro", "zz-panel-check", "bug-nightly-build"]), kept(&["bug-nightly-build", "M5 Pro", "support", "zz-panel-check"]));
+    }
 
     #[test]
     fn dragged_columns_keep_every_column_its_least() {
