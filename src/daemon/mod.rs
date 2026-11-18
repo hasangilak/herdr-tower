@@ -921,9 +921,10 @@ impl Daemon {
                     Err(e) => Response::err(format!("{e:#}")),
                 };
             }
-            Request::Youtrack { action, id } => {
+            Request::Youtrack { action, id, no_link } => {
                 let r = match action.as_str() {
                     "now" => youtrack::now(&self.prs).map(|did| serde_json::json!({ "did": did })),
+                    "try" => youtrack::try_one(&self.prs, &id, !no_link).map(|did| serde_json::json!({ "did": did })),
                     "remove" => youtrack::remove(&self.prs, &id),
                     _ => Err(format!("no youtrack action {action}")),
                 };

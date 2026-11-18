@@ -300,8 +300,9 @@ enum Cmd {
     /// YouTrack tickets for the PRs sessions open in the `[youtrack] github_owners` repos (eyzhub):
     /// `status` (default), `on`, `off`, `set url|project|type|owners|link-pr <value>`, `token`
     /// (keeps your API token in the Keychain: typed at its prompt, or piped in; never shown),
-    /// `token clear`, `check` (asks YouTrack who the token is and whether the project is there),
-    /// `now` (makes the tickets due now) and `remove <ID>` (deletes a ticket the tower made, and
+    /// `token clear`, `check` (asks YouTrack who the token is and whether the projects are there),
+    /// `now` (makes the tickets due now), `try <PR> [--no-link]` (one PR's ticket now, on or off;
+    /// `set project-for <repo> <PROJECT>` gives a repo its own project) and `remove <ID>` (deletes a ticket the tower made, and
     /// its comment on the PR; from a shell only).
     Youtrack {
         #[arg(default_value = "status")]
@@ -1778,6 +1779,9 @@ fn youtrack_cmd(action: &str, args: &[String]) -> Result<()> {
         println!("YouTrack tickets: {}", if c.enabled { "on" } else { "off" });
         println!("  url:      {}", if c.url.trim().is_empty() { "(not set)" } else { c.url.trim() });
         println!("  project:  {}", if c.project.trim().is_empty() { "(not set)" } else { c.project.trim() });
+        for (repo, p) in &c.repo_projects {
+            println!("    {repo} → {p}");
+        }
         println!("  type:     {}", if c.issue_type.trim().is_empty() { "(the project's default)" } else { c.issue_type.trim() });
         println!("  for PRs in: {}", c.github_owners.join(", "));
         println!("  link on the PR: {}", if c.link_pr { "yes (a comment with the ticket's link)" } else { "no" });
@@ -1810,6 +1814,14 @@ fn youtrack_cmd(action: &str, args: &[String]) -> Result<()> {
                     write("url", quoted(&v))?
                 }
                 "project" => write("project", quoted(&v))?,
+                "project-for" | "repo-project" => {
+                    let Some((repo, project)) = v.trim().split_once(' ') else { bail!("tower youtrack set project-for <repo> <PROJECT> (or <repo> none)") };
+                    let table = config::with_table_key(&text, "youtrack.repo_projects", &quoted(repo), &quoted(project));
+                    let table = if project.trim() == "none" { text.lines().filter(|l| l.split('=').next().map(str::trim) != Some(quoted(repo).as_str())).collect::<Vec<_>>().join("\n") + "\n" } else { table };
+                    let read = config::Config::from_text(&table)?.youtrack;
+                    std::fs::write(&path, table)?;
+                    read
+                }
                 "type" | "issue_type" => write("issue_type", quoted(&v))?,
                 "owners" | "github_owners" => {
                     let list: Vec<toml::Value> = v.split([',', ' ']).filter(|o| !o.trim().is_empty()).map(|o| toml::Value::String(o.trim().into())).collect();
@@ -1845,6 +1857,12 @@ fn youtrack_cmd(action: &str, args: &[String]) -> Result<()> {
             use youtrack::Remote as _;
             let id = real.project_id(&now.project)?;
             println!("Project {}: there ({id})", now.project.trim());
+            for (repo, p) in &now.repo_projects {
+                match real.project_id(p) {
+                    Ok(pid) => println!("  {repo} → {p}: there ({pid})"),
+                    Err(e) => bail!("{repo} → {p}: {e:#}"),
+                }
+            }
             let types = real.types(&id);
             match now.issue_type.trim() {
                 "" if !types.is_empty() => println!("Type: the project's default (it has {})", types.join(", ")),
@@ -1855,7 +1873,7 @@ fn youtrack_cmd(action: &str, args: &[String]) -> Result<()> {
             }
         }
         ("now", _) => {
-            let r = protocol::send(&Request::Youtrack { action: "now".into(), id: String::new() })?;
+            let r = protocol::send(&Request::Youtrack { action: "now".into(), id: String::new(), no_link: false })?;
             if !r.ok {
                 bail!("{}", r.error.unwrap_or_default());
             }
@@ -1867,11 +1885,21 @@ fn youtrack_cmd(action: &str, args: &[String]) -> Result<()> {
                 println!("{}: {}", d["pr"].as_str().unwrap_or(""), d["did"].as_str().unwrap_or(""));
             }
         }
+        ("try", [what, rest @ ..]) => {
+            let no_link = rest.contains(&"--no-link");
+            let r = protocol::send(&Request::Youtrack { action: "try".into(), id: what.to_string(), no_link })?;
+            if !r.ok {
+                bail!("{}", r.error.unwrap_or_default());
+            }
+            for d in r.state.unwrap_or_default()["did"].as_array().cloned().unwrap_or_default() {
+                println!("{}: {}", d["pr"].as_str().unwrap_or(""), d["did"].as_str().unwrap_or(""));
+            }
+        }
         ("remove", [id]) => {
             if home::caller() != home::Caller::Other {
                 bail!("only from a shell: a session or a tower doesn't take back tickets");
             }
-            let r = protocol::send(&Request::Youtrack { action: "remove".into(), id: id.to_string() })?;
+            let r = protocol::send(&Request::Youtrack { action: "remove".into(), id: id.to_string(), no_link: false })?;
             if !r.ok {
                 bail!("{}", r.error.unwrap_or_default());
             }

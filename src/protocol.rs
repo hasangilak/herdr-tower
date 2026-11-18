@@ -160,13 +160,17 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<String>,
     },
-    /// YouTrack tickets (`tower youtrack now|remove`): `now` makes the
-    /// tickets due now; `remove` takes back the one with id `id` that the
+    /// YouTrack tickets (`tower youtrack now|try|remove`): `now` makes the
+    /// tickets due now; `try` the ticket of one PR (`id`: its key or link),
+    /// on or off; `remove` takes back the one with id `id` that the
     /// tower made (deleted, its PR comment too, forgotten).
     Youtrack {
         action: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         id: String,
+        /// `try`: comment the ticket's link on the PR (as `[youtrack] link_pr` says).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        no_link: bool,
     },
     /// A planned check of a PR, reported by its session (`tower validate`):
     /// `pr` (its key, its link, or `#12`: the caller's own), `check` (its id;
