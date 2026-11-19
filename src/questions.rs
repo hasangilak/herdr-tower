@@ -1921,10 +1921,36 @@ pub fn must_escalate(set: &QuestionSet) -> Option<&'static str> {
     if let Some(f) = file_write(set) {
         return file_hard(&f);
     }
-    let (text, command) = prompt_text(set, true, true);
+    // A question at the end of a turn: what it asks and what its answers would
+    // do (`asked_text`), never the report it came at the end of, nor the
+    // session's task. A dialog ("Go ahead?") still reads its task.
+    let (text, command) = if set.kind == "text" { (asked_text(set), None) } else { prompt_text(set, true, true) };
     reason_of(&text, command.as_deref())
         .or_else(|| cut_with_rm_warning(set).then_some("Claude Code can't rule out an rm, and the command's start isn't shown"))
         .or_else(|| rm_warning(set).then_some(RM_WARNED))
+}
+
+/// A question at the end of a turn, for the 90/10 rule: what it asks (its
+/// questions, as the brain put them, and their options) and what each
+/// answer would do (the recommendations: their labels and the replies they
+/// send). Not the message it came at the end of (the session's report),
+/// nor its task: words there ("the release check", "the PR into main")
+/// are no part of what the answer does.
+fn asked_text(set: &QuestionSet) -> String {
+    let mut out = vec![set.title.clone()];
+    for t in &set.tabs {
+        out.push(t.question.clone());
+        out.extend(t.options.iter().map(|o| format!("{} {}", o.label, o.description)));
+    }
+    for r in set.recommendations.iter().flatten().flat_map(|t| t.options.iter()) {
+        out.push(r.label.clone());
+        match &r.choice {
+            Value::String(s) => out.push(s.clone()),
+            Value::Object(o) => out.extend(o.get("other").and_then(Value::as_str).map(String::from)),
+            _ => {}
+        }
+    }
+    out.join("\n")
 }
 
 /// Why a prompt Claude Code warns may remove files is the user's.
@@ -4491,6 +4517,53 @@ mod tests {
         assert_eq!(planned_base(&live, "Storefront users", "api").as_deref(), Some("dev"), "dev before a release into main");
         assert_eq!(planned_base(&live, "Other", "api"), None);
         assert_eq!(planned_base(&live, "Storefront users", "web"), None);
+    }
+
+    /// The question "Move a835.17 and a835.18 out of a835?" (card
+    /// dac602b6bab29): the brain said auto, low risk, 0.9, and the tower
+    /// made it "it deploys or releases", the user's. Nothing in it deploys:
+    /// the words were in what the session was asked ("…, a sooner-help-faqs
+    /// release check") around its report. A question at the end of a turn
+    /// is read for what it asks and what its answers would do; "open the
+    /// release PR into main?" is still the user's.
+    #[test]
+    fn a_turn_end_question_is_judged_by_what_it_asks_not_the_report_or_the_task() {
+        let task = "Tower bug, agendas: work handed out while a user request is fresh joins that request's agenda across unrelated spaces, and then [agenda] notes go to the wrong space's tower. Example: agenda a835 (the user's 'make the PR every time' request, M5 Pro) now holds 14 tasks across six spaces: browser-sharing notes to t1rr, a CI watch for t1rw in dashboard-date-format › … › bug-help-center, PR pushes in kb-full-dump, a sooner-help-faqs release check. Merge into local main and install; don't push.";
+        let message = "All three fixes are in: merged into local main as `7de9017`, installed at 19:48:41, not pushed.\n\n**Not verified**\n- No real task has been registered or no real note routed since the install.\n- Relay detection relies on the brain's hooks reporting its latest prompt. If they report nothing, a brain's queue is treated as your words, as before.\n\n**a835 now:** tasks .3 to .14 are no longer listed in it; someone removed them before this fix. It still holds a835.17 and a835.18, two relays to t1rr about PR #988, registered before the fix. Want me to move them out with `tower agenda move a835.17 new`? a835.16 is a follow-up of yours on this bug, queued for me; I'll take it when it arrives.";
+        let mut set = text_set("t12w", "m5pro herder tower", message, task);
+        // What set it off: the session's task, not the question.
+        assert_eq!(reason_of(task, None), Some("it deploys or releases"));
+        let (tabs, recs) = text_recs(&json!([{ "question": "Move a835.17 and a835.18 (relays to t1rr about PR #988) out of a835?", "options": [
+            { "label": "Yes, move both to a new agenda", "why": "they are relays for another space, not part of the user's PR request", "choice": { "other": "Yes: move a835.17 and a835.18 out with tower agenda move <task> new (or into the open agenda in t1rr's space if there is one), and show a835 afterwards." } },
+            { "label": "Leave them", "why": "they settle on their own when t1rr finishes", "choice": { "other": "Leave them in a835; they will settle when t1rr finishes." } },
+            { "label": "Abandon them", "why": "if the PR #988 relays are moot", "choice": { "other": "If the PR #988 relays to t1rr are moot, abandon them; otherwise move them to a new agenda." } },
+        ]}]))
+        .unwrap();
+        set.title = tabs[0].question.clone();
+        set.tabs = tabs;
+        set.recommendations = Some(recs);
+        assert_eq!(must_escalate(&set), None);
+        let said = Said { risk: Some(crate::scoring::Risk::Low), risk_why: "agenda bookkeeping".into(), confidence: Some(0.9), confidence_why: "the fix says so".into() };
+        let t = crate::scoring::Thresholds::default();
+        let (decision, why, scores) = decide_scored(&set, Some("auto"), "routine", "normal", &said, &t, &Default::default(), None);
+        assert_eq!((decision.as_str(), scores.risk), ("auto", crate::scoring::Risk::Low), "{why}: {scores:?}");
+
+        // A release PR into main, asked at the end of a turn: still the user's, before the brain and after.
+        let mut release = text_set("t12w", "m5pro herder tower", "dev has #1595 and #1597 now. Want me to open the release PR into main?", "Fix the dates.");
+        assert_eq!(must_escalate(&release), Some("it deploys or releases"));
+        let (tabs, recs) = text_recs(&json!([{ "question": "Open the release PR from dev into main?", "options": [
+            { "label": "Yes, open it", "why": "both are on dev", "choice": { "other": "Yes, open the release PR into main." } }]}])).unwrap();
+        release.tabs = tabs;
+        release.recommendations = Some(recs);
+        assert_eq!(must_escalate(&release), Some("it deploys or releases"));
+        assert_eq!(decide_scored(&release, Some("auto"), "routine", "normal", &said, &t, &Default::default(), None).0, "escalate");
+        // What an answer would do counts too: a harmless question whose recommended reply deploys.
+        let mut sneaky = text_set("t12w", "x", "The fix is in. Shall I go on?", "");
+        let (tabs, recs) = text_recs(&json!([{ "question": "Go on?", "options": [
+            { "label": "Yes", "why": "", "choice": { "other": "Yes, and deploy it to production." } }]}])).unwrap();
+        sneaky.tabs = tabs;
+        sneaky.recommendations = Some(recs);
+        assert_eq!(must_escalate(&sneaky), Some("it deploys or releases"));
     }
 
     /// What the session was asked when its memory note became a card: the
