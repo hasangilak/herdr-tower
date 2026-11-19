@@ -466,6 +466,9 @@ pub struct Agenda {
     /// When the request it came from was heard (0: none).
     pub request_ms: u64,
     pub spaces: Vec<String>,
+    /// The space the user asked it in (a space's view, its tower); None: of the main tower.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asked_in: Option<String>,
     pub created_ms: u64,
     pub state: AgendaState,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -627,6 +630,19 @@ pub fn is_note(prompt: &str) -> bool {
     let Some(rest) = prompt.trim_start().strip_prefix('[') else { return false };
     let word: String = rest.chars().take_while(|c| *c != ']' && !c.is_whitespace()).collect();
     !word.is_empty() && word.len() <= 24 && word != "voice"
+}
+
+/// The user's `words` name `space`: its whole name, or its last part
+/// (`storefront-users-filter › bug-catalogue-quick`: "bug-catalogue-quick",
+/// "catalogue quick" with the "bug" left off), as words of their own,
+/// any case, hyphens as spaces. A part of one word or two letters never does.
+pub fn names_space(words: &str, space: &str) -> bool {
+    let flat = |s: &str| s.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { ' ' }).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+    let said = format!(" {} ", flat(words));
+    let has = |name: &str| name.len() >= 4 && said.contains(&format!(" {name} "));
+    let last = space.rsplit('›').next().unwrap_or(space);
+    let bare = flat(last).strip_prefix("bug ").map(String::from).unwrap_or_default();
+    has(&flat(space)) || has(&flat(last)) || (bare.contains(' ') && has(&bare))
 }
 
 /// Two spaces' names are the same one.
@@ -858,16 +874,20 @@ impl Ledger {
     }
 
     /// What a task just registered (`r`) hands out of a request of the
-    /// user's into a space: that space (its own, else `session_space`, its
-    /// session's), the user's words, and when they asked. None for work the
-    /// tower started on its own, typed in a terminal, with no space, or
-    /// with no request heard (an agenda opened with its words, as `tower
-    /// launch` opens one for its ticket).
+    /// user's into a space whose goal it may widen: that space (its own,
+    /// else `session_space`, its session's), the user's words, and when they
+    /// asked. Only a space the user's words are about: the one they asked
+    /// in, or one they name (`names_space`); never one whose sessions only
+    /// got work while the request was fresh. None for work the tower started
+    /// on its own, typed in a terminal, with no space, or with no request
+    /// heard (an agenda opened with its words, as `tower launch` opens one
+    /// for its ticket).
     pub fn request_in_space(&self, r: &Registered, session_space: Option<&str>) -> Option<(String, String, u64)> {
         let a = self.agenda(&r.agenda).filter(|a| a.origin == "user" && a.request_ms > 0)?;
         let own = a.tasks.iter().find(|t| t.id == r.task).and_then(|t| t.space.clone());
         let space = own.or_else(|| session_space.map(String::from)).filter(|s| !s.trim().is_empty())?;
-        Some((space, a.words.clone(), a.request_ms))
+        let about = a.asked_in.as_deref().is_some_and(|s| same_space(s, &space)) || names_space(&a.words, &space);
+        about.then(|| (space, a.words.clone(), a.request_ms))
     }
 
     fn agenda_mut(&mut self, id: &str) -> Option<&mut Agenda> {
@@ -1253,7 +1273,13 @@ impl Ledger {
         let agenda = match named {
             Some(a) => a,
             None => match recent {
-                Some(h) => self.open(&h.text, "", "user", h.at_ms, &h.space.iter().cloned().collect::<Vec<_>>(), now),
+                Some(h) => {
+                    let a = self.open(&h.text, "", "user", h.at_ms, &h.space.iter().cloned().collect::<Vec<_>>(), now);
+                    if let Some(ag) = self.agenda_mut(&a).filter(|ag| ag.asked_in.is_none()) {
+                        ag.asked_in = h.space.clone();
+                    }
+                    a
+                }
                 None => match self.unfinished_handed(&reg.session).and_then(|t| self.agenda_of(&t.id)).map(|a| a.id.clone()) {
                     Some(a) => a,
                     None => match space.as_deref().and_then(|s| self.open_in_space(s)) {
@@ -2508,6 +2534,44 @@ mod tests {
         assert_eq!(m.register(&reg_in(2, "t2", "docs", main()), &of_main, now + 1).unwrap().agenda, api.agenda, "one request, two spaces");
         let docs_tower = Tag { brain: Some("tower-docs".into()), brain_space: Some("docs".into()), ..Default::default() };
         assert_ne!(m.register(&reg_in(3, "t3", "docs", docs_tower), &of_main, now + 2).unwrap().agenda, api.agenda);
+    }
+
+    /// The user's M5 Pro request ("make the god damn pr everytime … let me
+    /// write something in the pr cards") widened the goal of
+    /// storefront-users-filter › bug-catalogue-quick, whose session only got
+    /// work while it was fresh: a finished bug space would never be ready. A
+    /// request widens only the goals of spaces the user's words are about:
+    /// the one they asked in, or one they name.
+    #[test]
+    fn a_request_widens_only_the_goal_of_a_space_its_words_are_about() {
+        let now = 10_000_000;
+        let words = "hey tower is always asking me to make a pr. make the god damn pr everytime bro. also in the pr cards in the queue let me write something";
+        let bug = "storefront-users-filter › bug-catalogue-quick";
+        let main = || Tag { brain: Some("tower".into()), ..Default::default() };
+        // Asked in M5 Pro: M5 Pro's goal may take it; the bug space's never (its work isn't the request's at all).
+        let mut l = Ledger::default();
+        let in_m5 = Heard { text: words.into(), at_ms: now - 1000, space: Some("M5 Pro".into()) };
+        let r = l.register(&reg_in(1, "t12w", "M5 Pro", main()), &in_m5, now).unwrap();
+        assert_eq!(l.request_in_space(&r, Some("M5 Pro")).map(|(s, _, at)| (s, at)), Some(("M5 Pro".to_string(), now - 1000)));
+        let other = l.register(&reg_in(2, "t1qx", bug, main()), &in_m5, now + 1).unwrap();
+        assert_eq!(l.request_in_space(&other, Some(bug)), None);
+        // Asked of the main tower: its work joins the request in any space, yet no goal takes the words...
+        let mut m = Ledger::default();
+        let of_main = Heard { text: words.into(), at_ms: now - 1000, space: None };
+        let a = m.register(&reg_in(1, "t12w", "M5 Pro", main()), &of_main, now).unwrap();
+        let b = m.register(&reg_in(2, "t1qx", bug, main()), &of_main, now + 1).unwrap();
+        assert_eq!(a.agenda, b.agenda, "one request");
+        assert_eq!((m.request_in_space(&a, Some("M5 Pro")), m.request_in_space(&b, Some(bug))), (None, None));
+        // ... unless the words name the space.
+        let mut n = Ledger::default();
+        let named = Heard { text: "in catalogue quick, also show the year without a separator".into(), at_ms: now - 1000, space: None };
+        let c = n.register(&reg_in(1, "t1qx", bug, main()), &named, now).unwrap();
+        assert_eq!(n.request_in_space(&c, Some(bug)).map(|(s, _, _)| s), Some(bug.to_string()));
+        // What names a space, and what doesn't.
+        assert!(names_space("fix the bug-catalogue-quick filter", bug) && names_space("In storefront-users-filter › bug-catalogue-quick: go on", bug));
+        assert!(names_space("ask m5 pro to fix it", "M5 Pro"));
+        assert!(!names_space(words, bug) && !names_space("the storefront looks fine", bug) && !names_space("a quick look at the catalogue", bug));
+        assert!(!names_space("push to dev", "dev"), "too short to be named by a word");
     }
 
     /// The [agenda] note for a835.13 (t1rw, in dashboard-date-format ›
