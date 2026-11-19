@@ -770,6 +770,38 @@ pub fn raise_key(space: Option<&str>, line: &str) -> String {
     format!("raise:{}:{}", space_part(space), normalise(line))
 }
 
+/// The providers whose account-wide trouble reaches every space at once.
+const PROVIDERS: &[&str] = &["github", "vercel", "aws", "openai", "anthropic", "stripe", "sentry", "youtrack", "npm", "cloudflare", "supabase", "google"];
+
+/// An account-wide cause a raise is about, whatever space raised it and in
+/// whatever words: one provider's billing (failed payments, a spending
+/// limit), an expired or revoked token, or an outage. `github:billing`,
+/// `vercel:token`, `github:outage`; None for anything else.
+pub fn account_cause(text: &str, detail: &str) -> Option<String> {
+    let flat = format!(" {} ", normalise(&format!("{text} {detail}")));
+    let has = |w: &str| flat.contains(&format!(" {w} "));
+    let any = |ws: &[&str]| ws.iter().any(|w| has(w));
+    // GitHub Actions is GitHub's.
+    let ci = any(&["ci", "workflow", "workflows", "runner", "runners", "job", "jobs", "checks", "check"]);
+    let provider = PROVIDERS.iter().find(|p| has(p)).copied().or_else(|| (has("actions") && ci).then_some("github"))?;
+    // Billing that stops the account, not a billing page or feature.
+    let cause = if any(&["spending limit", "payment failed", "payments failed", "payments have failed", "payment has failed", "out of credits", "credit balance is too low", "quota exceeded", "past due", "card declined", "billing issue", "billing problem", "billing needs fixing", "billing is failing"]) {
+        "billing"
+    } else if any(&["token", "tokens", "credentials", "api key", "gh auth", "pat"]) && any(&["expired", "expires", "revoked", "invalid", "bad credentials", "401", "unauthorized"]) {
+        "token"
+    } else if any(&["outage", "is down", "are down", "degraded", "incident", "unavailable", "githubstatus", "status page"]) {
+        "outage"
+    } else {
+        return None;
+    };
+    Some(format!("{provider}:{cause}"))
+}
+
+/// One decision for an account-wide cause, across every space (`account_cause`).
+pub fn account_key(cause: &str) -> String {
+    format!("account:{cause}")
+}
+
 /// A session blocked on what the tower can't read: one decision per session.
 pub fn blocked_key(space: Option<&str>, address: &str) -> String {
     format!("blocked:{}:{}", space_part(space), address.trim())
@@ -1241,6 +1273,57 @@ impl Book {
         Some(d)
     }
 
+    /// Open cards raised about one account-wide cause (`account_cause`) in
+    /// several spaces, from before raises were matched so: one each, the
+    /// oldest, with every session on it (the rest stopped, each saying which
+    /// it joined). The cards kept and those folded into them.
+    pub fn fold_account_wide(&mut self, now: u64) -> Vec<(String, Vec<String>)> {
+        let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for d in self.open.iter().filter(|d| matches!(d.kind, Kind::Raised | Kind::Choice) && d.hold.is_none()) {
+            if let Some(c) = account_cause(&d.title, &d.detail) {
+                groups.entry(account_key(&c)).or_default().push(d.id.clone());
+            }
+        }
+        let mut out = vec![];
+        for (key, mut ids) in groups {
+            ids.sort_by_key(|id| self.open.iter().find(|d| &d.id == id).map(|d| d.first_ms).unwrap_or(u64::MAX));
+            let keep = ids.remove(0);
+            let others: Vec<Decision> = ids.iter().filter_map(|id| self.open.iter().find(|d| &d.id == id).cloned()).collect();
+            let Some(k) = self.open.iter_mut().find(|d| d.id == keep) else { continue };
+            k.key = key;
+            for o in &others {
+                for w in &o.sessions {
+                    if !k.sessions.iter().any(|s| s.address == w.address) {
+                        k.sessions.push(w.clone());
+                    }
+                }
+                k.count += o.count;
+                k.last_ms = k.last_ms.max(o.last_ms);
+                if k.options.is_empty() && !o.options.is_empty() {
+                    k.options = o.options.clone();
+                    k.kind = Kind::Choice;
+                }
+                if k.detail.trim().is_empty() && !o.detail.trim().is_empty() {
+                    k.detail = o.detail.clone();
+                }
+                if space_part(k.space.as_deref()) != space_part(o.space.as_deref()) {
+                    k.space = None;
+                }
+            }
+            for o in &ids {
+                if self.close(o, State::Stopped, now).is_some()
+                    && let Some(c) = self.closed.iter_mut().rev().find(|c| &c.id == o)
+                {
+                    c.answer = format!("joined {keep}: the same account-wide cause");
+                }
+            }
+            if !ids.is_empty() {
+                out.push((keep, ids));
+            }
+        }
+        out
+    }
+
     /// The user answered it (`with`: the option's label, or their words).
     pub fn answered(&mut self, id: &str, with: &str, now: u64) -> Option<Decision> {
         self.close(id, State::Answered, now)?;
@@ -1611,12 +1694,21 @@ impl Book {
     /// or a raise about something already in front of the user, is that
     /// decision once more (`count`, `last_ms`, its session), never a second one.
     pub fn raise(&mut self, r: Raise, now: u64) -> Raised {
-        let key = raise_key(r.space.as_deref(), &r.text);
+        // An account-wide cause (billing, an expired token, an outage): one decision whatever space raised it.
+        let account = account_cause(&r.text, &r.detail);
+        let key = match &account {
+            Some(c) => account_key(c),
+            None => raise_key(r.space.as_deref(), &r.text),
+        };
         let by_key = self.open.iter().position(|d| d.key == key);
         if let Some(i) = by_key.or_else(|| self.same_thing(&r)) {
             let d = &mut self.open[i];
             d.count += 1;
             d.last_ms = now;
+            // Another space's: it is every space's now (the main queue's).
+            if account.is_some() && space_part(d.space.as_deref()) != space_part(r.space.as_deref()) {
+                d.space = None;
+            }
             // A merge's or a question's sessions are its PRs' and its sets'.
             if !d.kind.asks()
                 && d.kind != Kind::Merge
@@ -2367,6 +2459,95 @@ pub fn takers<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GitHub Actions for eyzhub stopped starting jobs (failed payments, a
+    /// spending limit): three spaces raised it in their own words, and it was
+    /// three cards (d7ad277fbca3a, d1c9e62997319, d40d95d8e4dcd). One
+    /// account-wide cause is one decision, with every waiting session on it,
+    /// whatever space raised it; cards open from before are folded on load.
+    #[test]
+    fn one_account_wide_cause_raised_in_several_spaces_is_one_decision() {
+        let raise = |space: &str, who: &str, text: &str, detail: &str, options: Vec<Opt>| Raise {
+            space: Some(space.into()),
+            who: Some(Who { address: who.into(), name: who.into(), waiting: true, question_id: None }),
+            why: "money".into(),
+            text: text.into(),
+            detail: detail.into(),
+            options,
+        };
+        let first = (
+            "support-inbox-video",
+            "t1sv",
+            "GitHub didn't start the CI checks on eyzflow PR #991: the GitHub billing or Actions spending limit needs fixing.",
+            "The eyzflow session runs the same checks on this Mac meanwhile. GitHub's own checks won't run on the PRs until the billing or spending limit is fixed.",
+        );
+        let second = ("sooner-help-faqs", "t1nt", "GitHub Actions won't run eyzflow's CI: GitHub says recent payments failed or the spending limit needs raising. It's fixed in GitHub's Billing & plans; then the session re-runs verify on PR #990. The PR itself passes locally and was checked live on dev.", "");
+        let third = (
+            "eyzflow-colour-system",
+            "t1sx",
+            "GitHub Actions won't run for eyzhub: payments failed or the spending limit is reached, so PR #992's verify check (and every PR's since 19:32) never started. Settle it under the eyzhub organisation's Billing & plans, then I'll re-run the check.",
+            "The run's only message: 'The job was not started because recent account payments have failed or your spending limit needs to be increased.'",
+        );
+        let opts = || vec![Opt { label: "I fixed billing: re-run the check".into(), pick: true, text: "Billing is fixed: re-run your PR's checks.".into(), ..Default::default() }, Opt { label: "Leave it for now".into(), ..Default::default() }];
+        for (_, _, t, d) in [first, second, third] {
+            assert_eq!(account_cause(t, d).as_deref(), Some("github:billing"), "{t}");
+        }
+        // Raised now: one decision, every session on it, in the main queue.
+        let mut b = Book::default();
+        let a = b.raise(raise(first.0, first.1, first.2, first.3, vec![]), 1);
+        let c = b.raise(raise(second.0, second.1, second.2, second.3, vec![]), 2);
+        let e = b.raise(raise(third.0, third.1, third.2, third.3, opts()), 3);
+        assert!(a.fresh && !c.fresh && !e.fresh);
+        assert!(c.id == a.id && e.id == a.id);
+        assert_eq!(b.open.len(), 1);
+        let d = &b.open[0];
+        assert_eq!(d.sessions.iter().map(|w| w.address.as_str()).collect::<Vec<_>>(), ["t1sv", "t1nt", "t1sx"]);
+        assert_eq!((d.space.clone(), d.count, d.kind, d.options.len()), (None, 3, Kind::Choice, 2), "every space's, with the answers one of them offered");
+        // Its answer goes to every waiting session.
+        match act(d, &json!({ "choice": 0 }), true).unwrap() {
+            Act::Send { to, text, .. } => assert_eq!((to.len(), text.as_str()), (3, "Billing is fixed: re-run your PR's checks.")),
+            other => panic!("{other:?}"),
+        }
+        // Three cards from before (each under its own space's key): folded into the oldest when the tower loads.
+        let mut old = Book::default();
+        for (n, (sp, who, t, dt)) in [first, second, third].into_iter().enumerate() {
+            let d = Decision {
+                key: raise_key(Some(sp), t),
+                kind: if n == 2 { Kind::Choice } else { Kind::Raised },
+                space: Some(sp.into()),
+                sessions: vec![Who { address: who.into(), name: who.into(), waiting: true, question_id: None }],
+                title: t.into(),
+                detail: dt.into(),
+                why: "money".into(),
+                options: if n == 2 { opts() } else { vec![] },
+                first_ms: 10 + n as u64,
+                ..Default::default()
+            };
+            old.add(d, 10 + n as u64);
+        }
+        let keep = old.open[0].id.clone();
+        let folded = old.fold_account_wide(100);
+        assert_eq!(folded.len(), 1);
+        assert_eq!((folded[0].0.as_str(), folded[0].1.len()), (keep.as_str(), 2));
+        assert_eq!(old.open.len(), 1);
+        let k = &old.open[0];
+        assert_eq!((k.key.as_str(), k.space.clone(), k.sessions.len(), k.kind), ("account:github:billing", None, 3, Kind::Choice));
+        assert!(old.closed.iter().all(|c| c.state == State::Stopped && c.answer == format!("joined {keep}: the same account-wide cause")));
+        assert!(old.fold_account_wide(101).is_empty(), "once");
+        // A later raise of it, from yet another space, joins that one.
+        assert_eq!(old.raise(raise("kb-full-dump", "t1s4", "GitHub Actions jobs don't start: the eyzhub spending limit is reached", "", vec![]), 200).id, keep);
+        // Not account-wide: a billing feature, a page's own error, another cause of the same provider.
+        assert_eq!(account_cause("The Stripe billing portal shows the wrong currency on the invoices page", ""), None);
+        assert_eq!(account_cause("Billing actions in the dashboard need a design decision", ""), None);
+        assert_eq!(account_cause("The login form says the CSRF token is invalid", ""), None);
+        assert_eq!(account_cause("GitHub is down: githubstatus.com shows an incident for Actions", "").as_deref(), Some("github:outage"));
+        assert_eq!(account_cause("The Vercel token expired: deploys fail with 401", "").as_deref(), Some("vercel:token"));
+        let mut two = Book::default();
+        let x = two.raise(raise("a", "t1", "GitHub Actions jobs don't start: payments failed", "", vec![]), 1).id;
+        let y = two.raise(raise("b", "t2", "GitHub is down: githubstatus.com shows an incident", "", vec![]), 2).id;
+        let z = two.raise(raise("c", "t3", "Pick tabs or a sidebar for the settings page", "", vec![]), 3).id;
+        assert!(x != y && y != z && x != z, "another cause, and a space's own question, stay apart");
+    }
 
     #[test]
     fn an_answer_goes_only_where_it_means_what_the_card_showed() {
