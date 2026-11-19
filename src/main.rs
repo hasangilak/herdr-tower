@@ -1291,6 +1291,11 @@ fn run(cli: Cli) -> Result<()> {
                     Err(stop) => bail!("stopped at {stop}"),
                 };
             }
+            // Who answered a decision: the terminal this runs in (a session, a tower), else a shell.
+            let mut answers = answers;
+            if decision && let Some(o) = answers.as_object_mut() {
+                o.insert("by".into(), serde_json::json!(crate::peers::caller().map(|t| format!("terminal:{t}")).unwrap_or_else(|| "cli".into())));
+            }
             let v = answers::answer(&target, answers, !no_submit)?;
             if !decision {
                 println!("Answered{}.", if no_submit { " (filled in, not sent)" } else { "" });

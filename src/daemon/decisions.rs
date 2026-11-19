@@ -845,6 +845,10 @@ impl Decisions {
             Err(e) if d.kind == decisions::Kind::Merge => return Err(Refused::Merge(format!("{e:#}"))),
             Err(e) => return Err(Refused::Bad(format!("{e:#}"))),
         };
+        // Who answers it, as its sender says (the Mac, a phone, a terminal), kept on the card and in the record.
+        if let Some(by) = body.get("by").and_then(Value::as_str).filter(|b| !b.trim().is_empty()) {
+            self.change(|b, _| b.note_by(id, by));
+        }
         // An option by its number, from a sender that says what it showed there: still that one.
         if let (Some(n), Some(label)) = (body.get("choice").and_then(Value::as_u64), body.get("label").and_then(Value::as_str))
             && d.options.get(n as usize).is_some_and(|o| o.label.trim() != label.trim())
@@ -1134,7 +1138,7 @@ fn entry_of(d: &Decision) -> crate::history::Entry {
     // Blocked on what the tower couldn't read, and no longer: the user answered it in its terminal.
     let there = d.kind == decisions::Kind::Blocked && d.state == State::Answered;
     crate::history::Entry {
-        source: who.as_ref().filter(|_| there).map(|w| format!("terminal:{}", w.address)),
+        source: who.as_ref().filter(|_| there).map(|w| format!("terminal:{}", w.address)).or_else(|| Some(d.by.clone()).filter(|b| !b.is_empty())),
         kind: "decision".into(),
         id: Some(d.id.clone()),
         session: who.as_ref().map(|w| w.address.clone()),
