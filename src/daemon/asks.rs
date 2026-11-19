@@ -380,6 +380,9 @@ pub struct Asks {
     choices: Choices,
     /// Whether a message a brain passed on answers a session's question (`relayed`).
     relays: Relays,
+    /// Where a session's PR would go (`questions::open_pr_yes`): its
+    /// branch, its plan's base or dev, its default branch (tests give their own).
+    pr_place: PrPlaceOf,
     /// Answers a set the tower decided to answer itself (`auto_answer`,
     /// in a thread of its own); tests keep which ones it would have.
     answers: Auto,
@@ -387,6 +390,9 @@ pub struct Asks {
 
 /// How the tower goes on to answer a set it decided to answer itself.
 type Auto = Arc<dyn Fn(&Asks, &str) + Send + Sync>;
+
+/// Where a session's PR would go, read from its folder and its plan.
+type PrPlaceOf = Arc<dyn Fn(&QuestionSet) -> Option<questions::PrPlace> + Send + Sync>;
 
 /// Why the tower said yes itself to a prompt that only writes Claude's memory.
 pub const MEMORY_YES: &str = "it only writes Claude's own memory, notes or files in its own folder (a plain yes, this once)";
@@ -399,7 +405,9 @@ impl Asks {
                 eprintln!("[questions] the brain can't take it: {e:#}");
             }
         });
+        let plans = shared.clone();
         let me = Asks {
+            pr_place: Arc::new(move |set: &QuestionSet| pr_place_of(set, &plans.with(|s| s.plans_live.clone()))),
             inner: Arc::new(Mutex::new(Inner::default())),
             learning: Arc::new(Mutex::new((crate::scoring::Learned::default(), None))),
             store: None,
@@ -1267,8 +1275,8 @@ impl Asks {
         if set.kind == "text" && set.state.decision == Decision::Escalated && self.give_buttons(&set.id) {
             set = self.get(&set.id).unwrap_or(set);
         }
-        // Claude's own memory or notes: the tower's plain yes, nobody asked.
-        if note && self.memory_rule(&set) {
+        // Claude's own memory or notes, the session's own PR: the tower's yes, nobody asked.
+        if note && self.own_yes(&set) {
             return self.get(&set.id).unwrap_or(set);
         }
         if note {
@@ -1730,31 +1738,43 @@ impl Asks {
         Ok(set)
     }
 
-    /// A prompt that only writes Claude's own memory or notes
-    /// (`questions::memory_yes`): the tower answers its plain one-time yes
-    /// at once, without the brain and without the user (unless they asked
-    /// to decide everything). Whether it did.
-    fn memory_rule(&self, set: &QuestionSet) -> bool {
-        let Some(yes) = questions::memory_yes(set) else { return false };
+    /// What the tower answers itself, without the brain and without the
+    /// user (unless they asked to decide everything): a prompt that only
+    /// writes Claude's own memory or notes (`questions::memory_yes`, its
+    /// plain one-time yes), and the session opening its own PR, its branch
+    /// pushed for it (`questions::open_pr_yes`). Whether it did.
+    fn own_yes(&self, set: &QuestionSet) -> bool {
+        let Some(yes) = self.own_yes_of(set) else { return false };
         let decided = {
             let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if i.policy == "ask-everything" {
                 return false;
             }
             let Some(s) = i.sets.iter_mut().find(|s| s.id == set.id) else { return false };
-            let label = s.tabs.first().and_then(|t| t.options.get(yes)).map(|o| o.label.clone()).unwrap_or_default();
-            s.recommendations = Some(vec![questions::TabRecs { tab: 0, options: vec![questions::Rec { label, why: MEMORY_YES.into(), choice: json!(yes) }] }]);
+            s.recommendations = Some(vec![questions::TabRecs { tab: 0, options: vec![questions::Rec { label: yes.label.clone(), why: yes.why.clone(), choice: yes.choice.clone() }] }]);
             if card::apply(s, &Ev::Decide { auto: true }).is_err() {
                 return false;
             }
-            s.reason = MEMORY_YES.into();
+            s.reason = yes.why.clone();
             s.clone()
         };
-        eprintln!("[questions] {} ({}): {}; answering {:?}", decided.session, decided.id, MEMORY_YES, decided.tabs[0].options[yes].label);
+        eprintln!("[questions] {} ({}): {}; answering {:?}", decided.session, decided.id, yes.why, yes.label);
         self.publish();
         self.event("update", Some(&decided), &decided.id);
         (self.answers)(self, &decided.id);
         true
+    }
+
+    /// The tower's own yes to `set` (`own_yes`), when it has one.
+    fn own_yes_of(&self, set: &QuestionSet) -> Option<questions::RuleYes> {
+        if let Some(yes) = questions::memory_yes(set) {
+            let label = set.tabs.first().and_then(|t| t.options.get(yes)).map(|o| o.label.clone()).unwrap_or_default();
+            return Some(questions::RuleYes { label, choice: json!(yes), why: MEMORY_YES.into() });
+        }
+        if !questions::may_open_pr(set) {
+            return None;
+        }
+        (self.pr_place)(set).and_then(|at| questions::open_pr_yes(set, &at))
     }
 
     /// The tower answers it itself: recommendation 1 for every question, once,
@@ -1937,7 +1957,11 @@ impl Asks {
             return Err("you asked to decide everything yourself".into());
         }
         if let Some(why) = questions::must_escalate(now) {
-            return Err(why.into());
+            // The tower's own yes (the session's own PR) still holds on the screen as it is now: that yes only.
+            let own = self.own_yes_of(now).is_some_and(|y| matches!(answers, [a] if a.tab == 0 && a.choice == y.choice));
+            if !own {
+                return Err(why.into());
+            }
         }
         questions::safe_auto(now, answers).map(|(a, _)| a)
     }
@@ -2461,6 +2485,25 @@ fn thresholds() -> crate::scoring::Thresholds {
         return crate::scoring::Thresholds::default();
     }
     crate::config::Config::load().map(|c| c.scoring).unwrap_or_default()
+}
+
+/// Where a session's PR would go (`questions::PrPlace`), from its folder:
+/// its branch, its plan's base for the repository (`plans::planned_base`)
+/// else its dev branch on origin, and origin's default branch. None in tests,
+/// or without a branch and a base.
+fn pr_place_of(set: &QuestionSet, live: &[serde_json::Value]) -> Option<questions::PrPlace> {
+    let cwd = cwd_of(&set.session)?;
+    let git = |args: &[&str]| -> Option<String> {
+        let o = std::process::Command::new("git").arg("-C").arg(&cwd).args(args).output().ok()?;
+        let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        (o.status.success() && !out.is_empty()).then_some(out)
+    };
+    let branch = git(&["branch", "--show-current"])?;
+    let default = git(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).map(|d| d.trim_start_matches("origin/").to_string()).unwrap_or_default();
+    let repo = git(&["remote", "get-url", "origin"]).unwrap_or_default();
+    let planned = set.space.as_deref().and_then(|space| crate::plans::planned_base(live, space, &repo));
+    let base = planned.or_else(|| ["dev", "develop", "development"].iter().find(|b| git(&["rev-parse", "--verify", "-q", &format!("refs/remotes/origin/{b}")]).is_some()).map(|b| b.to_string()))?;
+    Some(questions::PrPlace { branch, base, default })
 }
 
 /// The folder a session works in (its risk floor's project), when Herdr says.
@@ -3456,6 +3499,77 @@ mod tests {
         assert_eq!(c.upsert(other).state.decision, Decision::Deciding);
         assert!(went.lock().unwrap().is_empty());
         assert_eq!(told(&brain, 1).len(), 1);
+    }
+
+    /// "Make the PR every time": a session asking to open its own PR into
+    /// dev (and push its branch for it), from a Bash prompt or at the end of
+    /// its turn, is answered by the tower at once, with no brain and no card;
+    /// a merge or a PR into main still goes to the user, whatever the brain says.
+    #[test]
+    fn opening_the_sessions_own_pr_into_dev_is_answered_by_the_tower_and_a_merge_or_main_escalates() {
+        let at = questions::PrPlace { branch: "feat/users-filter".into(), base: "dev".into(), default: "main".into() };
+        let wired = |policy: &str| {
+            let (mut a, brain) = asks();
+            let went = Arc::new(Mutex::new(vec![]));
+            let w = went.clone();
+            a.answers = Arc::new(move |_: &Asks, id: &str| w.lock().unwrap_or_else(|e| e.into_inner()).push(id.to_string()));
+            let place = at.clone();
+            a.pr_place = Arc::new(move |_: &QuestionSet| Some(place.clone()));
+            a.set_policy(policy);
+            (a, brain, went)
+        };
+        let bash = |session: &str, command: &str| {
+            let screen = fixture("claude-permission.txt").replace(" touch /tmp/qfix-perm-test\n╌", &format!(" {command}\n╌"));
+            questions::build(session, "storefront filter", false, &questions::parse_screen(&screen).unwrap(), None, "", "Add the users filter.")
+        };
+
+        // The Bash prompt: its plain yes, by the tower.
+        let (a, brain, went) = wired("normal");
+        let set = bash("t1qa", "git push -u origin feat/users-filter && gh pr create --base dev --fill");
+        let s = a.upsert(set.clone());
+        assert_eq!((s.state.decision, s.reason.clone()), (Decision::Auto, questions::pr_yes_why("dev")));
+        assert_eq!(s.recommendations.as_ref().unwrap()[0].options[0].choice, json!(0));
+        assert_eq!(*went.lock().unwrap(), [set.id.clone()], "the tower answers it");
+        assert!(told(&brain, 1).is_empty(), "the brain isn't asked");
+        // Checked on the screen again just before its keys go in: its Yes, never another.
+        let pick = |i: usize| vec![Answer { tab: 0, choice: json!(i), attachments: vec![] }];
+        assert_eq!(a.recheck(&set, &pick(0)).unwrap(), pick(0));
+        assert!(a.recheck(&set, &pick(1)).is_err());
+
+        // The end of a turn: the reply typed, naming dev.
+        let (a, brain, went) = wired("normal");
+        let turn = questions::text_set("t1qb", "storefront filter", "The filter works and its tests pass. Want me to push the branch and open a PR into dev?", "");
+        let s = a.upsert(turn.clone());
+        assert_eq!(s.state.decision, Decision::Auto);
+        assert_eq!(s.recommendations.as_ref().unwrap()[0].options[0].choice, json!({ "other": "Yes: push your branch and open the PR into dev. Don't merge it; the user merges." }));
+        assert_eq!(*went.lock().unwrap(), [turn.id.clone()]);
+        assert!(told(&brain, 1).is_empty());
+
+        // Asked to decide everything: the user's, as every other.
+        let (a, brain, went) = wired("ask-everything");
+        assert_eq!(a.upsert(bash("t1qc", "git push -u origin feat/users-filter && gh pr create --base dev --fill")).state.decision, Decision::Deciding);
+        assert!(went.lock().unwrap().is_empty());
+        assert_eq!(told(&brain, 1).len(), 1);
+
+        // A merge, a PR into main: the brain is told as before, and even its "auto" goes to the user.
+        let recs = json!([{"tab": 0, "options": [{"label": "Yes", "why": "routine", "choice": 0}]}]);
+        let said = questions::Said { risk: Some(crate::scoring::Risk::Low), confidence: Some(1.0), ..Default::default() };
+        for (i, cmd) in ["gh pr merge 12 --squash", "git push -u origin feat/users-filter && gh pr create --base main --fill", "git push origin dev"].iter().enumerate() {
+            let (a, brain, went) = wired("normal");
+            let set = bash(&format!("t1q{i}x"), cmd);
+            assert_eq!(a.upsert(set.clone()).state.decision, Decision::Deciding, "{cmd}");
+            assert_eq!(told(&brain, 1).len(), 1, "{cmd}");
+            let s = a.recommend_scored(&set.id, &recs, Some("auto"), "routine", false, &said).unwrap();
+            assert_eq!(s.decision.as_deref(), Some("escalate"), "{cmd}");
+            assert!(went.lock().unwrap().is_empty(), "{cmd}");
+        }
+        let (a, brain, went) = wired("normal");
+        let merge = questions::text_set("t1qd", "storefront filter", "Want me to open the PR into dev and merge it once CI passes?", "");
+        assert_eq!(a.upsert(merge.clone()).state.decision, Decision::Deciding);
+        assert_eq!(told(&brain, 1).len(), 1);
+        let text_recs = json!([{"question": "Open the PR and merge it?", "options": [{"label": "Yes", "why": "x", "choice": {"other": "Yes, open and merge it."}}]}]);
+        assert_eq!(a.recommend_scored(&merge.id, &text_recs, Some("auto"), "routine", false, &said).unwrap().decision.as_deref(), Some("escalate"));
+        assert!(went.lock().unwrap().is_empty());
     }
 
     /// A file prompt for a Claude folder (the memory edit through orca's
