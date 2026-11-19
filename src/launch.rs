@@ -884,7 +884,7 @@ pub fn open(p: &Plan, by: Option<&str>, each: &mut dyn FnMut(&Value)) -> Result<
     // One request: the whole ticket, under its title; each session's first task joins it.
     let agenda = match crate::protocol::is_running() {
         true => {
-            let cmd = crate::agenda::Cmd { action: "open".into(), text: p.ticket.clone(), title: crate::agenda::clip(&p.goal, 80), spaces: vec![p.space.clone()], ..Default::default() };
+            let cmd = crate::agenda::Cmd { action: "open".into(), text: p.ticket.clone(), title: crate::agenda::clip(&p.goal, 80), spaces: vec![p.space.clone()], ticket: true, ..Default::default() };
             match crate::agenda_do(&cmd) {
                 Ok(v) => v["id"].as_str().map(String::from),
                 Err(e) => {
