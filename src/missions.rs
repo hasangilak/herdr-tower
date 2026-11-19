@@ -886,29 +886,44 @@ pub fn review_in(s: &mut Spaces, name: &str, on: bool, now: u64) -> Value {
     brief(s, &key)
 }
 
-/// Sets a space's goal ("" clears it) and, when given, what counts as done,
-/// as `by` says who set it (`you`: by hand; else the tower's brain).
+/// The goal `tower space goal <space> [<goal>…]` was given: None when no
+/// word came after the space (it is read, never cleared: a tower that only
+/// looks at a goal leaves it as it is), `Some("")` for an explicit `""`.
+pub fn goal_words(text: &[String]) -> Option<String> {
+    (!text.is_empty()).then(|| text.join(" "))
+}
+
+/// Sets a space's goal (`Some("")` clears it; None leaves it) and, when
+/// given, what counts as done, as `by` says who set it (`you`: by hand; else
+/// the tower's brain). Neither given: the space as it is, nothing written.
 /// A closed space that gets a goal is open again.
-pub fn set_goal(space: &str, goal: &str, done_when: Option<&str>, by: Option<&str>) -> Result<Value> {
+pub fn set_goal(space: &str, goal: Option<&str>, done_when: Option<&str>, by: Option<&str>) -> Result<Value> {
     let name = spaces::pick(space)?;
+    if goal.is_none() && done_when.is_none() {
+        return Ok(brief(&spaces::load(), &name));
+    }
     let now = history::now_ms();
     let change = Change::by(by.map(str::trim).filter(|b| !b.is_empty()).unwrap_or("tower"));
-    let v = spaces::update(|s| goal_by(s, &name, Some(goal), done_when, &change, now));
+    let v = spaces::update(|s| goal_by(s, &name, goal, done_when, &change, now));
     poke();
     Ok(v)
 }
 
-/// `tower space goal <space> "<goal>" [--done-when "<…>"] [--by you]` (and `tower space agenda`).
-pub fn cmd_goal(space: String, goal: String, done_when: Option<String>, by: Option<String>) -> Result<()> {
-    let v = set_goal(&space, &goal, done_when.as_deref(), by.as_deref())?;
+/// `tower space goal <space> ["<goal>"] [--done-when "<…>"] [--by you]` (and
+/// `tower space agenda`): with neither, it prints the goal and its history.
+pub fn cmd_goal(space: String, goal: Option<String>, done_when: Option<String>, by: Option<String>) -> Result<()> {
+    let v = set_goal(&space, goal.as_deref(), done_when.as_deref(), by.as_deref())?;
     let name = v["space"].as_str().unwrap_or("");
+    let done = v["done_when"].as_str().filter(|d| !d.is_empty()).map(|d| format!(" Done when: {d}.")).unwrap_or_default();
     if !std::io::stdout().is_terminal() {
         println!("{}", serde_json::to_string_pretty(&v)?);
-    } else if goal.trim().is_empty() {
+    } else if goal.as_deref().is_some_and(|g| g.trim().is_empty()) {
         println!("{name}: goal cleared.");
     } else {
-        let done = v["done_when"].as_str().filter(|d| !d.is_empty()).map(|d| format!(" Done when: {d}.")).unwrap_or_default();
-        println!("{name}: {}.{done}", goal.trim().trim_end_matches('.'));
+        match v["goal"].as_str().map(|g| g.trim().trim_end_matches('.')).filter(|g| !g.is_empty()) {
+            Some(g) => println!("{name}: {g}.{done}"),
+            None => println!("{name}: no goal.{done}"),
+        }
     }
     Ok(())
 }
@@ -990,13 +1005,19 @@ pub fn set_report(space: &str, text: &str) -> Result<Value> {
         bail!("tower space report <space> \"<the closing report>\"");
     }
     let now = history::now_ms();
-    let v = spaces::update(|s| {
-        let m = s.missions.entry(name.clone()).or_insert_with(|| Mission::born(now));
-        (m.report, m.report_ms) = (text.clone(), now);
-        brief(s, &name)
-    });
+    let v = spaces::update(|s| report_in(s, &name, &text, now));
     poke();
     Ok(v)
+}
+
+/// A space's closing report written in `s`: its report and when, nothing
+/// else. Its goal, what counts as done, the goal's history and its state
+/// stay as they are (a ready space stays ready).
+pub fn report_in(s: &mut Spaces, name: &str, text: &str, now: u64) -> Value {
+    let key = of(s, name).map(|(k, _)| k.clone()).unwrap_or_else(|| name.trim().to_string());
+    let m = s.missions.entry(key.clone()).or_insert_with(|| Mission::born(now));
+    (m.report, m.report_ms) = (text.to_string(), now);
+    brief(s, &key)
 }
 
 /// `tower space report <space> "<text>"`.
@@ -1657,6 +1678,64 @@ mod tests {
 
     fn at(space: &str, f: Facts) -> BTreeMap<String, Facts> {
         BTreeMap::from([(space.to_string(), f)])
+    }
+
+    /// "sooner-help-faqs › bug-account-settings", 2026-11-19: ready, its goal grown
+    /// by a request, as its tower wrote the closing report and looked at the goal.
+    fn ready_space() -> (Spaces, String) {
+        let name = "sooner-help-faqs \u{203a} bug-account-settings".to_string();
+        let mut s = Spaces::default();
+        goal_by(&mut s, &name, Some("Fix: Account settings shows the newsletter toggle off for every viewer"), Some("The bug is fixed with a test"), &Change::by("launch"), 100);
+        let change = Change { by: "request".into(), request: "i dont see attach button on the chat input!".into(), why: "adds a separate chat input bug".into() };
+        let grown = goal_from_request(&mut s, &name, ("Fix: Account settings shows the newsletter toggle off for every viewer", "The bug is fixed with a test"), "Fix: Account settings shows the newsletter toggle off for every viewer; also fix missing attach button on the chat input", "The bug is fixed with a test; the attach button is visible on the chat input", &change, 200);
+        assert!(grown.is_some());
+        let done = Facts { finished_requests: 1, ..live(&["idle"]) };
+        assert_eq!(step(&mut s, &at(&name, done), 300, 24), [Effect::Ready(name.clone())]);
+        (s, name)
+    }
+
+    #[test]
+    fn writing_a_space_report_never_changes_its_goal_or_state() {
+        let (mut s, name) = ready_space();
+        let before = s.missions[&name].clone();
+        let goal = goal_of(&s, &name).to_string();
+        for (i, text) in ["The toggle fix is merged and deployed; nothing is left here.", "The toggle fix is merged; the missing attach button on the chat input, added to this goal later, is another repo's: reload the inbox."].iter().enumerate() {
+            let now = 400 + i as u64;
+            let v = report_in(&mut s, &name, text, now);
+            assert_eq!((v["goal"].as_str(), v["state"].as_str(), v["report"].as_str()), (Some(goal.as_str()), Some("ready"), Some(*text)));
+            assert_eq!(v["goal_history"].as_array().map(Vec::len), Some(2));
+            let m = &s.missions[&name];
+            assert_eq!(goal_of(&s, &name), goal);
+            assert_eq!((&m.done_when, &m.goals, m.state, m.ready_since_ms, m.goal_ms, m.goal_cleared), (&before.done_when, &before.goals, State::Ready, before.ready_since_ms, before.goal_ms, false));
+            assert_eq!((m.report.as_str(), m.report_ms), (*text, now));
+        }
+        // By its name in another case: the same space, not a second one.
+        report_in(&mut s, &name.to_uppercase(), "Done.", 500);
+        assert_eq!((s.missions.len(), s.missions[&name].report.as_str()), (1, "Done."));
+        // And the space stays ready on the next look.
+        assert!(step(&mut s, &at(&name, Facts { finished_requests: 1, ..live(&["idle"]) }), 600, 24).is_empty());
+        assert_eq!(s.missions[&name].state, State::Ready);
+    }
+
+    #[test]
+    fn looking_at_a_goal_never_clears_it() {
+        // t1pf's `tower space goal "<space>" | grep goal_history`: no goal given, so nothing is set.
+        assert_eq!(goal_words(&[]), None);
+        assert_eq!(goal_words(&["".to_string()]).as_deref(), Some(""), "an explicit \"\" still clears it");
+        assert_eq!(goal_words(&["Ship".to_string(), "it".to_string()]).as_deref(), Some("Ship it"));
+        let (mut s, name) = ready_space();
+        let before = (goal_of(&s, &name).to_string(), s.missions[&name].clone());
+        let v = goal_by(&mut s, &name, goal_words(&[]).as_deref(), None, &Change::by("tower"), 700);
+        assert_eq!((goal_of(&s, &name), &s.missions[&name]), (before.0.as_str(), &before.1));
+        assert_eq!(v["goal_history"].as_array().map(Vec::len), Some(2));
+        // Only what counts as done, given alone: the goal stays.
+        goal_by(&mut s, &name, None, Some("The bug is fixed with a test"), &Change::by("tower"), 800);
+        assert_eq!(goal_of(&s, &name), before.0);
+        // What it was before the fix: the goal and its history gone, and the ready space open again.
+        let (mut old, _) = ready_space();
+        goal_by(&mut old, &name, Some(""), None, &Change::by("tower"), 700);
+        assert!(goal_of(&old, &name).is_empty() && old.missions[&name].goals.is_empty());
+        assert_eq!(step(&mut old, &at(&name, Facts { finished_requests: 1, ..live(&["idle"]) }), 701, 24), [Effect::Reopened(name.clone())]);
     }
 
     #[test]

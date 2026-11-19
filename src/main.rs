@@ -1457,7 +1457,8 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Focus { space, clear } => spaces::cmd_focus(Some(space.join(" ")).filter(|s| !s.is_empty()), clear),
         Cmd::Space { what, space, text, done_when, by, force, dry_run } => match what.as_str() {
-            "goal" | "agenda" => missions::cmd_goal(space, text.join(" "), done_when, by),
+            // No goal given (`tower space goal <space>`): read, not cleared; `""` clears it.
+            "goal" | "agenda" => missions::cmd_goal(space, missions::goal_words(&text), done_when, by),
             "goal-request" => goals::cmd_request(&space, &text.join(" "), dry_run),
             // The space's name may be several words; `all`: every open space with no goal.
             "goal-backfill" => goals::cmd_backfill(&std::iter::once(space).chain(text).collect::<Vec<_>>().join(" "), dry_run),
