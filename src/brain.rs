@@ -686,7 +686,7 @@ mod tests {
         set_turn(own, Turn::of_prompt("[watch] t5 (app) is now done. You had asked it: x."));
         set_turn(main, Turn::of_prompt("[voice] what's left? [radar] t5 app: done"));
         assert_eq!(turn_of(own), Turn { watch: true, note: true, question: false, user: Some(false) });
-        assert_eq!(turn_of(main), Turn::default(), "the other brain's note doesn't make this one's turn a note");
+        assert_eq!(turn_of(main), Turn { user: Some(true), ..Turn::default() }, "the other brain's note doesn't make this one's turn a note: the user's words");
         set_turn(main, Turn::of_prompt("[question] t5 q1 {}"));
         assert_eq!((turn_of(main).question, turn_of(own).question), (true, false));
         set_turn(own, Turn::of_prompt("[session] From Shop › api (t5): the build is green"));
