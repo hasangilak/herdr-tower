@@ -928,11 +928,31 @@ impl Panel {
             if !rest.is_empty() {
                 items.push(bay_label(&rest_label(rest.len())).pt(px(6.0)).into_any_element());
             }
-            for r in rest {
+            // Grouped by space (in the queue's order within each), with a count, when they are from more than one.
+            let groups = by_space(&rest);
+            let grouped = groups.len() > 1;
+            for (space, group) in groups {
+                if grouped {
+                    let label = if space.is_empty() { "No space".to_string() } else { space.clone() };
+                    items.push(
+                        h_flex()
+                            .gap(px(6.0))
+                            .px(px(6.0))
+                            .pt(px(4.0))
+                            .text_size(px(12.0))
+                            .child(div().font_weight(FontWeight::SEMIBOLD).text_color(g.muted).child(label))
+                            .child(div().text_color(g.faint).child(format!("{}", group.len())))
+                            .into_any_element(),
+                    );
+                }
+            for r in group {
                 let id = r.id.clone();
                 let mut sub = vec![];
-                if !r.space.is_empty() {
+                if !r.space.is_empty() && !grouped {
                     sub.push(r.space.clone());
+                }
+                if r.count > 1 {
+                    sub.push(format!("asked {}×", r.count));
                 }
                 sub.push(r.stake().to_lowercase());
                 sub.push(r.waited(now));
@@ -958,6 +978,7 @@ impl Panel {
                         .on_click(cx.listener(move |this, _, _, cx| this.pick(&id, cx)))
                         .into_any_element(),
                 );
+            }
             }
         } else if items.is_empty() {
             items.push(empty_box(empty));
@@ -1606,5 +1627,33 @@ mod tests {
         assert_eq!(whereabouts(&d), "t3");
         d.sessions.clear();
         assert_eq!(whereabouts(&d), "");
+    }
+}
+
+
+/// The queue's other cards by space, each space where its first card is,
+/// the cards in the queue's order within it.
+pub(super) fn by_space<'a>(rest: &[&'a Decision]) -> Vec<(String, Vec<&'a Decision>)> {
+    let mut out: Vec<(String, Vec<&'a Decision>)> = vec![];
+    for d in rest {
+        match out.iter_mut().find(|(s, _)| s.eq_ignore_ascii_case(&d.space)) {
+            Some((_, g)) => g.push(d),
+            None => out.push((d.space.clone(), vec![*d])),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod queue_groups {
+    use super::*;
+
+    #[test]
+    fn the_rest_of_the_queue_is_grouped_by_space_in_its_order() {
+        let d = |id: &str, space: &str| Decision { id: id.into(), space: space.into(), ..Default::default() };
+        let (a, b, c, e) = (d("d1", "support"), d("d2", "notification-settings"), d("d3", "Support"), d("d4", ""));
+        let g = by_space(&[&a, &b, &c, &e]);
+        let shape: Vec<(String, Vec<String>)> = g.iter().map(|(s, l)| (s.clone(), l.iter().map(|x| x.id.clone()).collect())).collect();
+        assert_eq!(shape, [("support".to_string(), vec!["d1".to_string(), "d3".to_string()]), ("notification-settings".into(), vec!["d2".into()]), ("".into(), vec!["d4".into()])]);
     }
 }
