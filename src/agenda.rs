@@ -2756,11 +2756,14 @@ mod tests {
         assert_eq!((again.task.as_str(), again.how), (w.task.as_str(), "followup"));
         // skip: not registered.
         assert!(l.register(&Reg { tag: Tag { skip: true, ..Default::default() }, ..reg(7, "t1", "x") }, &heard, now).is_none());
-        // A request of the user's handed out into a space: that space, their words, when they asked (a space's goal follows it).
-        assert_eq!(l.request_in_space(&a, Some("Shop")), Some(("Shop".into(), "do A and B".into(), now - 60_000)));
+        // A request asked of the main tower, handed out into a space its words don't name: no goal there takes it.
+        assert_eq!(l.request_in_space(&a, Some("Shop")), None);
         assert_eq!(l.request_in_space(&a, None), None, "no space: nothing to follow");
-        let spaced = l.register(&Reg { tag: Tag { space: Some("Docs".into()), ..Default::default() }, ..reg(8, "t3", "do C") }, &heard, now).unwrap();
-        assert_eq!(l.request_in_space(&spaced, Some("Shop")).map(|r| r.0), Some("Docs".into()), "the task's own space first");
+        // Asked in a space: that space, their words, when they asked (its goal follows it); the task's own space first.
+        let mut d = Ledger::default();
+        let in_docs = Heard { text: "do C".into(), at_ms: now - 60_000, space: Some("Docs".into()) };
+        let spaced = d.register(&Reg { tag: Tag { space: Some("Docs".into()), ..Default::default() }, ..reg(8, "t3", "do C") }, &in_docs, now).unwrap();
+        assert_eq!(d.request_in_space(&spaced, Some("Shop")), Some(("Docs".into(), "do C".into(), now - 60_000)), "the task's own space first");
         // Work of the tower's own: none.
         assert_eq!(l.request_in_space(&t, Some("Shop")), None);
     }
