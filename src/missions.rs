@@ -2109,7 +2109,7 @@ mod tests {
         let mut l = Ledger::default();
         let reg = |l: &mut Ledger, agenda: &str, queue_id: u64, session: &str, space: &str| {
             let tag = Tag { agenda: Some(agenda.into()), title: format!("task {queue_id}"), space: Some(space.into()), ..Default::default() };
-            l.register(&Reg { queue_id, session: session.into(), name: session.into(), text: format!("do {queue_id}"), tag }, &Default::default(), now - HOUR).unwrap().task
+            l.register(&Reg { queue_id, session: session.into(), name: session.into(), text: format!("do {queue_id}"), tag, session_space: None }, &Default::default(), now - HOUR).unwrap().task
         };
         let a = l.open("Ship the new checkout with the redesigned payment step", "", "user", 0, &["Shop".to_string()], now - HOUR);
         let t1 = reg(&mut l, &a, 1, "t1", "Shop");
@@ -2142,7 +2142,7 @@ mod tests {
         let sessions = vec![seen(space, "t1q5", "idle"), seen(space, "t1q6", "idle")];
         let reg = |l: &mut Ledger, agenda: &str, queue_id: u64, session: &str, space: Option<&str>| {
             let tag = Tag { agenda: Some(agenda.into()), title: format!("task {queue_id}"), space: space.map(String::from), ..Default::default() };
-            l.register(&Reg { queue_id, session: session.into(), name: session.into(), text: format!("do {queue_id}"), tag }, &Default::default(), now - HOUR).unwrap().task
+            l.register(&Reg { queue_id, session: session.into(), name: session.into(), text: format!("do {queue_id}"), tag, session_space: None }, &Default::default(), now - HOUR).unwrap().task
         };
         // Its one request, done: on its own, ready.
         let mut l = Ledger::default();

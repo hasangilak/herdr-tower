@@ -976,7 +976,7 @@ impl Daemon {
                 if action == "start" {
                     return match self.sendq.add_start(&session, &text, &start, &after) {
                         Ok(id) => {
-                            let r = self.ledger(id, "", &session, &text, tag);
+                            let r = self.ledger(id, "", &session, &text, Self::brain_tag(from.as_deref(), tag));
                             Response { ok: true, error: None, state: Some(with_agenda(serde_json::json!({ "id": id, "name": session }), r)) }
                         }
                         Err(e) => Response::err(format!("{e:#}")),
@@ -1276,7 +1276,22 @@ impl Daemon {
         if queue_id == 0 {
             return None;
         }
-        self.agendas.register(crate::agenda::Reg { queue_id, session: session.into(), name: name.into(), text: text.into(), tag: tag.unwrap_or_default() })
+        self.agendas.register(crate::agenda::Reg { queue_id, session: session.into(), name: name.into(), text: text.into(), tag: tag.unwrap_or_default(), session_space: None })
+    }
+
+    /// Who ran it, when a brain did (`from`: its terminal): which brain, its
+    /// space, and whether it was on a note of the tower's rather than the
+    /// user's words (its latest prompt, as its hooks said: the user's come
+    /// in as `[voice] …`, the tower's notes as `[session] …`, `[agenda] …`).
+    fn brain_tag(from: Option<&str>, tag: Option<crate::agenda::Tag>) -> Option<crate::agenda::Tag> {
+        let Some(t) = from.map(str::trim).filter(|f| !f.is_empty()).and_then(crate::hc::get) else { return tag };
+        let Some(brain) = brain::brain_of(&t) else { return tag };
+        let mut tag = tag.unwrap_or_default();
+        tag.brain_space = brains::space_of(&brain).or_else(|| crate::spaces::space_of(&t).filter(|_| brain != brain::name()));
+        let address = t["address"].as_str().unwrap_or("");
+        tag.relay = sessions::registry().get(address).is_some_and(|s| crate::agenda::is_note(&s.prompt));
+        tag.brain = Some(brain.to_string());
+        Some(tag)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1291,7 +1306,7 @@ impl Daemon {
             "track" => match self.sendq.track(session, text) {
                 Ok(id) => {
                     let name = crate::hc::get(session).map(|t| crate::hc::spoken_name(&t)).unwrap_or_default();
-                    let r = self.ledger(id, session, &name, text, tag);
+                    let r = self.ledger(id, session, &name, text, Self::brain_tag(from, tag));
                     ok(with_agenda(serde_json::json!({ "id": id, "session": session }), r))
                 }
                 Err(e) => Response::err(format!("{e:#}")),
@@ -1365,7 +1380,7 @@ impl Daemon {
                         // More work for a session the tower just opened: its act is no longer undone lightly.
                         acts::given(&address, &text);
                         // A session's own (while the tower tells everything, a task): who sent it, so it is no request of the user's.
-                        let mut tag = tag.unwrap_or_default();
+                        let mut tag = Self::brain_tag(from, tag).unwrap_or_default();
                         tag.from = caller.as_ref().and_then(crate::peers::sender_of).map(|s| s.address);
                         let r = self.ledger(id, &address, &name, &text, Some(tag));
                         ok(with_agenda(v, r))

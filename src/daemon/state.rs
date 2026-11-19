@@ -53,6 +53,9 @@ pub struct State {
     /// What the tower last heard you say.
     pub heard: String,
     pub heard_ms: u64,
+    /// The space it was asked in (a space's view); None: of the main tower.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heard_space: Option<String>,
     /// A take dictated into the panel's draft (see `draft`): its final text,
     /// for the panel to keep in the input, not sent.
     pub dictated: String,
@@ -263,6 +266,7 @@ impl State {
             hearing: String::new(),
             heard: String::new(),
             heard_ms: 0,
+            heard_space: None,
             dictated: String::new(),
             dictated_ms: 0,
             said: String::new(),

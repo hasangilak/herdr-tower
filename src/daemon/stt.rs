@@ -306,6 +306,7 @@ pub fn deliver_to(shared: &Shared, mouth: &Mouth, text: &str, ack: Option<Durati
     shared.update(|s| {
         s.heard = text.to_string();
         s.heard_ms = now_ms();
+        s.heard_space = space.map(str::trim).filter(|x| !x.is_empty()).map(String::from);
         s.hearing.clear();
         s.error.clear();
     });

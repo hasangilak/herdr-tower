@@ -509,7 +509,7 @@ mod tests {
         let mut l = Ledger::default();
         let a = l.open("Ship the checkout", "", "user", 0, &["Shop".to_string()], now);
         let tag = Tag { agenda: Some(a), space: Some("Shop".into()), ..Default::default() };
-        let task = l.register(&Reg { queue_id: 1, session: "t1".into(), name: "web".into(), text: "ship it".into(), tag }, &Default::default(), now).unwrap().task;
+        let task = l.register(&Reg { queue_id: 1, session: "t1".into(), name: "web".into(), text: "ship it".into(), tag, session_space: None }, &Default::default(), now).unwrap().task;
         let (m, shared, ui, told) = missions("ready", &l);
         spaces::update_in(&ui, |s| {
             s.agendas.insert("Shop".into(), "Ship the checkout".into());
