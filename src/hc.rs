@@ -305,12 +305,34 @@ pub fn block_kind(t: &Value) -> BlockKind {
 
 /// The agent status word a terminal reports (`idle`, `working`, `blocked`,
 /// `done`, `error`), or None for a plain program.
+///
+/// A Claude Code session whose turn is over but that left a background
+/// shell running stays `working` in Herdr for as long as the shell runs (a
+/// dev server: for hours), its status line saying "1 shell still running".
+/// That is a finished turn at its prompt: `done`, so its turn's end is
+/// looked at, its PRs found, and what waits in the queue goes in.
 pub fn status_word(t: &Value) -> Option<String> {
     match &t["status"] {
         Value::String(s) => Some(s.clone()),
-        Value::Object(o) => o.get("state").and_then(Value::as_str).map(String::from),
+        Value::Object(o) => {
+            let state = o.get("state").and_then(Value::as_str)?;
+            let msg = o.get("msg").and_then(Value::as_str).unwrap_or("");
+            Some(if state == "working" && background_only(msg) { "done".into() } else { state.into() })
+        }
         _ => None,
     }
+}
+
+/// Claude Code's line for a turn that is over with background work left
+/// ("1 shell still running", "2 shells still running", "1 background task
+/// still running"): nothing of the turn itself is working.
+pub fn background_only(msg: &str) -> bool {
+    let low = msg.trim().trim_end_matches('.').to_lowercase();
+    let Some(rest) = low.strip_suffix(" still running") else { return false };
+    let mut words = rest.split_whitespace();
+    let count = words.next().is_some_and(|n| n.parse::<u32>().is_ok_and(|n| n > 0));
+    let what: Vec<&str> = words.collect();
+    count && matches!(what.as_slice(), ["shell" | "shells"] | ["background", "task" | "tasks" | "shell" | "shells"] | ["task" | "tasks"])
 }
 
 /// The program that reported the status (`claude-code`, `codex`, ...).
@@ -398,6 +420,22 @@ pub fn clean(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_turn_over_with_a_shell_left_running_is_done() {
+        let t = |state: &str, msg: &str| serde_json::json!({ "status": { "app": "claude-code", "state": state, "msg": msg } });
+        // As Herdr says it for a session whose dev server runs in the background (t1mv, 19 Nov: "working" for half an hour).
+        assert_eq!(status(&t("working", "1 shell still running")), SessionStatus::Done);
+        assert_eq!(status(&t("working", "2 shells still running")), SessionStatus::Done);
+        assert_eq!(status(&t("working", "1 background task still running")), SessionStatus::Done);
+        // At work: its own activity line.
+        assert_eq!(status(&t("working", "Running m=$(gh pr view 963 --json mergedAt -q…")), SessionStatus::Working);
+        assert_eq!(status(&t("working", "Checks are still running")), SessionStatus::Working);
+        assert_eq!(status(&t("working", "")), SessionStatus::Working);
+        // Only a working one: blocked on a dialog stays blocked.
+        assert_eq!(status(&t("blocked", "1 shell still running")), SessionStatus::Blocked);
+        assert_eq!(status(&serde_json::json!({ "status": "working" })), SessionStatus::Working);
+    }
 
     #[test]
     fn one_vocabulary_for_a_session() {

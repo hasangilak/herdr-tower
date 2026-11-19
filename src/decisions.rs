@@ -498,6 +498,9 @@ impl Decision {
             "last_ms": self.last_ms,
             "count": self.count,
             "state": self.state.word(),
+            // Once it is over: what it was answered with (or why it ended), and when.
+            "answer": Some(self.answer.as_str()).filter(|a| !a.is_empty()),
+            "closed_ms": self.closed_ms,
             "muted": muted,
             "hold": self.hold.as_ref().map(|h| json!({ "reason": h.reason, "by": h.by, "since_ms": h.since_ms, "until_prs": h.until_prs })),
             "back": self.back.as_ref().map(|b| json!({ "why": b.why, "at_ms": b.at_ms })),
@@ -508,8 +511,14 @@ impl Decision {
     pub fn row(&self) -> String {
         let who: Vec<&str> = self.sessions.iter().map(|w| if w.name.is_empty() { w.address.as_str() } else { w.name.as_str() }).collect();
         let pick = self.pick().map(|o| format!("  (pick: {})", o.label)).unwrap_or_default();
+        // One that is over: how, and with what.
+        let over = match (self.closed_ms, self.answer.trim()) {
+            (Some(_), "") => format!("  -> {}", self.state.word()),
+            (Some(_), a) => format!("  -> {}: {}", self.state.word(), clip(a, 80)),
+            _ => String::new(),
+        };
         format!(
-            "{}  {:<10} {:<16} {} waiting, {}  {}{}{}",
+            "{}  {:<10} {:<16} {} waiting, {}  {}{}{}{over}",
             self.id,
             self.kind.word(),
             clip(self.space.as_deref().unwrap_or("-"), 16),
@@ -870,6 +879,56 @@ pub fn options_from(v: &Value) -> Result<Vec<Opt>> {
 }
 
 /// The PR numbers a line names (`#42`, `PR 42`).
+/// The PR a merge raise is about.
+#[derive(Debug, Clone, PartialEq)]
+enum Subject {
+    /// Linked (`github.com/<owner>/<repo>/pull/<n>`): their keys.
+    Keys(Vec<String>),
+    /// Only by number: the first one its line names.
+    Number(u64),
+    None,
+}
+
+/// What a merge raise is about: the PRs its line links to, else the first
+/// link in its detail, else the first number its line names ("MediaRoom PR
+/// #1578 into dev …"). A number it names after that is another's ("…, after
+/// MediaRoom #1578").
+fn merge_subject(text: &str, detail: &str) -> Subject {
+    let keys: Vec<String> = merge_links(text, detail).into_iter().map(|(r, n)| crate::prs::key(&r, n)).collect();
+    if !keys.is_empty() {
+        return Subject::Keys(keys);
+    }
+    pr_numbers(text).first().map_or(Subject::None, |n| Subject::Number(*n))
+}
+
+/// The PRs a merge raise links to as its own (`merge_subject`), as (repo, number).
+pub fn merge_links(text: &str, detail: &str) -> Vec<(String, u64)> {
+    let in_line = crate::prs::links(text);
+    if !in_line.is_empty() {
+        return in_line;
+    }
+    crate::prs::links(detail).into_iter().take(1).collect()
+}
+
+/// The tracked PR a merge raise is about (`merge_subject`): by its link,
+/// or by its number among its sessions' PRs, else its space's, when only
+/// one there has it.
+fn raised_pr<'a>(d: &Decision, prs: &'a [Pr]) -> Option<&'a Pr> {
+    match merge_subject(&d.title, &d.detail) {
+        Subject::Keys(keys) => keys.iter().find_map(|k| prs.iter().find(|p| p.key().eq_ignore_ascii_case(k))),
+        Subject::Number(n) => {
+            let with: Vec<&Pr> = prs.iter().filter(|p| p.number == n).collect();
+            let mine: Vec<&&Pr> = with.iter().filter(|p| d.sessions.iter().any(|w| w.address == p.session)).collect();
+            let near: Vec<&&Pr> = with.iter().filter(|p| space_part(p.space.as_deref()) == space_part(d.space.as_deref()) && d.space.is_some()).collect();
+            match (mine.as_slice(), near.as_slice()) {
+                ([one], _) | ([], [one]) => Some(**one),
+                _ => None,
+            }
+        }
+        Subject::None => None,
+    }
+}
+
 pub(crate) fn pr_numbers(text: &str) -> Vec<u64> {
     let low = text.to_lowercase();
     let mut out = vec![];
@@ -1154,9 +1213,45 @@ impl Book {
         for (id, state) in over {
             ch.closed.extend(if state == State::Answered { self.answered(&id, "merged", now) } else { self.close(&id, state, now) });
         }
+        self.settle_merge_raises(prs, now, &mut ch);
         // What a decision on hold waits for merged: it comes back.
         self.wake_on_merged(prs, now);
         ch
+    }
+
+    /// Merge raises (`tower raise --why merge`) about a PR the tower
+    /// tracks: one whose PR merged or closed is over with it, and one whose
+    /// PR has its merge card now goes into that card (its words become the
+    /// card's detail when it has none), so the user answers the merge
+    /// itself, once (19 Nov: #115 and #116 each had a raise and a merge
+    /// card, and #116's raise stayed after the user merged it).
+    fn settle_merge_raises(&mut self, prs: &[Pr], now: u64, ch: &mut Changes) {
+        let mut over: Vec<(String, State, String, Option<String>)> = vec![];
+        for d in self.open.iter().filter(|d| d.kind == Kind::Raised && d.why.trim().eq_ignore_ascii_case("merge")) {
+            let Some(p) = raised_pr(d, prs) else { continue };
+            if p.state == "merged" {
+                over.push((d.id.clone(), State::Answered, "merged".into(), None));
+            } else if !p.open() {
+                over.push((d.id.clone(), State::Stopped, "its PR was closed".into(), None));
+            } else if let Some(m) = self.open.iter().find(|m| m.kind == Kind::Merge && m.prs.iter().any(|r| r.key.eq_ignore_ascii_case(&p.key()))) {
+                over.push((d.id.clone(), State::Stopped, format!("in the merge card {}", m.id), Some(m.id.clone())));
+            }
+        }
+        for (id, state, why, into) in over {
+            let said = self.open.iter().find(|d| d.id == id).map(|d| if d.detail.trim().is_empty() { d.title.clone() } else { d.detail.clone() });
+            if let (Some(into), Some(said)) = (into, said)
+                && let Some(m) = self.open.iter_mut().find(|m| m.id == into)
+                && m.detail.trim().is_empty()
+            {
+                m.detail = said;
+            }
+            if self.close(&id, state, now).is_some()
+                && let Some(d) = self.closed.iter_mut().rev().find(|c| c.id == id)
+            {
+                d.answer = why;
+                ch.closed.push(d.clone());
+            }
+        }
     }
 
     /// An open decision about the same thing as a raise, under another key:
@@ -1168,11 +1263,16 @@ impl Book {
         let same_space = |d: &Decision| space_part(d.space.as_deref()) == space_part(r.space.as_deref());
         match why.as_str() {
             "merge" => {
-                let named = pr_numbers(&r.text);
+                // Its own PR, not one it only names ("after MediaRoom #1578"): another's card is another merge.
+                let subject = merge_subject(&r.text, &r.detail);
                 self.open.iter().position(|d| {
                     d.kind == Kind::Merge
                         && same_space(d)
-                        && if named.is_empty() { about(d) } else { d.prs.iter().any(|p| named.contains(&p.number)) }
+                        && match &subject {
+                            Subject::Keys(keys) => d.prs.iter().any(|p| keys.iter().any(|k| k.eq_ignore_ascii_case(&p.key))),
+                            Subject::Number(n) => d.prs.iter().any(|p| p.number == *n),
+                            Subject::None => about(d),
+                        }
                 })
             }
             "waiting" | "blocked" | "question" => self.open.iter().position(|d| (d.kind.asks() || d.kind == Kind::Blocked) && about(d)),
@@ -1286,8 +1386,10 @@ impl Book {
                 d.options = r.options;
                 d.kind = Kind::Choice;
             }
-            // Raised again with more to read: the card shows it (a question's or a merge's own stays).
-            if matches!(d.kind, Kind::Raised | Kind::Choice) && !r.detail.trim().is_empty() {
+            // Raised again with more to read: the card shows it (a question's or a merge's own stays,
+            // but a merge card with nothing to read takes what its session says of it).
+            let reads = matches!(d.kind, Kind::Raised | Kind::Choice) || (d.kind == Kind::Merge && d.detail.trim().is_empty());
+            if reads && !r.detail.trim().is_empty() {
                 d.detail = detail_cut(&r.detail, false);
             }
             return Raised { id: d.id.clone(), fresh: false, folded: by_key.is_none(), count: d.count, waiting: d.waiting() };
@@ -2915,5 +3017,128 @@ mod tests {
         // Nothing waits any more: it stops.
         assert_eq!(b.accounts_out(None, 3), None);
         assert!(!b.open.iter().any(|d| d.key == ACCOUNTS_KEY));
+    }
+
+    // ---- 19 Nov, support-chat-attachments: merge raises and the tower's own merge cards ----
+
+    const SPACE: &str = "support-chat-attachments";
+    const BUG_SPACE: &str = "support-chat-attachments › bug-18-tests";
+
+    fn their_pr(repo: &str, n: u64, session: &str, space: &str) -> Pr {
+        Pr { repo: repo.into(), ..pr(n, "dev", session, space, "passing") }
+    }
+
+    fn merge_raise(space: &str, session: &str, text: &str, detail: &str) -> Raise {
+        Raise { space: Some(space.into()), who: who(session), why: "merge".into(), text: text.into(), detail: detail.into(), options: vec![] }
+    }
+
+    /// t1mv raised "#1578 waits for your merge" twice while the tower had no
+    /// merge card for it (its turn ends never registered). Once the PR is
+    /// tracked, its merge card is what the user answers: the raise goes into
+    /// it (its words as the card's detail), and a raise again joins it.
+    #[test]
+    fn a_merge_raise_goes_into_its_prs_merge_card() {
+        let mut b = Book::default();
+        let link = "https://github.com/eyzhub/eyz-mediaroom-serverless/pull/1578 into dev. Adds a staff upload route.";
+        let line = "MediaRoom PR #1578 into dev waits for your merge: support staff can attach pictures and PDFs to replies.";
+        let r = b.raise(merge_raise(SPACE, "t1mv", line, link), MIN);
+        assert!(r.fresh);
+        // The PR is tracked now: its merge card comes, and the raise is in it.
+        let prs = vec![their_pr("eyzhub/eyz-mediaroom-serverless", 1578, "t1mv", SPACE)];
+        let ch = b.sync_merges(&prs, 2 * MIN);
+        assert_eq!(ch.fresh.len(), 1, "the tower's own merge card");
+        let merge = b.find(&ch.fresh[0]).unwrap().clone();
+        assert_eq!(merge.kind, Kind::Merge);
+        assert_eq!(merge.detail, link, "what the session said of it, on the card the user merges from");
+        let raised = b.closed.iter().find(|d| d.id == r.id).expect("the raise is over");
+        assert_eq!((raised.state, raised.answer.clone()), (State::Stopped, format!("in the merge card {}", merge.id)));
+        assert!(ch.closed.iter().any(|d| d.id == r.id));
+        // Raised once more (the session didn't hear back): the same merge card, not a third card.
+        let again = b.raise(merge_raise(SPACE, "t1mv", "MediaRoom PR #1578 into dev waits for your merge. A customer is waiting on it.", link), 3 * MIN);
+        assert_eq!((again.id.clone(), again.fresh, again.folded), (merge.id.clone(), false, true));
+        assert_eq!(b.open.len(), 1);
+        // A raise without a link, by its number among its session's PRs, the same.
+        b.sync_merges(&prs, 4 * MIN);
+        let bare = b.raise(merge_raise(SPACE, "t1mv", "PR #1578 still waits for your merge", ""), 5 * MIN);
+        assert_eq!(bare.id, merge.id);
+    }
+
+    /// #116: t1mz raised its merge before its review was done (no merge card
+    /// yet); the user merged it from the phone, the merge card closed, and
+    /// the raise stayed until the session dismissed it itself.
+    #[test]
+    fn a_merge_raise_ends_when_its_pr_merges() {
+        let mut b = Book::default();
+        let r = b.raise(
+            merge_raise(SPACE, "t1mz", "Sooner PR #116 into entitlment waits for your merge", "https://github.com/eyzhub/sooner-app-web/pull/116 into entitlment."),
+            MIN,
+        );
+        // Still under review: no merge card, and the raise stays.
+        let mut p = their_pr("eyzhub/sooner-app-web", 116, "t1mz", SPACE);
+        p.review = Some(crate::reviews::Brief { status: "reviewing".into(), ..Default::default() });
+        assert!(b.sync_merges(std::slice::from_ref(&p), 2 * MIN).fresh.is_empty());
+        assert!(b.find(&r.id).is_some_and(|d| d.closed_ms.is_none()));
+        // Merged: the raise is over with it, answered "merged" as a merge card is.
+        p.state = "merged".into();
+        let ch = b.sync_merges(&[p.clone()], 3 * MIN);
+        let raised = b.closed.iter().find(|d| d.id == r.id).expect("over");
+        assert_eq!((raised.state, raised.answer.as_str()), (State::Answered, "merged"));
+        assert!(ch.closed.iter().any(|d| d.id == r.id));
+        // One closed without a merge: over as stopped.
+        let r2 = b.raise(merge_raise(SPACE, "t1mz", "PR #117 waits for your merge", "https://github.com/eyzhub/sooner-app-web/pull/117"), 4 * MIN);
+        let closed = Pr { state: "closed".into(), ..their_pr("eyzhub/sooner-app-web", 117, "t1mz", SPACE) };
+        b.sync_merges(&[p, closed], 5 * MIN);
+        assert_eq!(b.closed.iter().find(|d| d.id == r2.id).map(|d| d.state), Some(State::Stopped));
+    }
+
+    /// #962's raise names #1578 too ("after MediaRoom #1578"): it is eyzflow's
+    /// own merge, never folded into MediaRoom's card, with or without a link.
+    #[test]
+    fn a_merge_raise_naming_another_pr_is_its_own() {
+        let mut b = Book::default();
+        let prs = vec![their_pr("eyzhub/eyz-mediaroom-serverless", 1578, "t1mv", SPACE)];
+        let merge = b.sync_merges(&prs, MIN).fresh[0].clone();
+        let line = "eyzflow PR #962 into dev waits for your merge, after MediaRoom #1578: the paperclip in the support inbox.";
+        let linked = b.raise(merge_raise(SPACE, "t1n0", line, "https://github.com/eyzhub/eyzflow/pull/962 into dev. Merge #1578 first."), 2 * MIN);
+        assert!(linked.fresh && linked.id != merge, "its own card");
+        let bare = b.raise(merge_raise(SPACE, "t1n0", "eyzflow #962 waits for your merge, after #1578", ""), 3 * MIN);
+        assert!(bare.fresh && bare.id != merge && bare.id != linked.id);
+        // And MediaRoom's card settles nothing of eyzflow's.
+        b.sync_merges(&prs, 4 * MIN);
+        assert!(b.open.iter().any(|d| d.id == linked.id) && b.open.iter().any(|d| d.id == bare.id));
+    }
+
+    /// The report's second worry: a space named after another plus " › …"
+    /// (a bug spun out of it) is another space. #115's raise there and
+    /// #1578's here are two cards, and answering one leaves the other.
+    #[test]
+    fn a_spun_out_space_is_never_its_sources_decision() {
+        let mut b = Book::default();
+        let mediaroom = b.raise(merge_raise(SPACE, "t1mv", "MediaRoom PR #1578 into dev waits for your merge", "https://github.com/eyzhub/eyz-mediaroom-serverless/pull/1578"), MIN);
+        let sooner = b.raise(merge_raise(BUG_SPACE, "t1n4", "PR #115 in sooner-app-web, into entitlment, waits for your merge", "PR https://github.com/eyzhub/sooner-app-web/pull/115"), 2 * MIN);
+        assert_ne!(mediaroom.id, sooner.id);
+        assert_ne!(raise_key(Some(SPACE), "x"), raise_key(Some(BUG_SPACE), "x"));
+        let answered = b.answered(&sooner.id, "go ahead", 3 * MIN).unwrap();
+        assert_eq!(answered.sessions.iter().map(|w| w.address.as_str()).collect::<Vec<_>>(), ["t1n4"], "the answer is t1n4's only");
+        assert!(b.open.iter().any(|d| d.id == mediaroom.id), "#1578's card stays");
+        // The same number in both spaces: each raise is its own space's, and so is each merge card.
+        let prs = vec![their_pr("eyzhub/sooner-app-web", 115, "t1n4", BUG_SPACE)];
+        let card = b.sync_merges(&prs, 4 * MIN).fresh[0].clone();
+        let here = b.raise(merge_raise(SPACE, "t1mz", "PR #115 waits for your merge", ""), 5 * MIN);
+        assert!(here.fresh && here.id != card, "a raise here is not the bug space's merge card");
+    }
+
+    /// `tower decisions --all` said `answer: null` for cards answered "go
+    /// ahead": a closed one says what it was answered with, and when.
+    #[test]
+    fn a_closed_decision_says_how_it_ended() {
+        let mut b = Book::default();
+        let r = b.raise(merge_raise(SPACE, "t1mv", "MediaRoom PR #1578 into dev waits for your merge", ""), MIN);
+        let open = b.find(&r.id).unwrap().view(false);
+        assert_eq!((open["answer"].clone(), open["closed_ms"].clone()), (Value::Null, Value::Null));
+        let d = b.answered(&r.id, "go ahead", 2 * MIN).unwrap();
+        let v = d.view(false);
+        assert_eq!((v["state"].as_str(), v["answer"].as_str(), v["closed_ms"].as_u64()), (Some("answered"), Some("go ahead"), Some(2 * MIN)));
+        assert!(d.row().ends_with("-> answered: go ahead"), "{}", d.row());
     }
 }
