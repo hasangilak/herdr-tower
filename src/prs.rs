@@ -51,6 +51,60 @@ pub struct Checks {
     pub pending: Vec<String>,
     pub passed: usize,
     pub total: usize,
+    /// Checks of workflows the repo has switched off (`gh workflow disable`):
+    /// not counted, whatever their last run says (by name).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub off: Vec<String>,
+}
+
+/// The `gh` the tower asks about a repo's workflows (the real tower's: set by `Prs::at`).
+static GH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// What each repo's switched-off workflows are, and when that was read.
+static DISABLED: Mutex<BTreeMap<String, (u64, Vec<String>)>> = Mutex::new(BTreeMap::new());
+
+/// How long what a repo's workflows are is believed.
+const WORKFLOWS_MS: u64 = 5 * 60_000;
+
+/// The workflows `repo` has switched off (`gh api repos/<repo>/actions/workflows`:
+/// state `disabled_manually`, `disabled_inactivity`), by name, read again every
+/// few minutes. Their runs are no check of its PRs. None known: none. (Tests
+/// never ask GitHub: they say what they need with `set_disabled_workflows`.)
+pub fn disabled_workflows(repo: &str) -> Vec<String> {
+    let repo = repo.trim();
+    if repo.is_empty() {
+        return vec![];
+    }
+    let now = crate::history::now_ms();
+    if let Some((at, names)) = DISABLED.lock().unwrap_or_else(|e| e.into_inner()).get(repo)
+        && (cfg!(test) || now.saturating_sub(*at) < WORKFLOWS_MS)
+    {
+        return names.clone();
+    }
+    let Some(gh) = GH.get().filter(|_| !cfg!(test)) else { return vec![] };
+    let names: Vec<String> = std::process::Command::new(gh)
+        .args(["api", &format!("repos/{repo}/actions/workflows?per_page=100")])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
+        .map(|v| {
+            v["workflows"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|w| w["state"].as_str().is_some_and(|s| s.starts_with("disabled")))
+                .filter_map(|w| w["name"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    DISABLED.lock().unwrap_or_else(|e| e.into_inner()).insert(repo.to_string(), (now, names.clone()));
+    names
+}
+
+#[cfg(test)]
+pub fn set_disabled_workflows(repo: &str, names: &[&str]) {
+    DISABLED.lock().unwrap_or_else(|e| e.into_inner()).insert(repo.to_string(), (0, names.iter().map(|n| n.to_string()).collect()));
 }
 
 /// A low-risk PR into dev that no plan predicted, its session asked nothing
@@ -193,12 +247,14 @@ impl Pr {
     /// Its checks in a few words: "checks passing", "1 check failing: lint".
     pub fn checks_line(&self) -> String {
         let c = &self.checks;
-        match c.state.as_str() {
+        let line: String = match c.state.as_str() {
             "failing" => format!("{} check{} failing: {}", c.failing.len(), if c.failing.len() == 1 { "" } else { "s" }, c.failing.join(", ")),
             "pending" => format!("checks running ({} of {} done)", c.total - c.pending.len(), c.total),
             "passing" => "checks passing".into(),
             _ => "no checks".into(),
-        }
+        };
+        // A workflow switched off in the repo: said, so its absence reads as meant.
+        if c.off.is_empty() { line } else { format!("{line} ({} switched off, not counted)", c.off.join(", ")) }
     }
 }
 
@@ -433,7 +489,8 @@ pub fn apply_gh(pr: &mut Pr, v: &Value) {
     if let Some(c) = v["mergeCommit"]["oid"].as_str().filter(|c| !c.is_empty()) {
         pr.merge_commit = c.to_string();
     }
-    pr.checks = rollup(&v["statusCheckRollup"]);
+    // A workflow the repo switched off: its runs (an old failure among them) are no check of the PR.
+    pr.checks = rollup_without(&v["statusCheckRollup"], &disabled_workflows(&pr.repo));
     if let Some(b) = v.get("body").and_then(Value::as_str) {
         pr.body = Some(b.trim().to_string());
     }
@@ -441,9 +498,22 @@ pub fn apply_gh(pr: &mut Pr, v: &Value) {
 
 /// The checks, the latest run of each (a check re-run after failing counts as its last run).
 pub fn rollup(v: &Value) -> Checks {
+    rollup_without(v, &[])
+}
+
+/// `rollup`, leaving out the runs of the workflows in `off` (switched off in
+/// the repo: `disabled_workflows`), which `Checks::off` names.
+pub fn rollup_without(v: &Value, off: &[String]) -> Checks {
     // name → (when, outcome): outcome 0 passed, 1 pending, 2 failed.
     let mut latest: BTreeMap<String, (String, u8)> = BTreeMap::new();
+    let mut skipped: Vec<String> = vec![];
     for c in v.as_array().into_iter().flatten() {
+        if let Some(w) = c["workflowName"].as_str().filter(|w| off.iter().any(|o| o.eq_ignore_ascii_case(w))) {
+            if !skipped.iter().any(|s| s == w) {
+                skipped.push(w.to_string());
+            }
+            continue;
+        }
         let (name, when, outcome) = if c["__typename"] == "StatusContext" || c.get("context").is_some() {
             let outcome = match c["state"].as_str().unwrap_or("") {
                 "SUCCESS" => 0,
@@ -476,7 +546,7 @@ pub fn rollup(v: &Value) -> Checks {
             }
         }
     }
-    let mut c = Checks { total: latest.len(), ..Default::default() };
+    let mut c = Checks { total: latest.len(), off: skipped, ..Default::default() };
     for (name, (_, o)) in latest {
         match o {
             0 => c.passed += 1,
@@ -820,6 +890,8 @@ pub fn next_check(pr: &Pr) -> Option<u64> {
 
 impl Prs {
     pub fn at(path: PathBuf, gh: PathBuf) -> Prs {
+        // The first one's (the daemon's): what workflows a repo switched off is asked with it.
+        let _ = GH.set(gh.clone());
         let f: File = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
         Prs {
             path,
@@ -1507,6 +1579,48 @@ pub(crate) mod tests {
             "number": 12, "title": "release: tickets", "url": "https://github.com/o/app/pull/12", "state": state, "isDraft": false,
             "mergeable": mergeable, "baseRefName": "main", "headRefName": "dev", "headRefOid": "abc123", "statusCheckRollup": checks,
         })
+    }
+
+    /// eyzflow's Verify workflow is switched off (by the user's word, `gh
+    /// workflow disable`), but PRs #990-#993 still carry its runs that failed
+    /// in the billing outage. A switched-off workflow's runs are no check of a
+    /// PR: not failing, not missing, nothing that holds its merge. In a repo
+    /// where Verify runs, its failure still counts.
+    #[test]
+    fn a_switched_off_workflows_runs_are_no_check_of_a_pr() {
+        let run = |workflow: &str, name: &str, conclusion: &str| json!({"__typename":"CheckRun","name":name,"workflowName":workflow,"status":"COMPLETED","conclusion":conclusion,"startedAt":"2026-11-19T18:33:00Z"});
+        let rollup993 = json!([
+            run("Verify", "verify", "FAILURE"),
+            {"__typename":"StatusContext","context":"Vercel – eyzflow","state":"SUCCESS","startedAt":"2026-11-19T18:34:00Z"},
+            {"__typename":"StatusContext","context":"Vercel Preview Comments","state":"SUCCESS","startedAt":"2026-11-19T18:34:00Z"},
+            run("Vercel Security Review", "review", "SUCCESS"),
+        ]);
+        let gh = |repo: &str| {
+            let mut v = gh_json("OPEN", "MERGEABLE", rollup993.clone());
+            v["url"] = json!(format!("https://github.com/{repo}/pull/993"));
+            v["baseRefName"] = json!("dev");
+            v
+        };
+        set_disabled_workflows("eyzhub/eyzflow", &["Verify"]);
+        let mut pr = Pr { repo: "eyzhub/eyzflow".into(), number: 993, ..Default::default() };
+        apply_gh(&mut pr, &gh("eyzhub/eyzflow"));
+        assert_eq!((pr.checks.state.as_str(), pr.checks.passed, pr.checks.total, pr.checks.failing.len()), ("passing", 3, 3, 0), "{:?}", pr.checks);
+        assert_eq!(pr.checks.off, ["Verify"], "named, so the card can say it isn't counted");
+        let g = gate(&pr);
+        assert!(g.blocked.is_none() && g.needs_override.is_none(), "{g:?}");
+        assert_eq!(pr.checks_line(), "checks passing (Verify switched off, not counted)");
+        // Auto-merge: no check that holds it (it waits on the rest as for any PR).
+        assert!(!matches!(crate::prscore::auto_path(&pr, true), crate::prscore::Path::Yours(w) if w.contains("checks fail") || w.contains("no checks")));
+        // Where Verify still runs, its failure counts.
+        let mut other = Pr { repo: "eyzhub/eyz-mediaroom-serverless".into(), number: 1601, ..Default::default() };
+        apply_gh(&mut other, &gh("eyzhub/eyz-mediaroom-serverless"));
+        assert_eq!((other.checks.state.as_str(), other.checks.failing.as_slice(), other.checks.off.is_empty()), ("failing", &["Verify / verify".to_string()][..], true));
+        assert!(gate(&other).needs_override.is_some());
+        // Only Verify ran, and it is switched off: no checks at all, not a failing one.
+        set_disabled_workflows("eyzhub/only-verify", &["verify"]);
+        let mut only = Pr { repo: "eyzhub/only-verify".into(), number: 1, ..Default::default() };
+        apply_gh(&mut only, &{ let mut v = gh("eyzhub/only-verify"); v["statusCheckRollup"] = json!([run("Verify", "verify", "FAILURE")]); v });
+        assert_eq!((only.checks.state.as_str(), only.checks.off.as_slice()), ("none", &["Verify".to_string()][..]));
     }
 
     #[test]
