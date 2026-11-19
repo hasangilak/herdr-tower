@@ -62,8 +62,11 @@ pub struct Finding {
     pub id: String,
     pub report: Report,
     pub at: u64,
-    /// `drafted` (written up, its artifact not yet published), `spun-out`.
+    /// `drafted` (written up, its artifact not yet published), `publishing`
+    /// (its space opening), `spun-out`.
     pub state: String,
+    /// When its space began to open (`publishing`): another `published` waits for it.
+    pub publishing_at: u64,
     /// Its artifact.
     pub url: String,
     /// The space it was spun out to.
@@ -184,8 +187,47 @@ fn repo_key(repo: &str) -> String {
     Path::new(repo.trim_end_matches('/')).file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default()
 }
 
+/// A place's file, as written: `lib/user.js:17-21`, `lib/user.js (pickProfileFields)`
+/// and `lib/user.js#L17` are `lib/user.js`; a bare name (`RegisterForm`) stays a name.
+fn file_of(place: &str) -> String {
+    let p = place.trim().split(|c: char| c.is_whitespace() || c == '(' || c == '#').next().unwrap_or("");
+    let p = p.split(':').next().unwrap_or(p);
+    p.trim_matches(|c: char| c == '`' || c == '"' || c == '\'' || c == ',').trim_start_matches("./").to_lowercase()
+}
+
 fn files_of(places: &[String]) -> BTreeSet<String> {
-    places.iter().map(|p| p.split(':').next().unwrap_or(p).trim().trim_start_matches("./").to_lowercase()).filter(|p| !p.is_empty()).collect()
+    places.iter().map(|p| file_of(p)).filter(|p| !p.is_empty()).collect()
+}
+
+/// A file's name without its folders and extension: `components/auth/RegisterForm.js` is `registerform`.
+fn file_stem(f: &str) -> &str {
+    let name = f.rsplit('/').next().unwrap_or(f);
+    name.split_once('.').map(|(a, _)| a).unwrap_or(name)
+}
+
+/// Two places the same file: the same path, one the other's end
+/// (`user.js`, `lib/functions/user.js`), or a bare name of four letters or
+/// more (`RegisterForm`: no folder, no extension) the other's file name.
+fn same_file(a: &str, b: &str) -> bool {
+    let ends = |long: &str, short: &str| long.strip_suffix(short).is_some_and(|rest| rest.ends_with('/'));
+    let bare = |f: &str| !f.contains('/') && !f.contains('.') && f.chars().count() >= 4;
+    a == b || ends(a, b) || ends(b, a) || (bare(a) && file_stem(b) == a) || (bare(b) && file_stem(a) == b)
+}
+
+/// The names in code a text gives: `pickProfileFields`, `marketing_email_opt_in`,
+/// `RegisterForm`, `lib/functions/user.js`. Plain words aren't.
+fn code_names(text: &str) -> BTreeSet<String> {
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '/'))
+        .map(|w| w.trim_matches(|c: char| c == '.' || c == '/'))
+        .filter(|w| w.chars().count() >= 4 && w.chars().any(|c| c.is_alphabetic()))
+        .filter(|w| {
+            let camel = w.chars().zip(w.chars().skip(1)).any(|(x, y)| x.is_lowercase() && y.is_uppercase());
+            let snake = w.contains('_') && !w.starts_with('_');
+            let path = w.contains('/') || w.rsplit_once('.').is_some_and(|(a, ext)| !a.is_empty() && (1..=4).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphabetic()));
+            camel || snake || path
+        })
+        .map(|w| w.to_lowercase())
+        .collect()
 }
 
 fn overlap(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f32 {
@@ -194,8 +236,10 @@ fn overlap(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f32 {
 }
 
 /// The same bug: in the same repo (or one says none), and either in the
-/// same files with a title much alike, or a title and account alike enough
-/// on their own. Found by any session, in any space.
+/// same files (however its places are written: `same_file`) or naming two
+/// of the same names in code, with a title or account somewhat alike, or a
+/// title and account alike enough on their own. Found by any session, in
+/// any space, reported by any tower.
 pub fn same_bug(a: &Report, b: &Report) -> bool {
     let (ra, rb) = (repo_key(&a.repo), repo_key(&b.repo));
     if !ra.is_empty() && !rb.is_empty() && ra != rb {
@@ -205,8 +249,11 @@ pub fn same_bug(a: &Report, b: &Report) -> bool {
     let (fa, fb) = (files_of(&a.places), files_of(&b.places));
     let all_a: BTreeSet<String> = ta.iter().cloned().chain(words(&a.what)).collect();
     let all_b: BTreeSet<String> = tb.iter().cloned().chain(words(&b.what)).collect();
-    let same_files = !fa.is_empty() && !fb.is_empty() && fa.intersection(&fb).next().is_some();
-    (same_files && (overlap(&ta, &tb) >= 0.25 || overlap(&all_a, &all_b) >= 0.25)) || overlap(&ta, &tb) >= 0.6 || overlap(&all_a, &all_b) >= 0.5
+    let same_files = fa.iter().any(|x| fb.iter().any(|y| same_file(x, y)));
+    // Two names in code in common (what it said, its places): as the same files.
+    let names = |r: &Report| -> BTreeSet<String> { code_names(&format!("{} {} {}", r.title, r.what, r.places.join(" "))) };
+    let same_names = names(a).intersection(&names(b)).count() >= 2;
+    ((same_files || same_names) && (overlap(&ta, &tb) >= 0.25 || overlap(&all_a, &all_b) >= 0.25)) || overlap(&ta, &tb) >= 0.6 || overlap(&all_a, &all_b) >= 0.5
 }
 
 // ---- the write-up ----
@@ -403,6 +450,50 @@ pub fn file(book: &mut Book, r: Report, now: u64) -> Filed {
     Filed::New(f)
 }
 
+/// A draft older than this, or a space that began to open longer ago, is
+/// let go: whoever filed it didn't publish it, or its launch died.
+pub const CLAIM_MS: u64 = 10 * 60 * 1000;
+
+/// What `published` may do with a finding.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Claim {
+    /// Its space is to open now: this call's (its link kept).
+    Go(Finding),
+    /// Spun out already: its link and space as they are.
+    Done(Finding),
+    /// Its space is opening, by another call: nothing to do.
+    Opening(Finding),
+}
+
+/// Claims finding `id` for its space to open, once: two towers that
+/// reported one bug, or one that publishes twice, open one space.
+pub fn claim(book: &mut Book, id: &str, url: &str, now: u64) -> Option<Claim> {
+    let f = book.findings.iter_mut().find(|f| f.id == id)?;
+    Some(match f.state.as_str() {
+        "spun-out" => Claim::Done(f.clone()),
+        "publishing" if now.saturating_sub(f.publishing_at) < CLAIM_MS => Claim::Opening(f.clone()),
+        _ => {
+            (f.state, f.url, f.publishing_at) = ("publishing".into(), url.into(), now);
+            Claim::Go(f.clone())
+        }
+    })
+}
+
+/// Its addresses of whoever found it again ("space › name (t1pd)"), but its own finder's.
+fn again_addresses(f: &Finding) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for a in &f.again {
+        if let Some(addr) = a.rsplit_once('(').and_then(|(_, r)| r.strip_suffix(')')).map(str::trim)
+            && !addr.is_empty()
+            && addr != f.report.session
+            && !out.iter().any(|o| o == addr)
+        {
+            out.push(addr.to_string());
+        }
+    }
+    out
+}
+
 // ---- the command ----
 
 #[derive(Debug, Default)]
@@ -498,7 +589,9 @@ pub fn report(a: &Args, now: u64) -> Result<Value> {
             }
             Ok(json!({ "filed": "again", "id": f.id, "state": f.state, "space": f.spun_to, "url": f.url,
                 "next": if f.state == "spun-out" { format!("Found before ({}): {from} is told it is in \"{}\". Nothing new opens; nothing to tell the user.", f.id, f.spun_to) }
-                        else { format!("Found before ({}), not yet published: publish {} and run `tower finding published {} --url <link>`.", f.id, dir().join(format!("{}.md", f.id)).display(), f.id) } }))
+                        else if f.state == "publishing" || now.saturating_sub(f.at) < CLAIM_MS {
+                            format!("Found before ({}, filed {} s ago): its space is opening or about to, by whoever filed it first, and {from} is told where it went when it opens. Nothing new opens: don't publish it again. Only if you filed {} yourself and haven't published it: publish {} and run `tower finding published {} --url <link>`.", f.id, now.saturating_sub(f.at) / 1000, f.id, dir().join(format!("{}.md", f.id)).display(), f.id)
+                        } else { format!("Found before ({}), not yet published: publish {} and run `tower finding published {} --url <link>`.", f.id, dir().join(format!("{}.md", f.id)).display(), f.id) } }))
         }
         Filed::New(f) => {
             let md = dir().join(format!("{}.md", f.id));
@@ -515,15 +608,26 @@ pub fn published(id: &str, url: &str) -> Result<Value> {
     if !url.starts_with("https://") {
         bail!("--url is the artifact's link (https://claude.ai/…), not {url:?}");
     }
-    let f = update_at(&path(), |b| {
-        let f = b.findings.iter_mut().find(|f| f.id == id)?;
-        f.url = url.into();
-        Some(f.clone())
-    })
-    .with_context(|| format!("no finding {id} (tower finding list)"))?;
-    if f.state == "spun-out" {
-        return Ok(json!({ "id": f.id, "space": f.spun_to, "url": f.url, "next": "Already spun out: nothing more to do." }));
+    let f = match update_at(&path(), |b| claim(b, id, url, history::now_ms())).with_context(|| format!("no finding {id} (tower finding list)"))? {
+        Claim::Go(f) => f,
+        Claim::Done(f) => return Ok(json!({ "id": f.id, "space": f.spun_to, "url": f.url, "next": format!("Already spun out to \"{}\" ({}): nothing more to do.", f.spun_to, f.url) })),
+        Claim::Opening(f) => return Ok(json!({ "id": f.id, "url": f.url, "next": format!("Its space is opening already ({}): nothing more to do.", f.url) })),
+    };
+    let r = open_space(&f);
+    if r.is_err() {
+        // Let go, for a publish once more.
+        update_at(&path(), |b| {
+            if let Some(f) = b.findings.iter_mut().find(|f| f.id == id && f.state == "publishing") {
+                (f.state, f.publishing_at) = ("drafted".into(), 0);
+            }
+        });
     }
+    r
+}
+
+/// Opens a claimed finding's space and tells its finders and the user.
+fn open_space(f: &Finding) -> Result<Value> {
+    let id = f.id.as_str();
     let (goal, done_when) = goal_of(&f);
     let repos: Vec<String> = if f.report.repo.is_empty() { vec![] } else { vec![f.report.repo.clone()] };
     let taken = crate::launch::world_now().map(|w| w.spaces.into_iter().chain(w.open).collect::<Vec<_>>()).unwrap_or_default();
@@ -546,6 +650,10 @@ pub fn published(id: &str, url: &str) -> Result<Value> {
     // The write-up kept with the link, for whoever reads it from the folder.
     let _ = std::fs::write(dir().join(format!("{}.md", f.id)), format!("{}\nArtifact: {}\n", writeup(&f), f.url));
     let told = queue_to(&f.report.session, &told_finder(&f, false));
+    // Whoever found it again before it opened: where it went.
+    for addr in again_addresses(&f) {
+        let _ = queue_to(&addr, &told_finder(&f, true));
+    }
     // Said, unless where it was found is muted (what happens there isn't said).
     if !crate::spaces::muted_in(&crate::spaces::load(), &f.report.space) {
         say(&told_user(&f));
@@ -632,6 +740,96 @@ mod tests {
         let elsewhere = rep("Video upload times out after 30 s on large files", "", "/w/eyzflow", &["src/upload/multipart.ts:88"]);
         assert!(matches!(file(&mut b, elsewhere, 5), Filed::New(_)));
         assert_eq!(b.findings.len(), 3);
+    }
+
+    /// f31 and f32 (2026-11-19): one sign-up bug, reported by the main tower
+    /// and then by the space's own tower, from one session's account, ten
+    /// seconds apart, in other words and with its places written otherwise.
+    fn sign_up_reports() -> (Report, Report) {
+        let mut main_tower = rep(
+            "Sign-up drops the newsletter opt-in on sooner-app-web",
+            "RegisterForm sends the newsletter opt-in as 'mailing', but pickProfileFields in lib/functions/user.js only forwards marketing_email_opt_in to PATCH /auth/me, so a viewer who opts in at registration is stored as opted out.",
+            "/w/eyz/sooner-app-web",
+            &["lib/functions/user.js (pickProfileFields)", "RegisterForm"],
+        );
+        let mut space_tower = rep(
+            "Sign-up drops the newsletter opt-in, so new viewers are saved with marketing_email_opt_in false",
+            "A viewer who ticks the newsletter box at registration is saved with marketing_email_opt_in false. RegisterForm sends the opt-in as mailing; createUserData passes the input through pickProfileFields, whose allow-list has marketing_email_opt_in but not mailing, so PATCH /auth/me never gets the opt-in. Only the legacy AppSync mirror in lib/legacy/registerUser.js receives mailing.",
+            "/w/eyz/sooner-app-web",
+            &["components/auth/RegisterForm.js:109", "lib/functions/user.js:17-21"],
+        );
+        for r in [&mut main_tower, &mut space_tower] {
+            (r.space, r.session, r.session_name) = ("sooner-help-faqs \u{203a} bug-account-settings".into(), "t1pd".into(), "sooner-app".into());
+        }
+        (main_tower, space_tower)
+    }
+
+    #[test]
+    fn one_bug_reported_by_two_towers_is_one_finding() {
+        let (first, second) = sign_up_reports();
+        let mut b = Book { next: 30, ..Default::default() };
+        let Filed::New(f31) = file(&mut b, first, 1) else { panic!("new") };
+        assert_eq!(f31.id, "f31");
+        // Not yet published when the second report comes: still the same one.
+        assert_eq!(f31.state, "drafted");
+        match file(&mut b, second, 2) {
+            Filed::Again(f) => assert_eq!(f.id, "f31", "matched to the first"),
+            Filed::New(f) => panic!("filed again as {}", f.id),
+        }
+        assert_eq!(b.findings.len(), 1);
+        assert!(f31.again.is_empty() && b.findings[0].again.is_empty(), "one finder (t1pd), not listed twice");
+
+        // Either of its signals alone: its places, however written ...
+        let (first, mut second) = sign_up_reports();
+        second.what = "A viewer who ticks the newsletter box at registration is saved as opted out.".into();
+        assert!(same_bug(&first, &second), "the same files: user.js (pickProfileFields) and user.js:17-21, RegisterForm and RegisterForm.js:109");
+        // ... or the names in code its accounts give, with no places at all.
+        let (mut first, mut second) = sign_up_reports();
+        (first.places, second.places) = (vec![], vec![]);
+        assert!(same_bug(&first, &second), "pickProfileFields, RegisterForm, marketing_email_opt_in in both");
+
+        // Another bug of the same repo and field (f30, the settings toggle): its own finding.
+        let mut settings = rep(
+            "Account settings shows the newsletter toggle off for every viewer",
+            "Account Settings shows the newsletter toggle off for every viewer, because a mount effect resets it from user.mailing, a legacy field the eyzflow user object doesn't carry, while the form starts from and saves marketing_email_opt_in.",
+            "/w/eyz/sooner-app-web",
+            &["components/account/SettingsSection.js:22-25", "components/account/SettingsSection.js:16"],
+        );
+        settings.space = "sooner-help-faqs".into();
+        let (first, second) = sign_up_reports();
+        assert!(!same_bug(&settings, &first) && !same_bug(&settings, &second));
+        // A place's note and a bare name, as places.
+        assert_eq!(file_of("lib/functions/user.js (pickProfileFields)"), "lib/functions/user.js");
+        assert_eq!(file_of("`src/a.rs:12-14`"), "src/a.rs");
+        assert!(same_file("registerform", "components/auth/registerform.js") && same_file("user.js", "lib/functions/user.js"));
+        assert!(!same_file("user.js", "lib/functions/superuser.js") && !same_file("lib", "lib/functions/user.js") && !same_file("index.js", "src/index.ts"));
+    }
+
+    #[test]
+    fn two_towers_publishing_one_finding_open_one_space() {
+        let (first, second) = sign_up_reports();
+        let mut b = Book { next: 30, ..Default::default() };
+        let Filed::New(f) = file(&mut b, first, 1_000) else { panic!("new") };
+        // The space tower's report of it comes while the main tower publishes it.
+        let mut other = second;
+        (other.session, other.session_name) = ("t1pm".into(), "other".into());
+        assert!(matches!(file(&mut b, other, 2_000), Filed::Again(_)));
+        let Some(Claim::Go(g)) = claim(&mut b, &f.id, "https://claude.ai/artifact/first", 3_000) else { panic!("the main tower's") };
+        assert_eq!(g.url, "https://claude.ai/artifact/first");
+        // The space tower publishes it too: its space is opening, its link isn't kept.
+        let Some(Claim::Opening(o)) = claim(&mut b, &f.id, "https://claude.ai/artifact/second", 4_000) else { panic!("opening") };
+        assert_eq!(o.url, "https://claude.ai/artifact/first");
+        // Spun out: done, as it is.
+        b.findings[0].state = "spun-out".into();
+        assert!(matches!(claim(&mut b, &f.id, "https://claude.ai/artifact/third", 5_000), Some(Claim::Done(ref d)) if d.url == "https://claude.ai/artifact/first"));
+        // A launch that died long ago is let go.
+        b.findings[0].state = "publishing".into();
+        assert!(matches!(claim(&mut b, &f.id, "https://claude.ai/artifact/again", 3_000 + CLAIM_MS), Some(Claim::Go(_))));
+        assert!(claim(&mut b, "f99", "https://x", 0).is_none());
+        // Whoever found it again is told where it went, its first finder once.
+        let mut f = b.findings[0].clone();
+        f.again.push("s › first (t1pd)".into());
+        assert_eq!(again_addresses(&f), ["t1pm"]);
     }
 
     #[test]
