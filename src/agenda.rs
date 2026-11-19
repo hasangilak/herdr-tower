@@ -1095,14 +1095,19 @@ impl Ledger {
         // Every request's, done ones too: the task its turn's end settled is often its request's
         // last, and that request is done by then (a781.2, 2026-11-19).
         let on: Vec<&Task> = self.agendas.iter().flat_map(|a| a.tasks.iter()).filter(|t| !session.is_empty() && t.session == session).collect();
-        let open = self.unfinished_on(session);
+        let last = on.iter().filter_map(|t| ended(t).map(|at| (at, *t))).max_by_key(|(at, t)| (*at, t.delivered_ms));
+        let lately = last.is_some_and(|(at, _)| now.saturating_sub(at) < TURN_JUDGED_MS);
+        // After a turn ended lately, a task the ledger hasn't seen go in (the queue
+        // typed it a moment ago, before the reconciler looked: a852.2, 4 s after
+        // a835.16's turn ended) isn't one its session could have finished: the
+        // verdict is that turn's. (With no turn to give it to, it is still the one.)
+        let open = self.unfinished_on(session).filter(|u| !lately || u.delivered_ms > 0 || u.state != TaskState::Queued);
         // A turn ended on the newest unfinished one: it.
         if let Some(u) = open
             && (u.state == TaskState::DoneClaimed || ended(u).is_some())
         {
             return Some((u.id.clone(), false));
         }
-        let last = on.iter().filter_map(|t| ended(t).map(|at| (at, *t))).max_by_key(|(at, t)| (*at, t.delivered_ms));
         match (last, open) {
             // The newest unfinished one went in after the last turn's end: the verdict is that turn's.
             (Some((at, e)), Some(u)) if u.delivered_ms >= at && now.saturating_sub(at) < TURN_JUDGED_MS => Some((e.id.clone(), e.state.settled())),
@@ -2962,6 +2967,29 @@ mod tests {
         assert_eq!(l.judged_task("t12w", now + 509_000), Some((a.clone(), true)));
         assert_eq!(l.judged("t12w", true, "Ready check fixed", now + 509_000), Some(a.clone()));
         assert_eq!(l.task(&b).unwrap().state, TaskState::Running, "the newer task of another request isn't finished by it");
+        // a835.16's turn ended and its check verified it; the queue typed in the next one, a852.2
+        // (moved there from a835.20 with `tower agenda move`), and the verdict came 4 s later, before
+        // the ledger saw it go in. The verdict is a835.16's; a852.2 isn't settled by it.
+        let mut l = Ledger::default();
+        let first = l.open("goal requests", "", "user", 0, &["M5 Pro".to_string()], now);
+        let other = l.open("the PR words", "", "user", 0, &["M5 Pro".to_string()], now);
+        let (done, next) = (reg(&mut l, &first, 3546), reg(&mut l, &other, 3565));
+        let (next, _) = l.move_task(&next, "new", now + 1).unwrap();
+        assert_eq!(l.task(&next).unwrap().state, TaskState::Queued);
+        went(&mut l, &done, now + 2);
+        l.apply(&done, TaskEv::Claimed { said: "Merged into main and installed.".into() }, now + 400_000).unwrap();
+        l.apply(&done, TaskEv::Verify { how: "its last message says \"merged\"".into() }, now + 400_000).unwrap();
+        assert_eq!(l.judged_task("t12w", now + 404_000), Some((done.clone(), true)));
+        assert_eq!(l.judged("t12w", true, "Goal-requests now widen only the space the user asked in", now + 404_000), Some(done.clone()));
+        assert_eq!(l.task(&next).unwrap().state, TaskState::Queued, "still to be worked on, moved or not");
+        // Once the ledger sees it go in (by its new id, from its queue id), it runs; its own turn's end is what settles it.
+        let facts: BTreeMap<String, Facts> = [(next.clone(), Facts { queue: QueueFact::Delivered { session: "t12w".into(), at_ms: now + 401_000, turn_before: Some(3), taken: true, finished: false, next_ms: None }, ..Default::default() })].into();
+        l.step(&facts, now + 405_000);
+        assert_eq!(l.task(&next).unwrap().state, TaskState::Running, "{:?}", l.task(&next).unwrap().history);
+        assert_eq!(l.judged_task("t12w", now + 406_000), Some((done.clone(), true)), "it went in after that turn ended");
+        l.apply(&next, TaskEv::Claimed { said: "Fixed and installed.".into() }, now + 700_000).unwrap();
+        assert_eq!(l.judged("t12w", true, "fixed", now + 701_000), Some(next.clone()));
+        assert_eq!(l.task(&next).unwrap().state, TaskState::Verified);
         // No turn ended lately: the newest unfinished task, as before.
         let (mut old, _, ids) = ledger_with(1, now);
         to(&mut old, &ids[0], now);
