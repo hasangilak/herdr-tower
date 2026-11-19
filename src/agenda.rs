@@ -1489,6 +1489,20 @@ impl Ledger {
         out
     }
 
+    /// The tasks of any request (the user's, the tower's, a plan's, a
+    /// message) still in flight in `space`: queued, running, blocked,
+    /// claimed but not checked, or stalled, for one of its `sessions` or
+    /// handed out in it. A space with one isn't finished.
+    pub fn in_flight(&self, space: &str, sessions: &[&str]) -> usize {
+        self.agendas
+            .iter()
+            .filter(|a| a.live())
+            .flat_map(|a| a.tasks.iter())
+            .filter(|t| matches!(t.state, TaskState::Queued | TaskState::Running | TaskState::Blocked | TaskState::DoneClaimed | TaskState::Stalled))
+            .filter(|t| t.space.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(space.trim())) || (!t.session.is_empty() && sessions.contains(&t.session.as_str())))
+            .count()
+    }
+
     /// The open requests that are about `space` and no other: closed with it.
     pub fn only_in(&self, space: &str) -> Vec<String> {
         self.agendas
