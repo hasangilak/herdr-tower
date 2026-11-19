@@ -144,7 +144,7 @@ pub fn run() -> Result<()> {
     // and those that wait for a merge are one decision per repo and space.
     let prs = crate::prs::Prs::open_daemon();
     {
-        let (hub, decisions, all) = (hub.clone(), decisions.clone(), prs.clone());
+        let (hub, decisions, all, waits) = (hub.clone(), decisions.clone(), prs.clone(), asks.clone());
         prs.on_change(Box::new(move |op, pr| {
             hub.broadcast("pr", serde_json::json!({ "op": op, "pr": pr.view() }));
             // A PR found in a space with review on gets its reviewer (first: a PR the
@@ -154,6 +154,8 @@ pub fn run() -> Result<()> {
                 r.pr_changed(op, pr);
             }
             sync_merges(&decisions, &all);
+            // A wait for a merge whose card is there now goes into it.
+            waits.fold_waits_into_merges();
         }));
     }
     let lan = lan::Lan::new(lan::Ctx {

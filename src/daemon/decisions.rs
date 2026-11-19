@@ -349,6 +349,11 @@ impl Decisions {
         }
     }
 
+    /// The open merge cards: each one's id, space and PRs (repo, number).
+    pub fn open_merges(&self) -> Vec<(String, Option<String>, Vec<(String, u64)>)> {
+        lock(&self.book).open.iter().filter(|d| d.kind == decisions::Kind::Merge).map(|d| (d.id.clone(), d.space.clone(), d.prs.iter().map(|p| (p.repo.clone(), p.number)).collect())).collect()
+    }
+
     /// `tower raise`: the decision it is, as it stands, and whether the user
     /// is told now (the first time; every time while the tower tells everything).
     pub fn raise(&self, r: Raise) -> (Raised, Decision, bool) {

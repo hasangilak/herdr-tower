@@ -317,6 +317,65 @@ pub struct Hold {
     pub weighed: Vec<String>,
     /// How it stood when it was held, to tell an update from what it was.
     pub seen: Seen,
+    /// The tower held it itself, until then at most (a merge raise waiting
+    /// for its PR's merge card): only that, not an update, brings it back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_ms: Option<u64>,
+}
+
+/// A merge raise about a PR with no merge card yet waits this long for
+/// one (its PR under review, or its checks running) before it shows.
+pub const RAISE_WAITS_MS: u64 = 5 * 60_000;
+/// A raise of what the user answered this recently is no new card: the
+/// brain hears their answer.
+pub const ANSWERED_LATELY_MS: u64 = 30 * 60_000;
+/// A card that stopped (not answered) this recently, asked again under its
+/// key by the same session (or a merge card for the same PRs), is the same
+/// card again (its id), not a new one.
+pub const AGAIN_MS: u64 = 10 * 60_000;
+/// One the user answered this recently, asked again by the same session
+/// (a dialog that came straight back), is the same card again, told again.
+pub const AGAIN_ANSWERED_MS: u64 = 2 * 60_000;
+/// A title longer than this is cut where it reads whole; the rest leads its detail.
+pub const TITLE_CHARS: usize = 110;
+
+/// A card's title as it shows, and what of it goes to the detail: the
+/// decision itself (its first sentence, when that is short enough), the
+/// rest below it.
+pub fn short_title(title: &str) -> (String, String) {
+    let t = title.trim();
+    if t.chars().count() <= TITLE_CHARS {
+        return (t.to_string(), String::new());
+    }
+    // The first sentence that ends within the limit (a question, or a statement).
+    let mut cut = None;
+    for (i, c) in t.char_indices() {
+        if t[..i].chars().count() >= TITLE_CHARS {
+            break;
+        }
+        if matches!(c, '?' | '.' | ':' | '!') && t[i + c.len_utf8()..].starts_with(' ') && t[..i].chars().count() >= 30 {
+            cut = Some(i + c.len_utf8());
+            if c == '?' {
+                break;
+            }
+        }
+    }
+    let (head, rest) = match cut {
+        Some(i) => (t[..i].trim_end_matches(':').to_string(), t[i..].trim().to_string()),
+        None => {
+            let mut end = 0;
+            for (i, _) in t.char_indices() {
+                if t[..i].chars().count() > TITLE_CHARS - 1 {
+                    break;
+                }
+                if t[i..].starts_with(' ') {
+                    end = i;
+                }
+            }
+            (format!("{}…", t[..end].trim_end_matches([',', ';', ' '])), format!("…{}", t[end..].trim_start()))
+        }
+    };
+    (head, rest)
 }
 
 /// What of a decision counts as an update to one on hold.
@@ -400,6 +459,10 @@ pub struct Decision {
     /// It was on hold and came back: why (its card says so).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub back: Option<Back>,
+    /// It closed and was asked again soon after, under its key: how it
+    /// ended then (its card says so, and stays the same card).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub again: Option<Back>,
     /// A merge card: what the user asked to have added to its PRs, as sent
     /// to their sessions (`Act::PrNote`), oldest first. The card stays open.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -502,6 +565,13 @@ impl Decision {
             })
             .collect();
         let options: Vec<Value> = self.options.iter().map(|o| json!({ "label": o.label, "why": o.why, "pick": o.pick })).collect();
+        // A long title shows its decision; the rest leads the detail.
+        let (title, rest) = short_title(&self.title);
+        let detail = match (rest.is_empty(), self.detail.trim().is_empty()) {
+            (true, _) => self.detail.clone(),
+            (false, true) => rest,
+            (false, false) => format!("{rest}\n\n{}", self.detail),
+        };
         json!({
             "id": self.id,
             "key": self.key,
@@ -509,8 +579,9 @@ impl Decision {
             "space": self.space,
             "sessions": sessions,
             "waiting": self.waiting(),
-            "title": self.title,
-            "detail": self.detail,
+            "title": title,
+            "title_full": self.title,
+            "detail": detail,
             "why": self.why,
             "options": options,
             "scores": self.scores,
@@ -529,6 +600,7 @@ impl Decision {
             "muted": muted,
             "hold": self.hold.as_ref().map(|h| json!({ "reason": h.reason, "by": h.by, "since_ms": h.since_ms, "until_prs": h.until_prs })),
             "back": self.back.as_ref().map(|b| json!({ "why": b.why, "at_ms": b.at_ms })),
+            "again": self.again.as_ref().map(|b| json!({ "why": b.why, "at_ms": b.at_ms })),
             "notes": self.notes,
         })
     }
@@ -905,7 +977,28 @@ pub fn options_from(v: &Value) -> Result<Vec<Opt>> {
     Ok(out)
 }
 
-/// The PR numbers a line names (`#42`, `PR 42`).
+/// Two lines that ask the same thing in other words: most of their words
+/// alike (numbers aside), and no PR number one names that the other doesn't.
+pub fn like_words(a: &str, b: &str) -> bool {
+    let words = |t: &str| -> std::collections::BTreeSet<String> {
+        t.split(|c: char| !c.is_alphanumeric() && c != '\'')
+            .map(|w| w.to_lowercase())
+            .filter(|w| w.len() > 2 && !w.chars().all(|c| c.is_ascii_digit()))
+            .filter(|w| !["the", "and", "for", "you", "your", "with", "this", "that", "into", "from", "now", "its", "are", "was"].contains(&w.as_str()))
+            .collect()
+    };
+    let (x, y) = (words(a), words(b));
+    if x.is_empty() || y.is_empty() {
+        return false;
+    }
+    let (na, nb) = (pr_numbers(a), pr_numbers(b));
+    if !na.is_empty() && !nb.is_empty() && na.iter().all(|n| !nb.contains(n)) {
+        return false;
+    }
+    let both = x.intersection(&y).count() as f64;
+    both / (x.union(&y).count() as f64) >= 0.55
+}
+
 /// The PR a merge raise is about.
 #[derive(Debug, Clone, PartialEq)]
 enum Subject {
@@ -1043,6 +1136,40 @@ impl Book {
     }
 
     fn add(&mut self, mut d: Decision, now: u64) -> String {
+        // Closed minutes ago and asked again under its key (a merge card that
+        // stopped, a dialog that came back after its answer): the same card,
+        // which says so, not a new one beside the old.
+        if !d.key.is_empty()
+            && let Some(i) = self.closed.iter().rposition(|c| {
+                let ago = c.closed_ms.map(|t| now.saturating_sub(t)).unwrap_or(u64::MAX);
+                let same_who = c.sessions.iter().any(|w| d.sessions.iter().any(|x| x.address == w.address));
+                c.key == d.key
+                    && !self.open.iter().any(|o| o.id == c.id)
+                    && match c.state {
+                        State::Stopped => ago < AGAIN_MS && (c.kind == Kind::Merge || same_who),
+                        State::Answered => ago < AGAIN_ANSWERED_MS && same_who,
+                        _ => false,
+                    }
+            })
+        {
+            let old = self.closed.remove(i);
+            let how = match (old.state, old.answer.trim()) {
+                (State::Answered, a) if !a.is_empty() => format!("you answered \"{}\"", clip(a, 120)),
+                (State::Answered, _) => "you answered it".to_string(),
+                (_, a) if !a.is_empty() => format!("it ended: {}", clip(a, 120)),
+                (s, _) => format!("it was {}", s.word()),
+            };
+            d.id = old.id.clone();
+            d.first_ms = old.first_ms;
+            d.count = old.count + 1;
+            d.last_ms = now;
+            d.again = Some(Back { why: format!("Asked again: {how}"), at_ms: now });
+            // One that only stopped isn't said again; one the user answered is a new ask, said as one.
+            d.told = old.told && old.state != State::Answered;
+            let id = d.id.clone();
+            self.open.push(d);
+            return id;
+        }
         if d.first_ms == 0 || d.first_ms > now {
             d.first_ms = now;
         }
@@ -1306,7 +1433,7 @@ impl Book {
     /// card, and #116's raise stayed after the user merged it).
     fn settle_merge_raises(&mut self, prs: &[Pr], now: u64, ch: &mut Changes) {
         let mut over: Vec<(String, State, String, Option<String>)> = vec![];
-        for d in self.open.iter().filter(|d| d.kind == Kind::Raised && d.why.trim().eq_ignore_ascii_case("merge")) {
+        for d in self.open.iter().filter(|d| matches!(d.kind, Kind::Raised | Kind::Choice) && d.why.trim().eq_ignore_ascii_case("merge") && d.key.starts_with("raise:")) {
             let Some(p) = raised_pr(d, prs) else { continue };
             if p.state == "merged" {
                 over.push((d.id.clone(), State::Answered, "merged".into(), None));
@@ -1354,9 +1481,14 @@ impl Book {
                         }
                 })
             }
-            "waiting" | "blocked" | "question" => self.open.iter().position(|d| (d.kind.asks() || d.kind == Kind::Blocked) && about(d)),
+            "waiting" | "blocked" | "question" => self
+                .open
+                .iter()
+                .position(|d| (d.kind.asks() || d.kind == Kind::Blocked) && about(d))
+                .or_else(|| self.open.iter().position(|d| matches!(d.kind, Kind::Raised | Kind::Choice) && about(d) && d.why.eq_ignore_ascii_case(&why) && like_words(&d.title, &r.text))),
             "failed" => self.open.iter().position(|d| d.kind == Kind::Failed && about(d)),
-            _ => None,
+            // The same session raising what it raised, in other words: that card, its words brought up to date.
+            _ => self.open.iter().position(|d| matches!(d.kind, Kind::Raised | Kind::Choice) && about(d) && d.why.eq_ignore_ascii_case(&why) && like_words(&d.title, &r.text)),
         }
     }
 
@@ -1473,7 +1605,12 @@ impl Book {
             }
             return Raised { id: d.id.clone(), fresh: false, folded: by_key.is_none(), count: d.count, waiting: d.waiting() };
         }
-        let d = Decision {
+        // Asked again of what the user answered lately: no card; the brain hears their answer.
+        if let Some(id) = self.answered_lately(&r, &key, now) {
+            return Raised { id, fresh: false, folded: true, count: 1, waiting: 0 };
+        }
+        let merge = r.why.trim().eq_ignore_ascii_case("merge") && merge_subject(&r.text, &r.detail) != Subject::None;
+        let mut d = Decision {
             key,
             kind: if r.options.is_empty() { Kind::Raised } else { Kind::Choice },
             space: r.space,
@@ -1484,8 +1621,47 @@ impl Book {
             options: r.options,
             ..Default::default()
         };
+        // A merge raise about a PR with no merge card yet (under review, its
+        // checks running, not seen yet) waits for that card, out of the
+        // queue, and goes into it (`settle_merge_raises`); with none in
+        // `RAISE_WAITS_MS` it shows as it is.
+        if merge {
+            let seen = d.seen();
+            d.hold = Some(Hold {
+                reason: "until its PR's merge card: the merge is asked there".into(),
+                by: "tower".into(),
+                since_ms: now,
+                until_prs: vec![],
+                weighed: vec![],
+                seen,
+                expires_ms: Some(now + RAISE_WAITS_MS),
+            });
+        }
         let waiting = d.waiting();
         Raised { id: self.add(d, now), fresh: true, folded: false, count: 1, waiting }
+    }
+
+    /// A closed card the user answered within `ANSWERED_LATELY_MS` that a
+    /// raise asks again: its key; the same session's raise of the same kind
+    /// in like words; or, for a merge, the same PR.
+    fn answered_lately(&self, r: &Raise, key: &str, now: u64) -> Option<String> {
+        let same_space = |d: &Decision| space_part(d.space.as_deref()) == space_part(r.space.as_deref());
+        let about = |d: &Decision| r.who.as_ref().is_some_and(|w| d.sessions.iter().any(|s| s.address == w.address));
+        let why = r.why.trim().to_lowercase();
+        let subject = merge_subject(&r.text, &r.detail);
+        self.closed.iter().rev().find(|c| {
+            c.state == State::Answered
+                && c.closed_ms.is_some_and(|t| now.saturating_sub(t) < ANSWERED_LATELY_MS)
+                && same_space(c)
+                && (c.key == key
+                    || (why == "merge"
+                        && match &subject {
+                            Subject::Keys(keys) => c.prs.iter().any(|p| keys.iter().any(|k| k.eq_ignore_ascii_case(&p.key))) || keys.iter().any(|k| merge_subject(&c.title, &c.detail) == Subject::Keys(vec![k.clone()])),
+                            Subject::Number(n) => (c.kind == Kind::Merge && c.prs.iter().any(|p| p.number == *n)) || (c.why.eq_ignore_ascii_case("merge") && about(c) && merge_subject(&c.title, &c.detail) == Subject::Number(*n)),
+                            Subject::None => false,
+                        })
+                    || (about(c) && c.why.trim().eq_ignore_ascii_case(&why) && why != "merge" && like_words(&c.title, &r.text)))
+        }).map(|c| c.id.clone())
     }
 
     /// A task failed again after its retry: the user's to say whether it is
@@ -1760,7 +1936,7 @@ impl Book {
             }
         }
         until.retain(|u| !own.contains(u));
-        d.hold = Some(Hold { reason, by: by.trim().to_string(), since_ms: now, until_prs: until, weighed: vec![], seen: d.seen() });
+        d.hold = Some(Hold { reason, by: by.trim().to_string(), since_ms: now, until_prs: until, weighed: vec![], seen: d.seen(), expires_ms: None });
         d.back = None;
         Ok(d.clone())
     }
@@ -1788,8 +1964,18 @@ impl Book {
     /// The decisions on hold that were updated since they were held (see
     /// `Decision::update_since`) come back: (id, why) each.
     pub fn wake(&mut self, now: u64) -> Vec<(String, String)> {
-        let woke: Vec<(String, String)> =
-            self.open.iter().filter_map(|d| d.hold.as_ref().and_then(|h| d.update_since(&h.seen)).map(|why| (d.id.clone(), why))).collect();
+        let woke: Vec<(String, String)> = self
+            .open
+            .iter()
+            .filter_map(|d| {
+                let h = d.hold.as_ref()?;
+                match h.expires_ms {
+                    // The tower's own hold: only its time running out brings it back.
+                    Some(at) => (now >= at).then(|| (d.id.clone(), "its PR has no merge card yet, so it waits for you as it is".to_string())),
+                    None => d.update_since(&h.seen).map(|why| (d.id.clone(), why)),
+                }
+            })
+            .collect();
         for (id, why) in &woke {
             let _ = self.unhold(id, why, now);
         }
@@ -3175,6 +3361,104 @@ mod tests {
 
     fn merge_raise(space: &str, session: &str, text: &str, detail: &str) -> Raise {
         Raise { space: Some(space.into()), who: who(session), why: "merge".into(), text: text.into(), detail: detail.into(), options: vec![] }
+    }
+
+    /// 19 Nov, after aa96771: a merge raise still stood alone 1 to 4
+    /// minutes before its PR's merge card came, and the user answered "go
+    /// ahead" there and then merged again on the card. Now it waits for the
+    /// card out of the queue (not counted, not told), and goes into it; with
+    /// no card in `RAISE_WAITS_MS` it shows as it is.
+    #[test]
+    fn a_merge_raise_waits_out_of_the_queue_for_its_merge_card() {
+        let mut b = Book::default();
+        let r = b.raise(merge_raise(SPACE, "t1mv", "MediaRoom PR #1578 into dev waits for your merge: staff can attach files.", ""), MIN);
+        assert!(r.fresh);
+        let d = b.find(&r.id).unwrap().clone();
+        assert!(d.held() && d.hold.as_ref().is_some_and(|h| h.by == "tower" && h.expires_ms == Some(MIN + RAISE_WAITS_MS)));
+        assert_eq!(b.open.iter().filter(|d| !d.held()).count(), 0, "nothing in the queue yet");
+        // Raised again meanwhile: still one card, still waiting (an update doesn't wake the tower's hold).
+        b.raise(merge_raise(SPACE, "t1mv", "MediaRoom PR #1578 into dev waits for your merge: staff can attach files.", ""), 2 * MIN);
+        b.wake(2 * MIN);
+        assert!(b.find(&r.id).unwrap().held());
+        // Its merge card comes: the raise goes into it; the user answers the merge, once.
+        let ch = b.sync_merges(&[their_pr("eyzhub/eyz-mediaroom-serverless", 1578, "t1mv", SPACE)], 3 * MIN);
+        assert_eq!(ch.fresh.len(), 1);
+        assert_eq!(b.open.len(), 1);
+        assert_eq!(b.open[0].kind, Kind::Merge);
+        assert_eq!(b.closed.iter().find(|c| c.id == r.id).map(|c| c.state), Some(State::Stopped));
+        // A raise whose PR never gets a card here: it shows once its time is up.
+        let lone = b.raise(merge_raise(SPACE, "t1n0", "eyzflow PR #962 into dev waits for your merge.", ""), 4 * MIN);
+        b.wake(4 * MIN + RAISE_WAITS_MS - 1);
+        assert!(b.find(&lone.id).unwrap().held());
+        let woke = b.wake(4 * MIN + RAISE_WAITS_MS);
+        assert_eq!(woke.len(), 1);
+        assert!(!b.find(&lone.id).unwrap().held());
+        assert!(b.find(&lone.id).unwrap().back.as_ref().is_some_and(|x| x.why.contains("no merge card yet")));
+    }
+
+    /// 19 Nov 12:04–12:12: #1578 was raised four times, the release scope
+    /// twice, each after the user had answered the one before. A raise of
+    /// what the user answered within half an hour makes no card: the brain
+    /// hears the answer (`settled`). The same session asking the same in
+    /// other words while its card is open joins that card.
+    #[test]
+    fn what_the_user_answered_lately_is_not_asked_again_and_other_words_join_the_open_card() {
+        let mut b = Book::default();
+        let ask = |text: &str, session: &str| Raise { space: Some(SPACE.into()), who: who(session), why: "deploy".into(), text: text.into(), detail: String::new(), options: vec![] };
+        let r = b.raise(ask("MediaRoom's production release: ship only the support attachments, or all of dev?", "t1mv"), MIN);
+        let again = b.raise(ask("MediaRoom's production release: ship only the support attachments, or all of dev? Dev also carries #1574.", "t1mv"), 2 * MIN);
+        assert_eq!((again.id.clone(), again.fresh), (r.id.clone(), false), "other words, the same card");
+        assert_eq!(b.open.len(), 1);
+        b.answered(&r.id, "only the attachments", 3 * MIN);
+        let late = b.raise(ask("MediaRoom's production release: ship only the support attachments, or all of dev?", "t1mv"), 4 * MIN);
+        assert_eq!((late.id.clone(), late.fresh, b.open.len()), (r.id.clone(), false, 0), "answered: no card, the answer stands");
+        assert_eq!(b.find(&r.id).map(|d| d.answer.clone()), Some("only the attachments".to_string()));
+        // Another thing, or the same after half an hour: a card.
+        assert!(b.raise(ask("Turn the notification flag on in production?", "t1mv"), 5 * MIN).fresh);
+        assert!(b.raise(ask("MediaRoom's production release: ship only the support attachments, or all of dev?", "t1mv"), 3 * MIN + ANSWERED_LATELY_MS).fresh);
+        // A merge the user merged: raised again for the same PR, no card.
+        let m = b.sync_merges(&[their_pr("eyzhub/eyz-mediaroom-serverless", 1580, "t1mv", SPACE)], 40 * MIN).fresh[0].clone();
+        b.answered(&m, "merged", 41 * MIN);
+        let r2 = b.raise(merge_raise(SPACE, "t1mv", "MediaRoom PR #1580 into dev waits for your merge.", ""), 42 * MIN);
+        assert_eq!((r2.id, r2.fresh), (m, false));
+    }
+
+    /// #884 (16 Nov) and #980 (19 Nov): a merge card stopped and came back
+    /// minutes later under a new id. Now it is the same card, which says it
+    /// is asked again, and isn't told again; a dialog the user answered that
+    /// comes straight back is the same card too, told again.
+    #[test]
+    fn a_card_closed_minutes_ago_and_asked_again_is_the_same_card() {
+        let mut b = Book::default();
+        let prs = vec![their_pr("eyzhub/eyzflow", 884, "t7h", SPACE)];
+        let id = b.sync_merges(&prs, MIN).fresh[0].clone();
+        b.claim_told(&id);
+        b.sync_merges(&[], 2 * MIN);
+        assert!(b.open.is_empty());
+        let back = b.sync_merges(&prs, 5 * MIN);
+        assert_eq!(back.fresh, vec![id.clone()], "the same card");
+        let d = b.find(&id).unwrap();
+        assert!(d.again.as_ref().is_some_and(|a| a.why.starts_with("Asked again")) && d.told && d.count == 2);
+        // Long after: a new card.
+        b.sync_merges(&[], 6 * MIN);
+        assert_ne!(b.sync_merges(&prs, 6 * MIN + AGAIN_MS).fresh[0], id);
+    }
+
+    #[test]
+    fn a_long_title_shows_its_decision_and_the_rest_leads_its_detail() {
+        assert_eq!(short_title("Merge PR #1578 into dev (eyzhub/eyz-mediaroom-serverless)"), ("Merge PR #1578 into dev (eyzhub/eyz-mediaroom-serverless)".to_string(), String::new()));
+        let long = "Should the backend session turn the notification settings flag on in production for EYZMEDIA now? #1562 and the dashboard release are live, and with the flag off people keep getting every email.";
+        let (t, rest) = short_title(long);
+        assert_eq!(t, "Should the backend session turn the notification settings flag on in production for EYZMEDIA now?");
+        assert!(rest.starts_with("#1562 and the dashboard release are live"));
+        let flat = "a ".repeat(30) + &"word ".repeat(40);
+        let (t, rest) = short_title(&flat);
+        assert!(t.ends_with('…') && t.chars().count() <= TITLE_CHARS + 1 && rest.starts_with('…'), "{t} | {rest}");
+        let d = Decision { title: long.into(), detail: "More below.".into(), ..Default::default() };
+        let v = d.view(false);
+        assert_eq!(v["title"], "Should the backend session turn the notification settings flag on in production for EYZMEDIA now?");
+        assert!(v["detail"].as_str().unwrap().starts_with("#1562 and the dashboard") && v["detail"].as_str().unwrap().ends_with("\n\nMore below."));
+        assert_eq!(v["title_full"], long);
     }
 
     /// t1mv raised "#1578 waits for your merge" twice while the tower had no
