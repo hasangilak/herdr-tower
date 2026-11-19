@@ -117,6 +117,11 @@ impl Plans {
     pub fn start(&self) {
         let me = self.clone();
         let _ = thread::Builder::new().name("plans".into()).spawn(move || {
+            // Cards an older tower left on questions a revision dropped or renumbered: as the plans are now.
+            let plans: Vec<Plan> = lock(&me.book).plans.iter().filter(|p| p.status != plans::Status::Closed).cloned().collect();
+            for p in &plans {
+                me.follow_cards(p);
+            }
             let mut n: u64 = 0;
             loop {
                 me.look();
@@ -331,11 +336,26 @@ impl Plans {
 
     /// One change to the store: kept and shown.
     fn change(&self, f: impl FnOnce(&mut Book) -> Result<Plan>) -> Result<Plan> {
-        let mut b = lock(&self.book);
-        let p = f(&mut b)?;
-        self.save(&b);
-        self.publish(&b);
+        let p = {
+            let mut b = lock(&self.book);
+            let p = f(&mut b)?;
+            self.save(&b);
+            self.publish(&b);
+            p
+        };
+        self.follow_cards(&p);
         Ok(p)
+    }
+
+    /// The plan's question cards follow its questions (a revision renumbers
+    /// or drops them): each card asks what the plan asks now, or is over.
+    fn follow_cards(&self, p: &Plan) {
+        let Some(d) = &self.decisions else { return };
+        if p.status == plans::Status::Closed {
+            return;
+        }
+        let questions: Vec<(String, Option<String>)> = p.questions.iter().map(|q| (q.id.clone(), q.card.clone())).collect();
+        d.plan_follow(&p.id, &questions);
     }
 
     /// The open plan's planner, as Herdr has it now.
@@ -940,6 +960,78 @@ mod tests {
                 { "id": "q4", "text": "Name the toggle 'Translate' or 'Show in English'?", "options": [{ "label": "Translate" }, { "label": "Show in English" }], "recommended": 0 }
             ]
         })
+    }
+
+    /// p6 (2026-11-19): a version dropped q2, whose answer it had worked in,
+    /// a later one listed it again (a new card), the next dropped it again,
+    /// and its card answered "plan p6 has no question q2".
+    #[test]
+    fn a_card_follows_its_question_across_versions_and_goes_when_the_question_does() {
+        use crate::daemon::decisions::{Carry, Decisions};
+        let dir = std::env::temp_dir().join(format!("tower-plans-follow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shared = Shared::new(State::new("off", "test", "test"));
+        let decisions = Decisions::new(shared.clone());
+        let brain: BrainNote = Arc::new(|_: &str| {});
+        let plans = Plans::at(dir.join("plans.json"), shared.clone(), SendQueue::open()).wired(decisions.clone(), Arc::new(|_: &str| None), brain).brain_within(60_000);
+        translation_plan(&plans, &dir);
+        let q = |id: &str, text: &str| json!({ "id": id, "text": text, "options": [{ "label": "Yes, now" }, { "label": "At release" }], "theirs": true });
+        let (cache, langs, key) = ("Cache translations for 30 days or forever?", "Which languages first?", "Put the provider's API key in prod's secrets now?");
+        let version = |questions: Vec<Value>| {
+            let mut v = structure_of();
+            v["questions"] = json!(questions);
+            let mut st = ask("stages", "p1");
+            if let Request::Plan { body, .. } = &mut st {
+                *body = Some(v);
+            }
+            let r = plans.request(&st);
+            assert!(r.ok, "{:?}", r.error);
+            shared.get().plan.unwrap()
+        };
+        let card_of = |v: &Value, id: &str| v["questions"].as_array().unwrap().iter().find(|x| x["id"] == id).and_then(|x| x["card"].as_str()).map(String::from);
+        let open_keys = || -> Vec<String> {
+            let mut k: Vec<String> = decisions.list(None, false)["decisions"].as_array().unwrap().iter().map(|d| decisions.get(d["id"].as_str().unwrap()).unwrap().key).collect();
+            k.sort();
+            k
+        };
+        let asks = crate::daemon::asks::Asks::new(shared.clone(), Arc::new(crate::daemon::lan::hub::Hub::default()), "normal");
+        let send = |_: &str, _: &str| -> Result<Value> { panic!("nothing is sent to a session") };
+        let agenda = |_: &crate::agenda::Cmd| crate::protocol::Response { ok: true, error: None, state: None };
+        let reopen = |_: &crate::reopen::Pick| -> Result<Value> { panic!("no reopen") };
+        let accounts = |_: bool| -> Result<Value> { panic!("no accounts") };
+        let planned = |plan: &str, what: &str, a: &str| plans.from_card(plan, what, a);
+        let carry = Carry { asks: &asks, send: &send, agenda: &agenda, reopen: &reopen, accounts: &accounts, plan: &planned };
+
+        // Version 1: three questions, each the user's: three cards.
+        let v1 = version(vec![q("q1", cache), q("q2", langs), q("q3", key)]);
+        assert_eq!(open_keys(), ["plan:p1:q1", "plan:p1:q2", "plan:p1:q3"]);
+        let (c1, c2, c3) = (card_of(&v1, "q1").unwrap(), card_of(&v1, "q2").unwrap(), card_of(&v1, "q3").unwrap());
+        // The user answers q2 on its card.
+        decisions.answer_with(&c2, &json!({ "choice": 0 }), true, &carry).unwrap();
+        assert_eq!(open_keys(), ["plan:p1:q1", "plan:p1:q3"]);
+
+        // Version 2: q2 worked in and dropped, q3 renumbered as q2. Its card follows it; nothing new is asked.
+        let v2 = version(vec![q("q1", cache), q("q2", key)]);
+        assert_eq!(card_of(&v2, "q2").as_deref(), Some(c3.as_str()), "the API key question keeps its card");
+        assert_eq!(open_keys(), ["plan:p1:q1", "plan:p1:q2"]);
+        assert_eq!(decisions.get(&c3).unwrap().key, "plan:p1:q2");
+
+        // Version 3: the languages question back as q5 (its answer kept: no card), q1 gone for good.
+        let v3 = version(vec![q("q2", key), q("q5", langs)]);
+        let q5 = v3["questions"].as_array().unwrap().iter().find(|x| x["id"] == "q5").unwrap().clone();
+        assert_eq!((q5["status"].as_str(), q5["answer"].as_str()), (Some("answered"), Some("Yes, now")), "answered before: not asked again");
+        assert_eq!(open_keys(), ["plan:p1:q2"], "q1's card is over with it");
+        let gone = decisions.get(&c1).unwrap();
+        assert_eq!((gone.state, gone.answer.as_str()), (crate::decisions::State::Stopped, "the plan no longer asks it"));
+
+        // The moved card's answer lands on the question it asks now.
+        let v = decisions.answer_with(&c3, &json!({ "choice": 1 }), true, &carry).unwrap();
+        assert_eq!((v["state"].as_str(), v["plan"]["question"].as_str(), v["plan"]["answer"].as_str()), (Some("answered"), Some("q2"), Some("At release")));
+        let shown = shared.get().plan.unwrap();
+        let q2 = shown["questions"].as_array().unwrap().iter().find(|x| x["id"] == "q2").unwrap().clone();
+        assert_eq!((q2["text"].as_str(), q2["status"].as_str()), (Some(key), Some("answered")));
+        assert!(open_keys().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1039,6 +1039,44 @@ impl Book {
     }
 
     /// Closes an open decision as `state`. None: it isn't open.
+    /// A plan's open question cards, as its questions are now (`questions`:
+    /// each one's id and its card, if it has one): a card whose question is
+    /// there under another id (renumbered) follows it; one whose question
+    /// the plan no longer has at all is over (stopped, and says why). One
+    /// whose question is there (asked, answered: its answer closes it) stays,
+    /// as does a revision's card (`rev:N`). What moved (card, from, to), and what closed.
+    pub fn plan_follow(&mut self, plan: &str, questions: &[(String, Option<String>)], gone_why: &str, now: u64) -> (Vec<(String, String, String)>, Vec<Decision>) {
+        let prefix = format!("{PLAN_KEY}{}:", plan.trim());
+        let mut moved = vec![];
+        let mut over = vec![];
+        let cards: Vec<(String, String)> = self.open.iter().filter(|d| d.key.starts_with(&prefix)).map(|d| (d.id.clone(), d.key[prefix.len()..].to_string())).collect();
+        for (id, q) in cards {
+            if q.starts_with("rev:") {
+                continue;
+            }
+            match questions.iter().find(|(_, card)| card.as_deref() == Some(id.as_str())) {
+                Some((now_q, _)) if now_q.eq_ignore_ascii_case(&q) => {}
+                Some((now_q, _)) => {
+                    if let Some(d) = self.open.iter_mut().find(|d| d.id == id) {
+                        d.key = plan_key(plan, now_q);
+                        moved.push((id.clone(), q.clone(), now_q.clone()));
+                    }
+                }
+                // Its question is there (its card not written on it yet, or another's): it stays.
+                None if questions.iter().any(|(x, _)| x.eq_ignore_ascii_case(&q)) => {}
+                None => {
+                    if let Some(i) = self.open.iter().position(|d| d.id == id) {
+                        self.open[i].answer = gone_why.to_string();
+                    }
+                    if let Some(d) = self.close(&id, State::Stopped, now) {
+                        over.push(d);
+                    }
+                }
+            }
+        }
+        (moved, over)
+    }
+
     pub fn close(&mut self, id: &str, state: State, now: u64) -> Option<Decision> {
         let i = self.open.iter().position(|d| d.id == id)?;
         let mut d = self.open.remove(i);
