@@ -1450,6 +1450,7 @@ impl Book {
     /// card, and #116's raise stayed after the user merged it).
     fn settle_merge_raises(&mut self, prs: &[Pr], now: u64, ch: &mut Changes) {
         let mut over: Vec<(String, State, String, Option<String>)> = vec![];
+        let mut tracked: Vec<String> = vec![];
         for d in self.open.iter().filter(|d| matches!(d.kind, Kind::Raised | Kind::Choice) && d.why.trim().eq_ignore_ascii_case("merge") && d.key.starts_with("raise:")) {
             let Some(p) = raised_pr(d, prs) else { continue };
             if p.state == "merged" {
@@ -1458,6 +1459,15 @@ impl Book {
                 over.push((d.id.clone(), State::Stopped, "its PR was closed".into(), None));
             } else if let Some(m) = self.open.iter().find(|m| m.kind == Kind::Merge && m.prs.iter().any(|r| r.key.eq_ignore_ascii_case(&p.key()))) {
                 over.push((d.id.clone(), State::Stopped, format!("in the merge card {}", m.id), Some(m.id.clone())));
+            } else {
+                tracked.push(d.id.clone());
+            }
+        }
+        // A PR the tower tracks, with no merge card yet (its review runs): the raise waits for that card,
+        // however long the review takes; its time runs out only for a PR the tower doesn't know.
+        for id in tracked {
+            if let Some(h) = self.open.iter_mut().find(|d| d.id == id).and_then(|d| d.hold.as_mut()).filter(|h| h.by == "tower") {
+                h.expires_ms = None;
             }
         }
         for (id, state, why, into) in over {
@@ -1991,10 +2001,11 @@ impl Book {
             .iter()
             .filter_map(|d| {
                 let h = d.hold.as_ref()?;
-                match h.expires_ms {
-                    // The tower's own hold: only its time running out brings it back.
-                    Some(at) => (now >= at).then(|| (d.id.clone(), "its PR has no merge card yet, so it waits for you as it is".to_string())),
-                    None => d.update_since(&h.seen).map(|why| (d.id.clone(), why)),
+                match (h.expires_ms, h.by == "tower") {
+                    // The tower's own hold: only its time running out brings it back (none: its merge card will).
+                    (Some(at), _) => (now >= at).then(|| (d.id.clone(), "its PR has no merge card yet, so it waits for you as it is".to_string())),
+                    (None, true) => None,
+                    (None, false) => d.update_since(&h.seen).map(|why| (d.id.clone(), why)),
                 }
             })
             .collect();
@@ -3383,6 +3394,38 @@ mod tests {
 
     fn merge_raise(space: &str, session: &str, text: &str, detail: &str) -> Raise {
         Raise { space: Some(space.into()), who: who(session), why: "merge".into(), text: text.into(), detail: detail.into(), options: vec![] }
+    }
+
+    /// 19 Nov 20:26 (the user's screenshot): eyzflow opened release PR
+    /// #989, dev into main, its reviewer started, and the space's brain
+    /// raised "#989 … is ready for your merge … merge it from its chip in
+    /// the chat" at once: a card with no Merge button. Now the raise waits
+    /// for #989's merge card however long the review takes (the tower
+    /// tracks #989), and the only card is that merge card, with its button.
+    #[test]
+    fn a_release_prs_merge_is_asked_on_its_merge_card_once_its_review_lets_it() {
+        const SPACE: &str = "dashboard-date-format";
+        let mut b = Book::default();
+        let review = |status: &str| crate::reviews::Brief { status: status.into(), ..Default::default() };
+        let release = |status: &str| Pr { repo: "eyzhub/eyzflow".into(), review: Some(review(status)), ..pr(989, "main", "t1rc", SPACE, "passing") };
+        // Found, under review: no merge card yet.
+        assert!(b.sync_merges(&[release("reviewing")], MIN).fresh.is_empty());
+        let line = "Dashboard release PR #989 from dev into main is ready for your merge: it carries the day/month/year dates (#983, #985), a year filter fix (#987) and two Storybook-only fixes. Merge it from its chip in the chat to go live.";
+        let r = b.raise(merge_raise(SPACE, "t1rc", line, ""), MIN + 1_000);
+        assert!(r.fresh && b.find(&r.id).unwrap().held());
+        // The review takes long: the raise still waits, out of the queue, past its usual time.
+        b.sync_merges(&[release("reviewing")], 2 * MIN);
+        assert!(b.wake(MIN + RAISE_WAITS_MS + 10 * MIN).is_empty());
+        assert!(b.find(&r.id).unwrap().held());
+        assert_eq!(b.open.iter().filter(|d| !d.held()).count(), 0, "nothing in the queue while the review runs");
+        // The review agrees: #989's merge card, with its button; the raise goes into it.
+        let ch = b.sync_merges(&[release("agreed")], 20 * MIN);
+        assert_eq!(ch.fresh.len(), 1);
+        let card = b.find(&ch.fresh[0]).unwrap().clone();
+        assert_eq!((card.kind, card.prs.iter().map(|p| (p.number, p.base.clone())).collect::<Vec<_>>()), (Kind::Merge, vec![(989, "main".to_string())]));
+        assert!(card.options.iter().any(|o| o.label.starts_with("Merge ")), "{:?}", card.options);
+        assert_eq!(b.closed.iter().find(|c| c.id == r.id).map(|c| (c.state, c.answer.starts_with("in the merge card"))), Some((State::Stopped, true)));
+        assert_eq!(b.open.len(), 1);
     }
 
     /// 19 Nov 12:46–12:47 (found by t13z): the space's tower raised the

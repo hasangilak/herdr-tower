@@ -74,6 +74,9 @@ pub struct Decisions {
     /// another terminal (`carry_over`) before they leave them.
     gone: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     gone_grace_ms: u64,
+    /// PRs a session ended its turn on before their merge card was made
+    /// (under review): the user is told once, when that card comes.
+    tell_on_card: Arc<Mutex<std::collections::BTreeSet<String>>>,
 }
 
 fn in_muted(d: &Decision, muted: &[String]) -> bool {
@@ -93,6 +96,7 @@ impl Decisions {
             judge: None,
             gone: Arc::default(),
             gone_grace_ms: crate::reopen::GRACE_MS,
+            tell_on_card: Arc::default(),
         }
     }
 
@@ -291,8 +295,35 @@ impl Decisions {
 
     /// The PRs as they are now: those waiting for a merge are one decision per repo and space.
     pub fn sync_prs(&self, prs: &[Pr]) {
-        self.round("a merge", |b, now| b.sync_merges(prs, now));
+        let ch = self.round("a merge", |b, now| b.sync_merges(prs, now));
+        self.tell_new_merges(&ch.fresh);
+        // A PR that merged or closed meanwhile is told of no more.
+        lock(&self.tell_on_card).retain(|k| prs.iter().any(|p| p.key() == *k && p.open()));
         self.weigh(prs);
+    }
+
+    /// Merge cards just made for PRs a session ended its turn on before
+    /// their card could be (`tell_on_card`): each is said once, now, as a
+    /// raise is, with its first PR's session.
+    fn tell_new_merges(&self, fresh: &[String]) {
+        for id in fresh {
+            let Some(d) = self.get(id).filter(|d| d.kind == decisions::Kind::Merge) else { continue };
+            let waited = {
+                let mut later = lock(&self.tell_on_card);
+                let had = d.prs.iter().any(|p| later.contains(&p.key));
+                for p in &d.prs {
+                    later.remove(&p.key);
+                }
+                had
+            };
+            if waited && self.tells(std::slice::from_ref(&d.id), true) {
+                let name = d.sessions.first().map(|w| w.name.clone()).unwrap_or_default();
+                let line = decisions::said(&name, &d.title, None);
+                if let Some(say) = self.back.get() {
+                    say(&d, &line);
+                }
+            }
+        }
     }
 
     /// The PRs that merged in a held decision's space since it was held
@@ -629,7 +660,14 @@ impl Decisions {
     pub fn tells_merge(&self, prs: &[Pr], loud: bool) -> bool {
         let ids = self.for_prs(prs);
         if ids.is_empty() {
-            return loud && !(self.level)().quiet();
+            // Telling everything: said now, as it always was.
+            if !(self.level)().quiet() {
+                return loud;
+            }
+            // No merge card yet (its review runs, it isn't ready): the user is told once, when the card comes.
+            let mut later = lock(&self.tell_on_card);
+            later.extend(prs.iter().filter(|p| p.open()).map(|p| p.key()));
+            return false;
         }
         self.tells(&ids, loud)
     }
@@ -1115,7 +1153,8 @@ impl Decisions {
 /// A decision that is over, written down (kind `decision`, for the record).
 /// The open decisions on hold as the state carries them, newest hold first.
 fn held_views(book: &Book, muted: &[String]) -> Vec<Value> {
-    let mut held: Vec<&Decision> = book.open.iter().filter(|d| d.held()).collect();
+    // The tower's own holds (a merge raise waiting for its merge card) are no one's to see: the card is what shows.
+    let mut held: Vec<&Decision> = book.open.iter().filter(|d| d.held() && d.hold.as_ref().is_none_or(|h| h.by != "tower")).collect();
     held.sort_by_key(|d| std::cmp::Reverse(d.hold.as_ref().map(|h| h.since_ms).unwrap_or(0)));
     held.into_iter().map(|d| d.view(in_muted(d, muted))).collect()
 }
@@ -1706,5 +1745,39 @@ mod live {
         let no = judge_merged(words, &pr(832, "Fix a typo in the README", "chore/readme-typo"));
         eprintln!("took {} ms: the filters PR {yes:?}, the typo PR {no:?}", started.elapsed().as_millis());
         assert_eq!((yes, no), (Some(true), Some(false)));
+    }
+
+    /// The user is told of a PR's merge once, when its merge card comes:
+    /// a turn that ends on the PR while its review runs (no card yet) says
+    /// nothing; the card, made later, is said once.
+    #[test]
+    fn a_merge_is_told_once_when_its_card_comes() {
+        let shared = Shared::new(crate::daemon::state::State::new("off", "test", "test"));
+        let d = Decisions::new(shared);
+        let heard: Arc<Mutex<Vec<String>>> = Arc::default();
+        let said = heard.clone();
+        d.on_back(move |_, line| said.lock().unwrap().push(line.to_string()));
+        let pr = |status: &str| Pr {
+            repo: "eyzhub/eyzflow".into(),
+            number: 989,
+            base: "main".into(),
+            state: "open".into(),
+            session: "t1rc".into(),
+            name: "eyzflow".into(),
+            space: Some("dashboard-date-format".into()),
+            waiting: true,
+            found_ms: 1_000,
+            review: Some(crate::reviews::Brief { status: status.into(), ..Default::default() }),
+            ..Default::default()
+        };
+        d.sync_prs(&[pr("reviewing")]);
+        assert!(!d.tells_merge(&[pr("reviewing")], true), "no card yet: not told at the turn's end");
+        assert!(heard.lock().unwrap().is_empty());
+        d.sync_prs(&[pr("agreed")]);
+        assert_eq!(heard.lock().unwrap().len(), 1, "told once, as its card comes");
+        assert!(heard.lock().unwrap()[0].contains("Merge PR #989 into main"), "{:?}", heard.lock().unwrap());
+        d.sync_prs(&[pr("agreed")]);
+        assert!(!d.tells_merge(&[pr("agreed")], true), "the card was said already");
+        assert_eq!(heard.lock().unwrap().len(), 1);
     }
 }
