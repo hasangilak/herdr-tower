@@ -467,6 +467,11 @@ pub struct Decision {
     /// to their sessions (`Act::PrNote`), oldest first. The card stays open.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<PrNote>,
+    /// An account-wide decision's (`account_key`): what each session is told
+    /// when the user settles it (its address: its own raise's pick, as "re-run
+    /// gh run 446… for #992"); a session with none hears what to do in general.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub follow_ups: BTreeMap<String, String>,
 }
 
 /// More the user asked for on a merge card's PRs, sent to their sessions.
@@ -795,6 +800,13 @@ pub fn account_cause(text: &str, detail: &str) -> Option<String> {
         return None;
     };
     Some(format!("{provider}:{cause}"))
+}
+
+/// What choosing a raise's own pick tells its session: that option's words (else its label).
+fn pick_text(options: &[Opt]) -> Option<String> {
+    let o = options.iter().find(|o| o.pick).or(options.first())?;
+    let t = if o.text.trim().is_empty() { o.label.trim() } else { o.text.trim() };
+    (!t.is_empty()).then(|| t.to_string())
 }
 
 /// One decision for an account-wide cause, across every space (`account_cause`).
@@ -1296,6 +1308,13 @@ impl Book {
                     if !k.sessions.iter().any(|s| s.address == w.address) {
                         k.sessions.push(w.clone());
                     }
+                    // Its own card's pick is what it is told when it is settled.
+                    if let Some(t) = pick_text(&o.options) {
+                        k.follow_ups.entry(w.address.clone()).or_insert(t);
+                    }
+                }
+                for (a, t) in &o.follow_ups {
+                    k.follow_ups.entry(a.clone()).or_insert_with(|| t.clone());
                 }
                 k.count += o.count;
                 k.last_ms = k.last_ms.max(o.last_ms);
@@ -1709,6 +1728,12 @@ impl Book {
             if account.is_some() && space_part(d.space.as_deref()) != space_part(r.space.as_deref()) {
                 d.space = None;
             }
+            // What this session is to be told when it is settled: its own pick.
+            if account.is_some()
+                && let (Some(w), Some(t)) = (r.who.as_ref(), pick_text(&r.options))
+            {
+                d.follow_ups.insert(w.address.clone(), t);
+            }
             // A merge's or a question's sessions are its PRs' and its sets'.
             if !d.kind.asks()
                 && d.kind != Kind::Merge
@@ -1734,7 +1759,12 @@ impl Book {
             return Raised { id, fresh: false, folded: true, count: 1, waiting: 0 };
         }
         let merge = r.why.trim().eq_ignore_ascii_case("merge") && merge_subject(&r.text, &r.detail) != Subject::None;
+        let follow_ups: BTreeMap<String, String> = match (&account, r.who.as_ref(), pick_text(&r.options)) {
+            (Some(_), Some(w), Some(t)) => [(w.address.clone(), t)].into(),
+            _ => BTreeMap::new(),
+        };
         let mut d = Decision {
+            follow_ups,
             key,
             kind: if r.options.is_empty() { Kind::Raised } else { Kind::Choice },
             space: r.space,
@@ -2215,6 +2245,8 @@ pub enum Act {
     Accounts { wait: bool, label: String },
     /// A plan's question is answered: written into the plan.
     Plan { plan: String, question: String, answer: String, label: String },
+    /// Each session its own words (an account-wide decision settled: each re-runs its own PR's CI).
+    SendEach { to: Vec<(Who, String)>, label: String },
     /// More for a merge card's PRs: each session gets its PRs' message (address, text); the card stays open for the merge.
     PrNote { to: Vec<(String, String)>, prs: Vec<String>, text: String },
 }
@@ -2391,6 +2423,25 @@ pub fn act(d: &Decision, body: &Value, submit: bool) -> Result<Act> {
             if to.is_empty() || d.why == "review" {
                 to = d.sessions.clone();
             }
+            // One account-wide cause, many sessions: an option's words were one session's (its PR, its run).
+            if d.key.starts_with("account:") && choice.is_some() {
+                let n = choice.unwrap_or(0);
+                let settled = d.options.iter().position(|o| o.pick).unwrap_or(0) == n;
+                let each = to
+                    .into_iter()
+                    .map(|w| {
+                        let words = match d.follow_ups.get(&w.address) {
+                            Some(own) if settled => own.clone(),
+                            _ if settled => format!(
+                                "About \"{about}\": the user settled it ({label}). Re-run your own PR's CI checks that didn't start (`gh run rerun <its run id> --repo <its repo>`), wait until they are green, and report the result."
+                            ),
+                            _ => format!("About \"{about}\": the user decided: {label}."),
+                        };
+                        (w, words)
+                    })
+                    .collect();
+                return Ok(Act::SendEach { to: each, label });
+            }
             Ok(Act::Send { to, text, label })
         }
         Kind::Failed => {
@@ -2503,11 +2554,25 @@ mod tests {
         let d = &b.open[0];
         assert_eq!(d.sessions.iter().map(|w| w.address.as_str()).collect::<Vec<_>>(), ["t1sv", "t1nt", "t1sx"]);
         assert_eq!((d.space.clone(), d.count, d.kind, d.options.len()), (None, 3, Kind::Choice, 2), "every space's, with the answers one of them offered");
-        // Its answer goes to every waiting session.
-        match act(d, &json!({ "choice": 0 }), true).unwrap() {
-            Act::Send { to, text, .. } => assert_eq!((to.len(), text.as_str()), (3, "Billing is fixed: re-run your PR's checks.")),
-            other => panic!("{other:?}"),
+        // The space with eyzflow #993 waits on it too: its session raises it with its own re-run.
+        let own = |t: &str| vec![Opt { label: "I fixed billing: re-run the check".into(), pick: true, text: t.into(), ..Default::default() }, Opt { label: "Leave it for now".into(), ..Default::default() }];
+        let rerun993 = "Billing is sorted: re-run CI with gh run rerun 44602011182 --repo eyzhub/eyzflow, wait until every check on PR #993 is green, and report the result.";
+        let joined = b.raise(raise("dashboard-date-format › bug-german-abgeschlossen", "t1t8", "GitHub Actions won't start eyzflow PR #993's CI: payments failed or the spending limit is reached", "", own(rerun993)), 4);
+        assert_eq!(joined.id, a.id);
+        let d = &b.open[0];
+        assert_eq!(d.sessions.len(), 4);
+        // Settled ("I fixed billing"): each waiting session hears its own re-run; one that gave none, what to do with its own PR.
+        let Act::SendEach { to, label } = act(d, &json!({ "choice": 0 }), true).unwrap() else { panic!("each its own") };
+        let said: BTreeMap<&str, &str> = to.iter().map(|(w, t)| (w.address.as_str(), t.as_str())).collect();
+        assert_eq!(label, "I fixed billing: re-run the check");
+        assert_eq!(said["t1t8"], rerun993);
+        assert_eq!(said["t1sx"], "Billing is fixed: re-run your PR's checks.", "its own raise's pick");
+        for w in ["t1sv", "t1nt"] {
+            assert!(said[w].contains("Re-run your own PR's CI checks that didn't start") && !said[w].contains("44602011182"), "{w}: {}", said[w]);
         }
+        // Left for now: the same plain word to each, no one's run.
+        let Act::SendEach { to, .. } = act(d, &json!({ "choice": 1 }), true).unwrap() else { panic!() };
+        assert!(to.iter().all(|(_, t)| t.ends_with("the user decided: Leave it for now.")));
         // Three cards from before (each under its own space's key): folded into the oldest when the tower loads.
         let mut old = Book::default();
         for (n, (sp, who, t, dt)) in [first, second, third].into_iter().enumerate() {
@@ -2527,6 +2592,8 @@ mod tests {
         }
         let keep = old.open[0].id.clone();
         let folded = old.fold_account_wide(100);
+        // What the folded cards' own sessions are told when it's settled: their own pick (t1sx's, here).
+        assert_eq!(old.open[0].follow_ups.get("t1sx").map(String::as_str), Some("Billing is fixed: re-run your PR's checks."));
         assert_eq!(folded.len(), 1);
         assert_eq!((folded[0].0.as_str(), folded[0].1.len()), (keep.as_str(), 2));
         assert_eq!(old.open.len(), 1);

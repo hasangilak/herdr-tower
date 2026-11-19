@@ -944,6 +944,20 @@ impl Decisions {
                 let rule = rule_view(&d, said.as_deref().unwrap_or(""));
                 Ok(json!({ "ok": true, "id": id, "state": state.word(), "answered": answered, "errors": errors, "rule": rule }))
             }
+            Act::SendEach { to, label } => {
+                let (mut sent, mut errors) = (vec![], vec![]);
+                for (w, text) in &to {
+                    match (with.send)(&w.address, text) {
+                        Ok(v) => sent.push(v),
+                        Err(e) => errors.push(format!("{}: {e:#}", w.address)),
+                    }
+                }
+                if sent.is_empty() && !to.is_empty() {
+                    return Err(Refused::Failed(format!("its answer couldn't be sent: {}", errors.join("; "))));
+                }
+                self.answered(id, &label);
+                Ok(json!({ "ok": true, "id": id, "state": "answered", "answer": label, "sent": sent, "errors": errors }))
+            }
             Act::Send { to, text, label } => {
                 let (mut sent, mut errors) = (vec![], vec![]);
                 for w in &to {
