@@ -59,7 +59,7 @@ pub(super) fn todo_tools_line(on: bool) -> &'static str {
 /// What the auto-merge switch means, in a line.
 pub(super) fn auto_merge_line(on: bool) -> &'static str {
     if on {
-        "The tower merges a PR into dev itself when its plan predicted it, it is scored low risk (no migration, no breaking change, nothing on the escalate list, read again on its own files), its checks pass and its reviewer found nothing. Anything that needs review, and every merge into main or prod, still comes to you."
+        "The tower merges a PR into dev itself when it is scored low risk (no migration, no breaking change, nothing on the escalate list, read again on its own files), its validation passed (its plan's checks, or those its session reported), its CI checks pass and its reviewer found nothing. Anything that needs review, failing or missing checks, and every merge into main or prod, still comes to you."
     } else {
         "Off: every PR comes to you to merge. On, the tower merges low-risk PRs into dev itself once their checks pass and their reviewer found nothing; anything that needs review, and every merge into main or prod, still comes to you."
     }

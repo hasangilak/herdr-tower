@@ -405,7 +405,16 @@ pub fn run() -> Result<()> {
             if pr.session.is_empty() {
                 return;
             }
-            let note = crate::prscore::unreported_note(pr, missing, &crate::config::tower_bin().display().to_string());
+            let tower = crate::config::tower_bin().display().to_string();
+            // None missing: a PR no plan predicted, with no validation reported (only while auto-merge can use it).
+            let note = if missing.is_empty() {
+                if !crate::config::Config::live().prs.auto_merge_low_risk {
+                    return;
+                }
+                crate::prscore::unvalidated_note(pr, &tower)
+            } else {
+                crate::prscore::unreported_note(pr, missing, &tower)
+            };
             if let Err(e) = sendq.add_note(&pr.session, &note) {
                 eprintln!("[prs] {}: couldn't tell {} about its unreported checks: {e:#}", pr.key(), pr.session);
             }
