@@ -1473,6 +1473,19 @@ impl Daemon {
         // It waits on this unless it works on something else meanwhile.
         let waiting = t.as_ref().is_none_or(|t| crate::hc::status(t) != crate::hc::SessionStatus::Working);
         let who = live.then(|| crate::decisions::Who { waiting, ..crate::decisions::Who::new(&address, &name) });
+        // A merge it asks for of a PR it links to: that PR is the tower's to track (as its turn's end
+        // would have found it; a session that keeps a background shell never seemed to end one), so
+        // the user gets its merge card, and the raise goes into it or ends with the PR.
+        let merge = why.trim().eq_ignore_ascii_case("merge");
+        if merge
+            && live
+            && let Some(store) = crate::prs::daemon()
+        {
+            let linked = crate::decisions::merge_links(&text, detail);
+            if !linked.is_empty() {
+                store.mentioned(&linked, &address, &name, space.as_deref(), true);
+            }
+        }
         let (raised, d, told) =
             self.decisions.raise(crate::decisions::Raise { space: space.clone(), who, why: why.trim().to_string(), text: text.clone(), detail: crate::hc::clean(detail), options: choices });
         let entry = crate::history::Entry {
@@ -1490,9 +1503,14 @@ impl Daemon {
             ..Default::default()
         };
         crate::history::later(move || crate::history::append(entry));
+        // Its PR merged or closed already, or has its merge card: settled now, not at the PR's next change.
+        if merge && let Some(store) = crate::prs::daemon() {
+            sync_merges(&self.decisions, store);
+        }
+        let settled = self.decisions.get(&raised.id).filter(|d| d.closed_ms.is_some()).map(|d| d.answer);
         // What is asked, and what the tower would pick.
         let pick = d.pick().filter(|_| raised.fresh).map(|o| o.label.clone());
-        let told = told && self.watches.raise(&address, &crate::decisions::said(&name, &text, pick.as_deref()));
+        let told = told && settled.is_none() && self.watches.raise(&address, &crate::decisions::said(&name, &text, pick.as_deref()));
         eprintln!(
             "[tell] raised for the user ({why}) about {address}: {text} ({}, {})",
             raised.id,
@@ -1503,7 +1521,7 @@ impl Daemon {
             error: None,
             state: Some(serde_json::json!({
                 "raised": true, "id": raised.id, "new": raised.fresh, "folded": raised.folded, "kind": d.kind.word(), "title": d.title, "detail": d.detail,
-                "count": raised.count, "waiting": raised.waiting, "session": address, "name": name, "space": space, "why": why, "told": told,
+                "count": raised.count, "waiting": raised.waiting, "session": address, "name": name, "space": space, "why": why, "told": told, "settled": settled,
             })),
         }
     }
