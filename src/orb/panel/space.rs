@@ -647,7 +647,10 @@ impl Panel {
         items.extend(self.resolve_card(name, cx));
         // Where it is at, in a few lines (`crate::briefs`), and how it read before.
         if let Some(b) = &m.brief {
-            items.push(self.brief_card(name, b, cx));
+            // What "Needs you" below shows (its cards, and those on hold): the brief doesn't say it again.
+            let mut below: Vec<String> = all.iter().filter(|d| d.live() && d.in_space(name)).map(|d| d.title.clone()).collect();
+            below.extend(self.held_decisions(cx).into_iter().filter(|d| d.in_space(name)).map(|d| d.title));
+            items.push(self.brief_card(name, b, &below, cx));
         }
         let editing_goal = self.full.as_ref().and_then(|f| f.edit.as_ref()).is_some_and(|e| e.space == name);
         if !m.standing && !m.goal.trim().is_empty() && !editing_goal {
@@ -868,12 +871,12 @@ impl Panel {
 impl Panel {
     /// "Where we are": a space's brief, a line per part (waits in amber,
     /// risks in rose), when it last changed, and its earlier versions on request.
-    fn brief_card(&mut self, space: &str, b: &crate::briefs::SpaceBrief, cx: &mut Context<Self>) -> AnyElement {
+    fn brief_card(&mut self, space: &str, b: &crate::briefs::SpaceBrief, below: &[String], cx: &mut Context<Self>) -> AnyElement {
         let g = glass();
         let key = format!("space:{space}");
         let open = self.full.as_ref().is_some_and(|f| f.briefs_open.contains(&key));
         let mut col = v_flex().gap(px(5.0)).w_full();
-        for (label, text) in crate::briefs::space_lines(b) {
+        for (label, text) in crate::briefs::space_lines_above(b, below) {
             // Its goal is in the goal card just below: here its stage.
             let (label, text) = if label == "Goal" { ("Stage", b.stage.clone()) } else { (label, text) };
             let colour = match label {

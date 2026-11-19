@@ -65,6 +65,8 @@ pub struct SpaceBrief {
     pub stage: String,
     pub done: Vec<String>,
     pub doing: Vec<String>,
+    /// The sessions at work, by name (`doing`'s, in its order).
+    pub working: Vec<String>,
     pub next: Vec<String>,
     pub waits: Vec<String>,
     pub risks: Vec<String>,
@@ -254,14 +256,16 @@ pub fn space(f: &SpaceFacts) -> SpaceBrief {
     if let Some(r) = f.release.as_deref().filter(|r| !r.is_empty()) {
         stage = format!("{stage}; release {r}");
     }
-    // What was done lately, each in its session's words, the newest first.
-    let done: Vec<String> = tasks
-        .iter()
-        .rev()
-        .filter(recent)
-        .filter(|t| t.state == TaskState::Verified)
-        .map(|t| if t.name.is_empty() { clip(&outcome(t), 110) } else { format!("{}: {}", t.name, clip(&outcome(t), 110)) })
-        .collect();
+    // What was done lately, each in its session's words, the newest first;
+    // its session named once for a run of its own ("a: x; y", not "a: x; a: y").
+    let mut done: Vec<String> = vec![];
+    let mut last = None;
+    for t in tasks.iter().rev().filter(recent).filter(|t| t.state == TaskState::Verified) {
+        let what = clip(&outcome(t), 110);
+        done.push(if t.name.is_empty() || last == Some(t.name.as_str()) { what } else { format!("{}: {what}", t.name) });
+        last = Some(t.name.as_str());
+    }
+    done.dedup();
     // Who works on what: its task when its "now" only says it works on it.
     let doing: Vec<String> = f
         .sessions
@@ -272,6 +276,7 @@ pub fn space(f: &SpaceFacts) -> SpaceBrief {
             format!("{n}: {}", clip(&what, 120))
         })
         .collect();
+    let working: Vec<String> = f.sessions.iter().filter(|(_, _, w)| *w).map(|(n, _, _)| n.clone()).collect();
     let next: Vec<String> = tasks.iter().filter(|t| t.state == TaskState::Queued).map(|t| title(t)).collect();
     let mut waits = f.waits.clone();
     waits.extend(tasks.iter().rev().filter(|t| t.state == TaskState::Blocked && !t.question.is_empty()).map(|t| clip(&t.question, 120)));
@@ -279,7 +284,7 @@ pub fn space(f: &SpaceFacts) -> SpaceBrief {
     let mut risks: Vec<String> = tasks.iter().rev().filter(recent).filter(|t| matches!(t.state, TaskState::Stalled | TaskState::Failed)).map(|t| why_line(t)).collect();
     risks.extend(f.pr_risks.iter().cloned());
     let goal = if f.goal.trim().is_empty() { String::new() } else { clip(f.goal.trim(), 200) };
-    let mut s = SpaceBrief { goal, stage, done, doing, next, waits, risks, ..Default::default() };
+    let mut s = SpaceBrief { goal, stage, done, doing, working, next, waits, risks, ..Default::default() };
     s.text = space_text(&s);
     s
 }
@@ -303,6 +308,37 @@ pub fn space_lines(s: &SpaceBrief) -> Vec<(&'static str, String)> {
         parts.push(("Risks", list(&s.risks, 2)));
     }
     parts
+}
+
+/// The lines as the Mac's space view shows them, where each session's row
+/// (with what it is doing) and the cards in "Needs you" (`below`: their
+/// titles) are right under the brief: "In progress" names who is at work,
+/// and "Waiting for you" lists only what isn't one of those cards, never
+/// the same words twice on one screen.
+pub fn space_lines_above(s: &SpaceBrief, below: &[String]) -> Vec<(&'static str, String)> {
+    let shown: Vec<String> = below.iter().map(|t| crate::decisions::normalise(t)).collect();
+    let (carded, rest): (Vec<&String>, Vec<&String>) = s.waits.iter().partition(|w| shown.contains(&crate::decisions::normalise(w)));
+    space_lines(s)
+        .into_iter()
+        .filter_map(|(l, t)| match l {
+            "In progress" if !s.working.is_empty() => Some((l, names(&s.working))),
+            "Waiting for you" if !carded.is_empty() => {
+                let here = format!("{} in Needs you below", carded.len());
+                let rest: Vec<String> = rest.iter().map(|w| w.to_string()).collect();
+                Some((l, if rest.is_empty() { here } else { format!("{}; and {here}", list(&rest, 2)) }))
+            }
+            _ => Some((l, t)),
+        })
+        .collect()
+}
+
+/// "a", "a and b", "a, b and c".
+fn names(v: &[String]) -> String {
+    match v {
+        [] => String::new(),
+        [a] => a.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
 }
 
 fn space_text(s: &SpaceBrief) -> String {
@@ -503,6 +539,7 @@ pub fn cmd_brief(what: &str, history: bool, json: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     const MIN: u64 = 60_000;
 
@@ -583,6 +620,52 @@ mod tests {
         let calm = space(&SpaceFacts { sessions: vec![("mediaroom".into(), &idle, false)], ..facts });
         assert_eq!(space_stable(&b), space_stable(&calm));
         assert!(calm.text.contains("Nobody is working now."));
+    }
+
+    #[test]
+    fn a_spaces_brief_never_says_the_same_thing_twice() {
+        // Three done by one session, one by another: each session named once for its run.
+        let done = |id: &str, name: &str, said: &str, at: u64| {
+            let mut t = task(id, "a title", TaskState::Verified, at);
+            (t.name, t.said) = (name.into(), said.into());
+            t
+        };
+        let a = done("a1.1", "herder tower", "The note now goes out once per space.", 10 * MIN);
+        let b = done("a1.2", "herder tower", "The finding's text no longer counts as a request.", 20 * MIN);
+        let c = done("a1.3", "phone ux", "The queue shows one card at a time.", 30 * MIN);
+        let d = done("a1.4", "herder tower", "The third case is fixed and installed.", 35 * MIN);
+        let working = SessionBrief { now: "step 2 of 4: hooking into sync_merges · 3 min in".into(), ..Default::default() };
+        let other = SessionBrief { now: "working on it · 25 s in".into(), ..Default::default() };
+        let facts = SpaceFacts {
+            goal: "",
+            state: "open",
+            standing: true,
+            sessions: vec![("herder tower".into(), &working, true), ("phone ux".into(), &other, true)],
+            tasks: vec![&a, &b, &c, &d],
+            waits: vec!["Merge PR #839 into dev?".into(), "Ship #1408 to prod?".into(), "Sign in on the preview".into()],
+            pr_risks: vec![],
+            release: None,
+            now: 40 * MIN,
+        };
+        let s = space(&facts);
+        assert_eq!(
+            s.done,
+            [
+                "herder tower: The third case is fixed and installed.",
+                "phone ux: The queue shows one card at a time.",
+                "herder tower: The finding's text no longer counts as a request.",
+                "The note now goes out once per space.",
+            ]
+        );
+        assert_eq!(s.working, ["herder tower", "phone ux"]);
+        // On the Mac, right above the sessions' rows and the "Needs you" cards: who works, and only what no card says.
+        let above: BTreeMap<&str, String> = space_lines_above(&s, &["Merge PR #839 into dev?".into(), "ship #1408 to prod".into()]).into_iter().collect();
+        assert_eq!(above["In progress"], "herder tower and phone ux");
+        assert_eq!(above["Waiting for you"], "Sign in on the preview; and 2 in Needs you below");
+        let all_carded: BTreeMap<&str, String> = space_lines_above(&s, &facts.waits).into_iter().collect();
+        assert_eq!(all_carded["Waiting for you"], "3 in Needs you below");
+        // Elsewhere (the phone, the brain's `tower brief`), the brief says them in full.
+        assert!(s.text.contains("In progress: herder tower: step 2 of 4: hooking into sync_merges") && s.text.contains("Waiting for you: Merge PR #839 into dev?; Ship #1408 to prod? (and 1 more)"), "{}", s.text);
     }
 
     #[test]
