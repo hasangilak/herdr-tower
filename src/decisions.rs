@@ -388,6 +388,10 @@ pub struct Decision {
     /// What it was answered with, once it was.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub answer: String,
+    /// Who answered it (`mac`, `phone:<device>`, the terminal that ran
+    /// `tower answer`), once someone did: empty when the tower settled it.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub by: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub closed_ms: Option<u64>,
     /// On hold (see `Hold`); None: it waits for the user.
@@ -500,6 +504,7 @@ impl Decision {
             "state": self.state.word(),
             // Once it is over: what it was answered with (or why it ended), and when.
             "answer": Some(self.answer.as_str()).filter(|a| !a.is_empty()),
+            "by": Some(self.by.as_str()).filter(|b| !b.is_empty()),
             "closed_ms": self.closed_ms,
             "muted": muted,
             "hold": self.hold.as_ref().map(|h| json!({ "reason": h.reason, "by": h.by, "since_ms": h.since_ms, "until_prs": h.until_prs })),
@@ -514,6 +519,7 @@ impl Decision {
         // One that is over: how, and with what.
         let over = match (self.closed_ms, self.answer.trim()) {
             (Some(_), "") => format!("  -> {}", self.state.word()),
+            (Some(_), a) if !self.by.is_empty() => format!("  -> {}: {} (by {})", self.state.word(), clip(a, 80), self.by),
             (Some(_), a) => format!("  -> {}: {}", self.state.word(), clip(a, 80)),
             _ => String::new(),
         };
@@ -1063,6 +1069,13 @@ impl Book {
     pub fn note_answer(&mut self, id: &str, with: &str) {
         if let Some(d) = self.open.iter_mut().chain(self.closed.iter_mut()).find(|d| d.id == id) {
             d.answer = with.trim().to_string();
+        }
+    }
+
+    /// Who is answering `id` (`Decision::by`), kept as it closes.
+    pub fn note_by(&mut self, id: &str, by: &str) {
+        if let Some(d) = self.open.iter_mut().find(|d| d.id == id) {
+            d.by = by.trim().to_string();
         }
     }
 

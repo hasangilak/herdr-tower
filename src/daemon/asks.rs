@@ -1373,8 +1373,9 @@ impl Asks {
     }
 
     /// A PR was merged: the open questions of its space's sessions that are
-    /// about it (they name `#<n>` or its link: "Close release PR #786 into
-    /// main, or leave it open?") are settled, and their decisions with them.
+    /// about it (`about_pr`: each question names `#<n>` or its link: "Close
+    /// release PR #786 into main, or leave it open?") are settled, and their
+    /// decisions with them. Any other open decision stays as it is.
     pub fn settled_by_merge(&self, pr: &crate::prs::Pr, by: &str) -> Vec<String> {
         let what = format!("PR #{} was merged{}", pr.number, if by == "github" { " on GitHub" } else { "" });
         let about: Vec<(String, String)> = {
@@ -1382,7 +1383,7 @@ impl Asks {
             i.sets
                 .iter()
                 .filter(|s| s.session == pr.session || (pr.space.is_some() && s.space == pr.space))
-                .filter(|s| names_pr(&serde_json::to_string(s).unwrap_or_default(), &pr.repo, pr.number))
+                .filter(|s| about_pr(s, &pr.repo, pr.number))
                 .map(|s| (s.session.clone(), s.id.clone()))
                 .collect()
         };
@@ -2362,6 +2363,22 @@ pub fn detect(address: &str) -> Option<QuestionSet> {
 
 /// `text` names PR `number` of `repo`: its link, or `#<number>` as a word
 /// ("#786", not "#7860"); the repo's link names that repo only.
+/// A question set a merge of `repo#number` settles: each of its questions
+/// still open names the PR in what it asks (its title, for a set with no
+/// question of its own). What its options, its detail or the session's
+/// message mention in passing doesn't make it the PR's: 19 Nov, t1mv's
+/// dialog asked "Release scope" (#1578, #1574; one option said "#1580 if you
+/// include it") and "File order" (#1580), and #1580's merge settled both,
+/// so the release question left the user's queue while the dialog waited
+/// on its screen.
+pub fn about_pr(set: &QuestionSet, repo: &str, number: u64) -> bool {
+    let open: Vec<&str> = set.tabs.iter().filter(|t| !t.answered).map(|t| t.question.trim()).filter(|q| !q.is_empty()).collect();
+    if open.is_empty() {
+        return set.tabs.iter().all(|t| t.answered || t.question.trim().is_empty()) && names_pr(&set.title, repo, number);
+    }
+    open.iter().all(|q| names_pr(q, repo, number))
+}
+
 pub fn names_pr(text: &str, repo: &str, number: u64) -> bool {
     let n = number.to_string();
     if text.contains(&format!("github.com/{repo}/pull/{n}")) && !text.contains(&format!("github.com/{repo}/pull/{n}0")) {
@@ -2539,6 +2556,115 @@ mod tests {
         }
         std::thread::sleep(std::time::Duration::from_millis(30));
         t.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// t1mv's release dialog of 19 Nov: two questions, only the second about #1580.
+    fn release_dialog() -> QuestionSet {
+        let tab = |title: &str, question: &str, options: &[(&str, &str)]| questions::Tab {
+            title: title.into(),
+            question: question.into(),
+            options: options.iter().map(|(l, d)| questions::Opt { label: (*l).into(), description: (*d).into(), ..Default::default() }).collect(),
+            allows_other: true,
+            ..Default::default()
+        };
+        QuestionSet {
+            id: "q25704bc7466f".into(),
+            session: "t1mv".into(),
+            name: "eyz mediaroom serverles".into(),
+            kind: "claude-ask".into(),
+            title: "2 questions: Release scope, File order".into(),
+            detail: "dev holds more than the support attachments (#1578, #1580, #1574)".into(),
+            space: Some("support-chat-attachments".into()),
+            status: "pending".into(),
+            tabs: vec![
+                tab(
+                    "Release scope",
+                    "MediaRoom's dev is 2 PRs ahead of production (main). Besides the support attachments (#1578), dev also carries Kianrad's #1574. What should the release carry?",
+                    &[("Attachments only", "A release branch from main with only #1578 (and #1580 if you include it) cherry-picked"), ("All of dev", "#1574 and #1578 together")],
+                ),
+                tab("File order", "Should #1580, the file-order fix, go in too?", &[("Include #1580", ""), ("Leave it out", "")]),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_merge_settles_only_questions_wholly_about_its_pr() {
+        let (repo, other) = ("eyzhub/eyz-mediaroom-serverless", "eyzhub/eyzflow");
+        // Two questions, one of them about #1580 (its options name #1580 too): not #1580's to settle.
+        let set = release_dialog();
+        assert!(!about_pr(&set, repo, 1580), "the release scope isn't about #1580");
+        // Once the release scope is answered there, what is left is #1580's.
+        let mut rest = set.clone();
+        rest.tabs[0].answered = true;
+        assert!(about_pr(&rest, repo, 1580));
+        // One question about the PR: settled by its merge, as before.
+        let one = QuestionSet { tabs: vec![questions::Tab { question: "Close release PR #786 into main, or leave it open?".into(), ..Default::default() }], ..set.clone() };
+        assert!(about_pr(&one, other, 786) && !about_pr(&one, other, 787));
+        // Named only in its options, or in the session's message: not about it.
+        let passing = QuestionSet {
+            detail: "after https://github.com/eyzhub/eyzflow/pull/786".into(),
+            tabs: vec![questions::Tab { question: "Which test viewer address?".into(), options: vec![questions::Opt { label: "after #786".into(), ..Default::default() }], ..Default::default() }],
+            ..set.clone()
+        };
+        assert!(!about_pr(&passing, other, 786));
+        // A set with no question of its own goes by its title.
+        let titled = QuestionSet { title: "Merge #786 now?".into(), tabs: vec![], ..set };
+        assert!(about_pr(&titled, other, 786));
+    }
+
+    /// The report: two decisions in one space, one a PR's merge card. The
+    /// user merges that PR: its card is over, merged; the other (a session's
+    /// dialog, and a raised choice) stays open.
+    #[test]
+    fn a_merge_in_a_space_settles_only_its_own_card() {
+        let (a, d, _) = deciding(|| crate::tell::Level::Decisions);
+        let space = "support-chat-attachments";
+        let set = release_dialog();
+        a.upsert(set.clone());
+        // The user's to answer: its card is in the queue.
+        a.escalate(&set.id, "the release scope is the user's");
+        a.publish();
+        let raised = d.raise(crate::decisions::Raise {
+            space: Some(space.into()),
+            who: Some(crate::decisions::Who::new("t1mv", "eyz mediaroom serverles")),
+            why: "deploy".into(),
+            text: "MediaRoom's production release: ship only the support attachments, or all of dev?".into(),
+            detail: "#1580 is merged into dev, so it would be in either release.".into(),
+            options: vec![crate::decisions::Opt { label: "Attachments only".into(), ..Default::default() }, crate::decisions::Opt { label: "All of dev".into(), ..Default::default() }],
+        })
+        .0
+        .id;
+        // #1580's (t1mv's) and #966's (t1n0's, the same space) merge cards.
+        let pr = |repo: &str, n: u64, session: &str| crate::prs::Pr {
+            repo: repo.into(),
+            number: n,
+            base: "dev".into(),
+            state: "open".into(),
+            session: session.into(),
+            space: Some(space.into()),
+            waiting: true,
+            found_ms: 1_000,
+            ..Default::default()
+        };
+        let (mediaroom, eyzflow) = (pr("eyzhub/eyz-mediaroom-serverless", 1580, "t1mv"), pr("eyzhub/eyzflow", 966, "t1n0"));
+        d.sync_prs(&[mediaroom.clone(), eyzflow.clone()]);
+        let open = |kind: &str| d.list(None, false)["decisions"].as_array().unwrap().iter().filter(|c| c["kind"] == kind).count();
+        assert_eq!((open("merge"), open("question"), open("choice")), (2, 1, 1));
+        // The user merges each: only that PR's card closes.
+        let mut now = vec![mediaroom, eyzflow];
+        for i in [1, 0] {
+            now[i].state = "merged".into();
+            assert!(a.settled_by_merge(&now[i], "mac").is_empty(), "#{}'s merge settles no question of the release", now[i].number);
+            d.sync_prs(&now);
+            assert_eq!(open("merge"), i, "#{}'s card only", now[i].number);
+        }
+        let list = d.list(None, true);
+        let closed: Vec<(String, String)> = list["closed"].as_array().unwrap().iter().map(|c| (c["kind"].as_str().unwrap_or("").to_string(), c["answer"].as_str().unwrap_or("").to_string())).collect();
+        assert_eq!(closed, vec![("merge".to_string(), "merged".to_string()); 2], "only the merge cards closed: {closed:?}");
+        assert_eq!((open("merge"), open("question"), open("choice")), (0, 1, 1), "the release question and the raised choice stay");
+        assert!(a.get(&set.id).is_some(), "the dialog's set is still open");
+        assert!(d.get(&raised).is_some_and(|c| c.closed_ms.is_none()));
     }
 
     #[test]

@@ -533,7 +533,11 @@ impl Panel {
 
     /// Sends a decision's answer through the daemon; `said` is what its
     /// receipt names, `answer` the answer in words (what a rule would say).
-    fn answer_decision(&mut self, id: &str, body: Value, said: &str, answer: &str, cx: &mut Context<Self>) {
+    fn answer_decision(&mut self, id: &str, mut body: Value, said: &str, answer: &str, cx: &mut Context<Self>) {
+        // Who answered it: the Mac's card.
+        if let Some(o) = body.as_object_mut() {
+            o.insert("by".into(), json!("mac"));
+        }
         if !self.act(cx, |a| a.sent.insert(id.to_string())) {
             return;
         }

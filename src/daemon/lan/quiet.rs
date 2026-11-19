@@ -30,7 +30,7 @@ impl Lan {
             // What only the user can decide, in queue order.
             ("GET", ["decisions"]) => t().map(|t| Response::json(200, &t.decisions(q("space"), q("all") == Some("1")))),
             ("GET", ["decisions", id]) => t().and_then(|t| decision(t, id)).map(|d| Response::json(200, &json!({ "decision": d }))),
-            ("POST", ["decisions", id, "answer"]) => t().and_then(|t| self.answer_decision(t, req, id)),
+            ("POST", ["decisions", id, "answer"]) => t().and_then(|t| self.answer_decision(t, req, device, id)),
             ("DELETE", ["decisions", id]) => t().and_then(|t| dismiss_decision(t, id)),
             // On hold (`{"reason": "<the user's words>"}`, may be empty), and back.
             ("POST", ["decisions", id, "hold"]) => t().and_then(|t| hold_decision(t, req, device, id, false)),
@@ -130,7 +130,7 @@ impl Lan {
     /// "text"}`, or a question's answers as `/v1/questions/{id}/answer`
     /// takes them (`{answers, submit}`; multipart with that JSON as a
     /// `json` part and files for tab N's typed answer as parts named `tab<N>`).
-    fn answer_decision(&self, t: &dyn Tower, req: &Request, id: &str) -> Answered {
+    fn answer_decision(&self, t: &dyn Tower, req: &Request, device: &auth::Device, id: &str) -> Answered {
         let d = decision(t, id)?;
         let (mut body, files): (Value, Vec<multipart::Part>) = match req.header("content-type").and_then(multipart::boundary) {
             Some(b) => {
@@ -170,6 +170,10 @@ impl Lan {
             body = json!({ "answers": answers, "submit": body["submit"].as_bool().unwrap_or(true) });
         }
         let submit = body.get("submit").and_then(Value::as_bool).unwrap_or(true);
+        // Who answered it: this phone (its card and the record say so).
+        if let Some(o) = body.as_object_mut() {
+            o.insert("by".into(), json!(format!("phone:{}", device.id)));
+        }
         match t.answer(id, &body, submit) {
             Ok(v) => Ok(Response::json(200, &v)),
             Err(r) => Err(refused(t, id, r)),
@@ -1301,6 +1305,22 @@ mod tests {
             assert_eq!((st, code(&v)), (404, Some("no_act")), "{path}");
         }
         r.end();
+    }
+
+    /// 19 Nov: "All of dev" was answered twice on the release card, and the
+    /// space's tower took it for the tower closing it by itself: nothing
+    /// said who answered. A phone's answer says it is that phone's.
+    #[test]
+    fn an_answer_says_who_gave_it() {
+        let r = rig("answered-by");
+        let id = r.raise("support-chat-attachments", "MediaRoom's production release: attachments only, or all of dev?", &["Attachments only", "All of dev"]);
+        let (st, _) = r.post(&format!("/v1/decisions/{id}/answer"), r#"{"choice":1,"by":"mac"}"#);
+        assert_eq!(st, 200);
+        let d = r.tower.decisions.get(&id).unwrap();
+        assert_eq!((d.answer.as_str(), d.by.starts_with("phone:")), ("All of dev", true), "the phone's, whatever its body says: {}", d.by);
+        let v = d.view(false);
+        assert!(v["by"].as_str().is_some_and(|b| b.starts_with("phone:")), "{v}");
+        assert!(d.row().contains("-> answered: All of dev (by phone:"), "{}", d.row());
     }
 
     #[test]
