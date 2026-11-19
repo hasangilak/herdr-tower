@@ -1319,7 +1319,24 @@ impl Book {
                         told: a.replaces.is_some(),
                         ..Default::default()
                     };
-                    ch.fresh.push(self.add(d, now));
+                    let id = self.add(d, now);
+                    // A raise about the same session asking the same in like words (its tower raised what its
+                    // dialog asks now): the dialog is where it is answered, once.
+                    let over: Vec<String> = self
+                        .open
+                        .iter()
+                        .filter(|r| matches!(r.kind, Kind::Raised | Kind::Choice) && r.key.starts_with("raise:") && r.sessions.iter().any(|w| w.address == a.who.address) && like_words(&r.title, &a.title))
+                        .map(|r| r.id.clone())
+                        .collect();
+                    for rid in over {
+                        if self.close(&rid, State::Stopped, now).is_some()
+                            && let Some(c) = self.closed.iter_mut().rev().find(|c| c.id == rid)
+                        {
+                            c.answer = format!("asked in its session's own question {id}");
+                            ch.closed.push(c.clone());
+                        }
+                    }
+                    ch.fresh.push(id);
                 }
             }
         }
@@ -1487,8 +1504,13 @@ impl Book {
                 .position(|d| (d.kind.asks() || d.kind == Kind::Blocked) && about(d))
                 .or_else(|| self.open.iter().position(|d| matches!(d.kind, Kind::Raised | Kind::Choice) && about(d) && d.why.eq_ignore_ascii_case(&why) && like_words(&d.title, &r.text))),
             "failed" => self.open.iter().position(|d| d.kind == Kind::Failed && about(d)),
-            // The same session raising what it raised, in other words: that card, its words brought up to date.
-            _ => self.open.iter().position(|d| matches!(d.kind, Kind::Raised | Kind::Choice) && about(d) && d.why.eq_ignore_ascii_case(&why) && like_words(&d.title, &r.text)),
+            // The same session raising what it raised, in other words: that card, its words brought up to date;
+            // or what its own dialog asks already, in like words (19 Nov 12:46: the release scope twice).
+            _ => self
+                .open
+                .iter()
+                .position(|d| matches!(d.kind, Kind::Raised | Kind::Choice) && about(d) && d.why.eq_ignore_ascii_case(&why) && like_words(&d.title, &r.text))
+                .or_else(|| self.open.iter().position(|d| d.kind.asks() && about(d) && like_words(&d.title, &r.text))),
         }
     }
 
@@ -3361,6 +3383,36 @@ mod tests {
 
     fn merge_raise(space: &str, session: &str, text: &str, detail: &str) -> Raise {
         Raise { space: Some(space.into()), who: who(session), why: "merge".into(), text: text.into(), detail: detail.into(), options: vec![] }
+    }
+
+    /// 19 Nov 12:46–12:47 (found by t13z): the space's tower raised the
+    /// release scope about t1mv while t1mv's own dialog asked it, and the
+    /// user answered "All of dev" on both. Whichever comes second joins the
+    /// first: a raise joins the session's open question in like words, and
+    /// a dialog that comes after a raise takes its place.
+    #[test]
+    fn a_raise_and_its_sessions_own_question_about_the_same_are_one_card() {
+        let scope = "MediaRoom's production release: ship only the support attachments, or all of dev?";
+        let raise = |text: &str| Raise { space: Some(SPACE.into()), who: who("t1mv"), why: "deploy".into(), text: text.into(), detail: String::new(), options: vec![] };
+        // The raise first, then the dialog: the dialog's card, and the raise is over in it.
+        let mut b = Book::default();
+        let r = b.raise(raise(scope), MIN);
+        let dialog = waits("t1mv", "mediaroom", SPACE, "Ship only the support attachments to production, or all of dev?");
+        let ch = b.sync_questions(&asked_all(std::slice::from_ref(&dialog)), &|_| State::Stopped, 2 * MIN);
+        assert_eq!(ch.fresh.len(), 1);
+        assert_eq!(b.open.len(), 1);
+        assert!(b.open[0].kind.asks());
+        let over = b.closed.iter().find(|c| c.id == r.id).unwrap();
+        assert!(over.state == State::Stopped && over.answer.starts_with("asked in its session's own question"));
+        // The dialog first, then the raise: the raise joins the dialog's card.
+        let mut b = Book::default();
+        b.sync_questions(&asked_all(std::slice::from_ref(&dialog)), &|_| State::Stopped, MIN);
+        let q = b.open[0].id.clone();
+        let r = b.raise(raise(scope), 2 * MIN);
+        assert_eq!((r.id, r.fresh, b.open.len()), (q, false, 1));
+        // Another session's raise, or other words: its own card.
+        assert!(b.raise(Raise { who: who("t1n0"), ..raise(scope) }, 3 * MIN).fresh);
+        assert!(b.raise(raise("Turn the notification flag on in production?"), 4 * MIN).fresh);
     }
 
     /// 19 Nov, after aa96771: a merge raise still stood alone 1 to 4
