@@ -317,12 +317,16 @@ pub struct Turn {
     /// A `[question]` note (it recommends answers with `tower recommend`):
     /// nothing it writes is spoken or kept in the chat.
     pub question: bool,
+    /// The turn began with the user's words (`[voice] …`): Some(true); with
+    /// anything else (a note of the tower's, a finding, a plan's): Some(false);
+    /// not known (nothing given to it since the tower started): None.
+    pub user: Option<bool>,
 }
 
 impl Turn {
     /// The turn a prompt begins.
     pub fn of_prompt(prompt: &str) -> Turn {
-        Turn { watch: is_news_prompt(prompt), note: is_note_prompt(prompt), question: is_question_prompt(prompt) }
+        Turn { watch: is_news_prompt(prompt), note: is_note_prompt(prompt), question: is_question_prompt(prompt), user: Some(from_the_user(prompt)) }
     }
 }
 
@@ -474,7 +478,7 @@ pub fn note_to(to: &Target, text: &str, record: bool) -> Result<()> {
     }
     // A busy brain takes it after its turn; the transcript says when.
     if status.as_deref() != Some("working") {
-        set_turn(&to.name, Turn { watch: is_news_prompt(text), note: is_note_prompt(text), question: text.starts_with("[question") || text.starts_with("[behaviors]") });
+        set_turn(&to.name, Turn { watch: is_news_prompt(text), note: is_note_prompt(text), question: text.starts_with("[question") || text.starts_with("[behaviors]"), user: Some(from_the_user(text)) });
     }
     Ok(())
 }
@@ -633,6 +637,27 @@ mod tests {
 
     /// The evening of 13 Nov: the user said three times that they weren't at
     /// the desk, because the brain couldn't tell the phone from the Mac.
+    /// Notes queued from a [session] relay (browser sharing, a finding's
+    /// thanks) joined the user's request: the relay check read the brain's
+    /// hooks, which say nothing of a brain. A turn records whether it began
+    /// with the user's words; a tower queue on any other turn is a relay.
+    #[test]
+    fn a_turn_knows_whether_it_began_with_the_users_words() {
+        for (prompt, theirs) in [
+            ("[voice] make the conflict button [radar t12w working]", true),
+            ("<hc from=\"t1m8\">[voice] resolve it</hc>", true),
+            ("[session] t12t (sooner) says: the browser is shared now", false),
+            ("[watch] t1sv (eyzflow) is now done. You had asked it: x.", false),
+            ("[agenda] a883 (the user asked: …): a883.1 failed", false),
+            ("[finding] f52 from t1sv: Spam-check banner overlaps the inbox", false),
+            ("[plan p5] Finding f48 from t1nw, risk", false),
+            ("[question] t5 q1 {}", false),
+        ] {
+            assert_eq!(super::Turn::of_prompt(prompt).user, Some(theirs), "{prompt}");
+        }
+        assert_eq!(super::Turn::default().user, None, "nothing known: not taken for a relay");
+    }
+
     #[test]
     fn a_request_from_the_phone_says_so() {
         assert_eq!(super::source_tag("phone:d_0c7c288e"), Some("[phone]"));
@@ -660,12 +685,12 @@ mod tests {
         assert_eq!(turn_of(own), Turn::default(), "nothing known: an answer to the user");
         set_turn(own, Turn::of_prompt("[watch] t5 (app) is now done. You had asked it: x."));
         set_turn(main, Turn::of_prompt("[voice] what's left? [radar] t5 app: done"));
-        assert_eq!(turn_of(own), Turn { watch: true, note: true, question: false });
+        assert_eq!(turn_of(own), Turn { watch: true, note: true, question: false, user: Some(false) });
         assert_eq!(turn_of(main), Turn::default(), "the other brain's note doesn't make this one's turn a note");
         set_turn(main, Turn::of_prompt("[question] t5 q1 {}"));
         assert_eq!((turn_of(main).question, turn_of(own).question), (true, false));
         set_turn(own, Turn::of_prompt("[session] From Shop › api (t5): the build is green"));
-        assert_eq!(turn_of(own), Turn { watch: false, note: true, question: false });
+        assert_eq!(turn_of(own), Turn { watch: false, note: true, question: false, user: Some(false) });
         forget_turn(own);
         forget_turn(main);
         assert_eq!((turn_of(own), turn_of(main)), (Turn::default(), Turn::default()));

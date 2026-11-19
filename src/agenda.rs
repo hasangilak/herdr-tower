@@ -894,8 +894,12 @@ impl Ledger {
         self.agendas.iter_mut().find(|a| a.id == id)
     }
 
-    /// A task's id now: the one it was moved to, if it was (`moved`).
+    /// A task's id now: its own, when a task has it (a live task beats an
+    /// alias), else the one it was moved to, if it was (`moved`).
     fn now_id(&self, id: &str) -> String {
+        if self.agendas.iter().any(|a| a.tasks.iter().any(|t| t.id == id)) {
+            return id.to_string();
+        }
         let mut id = id.to_string();
         for _ in 0..8 {
             match self.moved.get(&id) {
@@ -1294,9 +1298,8 @@ impl Ledger {
                 },
             },
         };
+        let id = self.next_task_id(&agenda);
         let a = self.agenda_mut(&agenda)?;
-        let n = a.tasks.iter().filter_map(|t| t.id.rsplit('.').next()?.parse::<u64>().ok()).max().unwrap_or(0) + 1;
-        let id = format!("{agenda}.{n}");
         let after: Vec<String> =
             reg.tag.after.iter().filter_map(|p| a.tasks.iter().find(|t| &t.plan_id == p || &t.id == p).map(|t| t.id.clone())).collect();
         let title = if reg.tag.title.trim().is_empty() { title_of(&reg.text) } else { reg.tag.title.trim().to_string() };
@@ -1322,6 +1325,16 @@ impl Ledger {
         });
         a.settle(now);
         Some(Registered { agenda, task: id, how: "new" })
+    }
+
+    /// The next task id in `agenda`: after every number it ever gave, moved
+    /// ones too (their old ids still find them: never another's).
+    fn next_task_id(&self, agenda: &str) -> String {
+        let prefix = format!("{agenda}.");
+        let num = |id: &str| id.strip_prefix(&prefix).and_then(|n| n.parse::<u64>().ok());
+        let here = self.agenda(agenda).into_iter().flat_map(|a| a.tasks.iter()).filter_map(|t| num(&t.id));
+        let gone = self.moved.keys().filter_map(|k| num(k));
+        format!("{agenda}.{}", here.chain(gone).max().unwrap_or(0) + 1)
     }
 
     /// The newest open agenda of the tower's own about `space` (one of its
@@ -1375,9 +1388,8 @@ impl Ledger {
         } else {
             a.settle(now);
         }
+        let new_id = self.next_task_id(&dest);
         let d = self.agenda_mut(&dest).expect("resolved");
-        let n = d.tasks.iter().filter_map(|t| t.id.rsplit('.').next()?.parse::<u64>().ok()).max().unwrap_or(0) + 1;
-        let new_id = format!("{dest}.{n}");
         t.history.push(Step { at_ms: now, state: t.state, why: format!("moved here from {from} (it was {id})") });
         t.id = new_id.clone();
         // What it waited for in its old agenda isn't this one's.
@@ -2652,6 +2664,42 @@ mod tests {
         let later = l.news(now + GRACE_TROUBLE_MS + REMIND_MS + 1);
         assert_eq!(later.iter().map(|n| n.space.as_deref()).collect::<Vec<_>>(), [Some("kb-full-dump › bug-project-export"), Some("dashboard-date-format › bug-help-center")]);
         assert!(later[0].msg.contains(&kb) && !later[0].msg.contains(&ci), "{}", later[0].msg);
+    }
+
+    /// a883.5 (the chat SDK notice) was moved out; the next task filed in
+    /// a883 got a883.5 again, and `tower agenda move a883.5 new` moved the chat
+    /// SDK task a second time (through its alias), leaving the new one. Ids
+    /// are never given twice in an agenda, and a task that has the id beats
+    /// an alias of it.
+    #[test]
+    fn a_moved_tasks_id_is_never_given_again_and_a_live_task_beats_its_alias() {
+        let now = 10_000_000;
+        let mut l = Ledger::default();
+        let a = l.open("resolve conflict button", "", "user", now - 1000, &["M5 Pro".to_string()], now);
+        let tag = || Tag { agenda: Some(a.clone()), ..Default::default() };
+        let ids: Vec<String> = (1..=5).map(|q| l.register(&reg_in(q, &format!("t{q}"), "M5 Pro", tag()), &Heard::default(), now).unwrap().task).collect();
+        assert_eq!(ids[4], format!("{a}.5"));
+        let c = |action: &str, target: &str, text: &str| Cmd { action: action.into(), target: target.into(), text: text.into(), ..Default::default() };
+        let v = act(&mut l, &c("move", &ids[4], "new"), &Heard::default(), now + 1).unwrap().value;
+        let moved = v["task"].as_str().unwrap().to_string();
+        // The next one in a883 is a883.6, never a883.5 again.
+        let next = l.register(&reg_in(6, "t1t8", "M5 Pro", tag()), &Heard::default(), now + 2).unwrap().task;
+        assert_eq!(next, format!("{a}.6"));
+        assert_eq!(l.task(&ids[4]).unwrap().id, moved, "the old id still finds the moved task");
+        // Moving into an agenda counts past what moved out of it too.
+        let v = act(&mut l, &c("move", &next, &v["agenda"].as_str().unwrap().to_string()), &Heard::default(), now + 3).unwrap().value;
+        assert_eq!(v["task"].as_str().unwrap(), format!("{}.2", v["agenda"].as_str().unwrap()));
+        // An id given twice before this fix (a883.4 here): the task that has it is the one moved.
+        let mut r = Ledger::default();
+        let b = r.open("resolve conflict button", "", "user", now - 1000, &["M5 Pro".to_string()], now);
+        let first = r.register(&reg_in(1, "t1tw", "M5 Pro", Tag { agenda: Some(b.clone()), ..Default::default() }), &Heard::default(), now).unwrap().task;
+        let (gone, _) = r.move_task(&first, "new", now + 1).unwrap();
+        // (As the old counting did: the same id again for t1sv's note.)
+        r.agenda_mut(&b).unwrap().tasks.push(Task { id: first.clone(), session: "t1sv".into(), title: "Thanks: the bug you reported".into(), state: TaskState::Queued, ..Default::default() });
+        assert_eq!(r.task(&first).unwrap().session, "t1sv", "the live task, not the alias");
+        let (again, from) = r.move_task(&first, "new", now + 2).unwrap();
+        assert_eq!((from.as_str(), r.task(&again).unwrap().session.as_str()), (b.as_str(), "t1sv"));
+        assert_eq!(r.task(&gone).unwrap().session, "t1tw", "the one moved first stays where it went");
     }
 
     /// `tower agenda move <task> <agenda|new>`: a task that landed in the

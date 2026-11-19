@@ -1307,7 +1307,10 @@ impl Daemon {
         let mut tag = tag.unwrap_or_default();
         tag.brain_space = brains::space_of(&brain).or_else(|| crate::spaces::space_of(&t).filter(|_| brain != brain::name()));
         let address = t["address"].as_str().unwrap_or("");
-        tag.relay = sessions::registry().get(address).is_some_and(|s| crate::agenda::is_note(&s.prompt));
+        // Its turn as the tower gave it (the tower types both the user's words and its own notes in;
+        // a busy brain's, as its transcript took them): on anything but the user's words, a relay.
+        // (A brain's hooks may say nothing of it: they are a session's.)
+        tag.relay = brain::turn_of(brain).user == Some(false) || sessions::registry().get(address).is_some_and(|s| crate::agenda::is_note(&s.prompt));
         tag.brain = Some(brain.to_string());
         Some(tag)
     }
