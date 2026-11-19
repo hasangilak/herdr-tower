@@ -23,6 +23,10 @@ fn answered(r: Response) -> Result<Value> {
 }
 
 impl Tower for Daemon {
+    fn resolve_pr(&self, key: &str, by: &str) -> Result<Value> {
+        Daemon::resolve_pr(self, key, by)
+    }
+
     fn decisions(&self, space: Option<&str>, all: bool) -> Value {
         // A PR merged on GitHub leaves the phone's queue as soon as it looks.
         if let Some(p) = crate::prs::daemon() {

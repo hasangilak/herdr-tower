@@ -200,6 +200,15 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<String>,
     },
+    /// The user's "Resolve conflicts" on a PR (`tower pr resolve <pr>`, the
+    /// Mac panel's merge card): its session is asked now to merge the latest
+    /// base in, resolve, re-run its checks and push (`fixes::resolve`).
+    ResolvePr {
+        pr: String,
+        /// Who asked: `mac`, `phone:<device>`, `cli`.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        by: String,
+    },
     /// A PR's session can't resolve its conflicts with its base (`tower pr
     /// cant-fix <pr> "<why>"`): it goes to the user, once (`crate::fixes`).
     CantFix {
@@ -496,6 +505,8 @@ fn wait_for(req: &Request) -> Duration {
         Request::Model { .. } | Request::Brains { .. } | Request::Plan { .. } => Duration::from_secs(45),
         // A PR the tower doesn't know yet is looked up on GitHub first.
         Request::Validate { .. } | Request::Impact { .. } | Request::CantFix { .. } => Duration::from_secs(30),
+        // A session may be started for it (`tower start` takes a while).
+        Request::ResolvePr { .. } => Duration::from_secs(200),
         Request::Youtrack { .. } => Duration::from_secs(180),
         _ => Duration::from_secs(10),
     }

@@ -116,6 +116,42 @@ fn ask(pr: &Pr, what: &str, tries: u32, hands: &dyn Hands, now: u64) -> Fix {
     fix
 }
 
+/// The user's "Resolve conflicts" on a PR's merge card (the Mac panel, the
+/// phone, `tower pr resolve`): its own session (else another of its space in
+/// its repo, else one started in its worktree's repo) is asked now, through
+/// the queue, to merge the latest base into the branch, resolve the
+/// conflicts, run its checks again and push, never merge; a fresh try,
+/// even after one that came back to them. One being fixed already is left
+/// to it (nothing sent twice). Its merge card comes back once GitHub says it
+/// merges cleanly. The PR as it is now, and whether someone was asked now.
+pub fn resolve(prs: &Prs, hands: &dyn Hands, key: &str, by: &str, now: u64) -> Result<(Pr, bool)> {
+    let Some(pr) = prs.get(key) else { bail!("the tower doesn't know {key}") };
+    if !pr.open() {
+        bail!("{key} is {}: nothing to resolve", pr.state);
+    }
+    let Some(what) = fixes::trouble(&pr) else {
+        bail!("GitHub says {key} has no conflicts with {} (or is still working it out): nothing to resolve", if pr.base.is_empty() { "its base" } else { &pr.base });
+    };
+    if hands.in_chain(key) {
+        bail!("{key} is being merged in order (\"Merge all\"): that asks its session itself");
+    }
+    // Asked already, and not back with the user: its session is on it.
+    if let Some(f) = pr.fix.as_ref().filter(|f| f.back.is_none() && !f.to.is_empty() && hands.alive(&f.to)) {
+        eprintln!("[fixes] {key}: {by} asks to resolve it; {} is on it already", f.to);
+        return Ok((pr.clone(), false));
+    }
+    // A fresh try: what came back to the user before is theirs no more.
+    let fresh = Pr { fix: pr.fix.clone().map(|f| Fix { back: None, tries: 0, ..f }), ..pr.clone() };
+    let fix = ask(&fresh, what, 1, hands, now);
+    eprintln!("[fixes] {key}: {by} asked to resolve its {what}");
+    if let Some(why) = &fix.back {
+        prs.set_fix(key, Some(fix.clone()));
+        bail!("{key}: {why}");
+    }
+    prs.set_fix(key, Some(fix));
+    Ok((prs.get(key).unwrap_or(pr), true))
+}
+
 /// The session said it can't resolve it (`tower pr cant-fix`): the user's, once, with its words.
 pub fn cant_fix(prs: &Prs, key: &str, why: &str, by: &str) -> Result<Pr> {
     let Some(pr) = prs.get(key) else { bail!("the tower doesn't know {key}") };
@@ -306,6 +342,70 @@ mod tests {
             waiting: true,
             ..Default::default()
         }
+    }
+
+    /// PR #994's merge sheet said "Conflicts with dev" with Merge greyed out
+    /// and nothing to press. "Resolve conflicts" asks its own session now to
+    /// merge the latest base in, resolve, re-run its checks and push (never
+    /// merge), a fresh try even after one came back to the user; one on it
+    /// already is left to it; gone, a session is started in its worktree.
+    /// The PR is no merge card meanwhile, and is one again once it merges cleanly.
+    #[test]
+    fn resolve_conflicts_asks_its_session_now_and_the_card_waits_for_a_clean_merge() {
+        let k = "eyzhub/eyzflow#841";
+        // Came back to the user (two tries didn't fix it): on its merge card, with a Resolve button.
+        let prs = store("resolve");
+        let back = Fix { what: "conflicts".into(), to: "t13y".into(), head_asked: "a1".into(), asked_ms: 1, tries: 2, back: Some("it still conflicts with dev after its session's update".into()), ..Default::default() };
+        prs.put(Pr { fix: Some(back), ..pr("conflicting", "dirty", "a1") }, "found");
+        assert!(fixes::with_user(&prs.get(k).unwrap()), "the user's: on its card");
+        let hands = Fake { alive: vec!["t13y".into()], ..Default::default() };
+        let (now, asked) = resolve(&prs, &hands, k, "phone:p1", 5_000).unwrap();
+        assert!(asked);
+        let told = hands.told.lock().unwrap().clone();
+        assert_eq!(told.len(), 1);
+        assert_eq!(told[0].0, "t13y");
+        for words in ["merge origin/dev into it", "resolve the conflicts", "run its checks and tests again, and push", "Don't merge the PR yourself"] {
+            assert!(told[0].1.contains(words), "{words}: {}", told[0].1);
+        }
+        assert!(!told[0].1.contains("didn't fix it"), "a fresh try: {}", told[0].1);
+        let f = now.fix.clone().unwrap();
+        assert_eq!((f.to.as_str(), f.tries, f.back.clone(), f.asked_ms), ("t13y", 1, None, 5_000));
+        // Meanwhile no merge card: its session is on it (its chip says so).
+        assert!(!fixes::with_user(&now));
+        assert_eq!(fixes::line(&now).as_deref(), Some("Being fixed by t13y: resolving its conflicts with dev."));
+        // Pressed again while it's on it: nothing sent twice.
+        let (_, again) = resolve(&prs, &hands, k, "mac", 6_000).unwrap();
+        assert!(!again);
+        assert_eq!(hands.told.lock().unwrap().len(), 1);
+        // It pushed and GitHub says it merges cleanly: the fix is done, and it is the user's to merge again.
+        prs.put(Pr { fix: prs.get(k).unwrap().fix, ..pr("mergeable", "clean", "a2") }, "update");
+        tick(&prs, &hands, 7_000);
+        let clean = prs.get(k).unwrap();
+        assert!(clean.fix.is_none() && fixes::with_user(&clean));
+
+        // Its session gone and nobody else in the repo: one started in its space's worktree, told to check the branch out.
+        let prs = store("resolve-gone");
+        prs.put(pr("conflicting", "dirty", "b1"), "found");
+        let hands = Fake { can_start: true, ..Default::default() };
+        assert!(resolve(&prs, &hands, k, "mac", 1).unwrap().1);
+        let started = hands.started.lock().unwrap().clone();
+        assert_eq!((started[0].0.as_str(), started[0].1.as_str()), ("sooner-chatbot-answers", "eyzhub/eyzflow"));
+        assert!(started[0].2.starts_with("You take over PR #841: check out its branch first (`gh pr checkout 841 --repo eyzhub/eyzflow`)."), "{}", started[0].2);
+        // Nobody at all: it says so, and stays the user's.
+        let prs = store("resolve-nobody");
+        prs.put(pr("conflicting", "dirty", "c1"), "found");
+        assert!(resolve(&prs, &Fake::default(), k, "mac", 1).unwrap_err().to_string().contains("nobody could be asked"));
+        // Behind only: brought up to date. Clean, or merged: nothing to resolve.
+        let prs = store("resolve-other");
+        prs.put(pr("mergeable", "behind", "d1"), "found");
+        let hands = Fake { alive: vec!["t13y".into()], ..Default::default() };
+        assert!(resolve(&prs, &hands, k, "mac", 1).unwrap().1);
+        assert!(hands.told.lock().unwrap()[0].1.contains("is behind dev"));
+        prs.put(pr("mergeable", "clean", "d2"), "update");
+        assert!(resolve(&prs, &hands, k, "mac", 2).unwrap_err().to_string().contains("no conflicts"));
+        prs.put(Pr { state: "merged".into(), ..pr("mergeable", "clean", "d2") }, "update");
+        assert!(resolve(&prs, &hands, k, "mac", 3).unwrap_err().to_string().contains("is merged"));
+        assert!(resolve(&prs, &hands, "o/x#1", "mac", 3).is_err());
     }
 
     #[test]

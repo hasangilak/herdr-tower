@@ -59,7 +59,7 @@ pub const API: u32 = 1;
 /// `impact`: who outside depends on what a PR changes (`impact` on a PR,
 /// `dependents` and `outside` on a predicted one), and a breaking change's warning.
 /// `releases`: each space's release track (`releases` in the state, `GET /v1/releases`).
-pub const FEATURES: &[&str] = &["quiet", "acts", "pairing", "bonjour", "reviews", "scores", "validation", "impact", "releases", "accounts", "jobs", "browsers", "progress", "scoring", "tasks"];
+pub const FEATURES: &[&str] = &["quiet", "acts", "pairing", "bonjour", "reviews", "scores", "validation", "impact", "releases", "accounts", "jobs", "browsers", "progress", "scoring", "tasks", "resolve"];
 const MAX_CONNECTIONS: usize = 32;
 /// Connections open at once from one address.
 const MAX_PER_IP: usize = 8;
@@ -1433,6 +1433,18 @@ impl Lan {
                         }),
                     ),
                     Err(e) => Response::error(503, "github", &format!("GitHub couldn't be asked: {e:#}")),
+                }
+            }
+            // "Resolve conflicts" on its merge sheet: its session merges the latest base in, resolves, re-runs its checks and pushes.
+            ("POST", ["prs", owner, repo, n, "resolve"]) => {
+                let key = format!("{owner}/{repo}#{n}");
+                let Some(t) = self.tower() else { return Some(Response::error(503, "starting", "the tower is still starting")) };
+                match t.resolve_pr(&key, &format!("phone:{}", device.id)) {
+                    Ok(v) => {
+                        eprintln!("[phone] {} asked to resolve {key}'s conflicts", device.name);
+                        Response::json(200, &v)
+                    }
+                    Err(e) => Response::error(409, "not_resolvable", &format!("{e:#}")),
                 }
             }
             ("POST", ["prs", owner, repo, n, "merge"]) => {
