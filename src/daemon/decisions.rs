@@ -977,6 +977,21 @@ impl Decisions {
         self.answered(&id, with)
     }
 
+    /// A plan's question cards follow its questions as they are now
+    /// (`decisions::Book::plan_follow`): moved with a renumbered one, over
+    /// with one the plan no longer asks (or answered meanwhile).
+    pub fn plan_follow(&self, plan: &str, questions: &[(String, Option<String>)]) -> (Vec<(String, String, String)>, usize) {
+        let (moved, over) = self.change(|b, now| b.plan_follow(plan, questions, "the plan no longer asks it", now));
+        for (id, from, to) in &moved {
+            eprintln!("[decisions] {id}: plan {plan}'s {from} is {to} now: the card follows it");
+        }
+        for d in &over {
+            eprintln!("[decisions] {}: plan {plan} no longer asks it: out of the queue", d.id);
+            record(d);
+        }
+        (moved, over.len())
+    }
+
     /// A plan is closed: its cards still open (its questions, a revision) are over.
     pub fn plan_over(&self, plan: &str) -> usize {
         let prefix = format!("{}{}:", decisions::PLAN_KEY, plan.trim());

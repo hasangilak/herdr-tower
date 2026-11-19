@@ -207,6 +207,11 @@ pub struct Plan {
     /// What it can't decide alone: each answered by the tower or the user, and written back.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub questions: Vec<Question>,
+    /// Questions a version no longer lists that were answered or asked:
+    /// one that comes back (by its id, or its words under another) keeps
+    /// its answer, and asks nothing again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped: Vec<Question>,
     /// What the sessions learned while working that bears on the plan.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub findings: Vec<Finding>,
@@ -975,11 +980,7 @@ impl Book {
                 (a.status, a.proof) = (o.status.clone(), o.proof.clone());
             }
         }
-        for q in questions.iter_mut() {
-            if let Some(o) = p.questions.iter().find(|o| o.id == q.id && (o.text.trim() == q.text.trim() || o.status == Q_ANSWERED)) {
-                (q.status, q.answer, q.by, q.card, q.at_ms) = (o.status.clone(), o.answer.clone(), o.by.clone(), o.card.clone(), o.at_ms);
-            }
-        }
+        carry_questions(&p.questions, &mut p.dropped, &mut questions);
         // A draft's structure that changes is a new version too (a live plan's change is a revision: `revise`).
         let changed = !diff_structure(&p.stages, &p.assumptions, &stages, &assumptions, &questions, &p.questions).0.is_empty() || p.questions.len() != questions.len();
         let first = p.stages.is_empty();
@@ -1459,6 +1460,65 @@ pub fn structure(v: &Value, prs: &[crate::prscore::Predicted]) -> Result<(Vec<St
         questions.push(Question { id, text, why: word(q, "why"), options, recommended, theirs: q["theirs"] == true, stage, status: Q_OPEN.into(), ..Default::default() });
     }
     Ok((stages, assumptions, questions))
+}
+
+/// What a new version's `questions` keep of the ones before (`was`, and
+/// those an earlier version dropped): the same question by its id and
+/// words; renumbered, by its words under another id; reworded under its
+/// id, an answered one's answer. Each takes the answer, where it is and the
+/// card. Those the version no longer lists, answered or asked, go to
+/// `dropped`; one that comes back takes its answer from there and asks
+/// nothing again.
+pub fn carry_questions(was: &[Question], dropped: &mut Vec<Question>, questions: &mut [Question]) {
+    let same_words = |a: &Question, b: &Question| a.text.trim().eq_ignore_ascii_case(b.text.trim());
+    let take = |q: &mut Question, o: &Question| (q.status, q.answer, q.by, q.card, q.at_ms) = (o.status.clone(), o.answer.clone(), o.by.clone(), o.card.clone(), o.at_ms);
+    let mut used: Vec<usize> = vec![];
+    let mut done = vec![false; questions.len()];
+    // Its id and its words: the same question.
+    for (j, q) in questions.iter_mut().enumerate() {
+        if let Some((i, o)) = was.iter().enumerate().find(|(i, o)| !used.contains(i) && o.id.eq_ignore_ascii_case(&q.id) && same_words(o, q)) {
+            take(q, o);
+            (used.push(i), done[j] = true);
+        }
+    }
+    // Renumbered: its words under another id.
+    for (j, q) in questions.iter_mut().enumerate() {
+        if done[j] {
+            continue;
+        }
+        if let Some((i, o)) = was.iter().enumerate().find(|(i, o)| !used.contains(i) && same_words(o, q)) {
+            take(q, o);
+            (used.push(i), done[j] = true);
+        }
+    }
+    // Reworded under its id, answered: the answer stays.
+    for (j, q) in questions.iter_mut().enumerate() {
+        if done[j] {
+            continue;
+        }
+        if let Some((i, o)) = was.iter().enumerate().find(|(i, o)| !used.contains(i) && o.id.eq_ignore_ascii_case(&q.id) && o.status == Q_ANSWERED) {
+            take(q, o);
+            (used.push(i), done[j] = true);
+        }
+    }
+    // What this version no longer lists, answered or asked: kept aside.
+    for (i, o) in was.iter().enumerate() {
+        if used.contains(&i) || o.status == Q_OPEN {
+            continue;
+        }
+        dropped.retain(|d| !(d.id.eq_ignore_ascii_case(&o.id) && same_words(d, o)));
+        dropped.push(o.clone());
+    }
+    // Back again: its answer from there (an asked one's card is over: it closed as the question went).
+    for (j, q) in questions.iter_mut().enumerate() {
+        if done[j] {
+            continue;
+        }
+        if let Some(at) = dropped.iter().position(|d| d.status == Q_ANSWERED && (same_words(d, q) || d.id.eq_ignore_ascii_case(&q.id))) {
+            let d = dropped.remove(at);
+            take(q, &d);
+        }
+    }
 }
 
 /// What the brain is told of a plan's question it may answer itself: the
