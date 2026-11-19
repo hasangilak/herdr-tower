@@ -982,7 +982,9 @@ impl Ledger {
     /// the newest unfinished task, as before.
     pub fn judged_task(&self, session: &str, now: u64) -> Option<(String, bool)> {
         let ended = |t: &Task| t.history.iter().filter(|h| h.state == TaskState::DoneClaimed && h.at_ms >= t.delivered_ms).map(|h| h.at_ms).max();
-        let on: Vec<&Task> = self.agendas.iter().filter(|a| a.live()).flat_map(|a| a.tasks.iter()).filter(|t| !session.is_empty() && t.session == session).collect();
+        // Every request's, done ones too: the task its turn's end settled is often its request's
+        // last, and that request is done by then (a781.2, 2026-11-19).
+        let on: Vec<&Task> = self.agendas.iter().flat_map(|a| a.tasks.iter()).filter(|t| !session.is_empty() && t.session == session).collect();
         let open = self.unfinished_on(session);
         // A turn ended on the newest unfinished one: it.
         if let Some(u) = open
@@ -2570,6 +2572,27 @@ mod tests {
         l.task_mut(&c).unwrap().apply(TaskEv::Verify { how: "checked".into() }, now + 900_000).unwrap();
         assert_eq!(l.judged("t12w", true, "planner tab done", now + 901_000), Some(b.clone()));
         assert_eq!(l.task(&b).unwrap().state, TaskState::Verified);
+        // A's request had only A: its turn's end settled it, and the request with it (a781.2 and
+        // a783.2, 2026-11-19). The verdict is still A's, and B, of another request, runs on.
+        let mut l = Ledger::default();
+        let reg = |l: &mut Ledger, agenda: &str, queue_id: u64| {
+            let tag = Tag { agenda: Some(agenda.into()), title: format!("task {queue_id}"), ..Default::default() };
+            l.register(&Reg { queue_id, session: "t12w".into(), name: "m5pro".into(), text: format!("do {queue_id}"), tag }, &Heard::default(), now).unwrap().task
+        };
+        let ra = l.open("Fix the ready check", "", "user", 0, &["M5 Pro".to_string()], now);
+        let rb = l.open("Remap p6's PR 3", "", "user", 0, &["M5 Pro".to_string()], now);
+        let (a, b) = (reg(&mut l, &ra, 3238), reg(&mut l, &rb, 3244));
+        let went = |l: &mut Ledger, id: &str, at: u64| {
+            l.apply(id, TaskEv::Delivered { session: "t12w".into(), name: "m5pro".into(), created_ms: None, space: None, at_ms: at, fresh: false }, at).unwrap();
+        };
+        went(&mut l, &a, now);
+        l.apply(&a, TaskEv::Claimed { said: "Merged and installed: a space is ready only when nothing is open.".into() }, now + 500_000).unwrap();
+        l.apply(&a, TaskEv::Verify { how: "its last message says \"ready\"".into() }, now + 500_000).unwrap();
+        assert!(!l.agendas.iter().find(|x| x.id == ra).unwrap().live(), "A's request is done with it");
+        went(&mut l, &b, now + 501_000);
+        assert_eq!(l.judged_task("t12w", now + 509_000), Some((a.clone(), true)));
+        assert_eq!(l.judged("t12w", true, "Ready check fixed", now + 509_000), Some(a.clone()));
+        assert_eq!(l.task(&b).unwrap().state, TaskState::Running, "the newer task of another request isn't finished by it");
         // No turn ended lately: the newest unfinished task, as before.
         let (mut old, _, ids) = ledger_with(1, now);
         to(&mut old, &ids[0], now);
