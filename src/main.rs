@@ -1760,7 +1760,7 @@ fn automerge_cmd(action: &str) -> Result<()> {
     if !std::io::stdout().is_terminal() {
         println!("{}", serde_json::json!({ "auto_merge_low_risk": on, "changed": on != now }));
     } else if on {
-        println!("Auto-merge is on: the tower merges a low-risk PR into dev itself once a plan predicted it, its checks pass and its reviewer found nothing. Anything that needs review, and every merge into main or prod, is still yours.");
+        println!("Auto-merge is on: the tower merges a low-risk PR into dev itself once its validation passed (its plan's checks, or those its session reported), its CI checks pass, its reviewer found nothing and nothing outside breaks. Anything that needs review, failing or missing checks, and every merge into main or prod, is still yours.");
     } else {
         println!("Auto-merge is off: every PR is yours to merge.");
     }

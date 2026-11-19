@@ -189,10 +189,11 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrsCfg {
-    /// The tower merges a PR into dev itself when a plan predicted it, it
-    /// is scored low risk (no migration, no breaking change, nothing on the
-    /// escalate list, read again on its own files), its checks pass and its
-    /// reviewer agreed without finding anything (`crate::prscore::auto_path`,
+    /// The tower merges a PR into dev itself when it is scored low risk (no
+    /// migration, no breaking change, nothing on the escalate list, read
+    /// again on its own files), its validation passed (its plan's checks, or
+    /// for a PR no plan predicted the checks its session reported), its CI
+    /// checks pass and its reviewer agreed without finding anything (`crate::prscore::auto_path`,
     /// `tower automerge`). Off (the default): every PR is the user's to
     /// merge. Anything that needs review, and every merge into main or
     /// prod, is the user's either way.

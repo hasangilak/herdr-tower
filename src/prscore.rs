@@ -282,16 +282,7 @@ impl Validation {
 
     /// Its session reports a check (`status`: passed, failed, not-run).
     pub fn report(&mut self, id: &str, status: &str, proof: &str, by: &str, now: u64) -> Result<Check> {
-        let status = match status.trim().to_lowercase().replace('-', "_").as_str() {
-            "passed" | "pass" | "ok" => PASSED,
-            "failed" | "fail" => FAILED,
-            "not_run" | "notrun" | "skipped" => NOT_RUN,
-            other => bail!("a check is passed, failed or not-run, not {other:?}"),
-        };
-        let proof = proof.trim();
-        if proof.is_empty() {
-            bail!("give its evidence: --evidence \"<the test output, a screenshot's path, a log, or why it wasn't run>\"");
-        }
+        let (status, proof) = reported(status, proof)?;
         let ids: Vec<String> = self.checks.iter().map(|c| c.id.clone()).collect();
         let Some(c) = self.checks.iter_mut().find(|c| c.id.eq_ignore_ascii_case(id.trim())) else {
             bail!("no planned check {id:?}: its checks are {}", ids.join(", "));
@@ -301,6 +292,22 @@ impl Validation {
         c.by = by.to_string();
         c.at_ms = Some(now);
         Ok(c.clone())
+    }
+
+    /// A check of the session's own, on a PR no plan predicted (`tower
+    /// validate <pr> <check> passed --evidence …`): reported as `report`
+    /// does, added first when it isn't there.
+    pub fn report_own(&mut self, id: &str, status: &str, proof: &str, by: &str, now: u64) -> Result<Check> {
+        let id = id.trim();
+        if id.is_empty() {
+            bail!("name the check: what it shows (`tower validate <pr> \"the filter test\" passed --evidence …`)");
+        }
+        // Refused (no evidence, a status it doesn't know): nothing added.
+        reported(status, proof)?;
+        if !self.checks.iter().any(|c| c.id.eq_ignore_ascii_case(id)) {
+            self.checks.push(Check { id: id.into(), what: id.into(), how: "its session's own check".into(), evidence: String::new(), status: PLANNED.into(), ..Default::default() });
+        }
+        self.report(id, status, proof, by, now)
     }
 
     /// Its session finished its turn on the PR: what it didn't report is
@@ -315,6 +322,34 @@ impl Validation {
         }
         marked
     }
+}
+
+/// A check's report as given: its status (passed, failed, not run) and its evidence, which it must have.
+fn reported<'a>(status: &str, proof: &'a str) -> Result<(&'static str, &'a str)> {
+    let status = match status.trim().to_lowercase().replace('-', "_").as_str() {
+        "passed" | "pass" | "ok" => PASSED,
+        "failed" | "fail" => FAILED,
+        "not_run" | "notrun" | "skipped" => NOT_RUN,
+        other => bail!("a check is passed, failed or not-run, not {other:?}"),
+    };
+    let proof = proof.trim();
+    if proof.is_empty() {
+        bail!("give its evidence: --evidence \"<the test output, a screenshot's path, a log, or why it wasn't run>\"");
+    }
+    Ok((status, proof))
+}
+
+/// What a session is told when it finished its turn on a low-risk PR into
+/// dev that no plan predicted, without reporting how it validated it: the
+/// tower merges it itself once it has (auto-merge on).
+pub fn unvalidated_note(pr: &Pr, tower: &str) -> String {
+    format!(
+        "[tower] PR #{} ({}) into {} is low risk, and the tower merges it itself once you report how you validated it: for each check you ran (a test, the type check, a look at it running), {tower} validate {} \"<what it checks>\" passed --evidence \"<the test output, a screenshot's path, a log>\" (or failed, with why). No reported checks, or one that didn't pass: the merge stays the user's.",
+        pr.number,
+        pr.repo,
+        pr.base,
+        pr.key()
+    )
 }
 
 /// What a session is told when it finished its turn on a PR without
@@ -986,11 +1021,16 @@ pub enum Path {
 }
 
 /// Whether the tower merges `pr` itself (`on`: `[prs] auto_merge_low_risk`):
-/// only a PR into dev that a plan predicted, scored low risk, every planned
-/// check passed (one not reported yet is waited for; one failed or not run
-/// makes it the user's), open and no draft, clean, whose CI checks pass and whose reviewer agreed without
+/// only a PR into dev, scored low risk on its own files (nothing that needs
+/// review: a migration, a breaking change, secrets, infrastructure, auth,
+/// deletes, money, new dependencies, security), nothing outside broken by
+/// it, its validation passed with evidence (a plan's PR: every planned
+/// check, one not reported yet waited for; a PR no plan predicted: the
+/// checks its session reported, at least one, every one passed), open and
+/// no draft, clean, whose CI checks pass and whose reviewer agreed without
 /// finding anything critical, and that the tower hasn't failed to merge at
-/// this commit.
+/// this commit. Into main or prod, a release, failing or missing checks:
+/// always the user's.
 pub fn auto_path(pr: &Pr, on: bool) -> Path {
     let yours = |s: &str| Path::Yours(s.to_string());
     if !on {
@@ -1013,9 +1053,6 @@ pub fn auto_path(pr: &Pr, on: bool) -> Path {
         Some(i) if i.sha != pr.head_sha => return Path::Waits("its dependents checked at its head commit".into()),
         Some(_) => {}
     }
-    if s.planned.is_none() {
-        return yours("no plan predicted it");
-    }
     if !is_dev(&pr.base) {
         return Path::Yours(if crate::prs::is_prod(&pr.base) {
             format!("it merges into {}: that ships to production", pr.base)
@@ -1023,8 +1060,17 @@ pub fn auto_path(pr: &Pr, on: bool) -> Path {
             format!("it merges into {}, not dev", if pr.base.is_empty() { "?" } else { &pr.base })
         });
     }
-    // Its planned checks, all passed with their evidence: else never low risk enough.
+    // Its validation, all passed with its evidence: else never low risk enough.
+    let unplanned = s.planned.is_none();
     match &pr.validation {
+        // No plan: its session's own checks, reported with evidence (`tower validate`).
+        // (Waited for while its session is on it; once its turn on it ended without one, the user's,
+        // until its session reports them: a waiting PR is hidden from the queue, and this may never come.)
+        None if unplanned && !pr.waiting => return Path::Waits("its session to report how it validated it (tower validate)".into()),
+        Some(v) if unplanned && v.checks.is_empty() && !pr.waiting => return Path::Waits("its session to report how it validated it (tower validate)".into()),
+        None if unplanned => return yours("its session hasn't reported how it validated it (tower validate)"),
+        Some(v) if unplanned && v.checks.is_empty() => return yours("its session hasn't reported how it validated it (tower validate)"),
+        Some(v) if unplanned && v.any_bad() => return Path::Yours(format!("its checks didn't all pass: {}", v.missing_line())),
         None => return yours("its plan lists no checks for it"),
         Some(v) if v.checks.is_empty() => return yours("its plan lists no checks for it"),
         Some(v) if v.any_bad() => return Path::Yours(format!("planned checks missing: {}", v.missing_line())),
@@ -1084,7 +1130,7 @@ pub fn auto_line(pr: &Pr, on: bool) -> Option<String> {
         return Some(format!("The tower merged it: {}", a.why));
     }
     match auto_path(pr, on) {
-        Path::Off => pr.score.as_ref().filter(|s| !s.needs_review && s.planned.is_some() && is_dev(&pr.base)).map(|_| "Auto-merge is off: yours to merge.".to_string()),
+        Path::Off => pr.score.as_ref().filter(|s| !s.needs_review && is_dev(&pr.base)).map(|_| "Auto-merge is off: yours to merge.".to_string()),
         Path::Waits(w) => Some(format!("The tower merges it itself after {w}.")),
         Path::Ready => Some("The tower is merging it.".into()),
         Path::Yours(_) if pr.score.as_ref().is_some_and(|s| s.needs_review) => None,
@@ -1343,6 +1389,59 @@ pub(crate) mod tests {
         }
     }
 
+    /// "Bro just make a PR and merge the low risks": a PR into dev that no
+    /// plan predicted merges by itself (auto-merge on) once it is low risk on
+    /// its own files, nothing outside breaks, its CI passes, its reviewer
+    /// found nothing and its session reported how it validated it, with
+    /// evidence. A migration, one into main and one with red CI don't.
+    #[test]
+    fn an_unplanned_low_risk_pr_into_dev_with_green_ci_and_a_clean_review_merges_by_itself() {
+        // Scored on its own files only (no prediction), as the tower scores a PR it finds.
+        let unplanned = |base: &str, files: &[&str]| {
+            let mut p = low_pr(base);
+            let mut s = combine(None, &real_score("fix(dates): day first in the invitation email", &files.iter().map(|f| f.to_string()).collect::<Vec<_>>()), "abc");
+            assert_eq!(s.planned, None);
+            s.sha = "abc".into();
+            p.score = Some(s);
+            p.validation = None;
+            p
+        };
+        let files = ["src/shared/utils/date/date-text.ts", "src/shared/utils/date/date-text.test.ts"];
+        let mut pr = unplanned("dev", &files);
+        assert!(!pr.score.as_ref().unwrap().needs_review, "{:?}", pr.score);
+        // While its session is on it, the tower waits for its validation; its turn over without one: the user's.
+        assert_eq!(auto_path(&Pr { waiting: false, ..pr.clone() }, true), Path::Waits("its session to report how it validated it (tower validate)".into()));
+        assert_eq!(auto_path(&pr, true), Path::Yours("its session hasn't reported how it validated it (tower validate)".into()));
+        // Its session reports its own checks with evidence (`tower validate <pr> "<what>" passed --evidence …`): it merges by itself.
+        let v = pr.validation.get_or_insert_with(Default::default);
+        v.report_own("the date formatter test", "passed", "12 passed", "t1s1", 1).unwrap();
+        v.report_own("type check", "passed", "tsc --noEmit: exit 0", "t1s1", 2).unwrap();
+        assert!(v.report_own("x", "passed", "", "t1s1", 3).is_err(), "evidence is needed");
+        assert_eq!(auto_path(&pr, true), Path::Ready);
+        assert_eq!(auto_path(&pr, false), Path::Off, "only with auto-merge on");
+        assert_eq!(auto_line(&pr, true).as_deref(), Some("The tower is merging it."));
+        // A check that didn't pass: the user's.
+        let mut bad = pr.clone();
+        bad.validation.as_mut().unwrap().report_own("the invitation email", "failed", "the date is month first", "t1s1", 4).unwrap();
+        assert!(matches!(auto_path(&bad, true), Path::Yours(w) if w.starts_with("its checks didn't all pass")));
+        let with_checks = |mut p: Pr| {
+            p.validation = pr.validation.clone();
+            auto_path(&p, true)
+        };
+        // A migration (on its own files): needs review, the user's.
+        assert!(matches!(with_checks(unplanned("dev", &["db/migrations/0043_dates.sql"])), Path::Yours(w) if w.starts_with("Needs review: a database migration")));
+        // Into main (a release among them): the user's.
+        assert_eq!(with_checks(unplanned("main", &files)), Path::Yours("it merges into main: that ships to production".into()));
+        // Red CI, or none at all: the user's.
+        assert_eq!(with_checks(Pr { checks: crate::prs::Checks { state: "failing".into(), ..Default::default() }, ..unplanned("dev", &files) }), Path::Yours("its checks fail".into()));
+        assert_eq!(with_checks(Pr { checks: crate::prs::Checks { state: "none".into(), ..Default::default() }, ..unplanned("dev", &files) }), Path::Yours("no checks ran on it".into()));
+        // No reviewer, or one that found something; a breaking change: the user's.
+        assert_eq!(with_checks(Pr { review: None, ..unplanned("dev", &files) }), Path::Yours("no reviewer looked at it".into()));
+        assert!(matches!(with_checks(Pr { review: Some(crate::reviews::Brief { status: "agreed".into(), rounds: 1, critical: 1, ..Default::default() }), ..unplanned("dev", &files) }), Path::Yours(_)));
+        // New dependencies, auth, secrets: needs review.
+        assert!(matches!(with_checks(unplanned("dev", &["package.json"])), Path::Yours(w) if w.starts_with("Needs review")));
+    }
+
     #[test]
     fn only_a_planned_low_risk_pr_into_dev_that_passed_everything_merges_by_itself() {
         let pr = low_pr("dev");
@@ -1356,7 +1455,8 @@ pub(crate) mod tests {
         assert_eq!(auto_path(&low_pr("main"), true), Path::Yours("it merges into main: that ships to production".into()));
         assert_eq!(auto_path(&low_pr("feature/x"), true), Path::Yours("it merges into feature/x, not dev".into()));
         assert!(matches!(with(&|p| p.score = Some(score(&ev("x", "", &["db/migrations/1.sql"])))), Path::Yours(w) if w.starts_with("Needs review: a database migration")));
-        assert_eq!(with(&|p| p.score.as_mut().unwrap().planned = None), Path::Yours("no plan predicted it".into()));
+        // No plan, and its session reported nothing of how it validated it: the user's.
+        assert_eq!(with(&|p| { p.score.as_mut().unwrap().planned = None; p.validation = None; }), Path::Yours("its session hasn't reported how it validated it (tower validate)".into()));
         assert_eq!(with(&|p| p.score = None), Path::Yours("it has no review score".into()));
         // Who depends on what it changes: checked at its head, and nothing breaks.
         assert_eq!(with(&|p| p.impact = None), Path::Yours("who depends on what it changes wasn't checked".into()));

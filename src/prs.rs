@@ -53,6 +53,16 @@ pub struct Checks {
     pub total: usize,
 }
 
+/// A low-risk PR into dev that no plan predicted, its session asked nothing
+/// yet, with none of its own checks reported: what auto-merge waits for.
+fn unvalidated(pr: &Pr) -> bool {
+    pr.open()
+        && !pr.asked_validation
+        && crate::prscore::is_dev(&pr.base)
+        && pr.score.as_ref().is_some_and(|s| !s.needs_review && s.planned.is_none())
+        && pr.validation.as_ref().is_none_or(|v| v.checks.is_empty())
+}
+
 /// One pull request, as the chip shows it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -116,6 +126,10 @@ pub struct Pr {
     /// The tower's own merge of it (`[prs] auto_merge_low_risk`): merged, or why it couldn't.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto: Option<crate::prscore::Auto>,
+    /// Its session was told once to report how it validated it (a low-risk PR
+    /// into dev that no plan predicted: `prscore::unvalidated_note`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub asked_validation: bool,
     /// How its plan said it is validated (its checks and edge cases), and
     /// where each check stands (`tower validate`); none when no plan predicted it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -883,8 +897,13 @@ impl Prs {
     /// passed, failed or not run, with its evidence. The PR as it is now.
     pub fn report_check(&self, k: &str, check: &str, status: &str, proof: &str, by: &str) -> Result<Pr> {
         let mut pr = self.get(k).with_context(|| format!("the tower doesn't know {k}"))?;
-        let Some(v) = pr.validation.as_mut() else { bail!("{k} has no planned checks: no plan predicted it") };
-        v.report(check, status, proof, by, crate::history::now_ms())?;
+        // No plan predicted it: the session's own checks (what it ran, with its evidence).
+        if pr.score.as_ref().is_none_or(|s| s.planned.is_none()) {
+            pr.validation.get_or_insert_with(Default::default).report_own(check, status, proof, by, crate::history::now_ms())?;
+        } else {
+            let Some(v) = pr.validation.as_mut() else { bail!("{k} has no planned checks") };
+            v.report(check, status, proof, by, crate::history::now_ms())?;
+        }
         self.store(pr.clone(), "update", true);
         Ok(pr)
     }
@@ -1130,11 +1149,16 @@ impl Prs {
                     // Its session finished its turn on it: what it didn't report is not run (another's
                     // mention of it isn't that).
                     let unreported = if waiting && pr.session == session { pr.validation.as_mut().map(|v| v.finished(now)).unwrap_or_default() } else { vec![] };
-                    if waiting && (!pr.waiting || !unreported.is_empty()) {
+                    let ask = waiting && pr.session == session && unvalidated(&pr);
+                    if waiting && (!pr.waiting || !unreported.is_empty() || ask) {
                         pr.waiting = true;
+                        pr.asked_validation |= ask;
                         self.store(pr.clone(), "update", true);
                     }
                     self.told_unreported(&pr, &unreported);
+                    if ask {
+                        self.told_unvalidated(&pr);
+                    }
                     open.push(pr);
                 }
                 continue;
@@ -1179,6 +1203,8 @@ impl Prs {
             }
             // Found as its session finished its turn on it: none of its checks was reported.
             let unreported = if waiting { pr.validation.as_mut().map(|v| v.finished(now)).unwrap_or_default() } else { vec![] };
+            let ask = waiting && unvalidated(&pr);
+            pr.asked_validation |= ask;
             eprintln!(
                 "[prs] {k} by {} ({}): {} into {}, {}{}",
                 pr.session,
@@ -1201,9 +1227,22 @@ impl Prs {
             }
             self.put(pr.clone(), "open");
             self.told_unreported(&pr, &unreported);
+            if ask {
+                self.told_unvalidated(&pr);
+            }
             open.push(pr);
         }
         open
+    }
+
+    /// Its session finished its turn on a low-risk PR into dev that no plan
+    /// predicted, with none of its own checks reported: told once (empty
+    /// `missing`: `on_unreported` sends `prscore::unvalidated_note` then).
+    fn told_unvalidated(&self, pr: &Pr) {
+        eprintln!("[prs] {}: no validation reported by its session: asking it once", pr.key());
+        if let Some(f) = self.on_unreported.get() {
+            f(pr, &[]);
+        }
     }
 
     fn told_unreported(&self, pr: &Pr, unreported: &[crate::prscore::Check]) {

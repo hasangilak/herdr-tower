@@ -8,8 +8,9 @@
 //!   again on its own files at its head (`gh pr view --json files`): what it
 //!   shows now is added to its score, so the card says it and nothing is
 //!   merged on an old reading.
-//! - A PR that is `Ready` (a plan predicted it, low risk, into dev, checks
-//!   pass, its reviewer agreed without finding anything, clean) is read
+//! - A PR that is `Ready` (low risk, into dev, its validation passed: its
+//!   plan's checks, or the checks its session reported when no plan
+//!   predicted it; CI passes, its reviewer agreed without finding anything, clean) is read
 //!   once more right before the merge; if its files still score low risk it
 //!   is merged pinned to that head commit, with the repo's own method, never
 //!   `--admin` (`prs::merge`). Then GitHub is asked, and the session and the
@@ -240,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn a_migration_a_pr_into_main_or_an_unplanned_one_never_merges_by_itself() {
+    fn a_migration_a_pr_into_main_or_an_unplanned_one_unvalidated_never_merges_by_itself() {
         let gh = fake_gh("auto-never");
         // A migration, as the plan predicted it.
         serve(&gh, 21, "dev", &["db/migrations/0042_orders.sql"], "m1");
@@ -251,7 +252,7 @@ mod tests {
         // Predicted as UI, but its real files have a migration.
         serve(&gh, 23, "dev", &["src/Cart.tsx", "db/migrations/0043_flags.sql"], "m3");
         let c = found(&gh, 23, &ui(), true);
-        // Low risk, into dev, but no plan predicted it.
+        // Low risk, into dev, no plan predicted it, and its session reported nothing of how it validated it.
         serve(&gh, 24, "dev", &["src/Cart.tsx"], "m4");
         let d = found(&gh, 24, &ui(), false);
         for (prs, k) in [(&a, "o/app#21"), (&b, "o/app#22"), (&c, "o/app#23"), (&d, "o/app#24")] {
@@ -267,6 +268,21 @@ mod tests {
         // And all of them stay the user's merge decision.
         let all: Vec<Pr> = [&a, &b, &c, &d].iter().flat_map(|p| p.list()).collect();
         assert_eq!(prscore::for_the_user(&all, true).iter().filter(|p| p.waiting).count(), 4);
+        // The unplanned one's session reports its own checks (`tower validate`): then it merges by itself.
+        assert!(d.report_check("o/app#24", "the cart test", "passed", "", "t7").is_err(), "evidence first");
+        d.report_check("o/app#24", "the cart test", "passed", "12 tests passed", "t7").unwrap();
+        d.report_check("o/app#24", "type check", "passed", "tsc --noEmit: exit 0", "t7").unwrap();
+        assert_eq!(d.get("o/app#24").unwrap().validation.unwrap().checks.len(), 2, "only what was reported with evidence");
+        let m = AutoMerger::new(d.clone(), || true);
+        assert_eq!(m.tick(), ["o/app#24"]);
+        assert!(calls(&gh).contains("pr merge 24 --repo o/app --squash --match-head-commit m4"), "{}", calls(&gh));
+        assert_eq!(d.get("o/app#24").unwrap().merged_by.as_deref(), Some("tower"));
+        // Reported for the migration, the one into main: still never.
+        for (prs, k) in [(&a, "o/app#21"), (&b, "o/app#22")] {
+            let _ = prs.report_check(k, "c1", "passed", "12 tests passed", "t7");
+            assert!(AutoMerger::new(prs.clone(), || true).tick().is_empty(), "{k}");
+        }
+        assert!(!calls(&gh).contains("pr merge 21") && !calls(&gh).contains("pr merge 22"));
     }
 
     #[test]
@@ -299,6 +315,39 @@ mod tests {
         assert!(matches!(prscore::auto_path(&pr, true), Path::Yours(w) if w.contains("a review is required")), "{:?}", prscore::auto_path(&pr, true));
         assert!(m.tick().is_empty(), "not tried again at the same commit");
         assert_eq!(calls(&gh).matches("pr merge").count(), 1);
+    }
+
+    /// A low-risk PR into dev that no plan predicted, its session's turn on
+    /// it ended with no checks reported: its session is asked once how it
+    /// validated it (an empty `missing`: `prscore::unvalidated_note`); not
+    /// again at its next turn's end, and never for one that needs review.
+    #[test]
+    fn an_unplanned_prs_session_is_asked_once_to_report_how_it_validated_it() {
+        let gh = fake_gh("auto-ask");
+        serve(&gh, 51, "dev", &["src/Cart.tsx"], "w1");
+        serve(&gh, 52, "dev", &["db/migrations/0044_x.sql"], "w2");
+        let asked = |n: u64| {
+            let prs = Prs::at(gh.with_file_name(format!("prs-ask-{n}.json")), gh.clone());
+            let gh2 = gh.clone();
+            prs.on_score(Box::new(move |pr| {
+                let (files, sha) = crate::prs::fetch_files(&gh2, &pr.repo, pr.number).unwrap();
+                let s = prscore::combine(None, &prscore::real_score(&pr.title, &files), &sha);
+                prscore::Scored { score: Some(s), validation: None, impact: Some(crate::impact::Impact { sha, ..Default::default() }) }
+            }));
+            let told = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let t2 = told.clone();
+            prs.on_unreported(Box::new(move |pr, missing| t2.lock().unwrap().push(format!("{} [{}]", pr.key(), missing.len()))));
+            prs.found(&[("o/app".into(), n)], "t7", "web", Some("shop"), true);
+            prs.found(&[("o/app".into(), n)], "t7", "web", Some("shop"), true);
+            (prs, told)
+        };
+        let (prs, told) = asked(51);
+        assert_eq!(*told.lock().unwrap(), ["o/app#51 [0]"], "once, at its first turn's end on it");
+        assert!(prs.get("o/app#51").unwrap().asked_validation);
+        let note = prscore::unvalidated_note(&prs.get("o/app#51").unwrap(), "tower");
+        assert!(note.contains("tower validate o/app#51 \"<what it checks>\" passed --evidence"), "{note}");
+        let (_, told) = asked(52);
+        assert!(told.lock().unwrap().is_empty(), "a migration needs review: nothing to ask for");
     }
 
     #[test]
