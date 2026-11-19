@@ -1310,6 +1310,26 @@ impl Book {
         Some((p.id.clone(), p.prs[i].clone()))
     }
 
+    /// The plan's predicted PR `n` is the real PR `key` (`tower plan remap`):
+    /// another prediction of the plan that had it lets it go. The
+    /// prediction, and the PR it had before (whose planned checks go).
+    pub fn remap_pr(&mut self, id: &str, n: u32, key: &str, now: u64) -> Result<(crate::prscore::Predicted, Option<String>)> {
+        let p = self.plans.iter_mut().find(|p| p.id == id).ok_or_else(|| anyhow::anyhow!("no plan {id}"))?;
+        let ns: Vec<String> = p.prs.iter().map(|x| x.n.to_string()).collect();
+        let at = p.prs.iter().position(|x| x.n == n).ok_or_else(|| anyhow::anyhow!("plan {id} has no PR {n}: its PRs are {}", if ns.is_empty() { "none".into() } else { ns.join(", ") }))?;
+        let repo = key.split_once('#').map(|(r, _)| r).unwrap_or(key);
+        let folder = repo.rsplit('/').next().unwrap_or(repo);
+        if !p.prs[at].repo.eq_ignore_ascii_case(folder) {
+            bail!("plan {id}'s PR {n} is one of {}, not of {repo}", p.prs[at].repo);
+        }
+        for x in p.prs.iter_mut().filter(|x| x.n != n && x.pr.as_deref() == Some(key)) {
+            x.pr = None;
+        }
+        let was = p.prs[at].pr.replace(key.to_string()).filter(|w| w != key);
+        p.updated_ms = now;
+        Ok((p.prs[at].clone(), was))
+    }
+
     /// Published (again): its link, and it is ready.
     pub fn published(&mut self, id: &str, url: &str, now: u64) -> Result<Plan> {
         let url = url.trim();
@@ -2154,7 +2174,7 @@ pub struct Args {
     pub json: bool,
 }
 
-const USAGE: &str = "tower plan finding <id> --kind <kind> \"<what was found>\" [--stage s] [--assumption a] | assume <id> <a> holds|broken --evidence \"<…>\" | revise <id> --json-file stages.json --why \"<…>\" [--finding f1] | new --form page|whiteboard --draft '<draft JSON>' --ticket-file <file> | say <id> \"<words>\" [--as user|planner] | draft <id> --json-file <file> | prs <id> --json-file <file> | stages <id> --json-file <file> | answer <id> <question> \"<answer>\" [--by tower|you] | ask <id> <question> | check <id> <stage> <check> passed|failed|not-run --evidence \"<…>\" | published <id> --url <link> | failed <id> \"<why>\" | show [<id>] [--json] | close [<id>] | list";
+const USAGE: &str = "tower plan finding <id> --kind <kind> \"<what was found>\" [--stage s] [--assumption a] | assume <id> <a> holds|broken --evidence \"<…>\" | revise <id> --json-file stages.json --why \"<…>\" [--finding f1] | new --form page|whiteboard --draft '<draft JSON>' --ticket-file <file> | say <id> \"<words>\" [--as user|planner] | draft <id> --json-file <file> | prs <id> --json-file <file> | stages <id> --json-file <file> | answer <id> <question> \"<answer>\" [--by tower|you] | ask <id> <question> | check <id> <stage> <check> passed|failed|not-run --evidence \"<…>\" | published <id> --url <link> | failed <id> \"<why>\" | remap <id> <n> <pr> (the plan's predicted PR n is that real PR) | show [<id>] [--json] | close [<id>] | list";
 
 /// Reads `tower plan …`'s words (after `plan`): the action, its flags, the id, the words.
 pub fn parse_args(raw: &[String]) -> Result<Args> {
@@ -2220,6 +2240,9 @@ pub fn parse_args(raw: &[String]) -> Result<Args> {
         "stages" if a.id.is_none() || a.json_file.is_none() => bail!("tower plan stages <id> --json-file <the plan's stages, assumptions and questions>"),
         "answer" if a.id.is_none() || a.words.split_whitespace().count() < 2 => bail!("tower plan answer <id> <question> \"<the answer>\" [--by tower|you]"),
         "ask" if a.id.is_none() || a.words.split_whitespace().count() != 1 => bail!("tower plan ask <id> <question>: it goes to the user's queue"),
+        "remap" if a.id.is_none() || a.words.split_whitespace().count() != 2 || a.words.split_whitespace().next().is_none_or(|n| n.trim_start_matches('#').parse::<u32>().is_err()) => {
+            bail!("tower plan remap <id> <n> <pr>: the plan's predicted PR n (1, 2, …) is that real PR (owner/repo#12 or its link)")
+        }
         "check" if a.id.is_none() || a.words.split_whitespace().count() != 3 || a.evidence.is_none() => {
             bail!("tower plan check <id> <stage> <check> passed|failed|not-run --evidence \"<the test output, a screenshot's path, a log, or why it wasn't run>\"")
         }
@@ -2229,10 +2252,10 @@ pub fn parse_args(raw: &[String]) -> Result<Args> {
         "assume" if a.id.is_none() || a.words.split_whitespace().count() != 2 || a.evidence.is_none() => bail!("tower plan assume <id> <assumption> holds|broken --evidence \"<what showed it>\""),
         "revise" if a.id.is_none() || a.json_file.is_none() || a.why.is_none() => bail!("tower plan revise <id> --json-file stages.json --why \"<what made it change>\" [--finding f1,f2]"),
         "keep" if a.id.is_none() || a.why.is_none() => bail!("tower plan keep <id> --why \"<why what was found changes nothing>\""),
-        "say" | "failed" | "draft" | "prs" | "stages" | "answer" | "ask" | "check" | "finding" | "assume" | "revise" | "keep" | "published" | "show" | "close" | "list" => {}
+        "say" | "failed" | "draft" | "prs" | "stages" | "answer" | "ask" | "check" | "finding" | "assume" | "revise" | "keep" | "remap" | "published" | "show" | "close" | "list" => {}
         other => bail!("tower plan {other}: {USAGE}"),
     }
-    if !a.words.is_empty() && !matches!(a.action.as_str(), "say" | "failed" | "answer" | "ask" | "check" | "finding" | "assume") {
+    if !a.words.is_empty() && !matches!(a.action.as_str(), "say" | "failed" | "answer" | "ask" | "check" | "finding" | "assume" | "remap") {
         bail!("tower plan {}: what is {:?}? {USAGE}", a.action, a.words);
     }
     Ok(a)
@@ -2272,6 +2295,7 @@ fn body_of(a: &Args) -> Option<Value> {
     match a.action.as_str() {
         "answer" => Some(json!({ "question": w.first().copied().unwrap_or(""), "answer": w.get(1..).map(|r| r.join(" ")).unwrap_or_default(), "by": a.by.clone().unwrap_or_default() })),
         "ask" => Some(json!({ "question": w.first().copied().unwrap_or("") })),
+        "remap" => Some(json!({ "n": w.first().and_then(|n| n.trim_start_matches('#').parse::<u32>().ok()), "pr": w.get(1).copied().unwrap_or("") })),
         "check" => Some(json!({ "stage": w.first(), "check": w.get(1), "status": w.get(2), "evidence": a.evidence.clone().unwrap_or_default() })),
         "finding" => Some(json!({ "kind": a.kind, "text": a.words, "stage": a.stage.clone().unwrap_or_default(), "assumption": a.assumption.clone().unwrap_or_default(), "session": a.session.clone().unwrap_or_default() })),
         "assume" => Some(json!({ "assumption": w.first(), "status": w.get(1), "evidence": a.evidence.clone().unwrap_or_default(), "session": a.session.clone().unwrap_or_default() })),
@@ -2630,6 +2654,19 @@ mod tests {
         let a = parse_args(&words(&["prs", "p3", "--json-file", "prs.json"])).unwrap();
         assert_eq!((a.action.as_str(), a.id.as_deref(), a.json_file.as_deref()), ("prs", Some("p3"), Some("prs.json")));
         assert!(parse_args(&words(&["prs", "p3"])).is_err(), "prs needs its file");
+
+        // `tower plan remap`: PR 2 is #9, not #7, which lets it go; the one before comes back.
+        let (x, was) = b.remap_pr("p1", 2, "eyzhub/eyzflow-admin-dashboard#9", 12).unwrap();
+        assert_eq!((x.n, x.pr.as_deref(), was.as_deref()), (2, Some("eyzhub/eyzflow-admin-dashboard#9"), Some("eyzhub/eyzflow-admin-dashboard#7")));
+        // The same again: nothing it had before.
+        assert_eq!(b.remap_pr("p1", 2, "eyzhub/eyzflow-admin-dashboard#9", 13).unwrap().1, None);
+        // PR 1 taking #9: PR 2 lets it go.
+        b.remap_pr("p1", 1, "eyzhub/eyz-customer-support#9", 14).unwrap();
+        assert!(b.remap_pr("p1", 1, "eyzhub/eyzflow-admin-dashboard#9", 15).unwrap_err().to_string().contains("one of eyz-customer-support"), "another repo's PR isn't it");
+        assert!(b.remap_pr("p1", 7, "eyzhub/eyzflow-admin-dashboard#9", 15).unwrap_err().to_string().contains("its PRs are 1, 2"));
+        let a = parse_args(&words(&["remap", "p6", "3", "eyzhub/eyz-mediaroom-serverless#1594"])).unwrap();
+        assert_eq!(body_of(&a), Some(json!({ "n": 3, "pr": "eyzhub/eyz-mediaroom-serverless#1594" })));
+        assert!(parse_args(&words(&["remap", "p6", "#1594"])).is_err(), "remap needs the plan's PR number and the real PR");
     }
 
     #[test]

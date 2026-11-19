@@ -889,6 +889,27 @@ impl Prs {
         Ok(pr)
     }
 
+    /// The plan's prediction it is (`planned`, `p6#3`) and the checks it
+    /// plans (`tower plan remap`), or neither. Results reported on it before
+    /// for the same checks stay. The PR as it is now.
+    pub fn set_planned(&self, k: &str, planned: Option<String>, validation: Option<crate::prscore::Validation>) -> Option<Pr> {
+        let mut pr = self.get(k)?;
+        let had = pr.validation.take();
+        pr.validation = validation.map(|mut v| {
+            for c in v.checks.iter_mut() {
+                if let Some(o) = had.as_ref().and_then(|h| h.checks.iter().find(|o| o.id == c.id && o.status != crate::prscore::PLANNED)) {
+                    (c.status, c.proof, c.by, c.at_ms) = (o.status.clone(), o.proof.clone(), o.by.clone(), o.at_ms);
+                }
+            }
+            v
+        });
+        let mut score = pr.score.clone().unwrap_or_default();
+        score.planned = planned;
+        pr.score = Some(score);
+        self.store(pr.clone(), "update", true);
+        Some(pr)
+    }
+
     /// The user merged `key` (from the Mac panel or a phone): GitHub is
     /// asked, and when it says merged, the chip moves and the session and the
     /// brain are told (`on_merged`), once.

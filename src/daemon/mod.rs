@@ -637,6 +637,27 @@ fn validate(prs: &crate::prs::Prs, pr: &str, check: &str, status: &str, evidence
     Ok(serde_json::json!({ "pr": pr.key(), "validation": pr.validation, "line": pr.validation.as_ref().map(|v| v.line()) }))
 }
 
+/// `tower plan remap <id> <n> <pr>`: the plan's predicted PR `n` is that
+/// real PR, which takes its planned checks (results it had for them stay);
+/// the PR it was matched to before loses them: no plan predicted that one.
+fn remap_plan_pr(plans: &plans::Plans, prs: &crate::prs::Prs, id: &str, body: Option<&serde_json::Value>) -> anyhow::Result<serde_json::Value> {
+    let b = body.cloned().unwrap_or_default();
+    let n = b["n"].as_u64().ok_or_else(|| anyhow::anyhow!("tower plan remap <id> <n> <pr>"))? as u32;
+    let key = pr_key(prs, b["pr"].as_str().unwrap_or(""), None)?;
+    let pr = prs.get(&key).ok_or_else(|| anyhow::anyhow!("the tower doesn't know {key} yet"))?;
+    let id = if id.trim().is_empty() { anyhow::bail!("tower plan remap <id> <n> <pr>: give the plan") } else { id.trim() };
+    let (p, was) = plans.remap(id, n, &key)?;
+    if !p.base.trim().is_empty() && !p.base.eq_ignore_ascii_case(&pr.base) {
+        eprintln!("[plans] {id}: PR {n} predicted into {}, {key} is into {}", p.base, pr.base);
+    }
+    if let Some(old) = &was {
+        prs.set_planned(old, None, None);
+    }
+    let now = prs.set_planned(&key, Some(format!("{id}#{n}")), Some(p.validation())).ok_or_else(|| anyhow::anyhow!("{key} went meanwhile"))?;
+    eprintln!("[plans] {id}: PR {n} is {key} now{}", was.as_ref().map(|w| format!(", not {w}")).unwrap_or_default());
+    Ok(serde_json::json!({ "plan": id, "n": n, "pr": key, "was": was, "validation": now.validation, "line": now.validation.as_ref().map(|v| v.line()) }))
+}
+
 /// `tower impact`: who depends on a PR's changes (with no verdict), or a
 /// break found, or none, by compiling, type-checking or running the dependents' tests.
 fn impact_report(prs: &crate::prs::Prs, pr: &str, verdict: &str, text: &str, from: Option<&str>) -> anyhow::Result<serde_json::Value> {
@@ -1148,6 +1169,12 @@ impl Daemon {
                 };
             }
             Request::Screenshots => load_screenshots(&self.shared),
+            Request::Plan { action, id, body, .. } if action == "remap" => {
+                return match remap_plan_pr(&self.plans, &self.prs, &id, body.as_ref()) {
+                    Ok(v) => Response { ok: true, error: None, state: Some(v) },
+                    Err(e) => Response::err(format!("{e:#}")),
+                };
+            }
             plan @ Request::Plan { .. } => return self.plans.request(&plan),
             Request::Phone { action, arg } => {
                 let info = match action.as_str() {
