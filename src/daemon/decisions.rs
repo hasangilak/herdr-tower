@@ -947,6 +947,27 @@ impl Decisions {
                 self.answered(id, &label);
                 Ok(json!({ "ok": true, "id": id, "state": "answered", "answer": label, "plan": done }))
             }
+            Act::PrNote { to, prs, text } => {
+                let (mut sent, mut errors, mut reached) = (vec![], vec![], vec![]);
+                for (address, words) in &to {
+                    match (with.send)(address, words) {
+                        Ok(v) => {
+                            sent.push(v);
+                            reached.push(address.clone());
+                        }
+                        Err(e) => errors.push(format!("{address}: {e:#}")),
+                    }
+                }
+                if reached.is_empty() {
+                    return Err(Refused::Failed(format!("it couldn't be sent: {}", errors.join("; "))));
+                }
+                let by = body.get("by").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                let note = decisions::PrNote { text: text.clone(), prs: prs.clone(), to: reached.clone(), by, at_ms: crate::history::now_ms() };
+                self.change(|b, _| b.note_pr(id, note));
+                // The card stays open: the merge is still the user's.
+                let state = self.get(id).map(|d| d.state).unwrap_or(State::Open);
+                Ok(json!({ "ok": true, "id": id, "state": state.word(), "note": text, "prs": prs, "to": reached, "sent": sent, "errors": errors }))
+            }
             Act::Accounts { wait, label } => {
                 self.answered(id, &label);
                 let done = match (with.accounts)(wait) {
@@ -1225,6 +1246,63 @@ mod tests {
         let merge = d.for_prs(&prs)[0].clone();
         assert!(d.typed_in_with("t9", "merged it", &|_, _| Ok(true)).is_empty());
         assert_eq!(d.get(&merge).map(|c| c.state), Some(State::Open));
+    }
+
+    /// "In the PR cards in the queue let me write something if I want
+    /// something more into the PR": words typed on a merge card go to its
+    /// PR's session through the queue, as a change to make on that PR, and
+    /// the card stays open for the merge. Words naming one of its PRs (#n)
+    /// go to that PR's session alone; a card's notes keep what went.
+    #[test]
+    fn words_on_a_merge_card_reach_the_prs_session_as_a_change_and_leave_the_card_open() {
+        let s = shared();
+        let d = Decisions::telling(s.clone(), || Level::Decisions);
+        let prs = vec![pr(987, "dev", "t1qx"), pr(988, "dev", "t1qy")];
+        d.sync_prs(&prs);
+        let card = d.for_prs(&prs)[0].clone();
+        let asks = crate::daemon::asks::Asks::new(s.clone(), Arc::new(crate::daemon::lan::hub::Hub::default()), "normal");
+        let sent: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let w = sent.clone();
+        let send = move |session: &str, text: &str| -> Result<Value> {
+            w.lock().unwrap().push((session.to_string(), text.to_string()));
+            Ok(json!({ "session": session, "queue_id": "q1", "sent": false }))
+        };
+        let agenda = |_: &crate::agenda::Cmd| crate::protocol::Response { ok: true, error: None, state: None };
+        let reopen = |_: &crate::reopen::Pick| -> Result<Value> { panic!("no reopen") };
+        let accounts = |_: bool| -> Result<Value> { panic!("no accounts") };
+        let plan = |_: &str, _: &str, _: &str| -> Result<Value> { panic!("no plan") };
+        let carry = Carry { asks: &asks, send: &send, agenda: &agenda, reopen: &reopen, accounts: &accounts, plan: &plan };
+
+        // Words naming #987: to its session only, about that PR.
+        let v = d.answer_with(&card, &json!({ "other": "On #987, also rename the Year filter to Release year.", "by": "mac" }), true, &carry).unwrap();
+        assert_eq!((v["state"].as_str(), &v["prs"], &v["to"]), (Some("open"), &json!(["o/app#987"]), &json!(["t1qx"])), "{v}");
+        let got = sent.lock().unwrap().clone();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "t1qx");
+        assert_eq!(
+            got[0].1,
+            "[tower] Before merging PR #987 (o/app, into dev), the user wants more on it: On #987, also rename the Year filter to Release year.\n\nMake this change on it: commit it on the PR's branch and push, so it carries it. Then say in a line or two what you changed. Don't merge it: the user still does, from its merge card."
+        );
+        // The card stays open for the merge, and keeps what went.
+        let c = d.get(&card).unwrap();
+        assert_eq!((c.state, c.closed_ms), (State::Open, None));
+        assert_eq!((c.notes.len(), c.notes[0].text.as_str(), c.notes[0].to.as_slice(), c.notes[0].by.as_str()), (1, "On #987, also rename the Year filter to Release year.", &["t1qx".to_string()][..], "mac"));
+        assert_eq!(s.get().decisions.iter().find(|v| v["id"] == card.as_str()).unwrap()["notes"][0]["prs"], json!(["o/app#987"]), "the panel and the phone see it");
+        assert_eq!(d.list(None, false)["count"], 1, "still in the queue");
+
+        // Words naming none: every PR's own session, each about its own PR.
+        sent.lock().unwrap().clear();
+        d.answer_with(&card, &json!({ "other": "Add a test for an empty catalogue." }), true, &carry).unwrap();
+        let got = sent.lock().unwrap().clone();
+        assert_eq!(got.iter().map(|(a, t)| (a.as_str(), t.contains(&format!("PR #{}", if a == "t1qx" { 987 } else { 988 })))).collect::<Vec<_>>(), [("t1qx", true), ("t1qy", true)]);
+        // One by its key ("pr").
+        sent.lock().unwrap().clear();
+        d.answer_with(&card, &json!({ "other": "Squash the fixups.", "pr": "o/app#988" }), true, &carry).unwrap();
+        assert_eq!(sent.lock().unwrap()[0].0, "t1qy");
+        assert!(d.answer_with(&card, &json!({ "other": "x", "pr": "o/app#1" }), true, &carry).is_err(), "a PR the card hasn't");
+        // A choice still isn't a merge: the merge stays the PR's own flow.
+        assert!(matches!(d.answer_with(&card, &json!({ "choice": 0 }), true, &carry), Err(Refused::Merge(_))));
+        assert_eq!(d.get(&card).unwrap().notes.len(), 3);
     }
 
     fn pr(n: u64, base: &str, session: &str) -> Pr {

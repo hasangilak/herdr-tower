@@ -281,6 +281,14 @@ impl Asks {
         self.other = None;
     }
 
+    /// What card `id` kept typed goes (sent, or let go).
+    pub(super) fn forget_typed(&mut self, id: &str) {
+        if let Some(c) = self.cards.get_mut(id) {
+            c.others.clear();
+            c.choices.clear();
+        }
+    }
+
 }
 
 impl Panel {

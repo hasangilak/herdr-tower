@@ -1186,9 +1186,12 @@ of one repo waiting for a merge in one space are one decision.
   "state": "open",                   // open | answering | answered | stopped | dismissed
   "muted": false,
   "hold": null,                      // on hold: {"reason", "by", "since_ms", "until_prs"} (see "On hold")
-  "back": null                       // back from hold: {"why", "at_ms"}
+  "back": null,                      // back from hold: {"why", "at_ms"}
+  "notes": []                        // a merge's: what the user asked to add to its PRs, as sent, oldest first: {"text", "prs", "to", "by", "at_ms"}
 }
 ```
+
+On a `merge` card, offer a text field under its PRs ("Ask for a change to this PR…"): what is typed is sent with `POST /v1/decisions/{id}/answer` `{"other": "…"}` and the card stays open for the merge. Show its `notes` on the card ("You asked: …", with when), so the user sees it went.
 
 | `kind` | It is | `options` | Answered with |
 |---|---|---|---|
@@ -1197,7 +1200,7 @@ of one repo waiting for a merge in one space are one decision.
 | `choice` | Raised by the tower with choices | As raised, the first one the pick | `{"choice": n}` or `{"other": "text"}` |
 | `raised` | Raised by the tower, in a line | None | `{"other": "text"}` |
 | `failed` | A task that failed again after one retry | "Try again", "Drop it"; no pick | `{"choice": 0}` (again), `{"choice": 1}` (drop), `{"other": "what to do instead"}` (again, with those words) |
-| `merge` | The PRs of one repo that wait for a merge in one space | One per PR, in order; the pick is the first when it can be merged, its checks pass and its base is not production | Not here: see "A merge" |
+| `merge` | The PRs of one repo that wait for a merge in one space | One per PR, in order; the pick is the first when it can be merged, its checks pass and its base is not production | The merge itself: not here, see "A merge". More for its PRs: `{"other": "also add X"}` (optionally `"pr": "owner/repo#n"` or a number, or a list, for some of them; else the PRs the words name as `#n`, else all) goes to each PR's session through its queue as a change to make on that PR. The decision stays `open` for the merge; `200 {"ok":true,"state":"open","note":"…","prs":[…],"to":[…]}`, and the decision's `notes` grow by one |
 | `blocked` | A session blocked on something the tower can't read (no menu on its screen: a dialog with options, even one it doesn't know by its question, is a question set and comes as a `permission` decision with its options): no question set comes of it, but the user still has to act | None | Not here: it is answered in the session itself. Offer "Show on Mac" (`POST /v1/sessions/{address}/show`, the address from `sessions`). Answering returns `400 bad_answer`. It closes by itself (`answered`) once the session is no longer blocked |
 
 - A `kind` the app doesn't know (a newer tower's) is still the user's: show it as a plain card with its `title` and `sessions` and count it; never leave it out.

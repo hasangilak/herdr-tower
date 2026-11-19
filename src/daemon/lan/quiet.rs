@@ -407,7 +407,7 @@ fn closed(id: &str, state: &str) -> Response {
 /// A merge is its PR's own flow: which PRs, so the app can go there.
 fn merge_error(d: &Value) -> Response {
     let prs: Vec<&str> = d["prs"].as_array().into_iter().flatten().filter_map(|p| p["key"].as_str()).collect();
-    let message = "a merge isn't answered here: confirm and merge its PR (POST /v1/prs/{owner}/{repo}/{number}/confirm, then /merge), or dismiss the decision";
+    let message = "a merge isn't answered here: confirm and merge its PR (POST /v1/prs/{owner}/{repo}/{number}/confirm, then /merge), or dismiss the decision; words for its PR ({\"other\": \"…\"}) go to its session";
     Response::json(400, &json!({ "error": { "code": "merge", "message": message, "prs": prs } }))
 }
 

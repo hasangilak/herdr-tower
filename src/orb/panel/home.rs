@@ -526,9 +526,41 @@ impl Panel {
         self.asks.close_other();
         // It went: what was typed for it is not kept.
         crate::unsent::clear(&crate::unsent::Key::others_of(id));
+        // A merge card: more for its PRs, to their sessions; the card stays for the merge.
+        if self.decisions(cx).iter().any(|d| d.id == id && d.kind == Kind::Merge) {
+            self.asks.forget_typed(id);
+            self.send_pr_words(id, history::compose(&text, &kept), cx);
+            return;
+        }
         // Words with files are for this once; plain words can be a rule.
         let answer = if kept.is_empty() { text.trim().to_string() } else { String::new() };
         self.answer_decision(id, json!({ "other": history::compose(&text, &kept) }), &format!("“{said}”"), &answer, cx);
+    }
+
+    /// Sends words typed on merge card `id` to its PRs' sessions (the
+    /// daemon's `Act::PrNote`): the card stays open, and shows them as sent.
+    fn send_pr_words(&mut self, id: &str, words: String, cx: &mut Context<Self>) {
+        let short: String = words.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(60).collect();
+        self.status = Some((true, format!("Sending to the PR's session: “{short}”")));
+        let task = cx.background_executor().spawn({
+            let id = id.to_string();
+            async move { crate::answers::answer(&id, json!({ "other": words, "by": "mac" }), true) }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.status = Some(match result {
+                    Ok(v) => {
+                        let to: Vec<&str> = v["to"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                        (true, format!("Sent to {}: it makes the change on the PR, and the card stays for the merge", if to.is_empty() { "its session".to_string() } else { to.join(", ") }))
+                    }
+                    Err(e) => (false, format!("Not sent: {e:#}")),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     /// Sends a decision's answer through the daemon; `said` is what its
@@ -616,7 +648,9 @@ impl Panel {
             eprintln!("[orb] HERDER_TOWER_ORB_KEYS: no open card {id}");
             return;
         }
-        self.open_other(id, 0, "Your answer: type it, or talk (Control)", window, cx);
+        // A merge card's field asks for more on its PR (its words go to the PR's session).
+        let merge = self.decisions(cx).iter().any(|d| d.id == id && d.kind == Kind::Merge);
+        self.open_other(id, 0, if merge { "What more for this PR? Enter sends it to its session" } else { "Your answer: type it, or talk (Control)" }, window, cx);
         eprintln!("[orb] HERDER_TOWER_ORB_KEYS: {id}: its field is open");
     }
 

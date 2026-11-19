@@ -400,6 +400,26 @@ pub struct Decision {
     /// It was on hold and came back: why (its card says so).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub back: Option<Back>,
+    /// A merge card: what the user asked to have added to its PRs, as sent
+    /// to their sessions (`Act::PrNote`), oldest first. The card stays open.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<PrNote>,
+}
+
+/// More the user asked for on a merge card's PRs, sent to their sessions.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrNote {
+    /// The user's words.
+    pub text: String,
+    /// The PRs it was about (`owner/repo#n`).
+    pub prs: Vec<String>,
+    /// The sessions it went to.
+    pub to: Vec<String>,
+    /// Who sent it: `mac`, `phone:<id>`, `terminal:<t>`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub by: String,
+    pub at_ms: u64,
 }
 
 impl Decision {
@@ -509,6 +529,7 @@ impl Decision {
             "muted": muted,
             "hold": self.hold.as_ref().map(|h| json!({ "reason": h.reason, "by": h.by, "since_ms": h.since_ms, "until_prs": h.until_prs })),
             "back": self.back.as_ref().map(|b| json!({ "why": b.why, "at_ms": b.at_ms })),
+            "notes": self.notes,
         })
     }
 
@@ -1107,6 +1128,13 @@ impl Book {
     pub fn note_answer(&mut self, id: &str, with: &str) {
         if let Some(d) = self.open.iter_mut().chain(self.closed.iter_mut()).find(|d| d.id == id) {
             d.answer = with.trim().to_string();
+        }
+    }
+
+    /// More the user asked for on merge card `id`'s PRs, as sent (`Decision::notes`).
+    pub fn note_pr(&mut self, id: &str, note: PrNote) {
+        if let Some(d) = self.open.iter_mut().find(|d| d.id == id) {
+            d.notes.push(note);
         }
     }
 
@@ -1876,6 +1904,41 @@ pub enum Act {
     Accounts { wait: bool, label: String },
     /// A plan's question is answered: written into the plan.
     Plan { plan: String, question: String, answer: String, label: String },
+    /// More for a merge card's PRs: each session gets its PRs' message (address, text); the card stays open for the merge.
+    PrNote { to: Vec<(String, String)>, prs: Vec<String>, text: String },
+}
+
+/// What a PR's session is sent when the user asks for more on its merge
+/// card: which PRs, the user's words, and what to do with them.
+pub fn pr_note_text(prs: &[&PrRef], text: &str) -> String {
+    let which: Vec<String> = prs.iter().map(|p| format!("PR #{} ({}, into {})", p.number, p.repo, if p.base.is_empty() { "?" } else { &p.base })).collect();
+    let (one, it) = if prs.len() == 1 { (which.join(""), "it") } else { (format!("your PRs {}", which.join(" and ")), "them") };
+    format!(
+        "[tower] Before merging {one}, the user wants more on {it}: {}\n\nMake this change on {it}: commit it on the PR's branch and push, so {it} carries it. Then say in a line or two what you changed. Don't merge {it}: the user still does, from its merge card.",
+        text.trim()
+    )
+}
+
+/// The PRs of merge card `d` that typed words are about: the ones `pick`
+/// names (keys or numbers; `body["pr"]`), else the ones the words name by
+/// number (`#12`), else all of them.
+fn note_targets<'a>(d: &'a Decision, pick: &[String], text: &str) -> Vec<&'a PrRef> {
+    let named = |p: &PrRef, w: &str| {
+        let w = w.trim().trim_start_matches('#');
+        w == p.key || w == p.number.to_string()
+    };
+    if !pick.is_empty() {
+        return d.prs.iter().filter(|p| pick.iter().any(|w| named(p, w))).collect();
+    }
+    let in_words: Vec<&PrRef> = d
+        .prs
+        .iter()
+        .filter(|p| {
+            let n = format!("#{}", p.number);
+            text.match_indices(&n).any(|(i, _)| !text[i + n.len()..].starts_with(|c: char| c.is_ascii_digit()))
+        })
+        .collect();
+    if in_words.is_empty() { d.prs.iter().collect() } else { in_words }
 }
 
 /// What answering `d` with `body` does: `{"choice": n}` (an option's index),
@@ -1913,9 +1976,40 @@ pub fn act(d: &Decision, body: &Value, submit: bool) -> Result<Act> {
             };
             Ok(Act::Questions { sets, answers, submit })
         }
+        // Words on a merge card: more for its PRs, sent to their sessions. The merge itself isn't answered here.
+        Kind::Merge if other.is_some() && !d.prs.is_empty() => {
+            let text = other.unwrap_or("").to_string();
+            let pick: Vec<String> = match body.get("pr") {
+                Some(Value::String(k)) => vec![k.clone()],
+                Some(Value::Number(n)) => vec![n.to_string()],
+                Some(Value::Array(a)) => a.iter().map(|x| x.as_str().map(String::from).unwrap_or_else(|| x.to_string())).collect(),
+                _ => vec![],
+            };
+            let prs = note_targets(d, &pick, &text);
+            if prs.is_empty() {
+                bail!("{} has no PR {}: its PRs are {}", d.id, pick.join(", "), d.prs.iter().map(|p| p.key.as_str()).collect::<Vec<_>>().join(", "));
+            }
+            // Each PR's own session, else whoever waits on the card.
+            let mut to: Vec<(String, Vec<&PrRef>)> = vec![];
+            for p in &prs {
+                let who: Vec<String> = if p.session.is_empty() { d.sessions.iter().map(|w| w.address.clone()).collect() } else { vec![p.session.clone()] };
+                for a in who {
+                    match to.iter_mut().find(|(x, _)| *x == a) {
+                        Some((_, list)) => list.push(p),
+                        None => to.push((a, vec![p])),
+                    }
+                }
+            }
+            if to.is_empty() {
+                bail!("{}: no session to send it to (its PRs' sessions are gone): tell one in its terminal", d.id);
+            }
+            let to = to.into_iter().map(|(a, list)| (a, pr_note_text(&list, &text))).collect();
+            Ok(Act::PrNote { to, prs: prs.iter().map(|p| p.key.clone()).collect(), text })
+        }
         Kind::Merge => bail!(
-            "a merge isn't answered here: the user merges its PR from the chat's chip or the phone ({}); `tower dismiss {}` takes it out of the queue",
+            "a merge isn't answered here: the user merges its PR from the chat's chip or the phone ({}); words for its PR (`{{\"other\": \"…\"}}`, `tower answer {} --other \"…\"`) go to its session; `tower dismiss {}` takes it out of the queue",
             d.prs.iter().map(|p| p.key.as_str()).collect::<Vec<_>>().join(", "),
+            d.id,
             d.id
         ),
         // Nothing typed reaches a dialog the tower can't read: the user answers it in the session.

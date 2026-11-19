@@ -223,6 +223,9 @@ pub struct Decision {
     pub hold: Option<HoldOf>,
     /// It was on hold and came back: why.
     pub back: Option<BackOf>,
+    /// A merge card's: what the user asked to add to its PRs, as sent to their sessions (`crate::decisions::PrNote`).
+    #[serde(deserialize_with = "or_default")]
+    pub notes: Vec<crate::decisions::PrNote>,
 }
 
 /// A decision's hold as the state carries it.
@@ -462,6 +465,7 @@ pub fn adapt(sets: &[QuestionSet], prs: &BTreeMap<String, Pr>, agents: &Value, s
             muted: false,
             hold: None,
             back: None,
+            notes: vec![],
         });
     }
 
@@ -525,6 +529,7 @@ pub fn adapt(sets: &[QuestionSet], prs: &BTreeMap<String, Pr>, agents: &Value, s
             muted: false,
             hold: None,
             back: None,
+            notes: vec![],
         });
     }
     out
