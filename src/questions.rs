@@ -570,9 +570,10 @@ fn config_dir_of(pid: u32) -> Option<std::path::PathBuf> {
 // ---- the question set ----
 
 /// The set's id: its session, kind, title, detail (the command, the plan)
-/// and questions, so a different command or plan is a different set.
+/// and questions, so a different command or plan is a different set. Its
+/// countdown's time isn't in it (`steady`): the dialog at 2:00 and at 1:41 is one.
 fn id_of(session: &str, kind: &str, tabs: &[Tab], title: &str, detail: &str) -> String {
-    let mut s = format!("{session}|{kind}|{title}|{detail}");
+    let mut s = format!("{session}|{kind}|{title}|{}", steady(detail));
     for t in tabs {
         s.push('|');
         s.push_str(&t.question);
@@ -1233,7 +1234,8 @@ pub fn drive(term: &mut dyn Term, set: &QuestionSet, answers: &[Answer], submit:
         }
         let n = set.tabs[0].options[p.options[0]].key.clone();
         let step = "the prompt".to_string();
-        let same = |x: &Screen| x.question == set.tabs[0].question && x.detail == set.detail;
+        // (Its countdown ticks on as it is read: the same prompt all the same.)
+        let same = |x: &Screen| x.question == set.tabs[0].question && steady(&x.detail) == steady(&set.detail);
         let before = parse_screen(&term.read());
         if !before.as_ref().is_some_and(same) {
             return Err(Stopped { step, message: "the prompt on screen isn't this one; nothing pressed".into() });
@@ -1251,7 +1253,7 @@ pub fn drive(term: &mut dyn Term, set: &QuestionSet, answers: &[Answer], submit:
         for _ in 0..8 {
             term.settle();
             let text = term.read();
-            if parse_screen(&text).is_none_or(|x| x.question != set.tabs[0].question || x.detail != set.detail) {
+            if parse_screen(&text).is_none_or(|x| !same(&x)) {
                 return Ok(());
             }
         }
@@ -1920,7 +1922,59 @@ pub fn must_escalate(set: &QuestionSet) -> Option<&'static str> {
         return file_hard(&f);
     }
     let (text, command) = prompt_text(set, true, true);
-    reason_of(&text, command.as_deref()).or_else(|| cut_with_rm_warning(set).then_some("Claude Code can't rule out an rm, and the command's start isn't shown"))
+    reason_of(&text, command.as_deref())
+        .or_else(|| cut_with_rm_warning(set).then_some("Claude Code can't rule out an rm, and the command's start isn't shown"))
+        .or_else(|| rm_warning(set).then_some(RM_WARNED))
+}
+
+/// Why a prompt Claude Code warns may remove files is the user's.
+pub const RM_WARNED: &str = "Claude Code can't rule out a dangerous removal";
+
+/// Claude Code warns it can't rule out a removal (`RM_NOTICES`): the
+/// user's, whatever the command reads as and however it was scored.
+fn rm_warning(set: &QuestionSet) -> bool {
+    set.kind == "claude-permission"
+        && set.detail.lines().any(|l| {
+            let l = notice_text(l);
+            RM_NOTICES.iter().any(|n| l.contains(n))
+        })
+}
+
+/// A command that removes files or throws away changes in a way the
+/// words alone miss: `git checkout -q -- f` (any flags before its `--`),
+/// `git checkout .`, `git rm`, `find … -delete`, `rsync --delete`.
+fn removes_files(raw: &str) -> bool {
+    for seg in raw.to_lowercase().split(['\n', ';', '&', '|', '(', ')', '`']) {
+        let ws: Vec<&str> = seg.split_whitespace().collect();
+        let Some(g) = ws.iter().position(|w| *w == "git") else {
+            if ws.first().is_some_and(|w| *w == "find" || w.ends_with("/find")) && ws.iter().any(|w| *w == "-delete") {
+                return true;
+            }
+            if ws.first().is_some_and(|w| *w == "rsync") && ws.iter().any(|w| w.starts_with("--delete")) {
+                return true;
+            }
+            continue;
+        };
+        // git's own options (`-C dir`, `-c k=v`, lower-cased) before its command.
+        let mut i = g + 1;
+        while i < ws.len() && ws[i].starts_with('-') {
+            i += if matches!(ws[i], "-c" | "--git-dir" | "--work-tree" | "--namespace") { 2 } else { 1 };
+        }
+        let rest = &ws[(i + 1).min(ws.len())..];
+        match ws.get(i).copied() {
+            Some("checkout") => {
+                if rest.iter().any(|w| matches!(*w, "--" | "." | "-f" | "--force" | "--ours" | "--theirs" | "-p" | "--patch")) {
+                    return true;
+                }
+            }
+            Some("rm") => return true,
+            Some("restore") | Some("clean") => return true,
+            Some("stash") if rest.first().is_some_and(|w| matches!(*w, "drop" | "clear")) => return true,
+            Some("reset") if rest.iter().any(|w| matches!(*w, "--hard" | "--merge" | "--keep")) => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The 90/10 rule over `text`; `command`: the shell command it asks to run
@@ -2046,6 +2100,7 @@ fn reason_of(text: &str, command: Option<&str>) -> Option<&'static str> {
             "images",
         ]);
     if removes
+        || removes_files(&raw)
         || any(&[
             "delete",
             "deletes",
@@ -2167,6 +2222,17 @@ fn notice_text(line: &str) -> String {
     ungutter(line).to_lowercase().replace('\u{2019}', "'")
 }
 
+/// Claude Code's countdown line ("⚠ Claude Code will automatically block this request in 1:41, …").
+fn countdown_line(line: &str) -> bool {
+    notice_text(line).contains("will automatically block this request")
+}
+
+/// A dialog's detail without its countdown's time, which ticks every
+/// second: what its id and the screen it is typed into are matched by.
+pub fn steady(detail: &str) -> String {
+    detail.lines().map(|l| if countdown_line(l) { "⚠ (it blocks itself after a countdown)" } else { l }).collect::<Vec<_>>().join("\n")
+}
+
 /// A line of Claude Code's own (`CLAUDE_NOTICES`, or its `⚠` lines).
 pub fn claude_notice(line: &str) -> bool {
     let l = notice_text(line);
@@ -2175,7 +2241,7 @@ pub fn claude_notice(line: &str) -> bool {
 
 /// A notice Claude Code gives a shell command only (not its countdown).
 fn shell_notice(line: &str) -> bool {
-    claude_notice(line) && !notice_text(line).contains("will automatically block this request")
+    claude_notice(line) && !countdown_line(line)
 }
 
 /// The prompt shows its command from the start: Claude Code's "Bash
@@ -4558,22 +4624,67 @@ mod risk_floor {
         decide_scored(set, Some("auto"), "routine", "normal", &said, &Thresholds::default(), &Learned::default(), Some("/Users/me/Work"))
     }
 
+    /// The review prompt without Claude Code's removal warning: its countdown only.
+    fn review_counting(id: &str, countdown: &str) -> QuestionSet {
+        let detail = format!("Bash command\nFind lint warnings on lines the PR added\n{REVIEW_LINES}\n⚠ Claude Code will automatically block this request in {countdown}, to avoid holding up an unattended session");
+        prompt(id, "Allow: Find lint warnings on lines the PR added?", detail, REVIEW_BRIEF)
+    }
+
     #[test]
-    fn claudes_own_warnings_and_the_sessions_task_dont_floor_a_harmless_command() {
-        for (set, confidence) in [(review("q8545a444cee7", "2:00"), 0.9), (review("q56da41652fd1", "0:37"), 0.9), (edit("q6fab9782c26d", "2:00", true), 0.85), (edit("q962bb1656414", "1:16", true), 0.85)] {
-            assert_eq!(must_escalate(&set), None, "{}", set.id);
-            let (decision, why, scores) = scored(&set, confidence);
-            assert_eq!((decision.as_str(), scores.floor, scores.risk), ("auto", Risk::Low, Risk::Low), "{}: {why} / {}", set.id, scores.floor_why);
+    fn the_sessions_task_and_the_countdown_dont_floor_a_harmless_command() {
+        for countdown in ["2:00", "0:37"] {
+            let set = review_counting("q8545a444cee7", countdown);
+            assert_eq!(must_escalate(&set), None, "{countdown}");
+            let (decision, why, scores) = scored(&set, 0.9);
+            assert_eq!((decision.as_str(), scores.floor, scores.risk), ("auto", Risk::Low, Risk::Low), "{countdown}: {why} / {}", scores.floor_why);
         }
         // The command, as read: the prompt's own line and what it runs; no warning, no task.
         let (text, command) = prompt_text(&review("q8545a444cee7", "2:00"), true, true);
         assert!(command.is_some() && !text.contains("rule out") && !text.contains("publish") && text.contains("eslint -f json"), "{text}");
-        // The edit's screen without its transcript (a remote session): its start, cut, may hold an rm. Still the user's.
+        // Another pending call than the one on screen isn't taken.
+        assert!(!command_shown(&edit("q6fab9782c26d", "2:00", false).detail, "python3 other.py"));
+    }
+
+    #[test]
+    fn a_dangerous_removal_warning_is_the_users_however_it_was_scored() {
+        // Claude Code can't rule out a removal: the user's, the command read or not,
+        // though the tower scored it low and sure (as t1pb scored t1p9's, 2026-11-19).
+        for set in [review("q8545a444cee7", "2:00"), review("q56da41652fd1", "0:37"), edit("q6fab9782c26d", "2:00", true), edit("q962bb1656414", "1:16", true)] {
+            assert_eq!(must_escalate(&set), Some(RM_WARNED), "{}", set.id);
+            let (decision, why, scores) = scored(&set, 0.95);
+            assert_eq!((decision.as_str(), scores.floor), ("escalate", Risk::High), "{}: {why}", set.id);
+        }
+        // Cut off at its start: said so.
         let cut = edit("q6fab9782c26d", "2:00", false);
         assert_eq!(must_escalate(&cut), Some("Claude Code can't rule out an rm, and the command's start isn't shown"));
         assert_eq!(scored(&cut, 0.85).0, "escalate");
-        // Another pending call than the one on screen isn't taken.
-        assert!(!command_shown(&cut.detail, "python3 other.py"));
+        // t1p9's prompt (q97e90041512e … qa3321add27f7): its command throws a file's changes away too.
+        let t1p9 = t1p9_prompt("2:00");
+        assert_eq!(must_escalate(&t1p9), Some("it deletes or overwrites"));
+        let (decision, _, scores) = scored(&t1p9, 0.85);
+        assert_eq!((decision.as_str(), scores.floor, scores.risk), ("escalate", Risk::High, Risk::High));
+        // Its command alone, no warning: still the user's.
+        let mut quiet = t1p9.clone();
+        quiet.detail = quiet.detail.lines().filter(|l| !l.contains("rule out") && !l.contains("Read the command")).collect::<Vec<_>>().join("\n");
+        assert_eq!(must_escalate(&quiet), Some("it deletes or overwrites"));
+    }
+
+    /// t1p9's prompt, 2026-11-19 (names changed): a test comparison that swaps a
+    /// test helper for an old one and checks it back out.
+    pub(super) fn t1p9_prompt(countdown: &str) -> QuestionSet {
+        prompt("q97e90041512e", "Allow: Compare per-test results old vs new loader?", format!("Bash command\nCompare per-test results old vs new loader\n{T1P9_LINES}\n{RM_WARNING}\n⚠ Claude Code will automatically block this request in {countdown}, to avoid holding up an unattended session"), "")
+    }
+
+    pub(super) const T1P9_LINES: &str = "│ S=/private/tmp/claude-501/-Users-me-Work-app/374cf24e/scratchpad\n│ TESTS=( ${(f)\"$(ls tests/*.test.mjs | grep -v collection-slice)\"} )\n│ echo \"files: ${#TESTS}\"\n│ run() { node --experimental-vm-modules --test --test-reporter=tap \"${TESTS[@]}\" 2>/dev/null | grep -E \"^(not )?ok\n│ [0-9]+ - \" | sed -E 's/^(not ok|ok) [0-9]+ - /\\1 /' | sort; }\n│ run > $S/new.txt\n│ git show ab653dc:tests/helpers/load-module.mjs > tests/helpers/load-module.mjs\n│ run > $S/old.txt\n│ git checkout -q -- tests/helpers/load-module.mjs; git status --short; echo \"worktree clean: $?\"\n│ diff $S/old.txt $S/new.txt && echo \"IDENTICAL per-test results\"";
+
+    #[test]
+    fn what_removes_files_by_its_command() {
+        for c in ["git checkout -q -- tests/a.mjs", "git -C ../x checkout -- .", "git checkout .", "git checkout -f main", "git rm -r --cached x", "git restore --staged a", "git stash drop", "find . -name '*.orig' -delete", "rsync -a --delete a/ b/", "git reset --hard", "cd x && git checkout --theirs a.rs"] {
+            assert!(removes_files(c), "{c}");
+        }
+        for c in ["git checkout main", "git checkout -b fix-x", "git status --short", "git show ab:a > /tmp/a", "find . -name '*.rs'", "rsync -a a/ b/", "git diff -- a.rs", "git log --oneline -- src"] {
+            assert!(!removes_files(c), "{c}");
+        }
     }
 
     #[test]
@@ -4769,3 +4880,107 @@ mod file_risk {
     }
 }
 
+
+/// Claude Code's countdown ("will automatically block this request in 1:41")
+/// ticks every second: still the same dialog, its answer typed in once.
+#[cfg(test)]
+mod countdown {
+    use super::*;
+
+    /// A permission prompt on screen, as Herdr reads it, `secs` left on its countdown.
+    fn screen(secs: u32) -> String {
+        let rule = "─".repeat(100);
+        let dash = "╌".repeat(100);
+        format!(
+            "{rule}\n Bash command\n Find lint warnings on lines the PR added\n{dash}\n │ ./node_modules/.bin/eslint -f json -o $S/lint.json src\n │ node scripts/count.js $S/lint.json\n{dash}\n ⚠ Claude Code will automatically block this request in {}:{:02}, to avoid holding up an unattended session\n\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\n Esc to cancel · Tab to amend\n{rule}\n",
+            secs / 60,
+            secs % 60
+        )
+    }
+
+    fn set_at(secs: u32) -> QuestionSet {
+        build("t1p9", "app", false, &parse_screen(&screen(secs)).expect("a prompt"), None, "", "")
+    }
+
+    #[test]
+    fn a_countdown_dialog_keeps_its_id_as_it_ticks() {
+        let (at_2_00, at_1_41, at_0_05) = (set_at(120), set_at(101), set_at(5));
+        assert_eq!(at_2_00.kind, "claude-permission");
+        assert!(at_2_00.detail.contains("in 2:00") && at_1_41.detail.contains("in 1:41"), "{}", at_2_00.detail);
+        assert_eq!(at_2_00.id, at_1_41.id, "one dialog, not a new question every tick");
+        assert_eq!(at_2_00.id, at_0_05.id);
+        // Another command is another dialog all the same.
+        let other = build("t1p9", "app", false, &parse_screen(&screen(120).replace("count.js", "other.js")).unwrap(), None, "", "");
+        assert_ne!(other.id, at_2_00.id);
+        // And one with no countdown at all, or none any more, is another reading of the same words.
+        assert_eq!(steady("a\n⚠ Claude Code will automatically block this request in 0:59, to avoid holding up an unattended session"), steady("a\n⚠ Claude Code will automatically block this request in 2:00, to avoid holding up an unattended session"));
+    }
+
+    /// The dialog, its countdown a second on at every read; a number answers it at once.
+    struct Ticking {
+        secs: u32,
+        gone: bool,
+        keys: Vec<String>,
+    }
+
+    impl Term for Ticking {
+        fn read(&mut self) -> String {
+            if self.gone {
+                return "⏺ Bash(Find lint warnings)\n  ⎿  Running…\n".into();
+            }
+            self.secs = self.secs.saturating_sub(1);
+            screen(self.secs)
+        }
+        fn keys(&mut self, keys: &[&str]) -> Result<()> {
+            for k in keys {
+                self.keys.push(k.to_string());
+                if *k == "1" || *k == "2" {
+                    self.gone = true;
+                }
+            }
+            Ok(())
+        }
+        fn paste(&mut self, _: &str) -> Result<()> {
+            bail!("nothing to paste")
+        }
+    }
+
+    #[test]
+    fn a_countdown_dialog_answered_once_types_in_once() {
+        // Read at 2:00; by the time the keys go in it says 1:58.
+        let set = set_at(120);
+        let mut term = Ticking { secs: 119, gone: false, keys: vec![] };
+        drive(&mut term, &set, &[Answer { tab: 0, choice: json!(0), attachments: vec![] }], true).expect("typed into the open dialog");
+        assert_eq!(term.keys, ["1"], "its Yes, once");
+        assert!(term.gone);
+        // A prompt whose cursor moves and waits for Enter: Enter goes in, once, as it ticks.
+        struct Cursor(Ticking, bool);
+        impl Term for Cursor {
+            fn read(&mut self) -> String {
+                if self.0.gone {
+                    return self.0.read();
+                }
+                let s = self.0.read();
+                if self.1 { s } else { s.replace(" ❯ 1. Yes\n   2. No", "   1. Yes\n ❯ 2. No") }
+            }
+            fn keys(&mut self, keys: &[&str]) -> Result<()> {
+                for k in keys {
+                    self.0.keys.push(k.to_string());
+                    match *k {
+                        "1" => self.1 = true,
+                        "enter" => self.0.gone = true,
+                        _ => {}
+                    }
+                }
+                Ok(())
+            }
+            fn paste(&mut self, _: &str) -> Result<()> {
+                bail!("nothing to paste")
+            }
+        }
+        let mut term = Cursor(Ticking { secs: 90, gone: false, keys: vec![] }, false);
+        let set = build("t1p9", "app", false, &parse_screen(&Cursor(Ticking { secs: 91, gone: false, keys: vec![] }, false).read()).unwrap(), None, "", "");
+        drive(&mut term, &set, &[Answer { tab: 0, choice: json!(0), attachments: vec![] }], true).expect("typed into the open dialog");
+        assert_eq!(term.0.keys, ["1", "enter"]);
+    }
+}
