@@ -142,6 +142,8 @@ pub struct Acts {
     steps: HashMap<String, prchip::Step>,
     /// The PRs whose full description is open on their merge card (by key).
     bodies: HashSet<String>,
+    /// PRs whose "Resolve conflicts" is on its way to the daemon (by key).
+    resolving: HashSet<String>,
     /// Decisions put on hold here, on their way to the daemon: out of the
     /// queue and every count at once, the orb's too (`Acts::held_here`).
     held: HashSet<String>,

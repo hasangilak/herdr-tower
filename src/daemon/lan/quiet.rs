@@ -864,6 +864,14 @@ mod tests {
             self.asked.lock().unwrap().push((text.to_string(), space.map(String::from), phone, source.to_string()));
             Ok(())
         }
+        // PR o/app#994 conflicts with dev and t9 is asked to resolve it; any other has nothing to resolve.
+        fn resolve_pr(&self, key: &str, by: &str) -> Result<Value> {
+            if key != "o/app#994" {
+                anyhow::bail!("GitHub says {key} has no conflicts with dev (or is still working it out): nothing to resolve");
+            }
+            self.sent.lock().unwrap().push(("t9".into(), format!("resolve {key} for {by}")));
+            Ok(json!({ "pr": { "key": key }, "asked": true, "line": "Being fixed by t9: resolving its conflicts with dev." }))
+        }
     }
 
     /// The phone API over a fake tower, with a phone paired.
@@ -1060,6 +1068,21 @@ mod tests {
     /// its name. Held, it needs the user nowhere: not in its space's count
     /// (the missions), the queue's, nor the state's count the tab badge
     /// reads; it is under `on_hold` only. Let go, it is 1 everywhere again.
+    /// The phone's merge sheet for a PR that conflicts: "Resolve conflicts"
+    /// is `POST /v1/prs/{owner}/{repo}/{number}/resolve`, which asks its
+    /// session (by this phone); one with nothing to resolve is a 409.
+    #[test]
+    fn the_phone_resolves_a_prs_conflicts_through_its_own_route() {
+        let r = rig("resolve");
+        let (st, v) = r.post("/v1/prs/o/app/994/resolve", "{}");
+        assert_eq!((st, v["asked"].as_bool(), v["line"].as_str()), (200, Some(true), Some("Being fixed by t9: resolving its conflicts with dev.")), "{v}");
+        assert_eq!(r.tower.sent.lock().unwrap().last().unwrap().1, format!("resolve o/app#994 for phone:{}", r.device));
+        let (st, v) = r.post("/v1/prs/o/app/12/resolve", "{}");
+        assert_eq!((st, v["error"]["code"].as_str()), (409, Some("not_resolvable")), "{v}");
+        assert!(v["error"]["message"].as_str().unwrap().contains("nothing to resolve"));
+        assert_eq!(r.stranger("POST", "/v1/prs/o/app/994/resolve"), 401);
+    }
+
     #[test]
     fn a_space_whose_only_decision_is_on_hold_needs_nothing() {
         let r = rig("only-held");
@@ -1882,7 +1905,7 @@ mod tests {
 
         // What an app checks first, and the calls from before this still answer.
         let (st, hello) = r.get("/v1/hello");
-        assert_eq!((st, hello["api"].as_u64(), &hello["features"]), (200, Some(1), &json!(["quiet", "acts", "pairing", "bonjour", "reviews", "scores", "validation", "impact", "releases", "accounts", "jobs", "browsers", "progress", "scoring", "tasks"])), "{hello}");
+        assert_eq!((st, hello["api"].as_u64(), &hello["features"]), (200, Some(1), &json!(["quiet", "acts", "pairing", "bonjour", "reviews", "scores", "validation", "impact", "releases", "accounts", "jobs", "browsers", "progress", "scoring", "tasks", "resolve"])), "{hello}");
         let (_, state) = r.get("/v1/state");
         for k in [
             "version",

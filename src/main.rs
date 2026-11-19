@@ -403,9 +403,11 @@ enum Cmd {
     },
     /// About your PR the tower follows: `tower pr cant-fix <pr> "<why>"` when you were asked to
     /// resolve its conflicts with its base (or bring it up to date) and can't. It then goes to
-    /// the user, with your words. A PR is its key (owner/repo#12), its link, or #12 (yours).
+    /// the user, with your words. `tower pr resolve <pr>` (the user's "Resolve conflicts"): its
+    /// session is asked to merge the latest base in, resolve, re-run its checks and push. A PR is
+    /// its key (owner/repo#12), its link, or #12 (yours).
     Pr {
-        /// cant-fix.
+        /// cant-fix or resolve.
         action: String,
         /// The PR: owner/repo#12, its link, or #12.
         pr: String,
@@ -1665,10 +1667,23 @@ fn releases_cmd(space: Option<&str>, as_json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `tower pr cant-fix <pr> "<why>"`.
+/// `tower pr cant-fix <pr> "<why>"`, `tower pr resolve <pr>`.
 fn pr_cmd(action: &str, pr: &str, why: &str) -> Result<()> {
+    if action == "resolve" {
+        let r = protocol::send(&Request::ResolvePr { pr: pr.trim().to_string(), by: "cli".into() })?;
+        if !r.ok {
+            bail!("{}", r.error.unwrap_or_default());
+        }
+        let v = r.state.unwrap_or_default();
+        println!(
+            "{}: {}",
+            v["pr"]["key"].as_str().unwrap_or(pr),
+            v["line"].as_str().unwrap_or(if v["asked"] == true { "its session was asked to resolve it" } else { "being resolved already" })
+        );
+        return Ok(());
+    }
     if action != "cant-fix" {
-        bail!("tower pr cant-fix <pr> \"<why you can't resolve its conflicts>\"");
+        bail!("tower pr cant-fix <pr> \"<why you can't resolve its conflicts>\", or tower pr resolve <pr>");
     }
     if why.trim().is_empty() {
         bail!("say why: tower pr cant-fix {pr} \"<why you can't resolve its conflicts>\"");

@@ -946,6 +946,13 @@ impl Daemon {
                     Err(e) => Response::err(format!("{e:#}")),
                 };
             }
+            Request::ResolvePr { pr, by } => {
+                let by = if by.trim().is_empty() { "cli".to_string() } else { by };
+                return match pr_key(&self.prs, &pr, None).and_then(|k| self.resolve_pr(&k, &by)) {
+                    Ok(v) => Response { ok: true, error: None, state: Some(v) },
+                    Err(e) => Response::err(format!("{e:#}")),
+                };
+            }
             Request::CantFix { pr, why, from } => {
                 let by = from.clone().unwrap_or_else(|| "cli".into());
                 return match pr_key(&self.prs, &pr, from.as_deref()).and_then(|k| fixes::cant_fix(&self.prs, &k, &why, &by)) {
@@ -1410,6 +1417,15 @@ impl Daemon {
 }
 
 impl Daemon {
+    /// The user's "Resolve conflicts" on PR `key` (`fixes::resolve`), with
+    /// this daemon's queue and sessions: the PR's view, its fix, its chip's
+    /// line, and whether someone was asked now (false: one is on it already).
+    pub fn resolve_pr(&self, key: &str, by: &str) -> anyhow::Result<serde_json::Value> {
+        let hands = fixes::Real { sendq: self.sendq.clone() };
+        let (pr, asked) = fixes::resolve(&self.prs, &hands, key, by, crate::history::now_ms())?;
+        Ok(serde_json::json!({ "pr": pr.view(), "fix": pr.fix, "line": crate::fixes::line(&pr), "asked": asked }))
+    }
+
     /// `tower tell`: how much the user is told. Kept in config.toml, shown
     /// in the state, and the brain reads its instructions again (they say
     /// what a note is at this level).

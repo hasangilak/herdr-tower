@@ -411,6 +411,39 @@ impl Panel {
         });
     }
 
+    /// "Resolve conflicts" on a merge card's PR: its session (else one in
+    /// its worktree) is asked to merge the latest base in, resolve, re-run
+    /// its checks and push (`tower pr resolve`, the daemon's `fixes::resolve`).
+    /// The card comes back as the PR merges cleanly again.
+    pub(super) fn resolve_conflicts(&mut self, key: &str, cx: &mut Context<Self>) {
+        if !self.act(cx, |a| a.resolving.insert(key.to_string())) {
+            return;
+        }
+        let k = key.to_string();
+        let task = cx.background_executor().spawn(async move {
+            let r = crate::protocol::send(&crate::protocol::Request::ResolvePr { pr: k, by: "mac".into() });
+            match r {
+                Ok(r) if r.ok => Ok(r.state.unwrap_or_default()),
+                Ok(r) => Err(r.error.unwrap_or_default()),
+                Err(e) => Err(format!("{e:#}")),
+            }
+        });
+        let key = key.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.act(cx, |a| drop(a.resolving.remove(&key)));
+                this.status = Some(match result {
+                    Ok(v) => (true, v["line"].as_str().map(String::from).unwrap_or_else(|| if v["asked"] == true { "Its session was asked to resolve the conflicts.".into() } else { "Its session is on it already.".into() })),
+                    Err(e) => (false, format!("Not asked: {e}")),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// A merge decision as the queue's open card: its PRs in order, and the
     /// two steps of merging one.
     pub(super) fn merge_card(&mut self, d: &Decision, tag: &str, now_ms: u64, cx: &mut Context<Self>) -> AnyElement {
@@ -501,6 +534,19 @@ impl Panel {
                     .children(l.impact().filter(|(_, breaks)| !*breaks).map(|(line, _)| div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.faint).line_clamp(2).child(line)))
                     // Its conflicts came back to the user: why (its session couldn't, or nobody could be asked).
                     .children(crate::fixes::line(&l.pr).map(|line| div().text_size(px(12.0)).line_height(px(16.0)).text_color(rgb(ROSE)).child(line)))
+                    // Conflicts (or behind its base), nobody on them: the user has its session resolve them.
+                    .children(resolve_label(&l.pr).map(|label| {
+                        let key = l.pr.key();
+                        let sending = self.acts(cx).resolving.contains(&key);
+                        div().mt(px(4.0)).child(
+                            mbtn(format!("resolve-{}", l.key), if sending { "Asking its session…" } else { label }, false, None)
+                                .when(sending, |el| el.opacity(0.6))
+                                .when(!sending, |el| el.on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.resolve_conflicts(&key, cx);
+                                }))),
+                        )
+                    }))
                     .children(crate::prscore::auto_line(&l.pr, auto_on).map(|line| div().text_size(px(12.0)).text_color(g.faint).truncate().child(line)))
                     // Where the tower's chain has it.
                     .children(running.and_then(|r| r.line(&l.key)).map(|line| {
@@ -978,4 +1024,15 @@ mod tests {
         let g = gate_of(&anyway).unwrap();
         assert!(g.blocked.is_none() && g.needs_override.is_some());
     }
+}
+
+/// The button a merge card's PR gets for its conflicts: "Resolve conflicts"
+/// (or "Bring up to date", only behind its base) while nobody is on them;
+/// None when it merges cleanly or its session is fixing it.
+fn resolve_label(pr: &Pr) -> Option<&'static str> {
+    let what = crate::fixes::trouble(pr)?;
+    if pr.fix.as_ref().is_some_and(|f| f.back.is_none() && !f.to.is_empty()) {
+        return None;
+    }
+    Some(if what == "conflicts" { "Resolve conflicts" } else { "Bring up to date" })
 }

@@ -83,6 +83,13 @@ pub trait Tower: Send + Sync {
     /// What the user asked, to the tower (or, with `space`, in that
     /// space's view). `phone`: the device that hears the reply alone.
     fn ask(&self, text: &str, phone: Option<String>, source: &str, space: Option<&str>) -> Result<()>;
+    /// "Resolve conflicts" on PR `key` (`owner/repo#n`), by `by`: its session
+    /// is asked to resolve them (`fixes::resolve`). The PR, its fix, whether
+    /// someone was asked now.
+    fn resolve_pr(&self, key: &str, by: &str) -> Result<Value> {
+        let _ = (key, by);
+        anyhow::bail!("this tower can't resolve a PR's conflicts")
+    }
 }
 
 /// Actions kept to be asked about.
