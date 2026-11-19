@@ -70,6 +70,53 @@ pub fn is_planner(name: &str) -> bool {
     name == PLANNER
 }
 
+/// Where the planner's tab goes in Herdr: the space being planned when
+/// Herdr has it already (a plan for a space that is there), else the space
+/// the window shows as the plan starts: where it is planned from, where
+/// the user is looking. None: Herdr's window isn't open (it stays hidden).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannerTab {
+    /// Herdr's id of the space.
+    pub space: String,
+    pub space_name: String,
+    /// The tab's name: `planner: <the space planned>`.
+    pub name: String,
+    /// The `herdr-app do …` steps, in order (`tab` stands for the new tab's id).
+    pub steps: Vec<Vec<String>>,
+}
+
+/// The tab's name of the planner of a plan for `planned`.
+pub fn planner_tab_name(planned: &str) -> String {
+    let planned = planned.trim();
+    if planned.is_empty() { "planner".into() } else { format!("planner: {planned}") }
+}
+
+/// Where the planner (`address`) of a plan for `planned` is shown, and
+/// how: `windows`: Herdr's spaces (`herdr-app ls`), each with the tab it
+/// shows (`shown_tab`). Herdr's `terminal.keep` gives the hidden terminal
+/// a tab in the space the window shows and shows it; the window is given
+/// back as it was (the space it showed, and that space's tab).
+pub fn planner_tab(planned: &str, address: &str, windows: &[crate::spaces::Window], shown_tab: &dyn Fn(&str) -> Option<String>) -> Option<PlannerTab> {
+    let active = windows.iter().find(|w| w.active && w.machine.is_none())?;
+    let target = windows.iter().find(|w| w.machine.is_none() && !planned.trim().is_empty() && w.name.trim().eq_ignore_ascii_case(planned.trim())).unwrap_or(active);
+    let name = planner_tab_name(planned);
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+    let mut steps = vec![];
+    if target.id != active.id {
+        steps.push(s(&["space.select", "--id", &target.id]));
+    }
+    let back_tab = shown_tab(&target.id);
+    steps.push(s(&["terminal.keep", "--terminal", address, "--place", "tab"]));
+    steps.push(s(&["tab.rename", "--id", "tab", "--name", &name]));
+    if target.id != active.id {
+        steps.push(s(&["space.select", "--id", &active.id]));
+    } else if let Some(t) = back_tab {
+        // Not taken from what the user looks at: the tab they had stays shown.
+        steps.push(s(&["tab.select", "--id", &t]));
+    }
+    Some(PlannerTab { space: target.id.clone(), space_name: target.name.clone(), name, steps })
+}
+
 /// The form a plan is published in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1764,7 +1811,7 @@ pub fn instructions(p: &Plan, tower: &str) -> String {
     s += &format!("If you can't publish it (no Artifact tool, an error that stays), say why and stop: `{t} plan failed {id} \"<why, in a line>\"`.\n\n");
     s += "## 5. Then: the chat\n\n";
     s += &format!(
-        "After that you wait. What the user says about the plan reaches you as a prompt that begins `[plan {id}] The user says:`. Answer it in a few sentences with `{t} plan say {id} \"<your answer>\"`: that is the only way your answer reaches them (nobody reads this terminal). Never ask anything in this terminal; ask with `plan say`.\n\n"
+        "After that you wait. What the user says about the plan reaches you as a prompt that begins `[plan {id}] The user says:`. Answer it in a few sentences with `{t} plan say {id} \"<your answer>\"`: that is how your answer reaches them in the tower's chat and on the phone. The user may also watch this terminal in its Herdr tab (`planner: <space>`) and type to you there: a prompt that doesn't begin with `[plan` is theirs, typed by hand. Take it as `The user says:` and answer it the same way, with `plan say` (a word here alone isn't seen in the chat). Never ask anything in this terminal; ask with `plan say`, or as a question in the stages.\n\n"
     );
     s += "- A question: answer it from the plan and the repositories.\n";
     s += "- A change: say what you would change, and ask whether to. Once the user agrees (or asked for it outright), make it, then say what changed:\n";

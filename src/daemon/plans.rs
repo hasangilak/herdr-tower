@@ -504,6 +504,12 @@ impl Plans {
                     brain::stop(&address);
                     return;
                 }
+                // A tab of its own in Herdr: the user watches it, and may type to it.
+                match show_planner(p, &address) {
+                    Ok(Some(t)) => eprintln!("[plans] {}: the planner's tab \"{}\" is in {}", p.id, t.name, t.space_name),
+                    Ok(None) => eprintln!("[plans] {}: Herdr's window isn't open: the planner runs without a tab", p.id),
+                    Err(e) => eprintln!("[plans] {}: the planner runs without a tab: {e:#}", p.id),
+                }
                 brain::settle(&address);
             }
             Err(e) => {
@@ -966,6 +972,36 @@ mod tests {
     /// a later one listed it again (a new card), the next dropped it again,
     /// and its card answered "plan p6 has no question q2".
     #[test]
+    fn the_planner_is_launched_by_its_name_and_shown_in_a_tab_of_its_own() {
+        let p = Plan { id: "p7".into(), dir: "/w/plans/p7".into(), draft: json!({ "space": "watchlist-filter" }), ..Default::default() };
+        let argv = vec!["claude".to_string(), "--append-system-prompt".into(), "x".into()];
+        let args = planner_run_args(&p, &argv, "/bin/zsh");
+        let at = |flag: &str| args.iter().position(|a| a == flag).map(|i| args[i + 1].as_str());
+        // By its name, with its role and plan: the tower reads it, sends it notes and stops it by these.
+        assert_eq!((at("--name"), at("--cwd")), (Some(plans::PLANNER), Some("/w/plans/p7")));
+        assert!(args.contains(&"--bg".to_string()) && args.contains(&"--no-parent".to_string()));
+        let labels: Vec<&str> = args.iter().enumerate().filter(|(i, _)| *i > 0 && args[i - 1] == "--label").map(|(_, a)| a.as_str()).collect();
+        assert_eq!(labels, ["tower.role=planner", "tower.plan=p7"]);
+        assert!(crate::brain::brain_of(&json!({ "name": plans::PLANNER, "labels": { "herdr.space": "sp1", "where": "M5 Pro / planner: watchlist-filter" } })).is_some(), "in a tab still the tower's own, never a session of the space");
+        // Its tab: in the space the window shows (the one it is planned from: the space planned isn't there yet).
+        let w = |id: &str, name: &str, active: bool| crate::spaces::Window { id: id.into(), name: name.into(), folder: String::new(), machine: None, active };
+        let windows = vec![w("sp1", "M5 Pro", true), w("sp2", "sandbox", false)];
+        let shown = |id: &str| (id == "sp1").then(|| "tb-chat".to_string());
+        let t = plans::planner_tab("watchlist-filter", "t9", &windows, &shown).unwrap();
+        assert_eq!((t.space.as_str(), t.name.as_str()), ("sp1", "planner: watchlist-filter"));
+        let words: Vec<String> = t.steps.iter().map(|s| s.join(" ")).collect();
+        assert_eq!(words, ["terminal.keep --terminal t9 --place tab", "tab.rename --id tab --name planner: watchlist-filter", "tab.select --id tb-chat"], "the tab the user had stays shown");
+        // The space planned is there already: in it, and the window back where it was.
+        let t = plans::planner_tab("Sandbox", "t9", &windows, &shown).unwrap();
+        let words: Vec<String> = t.steps.iter().map(|s| s.join(" ")).collect();
+        assert_eq!(t.space_name, "sandbox");
+        assert_eq!(words, ["space.select --id sp2", "terminal.keep --terminal t9 --place tab", "tab.rename --id tab --name planner: Sandbox", "space.select --id sp1"]);
+        // Herdr's window isn't open: no tab (it runs as before).
+        assert!(plans::planner_tab("x", "t9", &[], &shown).is_none());
+        assert_eq!(plans::planner_tab_name(""), "planner");
+    }
+
+    #[test]
     fn a_card_follows_its_question_across_versions_and_goes_when_the_question_does() {
         use crate::daemon::decisions::{Carry, Decisions};
         let dir = std::env::temp_dir().join(format!("tower-plans-follow-{}", std::process::id()));
@@ -1426,6 +1462,75 @@ mod tests {
 
 /// Starts the planner of `p` in a hidden Herdr terminal: its folder written
 /// first. Returns its address.
+/// The tab each of Herdr's spaces shows now, by the space's id (`herdr-app ls`).
+fn shown_tabs() -> std::collections::HashMap<String, String> {
+    let out = std::process::Command::new(config::herdr_app_bin()).arg("ls").stdin(std::process::Stdio::null()).output();
+    let v: Value = out.ok().and_then(|o| serde_json::from_slice(&o.stdout).ok()).unwrap_or_default();
+    v["spaces"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| Some((s["id"].as_str()?.to_string(), s["tabs"].as_array()?.iter().find(|t| t["active"] == true)?["id"].as_str()?.to_string())))
+        .collect()
+}
+
+/// Gives the planner's hidden terminal a tab (`plans::planner_tab`), once
+/// it runs. Herdr is driven by its own commands, never by keys: the
+/// planner's name, labels and address stay as they were, so the tower
+/// reads and writes it as before.
+fn show_planner(p: &Plan, address: &str) -> Result<Option<plans::PlannerTab>> {
+    let planned = p.draft["space"].as_str().unwrap_or("");
+    let tabs = shown_tabs();
+    let Some(t) = plans::planner_tab(planned, address, &crate::spaces::windows(), &|id| tabs.get(id).cloned()) else { return Ok(None) };
+    let herdr = |args: &[String]| -> Result<Value> {
+        let o = std::process::Command::new(config::herdr_app_bin()).arg("do").args(args).stdin(std::process::Stdio::null()).output()?;
+        let v: Value = serde_json::from_slice(&o.stdout).unwrap_or_default();
+        match v.get("error") {
+            Some(e) => bail!("herdr-app {}: {}", args.first().map(String::as_str).unwrap_or(""), e.as_str().unwrap_or("")),
+            None => Ok(v),
+        }
+    };
+    let mut tab = String::new();
+    for step in &t.steps {
+        let step: Vec<String> = step.iter().map(|a| if a == "tab" && !tab.is_empty() { tab.clone() } else { a.clone() }).collect();
+        if step[0] == "terminal.keep" {
+            // Herdr knows the terminal once it runs (a moment after `hc run`).
+            let mut last = None;
+            for _ in 0..20 {
+                match herdr(&step) {
+                    Ok(v) => {
+                        tab = v["tab"].as_str().unwrap_or("").to_string();
+                        last = None;
+                        break;
+                    }
+                    Err(e) => last = Some(e),
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+            if let Some(e) = last {
+                return Err(e);
+            }
+            continue;
+        }
+        if step[0] == "tab.rename" && tab.is_empty() {
+            continue;
+        }
+        if let Err(e) = herdr(&step) {
+            eprintln!("[plans] {}: {e:#}", p.id);
+        }
+    }
+    Ok(Some(t))
+}
+
+/// The planner's `hc run`: a terminal called `tower-planner` (the name the
+/// tower knows its own by: never a session of a space, never introduced),
+/// labelled with its role and plan, in its folder and the user's login
+/// shell, started in the background: `show_planner` gives it its tab.
+fn planner_run_args(p: &Plan, argv: &[String], shell: &str) -> Vec<String> {
+    let labels = [format!("{}=planner", plans::LABEL_ROLE), format!("{}={}", plans::LABEL_PLAN, p.id)];
+    crate::brain::hc_run_args(plans::PLANNER, &p.dir, argv, &labels, shell)
+}
+
 fn run_planner(p: &Plan) -> Result<String> {
     let cfg = config::Config::live();
     let tower = config::tower_bin().display().to_string();
@@ -1434,9 +1539,7 @@ fn run_planner(p: &Plan) -> Result<String> {
     let account = Some(p.account.clone()).filter(|a| !a.trim().is_empty()).or_else(|| crate::accounts::default_of(&crate::accounts::list().unwrap_or_default()));
     let cca = crate::accounts::cca_bin().map(|c| c.to_string_lossy().into_owned());
     let argv = plans::argv(p, &cfg, cca.as_deref().filter(|_| account.is_some()), account.as_deref(), &tower, &plans::tower_env())?;
-    let labels = [format!("{}=planner", plans::LABEL_ROLE), format!("{}={}", plans::LABEL_PLAN, p.id)];
-    // In the user's login shell, as a brain is (`brain::hc_run_args`).
-    let args = crate::brain::hc_run_args(plans::PLANNER, &p.dir, &argv, &labels, &crate::accounts::login_shell());
+    let args = planner_run_args(p, &argv, &crate::accounts::login_shell());
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let out = hc::run(&args)?;
     if out.code != 0 {
