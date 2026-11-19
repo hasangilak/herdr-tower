@@ -733,6 +733,10 @@ pub enum Verdict {
     Unclear(String),
 }
 
+/// How long after a session's turn ended a verdict on it (`tower job
+/// done`) is still about that turn's task, not a newer one that went in since.
+pub const TURN_JUDGED_MS: u64 = 15 * 60 * 1000;
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Ledger {
@@ -969,6 +973,33 @@ impl Ledger {
     }
 
     /// The latest task on `session` that isn't settled, in an agenda still open.
+    /// The task a verdict on `session` (`tower job done|failed`) is about,
+    /// and whether it is settled already: the one whose turn the session
+    /// ended last. A verdict comes after a turn's end; a task that went in
+    /// after that end (not a turn of its own yet) isn't what it judges, so a
+    /// task settled at that turn's end stays the one (nothing changes), and
+    /// the newer one runs on. With no turn ended lately (`TURN_JUDGED_MS`):
+    /// the newest unfinished task, as before.
+    pub fn judged_task(&self, session: &str, now: u64) -> Option<(String, bool)> {
+        let ended = |t: &Task| t.history.iter().filter(|h| h.state == TaskState::DoneClaimed && h.at_ms >= t.delivered_ms).map(|h| h.at_ms).max();
+        let on: Vec<&Task> = self.agendas.iter().filter(|a| a.live()).flat_map(|a| a.tasks.iter()).filter(|t| !session.is_empty() && t.session == session).collect();
+        let open = self.unfinished_on(session);
+        // A turn ended on the newest unfinished one: it.
+        if let Some(u) = open
+            && (u.state == TaskState::DoneClaimed || ended(u).is_some())
+        {
+            return Some((u.id.clone(), false));
+        }
+        let last = on.iter().filter_map(|t| ended(t).map(|at| (at, *t))).max_by_key(|(at, t)| (*at, t.delivered_ms));
+        match (last, open) {
+            // The newest unfinished one went in after the last turn's end: the verdict is that turn's.
+            (Some((at, e)), Some(u)) if u.delivered_ms >= at && now.saturating_sub(at) < TURN_JUDGED_MS => Some((e.id.clone(), e.state.settled())),
+            (Some((at, e)), None) if now.saturating_sub(at) < TURN_JUDGED_MS => Some((e.id.clone(), e.state.settled())),
+            (_, Some(u)) => Some((u.id.clone(), false)),
+            _ => None,
+        }
+    }
+
     pub fn unfinished_on(&self, session: &str) -> Option<&Task> {
         self.agendas
             .iter()
@@ -1189,7 +1220,11 @@ impl Ledger {
 
     /// `tower job done|failed <session>`: the brain's word on the session's latest unfinished task.
     pub fn judged(&mut self, session: &str, ok: bool, text: &str, now: u64) -> Option<String> {
-        let id = self.unfinished_on(session)?.id.clone();
+        let (id, settled) = self.judged_task(session, now)?;
+        if settled {
+            // About a task settled already (its turn's end checked it): it stays as it is, and the newer one runs on.
+            return Some(id);
+        }
         let ev = if ok {
             TaskEv::Verify { how: if text.trim().is_empty() { "the brain checked it".into() } else { format!("the brain checked it: {}", clip(text, 200)) } }
         } else {
@@ -2486,6 +2521,46 @@ mod tests {
         facts.insert(ids[0].clone(), Facts { queue: delivered("t1", now), live: here(SessionStatus::Working), screen: Some(3), ..Default::default() });
         l.step(&facts, now + 2 * STALL_MS + 1);
         assert_eq!(l.task(&ids[0]).unwrap().state, TaskState::Running);
+    }
+
+    /// a772.1 and a773.1 (2026-11-19): t12w ended its turn on A (checked by
+    /// that turn's end), B went in two seconds later, and the brain's
+    /// `tower job done t12w` about A came after: it settled B.
+    #[test]
+    fn a_job_done_settles_the_task_its_turn_ended_on_not_a_newer_one() {
+        let now = 9_000_000_000;
+        let (mut l, _, ids) = ledger_with(3, now);
+        let (a, b, c) = (ids[0].clone(), ids[1].clone(), ids[2].clone());
+        let to = |l: &mut Ledger, id: &str, at: u64| {
+            l.task_mut(id).unwrap().apply(TaskEv::Delivered { session: "t12w".into(), name: "m5pro".into(), created_ms: None, space: None, at_ms: at, fresh: false }, at).unwrap();
+        };
+        to(&mut l, &a, now);
+        l.task_mut(&a).unwrap().apply(TaskEv::Claimed { said: "Merged into main and installed.".into() }, now + 600_000).unwrap();
+        l.task_mut(&a).unwrap().apply(TaskEv::Verify { how: "its last message says \"merged\"".into() }, now + 600_000).unwrap();
+        to(&mut l, &b, now + 602_000);
+        assert_eq!(l.task(&b).unwrap().state, TaskState::Running);
+        // The brain's word on A's turn: A it is (settled already: as it is), and B runs on.
+        assert_eq!(l.judged_task("t12w", now + 609_000), Some((a.clone(), true)));
+        assert_eq!(l.judged("t12w", true, "Plan-card bug fixed and installed", now + 609_000), Some(a.clone()));
+        assert_eq!(l.task(&b).unwrap().state, TaskState::Running, "the newer task isn't finished by it");
+        assert!(!l.task(&a).unwrap().why.contains("Plan-card"), "A's own check stays");
+        // A claimed, not checked yet, when B goes in: the verdict checks A.
+        to(&mut l, &c, now + 700_000);
+        l.task_mut(&c).unwrap().apply(TaskEv::Claimed { said: "Done.".into() }, now + 800_000).unwrap();
+        // (B, delivered before C's turn ended, is what C's session was on before: still running.)
+        let mut l2 = l.clone();
+        assert_eq!(l2.judged("t12w", true, "done", now + 801_000), Some(c.clone()));
+        assert_eq!((l2.task(&c).unwrap().state, l2.task(&b).unwrap().state), (TaskState::Verified, TaskState::Running));
+        // B's own turn ends: then a verdict is B's.
+        l.task_mut(&b).unwrap().apply(TaskEv::Claimed { said: "The planner opens in a tab.".into() }, now + 900_000).unwrap();
+        l.task_mut(&c).unwrap().apply(TaskEv::Verify { how: "checked".into() }, now + 900_000).unwrap();
+        assert_eq!(l.judged("t12w", true, "planner tab done", now + 901_000), Some(b.clone()));
+        assert_eq!(l.task(&b).unwrap().state, TaskState::Verified);
+        // No turn ended lately: the newest unfinished task, as before.
+        let (mut old, _, ids) = ledger_with(1, now);
+        to(&mut old, &ids[0], now);
+        assert_eq!(old.judged("t12w", false, "it didn't work", now + 5_000), Some(ids[0].clone()));
+        assert_eq!(old.task(&ids[0]).unwrap().state, TaskState::Failed);
     }
 
     #[test]
