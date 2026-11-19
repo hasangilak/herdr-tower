@@ -346,7 +346,9 @@ its finish is in the record (or a receipt, at `tower tell results`).
 
 A space with a goal is a mission: it has a goal, what counts as done, and
 an end. `tower space goal <space> "<goal>" [--done-when "<…>"]` sets them
-(or the Goal button in the space's view).
+(or the Goal button in the space's view). With no goal after the space it
+only shows the goal and its history (`--done-when` alone sets only that);
+`tower space goal <space> ""` clears it.
 
 The goal follows your requests: when you ask for something in a space
 that adds to what it is for (of its tower, of the main tower about it, or
@@ -1000,7 +1002,7 @@ tower plan [show [<id>]] [--json] | list | close [<id>]   # the open plan (and i
 tower setups                         # the projects `tower launch` opens with; tower setup add "<name>" --account <a> [--about "<line>"] --repo "<dir>=<role>" [--repo …] [--was "<old>"], tower setup remove "<name>"
 tower missions                       # every open space as a mission: goal, state, what needs you, sessions (worktree, port), requests
 tower spaces [--all]                 # every space: focus, goal, state, unread news, sessions (--all: archived and closed ones too)
-tower space goal <space> "<goal>" [--done-when "<…>"] [--by you]   # what a space is for and what counts as done
+tower space goal <space> ["<goal>"] [--done-when "<…>"] [--by you]   # what a space is for and what counts as done (no goal: shows it; "": clears it)
 tower space goal-request <space> "<words>" [--dry-run]   # weigh words as your request there: the goal follows when they add scope
 tower space standing <space> on|off  # a space you keep: never ready, never closed by the tower, no worktrees
 tower space report <space> "<text>"  # its closing report (the brain writes it when the space is ready)
