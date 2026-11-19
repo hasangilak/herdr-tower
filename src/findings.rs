@@ -363,7 +363,7 @@ fn place_after(source: &str, new: &str) -> String {
 pub fn ticket(f: &Finding) -> String {
     let (goal, _) = goal_of(f);
     format!(
-        "{goal}\n\nThis bug was found off its space's goal and spun out here by the tower. Its write-up: {}\n\n{}\n\nReproduce it first, fix it in this worktree with a test that shows it, and commit on this space's branch. Report to the tower when it is fixed. Don't push or open a PR unless the user says so.",
+        "{goal}\n\nThis bug was found off its space's goal and spun out here by the tower. Its write-up: {}\n\n{}\n\nReproduce it first, fix it in this worktree with a test that shows it, and commit on this space's branch. When it is fixed, push this space's branch and open its PR into dev yourself, without asking (only merging it is the user's), then report to the tower.",
         f.url,
         writeup(f)
     )

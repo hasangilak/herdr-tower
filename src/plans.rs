@@ -869,6 +869,28 @@ impl Plan {
     }
 }
 
+/// The branch a session's PR goes into as the plan predicts it: in the
+/// latest live plan launched as `space` (`live`: their views, newest
+/// first), the base of its predicted PRs for `repo` (a folder name or a
+/// remote's URL) not yet opened (else all of them). One base, or dev when
+/// they differ and one is dev; None otherwise.
+pub fn planned_base(live: &[Value], space: &str, repo: &str) -> Option<String> {
+    let (space, name) = (space.trim(), crate::prscore::folder_name(repo));
+    if space.is_empty() || name.is_empty() {
+        return None;
+    }
+    let plan = live.iter().find(|p| p["launched"].as_str().is_some_and(|l| l.trim().eq_ignore_ascii_case(space)))?;
+    let prs: Vec<&Value> = plan["prs"].as_array()?.iter().filter(|x| x["repo"].as_str().is_some_and(|r| crate::prscore::folder_name(r).eq_ignore_ascii_case(name))).collect();
+    let open: Vec<&Value> = prs.iter().copied().filter(|x| x["pr"].as_str().is_none_or(str::is_empty)).collect();
+    let mut bases: Vec<String> = if open.is_empty() { &prs } else { &open }.iter().filter_map(|x| x["base"].as_str()).map(|b| b.trim().to_string()).filter(|b| !b.is_empty()).collect();
+    bases.sort();
+    bases.dedup();
+    match bases.as_slice() {
+        [one] => Some(one.clone()),
+        many => many.iter().find(|b| crate::prscore::is_dev(b)).cloned(),
+    }
+}
+
 /// Every plan: the open one (at most one) and the latest closed ones.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]

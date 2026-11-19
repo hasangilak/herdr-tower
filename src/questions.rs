@@ -2514,6 +2514,477 @@ pub fn pushes_or_merges(command: &str) -> bool {
     })
 }
 
+// ---- opening the session's own PR: the tower's yes ----
+
+/// Where a session's PR would go, as its repository and its plan say
+/// (`open_pr_yes`): the daemon reads it from the session's folder.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PrPlace {
+    /// The session's branch (`git branch --show-current`).
+    pub branch: String,
+    /// Where its PR goes: the base its plan predicted for this repository,
+    /// else the repository's dev branch.
+    pub base: String,
+    /// The repository's default branch (`origin/HEAD`): where `gh pr create`
+    /// without `--base` opens it.
+    pub default: String,
+}
+
+/// The tower's own yes to a question set (`open_pr_yes`): the answer it
+/// gives (an option's place, or `{"other": "<the reply>"}`), its label, and why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleYes {
+    pub label: String,
+    pub choice: Value,
+    pub why: String,
+}
+
+/// Why the tower opened a session's PR itself.
+pub fn pr_yes_why(base: &str) -> String {
+    format!("it opens the session's own PR into {base}, its branch pushed for it: the tower says yes to that itself (merges stay yours)")
+}
+
+/// What a session types when the tower tells it to open its PR.
+fn pr_reply(base: &str) -> String {
+    format!("Yes: push your branch and open the PR into {base}. Don't merge it; the user merges.")
+}
+
+/// A branch others share: dev, main, prod and the like. Pushing to one is
+/// the user's, and so is a PR from one.
+fn shared_branch(b: &str) -> bool {
+    let b = b.trim().to_lowercase();
+    crate::prscore::is_dev(&b) || release_base(&b) || matches!(b.as_str(), "staging" | "stage" | "qa" | "gh-pages") || b.starts_with("hotfix/")
+}
+
+/// A branch a PR into is a release: main, prod and the like. Always the user's.
+fn release_base(b: &str) -> bool {
+    let b = b.trim().to_lowercase();
+    matches!(b.as_str(), "main" | "master" | "trunk" | "prod" | "production" | "live" | "stable" | "release" | "releases") || b.starts_with("release/") || b.starts_with("release-") || b.starts_with("releases/")
+}
+
+/// A branch a session's PR may go into by the tower's yes: dev, or the base its plan predicted (not a release).
+fn pr_base_ok(b: &str, at: &PrPlace) -> bool {
+    let b = b.trim();
+    !b.is_empty() && !release_base(b) && (crate::prscore::is_dev(b) || b.eq_ignore_ascii_case(at.base.trim()))
+}
+
+/// The tower says yes itself to a session opening its own PR, and to the
+/// push of its own feature branch for it (the user: "make the PR every
+/// time"). `at`: the session's branch, where its PR goes, its repository's
+/// default branch.
+///
+/// - A shell prompt (Claude Code's Bash, its whole command shown) that
+///   only pushes the session's branch (`git push [-u] [origin] [<it>]`, no
+///   force, no delete, no other branch) and opens its PR (`gh pr create`
+///   into dev or the planned base, from its branch), with nothing else in
+///   it on the 90/10 list: its plain one-time yes.
+/// - A question (Claude's own, or one at the end of a turn) whose every
+///   question asks to open the PR (and maybe push the branch for it), into
+///   dev or the planned base or no branch named, and nothing more: no
+///   merge, no main, prod or release, no force, nothing else on the list
+///   (`pr_question`). Claude's question: its option that opens it, else
+///   the reply typed; a turn's question: the reply, naming the branch.
+///
+/// Never when the session is on a shared branch, or there is no base to
+/// open it into. Merges, pushes to dev, main or prod, force pushes and
+/// release PRs into main stay the user's.
+pub fn open_pr_yes(set: &QuestionSet, at: &PrPlace) -> Option<RuleYes> {
+    let branch = at.branch.trim();
+    if branch.is_empty() || shared_branch(branch) || branch.eq_ignore_ascii_case(at.base.trim()) || branch.eq_ignore_ascii_case(at.default.trim()) || !pr_base_ok(&at.base, at) {
+        return None;
+    }
+    match set.kind.as_str() {
+        "claude-permission" => {
+            let command = shell_command(set)?;
+            let base = pr_command(&command, at)?;
+            let yes = set.tabs.first()?.options.iter().position(plain_yes)?;
+            Some(RuleYes { label: set.tabs[0].options[yes].label.clone(), choice: json!(yes), why: pr_yes_why(&base) })
+        }
+        "claude-ask" => {
+            let [tab] = set.tabs.as_slice() else { return None };
+            let base = pr_question(&tab.question, at)?;
+            // Its option that opens the PR, when one does and says nothing more.
+            // (Its plain "Yes" when the question itself only asks it.)
+            let pick = tab.options.iter().position(|o| {
+                let text = format!("{} {}", o.label, o.description);
+                !negated(&text) && (pr_question(&text, at).is_some_and(|b| b == base || !names_branch(&text)) || (plain_yes(o) && !negated(&tab.question)))
+            });
+            match pick {
+                Some(i) if names_branch(&format!("{} {} {}", tab.question, tab.options[i].label, tab.options[i].description)) => Some(RuleYes { label: tab.options[i].label.clone(), choice: json!(i), why: pr_yes_why(&base) }),
+                _ if tab.allows_other => Some(RuleYes { label: pr_reply(&base), choice: json!({ "other": pr_reply(&base) }), why: pr_yes_why(&base) }),
+                Some(i) => Some(RuleYes { label: tab.options[i].label.clone(), choice: json!(i), why: pr_yes_why(&base) }),
+                None => None,
+            }
+        }
+        "text" => {
+            let [tab] = set.tabs.as_slice() else { return None };
+            let base = pr_question(&tab.question, at)?;
+            // Every question the message asks, not only its last.
+            for q in questions_in(&set.detail) {
+                if pr_question(&q, at).is_none_or(|b| b != base) && !push_for_it(&q, at) {
+                    return None;
+                }
+            }
+            Some(RuleYes { label: format!("Open the PR into {base}"), choice: json!({ "other": pr_reply(&base) }), why: pr_yes_why(&base) })
+        }
+        _ => None,
+    }
+}
+
+/// Whether `set` may be one `open_pr_yes` takes, from its words alone:
+/// before the session's branch is read for it.
+pub fn may_open_pr(set: &QuestionSet) -> bool {
+    if !matches!(set.kind.as_str(), "claude-permission" | "claude-ask" | "text") {
+        return false;
+    }
+    let all = format!(" {} {} {} ", set.title, set.detail, set.tabs.iter().map(|t| t.question.as_str()).collect::<Vec<_>>().join(" "));
+    let n = format!(" {} ", norm(&all));
+    [" pr ", " prs ", " pull request", " push "].iter().any(|w| n.contains(w))
+}
+
+/// Every sentence in `message` that asks something (ends with `?`).
+fn questions_in(message: &str) -> Vec<String> {
+    let flat = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = vec![];
+    let mut start = 0;
+    for (i, c) in flat.char_indices() {
+        let end = i + c.len_utf8();
+        let ends = flat[end..].is_empty() || flat[end..].starts_with(' ');
+        if ['.', '!', ':', '?'].contains(&c) && ends {
+            if c == '?' {
+                let s = flat[start..end].trim();
+                if !s.is_empty() {
+                    out.push(s.to_string());
+                }
+            }
+            start = end;
+        }
+    }
+    out
+}
+
+/// Words that turn the question around: not opening it, or not now.
+fn negated(text: &str) -> bool {
+    let t = format!(" {} ", norm(&text.replace('’', "'")));
+    [" don t ", " dont ", " do not ", " not ", " no ", " never ", " wait ", " hold ", " later ", " skip ", " instead of ", " without "].iter().any(|w| t.contains(w))
+}
+
+/// Words naming a branch the PR goes into ("into dev", "against develop").
+fn names_branch(text: &str) -> bool {
+    let n = norm(text);
+    let ws: Vec<&str> = n.split(' ').collect();
+    ws.iter().any(|w| crate::prscore::is_dev(w)) || ws.windows(2).any(|p| matches!(p[0], "into" | "against" | "onto" | "targeting"))
+}
+
+/// A question that asks to open the session's PR (maybe pushing its branch
+/// for it) and nothing more: the branch it goes into (the one it names,
+/// dev or the planned base; else the planned one). None: anything else,
+/// or anything more (a merge; main, prod or a release; a force push; a
+/// push to dev; another branch; anything else on the 90/10 list).
+fn pr_question(q: &str, at: &PrPlace) -> Option<String> {
+    let flat = norm(&q.replace('’', "'"));
+    let ws: Vec<&str> = flat.split(' ').collect();
+    // The PR: "PR", "pull request".
+    let pr_at = ws.iter().enumerate().position(|(i, w)| matches!(*w, "pr" | "prs") || (*w == "pull" && ws.get(i + 1).is_some_and(|n| n.starts_with("request"))))?;
+    if !ws.iter().any(|w| matches!(*w, "open" | "opening" | "create" | "creating" | "make" | "making" | "raise" | "raising" | "file" | "submit" | "put")) {
+        return None;
+    }
+    const MORE: &[&str] = &[
+        "merge", "merges", "merging", "merged", "force", "rebase", "squash", "deploy", "deploys", "deploying", "release", "releases", "releasing", "publish",
+        "prod", "production", "main", "master", "trunk", "live", "staging", "close", "delete", "approve", "tag", "hotfix", "revert",
+    ];
+    if ws.iter().any(|w| MORE.contains(w)) {
+        return None;
+    }
+    // A dev branch before the PR is a push to it ("push to dev and open a PR").
+    if ws[..pr_at].iter().any(|w| crate::prscore::is_dev(w) || w.eq_ignore_ascii_case(&at.base)) {
+        return None;
+    }
+    // The branch it names: after "into", "against", "onto", "targeting"; after "to" only a branch it knows.
+    let mut named: Option<String> = None;
+    for (i, w) in ws.iter().enumerate().skip(pr_at) {
+        let Some(n) = ws[i + 1..].iter().find(|n| !matches!(**n, "the" | "a" | "our" | "your" | "its" | "branch")) else { continue };
+        let known = crate::prscore::is_dev(n) || n.eq_ignore_ascii_case(&at.base);
+        if matches!(*w, "into" | "against" | "onto" | "targeting" | "base") || (*w == "to" && known) {
+            if !known {
+                return None;
+            }
+            named = Some(n.to_string());
+        }
+    }
+    // Nothing else on the 90/10 list, the push for it left out.
+    let rest: String = ws.iter().filter(|w| !matches!(**w, "push" | "pushes" | "pushing" | "pushed")).copied().collect::<Vec<_>>().join(" ");
+    if reason_of(&rest, None).is_some() {
+        return None;
+    }
+    let base = named.unwrap_or_else(|| at.base.clone());
+    pr_base_ok(&base, at).then_some(base)
+}
+
+/// A question that only asks to push the session's branch (beside one that
+/// opens its PR): a push, no branch named, nothing else on the 90/10 list.
+fn push_for_it(q: &str, at: &PrPlace) -> bool {
+    let flat = norm(q);
+    let ws: Vec<&str> = flat.split(' ').collect();
+    let pushes = ws.iter().any(|w| matches!(*w, "push" | "pushes" | "pushing"));
+    let names = ws.iter().any(|w| crate::prscore::is_dev(w) || shared_branch(w) || w.eq_ignore_ascii_case(&at.base) || matches!(*w, "force" | "into" | "onto" | "to" | "upstream" | "tags" | "tag" | "merge" | "delete"));
+    let rest: String = ws.iter().filter(|w| !matches!(**w, "push" | "pushes" | "pushing")).copied().collect::<Vec<_>>().join(" ");
+    pushes && !names && reason_of(&rest, None).is_none()
+}
+
+/// A shell command that only pushes the session's branch and opens its PR
+/// into dev or the planned base (the rest of it on nothing in the 90/10
+/// list): where the PR goes (the planned base when it only pushes). None:
+/// anything else, or a command it can't read whole.
+fn pr_command(command: &str, at: &PrPlace) -> Option<String> {
+    let segments = shell_segments(&without_data(command))?;
+    let mut base: Option<String> = None;
+    let mut acted = false;
+    let mut rest: Vec<String> = vec![];
+    // After a `cd` the session's folder may not be the repository: its branch and base must be named outright.
+    let mut moved = false;
+    for seg in segments {
+        // Its command past assignments and `rtk`.
+        let words: Vec<&str> = seg.iter().map(String::as_str).skip_while(|w| (w.contains('=') && !w.starts_with('-')) || *w == "rtk").collect();
+        let Some(first) = words.first() else { continue };
+        let name = first.rsplit('/').next().unwrap_or(first);
+        match (name, words.get(1).copied(), words.get(2).copied()) {
+            ("cd" | "pushd" | "popd", _, _) => moved = true,
+            ("git", Some("push"), _) => {
+                safe_push(&words[2..], &at.branch)?;
+                if moved && !words[2..].iter().any(|w| w.rsplit(':').next() == Some(at.branch.as_str())) {
+                    return None;
+                }
+                acted = true;
+            }
+            ("git", Some(w), _) if w.starts_with('-') => return None,
+            ("gh", Some("pr"), Some("create")) => {
+                if moved && !words[3..].iter().any(|w| matches!(*w, "-B" | "--base") || w.starts_with("--base=")) {
+                    return None;
+                }
+                base = Some(safe_pr_create(&words[3..], at)?);
+                acted = true;
+            }
+            ("gh", Some(w), _) if w.starts_with('-') => return None,
+            _ => {
+                // A commit's message is its data.
+                let mut keep = vec![];
+                let mut skip = false;
+                for w in &words {
+                    if std::mem::take(&mut skip) {
+                        continue;
+                    }
+                    if matches!(*w, "-m" | "--message" | "-F" | "--file") {
+                        skip = true;
+                        continue;
+                    }
+                    if !w.starts_with("--message=") {
+                        keep.push(*w);
+                    }
+                }
+                rest.push(keep.join(" "));
+            }
+        }
+    }
+    let rest = rest.join("\n");
+    if !acted || reason_of(&rest, Some(&rest)).is_some() {
+        return None;
+    }
+    Some(base.unwrap_or_else(|| at.base.clone()))
+}
+
+/// `git push`'s words (after `push`) push only `branch`, as it is: no
+/// force, delete, tags or other branches; to `origin`.
+fn safe_push(args: &[&str], branch: &str) -> Option<()> {
+    let mut positional = vec![];
+    for a in args {
+        match *a {
+            "-u" | "--set-upstream" | "-q" | "--quiet" | "-v" | "--verbose" | "--progress" | "--no-progress" | "--porcelain" | "-n" | "--dry-run" => {}
+            a if a.starts_with('-') => return None,
+            a => positional.push(a),
+        }
+    }
+    let Some((remote, refs)) = positional.split_first() else { return Some(()) };
+    if *remote != "origin" {
+        return None;
+    }
+    let mine = |r: &str| r == branch || r == format!("refs/heads/{branch}");
+    for r in refs {
+        let ok = match r.split_once(':') {
+            Some((from, to)) => (from == "HEAD" || mine(from)) && mine(to),
+            None => *r == "HEAD" || mine(r),
+        };
+        if !ok {
+            return None;
+        }
+    }
+    Some(())
+}
+
+/// `gh pr create`'s words (after `create`) open a PR from the session's
+/// branch into dev or the planned base, in its own repository: that base.
+fn safe_pr_create(args: &[&str], at: &PrPlace) -> Option<String> {
+    let mut base: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        let (flag, inline) = match a.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (a, None),
+        };
+        let mut value = || inline.clone().or_else(|| {
+            i += 1;
+            args.get(i).map(|s| s.to_string())
+        });
+        match flag {
+            "-B" | "--base" => base = Some(value()?),
+            "-H" | "--head" => {
+                let h = value()?;
+                if h.rsplit(':').next() != Some(at.branch.as_str()) {
+                    return None;
+                }
+            }
+            "-R" | "--repo" => return None,
+            // These take a value: its words are data.
+            "-t" | "--title" | "-b" | "--body" | "-F" | "--body-file" | "-a" | "--assignee" | "-l" | "--label" | "-m" | "--milestone" | "-p" | "--project" | "-r" | "--reviewer" | "-T" | "--template" | "--recover" => {
+                value()?;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let base = base.unwrap_or_else(|| at.default.clone());
+    pr_base_ok(&base, at).then_some(base)
+}
+
+/// A shell command's simple commands, each as its words (quotes taken off;
+/// a redirection left out; a `$(cat <<'EOF' … EOF)` body as one word):
+/// split at `;`, `&&`, `||`, `|`, `&` and line ends. None: a command it
+/// can't read for sure (an open quote, a backtick, another substitution).
+fn shell_segments(command: &str) -> Option<Vec<Vec<String>>> {
+    let c: Vec<char> = command.chars().collect();
+    let mut segs: Vec<Vec<String>> = vec![vec![]];
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut i = 0;
+    let end_word = |segs: &mut Vec<Vec<String>>, word: &mut String, in_word: &mut bool| {
+        if std::mem::take(in_word) {
+            segs.last_mut().unwrap().push(std::mem::take(word));
+        }
+    };
+    // `$(…)` from `i` (at its `$`): only `cat` of a heredoc (its body gone) or of a file.
+    let subst = |i: usize| -> Option<usize> {
+        let mut depth = 0;
+        let mut j = i + 1;
+        while j < c.len() {
+            match c[j] {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        if j >= c.len() {
+            return None;
+        }
+        let inner: String = c[i + 2..j].iter().collect();
+        let ws: Vec<&str> = inner.split_whitespace().collect();
+        let tag = ws.iter().find_map(|w| w.strip_prefix("<<")).map(|t| t.trim_start_matches('-').trim_matches(['\'', '"']).to_string());
+        let ok = ws.first() == Some(&"cat")
+            && ws[1..].iter().all(|w| w.starts_with("<<") || tag.as_deref() == Some(*w) || w.chars().all(|ch| ch.is_alphanumeric() || "._/-~".contains(ch)));
+        ok.then_some(j)
+    };
+    while i < c.len() {
+        let ch = c[i];
+        match ch {
+            '\'' => {
+                let close = c[i + 1..].iter().position(|x| *x == '\'')? + i + 1;
+                word.extend(&c[i + 1..close]);
+                in_word = true;
+                i = close + 1;
+            }
+            '"' => {
+                in_word = true;
+                i += 1;
+                loop {
+                    let x = *c.get(i)?;
+                    match x {
+                        '"' => break,
+                        '\\' => {
+                            word.push(*c.get(i + 1)?);
+                            i += 1;
+                        }
+                        '`' => return None,
+                        '$' if c.get(i + 1) == Some(&'(') => {
+                            i = subst(i)?;
+                            word.push_str("…");
+                        }
+                        _ => word.push(x),
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            '`' => return None,
+            '$' if c.get(i + 1) == Some(&'(') => {
+                i = subst(i)? + 1;
+                word.push_str("…");
+                in_word = true;
+            }
+            '\\' => {
+                // A line that goes on.
+                if c.get(i + 1) == Some(&'\n') {
+                    i += 2;
+                } else {
+                    word.push(*c.get(i + 1)?);
+                    in_word = true;
+                    i += 2;
+                }
+            }
+            ';' | '&' | '|' | '\n' => {
+                end_word(&mut segs, &mut word, &mut in_word);
+                segs.push(vec![]);
+                i += 1;
+            }
+            '>' | '<' => {
+                // A redirection: its target goes with it (`2>&1`, `> out.log`); a heredoc's marker too.
+                if word.chars().all(|d| d.is_ascii_digit()) {
+                    word.clear();
+                    in_word = false;
+                }
+                end_word(&mut segs, &mut word, &mut in_word);
+                i += 1;
+                while i < c.len() && "<>&-".contains(c[i]) {
+                    i += 1;
+                }
+                while i < c.len() && c[i] == ' ' {
+                    i += 1;
+                }
+                while i < c.len() && !c[i].is_whitespace() && !";&|".contains(c[i]) {
+                    i += 1;
+                }
+            }
+            '(' | ')' | '{' | '}' => return None,
+            x if x.is_whitespace() => {
+                end_word(&mut segs, &mut word, &mut in_word);
+                i += 1;
+            }
+            x => {
+                word.push(x);
+                in_word = true;
+                i += 1;
+            }
+        }
+    }
+    end_word(&mut segs, &mut word, &mut in_word);
+    Some(segs.into_iter().filter(|s| !s.is_empty()).collect())
+}
+
 // ---- a file prompt: what it writes, never what the file says ----
 
 /// What a file prompt does to its file.
@@ -3872,6 +4343,154 @@ mod tests {
             tabs: vec![Tab { question: question.into(), options: options.iter().map(|o| Opt { label: o.to_string(), ..Default::default() }).collect(), ..Default::default() }],
             ..Default::default()
         }
+    }
+
+    /// A Claude Code Bash prompt for `command` (its lines as the dialog draws them), off its screen.
+    fn bash_prompt(command: &str) -> QuestionSet {
+        let shown = command.lines().map(|l| format!(" {l}")).collect::<Vec<_>>().join("\n");
+        let screen = fixture("claude-permission.txt").replace(" touch /tmp/qfix-perm-test\n╌", &format!("{shown}\n╌")).replace("Create the qfix-perm-test file in /tmp", "Push the branch and open its PR");
+        build("t1qa", "storefront filter", false, &parse_screen(&screen).unwrap(), None, "", "Add the users filter.")
+    }
+
+    /// The session on its own branch, its PR into dev (`origin/HEAD` main).
+    fn feature() -> PrPlace {
+        PrPlace { branch: "feat/users-filter".into(), base: "dev".into(), default: "main".into() }
+    }
+
+    /// "tower is always asking me to make a pr. make the god damn pr
+    /// everytime bro." Opening the session's own PR into dev, and pushing its
+    /// branch for it, is the tower's yes: from a Bash prompt, Claude's own
+    /// question and the end of a turn. A merge, a push to dev or main, a force
+    /// push, a release PR into main and anything more stay the user's.
+    #[test]
+    fn opening_the_sessions_own_pr_into_dev_is_the_towers_yes_and_merges_stay_the_users() {
+        let at = feature();
+        // The Bash prompt: push and open it, a PR body in a heredoc (whose words are its data).
+        let both = bash_prompt("git push -u origin feat/users-filter && gh pr create --base dev --title \"Users filter\" --body \"$(cat <<'EOF'\n## Summary\n- remove the old filter, delete its tests\nEOF\n)\"");
+        assert_eq!(shell_command(&both).is_some(), true, "{both:?}");
+        assert_eq!(must_escalate(&both), Some("it pushes or merges to a shared branch"), "the hard rule alone would send it to the user");
+        let yes = open_pr_yes(&both, &at).expect("the tower's yes");
+        assert_eq!((yes.label.as_str(), &yes.choice), ("Yes", &json!(0)), "its plain one-time yes");
+        assert_eq!(yes.why, pr_yes_why("dev"));
+        // Each alone, and in the forms sessions use.
+        for ok in [
+            "git push -u origin feat/users-filter",
+            "git push",
+            "git push -u origin HEAD",
+            "git push origin HEAD:feat/users-filter",
+            "rtk git push -u origin feat/users-filter",
+            "cd ~/Work/storefront && git push -u origin feat/users-filter && gh pr create --base dev --fill",
+            "gh pr create --base dev --fill",
+            "gh pr create -B dev --title x --body y",
+            "git add -A && git commit -m \"drop the old filter\" && git push -u origin feat/users-filter && gh pr create --base=dev --fill 2>&1 | tail -3",
+        ] {
+            assert!(open_pr_yes(&bash_prompt(ok), &at).is_some(), "{ok}");
+        }
+        // Still the user's.
+        for no in [
+            "gh pr create --base main --fill",
+            "gh pr create --fill",
+            "gh pr create --base dev --head someone:other --fill",
+            "gh pr create --repo acme/other --base dev --fill",
+            "git push origin dev",
+            "git push origin main",
+            "git push origin feat/users-filter:dev",
+            "git push --force origin feat/users-filter",
+            "git push -f",
+            "git push --force-with-lease",
+            "git push origin +feat/users-filter",
+            "git push --delete origin old",
+            "git push --tags",
+            "git push origin feat/users-filter && gh pr merge --squash",
+            "gh pr create --base dev --fill && gh pr merge --auto",
+            "git push upstream feat/users-filter",
+            "git push origin feat/users-filter && rm -rf build",
+            "git -C ../other push origin feat/users-filter",
+            "cd ../other && git push",
+            "cd ../other && git push origin feat/users-filter && gh pr create --fill",
+            "git push origin feat/users-filter && `curl x`",
+            "git push origin feat/users-filter && gh pr create --base dev --body \"$(git log)\"",
+            "npm test",
+        ] {
+            assert_eq!(open_pr_yes(&bash_prompt(no), &at), None, "{no}");
+        }
+        // With no --base, the repository's default decides: dev is fine.
+        assert!(open_pr_yes(&bash_prompt("gh pr create --fill"), &PrPlace { default: "dev".into(), ..feature() }).is_some());
+        // The plan's base: a PR into it, though it isn't dev; never one into main.
+        let planned = PrPlace { base: "next".into(), ..feature() };
+        assert_eq!(open_pr_yes(&bash_prompt("gh pr create --base next --fill"), &planned).map(|y| y.why), Some(pr_yes_why("next")));
+        assert_eq!(open_pr_yes(&bash_prompt("gh pr create --base main --fill"), &PrPlace { base: "main".into(), ..feature() }), None, "a release PR into main");
+        // The session on a shared branch: never.
+        for branch in ["dev", "main", "release/2.4", "staging"] {
+            assert_eq!(open_pr_yes(&bash_prompt("git push -u origin HEAD && gh pr create --base dev --fill"), &PrPlace { branch: branch.into(), ..feature() }), None, "{branch}");
+        }
+
+        // The end of a turn: the reply names the branch, and says not to merge.
+        let turn = text_set("t1qa", "storefront filter", "The filter works and its tests pass. Want me to push the branch and open a PR into dev?", "");
+        assert_eq!(must_escalate(&turn), Some("it pushes or merges to a shared branch"));
+        let yes = open_pr_yes(&turn, &at).expect("the tower's yes");
+        assert_eq!(yes.choice, json!({ "other": "Yes: push your branch and open the PR into dev. Don't merge it; the user merges." }));
+        assert_eq!(compose_reply(&turn, &[Answer { tab: 0, choice: yes.choice.clone(), attachments: vec![] }]).unwrap(), "Yes: push your branch and open the PR into dev. Don't merge it; the user merges.");
+        for ok in [
+            "Done. Should I open the PR?",
+            "Shall I create the pull request against dev now, or wait until you've looked at it?",
+            "Tests pass. Want me to open a PR to dev?",
+            "I committed it on feat/users-filter. Push it and open the PR?",
+        ] {
+            assert!(open_pr_yes(&text_set("t1qa", "x", ok, ""), &at).is_some(), "{ok}");
+        }
+        for no in [
+            "Want me to open the PR and merge it once CI passes?",
+            "Should I open a PR into main?",
+            "Should I open the release PR?",
+            "Push to dev and open a PR?",
+            "Should I push it to dev?",
+            "Want me to open a PR into staging?",
+            "Should I force push and open the PR?",
+            "Open the PR and deploy it to the preview?",
+            "Should I drop the users table? And want me to open a PR into dev?",
+            "Want me to open a PR into dev? Also, should I delete the old branch?",
+            "Should I merge PR #12 into dev?",
+            "Is the filter what you wanted?",
+        ] {
+            assert_eq!(open_pr_yes(&text_set("t1qa", "x", no, ""), &at), None, "{no}");
+        }
+        // Several questions, each about the PR: still yes.
+        assert!(open_pr_yes(&text_set("t1qa", "x", "Should I push the branch? And open a PR into dev?", ""), &at).is_some());
+        assert_eq!(open_pr_yes(&text_set("t1qa", "x", "Should I push it to main? And open a PR into dev?", ""), &at), None);
+        assert_eq!(open_pr_yes(&text_set("t1qa", "x", "Should I open a PR into dev? Then push to production?", ""), &at), None);
+
+        // Claude's own question: its option that opens the PR.
+        let mut ask = q("", "Open a PR into dev?", &["Yes, open it", "Not yet"]);
+        ask.kind = "claude-ask".into();
+        ask.tabs[0].allows_other = true;
+        assert_eq!(open_pr_yes(&ask, &at).map(|y| y.choice), Some(json!(0)));
+        let mut ask = q("", "How should I continue?", &["Open the PR into dev (Recommended)", "Keep working"]);
+        ask.kind = "claude-ask".into();
+        assert_eq!(open_pr_yes(&ask, &at), None, "the question itself doesn't ask it");
+        let mut ask = q("", "Should I open a pull request?", &["Yes", "No, wait"]);
+        ask.kind = "claude-ask".into();
+        ask.tabs[0].allows_other = true;
+        assert_eq!(open_pr_yes(&ask, &at).map(|y| y.choice), Some(json!({ "other": "Yes: push your branch and open the PR into dev. Don't merge it; the user merges." })), "no branch named: the reply names it");
+        let mut merge = q("", "Open the PR and merge it into dev?", &["Yes", "No"]);
+        merge.kind = "claude-ask".into();
+        assert_eq!(open_pr_yes(&merge, &at), None);
+    }
+
+    /// The base a plan predicted for a session's repository.
+    #[test]
+    fn the_planned_base_is_the_plans_prediction_for_the_repository() {
+        use crate::plans::planned_base;
+        let live = vec![json!({"launched": "Storefront users", "prs": [
+            {"n": 1, "repo": "storefront", "base": "dev", "pr": "acme/storefront#5"},
+            {"n": 2, "repo": "storefront", "base": "next"},
+            {"n": 3, "repo": "api", "base": "dev"},
+            {"n": 4, "repo": "api", "base": "main"},
+        ]})];
+        assert_eq!(planned_base(&live, "storefront users", "git@github.com:acme/storefront.git").as_deref(), Some("next"), "the one not opened yet");
+        assert_eq!(planned_base(&live, "Storefront users", "api").as_deref(), Some("dev"), "dev before a release into main");
+        assert_eq!(planned_base(&live, "Other", "api"), None);
+        assert_eq!(planned_base(&live, "Storefront users", "web"), None);
     }
 
     /// What the session was asked when its memory note became a card: the
