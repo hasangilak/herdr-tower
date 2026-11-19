@@ -106,9 +106,17 @@ impl Decisions {
     }
 
     pub fn at(shared: Shared, path: PathBuf) -> Decisions {
-        let book = Book::load(&path);
+        let mut book = Book::load(&path);
         if !book.open.is_empty() {
             eprintln!("[decisions] {} open from before", book.open.len());
+        }
+        // Raised about one account-wide cause in several spaces before they were matched so: one card.
+        let folded = book.fold_account_wide(crate::history::now_ms());
+        for (kept, gone) in &folded {
+            eprintln!("[decisions] {} joined {kept}: one account-wide cause", gone.join(", "));
+        }
+        if !folded.is_empty() {
+            let _ = book.save(&path);
         }
         let d = Decisions { book: Arc::new(Mutex::new(book)), path: Some(Arc::new(path)), ..Decisions::new(shared) };
         d.refresh();
