@@ -1401,6 +1401,38 @@ impl Asks {
         about.into_iter().map(|(_, id)| id).collect()
     }
 
+    /// A "waits for you" set that asks the user to merge a PR which has its
+    /// merge card now goes into that card: the merge is asked there, once (a
+    /// turn ended "nothing else until #1549 is merged" before the merge card
+    /// for #1549 was made, and both stood in the queue). The sets settled.
+    pub fn fold_waits_into_merges(&self) -> Vec<String> {
+        let Some(d) = self.decisions.get() else { return vec![] };
+        let merges = d.open_merges();
+        if merges.is_empty() {
+            return vec![];
+        }
+        let fold: Vec<(String, String, String)> = {
+            let i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            i.sets
+                .iter()
+                .filter(|s| s.reason == questions::WAITS && s.status != "answered")
+                .filter_map(|s| {
+                    let words = format!("{} {}", s.title, s.tabs.iter().map(|t| t.question.as_str()).collect::<Vec<_>>().join(" "));
+                    if !words.to_lowercase().contains("merg") {
+                        return None;
+                    }
+                    let space = |m: &Option<String>| m.as_deref().map(str::to_lowercase) == s.space.as_deref().map(str::to_lowercase);
+                    let (id, ..) = merges.iter().find(|(_, sp, prs)| space(sp) && prs.iter().any(|(repo, n)| names_pr(&words, repo, *n)))?;
+                    Some((s.session.clone(), s.id.clone(), id.clone()))
+                })
+                .collect()
+        };
+        for (session, id, card) in &fold {
+            self.settle(session, id, &format!("in the merge card {card}"));
+        }
+        fold.into_iter().map(|(_, id, _)| id).collect()
+    }
+
     /// A set settled outside its dialog (`what` settled it): closed, and the
     /// decision it stood in answered with `what`.
     fn settle(&self, session: &str, id: &str, what: &str) {
@@ -2654,6 +2686,32 @@ mod tests {
         // A set with no question of its own goes by its title.
         let titled = QuestionSet { title: "Merge #786 now?".into(), tabs: vec![], ..set };
         assert!(about_pr(&titled, other, 786));
+    }
+
+    /// 18 Nov 18:08: t1jc ended its turn "nothing else until #1549 is
+    /// merged" before #1549's merge card was made, and both stood in the
+    /// queue. When the merge card comes, the wait goes into it; a wait about
+    /// another PR, or one that asks no merge, stays.
+    #[test]
+    fn a_wait_for_a_merge_goes_into_its_merge_card_when_the_card_comes() {
+        let (a, d, _) = deciding(|| crate::tell::Level::Decisions);
+        let space = "notification-settings";
+        let ask = |address: &str, msg: &str| {
+            let req = questions::waits_for_user(msg).unwrap();
+            a.waiting_in(Some(space.into()), address, "backend", None, msg, &req, "", false, false).unwrap()
+        };
+        let merge = ask("tw-n1", "The digest is done. Still waiting on you: merging #1549 into dev, then I deploy it.");
+        let other = ask("tw-n2", "The dashboard part is done. Still waiting on you: merging #932 into dev.");
+        let sign = ask("tw-n3", "Checked on dev. Still waiting on you: signing in on dev-app once for #1549's check.");
+        assert_eq!(d.list(None, false)["count"], 3);
+        let pr = crate::prs::Pr { repo: "eyzhub/eyz-mediaroom-serverless".into(), number: 1549, base: "dev".into(), state: "open".into(), session: "tw-n1".into(), space: Some(space.into()), waiting: true, found_ms: 1_000, ..Default::default() };
+        d.sync_prs(&[pr]);
+        let folded = a.fold_waits_into_merges();
+        assert_eq!(folded, vec![merge.id.clone()]);
+        let open: Vec<String> = d.list(None, false)["decisions"].as_array().unwrap().iter().map(|c| c["kind"].as_str().unwrap().to_string()).collect();
+        assert_eq!(open.iter().filter(|k| *k == "merge").count(), 1);
+        assert_eq!(open.len(), 3, "the merge card, #932's wait, and the sign-in");
+        assert!(a.get(&merge.id).is_none() && a.get(&other.id).is_some() && a.get(&sign.id).is_some());
     }
 
     /// The report: two decisions in one space, one a PR's merge card. The

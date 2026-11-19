@@ -199,8 +199,13 @@ impl Panel {
 
     /// The line on a card that came back from hold: why.
     pub(super) fn back_line(d: &Decision) -> Option<AnyElement> {
-        let b = d.back.as_ref().filter(|b| !b.why.trim().is_empty())?;
-        Some(div().text_size(px(12.0)).line_height(px(17.0)).text_color(rgb(AMBER)).child(format!("Back from hold: {}", b.why.trim())).into_any_element())
+        let line = |text: String| div().text_size(px(12.0)).line_height(px(17.0)).text_color(rgb(AMBER)).child(text).into_any_element();
+        if let Some(b) = d.back.as_ref().filter(|b| !b.why.trim().is_empty()) {
+            return Some(line(format!("Back from hold: {}", b.why.trim())));
+        }
+        // The same card asked again: how it ended the time before ("Asked again: you answered “go ahead”").
+        let a = d.again.as_ref().filter(|a| !a.why.trim().is_empty())?;
+        Some(line(format!("{} at {}", a.why.trim().trim_end_matches('.'), super::talk::when(a.at_ms))))
     }
 
     /// The "On hold" section's cards: what each is, the user's words, what
