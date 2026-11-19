@@ -792,6 +792,16 @@ impl Plans {
         Some(found)
     }
 
+    /// `tower plan remap`: the plan's predicted PR `n` is the real PR `key`
+    /// (`plans::Book::remap_pr`). The prediction, and the PR it had before.
+    pub fn remap(&self, id: &str, n: u32, key: &str) -> Result<(crate::prscore::Predicted, Option<String>)> {
+        let mut b = lock(&self.book);
+        let r = b.remap_pr(id, n, key, now())?;
+        self.save(&b);
+        self.publish(&b);
+        Ok(r)
+    }
+
     /// Closed, and its planner ended.
     fn close(&self, id: &str, launched: Option<&str>) -> Result<Plan> {
         let p = self.change(|b| b.close(id, launched, now()))?;

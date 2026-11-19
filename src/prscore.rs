@@ -942,13 +942,12 @@ fn title_words(t: &str) -> Vec<String> {
 pub fn best_match(prs: &[Predicted], repo: &str, base: &str, title: &str) -> Option<usize> {
     let name = folder_name(repo);
     let words = title_words(title);
+    // Only into the branch it predicts: a release into main is never taken by a PR into dev.
+    let same_base = |p: &Predicted| base.trim().is_empty() || p.base.trim().is_empty() || p.base.trim().eq_ignore_ascii_case(base.trim());
     prs.iter()
         .enumerate()
-        .filter(|(_, p)| p.pr.is_none() && p.repo.eq_ignore_ascii_case(name))
-        .map(|(i, p)| {
-            let shared = title_words(&p.title).iter().filter(|w| words.contains(w)).count();
-            (i, (p.base.eq_ignore_ascii_case(base), shared))
-        })
+        .filter(|(_, p)| p.pr.is_none() && p.repo.eq_ignore_ascii_case(name) && same_base(p))
+        .map(|(i, p)| (i, title_words(&p.title).iter().filter(|w| words.contains(w)).count()))
         .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
         .map(|(i, _)| i)
 }
@@ -1275,6 +1274,29 @@ pub(crate) mod tests {
         let mut bad = base();
         bad["dependents"] = json!([{ "what": "x" }]);
         assert!(check(&json!([bad]), &draft_repos()).unwrap_err().to_string().contains("\"used_by\""));
+    }
+
+    /// p6 (2026-11-19): its release PR 3 (MediaRoom dev → main) was taken by
+    /// #1592, a spec-only fix into dev that came first.
+    #[test]
+    fn a_release_into_main_is_never_taken_by_a_pr_into_dev() {
+        let pred = |n: u32, repo: &str, base: &str, title: &str| Predicted { n, repo: repo.into(), base: base.into(), title: title.into(), ..Default::default() };
+        let mut prs = vec![
+            pred(1, "eyz-mediaroom-serverless", "dev", "feat(storefront-users): filter the users list by access, watch history and plan"),
+            pred(2, "eyzflow", "dev", "feat(storefront-users): filter viewers by access, watch history and plan"),
+            pred(3, "eyz-mediaroom-serverless", "main", "release: eyz-mediaroom-serverless dev → main (storefront users filter)"),
+            pred(4, "eyzflow", "main", "release: eyzflow dev → main (storefront users filter)"),
+        ];
+        prs[0].pr = Some("eyzhub/eyz-mediaroom-serverless#1591".into());
+        prs[1].pr = Some("eyzhub/eyzflow#972".into());
+        // The spec fix into dev: every dev prediction of the repo is taken, and the release is into main: none.
+        assert_eq!(best_match(&prs, "eyzhub/eyz-mediaroom-serverless", "dev", "test(storefront-users): type the filter spec's stubs so tsc on specs passes"), None);
+        // The real release into main: PR 3, and the other repo's release stays for its own.
+        assert_eq!(best_match(&prs, "eyzhub/eyz-mediaroom-serverless", "main", "release: eyz-mediaroom-serverless dev → main (storefront users filter)"), Some(2));
+        assert_eq!(best_match(&prs, "eyzhub/eyzflow", "main", "release: eyzflow dev → main"), Some(3));
+        // Base names in another case are the same branch; a PR into another branch than any predicted: none.
+        assert_eq!(best_match(&prs, "eyzhub/eyzflow", "Main", "anything"), Some(3));
+        assert_eq!(best_match(&prs, "eyzhub/eyzflow", "staging", "release: eyzflow dev → main"), None);
     }
 
     #[test]
