@@ -284,6 +284,8 @@ pub fn ask(space: Option<&str>, text: &str, shared: &Shared, source: &str) -> Re
         return brain::ask(text, &super::stt::radar(shared), source);
     };
     let name = space_named(shared, asked);
+    // The request is that space's, by its whole name (the agenda reads it so).
+    shared.update(|s| s.heard_space = Some(name.clone()));
     let to = target(Some(&name));
     if let Some(own) = to.space.clone() {
         match brain::ask_as(&to, text, &radar_of(shared, &own), source) {

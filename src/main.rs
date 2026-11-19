@@ -163,10 +163,11 @@ enum Cmd {
     /// The agenda ledger: every request of the user's and the tasks handed out for it, until each
     /// is verified or dropped. `tower agenda` (open ones), `tasks` (what's unfinished), `show <id>`,
     /// `new "<the user's words>"`, `close <id> [--force]`, `abandon <id|task>`, `verify <task>`,
-    /// `fail <task> "<why>"`, `requeue <task> [<session>]`, `forget <id>` (takes a finished one out of
-    /// the ledger, as if it never was: a test, a mistake).
+    /// `fail <task> "<why>"`, `requeue <task> [<session>]`, `move <task> <agenda|new>` (a task that
+    /// landed in the wrong request goes to another, or to one of its own), `forget <id>` (takes a
+    /// finished one out of the ledger, as if it never was: a test, a mistake).
     Agenda {
-        /// list | tasks | show | new | close | abandon | verify | fail | requeue | forget
+        /// list | tasks | show | new | close | abandon | verify | fail | requeue | move | forget
         #[arg(default_value = "list")]
         action: String,
         /// The agenda or task (`a3`, `a3.2`), then words (why, a note) or, for requeue, a session.
@@ -3115,8 +3116,15 @@ fn agenda_cmd(action: &str, args: &[String], all: bool, force: bool, title: Opti
             c.session = args.get(1).cloned().unwrap_or_default();
             c.text = args.get(2..).map(|r| r.join(" ")).unwrap_or_default();
         }
+        "move" => {
+            c.target = need("task")?;
+            c.text = args.get(1).cloned().unwrap_or_default();
+            if c.text.trim().is_empty() {
+                bail!("tower agenda move <task> <agenda|new>: the agenda it goes to (`a3`), or `new` for one of its own");
+            }
+        }
         "new" => c.text = args.join(" "),
-        other => bail!("tower agenda {other}: use list, tasks, show, new, close, abandon, verify, fail, requeue or forget"),
+        other => bail!("tower agenda {other}: use list, tasks, show, new, close, abandon, verify, fail, requeue, move or forget"),
     }
     let v = agenda_do(&c)?;
     if !std::io::stdout().is_terminal() {
@@ -3174,6 +3182,13 @@ fn agenda_cmd(action: &str, args: &[String], all: bool, force: bool, title: Opti
         }
         "verify" | "fail" => list_line(if action == "verify" { "Verified" } else { "Failed" }, &v["moved"]),
         "forget" => println!("Forgot {}: it is out of the ledger (the record keeps what was said).", v["forgotten"].as_str().unwrap_or("")),
+        "move" => println!(
+            "Moved {} from {} to {}: it is {} now (its old id still finds it).",
+            v["was"].as_str().unwrap_or(""),
+            v["from"].as_str().unwrap_or(""),
+            v["agenda"].as_str().unwrap_or(""),
+            v["task"].as_str().unwrap_or("")
+        ),
         "requeue" => println!(
             "{} {} as #{} for {} ({}).",
             v["task"].as_str().unwrap_or(""),

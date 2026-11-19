@@ -179,13 +179,13 @@ impl Agendas {
     /// The user's latest request, as the daemon heard it.
     fn heard(&self) -> Heard {
         match self.ctx.get() {
-            Some(c) => c.shared.with(|s| Heard { text: s.heard.clone(), at_ms: s.heard_ms }),
+            Some(c) => c.shared.with(|s| Heard { text: s.heard.clone(), at_ms: s.heard_ms, space: s.heard_space.clone() }),
             None => Heard::default(),
         }
     }
 
     /// A task for what the send queue took on (`tower queue`, `dispatch`, `start`).
-    pub fn register(&self, reg: Reg) -> Option<agenda::Registered> {
+    pub fn register(&self, mut reg: Reg) -> Option<agenda::Registered> {
         if reg.queue_id == 0 || reg.text.trim().is_empty() {
             return None;
         }
@@ -197,6 +197,10 @@ impl Agendas {
         // What goes to a brain (the main one, a space's own) is no task of anyone's.
         if reg.session == crate::brain::name() || super::brains::is_brain_address(&reg.session) {
             return None;
+        }
+        // Its session's space, as Herdr says: where the task is, and what it may join.
+        if reg.session_space.is_none() {
+            reg.session_space = session.as_ref().and_then(crate::spaces::space_of);
         }
         let heard = self.heard();
         let (r, request) = {
@@ -582,7 +586,7 @@ mod tests {
         let now = 1_000_000;
         let mut l = Ledger::default();
         let a = l.open("fix the login", "", "user", 0, &[], now);
-        let reg = Reg { queue_id: 1, session: "t5".into(), name: "api".into(), text: "fix the login".into(), tag: Tag { agenda: Some(a), ..Default::default() } };
+        let reg = Reg { queue_id: 1, session: "t5".into(), name: "api".into(), text: "fix the login".into(), tag: Tag { agenda: Some(a), ..Default::default() }, session_space: None };
         let task = l.register(&reg, &Default::default(), now).unwrap().task;
         l.apply(&task, TaskEv::Fail { why: "the tests fail".into() }, now).unwrap();
         // On: the tower sends it once more.

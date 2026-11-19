@@ -563,6 +563,17 @@ pub struct Tag {
     /// queue`): a message from one session to another.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
+    /// The brain that ran it (`tower`, `tower-<space>`), by the daemon's word.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brain: Option<String>,
+    /// That brain's space, for a space's own tower (None: the main tower).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brain_space: Option<String>,
+    /// That brain was on a note of the tower's (`[session]`, `[agenda]`,
+    /// `[watch]`, …), not the user's words, when it ran it: no work for the
+    /// user's request.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub relay: bool,
 }
 
 /// A registration: a queue id, its session (empty: one still to start) and text.
@@ -573,6 +584,8 @@ pub struct Reg {
     pub name: String,
     pub text: String,
     pub tag: Tag,
+    /// The space its session is in, as Herdr says (None: not known, or one still to start).
+    pub session_space: Option<String>,
 }
 
 impl Agenda {
@@ -604,6 +617,41 @@ pub struct Typed {
 pub struct Heard {
     pub text: String,
     pub at_ms: u64,
+    /// The space it was asked in (a space's view, its tower); None: of the main tower.
+    pub space: Option<String>,
+}
+
+/// A prompt that is a note of the tower's to a brain (`[session] …`,
+/// `[agenda] …`, `[watch] …`, `[question] …`), not the user's words (`[voice] …`).
+pub fn is_note(prompt: &str) -> bool {
+    let Some(rest) = prompt.trim_start().strip_prefix('[') else { return false };
+    let word: String = rest.chars().take_while(|c| *c != ']' && !c.is_whitespace()).collect();
+    !word.is_empty() && word.len() <= 24 && word != "voice"
+}
+
+/// Two spaces' names are the same one.
+fn same_space(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+/// Whether a task handed out now (`reg`, into `space`) is work for the
+/// user's fresh request `heard`: not a message between sessions, not what
+/// a brain did on a note of the tower's (`relay`), not a space's tower's
+/// unless the request was asked of it, and only into the space the request
+/// was asked in (one asked of the main tower: wherever the main tower hands it).
+fn for_request(reg: &Reg, heard: &Heard, space: Option<&str>) -> bool {
+    if reg.tag.from.is_some() || reg.tag.relay {
+        return false;
+    }
+    if let Some(own) = reg.tag.brain_space.as_deref()
+        && heard.space.as_deref().is_none_or(|h| !same_space(h, own))
+    {
+        return false;
+    }
+    match heard.space.as_deref() {
+        Some(asked) => space.is_none_or(|s| same_space(s, asked)),
+        None => true,
+    }
 }
 
 /// Where a registration went.
@@ -709,6 +757,30 @@ pub struct Note {
     pub speech: String,
 }
 
+/// The lines of one agenda note for one space: the tasks there (`Ledger::news`).
+struct NoteGroup {
+    /// Its tasks' space; None: not known (then it is one session's: the radar finds its space).
+    space: Option<String>,
+    session: String,
+    name: String,
+    lines: Vec<String>,
+}
+
+impl NoteGroup {
+    /// `line` about `t`, with the others of its space (or of its session, when its space isn't known).
+    fn add(groups: &mut Vec<NoteGroup>, t: &Task, line: String) {
+        let found = groups.iter_mut().find(|g| match (&g.space, &t.space) {
+            (Some(a), Some(b)) => same_space(a, b),
+            (None, None) => g.session == t.session,
+            _ => false,
+        });
+        match found {
+            Some(g) => g.lines.push(line),
+            None => groups.push(NoteGroup { space: t.space.clone(), session: t.session.clone(), name: t.name.clone(), lines: vec![line] }),
+        }
+    }
+}
+
 /// A task the reconciler needs facts for.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Probe {
@@ -742,6 +814,9 @@ pub const TURN_JUDGED_MS: u64 = 15 * 60 * 1000;
 pub struct Ledger {
     pub next_id: u64,
     pub agendas: Vec<Agenda>,
+    /// Tasks moved to another agenda (`tower agenda move`): old id → new id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub moved: BTreeMap<String, String>,
 }
 
 static TMP: AtomicU64 = AtomicU64::new(0);
@@ -799,15 +874,30 @@ impl Ledger {
         self.agendas.iter_mut().find(|a| a.id == id)
     }
 
+    /// A task's id now: the one it was moved to, if it was (`moved`).
+    fn now_id(&self, id: &str) -> String {
+        let mut id = id.to_string();
+        for _ in 0..8 {
+            match self.moved.get(&id) {
+                Some(next) => id = next.clone(),
+                None => break,
+            }
+        }
+        id
+    }
+
     pub fn task(&self, id: &str) -> Option<&Task> {
+        let id = self.now_id(id);
         self.agendas.iter().flat_map(|a| a.tasks.iter()).find(|t| t.id == id)
     }
 
     fn task_mut(&mut self, id: &str) -> Option<&mut Task> {
+        let id = self.now_id(id);
         self.agendas.iter_mut().flat_map(|a| a.tasks.iter_mut()).find(|t| t.id == id)
     }
 
     fn agenda_of(&self, task: &str) -> Option<&Agenda> {
+        let task = self.now_id(task);
         self.agendas.iter().find(|a| a.tasks.iter().any(|t| t.id == task))
     }
 
@@ -815,8 +905,8 @@ impl Ledger {
     pub fn resolve(&self, target: &str) -> Result<Target> {
         let t = target.trim().trim_start_matches('#');
         let t = if t.chars().next().is_some_and(|c| c.is_ascii_digit()) { format!("a{t}") } else { t.to_string() };
-        if self.task(&t).is_some() {
-            return Ok(Target::Task(t));
+        if let Some(task) = self.task(&t) {
+            return Ok(Target::Task(task.id.clone()));
         }
         if self.agenda(&t).is_some() {
             return Ok(Target::Agenda(t));
@@ -1120,8 +1210,9 @@ impl Ledger {
     /// 2. `tag.agenda`: that agenda (a plan's task with the same plan id there gets the id);
     /// 3. a session whose task waits (asked something; or claimed, stalled, failed with no
     ///    newer request from the user): more for that task;
-    /// 4. the user's request of the last half hour: its agenda (opened now if it has none);
-    /// 5. the session's open agenda;
+    /// 4. the user's request of the last half hour, when it is work for it
+    ///    (`for_request`: into a space it is about, not a relay): its agenda (opened now if it has none);
+    /// 5. the session's open agenda; else the tower's open agenda already in its session's space;
     /// 6. a new agenda of the tower's own.
     pub fn register(&mut self, reg: &Reg, heard: &Heard, now: u64) -> Option<Registered> {
         if reg.tag.skip {
@@ -1131,7 +1222,11 @@ impl Ledger {
             let agenda = self.agenda_of(&t.id).map(|a| a.id.clone()).unwrap_or_default();
             return Some(Registered { agenda, task: t.id.clone(), how: "same" });
         }
+        // Where it goes: the space it was handed out into, else its session's.
+        let space: Option<String> = reg.tag.space.clone().or_else(|| reg.session_space.clone()).filter(|s| !s.trim().is_empty());
         let recent = (heard.at_ms > 0 && now.saturating_sub(heard.at_ms) < REQUEST_MS && !heard.text.trim().is_empty()).then_some(heard);
+        // Not work for that request: as if none were fresh.
+        let recent = recent.filter(|h| for_request(reg, h, space.as_deref()));
         let named = reg.tag.agenda.as_deref().and_then(|a| self.resolve(a).ok()).and_then(|t| match t {
             Target::Agenda(a) => Some(a),
             Target::Task(t) => self.agenda_of(&t).map(|a| a.id.clone()),
@@ -1158,10 +1253,13 @@ impl Ledger {
         let agenda = match named {
             Some(a) => a,
             None => match recent {
-                Some(h) => self.open(&h.text, "", "user", h.at_ms, &[], now),
+                Some(h) => self.open(&h.text, "", "user", h.at_ms, &h.space.iter().cloned().collect::<Vec<_>>(), now),
                 None => match self.unfinished_handed(&reg.session).and_then(|t| self.agenda_of(&t.id)).map(|a| a.id.clone()) {
                     Some(a) => a,
-                    None => self.open(&reg.text, &title_of(&reg.text), "tower", 0, &[], now),
+                    None => match space.as_deref().and_then(|s| self.open_in_space(s)) {
+                        Some(a) => a,
+                        None => self.open(&reg.text, &title_of(&reg.text), "tower", 0, &space.iter().cloned().collect::<Vec<_>>(), now),
+                    },
                 },
             },
         };
@@ -1179,7 +1277,7 @@ impl Ledger {
             project: reg.tag.project.clone(),
             session: reg.session.clone(),
             name: reg.name.clone(),
-            space: reg.tag.space.clone(),
+            space: space.clone(),
             queue_ids: vec![reg.queue_id],
             after,
             stage: reg.tag.stage.clone(),
@@ -1193,6 +1291,75 @@ impl Ledger {
         });
         a.settle(now);
         Some(Registered { agenda, task: id, how: "new" })
+    }
+
+    /// The newest open agenda of the tower's own about `space` (one of its
+    /// spaces, none of its tasks elsewhere): never a request of the user's
+    /// (what isn't work for one doesn't go into one this way either), nor
+    /// one typed in a terminal.
+    fn open_in_space(&self, space: &str) -> Option<String> {
+        self.agendas
+            .iter()
+            .rev()
+            .filter(|a| a.live() && a.origin == "tower")
+            .find(|a| {
+                let mine = a.spaces.iter().any(|s| same_space(s, space)) || a.tasks.iter().any(|t| t.space.as_deref().is_some_and(|s| same_space(s, space)));
+                let elsewhere = a.tasks.iter().any(|t| t.space.as_deref().is_some_and(|s| !same_space(s, space)));
+                mine && !elsewhere
+            })
+            .map(|a| a.id.clone())
+    }
+
+    /// `tower agenda move <task> <agenda|new>`: the task goes to that agenda
+    /// (a new one of its own with `new`), with the next id there; its old id
+    /// still finds it. An agenda it leaves empty is closed; the one it joins
+    /// opens again if it was done. (Its new id, the agenda it left.)
+    pub fn move_task(&mut self, task: &str, to: &str, now: u64) -> Result<(String, String)> {
+        let id = match self.resolve(task)? {
+            Target::Task(t) => t,
+            Target::Agenda(a) => bail!("{a} is an agenda: move takes a task (`a3.2`)"),
+        };
+        let from = self.agenda_of(&id).map(|a| a.id.clone()).unwrap_or_default();
+        let dest = if to.trim().eq_ignore_ascii_case("new") {
+            let t = self.task(&id).cloned().unwrap_or_default();
+            let spaces: Vec<String> = t.space.iter().cloned().collect();
+            self.open(&t.instruction, &t.title, "tower", 0, &spaces, now)
+        } else {
+            match self.resolve(to)? {
+                Target::Agenda(a) => a,
+                Target::Task(t) => self.agenda_of(&t).map(|a| a.id.clone()).unwrap_or_default(),
+            }
+        };
+        if dest == from {
+            bail!("{id} is in {from} already");
+        }
+        let a = self.agenda_mut(&from).expect("resolved");
+        let pos = a.tasks.iter().position(|t| t.id == id).expect("resolved");
+        let mut t = a.tasks.remove(pos);
+        if a.tasks.is_empty() {
+            a.state = AgendaState::Closed;
+            a.closed_ms = Some(now);
+            a.told_done = true;
+            a.note = format!("its task moved to {dest}");
+        } else {
+            a.settle(now);
+        }
+        let d = self.agenda_mut(&dest).expect("resolved");
+        let n = d.tasks.iter().filter_map(|t| t.id.rsplit('.').next()?.parse::<u64>().ok()).max().unwrap_or(0) + 1;
+        let new_id = format!("{dest}.{n}");
+        t.history.push(Step { at_ms: now, state: t.state, why: format!("moved here from {from} (it was {id})") });
+        t.id = new_id.clone();
+        // What it waited for in its old agenda isn't this one's.
+        t.after.clear();
+        d.tasks.push(t);
+        if matches!(d.state, AgendaState::Done | AgendaState::Closed) && d.tasks.iter().any(|t| !t.state.settled()) {
+            d.state = AgendaState::Open;
+            d.closed_ms = None;
+            d.told_done = false;
+        }
+        d.settle(now);
+        self.moved.insert(id.clone(), new_id.clone());
+        Ok((new_id, from))
     }
 
     /// A new try for a task, on queue id `queue_id` (`text`: what it was told this time).
@@ -1380,8 +1547,8 @@ impl Ledger {
             if !a.live() {
                 continue;
             }
-            let mut lines = vec![];
-            let mut first: Option<&Task> = None;
+            // Each to its own task's space: a note per space (per session, for a task with none known).
+            let mut groups: Vec<NoteGroup> = vec![];
             for t in a.tasks.iter_mut().filter(|t| t.state.trouble()) {
                 let key = format!("{}:{}", t.state.word(), if t.state == TaskState::Blocked { &t.question } else { &t.why });
                 let grace = match t.state {
@@ -1394,50 +1561,50 @@ impl Ledger {
                 }
                 t.told = key;
                 t.told_ms = now;
-                lines.push(trouble_line(t));
+                NoteGroup::add(&mut groups, t, trouble_line(t));
             }
-            for t in a.tasks.iter().filter(|t| t.state.trouble()) {
-                if first.is_none() {
-                    first = Some(t);
+            if !groups.is_empty() {
+                for g in groups {
+                    out.push(Note {
+                        session: g.session,
+                        name: g.name,
+                        space: g.space,
+                        msg: format!(
+                            "[agenda] {} (the user asked: \"{}\"; {}): {} Tell the user in a line or two, unless you are handling it.",
+                            a.id,
+                            clip(&a.words, 160),
+                            a.tally(),
+                            g.lines.join(" ")
+                        ),
+                        speech: format!("Something from your request {} needs a look.", clip(&a.title_or_words(), 60)),
+                    });
                 }
-            }
-            if !lines.is_empty() {
-                let f = first.cloned().unwrap_or_default();
-                out.push(Note {
-                    session: f.session.clone(),
-                    name: f.name.clone(),
-                    space: if lines.len() == 1 { f.space.clone() } else { a.space() },
-                    msg: format!(
-                        "[agenda] {} (the user asked: \"{}\"; {}): {} Tell the user in a line or two, unless you are handling it.",
-                        a.id,
-                        clip(&a.words, 160),
-                        a.tally(),
-                        lines.join(" ")
-                    ),
-                    speech: format!("Something from your request {} needs a look.", clip(&a.title_or_words(), 60)),
-                });
                 a.reminded_ms = now;
                 continue;
             }
-            // Told already and still unfinished: a reminder now and then.
+            // Told already and still unfinished: a reminder now and then (to each task's own space).
             let stuck: Vec<&Task> = a.tasks.iter().filter(|t| t.state.trouble() && !t.told.is_empty()).collect();
             let last = a.reminded_ms.max(stuck.iter().map(|t| t.told_ms).max().unwrap_or(0));
             if !stuck.is_empty() && a.reminded < MAX_REMINDERS && now.saturating_sub(last) >= REMIND_MS {
-                let list: Vec<String> = stuck.iter().map(|t| format!("{} \"{}\" on {} is {}", t.id, t.title, t.who(), t.state)).collect();
-                let s = stuck[0];
-                out.push(Note {
-                    session: s.session.clone(),
-                    name: s.name.clone(),
-                    space: a.space(),
-                    msg: format!(
-                        "[agenda] still unfinished from earlier: {} (the user asked: \"{}\"): {}. `tower agenda show {}` has the details. Remind the user in one line and ask whether to retry or drop it.",
-                        a.id,
-                        clip(&a.words, 160),
-                        list.join("; "),
-                        a.id
-                    ),
-                    speech: format!("Still unfinished: {}.", clip(&a.title_or_words(), 60)),
-                });
+                let mut groups: Vec<NoteGroup> = vec![];
+                for t in &stuck {
+                    NoteGroup::add(&mut groups, t, format!("{} \"{}\" on {} is {}", t.id, t.title, t.who(), t.state));
+                }
+                for g in groups {
+                    out.push(Note {
+                        session: g.session,
+                        name: g.name,
+                        space: g.space,
+                        msg: format!(
+                            "[agenda] still unfinished from earlier: {} (the user asked: \"{}\"): {}. `tower agenda show {}` has the details. Remind the user in one line and ask whether to retry or drop it.",
+                            a.id,
+                            clip(&a.words, 160),
+                            g.lines.join("; "),
+                            a.id
+                        ),
+                        speech: format!("Still unfinished: {}.", clip(&a.title_or_words(), 60)),
+                    });
+                }
                 a.reminded += 1;
                 a.reminded_ms = now;
             }
@@ -1722,6 +1889,16 @@ pub fn act(l: &mut Ledger, c: &Cmd, heard: &Heard, now: u64) -> Result<Acted> {
             })?;
             Ok(Acted { value: json!({ "closed": id, "abandoned": abandoned, "cancelled": cancel }), cancel, changed: true })
         }
+        // `tower agenda move <task> <agenda|new>`.
+        "move" => {
+            let to = c.text.trim();
+            if to.is_empty() {
+                bail!("tower agenda move <task> <agenda|new>");
+            }
+            let (task, from) = l.move_task(&c.target, to, now)?;
+            let agenda = l.agenda_of(&task).map(|a| a.id.clone()).unwrap_or_default();
+            Ok(Acted { value: json!({ "task": task, "was": c.target.trim(), "from": from, "agenda": agenda }), cancel: vec![], changed: true })
+        }
         "abandon" => {
             let (abandoned, cancel) = l.abandon(&c.target, &c.text, now)?;
             Ok(Acted { value: json!({ "abandoned": abandoned, "cancelled": cancel }), cancel, changed: true })
@@ -1777,7 +1954,7 @@ pub fn act(l: &mut Ledger, c: &Cmd, heard: &Heard, now: u64) -> Result<Acted> {
             let (id, spaces, asked) = l.receipt(&c.target, now)?;
             Ok(Acted { value: json!({ "agenda": id, "spaces": spaces, "asked": asked }), cancel: vec![], changed: true })
         }
-        other => bail!("tower agenda {other}: use list, tasks, show, new, close, abandon, verify, fail or requeue"),
+        other => bail!("tower agenda {other}: use list, tasks, show, new, close, abandon, verify, fail, requeue or move"),
     }
 }
 
@@ -2256,13 +2433,13 @@ mod tests {
 
     fn ledger_with(n: usize, now: u64) -> (Ledger, String, Vec<String>) {
         let mut l = Ledger::default();
-        let heard = Heard { text: "fix the login bug in the api and update the docs site".into(), at_ms: now - 1000 };
+        let heard = Heard { text: "fix the login bug in the api and update the docs site".into(), at_ms: now - 1000, space: None };
         let mut ids = vec![];
         let mut agenda = String::new();
         for i in 0..n {
             let r = l
                 .register(
-                    &Reg { queue_id: 10 + i as u64, session: format!("t{}", i + 1), name: format!("s{}", i + 1), text: format!("task number {i}: fix the login bug"), tag: Tag::default() },
+                    &Reg { queue_id: 10 + i as u64, session: format!("t{}", i + 1), name: format!("s{}", i + 1), text: format!("task number {i}: fix the login bug"), tag: Tag::default(), session_space: None },
                     &heard,
                     now,
                 )
@@ -2271,6 +2448,131 @@ mod tests {
             ids.push(r.task);
         }
         (l, agenda, ids)
+    }
+
+    /// A registration from `session` in `space` (as Herdr says), sent as `tag` says.
+    fn reg_in(queue_id: u64, session: &str, space: &str, tag: Tag) -> Reg {
+        Reg { queue_id, session: session.into(), name: session.into(), text: format!("work {queue_id}"), tag, session_space: Some(space.into()) }
+    }
+
+    /// a835 (the user's "make the PR every time", asked in M5 Pro) took in
+    /// 14 tasks across six spaces: other spaces' towers, the main tower's
+    /// relays. Now a task joins a fresh request only when it is work for it:
+    /// into the space it was asked in, not from another space's tower, not
+    /// a relay of a tower note. Anything else gets an agenda of its own, or
+    /// joins the open one already in its session's space. Asked of the main
+    /// tower, the main tower's work still joins it in any space.
+    #[test]
+    fn work_handed_out_while_a_request_is_fresh_joins_it_only_in_its_space_and_from_the_users_words() {
+        let now = 10_000_000;
+        let mut l = Ledger::default();
+        let heard = Heard { text: "make the PR every time".into(), at_ms: now - 1000, space: Some("M5 Pro".into()) };
+        let main = || Tag { brain: Some("tower".into()), ..Default::default() };
+        // The request's own work, in M5 Pro: its agenda.
+        let own = l.register(&reg_in(1, "t12w", "M5 Pro", main()), &heard, now).unwrap();
+        let request = own.agenda.clone();
+        assert_eq!((l.agenda(&request).unwrap().origin.as_str(), l.agenda(&request).unwrap().spaces.clone()), ("user", vec!["M5 Pro".to_string()]));
+        assert_eq!(l.task(&own.task).unwrap().space.as_deref(), Some("M5 Pro"), "the task knows its session's space");
+        // The main tower's, into another space: an agenda of its own.
+        let ci = l.register(&reg_in(2, "t1rw", "dashboard-date-format › bug-help-center", main()), &heard, now + 1).unwrap();
+        assert_ne!(ci.agenda, request);
+        assert_eq!(l.agenda(&ci.agenda).unwrap().origin, "tower");
+        // Another in that space: the open agenda already there.
+        let more = l.register(&reg_in(3, "t1rx", "dashboard-date-format › bug-help-center", main()), &heard, now + 2).unwrap();
+        assert_eq!(more.agenda, ci.agenda);
+        // Another space's own tower: never the request's, whatever its session.
+        let kb = Tag { brain: Some("tower-kb-full-dump".into()), brain_space: Some("kb-full-dump".into()), ..Default::default() };
+        let push = l.register(&reg_in(4, "t1s5", "kb-full-dump", kb.clone()), &heard, now + 3).unwrap();
+        assert!(push.agenda != request && push.agenda != ci.agenda);
+        assert_eq!(l.register(&reg_in(5, "t1s6", "M5 Pro", kb), &heard, now + 4).unwrap().agenda != request, true, "not even into the request's space");
+        // A relay (the main tower on a [session] note), into M5 Pro itself: not the request's either.
+        let relay = l.register(&reg_in(6, "t12x", "M5 Pro", Tag { relay: true, ..main() }), &heard, now + 5).unwrap();
+        assert_ne!(relay.agenda, request);
+        // What makes it a relay: the brain's prompt was a note of the tower's, not the user's words.
+        assert!(is_note("[session] t1rr (browser sharing) says: done") && is_note("[agenda] a835 …") && is_note("[question-text] t5 q1 {}"));
+        assert!(!is_note("[voice] make the PR every time [radar t12w working]") && !is_note("make the PR every time") && !is_note(""));
+        // A message between sessions: not the request's.
+        assert_ne!(l.register(&reg_in(7, "t12y", "M5 Pro", Tag { from: Some("t1rr".into()), ..Default::default() }), &heard, now + 6).unwrap().agenda, request);
+        assert_eq!(l.agenda(&request).unwrap().tasks.len(), 1, "only its own work: {:?}", l.agenda(&request).unwrap().tasks.iter().map(|t| &t.id).collect::<Vec<_>>());
+        // Asked in a space whose own tower took it: that tower's work there joins it.
+        let mut k = Ledger::default();
+        let asked = Heard { text: "release the export".into(), at_ms: now - 1000, space: Some("kb-full-dump".into()) };
+        let tkb = Tag { brain: Some("tower-kb-full-dump".into()), brain_space: Some("kb-full-dump".into()), ..Default::default() };
+        let a = k.register(&reg_in(1, "t1s5", "kb-full-dump", tkb.clone()), &asked, now).unwrap();
+        assert_eq!(k.agenda(&a.agenda).unwrap().origin, "user");
+        assert_eq!(k.register(&reg_in(2, "t1s7", "kb-full-dump", tkb), &asked, now + 1).unwrap().agenda, a.agenda);
+        // Asked of the main tower: its work joins it in any space; a space's tower's doesn't.
+        let mut m = Ledger::default();
+        let of_main = Heard { text: "fix the login bug in the api and update the docs site".into(), at_ms: now - 1000, space: None };
+        let api = m.register(&reg_in(1, "t1", "api", main()), &of_main, now).unwrap();
+        assert_eq!(m.register(&reg_in(2, "t2", "docs", main()), &of_main, now + 1).unwrap().agenda, api.agenda, "one request, two spaces");
+        let docs_tower = Tag { brain: Some("tower-docs".into()), brain_space: Some("docs".into()), ..Default::default() };
+        assert_ne!(m.register(&reg_in(3, "t3", "docs", docs_tower), &of_main, now + 2).unwrap().agenda, api.agenda);
+    }
+
+    /// The [agenda] note for a835.13 (t1rw, in dashboard-date-format ›
+    /// bug-help-center) went to the kb-full-dump tower (t1s5): one note for
+    /// every troubled task, addressed to the first. Now each space's tasks
+    /// have a note of their own, to that space, about its own session.
+    #[test]
+    fn an_agenda_note_goes_to_each_tasks_own_space_not_the_agendas_first() {
+        let now = 10_000_000;
+        let mut l = Ledger::default();
+        let a = l.open("make the PR every time", "", "user", now - 1000, &["M5 Pro".to_string()], now);
+        let tag = || Tag { agenda: Some(a.clone()), ..Default::default() };
+        let kb = l.register(&reg_in(1, "t1s5", "kb-full-dump › bug-project-export", tag()), &Heard::default(), now).unwrap().task;
+        let ci = l.register(&reg_in(2, "t1rw", "dashboard-date-format › bug-help-center", tag()), &Heard::default(), now).unwrap().task;
+        let ci2 = l.register(&reg_in(3, "t1ry", "dashboard-date-format › bug-help-center", tag()), &Heard::default(), now).unwrap().task;
+        for t in [&kb, &ci, &ci2] {
+            l.apply(t, TaskEv::Fail { why: format!("{t} failed") }, now).unwrap();
+        }
+        let notes = l.news(now + GRACE_TROUBLE_MS);
+        let by: Vec<(Option<&str>, &str, bool, bool)> =
+            notes.iter().map(|n| (n.space.as_deref(), n.session.as_str(), n.msg.contains(&format!("{kb} failed")), n.msg.contains(&format!("{ci} failed")))).collect();
+        assert_eq!(by, [(Some("kb-full-dump › bug-project-export"), "t1s5", true, false), (Some("dashboard-date-format › bug-help-center"), "t1rw", false, true)]);
+        assert!(notes[1].msg.contains(&format!("{ci2} failed")), "both tasks of that space in its note");
+        // The reminder later: the same, per space.
+        let later = l.news(now + GRACE_TROUBLE_MS + REMIND_MS + 1);
+        assert_eq!(later.iter().map(|n| n.space.as_deref()).collect::<Vec<_>>(), [Some("kb-full-dump › bug-project-export"), Some("dashboard-date-format › bug-help-center")]);
+        assert!(later[0].msg.contains(&kb) && !later[0].msg.contains(&ci), "{}", later[0].msg);
+    }
+
+    /// `tower agenda move <task> <agenda|new>`: a task that landed in the
+    /// wrong request goes to another (with the next id there; its old id
+    /// still finds it), or to one of its own. The agenda it leaves empty is
+    /// closed; the one it joins, if done, opens again.
+    #[test]
+    fn a_task_moves_to_another_agenda_and_its_old_id_still_finds_it() {
+        let now = 10_000_000;
+        let mut l = Ledger::default();
+        let wrong = l.open("the kb export bug", "", "user", now - 9000, &["kb-full-dump".to_string()], now);
+        let right = l.open("dashboard dates", "", "user", now - 8000, &["dashboard-date-format".to_string()], now);
+        let tag = |a: &str| Tag { agenda: Some(a.to_string()), ..Default::default() };
+        let stays = l.register(&reg_in(1, "t1s5", "kb-full-dump", tag(&wrong)), &Heard::default(), now).unwrap().task;
+        let lost = l.register(&reg_in(2, "t1s1", "dashboard-date-format", tag(&wrong)), &Heard::default(), now).unwrap().task;
+        let there = l.register(&reg_in(3, "t1s2", "dashboard-date-format", tag(&right)), &Heard::default(), now).unwrap().task;
+        l.apply(&there, TaskEv::Verify { how: "checked".into() }, now).unwrap();
+        assert_eq!(l.agenda(&right).unwrap().state, AgendaState::Done);
+        let c = |action: &str, target: &str, text: &str| Cmd { action: action.into(), target: target.into(), text: text.into(), ..Default::default() };
+        let v = act(&mut l, &c("move", &lost, &right), &Heard::default(), now + 1).unwrap().value;
+        let new_id = format!("{right}.2");
+        assert_eq!((v["task"].as_str(), v["from"].as_str(), v["agenda"].as_str()), (Some(new_id.as_str()), Some(wrong.as_str()), Some(right.as_str())), "{v}");
+        assert_eq!(l.agenda(&right).unwrap().state, AgendaState::Open, "it has unfinished work again");
+        assert_eq!(l.agenda(&wrong).unwrap().tasks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), [stays.as_str()]);
+        // Its old id still finds it (`show`, `verify`, a failed card's task).
+        assert_eq!(l.task(&lost).map(|t| t.id.as_str()), Some(new_id.as_str()));
+        assert_eq!(l.resolve(&lost).unwrap(), Target::Task(new_id.clone()));
+        assert!(l.task(&new_id).unwrap().history.last().unwrap().why.contains(&format!("moved here from {wrong}")));
+        // To one of its own; the agenda it leaves empty closes.
+        let v = act(&mut l, &c("move", &stays, "new"), &Heard::default(), now + 2).unwrap().value;
+        let own = v["agenda"].as_str().unwrap().to_string();
+        assert!(own != wrong && own != right);
+        assert_eq!(l.agenda(&own).unwrap().spaces, ["kb-full-dump"]);
+        assert_eq!(l.agenda(&wrong).unwrap().state, AgendaState::Closed);
+        // Not where it is already; not an agenda.
+        assert!(act(&mut l, &c("move", &new_id, &right), &Heard::default(), now + 3).is_err());
+        assert!(act(&mut l, &c("move", &right, &own), &Heard::default(), now + 3).is_err());
+        assert!(act(&mut l, &c("move", &new_id, ""), &Heard::default(), now + 3).is_err());
     }
 
     fn delivered(session: &str, at_ms: u64) -> QueueFact {
@@ -2363,8 +2665,8 @@ mod tests {
     fn registering_groups_by_request_follows_up_and_retries() {
         let now = 5_000_000_000;
         let mut l = Ledger::default();
-        let heard = Heard { text: "do A and B".into(), at_ms: now - 60_000 };
-        let reg = |q: u64, s: &str, text: &str| Reg { queue_id: q, session: s.into(), name: s.into(), text: text.into(), tag: Tag::default() };
+        let heard = Heard { text: "do A and B".into(), at_ms: now - 60_000, space: None };
+        let reg = |q: u64, s: &str, text: &str| Reg { queue_id: q, session: s.into(), name: s.into(), text: text.into(), tag: Tag::default(), session_space: None };
         let a = l.register(&reg(1, "t1", "do A"), &heard, now).unwrap();
         let b = l.register(&reg(2, "t2", "do B"), &heard, now).unwrap();
         assert_eq!((a.agenda.as_str(), b.agenda.as_str(), a.how, b.how), ("a1", "a1", "new", "new"));
@@ -2374,7 +2676,7 @@ mod tests {
         // A blocked task's session gets more: the same task, a follow-up.
         l.apply(&a.task, TaskEv::Delivered { session: "t1".into(), name: "t1".into(), created_ms: None, space: None, at_ms: now, fresh: false }, now).unwrap();
         l.apply(&a.task, TaskEv::Blocked { question: "Which way?".into() }, now + 1).unwrap();
-        let later = Heard { text: "use the second way".into(), at_ms: now + 2 };
+        let later = Heard { text: "use the second way".into(), at_ms: now + 2, space: None };
         let f = l.register(&reg(3, "t1", "use the second way"), &later, now + 3).unwrap();
         assert_eq!((f.task.as_str(), f.how), (a.task.as_str(), "followup"));
         assert_eq!(l.task(&a.task).unwrap().state, TaskState::Queued);
@@ -2577,7 +2879,7 @@ mod tests {
         let mut l = Ledger::default();
         let reg = |l: &mut Ledger, agenda: &str, queue_id: u64| {
             let tag = Tag { agenda: Some(agenda.into()), title: format!("task {queue_id}"), ..Default::default() };
-            l.register(&Reg { queue_id, session: "t12w".into(), name: "m5pro".into(), text: format!("do {queue_id}"), tag }, &Heard::default(), now).unwrap().task
+            l.register(&Reg { queue_id, session: "t12w".into(), name: "m5pro".into(), text: format!("do {queue_id}"), tag, session_space: None }, &Heard::default(), now).unwrap().task
         };
         let ra = l.open("Fix the ready check", "", "user", 0, &["M5 Pro".to_string()], now);
         let rb = l.open("Remap p6's PR 3", "", "user", 0, &["M5 Pro".to_string()], now);
@@ -2808,7 +3110,7 @@ mod tests {
         assert_eq!(a.cancel, vec![11]);
         assert_eq!(l.agenda(&agenda).unwrap().state, AgendaState::Done);
         // A new agenda from the user's latest request, or from words given.
-        let recent = Heard { text: "ship the release".into(), at_ms: now - 1000 };
+        let recent = Heard { text: "ship the release".into(), at_ms: now - 1000, space: None };
         let v = act(&mut l, &cmd("open", ""), &recent, now).unwrap().value;
         assert_eq!(v["words"], "ship the release");
         let again = act(&mut l, &cmd("open", ""), &recent, now).unwrap().value;
@@ -2993,7 +3295,7 @@ mod tests {
         assert_eq!((more.task.as_str(), more.how), (r.task.as_str(), "followup"));
         assert_eq!(l.task(&r.task).unwrap().followups, ["also log the rejected ones"]);
         // The brain hands the same session something: a task of its own, not more of the user's.
-        let reg = Reg { queue_id: 7, session: "t5".into(), name: "api".into(), text: "update the API docs".into(), tag: Tag::default() };
+        let reg = Reg { queue_id: 7, session: "t5".into(), name: "api".into(), text: "update the API docs".into(), tag: Tag::default(), session_space: None };
         let theirs = l.register(&reg, &Heard::default(), now + 70_000).unwrap();
         assert_ne!(theirs.agenda, r.agenda);
         assert_eq!(l.agenda(&theirs.agenda).unwrap().origin, "tower");

@@ -187,6 +187,7 @@ pub fn run(json_text: &str, dry_run: bool) -> Result<()> {
             skip: false,
             from: None,
             stage: stages.get(&t.id).cloned().unwrap_or_default(),
+            ..Default::default()
         };
         let (line, id, task) = match &routes[&t.id] {
             Route::Queue { session } => queue(session, &t.instruction, &after, tag)?,
