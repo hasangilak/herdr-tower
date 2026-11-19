@@ -194,7 +194,10 @@ impl Missions {
             sessions.iter().flat_map(|x| super::running::jobs_of(&x.address).into_iter().map(|j| (x.address.clone(), j.since_ms)).collect::<Vec<_>>()).collect();
         let day = missions::day_start(now);
         let active_of = |space: &str, opened: u64| tracker.of(space, opened, day, now, &|a: &str| working.get(a).copied(), &jobs);
-        let src = Sources { sessions: Some(&sessions), decisions: &decisions, ledger: &ledger, threads: &threads, towers: &towers, now, auto_close_hours, active: Some(&active_of) };
+        // What waits for its sessions in the send queue, and the live plans' stages.
+        let waiting = super::sendq::waiting_counts();
+        let plans = self.shared.with(|s| s.plans_live.clone());
+        let src = Sources { sessions: Some(&sessions), decisions: &decisions, ledger: &ledger, threads: &threads, towers: &towers, now, auto_close_hours, active: Some(&active_of), waiting: Some(&waiting), plans: &plans };
         // The first look of this run, or the first in a while (the Mac slept, Herdr
         // couldn't be asked, the clock moved): what wasn't watched isn't a space left alone.
         let away = asked && missions::was_away(lock(&self.looked).replace(now), now);
