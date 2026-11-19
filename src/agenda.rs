@@ -1866,6 +1866,10 @@ pub struct Cmd {
     pub force: bool,
     pub all: bool,
     pub ok: bool,
+    /// open: its words are a launch's ticket (a finding's write-up, a goal the
+    /// tower wrote), not the user's: no request of theirs, whatever they just said.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub ticket: bool,
 }
 
 /// What a command did: its answer, the queue ids to cancel, whether the ledger changed.
@@ -1901,7 +1905,12 @@ pub fn act(l: &mut Ledger, c: &Cmd, heard: &Heard, now: u64) -> Result<Acted> {
         }
         "open" | "new" => {
             let recent = heard.at_ms > 0 && now.saturating_sub(heard.at_ms) < REQUEST_MS && !heard.text.trim().is_empty();
-            let (words, request_ms, origin) = match (c.text.trim(), recent) {
+            // A launch's ticket is the tower's words: it never takes the fresh request's
+            // place (what joins that request would join it, and its words would count
+            // as the user's for other spaces' goals: f37's write-up and dashboard-date-format),
+            // unless its words are the request itself.
+            let theirs = recent && (!c.ticket || c.text.trim() == heard.text.trim());
+            let (words, request_ms, origin) = match (c.text.trim(), theirs) {
                 ("", true) => (heard.text.clone(), heard.at_ms, "user"),
                 ("", false) => (c.title.clone(), 0, "tower"),
                 (w, true) => (w.to_string(), heard.at_ms, "user"),
@@ -2577,6 +2586,45 @@ mod tests {
         assert!(names_space("ask m5 pro to fix it", "M5 Pro"));
         assert!(!names_space(words, bug) && !names_space("the storefront looks fine", bug) && !names_space("a quick look at the catalogue", bug));
         assert!(!names_space("push to dev", "dev"), "too short to be named by a word");
+    }
+
+    /// f37 was spun out into its own space while the user's last request was
+    /// fresh. Its launch opened agenda a830 with the finding's write-up as the
+    /// request of the user's (their request's time on it): t1s1's MediaRoom
+    /// check in dashboard-date-format joined it, and the write-up widened
+    /// dashboard-date-format's goal. A launch's ticket is no request of the
+    /// user's: nothing joins it as one, and its words widen no other space's goal.
+    #[test]
+    fn a_launch_ticket_is_no_request_of_the_users_and_widens_no_other_goal() {
+        let now = 10_000_000;
+        let bug = "kb-full-dump › bug-project-export";
+        let writeup = "Fix: Project export writes each document's latest revision, not the one live in production\n\nThis bug was found off its space's goal and spun out here by the tower. Found in kb-full-dump while checking the dashboard-date-format release.";
+        let heard = Heard { text: "check the dashboard dates on dev".into(), at_ms: now - 60_000, space: None };
+        let mut l = Ledger::default();
+        let open = |l: &mut Ledger, ticket: bool, text: &str| {
+            let c = Cmd { action: "open".into(), text: text.into(), title: "Fix the project export".into(), spaces: vec![bug.into()], ticket, ..Default::default() };
+            act(l, &c, &heard, now).unwrap().value["id"].as_str().unwrap().to_string()
+        };
+        let a830 = open(&mut l, true, writeup);
+        let ag = l.agenda(&a830).unwrap().clone();
+        assert_eq!((ag.request_ms, ag.spaces.clone()), (0, vec![bug.to_string()]), "not the fresh request");
+        // Its own session's first task joins it (by name); its words are no goal request, not even for the space it opens (the launch gives it its goal).
+        let first = l.register(&reg_in(1, "t1s4", bug, Tag { agenda: Some(a830.clone()), ..Default::default() }), &heard, now).unwrap();
+        assert_eq!(first.agenda, a830);
+        assert_eq!(l.request_in_space(&first, Some(bug)), None);
+        // The main tower's work for the user's fresh request, in dashboard-date-format: its own request's agenda, never a830.
+        let check = l.register(&reg_in(2, "t1s1", "dashboard-date-format", Tag { brain: Some("tower".into()), ..Default::default() }), &heard, now + 1).unwrap();
+        assert_ne!(check.agenda, a830);
+        assert_eq!(l.agenda(&check.agenda).unwrap().words, "check the dashboard dates on dev");
+        // Even a task put into a830 by name, elsewhere, gives the write-up to no goal (it names kb-full-dump and dashboard-date-format).
+        let named = l.register(&reg_in(3, "t1rm", "dashboard-date-format", Tag { agenda: Some(a830.clone()), ..Default::default() }), &heard, now + 2).unwrap();
+        assert_eq!((l.request_in_space(&named, Some("dashboard-date-format")), l.request_in_space(&named, Some("kb-full-dump"))), (None, None));
+        // `tower agenda new "<the user's words>"` (no ticket), and a ticket that is their very words: their request, as before.
+        for (ticket, words) in [(false, "fix the dates"), (true, "check the dashboard dates on dev")] {
+            let mut u = Ledger::default();
+            let id = open(&mut u, ticket, words);
+            assert_eq!(u.agenda(&id).unwrap().request_ms, now - 60_000, "{words}");
+        }
     }
 
     /// The [agenda] note for a835.13 (t1rw, in dashboard-date-format ›
