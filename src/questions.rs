@@ -687,8 +687,34 @@ fn permission_title(hc_msg: &str, screen: &Screen) -> String {
         },
         None if screen.kind == "menu" => screen.question.clone(),
         None if says_more => asked.to_string(),
-        None => command_purpose(&screen.detail).map(|w| format!("Allow: {w}?")).unwrap_or_else(|| "Allow this?".into()),
+        None => command_purpose(&screen.detail).or_else(|| first_said(&screen.detail)).map(|w| format!("Allow: {w}?")).unwrap_or_else(|| "Allow this?".into()),
     }
+}
+
+/// A dialog's first line that says what it is about, when it isn't a Bash
+/// command's ("Delete file", "Fetch https://…", a path): with the line
+/// under it when it is only a header, cut to a line. Its boilerplate
+/// (a tip, "requires approval", the question) is no such line.
+fn first_said(detail: &str) -> Option<String> {
+    let skip = |l: &str| {
+        let low = l.to_lowercase();
+        l.starts_with("Tip:") || low.contains("requires approval") || low.starts_with("do you want") || low.starts_with("❯") || l.chars().all(|c| !c.is_alphanumeric())
+    };
+    let mut lines = detail.lines().map(|l| l.trim().trim_start_matches('│').trim()).filter(|l| !l.is_empty() && !skip(l));
+    let first = lines.next()?.trim_end_matches(['.', ':']);
+    // A header of two or three words ("Delete file", "Web fetch"): what it is about follows.
+    let line = match lines.next() {
+        Some(next) if first.split_whitespace().count() <= 3 && !first.contains('/') => format!("{first} {}", file_or_line(next)),
+        _ => first.to_string(),
+    };
+    let line = line.trim().to_string();
+    (!line.is_empty()).then(|| if line.chars().count() > 90 { format!("{}…", line.chars().take(90).collect::<String>().trim_end()) } else { line })
+}
+
+/// A path as its file's name; any other line as it is.
+fn file_or_line(line: &str) -> String {
+    let l = line.trim().trim_end_matches(['.', ':']);
+    if l.starts_with('/') || l.starts_with("~/") { file_name(l).to_string() } else { l.to_string() }
 }
 
 /// A path's last part ("…/memory/notes.md" is "notes.md").
@@ -3645,6 +3671,11 @@ mod tests {
         // The command's own line when it has no words above it.
         let plain = Screen { kind: "permission".into(), question: "Do you want to proceed?".into(), detail: "Bash command\n│ ls -la".into(), ..Default::default() };
         assert_eq!(build("t1", "s", false, &plain, None, "", "").title, "Allow: ls -la?");
+        // Not a Bash prompt, and no question of its own (17 Nov: three \"Allow this?\" in a minute): its own first line.
+        let delete = Screen { kind: "permission".into(), question: "Do you want to proceed?".into(), detail: "Delete file\n/w/app/tmp/old-fixture.json\nThis command requires approval".into(), ..Default::default() };
+        assert_eq!(build("t1", "s", false, &delete, None, "", "").title, "Allow: Delete file old-fixture.json?");
+        let fetch = Screen { kind: "permission".into(), question: "Do you want to proceed?".into(), detail: "Fetch https://api-dev.example.com/v1/health\nTip: auto mode handles these".into(), ..Default::default() };
+        assert_eq!(build("t1", "s", false, &fetch, None, "", "").title, "Allow: Fetch https://api-dev.example.com/v1/health?");
         // Still a Bash prompt to the rules: its command is read as before.
         let set = bash("touch /tmp/x", "ctx");
         assert_eq!(set.title, "Allow: Do it?");
