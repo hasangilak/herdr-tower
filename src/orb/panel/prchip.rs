@@ -25,7 +25,8 @@
 //! show it.
 
 use gpui::{AnyElement, Context, FontWeight, SharedString, div, prelude::*, px, rgb, rgba};
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::input::Textarea;
+use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
 
 use super::home::{LINE, SOFT, acts_row, card_box, card_title, cstat, cstat_busy, mbtn, meta_row};
 use super::{AMBER, CYAN, Panel, ROSE, glass};
@@ -556,7 +557,98 @@ impl Panel {
             .child(rows)
             .children(said)
             .when(!acts.is_empty(), |el| el.child(buttons))
+            .child(self.pr_words(d, now_ms, cx))
             .into_any_element()
+    }
+
+    /// A merge card's own words for its PRs: what was asked already (sent
+    /// to their sessions), and a field to ask for more ("also add X"). What
+    /// is typed goes to the PR's session as a change to make on it; the
+    /// card stays for the merge.
+    fn pr_words(&mut self, d: &Decision, now_ms: u64, cx: &mut Context<Self>) -> AnyElement {
+        let g = glass();
+        let id = d.id.clone();
+        let many = d.prs.len() > 1;
+        let mut out = v_flex().gap(px(6.0));
+        for n in d.notes.iter().rev().take(3).rev() {
+            let when = super::ago(n.at_ms.min(now_ms.max(n.at_ms)));
+            let to = if n.to.is_empty() { String::new() } else { format!(" · sent to {}", n.to.join(", ")) };
+            let which = if many { format!(" ({})", n.prs.iter().map(|k| format!("#{}", k.rsplit('#').next().unwrap_or(""))).collect::<Vec<_>>().join(", ")) } else { String::new() };
+            out = out.child(
+                div()
+                    .text_size(px(12.0))
+                    .line_height(px(16.0))
+                    .text_color(rgb(CYAN))
+                    .line_clamp(3)
+                    .child(format!("You asked{which}: “{}” · {when}{to}", n.text.split_whitespace().collect::<Vec<_>>().join(" "))),
+            );
+        }
+        match self.asks.other_of_card(&id) {
+            Some(field) => {
+                let (id2, id3) = (id.clone(), id.clone());
+                out = out.child(
+                    h_flex()
+                        .gap_1()
+                        .items_end()
+                        .pl_2()
+                        .pr_1()
+                        .py_1()
+                        .rounded(px(12.0))
+                        .bg(g.pill)
+                        .text_color(g.pill_text)
+                        .child(div().flex_1().min_w_0().child(Textarea::new(&field).appearance(false).bordered(false).small().w_full().text_size(px(14.0)).text_color(g.pill_text)))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("pr-words-add-{id}")))
+                                .size(px(26.0))
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .cursor_pointer()
+                                .text_color(g.pill_muted)
+                                .hover(|s| s.bg(rgb(0xeef1f5)))
+                                .child(Icon::new(IconName::Plus).small())
+                                .on_click(cx.listener(|this, _, window, cx| this.pick_other_files(window, cx))),
+                        ),
+                );
+                let mut row = acts_row();
+                row = row.child(mbtn(format!("pr-words-send-{id}"), "Send to its session", false, None).on_click(cx.listener(move |this, _, _, cx| this.answer_words(&id2, cx))));
+                row = row.child(mbtn(format!("pr-words-cancel-{id}"), "Cancel", false, None).on_click(cx.listener(move |this, _, _, cx| this.close_pr_words(&id3, cx))));
+                out = out.child(row);
+            }
+            None => {
+                let kept = self.other_kept(&id);
+                let hint: &'static str = if many { "What more for its PRs? Name one as #number, or it goes to each. Enter sends it" } else { "What more for this PR? Enter sends it to its session" };
+                out = out.child(
+                    div()
+                        .id(SharedString::from(format!("pr-words-{id}")))
+                        .px(px(12.0))
+                        .py(px(9.0))
+                        .rounded(px(12.0))
+                        .bg(g.pill)
+                        .cursor_pointer()
+                        .text_size(px(13.0))
+                        .line_clamp(2)
+                        .text_color(if kept.is_some() { g.pill_text } else { g.pill_muted })
+                        .child(match kept {
+                            Some(k) => format!("More for the PR: “{k}”"),
+                            None => format!("Want something more in {}? Type it here…", if many { "these PRs" } else { "this PR" }),
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| this.open_other(&id, 0, hint, window, cx))),
+                );
+            }
+        }
+        out.into_any_element()
+    }
+
+    /// Closes a merge card's field, keeping nothing of it.
+    fn close_pr_words(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.asks.close_other();
+        crate::unsent::clear(&crate::unsent::Key::others_of(id));
+        self.asks.forget_typed(id);
+        cx.notify();
     }
 }
 
