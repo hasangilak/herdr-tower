@@ -249,6 +249,8 @@ impl Running {
         let mut names: HashMap<String, String> = HashMap::new();
         let mut browser_uses: BTreeMap<String, Vec<crate::browsers::Use>> = BTreeMap::new();
         for (address, name, pid) in &claudes {
+            // The Artifacts it published since the last look (`crate::links`).
+            let mut published: Vec<String> = vec![];
             names.insert(address.clone(), name.clone());
             // Its transcript, read on: its background tasks and its browser calls.
             let found = crate::questions::transcript_path_of(*pid);
@@ -272,6 +274,7 @@ impl Running {
                         Some((text, at)) => {
                             running::read_tasks(&text, &mut tasks);
                             calls.read(&text);
+                            published = crate::links::published_in(&text);
                             reader.read(&text);
                             at
                         }
@@ -285,6 +288,12 @@ impl Running {
                 }
                 None => (Tasks::default(), crate::browsers::Calls::default()),
             };
+            // Each is of the account the session runs on: the tower opens it in that account's browser.
+            if !published.is_empty()
+                && let Some(account) = crate::accounts::of_pid(*pid)
+            {
+                crate::links::note_all(&published, &account, now);
+            }
             // A browser it uses: its calls (the transcript's, the hook's) and a
             // headless one its shells run (not an MCP server that only waits).
             let shell_cmds: Vec<String> = world.shells(*pid).iter().flat_map(|s| world.subtree(s.pid)).map(|p| p.command.clone()).collect();

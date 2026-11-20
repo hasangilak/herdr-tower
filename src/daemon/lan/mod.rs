@@ -59,7 +59,7 @@ pub const API: u32 = 1;
 /// `impact`: who outside depends on what a PR changes (`impact` on a PR,
 /// `dependents` and `outside` on a predicted one), and a breaking change's warning.
 /// `releases`: each space's release track (`releases` in the state, `GET /v1/releases`).
-pub const FEATURES: &[&str] = &["quiet", "acts", "pairing", "bonjour", "reviews", "scores", "validation", "impact", "releases", "accounts", "jobs", "browsers", "progress", "scoring", "tasks", "resolve"];
+pub const FEATURES: &[&str] = &["quiet", "acts", "pairing", "bonjour", "reviews", "scores", "validation", "impact", "releases", "accounts", "jobs", "browsers", "progress", "scoring", "tasks", "resolve", "open-on-mac"];
 const MAX_CONNECTIONS: usize = 32;
 /// Connections open at once from one address.
 const MAX_PER_IP: usize = 8;
@@ -1512,6 +1512,24 @@ impl Lan {
                 list.reverse();
                 Response::json(200, &json!({ "entries": list }))
             }
+            // Open a link on the Mac (as `tower open`), in the browser of the Claude account it is
+            // of: an Artifact in the account that published it, else `session`'s, else the default's.
+            ("POST", ["links", "open"]) => {
+                let body = req.json().unwrap_or_default();
+                let url = body["url"].as_str().unwrap_or("").trim().to_string();
+                let session = body["session"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+                if session.as_deref().is_some_and(|s| !valid_address(s)) {
+                    return Some(Response::error(400, "bad_address", "an address looks like t3 or vps/t3"));
+                }
+                if crate::links::in_words(&url) != [url.clone()] {
+                    return Some(Response::error(400, "bad_url", "a web link (https://…)"));
+                }
+                let account = crate::links::account_now(&url, session.as_deref());
+                match crate::accounts::open_link(&url, account.as_deref()) {
+                    Ok(browser) => Response::json(200, &json!({ "opened": url, "browser": browser, "account": account })),
+                    Err(e) => Response::error(503, "not_opened", &format!("{e:#}")),
+                }
+            }
             // Bring a session on screen in Herdr (as `tower show <t>`).
             ("POST", ["sessions", address, "show"]) => {
                 if !valid_address(address) {
@@ -2722,6 +2740,14 @@ mod tests {
         assert_eq!(call(addr, &fp, "POST", "/v1/sessions/qnope-no-such-terminal/show", Some(&token), "").unwrap().0, 404);
         assert_eq!(call(addr, &fp, "POST", "/v1/sessions/a%3Bb/show", Some(&token), "").unwrap().0, 400);
         assert_eq!(call(addr, &fp, "POST", "/v1/sessions/t1/show", None, "").unwrap().0, 401);
+        // A link opened on the Mac (tests open none): only a web link, only with the token.
+        let (code, body) = call(addr, &fp, "POST", "/v1/links/open", Some(&token), r#"{"url":"https://claude.ai/artifact/x","session":"t1"}"#).unwrap();
+        assert_eq!(code, 200, "{body}");
+        assert_eq!((body["opened"].as_str(), body["browser"].is_string()), (Some("https://claude.ai/artifact/x"), true), "{body}");
+        for bad in [r#"{"url":"file:///etc/passwd"}"#, r#"{"url":"https://a.b x"}"#, r#"{}"#, r#"{"url":"https://claude.ai/artifact/x","session":"a;b"}"#] {
+            assert_eq!(call(addr, &fp, "POST", "/v1/links/open", Some(&token), bad).unwrap().0, 400, "{bad}");
+        }
+        assert_eq!(call(addr, &fp, "POST", "/v1/links/open", None, r#"{"url":"https://claude.ai/artifact/x"}"#).unwrap().0, 401);
         // Asking how a session goes: the same address rules; the list of working ones.
         assert_eq!(call(addr, &fp, "POST", "/v1/sessions/qnope-no-such-terminal/progress", Some(&token), "{}").unwrap().0, 404);
         assert_eq!(call(addr, &fp, "POST", "/v1/sessions/a%3Bb/progress", Some(&token), "{}").unwrap().0, 400);

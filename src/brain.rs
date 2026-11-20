@@ -131,6 +131,16 @@ fn on_available_account(argv: Vec<String>) -> Vec<String> {
             eprintln!("[brains] the {} account is out of usage: a brain starts on {other}", first.name);
             [cca.to_string_lossy().into_owned(), other].into_iter().chain(argv.into_iter().skip(1)).collect()
         }
+        _ => with_browser(argv, crate::accounts::cca_open_bin().as_deref()),
+    }
+}
+
+/// Plain `claude` (the default account) with the mod's `cca-open` as its
+/// `BROWSER`, as `cca` gives a session: the links the brain opens (a plan
+/// it publishes) open in its account's browser. (Through `cca`, cca sets it.)
+fn with_browser(argv: Vec<String>, opener: Option<&std::path::Path>) -> Vec<String> {
+    match (argv.first().map(String::as_str), opener) {
+        (Some("claude"), Some(o)) => ["env".to_string(), format!("BROWSER={}", o.display())].into_iter().chain(argv).collect(),
         _ => argv,
     }
 }
@@ -551,6 +561,16 @@ pub fn brain_dir_exists() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_brain_on_the_default_account_opens_links_through_cca_open() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let opener = std::path::Path::new("/m/cca-open");
+        assert_eq!(super::with_browser(s(&["claude", "-n", "tower"]), Some(opener)), s(&["env", "BROWSER=/m/cca-open", "claude", "-n", "tower"]));
+        assert_eq!(crate::accounts::program_of(&["env", "BROWSER=/m/cca-open", "claude", "-n", "tower"]), "claude", "still known as claude");
+        assert_eq!(super::with_browser(s(&["claude"]), None), s(&["claude"]), "a mod without cca-open");
+        assert_eq!(super::with_browser(s(&["/bin/cca", "orca"]), Some(opener)), s(&["/bin/cca", "orca"]), "cca sets it itself");
+    }
+
     use super::{trust_answer, trust_keys, trust_reply};
 
     #[test]

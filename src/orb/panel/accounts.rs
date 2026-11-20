@@ -18,6 +18,10 @@
 //!   account's badge. One the failover moved says from which account and
 //!   when (until it moves again); one moving now, or waiting for an
 //!   account, says so.
+//!   Each card also says which browser the account's links open in (its
+//!   sessions' Artifacts and sign-in pages, the links the tower opens of
+//!   it), as a row of the browsers this Mac has and "Mac default": a click
+//!   sets it through the mod (`accounts::set_browser`).
 //! - A space's own view has the same, for its tower and sessions (`seat_line`).
 //!
 //! It follows the state: the daemon writes the board again when usage
@@ -33,6 +37,32 @@ use super::{AMBER, CYAN, Glass, Panel, badge, glass};
 use crate::accounts::Window;
 use crate::orb::nav::Scope;
 use crate::usage::{self, Board, Group, Line, Seat};
+
+/// A browser picked on a card, until the board says it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct BrowserPick {
+    /// The app picked (None: the Mac's default).
+    pub browser: Option<String>,
+    /// The mod is setting it now.
+    pub busy: bool,
+    /// Why it couldn't be set.
+    pub error: Option<String>,
+}
+
+/// The browsers a card offers: those this Mac has (looked for once), the
+/// account's own when it is another, then the Mac's default (None).
+pub(super) fn browser_choices(current: Option<&str>) -> Vec<Option<String>> {
+    static HAVE: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    let have = HAVE.get_or_init(crate::accounts::installed_browsers);
+    let mut out: Vec<Option<String>> = have.iter().map(|b| Some(b.to_string())).collect();
+    if let Some(c) = current
+        && !have.contains(&c)
+    {
+        out.push(Some(c.to_string()));
+    }
+    out.push(None);
+    out
+}
 
 /// From this percent a window is drawn in amber: near its limit.
 const NEAR: f64 = 80.0;
@@ -170,8 +200,9 @@ impl Panel {
     }
 
     /// One account's card: its windows, whether it is out, what runs on it.
-    fn account_card(&self, l: &Line, board: &Board, groups: &[Group], now: u64) -> AnyElement {
+    fn account_card(&self, l: &Line, board: &Board, groups: &[Group], now: u64, cx: &mut Context<Self>) -> AnyElement {
         let g = glass();
+        let browsers = self.browser_row(l, cx);
         let out = l.out_until_ms.is_some();
         let pill = |text: &str| div().flex_none().px(px(8.0)).rounded_full().border_1().border_color(rgba(LINE)).text_size(px(11.0)).text_color(g.faint).child(text.to_string());
         let mut tags: Vec<AnyElement> = vec![];
@@ -241,7 +272,76 @@ impl Panel {
                 el.child(div().text_size(px(12.0)).line_height(px(16.0)).text_color(g.faint).child("No usage recorded for it yet: the accounts mod records it from Claude Code's status line."))
             })
             .child(div().text_size(px(12.5)).text_color(g.muted).child(runs))
+            .child(browsers)
             .into_any_element()
+    }
+
+    /// "Opens links in": a pill per browser (`browser_choices`), the
+    /// account's lit; a click sets it through the mod.
+    fn browser_row(&self, l: &Line, cx: &mut Context<Self>) -> AnyElement {
+        let g = glass();
+        let pick = self.browser_picks.get(&l.name).filter(|p| p.busy || p.error.is_some() || p.browser != l.browser);
+        let current = pick.map(|p| p.browser.clone()).unwrap_or_else(|| l.browser.clone());
+        let pills = browser_choices(current.as_deref()).into_iter().enumerate().map(|(i, b)| {
+            let on = b == current;
+            let word = match &b {
+                Some(app) => crate::accounts::browser_word(Some(app)),
+                None => "Mac default".to_string(),
+            };
+            let (name, b2) = (l.name.clone(), b.clone());
+            div()
+                .id(SharedString::from(format!("acc-browser-{}-{i}", l.name)))
+                .flex_none()
+                .px(px(10.0))
+                .py(px(3.0))
+                .rounded_full()
+                .border_1()
+                .text_size(px(12.0))
+                .when(on, |el| el.bg(rgb(CYAN)).border_color(rgb(CYAN)).text_color(rgb(0x0b1220)).font_weight(FontWeight::SEMIBOLD))
+                .when(!on, |el| el.border_color(rgba(LINE)).text_color(g.muted).cursor_pointer().hover(|s| s.bg(rgba(SOFT))))
+                .child(word)
+                .when(!on, |el| el.on_click(cx.listener(move |this, _, _, cx| this.pick_browser(&name, b2.clone(), cx))))
+        });
+        let note = match pick {
+            Some(p) if p.busy => Some(("setting it…".to_string(), g.faint)),
+            Some(BrowserPick { error: Some(e), .. }) => Some((format!("Couldn't set it: {e}"), gpui::Hsla::from(rgb(AMBER)))),
+            _ => None,
+        };
+        v_flex()
+            .gap(px(5.0))
+            .pt(px(2.0))
+            .child(
+                h_flex()
+                    .gap(px(6.0))
+                    .items_center()
+                    .flex_wrap()
+                    .child(div().flex_none().text_size(px(12.0)).text_color(g.muted).mr(px(2.0)).child("Opens links in"))
+                    .children(pills),
+            )
+            .child(div().text_size(px(11.5)).line_height(px(15.0)).text_color(g.faint).child("Its sessions' Artifacts and sign-in pages, and the links the tower opens of it."))
+            .children(note.map(|(t, c)| div().text_size(px(12.0)).text_color(c).child(t)))
+            .into_any_element()
+    }
+
+    /// Sets the browser `account`'s links open in (None: the Mac's default), through the mod.
+    pub(super) fn pick_browser(&mut self, account: &str, browser: Option<String>, cx: &mut Context<Self>) {
+        self.browser_picks.insert(account.to_string(), BrowserPick { browser: browser.clone(), busy: true, error: None });
+        cx.notify();
+        let name = account.to_string();
+        let task = cx.background_executor().spawn({
+            let (name, b) = (name.clone(), browser.clone());
+            async move { crate::accounts::set_browser(&name, b.as_deref().unwrap_or(crate::accounts::SYSTEM)) }
+        });
+        cx.spawn(async move |this, cx| {
+            let r = task.await;
+            let _ = this.update(cx, |this, cx| {
+                let p = this.browser_picks.entry(name).or_default();
+                p.busy = false;
+                p.error = r.err().map(|e| format!("{e:#}"));
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Who runs where: each group with its seats.
@@ -325,7 +425,10 @@ impl Panel {
         let mut items: Vec<AnyElement> = vec![];
         if let Some(b) = board.as_ref().filter(|b| !b.list.is_empty()) {
             let pane_w = self.full.as_ref().map(|f| f.pane_w).unwrap_or(600.0);
-            let cards: Vec<AnyElement> = b.list.iter().map(|l| self.account_card(l, b, &groups, now)).collect();
+            let mut cards: Vec<AnyElement> = vec![];
+            for l in &b.list {
+                cards.push(self.account_card(l, b, &groups, now, cx));
+            }
             // Two across when there is room.
             let cards = if pane_w >= 640.0 {
                 h_flex().w_full().gap(px(12.0)).items_start().flex_wrap().children(cards.into_iter().map(|c| div().w(px((pane_w - 12.0) / 2.0 - 1.0)).child(c))).into_any_element()

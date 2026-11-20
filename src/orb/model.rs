@@ -1292,6 +1292,9 @@ impl PlanMsg {
 pub struct PlanView {
     #[serde(deserialize_with = "or_default")]
     pub id: String,
+    /// The account its planner runs on (empty: the default one): its Artifact is that account's.
+    #[serde(deserialize_with = "or_default")]
+    pub account: String,
     /// `page` or `whiteboard`.
     #[serde(deserialize_with = "or_default")]
     pub form: String,

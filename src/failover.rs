@@ -587,7 +587,7 @@ mod tests {
     use super::*;
 
     fn acc(name: &str) -> Account {
-        Account { name: name.into(), email: format!("{name}@example.com") }
+        Account { name: name.into(), email: format!("{name}@example.com"), browser: None }
     }
 
     /// Unix ms of a local time today (hour, minute).
@@ -649,7 +649,7 @@ mod tests {
         book.mark_out("default", &Limit { what: "5-hour limit".into(), ..Default::default() }, Some(now + 3_600_000), now);
         assert_eq!(pick(&list, &none, &book, Some("work"), now), Pick::To("side".into()), "the default is out");
         // Not signed in: never a place to go.
-        let unsigned = vec![acc("default"), Account { name: "new".into(), email: "not signed in".into() }];
+        let unsigned = vec![acc("default"), Account { name: "new".into(), email: "not signed in".into(), browser: None }];
         assert_eq!(pick(&unsigned, &none, &book, Some("default"), now), Pick::AllOut { first: Some(("default".into(), now + 3_600_000)) });
         // What the mod recorded counts too.
         let mut usage = BTreeMap::new();

@@ -631,7 +631,7 @@ mod tests {
         let w = World {
             setups: vec![project],
             spaces: vec!["msg-translation".into()],
-            accounts: ["default", "orca"].iter().map(|n| crate::accounts::Account { name: n.to_string(), email: String::new() }).collect(),
+            accounts: ["default", "orca"].iter().map(|n| crate::accounts::Account { name: n.to_string(), email: String::new(), browser: None }).collect(),
             worktrees: true,
             projects: vec![flow.clone(), room.clone(), other],
             ..Default::default()

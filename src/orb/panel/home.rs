@@ -1260,10 +1260,13 @@ impl Panel {
         };
         let back = Panel::back_line(d);
         let strip = self.hold_strip(d, cx);
-        if back.is_none() && strip.is_none() {
+        // Its links (an Artifact a session made), each opened in its account's browser.
+        let words = [d.title.as_str(), d.detail.as_str(), d.why.as_str()].join("\n");
+        let links = super::talk::link_chips(&format!("card-{}", d.id), &words, d.sessions.first().map(|s| s.address.as_str())).map(|c| div().px(px(4.0)).child(c));
+        if back.is_none() && strip.is_none() && links.is_none() {
             return card;
         }
-        v_flex().w_full().gap(px(8.0)).children(back.map(|b| div().px(px(4.0)).child(b))).child(card).children(strip).into_any_element()
+        v_flex().w_full().gap(px(8.0)).children(back.map(|b| div().px(px(4.0)).child(b))).child(card).children(links).children(strip).into_any_element()
     }
 
     /// A decision with no dialog behind it (raised by the tower, a task that

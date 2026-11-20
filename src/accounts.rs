@@ -13,6 +13,13 @@
 //! - `cca <name> [claude args]` runs claude under an account: `tower start`
 //!   launches sessions that way.
 //!
+//! - `B\t<name>\t<browser>`: the browser the account's links open in (an
+//!   app name, or `system` for the Mac's default), set with
+//!   `cca --porcelain-browser <name> <browser>`. cca puts its `cca-open` in
+//!   each session's `BROWSER`, so the links a session opens (an Artifact, a
+//!   sign-in page) open there; the tower opens a link of an account's the
+//!   same way (`open_link`).
+//!
 //! A process keeps its environment for life, so a pid's account is looked up
 //! once and kept (in memory and in `accounts.json` in the state folder, for
 //! the short-lived `tower agents`). The list itself is read fresh each time.
@@ -32,6 +39,9 @@ use crate::config;
 pub struct Account {
     pub name: String,
     pub email: String,
+    /// The browser its links open in (an app name); None: the Mac's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser: Option<String>,
 }
 
 /// One usage window of an account, as the mod last recorded it (its
@@ -77,6 +87,9 @@ pub struct Porcelain {
     pub usage: std::collections::BTreeMap<String, Usage>,
 }
 
+/// What the mod writes for "the Mac's default browser".
+pub const SYSTEM: &str = "system";
+
 pub fn parse(text: &str) -> Porcelain {
     let mut p = Porcelain::default();
     for line in text.lines() {
@@ -85,7 +98,14 @@ pub fn parse(text: &str) -> Porcelain {
             ["C", name, ..] if !name.is_empty() => p.current = Some(name.to_string()),
             ["D", name, ..] if !name.is_empty() => p.selected = Some(name.to_string()),
             ["A", name, rest @ ..] if !name.is_empty() => {
-                p.accounts.push(Account { name: name.to_string(), email: rest.first().unwrap_or(&"").to_string() })
+                p.accounts.push(Account { name: name.to_string(), email: rest.first().unwrap_or(&"").to_string(), browser: None })
+            }
+            // (After its `A` line.)
+            ["B", name, app, ..] if !name.is_empty() => {
+                let app = app.trim();
+                if let Some(a) = p.accounts.iter_mut().rev().find(|a| a.name == *name) {
+                    a.browser = (!app.is_empty() && app != SYSTEM).then(|| app.to_string());
+                }
             }
             // `U <name> <5h used> <5h resets> <7d used> <7d resets>` (resets in Unix seconds, either may be empty).
             ["U", name, rest @ ..] if !name.is_empty() => {
@@ -148,6 +168,122 @@ fn porcelain(cca: &Path, pid: Option<u32>) -> Result<Porcelain> {
 pub fn list() -> Result<Vec<Account>> {
     let Some(cca) = cca_bin() else { return Ok(vec![]) };
     Ok(porcelain(&cca, None)?.accounts)
+}
+
+// ---- the browser an account's links open in ----
+
+/// The browsers the tower offers to pick from, by app name, with the word
+/// people say for each.
+pub const BROWSERS: [(&str, &str); 6] =
+    [("Google Chrome", "Chrome"), ("Brave Browser", "Brave"), ("Safari", "Safari"), ("Firefox", "Firefox"), ("Arc", "Arc"), ("Microsoft Edge", "Edge")];
+
+/// The app a word names: "brave" -> "Brave Browser", "Chrome" -> "Google
+/// Chrome", "system" or "default" -> `SYSTEM`; anything else as written
+/// (an app's own name).
+pub fn browser_app(word: &str) -> String {
+    let w = word.trim();
+    let lw = w.to_lowercase();
+    if matches!(lw.as_str(), "" | "system" | "default" | "system default" | "the mac's default") {
+        return SYSTEM.into();
+    }
+    BROWSERS
+        .iter()
+        .find(|(app, short)| lw == app.to_lowercase() || lw == short.to_lowercase() || lw == app.to_lowercase().replace(' ', "-"))
+        .map(|(app, _)| app.to_string())
+        .unwrap_or_else(|| w.to_string())
+}
+
+/// How a browser is named to people: "Brave", "Chrome"; None: "the Mac's
+/// default browser".
+pub fn browser_word(app: Option<&str>) -> String {
+    match app {
+        None => "the Mac's default browser".into(),
+        Some(a) => BROWSERS.iter().find(|(x, _)| *x == a).map(|(_, w)| w.to_string()).unwrap_or_else(|| a.to_string()),
+    }
+}
+
+/// The browsers of `BROWSERS` this Mac has (in /Applications or
+/// ~/Applications).
+pub fn installed_browsers() -> Vec<&'static str> {
+    let home = dirs::home_dir().unwrap_or_default();
+    BROWSERS
+        .iter()
+        .map(|(app, _)| *app)
+        .filter(|app| [PathBuf::from("/Applications"), home.join("Applications")].iter().any(|d| d.join(format!("{app}.app")).exists()))
+        .collect()
+}
+
+/// Sets the browser `account`'s links open in (`browser`: an app, a word
+/// for one, or "system"), through the mod: what it set.
+pub fn set_browser(account: &str, browser: &str) -> Result<String> {
+    let Some(cca) = cca_bin() else { bail!("the claude-accounts mod (cca) isn't installed: no accounts to set a browser for") };
+    set_browser_with(&cca, account, browser)
+}
+
+fn set_browser_with(cca: &Path, account: &str, browser: &str) -> Result<String> {
+    let app = browser_app(browser);
+    let out = Command::new(cca).args(["--porcelain-browser", account, &app]).stdin(Stdio::null()).output().with_context(|| format!("running {}", cca.display()))?;
+    if !out.status.success() {
+        let e = String::from_utf8_lossy(&out.stderr).trim().trim_start_matches("cca: ").to_string();
+        if out.status.code() == Some(127) || e.contains("unknown option") || e.contains("No account --porcelain-browser") {
+            bail!("this cca has no browser setting: update the claude-accounts mod");
+        }
+        bail!("{e}");
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The mod's `cca-open`: the `BROWSER` a session gets, which opens a link
+/// in the browser of the account it runs on. None: a mod without one.
+pub fn cca_open_bin() -> Option<PathBuf> {
+    let cca = cca_bin()?;
+    let home = dirs::home_dir().unwrap_or_default();
+    [cca.with_file_name("cca-open"), home.join(".local/bin/cca-open"), home.join(".config/herdr-app/mods/claude-accounts/cca-open")].into_iter().find(|p| p.is_file())
+}
+
+/// The browser a link of `account` opens in: that account's; one not known
+/// (None, or one the mod doesn't list) is the default account's, the one a
+/// session runs on when none is asked for. None: the Mac's default.
+pub fn browser_for(account: Option<&str>, list: &[Account]) -> Option<String> {
+    let a = account.and_then(|a| list.iter().find(|x| x.name == a)).or(list.first())?;
+    a.browser.clone()
+}
+
+/// The command that opens `url` in `browser` (None: the Mac's default).
+pub fn open_argv(url: &str, browser: Option<&str>) -> Vec<String> {
+    match browser {
+        Some(b) => vec!["open".into(), "-a".into(), b.into(), url.into()],
+        None => vec!["open".into(), url.into()],
+    }
+}
+
+/// Opens a web link the way a session of `account` would (`browser_for`),
+/// read from the mod now: the browser it went to, in words. Only http(s)
+/// links. Tests never open one.
+pub fn open_link(url: &str, account: Option<&str>) -> Result<String> {
+    let url = url.trim();
+    if !(url.starts_with("https://") || url.starts_with("http://")) || url.chars().any(char::is_whitespace) {
+        bail!("not a web link: {url:?}");
+    }
+    let list = list().unwrap_or_default();
+    let browser = browser_for(account, &list);
+    let argv = open_argv(url, browser.as_deref());
+    if !cfg!(test) {
+        let ok = Command::new(&argv[0]).args(&argv[1..]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+        // A browser that isn't there any more: the Mac's default, as cca-open does.
+        if !ok && browser.is_some() {
+            let plain = open_argv(url, None);
+            let st = Command::new(&plain[0]).args(&plain[1..]).stdin(Stdio::null()).status().context("running open")?;
+            if !st.success() {
+                bail!("open {url} failed");
+            }
+            return Ok(browser_word(None));
+        }
+        if !ok {
+            bail!("open {url} failed");
+        }
+    }
+    Ok(browser_word(browser.as_deref()))
 }
 
 /// The account to use: `want` when the mod knows it, the default when
@@ -413,7 +549,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const OUT: &str = "C\twork\nD\tdefault\nA\tdefault\tme@example.com\nL\tdefault\tMine\nU\tdefault\t12\t\t40\t\nA\twork\tai@example.com\nA\tside\t\nS\t9bea6336-0eba-435c-8cd9-bec697e79160\t/tmp\n";
+    const OUT: &str = "C\twork\nD\tdefault\nA\tdefault\tme@example.com\nL\tdefault\tMine\nB\tdefault\tGoogle Chrome\nU\tdefault\t12\t\t40\t\nA\twork\tai@example.com\nB\twork\tBrave Browser\nA\tside\t\nB\tside\tsystem\nS\t9bea6336-0eba-435c-8cd9-bec697e79160\t/tmp\n";
 
     fn accounts() -> Vec<Account> {
         parse(OUT).accounts
@@ -438,6 +574,56 @@ mod tests {
         assert_eq!(u.spent_until(1_794_599_000_000), Some(1_794_600_000_000), "at 100% until its reset");
         assert_eq!(u.spent_until(1_794_600_000_001), None, "reset already");
         assert_eq!(Usage::default().spent_until(1), None);
+    }
+
+    #[test]
+    fn each_account_has_the_browser_its_links_open_in() {
+        let l = accounts();
+        let browsers: Vec<_> = l.iter().map(|a| a.browser.as_deref()).collect();
+        assert_eq!(browsers, [Some("Google Chrome"), Some("Brave Browser"), None], "system: the Mac's default");
+        // A `B` line before its account's `A` line, or for one not listed: nothing.
+        assert_eq!(parse("B\tx\tSafari\nA\tx\t\n").accounts[0].browser, None);
+        // A mod without the setting: every account on the Mac's default.
+        assert!(parse("A\tdefault\tme@x\nA\torca\tai@x\n").accounts.iter().all(|a| a.browser.is_none()));
+        // A link opens in its account's browser; one of an account not known, in the default one's.
+        assert_eq!(browser_for(Some("work"), &l).as_deref(), Some("Brave Browser"));
+        assert_eq!(browser_for(Some("side"), &l), None);
+        assert_eq!(browser_for(None, &l).as_deref(), Some("Google Chrome"));
+        assert_eq!(browser_for(Some("gone"), &l).as_deref(), Some("Google Chrome"));
+        assert_eq!(browser_for(Some("work"), &[]), None, "no mod: the Mac's default");
+        assert_eq!(open_argv("https://claude.ai/artifact/x", Some("Brave Browser")), ["open", "-a", "Brave Browser", "https://claude.ai/artifact/x"]);
+        assert_eq!(open_argv("https://claude.ai/artifact/x", None), ["open", "https://claude.ai/artifact/x"]);
+        // The words people say for a browser.
+        for (w, app) in [("brave", "Brave Browser"), ("Chrome", "Google Chrome"), ("google-chrome", "Google Chrome"), (" safari ", "Safari"), ("EDGE", "Microsoft Edge"), ("default", "system"), ("System", "system"), ("Vivaldi", "Vivaldi")] {
+            assert_eq!(browser_app(w), app, "{w}");
+        }
+        assert_eq!((browser_word(Some("Brave Browser")), browser_word(Some("Vivaldi")), browser_word(None)), ("Brave".into(), "Vivaldi".into(), "the Mac's default browser".into()));
+        // Only a web link is opened.
+        for bad in ["file:///etc/passwd", "javascript:alert(1)", "https://x y", ""] {
+            assert!(open_link(bad, None).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_browser_is_set_through_the_mod() {
+        let dir = std::env::temp_dir().join(format!("herder-tower-test-browser-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("args");
+        let cca = dir.join("cca");
+        // As the mod answers: the app it set, or exit 2/3 with why.
+        let script = format!(
+            "#!/bin/sh\nprintf '%s|' \"$@\" > '{}'\ncase \"$2\" in nobody) echo 'cca: No account nobody.' >&2; exit 3;; esac\ncase \"$3\" in Nope) echo 'cca: No browser \"Nope\" on this Mac.' >&2; exit 2;; esac\necho \"$3\"\n",
+            log.display()
+        );
+        std::fs::write(&cca, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cca, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(set_browser_with(&cca, "orca", "brave").unwrap(), "Brave Browser");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "--porcelain-browser|orca|Brave Browser|", "the app's name goes to the mod");
+        assert_eq!(set_browser_with(&cca, "orca", "default").unwrap(), "system");
+        assert_eq!(set_browser_with(&cca, "nobody", "chrome").unwrap_err().to_string(), "No account nobody.");
+        assert_eq!(set_browser_with(&cca, "orca", "Nope").unwrap_err().to_string(), "No browser \"Nope\" on this Mac.");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

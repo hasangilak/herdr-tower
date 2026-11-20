@@ -49,6 +49,9 @@ pub struct Line {
     pub out_until_ms: Option<u64>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub out_why: String,
+    /// The browser its links open in (an app name, `accounts::Account::browser`); None: the Mac's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser: Option<String>,
 }
 
 impl Line {
@@ -142,6 +145,7 @@ pub fn board(list: &[Account], usage: &BTreeMap<String, Usage>, book: &Book, mov
                 seven_day: u.and_then(|u| live(&u.seven_day, now_ms)),
                 out_until_ms: out,
                 out_why: if out.is_some() { out_why(book, u, &a.name, now_ms) } else { String::new() },
+                browser: a.browser.clone(),
             }
         })
         .collect();
@@ -342,7 +346,7 @@ mod tests {
     const NOW: u64 = 1_794_600_000_000;
 
     fn accounts() -> Vec<Account> {
-        vec![Account { name: "default".into(), email: "me@example.com".into() }, Account { name: "orca".into(), email: "ai@example.com".into() }]
+        vec![Account { name: "default".into(), email: "me@example.com".into(), browser: None }, Account { name: "orca".into(), email: "ai@example.com".into(), browser: None }]
     }
 
     fn win(used: f64, resets_ms: Option<u64>) -> Option<Window> {
@@ -413,7 +417,10 @@ mod tests {
     fn a_board_goes_through_the_state_and_back() {
         let mut usage = BTreeMap::new();
         usage.insert("orca".to_string(), Usage { five_hour: win(7.0, Some(NOW + 1)), seven_day: None });
-        let b = board(&accounts(), &usage, &Book::default(), &[], NOW);
+        let mut list = accounts();
+        list[1].browser = Some("Brave Browser".into());
+        let b = board(&list, &usage, &Book::default(), &[], NOW);
+        assert_eq!((b.list[0].browser.as_deref(), b.list[1].browser.as_deref()), (None, Some("Brave Browser")), "each account's browser");
         let state = json!({ "accounts": serde_json::to_value(&b).unwrap() });
         assert_eq!(of_state(&state), Some(b));
         assert_eq!(of_state(&json!({ "accounts": null })), None, "a daemon that writes none");

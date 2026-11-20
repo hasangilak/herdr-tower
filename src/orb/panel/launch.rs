@@ -1686,9 +1686,9 @@ impl Panel {
                 .cursor_pointer()
                 .hover(|s| s.underline())
                 .child("Open")
-                .on_click(cx.listener(move |_, _, _, cx| {
-                    let url = url.clone();
-                    cx.background_executor().spawn(async move { std::process::Command::new("open").arg(url).status() }).detach();
+                .on_click(cx.listener({
+                    let (account, planner) = (p.account.clone(), p.address.clone());
+                    move |_, _, _, cx| super::talk::open_web_link(url.clone(), Some(account.clone()), planner.clone(), cx)
                 }));
             let line = h_flex()
                 .flex_wrap()
@@ -1844,10 +1844,10 @@ impl Panel {
         let g = glass();
         let url = p.url.clone();
         let waiting = p.findings.iter().filter(|f| f.revision.is_none()).count();
+        let (account, planner) = (p.account.clone(), p.address.clone());
         let open = url.map(|u| {
             div().id("live-plan-open").flex_none().font_weight(FontWeight::SEMIBOLD).text_color(rgb(CYAN)).cursor_pointer().hover(|s| s.underline()).child("Open").on_click(cx.listener(move |_, _, _, cx| {
-                let u = u.clone();
-                cx.background_executor().spawn(async move { std::process::Command::new("open").arg(u).status() }).detach();
+                super::talk::open_web_link(u.clone(), Some(account.clone()), planner.clone(), cx)
             }))
         });
         let stage_rows = p.stages.iter().enumerate().map(|(i, st)| {
