@@ -768,6 +768,9 @@ impl Panel {
             let cards = self.held_items(&held, cx);
             items.push(bay(&format!("On hold · {}", held.len()), cards));
         }
+        // What waits to go to its sessions (their turn to end): here, not in the conversation.
+        let pending = self.waiting_to_send(Some(name), cx);
+        items.extend(self.waiting_bay(&pending, false, cx));
 
         if !m.requests.is_empty() {
             let rows = m.requests.iter().enumerate().map(|(i, r)| {
