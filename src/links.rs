@@ -187,10 +187,10 @@ pub fn short(url: &str) -> String {
     let rest = url.split("://").nth(1).unwrap_or(url);
     let rest = rest.strip_prefix("www.").unwrap_or(rest);
     let rest = rest.split(['?', '#']).next().unwrap_or(rest).trim_end_matches('/');
-    if rest.chars().count() <= 34 {
+    if rest.chars().count() <= 30 {
         return rest.to_string();
     }
-    format!("{}…", rest.chars().take(33).collect::<String>())
+    format!("{}…", rest.chars().take(29).collect::<String>())
 }
 
 #[cfg(test)]
@@ -251,7 +251,7 @@ mod tests {
         let text = "The plan (https://claude.ai/artifact/x) is ready. See https://github.com/o/r/pull/12, and https://en.wikipedia.org/wiki/Foo_(bar). Also https://claude.ai/artifact/x again; not xhttps://no.pe or https://localhost.";
         assert_eq!(in_words(text), ["https://claude.ai/artifact/x", "https://github.com/o/r/pull/12", "https://en.wikipedia.org/wiki/Foo_(bar)"]);
         assert!(in_words("no links here, only http talk").is_empty());
-        assert_eq!(short("https://claude.ai/artifact/DYqdy4uvNXRTWy1sapVmXW?x=1"), "claude.ai/artifact/DYqdy4uvNXRTWy…");
+        assert_eq!(short("https://claude.ai/artifact/DYqdy4uvNXRTWy1sapVmXW?x=1"), "claude.ai/artifact/DYqdy4uvNX…");
         assert_eq!(short("https://www.github.com/o/r/pull/12/"), "github.com/o/r/pull/12");
     }
 }

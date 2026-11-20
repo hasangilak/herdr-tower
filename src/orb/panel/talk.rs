@@ -377,7 +377,9 @@ pub(super) fn link_chips(key: &str, text: &str, session: Option<&str>) -> Option
         let session = session.map(String::from);
         div()
             .id(SharedString::from(format!("link-{}-{i}", words_id(key, text))))
-            .flex_none()
+            .min_w_0()
+            .max_w_full()
+            .truncate()
             .px(px(9.0))
             .py(px(2.0))
             .rounded_full()
