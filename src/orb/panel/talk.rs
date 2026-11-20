@@ -43,9 +43,18 @@ pub(super) struct Said {
     pub with: Option<With>,
     /// The message it answers, by its `at` (the history's `reply_to`).
     pub reply_to: Option<u64>,
+    /// A message the tower queued: when it went in (0: not yet, or not
+    /// one). It shows there in the timeline; `at` stays what answers name.
+    pub sent_at: u64,
 }
 
 impl Said {
+    /// Where it stands in the timeline: when it went in, for a message
+    /// the tower queued; else when it was said.
+    pub fn shown_at(&self) -> u64 {
+        if self.sent_at > 0 { self.sent_at } else { self.at }
+    }
+
     /// A message that waits for an answer: yours (to the tower, or typed
     /// to a session), or one the tower sent a session.
     pub fn asks(&self) -> bool {
@@ -195,7 +204,7 @@ pub(super) fn session_said(e: &Entry) -> Option<Said> {
     if said.is_empty() || (you && (said.starts_with("<agent-message ") || said.starts_with("<task-notification>"))) {
         return None;
     }
-    Some(Said { you, text: said, at: e.at, request_at: 0, with: Some(With { addr, name, how }), reply_to: e.reply_to })
+    Some(Said { you, text: said, at: e.at, request_at: 0, with: Some(With { addr, name, how }), reply_to: e.reply_to, sent_at: 0 })
 }
 
 /// `s` into `out`: what went in (or didn't) of a message the tower queued is
@@ -208,6 +217,10 @@ fn push_session(out: &mut Vec<Said>, s: Said) {
     {
         if let Some(qw) = q.with.as_mut() {
             qw.how = w.how.clone();
+        }
+        // Gone in: it shows where it went in, once (not where it was queued).
+        if w.how == "sent" {
+            q.sent_at = s.at;
         }
         return;
     }
@@ -236,7 +249,7 @@ pub(super) fn session_thread(entries: &[Entry], addr: &str, max: usize) -> Vec<S
             push_session(&mut out, s);
         }
     }
-    out.sort_by_key(|s| s.at);
+    out.sort_by_key(Said::shown_at);
     let n = out.len();
     out.split_off(n.saturating_sub(max))
 }
@@ -276,7 +289,7 @@ pub(super) fn conversation(entries: &[Entry], space: Option<&str>, max: usize) -
             match mine {
                 Some(text) => {
                     let text = if text.is_empty() && !e.attachments.is_empty() { "(files)".to_string() } else { text };
-                    out.push(Said { you: true, text, at: e.at, request_at: e.at, with: None, reply_to: None });
+                    out.push(Said { you: true, text, at: e.at, request_at: e.at, with: None, reply_to: None, sent_at: 0 });
                     from = Some(of(e));
                     request_at = e.at;
                 }
@@ -289,11 +302,11 @@ pub(super) fn conversation(entries: &[Entry], space: Option<&str>, max: usize) -
             && let Some(f) = &from
             && (of(e) == *f || (f.is_none() && e.kind == "receipt"))
         {
-            out.push(Said { you: false, text: e.text.trim().to_string(), at: e.at, request_at, with: None, reply_to: e.reply_to });
+            out.push(Said { you: false, text: e.text.trim().to_string(), at: e.at, request_at, with: None, reply_to: e.reply_to, sent_at: 0 });
         }
     }
     // In time order (a line can be written a little after a later one).
-    out.sort_by_key(|s| s.at);
+    out.sort_by_key(Said::shown_at);
     let n = out.len();
     out.split_off(n.saturating_sub(max))
 }
@@ -360,7 +373,7 @@ pub(super) fn said_row_with(s: &Said, who: &str, top: Option<AnyElement>, extra:
     });
     let lines: Vec<AnyElement> = top.into_iter().chain(how).collect();
     let how = (!lines.is_empty()).then(|| v_flex().gap(px(3.0)).children(lines));
-    message_row(bar, bg, head, if s.at > 0 { when(s.at) } else { String::new() }, how, s.text.clone(), s.with.as_ref().map(|w| w.addr.as_str()), extra)
+    message_row(bar, bg, head, if s.at > 0 { when(s.shown_at()) } else { String::new() }, how, s.text.clone(), s.with.as_ref().map(|w| w.addr.as_str()), extra)
 }
 
 /// A chip for each web link in `text` (`crate::links::in_words`): a click
@@ -546,9 +559,28 @@ fn message_row(bar: gpui::Rgba, bg: gpui::Rgba, head: String, time: String, how:
         .into_any_element()
 }
 
-/// What waits in the send queue for a session (`name`), as the state's
-/// agent line has it (`waiting`): a row each; notes (introductions) aside.
-pub(super) fn waiting_rows(name: &str, waiting: &[serde_json::Value]) -> Vec<AnyElement> {
+/// A message waiting in the send queue to go to a session: who it goes
+/// to (and from), why it waits, its words. Shown in the side panel
+/// ("Waiting to send"), never in the conversation: once it goes in, the
+/// conversation has it, where it went in.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Pending {
+    pub id: u64,
+    pub addr: String,
+    /// "Tower → eyzflow", "api → eyzflow".
+    pub head: String,
+    /// Why it waits, in words.
+    pub why: String,
+    /// It won't go on its own, or is held: said in amber.
+    pub warn: bool,
+    pub text: String,
+    /// The space it is in (the main tower's list says it).
+    pub space: Option<String>,
+}
+
+/// What waits in the send queue for the session `addr` (`name`), as the
+/// state's agent line has it (`waiting`): notes (introductions) aside.
+pub(super) fn pending_of(addr: &str, name: &str, space: Option<&str>, waiting: &[serde_json::Value]) -> Vec<Pending> {
     waiting
         .iter()
         .filter(|w| w["note"] != true)
@@ -558,20 +590,64 @@ pub(super) fn waiting_rows(name: &str, waiting: &[serde_json::Value]) -> Vec<Any
                 Some(from) => format!("{from} → {name}"),
                 None => format!("Tower → {name}"),
             };
-            let how = if w["checking"] == true {
-                "held: checking it against what you typed there".to_string()
+            let (why, warn) = if w["checking"] == true {
+                ("held: checking it against what you typed there".to_string(), true)
             } else if let Some(why) = w["parked"].as_str() {
-                format!("parked ({why}): it won't go on its own")
+                (format!("parked ({why}): it won't go on its own"), true)
             } else {
-                "waiting: it goes in when its turn ends".to_string()
+                ("goes in when its turn ends".to_string(), false)
             };
-            let warn = w["checking"] == true || w["parked"].is_string();
-            let g = glass();
-            let how = div().text_size(px(12.0)).text_color(if warn { gpui::Hsla::from(faded(AMBER, 0xdd)) } else { g.faint }).child(how);
-            Some(message_row(faded(CYAN, 0x55), rgba(0x00000000), head, String::new(), Some(how), text, None, vec![]).into_any_element())
+            Some(Pending { id: w["id"].as_u64().unwrap_or(0), addr: addr.to_string(), head, why, warn, text, space: space.map(String::from) })
         })
-        .map(|row| div().w_full().rounded(px(14.0)).border_1().border_dashed().border_color(rgba(LINE)).child(row).into_any_element())
         .collect()
+}
+
+/// Words long enough to be folded in a `pending_row` (more than two short lines).
+pub(super) fn folds(text: &str) -> bool {
+    text.chars().count() > 120 || text.trim().lines().count() > 2
+}
+
+/// A compact row of "Waiting to send": who it goes to, why it waits, its
+/// words (two lines, unless `open`). `toggle`: what Show all / Less does.
+pub(super) fn pending_row(p: &Pending, open: bool, with_space: bool, toggle: Option<Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static>>) -> AnyElement {
+    let g = glass();
+    let head = match (&p.space, with_space) {
+        (Some(sp), true) => format!("{} · {sp}", p.head),
+        _ => p.head.clone(),
+    };
+    let key = format!("pending-{}-{}", p.addr, p.id);
+    let text = div().w_full().text_size(px(13.0)).line_height(px(18.0)).text_color(g.muted);
+    let text = if open { text.child(words(&key, p.text.clone())) } else { text.line_clamp(2).text_ellipsis().overflow_hidden().child(p.text.split_whitespace().collect::<Vec<_>>().join(" ")) };
+    h_flex()
+        .w_full()
+        .items_start()
+        .gap(px(9.0))
+        .p(px(10.0))
+        .rounded(px(12.0))
+        .border_1()
+        .border_dashed()
+        .border_color(rgba(LINE))
+        .child(div().w(px(3.0)).flex_none().self_stretch().rounded_full().bg(faded(if p.warn { AMBER } else { CYAN }, 0x77)))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(3.0))
+                .child(div().w_full().truncate().text_size(px(13.0)).font_weight(FontWeight::SEMIBOLD).child(head))
+                .child(div().text_size(px(12.0)).text_color(if p.warn { gpui::Hsla::from(faded(AMBER, 0xdd)) } else { g.faint }).child(p.why.clone()))
+                .child(text)
+                .children(toggle.map(|f| {
+                    div()
+                        .id(SharedString::from(format!("{key}-fold")))
+                        .text_size(px(12.0))
+                        .text_color(g.faint)
+                        .cursor_pointer()
+                        .hover(|st| st.text_color(glass().text))
+                        .child(if open { "Less" } else { "Show all" })
+                        .on_click(f)
+                })),
+        )
+        .into_any_element()
 }
 
 impl Panel {
@@ -580,28 +656,11 @@ impl Panel {
     pub(super) fn chat_column(&mut self, space: Option<&str>, width: f32, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let g = glass();
         let mut said = conversation(&self.entries, space, MAX_SAID);
-        // What still waits in the send queue for the space's sessions: at the
-        // end; its "queued" rows above are left out (the waiting row says it).
-        let mut waits: Vec<AnyElement> = vec![];
-        if let Some(sp) = space {
-            let agents = self.tower.read(cx).s("agents").as_array().cloned().unwrap_or_default();
-            // Its sessions, as its mission has them (Herdr's own list besides).
-            let all = self.decisions(cx);
-            let mut members: Vec<(String, String)> =
-                self.missions(&all, cx).open.iter().filter(|m| m.name == sp).flat_map(|m| m.sessions.iter().map(|s| (s.address.clone(), s.name.clone()))).collect();
-            for (a, n, _) in self.live.iter().filter(|l| l.name == sp).flat_map(|l| l.sessions.iter()) {
-                if !members.iter().any(|(m, _)| m == a) {
-                    members.push((a.clone(), n.clone()));
-                }
-            }
-            let mut texts = vec![];
-            for (addr, name) in members {
-                let Some(a) = agents.iter().find(|a| a["address"] == addr.as_str()) else { continue };
-                let name = a["name"].as_str().filter(|n| !n.is_empty()).unwrap_or(&name).to_string();
-                let w = a["waiting"].as_array().map(Vec::as_slice).unwrap_or_default();
-                texts.extend(waiting_texts(&addr, w));
-                waits.extend(waiting_rows(&name, w));
-            }
+        // What still waits in the send queue for the space's sessions: in
+        // the side panel ("Waiting to send"), not here; its "queued" rows
+        // are left out until it goes in (then it shows where it went in).
+        if space.is_some() {
+            let texts: Vec<(String, String)> = self.waiting_to_send(space, cx).into_iter().map(|p| (p.addr, p.text)).collect();
             said = without_waiting(said, &texts);
         }
         // How it was created (launched from New space): at its top, under its own label, folded as asked.
@@ -610,7 +669,7 @@ impl Panel {
         let folded = self.full.as_ref().is_some_and(|f| f.thread_open.contains(&fold_key));
         // A new message: the column goes to its end.
         if let Some(f) = self.full.as_mut() {
-            let key = (space.map(String::from), said.len() + story.len(), said.last().map(|s| s.at).unwrap_or(0));
+            let key = (space.map(String::from), said.len() + story.len(), said.last().map(Said::shown_at).unwrap_or(0));
             if f.chat_seen.as_ref() != Some(&key) {
                 f.chat_seen = Some(key);
                 f.chat_scroll.scroll_to_bottom();
@@ -671,7 +730,7 @@ impl Panel {
             if !folded {
                 rows.extend(story.iter().map(told_row));
             }
-            if !said.is_empty() || !waits.is_empty() {
+            if !said.is_empty() {
                 rows.push(div().px(px(4.0)).pt(px(6.0)).child(bay_label("Since it was launched").px(px(0.0))).into_any_element());
             }
         }
@@ -710,7 +769,7 @@ impl Panel {
                 // Its question is further back than the column goes: said, not linked.
                 (None, Some(at)) => self.entries.iter().find(|e| e.at == at).map(|q| {
                     let you = q.kind == "request";
-                    let q = Said { you, text: q.text.split_once(": ").filter(|_| !you).map(|(_, m)| m.to_string()).unwrap_or_else(|| q.text.clone()), at, request_at: 0, with: None, reply_to: None };
+                    let q = Said { you, text: q.text.split_once(": ").filter(|_| !you).map(|(_, m)| m.to_string()).unwrap_or_else(|| q.text.clone()), at, request_at: 0, with: None, reply_to: None, sent_at: 0 };
                     div().text_size(px(12.0)).text_color(g.faint).child(asked_line(&q)).into_any_element()
                 }),
                 _ => None,
@@ -770,8 +829,6 @@ impl Panel {
             rows.push(row);
             index.push((s.at, s.text.clone(), if matches!(state, Waits::Answered(_)) { Some(true) } else { pairs[i].asks.map(|_| false) }));
         }
-        index.extend(waits.iter().map(|_| (0, String::new(), None)));
-        rows.extend(waits);
         if let Some(f) = self.full.as_mut() {
             f.chat_rows = index;
         }
@@ -824,6 +881,75 @@ impl Panel {
             .children(status)
             .child(self.input(window, cx))
             .into_any_element()
+    }
+
+    /// What waits in the send queue for the sessions of `space` (None:
+    /// every session's, for the main tower), oldest queued first.
+    pub(super) fn waiting_to_send(&mut self, space: Option<&str>, cx: &mut Context<Self>) -> Vec<Pending> {
+        let agents = self.tower.read(cx).s("agents").as_array().cloned().unwrap_or_default();
+        if !agents.iter().any(|a| a["waiting"].as_array().is_some_and(|w| !w.is_empty())) {
+            return vec![];
+        }
+        // The sessions, with their space: as the missions have them (Herdr's own list besides).
+        let all = self.decisions(cx);
+        let mut members: Vec<(String, String, String)> =
+            self.missions(&all, cx).open.iter().flat_map(|m| m.sessions.iter().map(|s| (s.address.clone(), s.name.clone(), m.name.clone()))).collect();
+        for l in &self.live {
+            for (a, n, _) in &l.sessions {
+                if !members.iter().any(|(m, _, _)| m == a) {
+                    members.push((a.clone(), n.clone(), l.name.clone()));
+                }
+            }
+        }
+        let mut out = vec![];
+        for a in &agents {
+            let Some(addr) = a["address"].as_str() else { continue };
+            let w = a["waiting"].as_array().map(Vec::as_slice).unwrap_or_default();
+            if w.is_empty() {
+                continue;
+            }
+            let member = members.iter().find(|(m, _, _)| m == addr);
+            let in_space = member.map(|(_, _, sp)| sp.as_str());
+            if space.is_some() && in_space != space {
+                continue;
+            }
+            let name = a["name"].as_str().filter(|n| !n.is_empty()).or(member.map(|(_, n, _)| n.as_str())).unwrap_or(addr).to_string();
+            out.extend(pending_of(addr, &name, in_space, w));
+        }
+        out.sort_by_key(|p| p.id);
+        out
+    }
+
+    /// "Waiting to send" of the side panel: what waits to go to a session
+    /// (`list`), each compact, its words unfolded on a click. None: nothing
+    /// waits. `with_space`: each says its space (the main tower's list).
+    pub(super) fn waiting_bay(&mut self, list: &[Pending], with_space: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if list.is_empty() {
+            return None;
+        }
+        let rows: Vec<AnyElement> = list
+            .iter()
+            .map(|p| {
+                let key = format!("pending-open:{}:{}", p.addr, p.id);
+                let open = self.full.as_ref().is_some_and(|f| f.thread_open.contains(&key));
+                let toggle = folds(&p.text).then(|| {
+                    let me = cx.entity().downgrade();
+                    Box::new(move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut gpui::App| {
+                        let key = key.clone();
+                        let _ = me.update(cx, |this, cx| {
+                            if let Some(f) = this.full.as_mut()
+                                && !f.thread_open.remove(&key)
+                            {
+                                f.thread_open.insert(key);
+                            }
+                            cx.notify();
+                        });
+                    }) as Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static>
+                });
+                pending_row(p, open, with_space, toggle)
+            })
+            .collect();
+        Some(super::window::bay(&format!("Waiting to send · {}", list.len()), vec![v_flex().w_full().gap(px(6.0)).children(rows).into_any_element()]))
     }
 
     /// A click on a question (or its line on an answer) went to row `ix`
@@ -1153,6 +1279,54 @@ mod tests {
         assert_eq!(sb.iter().map(|x| (x.at, x.text.as_str())).collect::<Vec<_>>(), [(8, "what about the sandbox?"), (9, "Sandbox is idle."), (10, "is it done?"), (11, "Done in sandbox.")]);
         // At most `max`, the latest.
         assert_eq!(conversation(&entries, Some("support-translation"), 2).iter().map(|x| x.at).collect::<Vec<_>>(), [6, 7]);
+    }
+
+    /// What waits to be sent is the side panel's ("Waiting to send"), not
+    /// the conversation's: a row each (introductions aside), saying who it
+    /// goes to and why it waits; once it went in, the conversation has it
+    /// once, where it went in, and what answers it still pairs with it.
+    #[test]
+    fn what_waits_to_be_sent_is_listed_aside_and_shows_once_where_it_went_in() {
+        let waiting = vec![
+            serde_json::json!({ "id": 7, "text": "Run the e2e tests." }),
+            serde_json::json!({ "id": 8, "text": "[tower] You are eyzflow", "note": true }),
+            serde_json::json!({ "id": 9, "text": "Answers on stale writes.", "from": "mediaroom" }),
+            serde_json::json!({ "id": 10, "text": "Merge it.", "parked": "gone" }),
+            serde_json::json!({ "id": 11, "text": "  ", "checking": true }),
+            serde_json::json!({ "id": 12, "text": "Deploy it.", "checking": true }),
+        ];
+        let p = pending_of("t7", "eyzflow", Some("support-translation"), &waiting);
+        let rows: Vec<(u64, &str, &str, bool)> = p.iter().map(|p| (p.id, p.head.as_str(), p.why.as_str(), p.warn)).collect();
+        assert_eq!(rows, [
+            (7, "Tower → eyzflow", "goes in when its turn ends", false),
+            (9, "mediaroom → eyzflow", "goes in when its turn ends", false),
+            (10, "Tower → eyzflow", "parked (gone): it won't go on its own", true),
+            (12, "Tower → eyzflow", "held: checking it against what you typed there", true),
+        ]);
+        assert!(p.iter().all(|p| p.addr == "t7" && p.space.as_deref() == Some("support-translation")));
+        assert!(!folds("Run the e2e tests.") && folds(&"word ".repeat(40)) && folds("a\nb\nc"));
+
+        // Queued at 20, gone in at 40, answered at 50; you typed at 30.
+        let mut reply = of("reply", None, None, "t7", "They pass.", 50);
+        reply.reply_to = Some(20);
+        let mut queued = vec![
+            of("queue", Some("queued"), None, "t7", "Queued for eyzflow: Run the e2e tests.", 20),
+            of("request", None, Some("terminal:t7"), "t7", "and the lint?", 30),
+        ];
+        // While it waits: not in the conversation at all.
+        let waits = without_waiting(conversation(&queued, Some("support-translation"), 200), &waiting_texts("t7", &waiting));
+        assert_eq!(waits.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(), ["and the lint?"]);
+        queued.push(of("queue", Some("delivered"), None, "t7", "Delivered to eyzflow: Run the e2e tests.", 40));
+        queued.push(reply);
+        let said = conversation(&queued, Some("support-translation"), 200);
+        assert_eq!(
+            said.iter().map(|x| (x.text.as_str(), x.shown_at())).collect::<Vec<_>>(),
+            [("and the lint?", 30), ("Run the e2e tests.", 40), ("They pass.", 50)],
+            "once, where it went in"
+        );
+        assert_eq!(said[1].with.as_ref().map(|w| w.how.as_str()), Some("sent"));
+        assert_eq!(pairs(&said)[2].asks, Some(1), "its answer still names it");
+        assert_eq!(session_thread(&queued, "t7", 200).iter().map(Said::shown_at).collect::<Vec<_>>(), [30, 40, 50]);
     }
 }
 

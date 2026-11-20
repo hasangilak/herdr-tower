@@ -1216,7 +1216,10 @@ impl Panel {
         let muted = missions.muted();
         let held: Vec<Decision> = self.held_decisions(cx).into_iter().filter(|d| !d.muted && !muted.iter().any(|m| d.in_space(m))).collect();
         let held = self.held_bay(&held, cx);
-        let queue_col = v_flex().gap(px(10.0)).child(bay_label("Your queue · most waiting work first")).children(cards).children(held);
+        // What waits to go to a session, any space's: beside the queue, not in the conversation.
+        let pending = self.waiting_to_send(None, cx);
+        let waiting = self.waiting_bay(&pending, true, cx).map(|b| div().pt(px(12.0)).child(b));
+        let queue_col = v_flex().gap(px(10.0)).child(bay_label("Your queue · most waiting work first")).children(cards).children(held).children(waiting);
         let missions_col = v_flex().min_w_0().gap(px(8.0)).child(bay_label("Missions")).child(v_flex().gap(px(2.0)).children(rows));
         // Side by side when both have room; else the missions under the queue, each the pane's width.
         let cols = if pane_w >= QUEUE_W + 22.0 + 300.0 {
