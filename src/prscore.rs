@@ -571,6 +571,22 @@ fn path_words(path: &str) -> Vec<String> {
 }
 
 /// What kind of file a path is, when a person must look at a change to it.
+/// A test file, by its name or its folder: `x.spec.ts`, `x.test.tsx`,
+/// `x_test.go`, `test_x.py`, `x_spec.rb`, `XTest.java`, or anything under
+/// `tests/`, `test/`, `__tests__/`, `spec/`, `e2e/`. `p`: lowercased.
+pub fn is_test_file(p: &str) -> bool {
+    let name = p.rsplit('/').next().unwrap_or(p);
+    let stem = name.split('.').next().unwrap_or(name);
+    let dirs: Vec<&str> = p.split('/').collect();
+    dirs[..dirs.len().saturating_sub(1)].iter().any(|d| matches!(*d, "test" | "tests" | "__tests__" | "spec" | "specs" | "e2e" | "__mocks__"))
+        || name.split('.').skip(1).any(|part| matches!(part, "spec" | "test" | "e2e-spec" | "cy"))
+        || stem.ends_with("_test")
+        || stem.ends_with("_spec")
+        || stem.starts_with("test_")
+        || (stem.ends_with("test") && name.ends_with(".java"))
+        || (stem.ends_with("tests") && name.ends_with(".kt"))
+}
+
 pub fn file_kind(path: &str) -> Option<&'static str> {
     let p = path.trim().trim_start_matches("./").to_lowercase();
     if p.is_empty() {
@@ -582,6 +598,15 @@ pub fn file_kind(path: &str) -> Option<&'static str> {
     let words = path_words(path);
     let word = |w: &[&str]| words.iter().any(|x| w.contains(&x.as_str()));
     let ends = |e: &[&str]| e.iter().any(|x| name.ends_with(x));
+    // A test (`additive-migrations.spec.ts`, `tests/seed.sql`) changes
+    // nothing that runs: never a migration, an API, auth or money by its
+    // name. Only a real key or env file is still secrets wherever it is.
+    if is_test_file(&p) {
+        let key_file = (name.starts_with(".env") && !["example", "sample", "template", "dist"].iter().any(|x| name.contains(x)))
+            || ends(&[".pem", ".key", ".p12", ".pfx", ".jks", ".keystore"])
+            || name.starts_with("id_rsa");
+        return key_file.then_some("secrets");
+    }
     // A database migration, or the schema it changes.
     if dir(&["migrations", "migration", "migrate", "alembic", "flyway", "liquibase"])
         || ends(&[".sql"])
@@ -1204,9 +1229,28 @@ pub(crate) mod tests {
             ("package-lock.json", None),
             ("src/components/Cart.tsx", None),
             ("README.md", None),
+            // A test of a migration, or under a database folder, is a test (20 Nov: #1621).
+            ("src/core/database/additive-migrations.spec.ts", None),
+            ("db/migrations/__tests__/0042.test.ts", None),
+            ("src/db/migration_test.go", None),
+            ("tests/fixtures/seed.sql", None),
+            ("app/src/test/java/MigrationTest.java", None),
+            ("src/auth/session.test.ts", None),
+            ("src/billing/invoice.spec.ts", None),
+            ("tests/fixtures/server.pem", Some("secrets")),
+            ("spec/.env.production", Some("secrets")),
+            // What runs is still what it is.
+            ("src/core/database/additive-migrations.ts", Some("migration")),
+            ("src/core/database/migrations/0278_rename.sql", Some("migration")),
+            ("src/testing/auth.ts", Some("auth")),
         ] {
             assert_eq!(kind(p), k, "{p}");
         }
+        assert!(is_test_file("src/a.spec.ts") && is_test_file("pkg/x_test.go") && is_test_file("tests/test_orders.py") && is_test_file("e2e/login.cy.ts"));
+        assert!(!is_test_file("src/latest.ts") && !is_test_file("src/contest/entry.ts") && !is_test_file("src/specials.ts"));
+        // A PR whose only "migration" is its test needs no review for it.
+        let s = score(&ev("Slack", "", &["src/core/viewer-support/slack.ts", "src/core/database/additive-migrations.spec.ts"]));
+        assert!(!s.flags.iter().any(|f| f == "migration"), "{:?}", s.reasons);
         let s = score(&ev("UI", "", &["src/a.tsx", "db/migrations/1.sql", "db/migrations/2.sql", ".github/workflows/ci.yml"]));
         assert_eq!(s.reasons, ["a database migration (db/migrations/1.sql and 1 more)", "infrastructure (.github/workflows/ci.yml)"]);
     }

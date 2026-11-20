@@ -2956,6 +2956,31 @@ mod tests {
         assert_eq!(back.find(&id).unwrap().detail, "kubectl rollout restart deploy/tickets");
     }
 
+    /// A merge card is built again from its PR each time the PRs are read:
+    /// its CI fixed, the same card (the phone reads it) offers the merge
+    /// with no "Merge anyway"; failing once more, it asks for that again.
+    #[test]
+    fn a_merge_cards_options_follow_its_prs_checks() {
+        let mut b = Book::default();
+        let mut failing = pr(1621, "dev", "t1t0", "support", "failing");
+        failing.checks.failing = vec!["Unit tests and migrations".into()];
+        let id = b.sync_merges(std::slice::from_ref(&failing), MIN).fresh[0].clone();
+        let v = b.find(&id).unwrap().view(false);
+        assert!(v["prs"][0]["merge"]["needs_override"].as_str().is_some_and(|w| w.contains("Unit tests and migrations")), "{v}");
+        assert_eq!((v["title"].as_str(), v["options"][0]["pick"].as_bool()), (Some("Not ready to merge: PR #1621 into dev (o/app)"), Some(false)));
+        let mut fixed = pr(1621, "dev", "t1t0", "support", "passing");
+        fixed.head_sha = "d8dcb591".into();
+        let ch = b.sync_merges(&[fixed], 2 * MIN);
+        assert!(ch.fresh.is_empty(), "the same card");
+        let v = b.find(&id).unwrap().view(false);
+        assert!(v["prs"][0]["merge"]["needs_override"].is_null(), "{v}");
+        assert_eq!(v["prs"][0]["checks"], "pass");
+        assert_eq!((v["title"].as_str(), v["options"][0]["label"].as_str(), v["options"][0]["pick"].as_bool()), (Some("Merge PR #1621 into dev (o/app)"), Some("Merge PR #1621 into dev"), Some(true)));
+        b.sync_merges(&[failing], 3 * MIN);
+        let v = b.find(&id).unwrap().view(false);
+        assert!(v["prs"][0]["merge"]["needs_override"].is_string() && v["options"][0]["pick"] == false, "{v}");
+    }
+
     #[test]
     fn the_same_dialog_read_again_keeps_its_decision() {
         let mut old = waits("t1", "web", "Shop", "Please review the plan.");

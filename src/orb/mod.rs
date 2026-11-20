@@ -162,6 +162,7 @@ impl Tower {
             starting: None,
         };
         t.read();
+        t.acts.step_from_start();
         t
     }
 
@@ -177,7 +178,9 @@ impl Tower {
         self.work = std::fs::read_to_string(self.file.with_file_name("work.json")).ok().and_then(|t| serde_json::from_str(&t).ok());
         if let Some(dir) = self.file.parent() {
             self.spaces = crate::spaces::load_from(dir);
-            self.prs = crate::prs::load_from(dir);
+            let was = std::mem::replace(&mut self.prs, crate::prs::load_from(dir));
+            // A merge card's step on a PR that changed is over: its buttons follow the PR.
+            self.acts.prs_changed(&was, &self.prs);
             (self.follows, self.mutes) = (self.spaces.follow.iter().cloned().collect(), self.spaces.mute.iter().cloned().collect());
         }
         self.check_alive();

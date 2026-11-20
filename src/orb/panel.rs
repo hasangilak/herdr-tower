@@ -154,6 +154,28 @@ impl Acts {
     pub fn held_here(&self, id: &str) -> bool {
         self.held.contains(id)
     }
+
+    /// `HERDER_TOWER_ORB_MERGE_STEP=<pr key>:override|confirm`: the window
+    /// starts with that PR's merge step taken (as "Checks fail: continue…"
+    /// or the card's Merge would), for looking at a card in that step, and
+    /// at what it does when the PR changes, without the pointer.
+    pub fn step_from_start(&mut self) {
+        let Ok(v) = std::env::var("HERDER_TOWER_ORB_MERGE_STEP") else { return };
+        let Some((key, step)) = v.rsplit_once(':') else { return };
+        let step = match step {
+            "override" => prchip::Step::Override,
+            "confirm" => prchip::Step::Confirm,
+            _ => return,
+        };
+        eprintln!("[orb] HERDER_TOWER_ORB_MERGE_STEP: {key} starts at {step:?}");
+        self.steps.insert(key.to_string(), step);
+    }
+
+    /// `prs.json` was read again (it had `was`, it has `now`): a merge
+    /// card's step on a PR that changed is over (`prchip::keep_step`).
+    pub fn prs_changed(&mut self, was: &std::collections::BTreeMap<String, crate::prs::Pr>, now: &std::collections::BTreeMap<String, crate::prs::Pr>) {
+        self.steps.retain(|k, step| prchip::keep_step(step, was.get(k), now.get(k)));
+    }
 }
 
 pub struct Panel {
