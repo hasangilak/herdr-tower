@@ -318,7 +318,7 @@ pub(super) fn told_row(t: &Told) -> AnyElement {
         "planner" => (faded(CYAN, 0xa0), rgba(SOFT), "The planner"),
         _ => (rgb(CYAN).into(), rgba(SOFT), "The tower"),
     };
-    message_row(bar, bg, head.to_string(), if t.at > 0 { when(t.at) } else { String::new() }, None, t.text.clone(), vec![])
+    message_row(bar, bg, head.to_string(), if t.at > 0 { when(t.at) } else { String::new() }, None, t.text.clone(), None, vec![])
 }
 
 /// "7:50 PM" today, else the day and the time.
@@ -360,7 +360,52 @@ pub(super) fn said_row_with(s: &Said, who: &str, top: Option<AnyElement>, extra:
     });
     let lines: Vec<AnyElement> = top.into_iter().chain(how).collect();
     let how = (!lines.is_empty()).then(|| v_flex().gap(px(3.0)).children(lines));
-    message_row(bar, bg, head, if s.at > 0 { when(s.at) } else { String::new() }, how, s.text.clone(), extra)
+    message_row(bar, bg, head, if s.at > 0 { when(s.at) } else { String::new() }, how, s.text.clone(), s.with.as_ref().map(|w| w.addr.as_str()), extra)
+}
+
+/// A chip for each web link in `text` (`crate::links::in_words`): a click
+/// opens it on this Mac in the browser of the Claude account it is of
+/// (`open_web_link`), an Artifact in the account that published it. None:
+/// no links. `session`: the session the words came with.
+pub(super) fn link_chips(key: &str, text: &str, session: Option<&str>) -> Option<AnyElement> {
+    let links = crate::links::in_words(text);
+    if links.is_empty() {
+        return None;
+    }
+    let chips = links.into_iter().take(6).enumerate().map(|(i, url)| {
+        let shown = crate::links::short(&url);
+        let session = session.map(String::from);
+        div()
+            .id(SharedString::from(format!("link-{}-{i}", words_id(key, text))))
+            .flex_none()
+            .px(px(9.0))
+            .py(px(2.0))
+            .rounded_full()
+            .border_1()
+            .border_color(rgba(LINE))
+            .text_size(px(12.0))
+            .text_color(rgb(CYAN))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgba(SOFT)))
+            .child(format!("↗ {shown}"))
+            .on_click(move |_, _, cx| open_web_link(url.clone(), None, session.clone(), cx))
+    });
+    Some(h_flex().w_full().flex_wrap().gap(px(6.0)).children(chips).into_any_element())
+}
+
+/// Opens a web link on this Mac, off the UI thread, in the browser of the
+/// account it is of: `account` when given, else the one that published it
+/// or `session`'s (`crate::links::account_now`), else the default one's.
+pub(super) fn open_web_link(url: String, account: Option<String>, session: Option<String>, cx: &mut gpui::App) {
+    cx.background_executor()
+        .spawn(async move {
+            let account = account.filter(|a| !a.trim().is_empty()).or_else(|| crate::links::account_now(&url, session.as_deref()));
+            match crate::accounts::open_link(&url, account.as_deref()) {
+                Ok(b) => eprintln!("[orb] opened {} in {b} ({})", crate::links::short(&url), account.as_deref().unwrap_or("account not known")),
+                Err(e) => eprintln!("[orb] couldn't open {}: {e:#}", crate::links::short(&url)),
+            }
+        })
+        .detach();
 }
 
 /// Words that can be selected and copied, as in any Mac app: a drag selects
@@ -467,9 +512,10 @@ pub(super) fn words_id(key: &str, text: &str) -> String {
 }
 
 /// A row: a colored bar, its head (and the time), a line on how it went, the words.
-fn message_row(bar: gpui::Rgba, bg: gpui::Rgba, head: String, time: String, how: Option<gpui::Div>, text: String, extra: Vec<AnyElement>) -> AnyElement {
+fn message_row(bar: gpui::Rgba, bg: gpui::Rgba, head: String, time: String, how: Option<gpui::Div>, text: String, session: Option<&str>, extra: Vec<AnyElement>) -> AnyElement {
     let g = glass();
     let key = format!("{head}|{time}");
+    let chips = link_chips(&key, &text, session);
     h_flex()
         .w_full()
         .items_start()
@@ -492,6 +538,7 @@ fn message_row(bar: gpui::Rgba, bg: gpui::Rgba, head: String, time: String, how:
                 )
                 .children(how)
                 .child(div().w_full().text_size(px(13.5)).line_height(px(20.0)).text_color(g.text).child(words(&key, text)))
+                .children(chips)
                 .children(extra),
         )
         .into_any_element()
@@ -519,7 +566,7 @@ pub(super) fn waiting_rows(name: &str, waiting: &[serde_json::Value]) -> Vec<Any
             let warn = w["checking"] == true || w["parked"].is_string();
             let g = glass();
             let how = div().text_size(px(12.0)).text_color(if warn { gpui::Hsla::from(faded(AMBER, 0xdd)) } else { g.faint }).child(how);
-            Some(message_row(faded(CYAN, 0x55), rgba(0x00000000), head, String::new(), Some(how), text, vec![]).into_any_element())
+            Some(message_row(faded(CYAN, 0x55), rgba(0x00000000), head, String::new(), Some(how), text, None, vec![]).into_any_element())
         })
         .map(|row| div().w_full().rounded(px(14.0)).border_1().border_dashed().border_color(rgba(LINE)).child(row).into_any_element())
         .collect()
@@ -1128,8 +1175,8 @@ mod selection_tests {
                 .size_full()
                 .p(px(10.0))
                 .gap(px(10.0))
-                .child(message_row(rgb(CYAN).into(), rgba(SOFT), "The tower".into(), "7:50 PM".into(), None, "The radar no longer calls the training stuck.".into(), vec![]))
-                .child(message_row(rgb(AMBER).into(), rgba(0xffffff24), "You".into(), "7:51 PM".into(), None, "Thanks, merge it into main.".into(), vec![]))
+                .child(message_row(rgb(CYAN).into(), rgba(SOFT), "The tower".into(), "7:50 PM".into(), None, "The radar no longer calls the training stuck.".into(), None, vec![]))
+                .child(message_row(rgb(AMBER).into(), rgba(0xffffff24), "You".into(), "7:51 PM".into(), None, "Thanks, merge it into main.".into(), None, vec![]))
                 .child(div().w(px(400.0)).child(gpui_kit::component::input::Textarea::new(&self.field)))
         }
     }

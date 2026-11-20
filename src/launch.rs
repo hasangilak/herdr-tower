@@ -1000,7 +1000,7 @@ mod tests {
     }
 
     fn accounts(names: &[&str]) -> Vec<Account> {
-        names.iter().map(|n| Account { name: n.to_string(), email: format!("{n}@example.invalid") }).collect()
+        names.iter().map(|n| Account { name: n.to_string(), email: format!("{n}@example.invalid"), browser: None }).collect()
     }
 
     #[test]

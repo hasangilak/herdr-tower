@@ -923,7 +923,7 @@ mod tests {
     }
 
     fn acc(name: &str) -> Account {
-        Account { name: name.into(), email: format!("{name}@example.com") }
+        Account { name: name.into(), email: format!("{name}@example.com"), browser: None }
     }
 
     fn session(address: &str, name: &str) -> Value {

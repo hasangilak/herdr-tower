@@ -44,6 +44,7 @@ mod impact;
 mod install;
 mod introduce;
 mod launch;
+mod links;
 mod merges;
 mod missions;
 mod names;
@@ -628,7 +629,12 @@ enum Cmd {
     /// The Claude accounts the claude-accounts mod (`cca`) knows; the first is the default. `--usage`:
     /// each account's 5-hour and 7-day usage (as cca recorded it) and whether the tower found it out of
     /// usage, then every tower and session by space with the account it runs on, and those the failover moved.
+    /// `tower accounts browser [<account> [<browser>]]`: the browser each account's links open in (its
+    /// sessions' Artifacts and sign-in pages, and the links the tower opens of it): brave, chrome, safari,
+    /// firefox, arc, edge, an app's name, or system (the Mac's default).
     Accounts {
+        /// `browser [<account> [<browser>]]`.
+        words: Vec<String>,
         /// Another machine's accounts.
         #[arg(long)]
         on: Option<String>,
@@ -651,6 +657,18 @@ enum Cmd {
         /// pair: print the pairing details as JSON (for the orb).
         #[arg(long)]
         json: bool,
+    },
+    /// Open a web link on this Mac in the browser of the Claude account it is of: an Artifact in the
+    /// account that published it (as the tower noted it), else the account of `--session`, else
+    /// `--account`, else the default account's browser.
+    Open {
+        url: String,
+        /// The session (terminal address) the link came with.
+        #[arg(long)]
+        session: Option<String>,
+        /// The account to open it as.
+        #[arg(long)]
+        account: Option<String>,
     },
     /// Show a visual result in the tower (the panel, the phone): `tower screenshot shot.png --caption "the new login page"`.
     Screenshot {
@@ -1240,6 +1258,17 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Agenda { action, args, all, force, title, space } => agenda_cmd(&action, &args, all, force, title, space),
         Cmd::Introduce { space, dry_run } => introduce_cmd(&space.join(" "), dry_run),
         Cmd::Reopen { action, spaces, dry_run, json } => reopen_cmd(action.as_deref().unwrap_or("list"), &spaces, dry_run, json),
+        Cmd::Open { url, session, account } => {
+            let account = match account {
+                Some(a) => accounts::resolve(Some(&a), &accounts::list()?)?,
+                None => links::account_now(&url, session.as_deref()),
+            };
+            let went = accounts::open_link(&url, account.as_deref())?;
+            println!("Opened in {went}{}.", account.map(|a| format!(" (the {a} account's)")).unwrap_or_default());
+            Ok(())
+        }
+        Cmd::Accounts { words, .. } if words.first().is_some_and(|w| w == "browser") => accounts_browser(&words[1..]),
+        Cmd::Accounts { words, .. } if !words.is_empty() => bail!("tower accounts: no {:?} (only `tower accounts browser [<account> [<browser>]]`)", words[0]),
         Cmd::Accounts { usage: true, json, .. } => accounts_usage(json),
         Cmd::Accounts { on, .. } => list_accounts(on.as_deref()),
         Cmd::JobRunning { action, what, pid, until, minutes, session } => {
@@ -3410,6 +3439,40 @@ fn behavior_cmd(action: &str, arg: &[String], title: Option<String>, category: O
 }
 
 /// `tower accounts`.
+/// `tower accounts browser [<account> [<browser>]]`: each account's browser,
+/// one's, or sets one's (through the mod: `accounts::set_browser`).
+fn accounts_browser(words: &[String]) -> Result<()> {
+    let list = accounts::list()?;
+    if list.is_empty() {
+        bail!("No Claude accounts: the claude-accounts mod (cca) isn't installed.");
+    }
+    let one = |w: &str| -> Result<String> {
+        let w = w.trim();
+        list.iter().find(|a| a.name.eq_ignore_ascii_case(w)).map(|a| a.name.clone()).map(Ok).unwrap_or_else(|| accounts::resolve(Some(w), &list).map(|a| a.unwrap_or_default()))
+    };
+    match words {
+        [] => {
+            for a in &list {
+                println!("{:<12} {}", a.name, accounts::browser_word(a.browser.as_deref()));
+            }
+            let have = accounts::installed_browsers().iter().map(|b| accounts::browser_word(Some(b))).collect::<Vec<_>>().join(", ");
+            println!("\nSet one: tower accounts browser <account> <{}{}system>", have.to_lowercase().replace(", ", "|"), if have.is_empty() { "" } else { "|" });
+        }
+        [name] => {
+            let name = one(name)?;
+            let a = list.iter().find(|a| a.name == name).ok_or_else(|| anyhow::anyhow!("no account {name:?}"))?;
+            println!("{name}: links open in {}", accounts::browser_word(a.browser.as_deref()));
+        }
+        [name, browser @ ..] => {
+            let name = one(name)?;
+            let set = accounts::set_browser(&name, &browser.join(" "))?;
+            let shown = accounts::browser_word((set != accounts::SYSTEM).then_some(set.as_str()));
+            println!("{name}: links open in {shown} now: its sessions' (those started by cca, at once) and the ones the tower opens.");
+        }
+    }
+    Ok(())
+}
+
 fn list_accounts(on: Option<&str>) -> Result<()> {
     let list = match on {
         None => accounts::list()?,
@@ -3423,7 +3486,7 @@ fn list_accounts(on: Option<&str>) -> Result<()> {
             );
         }
         for (i, a) in list.iter().enumerate() {
-            println!("{} {:<12} {}", if i == 0 { "*" } else { " " }, a.name, a.email);
+            println!("{} {:<12} {:<28} links in {}", if i == 0 { "*" } else { " " }, a.name, a.email, accounts::browser_word(a.browser.as_deref()));
         }
     } else {
         print_json(&json!({ "default": list.first().map(|a| &a.name), "accounts": list }));

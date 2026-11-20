@@ -200,6 +200,8 @@ pub struct Panel {
     /// Screenshots in history, newest first (the state's recent list joins them when shown).
     shots: Vec<Shot>,
     thumbs: HashMap<PathBuf, Thumb>,
+    /// A browser picked on an account's card (Accounts), by account, until the board has it.
+    browser_picks: HashMap<String, accounts::BrowserPick>,
     text: Entity<TextareaState>,
     /// The next attachment's number in this message.
     next: usize,
@@ -376,6 +378,7 @@ impl Panel {
             send_after_take: false,
             shots: vec![],
             thumbs: HashMap::new(),
+            browser_picks: HashMap::new(),
             text,
             next: 1,
             sending: false,
