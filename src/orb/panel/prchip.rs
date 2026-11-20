@@ -176,6 +176,16 @@ impl Line {
     }
 }
 
+/// Whether a merge card's `step` on a PR still holds now that `prs.json`
+/// has it as `now` (it was `was`): a merge under way always does; any other
+/// step only while the PR is as it was (`Pr::merge_print`). Else the card
+/// is built again from the PR as it is: its checks passed meanwhile, a fix
+/// came in, its review changed (20 Nov: #1621 kept "Merge anyway" after
+/// its CI was fixed).
+pub(super) fn keep_step(step: &Step, was: Option<&Pr>, now: Option<&Pr>) -> bool {
+    *step == Step::Merging || (now.is_some() && was.map(Pr::merge_print) == now.map(Pr::merge_print))
+}
+
 /// What a merge card's button, or the number key on it, does.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum MergeAct {
@@ -241,7 +251,8 @@ pub(super) fn merge_acts(lines: &[Line], chained: bool, run: Option<&Run>) -> Ve
         return match (&l.step, &l.gate.needs_override) {
             (Step::Merging, _) => vec![],
             (Step::Failed(_), _) => vec![("Try again".into(), true, MergeAct::Ask(k)), cancel(&l.key)],
-            (Step::Override, _) => vec![("Merge anyway: the failure is unrelated".into(), true, MergeAct::Go(k, true)), cancel(&l.key)],
+            // "Merge anyway" only while a check still fails (it may pass since).
+            (Step::Override, Some(_)) => vec![("Merge anyway: the failure is unrelated".into(), true, MergeAct::Go(k, true)), cancel(&l.key)],
             (_, Some(_)) => vec![("Checks fail: continue…".into(), true, MergeAct::Override(k)), cancel(&l.key)],
             (_, None) => vec![(format!("Confirm: merge #{}", l.pr.number), true, MergeAct::Go(k, false)), cancel(&l.key)],
         };
@@ -349,6 +360,18 @@ impl Panel {
             },
         }
         cx.notify();
+    }
+
+    /// Words went from merge card `d` to its PRs' sessions: its steps
+    /// (Confirm, Merge anyway, a failure) are over, not a merge under way;
+    /// the card shows its PRs as they stand until the change lands.
+    pub(super) fn forget_merge_steps(&mut self, d: &Decision, cx: &mut Context<Self>) {
+        let keys: Vec<String> = d.prs.iter().map(|p| p.key()).collect();
+        let card = d.id.clone();
+        self.act(cx, |a| {
+            a.steps.retain(|k, s| *s == Step::Merging || !keys.contains(k));
+            a.chain.remove(&card);
+        });
     }
 
     /// The tower's chain for this card, as the daemon's state has it.
@@ -782,6 +805,43 @@ mod tests {
 
     fn labels(acts: &[(String, bool, MergeAct)]) -> Vec<&str> {
         acts.iter().map(|a| a.0.as_str()).collect()
+    }
+
+    /// A card asked once more because its checks failed ("Merge anyway")
+    /// is built again when the PR changes: its CI was fixed (20 Nov: #1621
+    /// kept "Merge anyway / Cancel" after "checks pass"), and back again
+    /// when it fails once more. A merge under way is never dropped.
+    #[test]
+    fn a_merge_cards_buttons_follow_its_pr_when_its_checks_change() {
+        let failing = line(1621, "dev", "failing", Step::Override);
+        assert_eq!(labels(&merge_acts(std::slice::from_ref(&failing), false, None)), ["Merge anyway: the failure is unrelated", "Cancel"]);
+        // Its session pushed the fix: the PR's checks pass, on a new commit.
+        let mut fixed = line(1621, "dev", "passing", Step::Override);
+        fixed.pr.head_sha = "d8dcb591".into();
+        assert!(!keep_step(&Step::Override, Some(&failing.pr), Some(&fixed.pr)), "the PR changed: the step is over");
+        let mut acts = super::super::Acts::default();
+        acts.steps.insert(failing.key.clone(), Step::Override);
+        let was = std::collections::BTreeMap::from([(failing.key.clone(), failing.pr.clone())]);
+        let now = std::collections::BTreeMap::from([(fixed.key.clone(), fixed.pr.clone())]);
+        acts.prs_changed(&was, &now);
+        let step = acts.steps.get(&fixed.key).cloned().unwrap_or_default();
+        assert_eq!(step, Step::Idle);
+        let rebuilt = Line { step, ..fixed.clone() };
+        assert_eq!(labels(&merge_acts(&[rebuilt], false, None)), ["Merge #1621"], "the normal merge button");
+        // Even a step that stayed: "Merge anyway" only while a check fails.
+        assert_eq!(labels(&merge_acts(&[fixed.clone()], false, None)), ["Confirm: merge #1621", "Cancel"]);
+        // Unchanged: the step holds. A merge under way holds whatever changed.
+        assert!(keep_step(&Step::Confirm, Some(&fixed.pr), Some(&fixed.pr)));
+        assert!(keep_step(&Step::Merging, Some(&failing.pr), Some(&fixed.pr)));
+        // It fails again (a new push): asked as a failing PR again, from the start.
+        let again = line(1621, "dev", "failing", Step::Idle);
+        assert!(!keep_step(&Step::Confirm, Some(&fixed.pr), Some(&again.pr)));
+        assert_eq!(labels(&merge_acts(&[again], false, None)), ["Review #1621: its checks fail"]);
+        // A new review, or a draft: over too.
+        let mut reviewed = fixed.pr.clone();
+        reviewed.review = Some(crate::reviews::Brief { status: "changes".into(), ..Default::default() });
+        assert!(!keep_step(&Step::Confirm, Some(&fixed.pr), Some(&reviewed)));
+        assert!(!keep_step(&Step::Confirm, Some(&fixed.pr), None), "gone from prs.json");
     }
 
     #[test]

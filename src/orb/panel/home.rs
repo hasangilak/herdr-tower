@@ -527,8 +527,10 @@ impl Panel {
         // It went: what was typed for it is not kept.
         crate::unsent::clear(&crate::unsent::Key::others_of(id));
         // A merge card: more for its PRs, to their sessions; the card stays for the merge.
-        if self.decisions(cx).iter().any(|d| d.id == id && d.kind == Kind::Merge) {
+        if let Some(d) = self.decisions(cx).into_iter().find(|d| d.id == id && d.kind == Kind::Merge) {
             self.asks.forget_typed(id);
+            // A change asked for (a fix): what was asked before it on this card is over.
+            self.forget_merge_steps(&d, cx);
             self.send_pr_words(id, history::compose(&text, &kept), cx);
             return;
         }

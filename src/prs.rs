@@ -210,6 +210,15 @@ pub struct Pr {
 }
 
 impl Pr {
+    /// What a merge card's step on it was taken against: its commit, its
+    /// state, draft or not, whether it merges cleanly, its checks (and
+    /// which fail) and its review. Any change and a step taken before it
+    /// (Confirm, Merge anyway, a failure) no longer holds.
+    pub fn merge_print(&self) -> String {
+        let review = self.review.as_ref().map(|r| r.status.as_str()).unwrap_or("");
+        format!("{}|{}|{}|{}|{}|{}|{review}", self.head_sha, self.state, self.draft, self.mergeable, self.checks.state, self.checks.failing.join(","))
+    }
+
     /// `owner/name#123`: its id everywhere (the chat entry's `id` too).
     pub fn key(&self) -> String {
         key(&self.repo, self.number)
