@@ -1118,6 +1118,8 @@ pub fn auto_path(pr: &Pr, on: bool) -> Path {
     }
     match &pr.review {
         None => return yours("no reviewer looked at it"),
+        // Agreed on an older commit: what was pushed since waits for its review.
+        Some(r) if r.outdated(&pr.head_sha) => return Path::Waits("its reviewer, for the commits pushed since it agreed".into()),
         Some(r) if r.status == "agreed" && r.rounds == 0 && r.critical == 0 => {}
         Some(r) if r.status == "reviewing" && r.rounds == 0 => return Path::Waits("its reviewer".into()),
         Some(r) if r.status == "agreed" => return Path::Yours(format!("its reviewer found critical issues first ({} round{})", r.rounds, if r.rounds == 1 { "" } else { "s" })),

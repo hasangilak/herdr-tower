@@ -236,7 +236,9 @@ impl Pr {
     /// fixing (`crate::fixes::with_user`): it comes when it merges cleanly,
     /// or when the fix came back to the user.
     pub fn ready_for_user(&self) -> bool {
-        !self.draft && !self.review.as_ref().is_some_and(|r| matches!(r.status.as_str(), "reviewing" | "changes")) && crate::fixes::with_user(self)
+        !self.draft
+            && !self.review.as_ref().is_some_and(|r| matches!(r.status.as_str(), "reviewing" | "changes") || r.outdated(&self.head_sha))
+            && crate::fixes::with_user(self)
     }
 
     /// As the chat, the panel and the phone show it: the PR and whether
@@ -674,7 +676,7 @@ pub fn gate(pr: &Pr) -> Gate {
         g.warnings.push("GitHub hasn't worked out yet whether it merges cleanly.".into());
     }
     // A review that isn't agreed: said plainly; the merge stays the user's.
-    if let Some(w) = pr.review.as_ref().and_then(crate::reviews::merge_warning) {
+    if let Some(w) = pr.review.as_ref().and_then(|b| crate::reviews::merge_warning_at(b, &pr.head_sha)) {
         g.warnings.push(w);
     }
     // Its score says a person must read it: said before the merge too.
