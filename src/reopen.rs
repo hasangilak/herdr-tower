@@ -170,7 +170,7 @@ pub fn flags_of(argv: &[String]) -> Vec<String> {
     if program != "claude" {
         return vec![];
     }
-    const WITH_VALUE: [&str; 5] = ["--model", "--effort", "--permission-mode", "--add-dir", "--settings"];
+    const WITH_VALUE: [&str; 6] = ["--model", "--effort", "--permission-mode", "--add-dir", "--settings", "--advisor"];
     const ALONE: [&str; 1] = ["--dangerously-skip-permissions"];
     let mut out = vec![];
     let mut i = 1;
@@ -478,7 +478,8 @@ pub fn resume_argv(k: &Kept, cca: Option<&str>, default_account: Option<&str>, t
             if !k.name.trim().is_empty() {
                 a.extend(["-n".into(), k.name.clone()]);
             }
-            a.extend(k.flags.iter().cloned());
+            // Its own advisor, else `[sessions] advisor`.
+            a.extend(crate::accounts::with_advisor(k.flags.clone(), crate::config::advisor().as_deref()));
             a.extend(["--resume".into(), k.session_id.clone()]);
             Some(a)
         }
@@ -843,7 +844,7 @@ mod tests {
         let folders = BTreeMap::from([("zendesk".to_string(), "/w/tw".to_string())]);
         let chosen = [&kept_shell_one, &in_a_tab, &first, &second, &gone];
         let steps = plan(&chosen, &windows, &folders, &get, &exists, Some("/bin/cca"), Some("default"), false);
-        assert_eq!(steps[0].1, Ok(Step::Type { address: "t7h".into(), line: "cd /w/eyzflow && /bin/cca orca -n sandbox-eyzflow --resume s-1".into() }));
+        assert_eq!(steps[0].1, Ok(Step::Type { address: "t7h".into(), line: "cd /w/eyzflow && /bin/cca orca -n sandbox-eyzflow --advisor fable --resume s-1".into() }), "the tower's advisor, as it had none");
         assert!(matches!(&steps[1].1, Ok(Step::Tab { space_id, argv, .. }) if space_id == "sp-sandbox" && argv[..2] == ["/bin/cca".to_string(), "default".to_string()]), "its account not known: the default one");
         assert!(matches!(&steps[2].1, Ok(Step::Space { name, folder, home, .. }) if name == "zendesk" && folder == "/w/tw" && home.as_deref() == Some("/w/.tower-worktrees/zendesk")), "{:?}", steps[2].1);
         assert!(matches!(&steps[3].1, Ok(Step::Tab { space_id, argv, .. }) if space_id.is_empty() && argv == &["codex", "resume", "s-4"]));
@@ -852,8 +853,8 @@ mod tests {
         let done = run(steps, &hands);
         assert_eq!(done.iter().map(|d| d.how.as_str()).collect::<Vec<_>>(), ["typed", "tab", "space", "tab", "failed"]);
         let calls = hands.calls.lock().unwrap().clone();
-        assert_eq!(calls[0], "type t7h cd /w/eyzflow && /bin/cca orca -n sandbox-eyzflow --resume s-1");
-        assert_eq!(calls[1], "tab sp-sandbox sandbox-mediaroom /w/media room /bin/cca default -n sandbox-mediaroom --resume s-2");
+        assert_eq!(calls[0], "type t7h cd /w/eyzflow && /bin/cca orca -n sandbox-eyzflow --advisor fable --resume s-1");
+        assert_eq!(calls[1], "tab sp-sandbox sandbox-mediaroom /w/media room /bin/cca default -n sandbox-mediaroom --advisor fable --resume s-2");
         assert_eq!(calls[2], "label t50 tower.port=3002 tower.name=sandbox-mediaroom", "what the tower gave it goes with it");
         assert!(calls[3].starts_with("space zendesk /w/tw zendesk-eyzflow ") && calls[3].ends_with(" home /w/.tower-worktrees/zendesk"), "{}", calls[3]);
         assert_eq!(calls[5], "tab sp-new zendesk-api /w/tw/api codex resume s-4", "into the space made a step ago");

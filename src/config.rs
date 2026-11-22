@@ -496,12 +496,34 @@ pub struct Sessions {
     /// TaskCreate/TaskUpdate only with it), so their progress shows as step N
     /// of M (`crate::progress`). `tower todo-tools on|off`, the panel's Settings.
     pub todo_tools: bool,
+    /// The model the Claude sessions the tower opens ask for advice
+    /// (`claude --advisor <model>`, as `/advisor <model>` sets it): fable
+    /// unless set; "" or "off": none. `tower advisor <model>|off`.
+    pub advisor: String,
 }
 
 impl Default for Sessions {
     fn default() -> Self {
-        Self { introduce: true, todo_tools: true }
+        Self { introduce: true, todo_tools: true, advisor: DEFAULT_ADVISOR.into() }
     }
+}
+
+/// The advisor the tower's sessions get unless `[sessions] advisor` says otherwise.
+pub const DEFAULT_ADVISOR: &str = "fable";
+
+/// An `[sessions] advisor` value as a model, None for "", "off" or "none".
+pub fn advisor_of(v: &str) -> Option<String> {
+    let v = v.trim();
+    (!v.is_empty() && !["off", "none"].contains(&v.to_ascii_lowercase().as_str())).then(|| v.to_string())
+}
+
+/// `[sessions] advisor` now (fable when config.toml can't be read; always
+/// fable in tests, which never read the user's config).
+pub fn advisor() -> Option<String> {
+    if cfg!(test) {
+        return advisor_of(DEFAULT_ADVISOR);
+    }
+    advisor_of(&Config::load().map(|c| c.sessions.advisor).unwrap_or_else(|_| DEFAULT_ADVISOR.into()))
 }
 
 /// `[sessions] todo_tools` now (on when config.toml can't be read; always

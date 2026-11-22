@@ -432,6 +432,18 @@ pub struct Start<'a> {
     /// With its task list on (`[sessions] todo_tools`): `env
     /// CLAUDE_CODE_ENABLE_TODO_TOOLS=1` before it.
     pub todo_tools: bool,
+    /// The model it asks for advice (`[sessions] advisor`): `--advisor <model>`.
+    pub advisor: Option<&'a str>,
+}
+
+/// `flags` with `--advisor <model>` added when they name no advisor of
+/// their own (a session the tower resumes or moves gets `[sessions] advisor`).
+pub fn with_advisor(mut flags: Vec<String>, advisor: Option<&str>) -> Vec<String> {
+    let named = flags.iter().any(|f| f == "--advisor" || f.starts_with("--advisor="));
+    if let Some(m) = advisor.filter(|_| !named) {
+        flags.extend(["--advisor".into(), m.to_string()]);
+    }
+    flags
 }
 
 /// What turns a session's task list on (`Start::todo_tools`).
@@ -532,6 +544,9 @@ pub fn command(s: &Start) -> Vec<String> {
         None => a.push("claude".into()),
     }
     a.extend(["-n".into(), s.name.into()]);
+    if let Some(m) = s.advisor {
+        a.extend(["--advisor".into(), m.into()]);
+    }
     if !s.task.is_empty() {
         a.push(s.task.into());
     }
@@ -646,6 +661,31 @@ mod tests {
     }
 
     #[test]
+    fn the_sessions_the_tower_opens_get_its_advisor() {
+        // `tower start`: as `/advisor fable` typed in it, before its task.
+        let s = Start { name: "x", cwd: None, on: None, task: "fix it", account: Some("orca"), cca: "/bin/cca", todo_tools: false, advisor: Some("fable") };
+        assert_eq!(command(&s), ["/bin/cca", "orca", "-n", "x", "--advisor", "fable", "fix it"]);
+        assert_eq!(command(&Start { advisor: None, ..s }), ["/bin/cca", "orca", "-n", "x", "fix it"], "advisor off: none");
+        // Its resume keeps it, as the started command had it…
+        let argv: Vec<String> = ["claude", "-n", "x", "--advisor", "fable", "fix it"].map(String::from).to_vec();
+        assert_eq!(crate::reopen::flags_of(&argv), ["--advisor", "fable"]);
+        // …and one started without gets the tower's; one with its own keeps that.
+        let f = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(with_advisor(f(&["--model", "opus"]), Some("fable")), ["--model", "opus", "--advisor", "fable"]);
+        assert_eq!(with_advisor(f(&["--advisor", "opus"]), Some("fable")), ["--advisor", "opus"]);
+        assert_eq!(with_advisor(f(&["--advisor=opus"]), Some("fable")), ["--advisor=opus"]);
+        assert_eq!(with_advisor(f(&[]), None), Vec::<String>::new());
+        // `[sessions] advisor`: fable unless set; off, none or "": no advisor.
+        assert_eq!(crate::config::Config::from_text("").unwrap().sessions.advisor, "fable");
+        assert_eq!(crate::config::Config::from_text("[sessions]\nadvisor = \"opus\"\n").unwrap().sessions.advisor, "opus");
+        for off in ["off", "OFF", "none", "", "  "] {
+            assert_eq!(crate::config::advisor_of(off), None, "{off:?}");
+        }
+        assert_eq!(crate::config::advisor_of(" fable "), Some("fable".into()));
+        assert_eq!(crate::config::advisor(), Some("fable".into()), "tests: the default");
+    }
+
+    #[test]
     fn builds_the_start_command() {
         let s = Start {
             name: "fix-login",
@@ -655,6 +695,7 @@ mod tests {
             account: Some("work"),
             cca: "/bin/cca",
             todo_tools: false,
+            advisor: None,
         };
         assert_eq!(
             hc_run_args_in(&s, None),
@@ -689,7 +730,7 @@ mod tests {
         let fish = in_login_shell("/opt/homebrew/bin/fish", vec!["claude".into(), "-n".into(), "x".into()]);
         assert_eq!(fish, ["/opt/homebrew/bin/fish", "-lic", "exec $argv", "claude", "-n", "x"]);
         // On another machine: as that machine runs it, no shell of this one's.
-        let s = Start { name: "x", cwd: None, on: Some("vps"), task: "", account: None, cca: "cca", todo_tools: false };
+        let s = Start { name: "x", cwd: None, on: Some("vps"), task: "", account: None, cca: "cca", todo_tools: false, advisor: None };
         assert_eq!(hc_run_args(&s), ["run", "--bg", "--json", "--outlive-parent", "--name", "x", "--on", "vps", "--", "claude", "-n", "x"]);
         // With its task list on (the default): env sets it, here and on another machine alike.
         let s = Start { todo_tools: true, ..s };

@@ -340,6 +340,15 @@ enum Cmd {
         #[arg(default_value = "status")]
         action: String,
     },
+    /// The model the Claude sessions the tower opens ask for advice, as `/advisor <model>` sets it
+    /// (fable by default): `claude --advisor <model>` for each session it starts, and for each it
+    /// resumes or moves to another account that has none of its own. For sessions started from now on.
+    /// `[sessions] advisor` in config.toml.
+    Advisor {
+        /// A model (fable, opus, …), off, or status (default).
+        #[arg(default_value = "status")]
+        model: String,
+    },
     /// Where each space's changes stand, repo by repo: each PR open, merged into dev, on dev
     /// (deployed) or on prod, with when, and each release to prod with what it carried. From
     /// GitHub, never from what sessions say. `tower releases [<space>]` (JSON when piped).
@@ -1153,6 +1162,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Automerge { action } => automerge_cmd(&action),
         Cmd::Youtrack { action, args } => youtrack_cmd(&action, &args),
         Cmd::TodoTools { action } => todo_tools_cmd(&action),
+        Cmd::Advisor { model } => advisor_cmd(&model),
         Cmd::Scoring { action, value, low, medium, json } => scoring_cmd(&action, value.as_deref(), low, medium, json),
         Cmd::Releases { space, json } => releases_cmd(space.as_deref(), json),
         Cmd::Finding { action, id, from, title, what, repo, places, repro, evidence, url, off_goal, json } => {
@@ -2126,6 +2136,39 @@ fn todo_tools_cmd(action: &str) -> Result<()> {
     Ok(())
 }
 
+/// `tower advisor <model>|off|status`: `[sessions] advisor` in config.toml.
+fn advisor_cmd(model: &str) -> Result<()> {
+    let path = config::config_file();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let was = config::Config::from_text(&text)?.sessions.advisor;
+    let want = match model.trim() {
+        "status" | "" => was.clone(),
+        m if m.eq_ignore_ascii_case("off") || m.eq_ignore_ascii_case("none") => "off".to_string(),
+        m if m.chars().all(|c| c.is_ascii_alphanumeric() || "-_.[]".contains(c)) => m.to_string(),
+        m => bail!("{m:?} isn't a model name: tower advisor <model>|off|status"),
+    };
+    let changed = config::advisor_of(&want) != config::advisor_of(&was);
+    if changed {
+        let new = config::with_table_key(&text, "sessions", "advisor", &format!("{want:?}"));
+        // Kept only once it reads back as asked.
+        if config::Config::from_text(&new)?.sessions.advisor != want {
+            bail!("couldn't set [sessions] advisor in {}", path.display());
+        }
+        std::fs::create_dir_all(config::config_dir())?;
+        std::fs::write(&path, new)?;
+    }
+    let now = config::advisor_of(&want);
+    if !std::io::stdout().is_terminal() {
+        println!("{}", serde_json::json!({ "advisor": now, "changed": changed }));
+    } else {
+        match now {
+            Some(m) => println!("The sessions the tower opens get {m} as their advisor (claude --advisor {m}), from the next one on."),
+            None => println!("The sessions the tower opens get no advisor, from the next one on."),
+        }
+    }
+    Ok(())
+}
+
 fn tell_cmd(level: Option<&str>, voice: Option<&str>) -> Result<()> {
     let level = level.map(tell::parse).transpose()?;
     let voice = voice.map(tell::parse_voice).transpose()?;
@@ -2682,7 +2725,9 @@ fn start(
     let cca = cca.unwrap_or_else(|| "cca".into());
     // Its task list on, unless turned off (`[sessions] todo_tools`): its progress shows as step N of M.
     let todo_tools = config::todo_tools();
-    let how = accounts::Start { name, cwd: cwd.as_deref(), on, task: &first, account: account.as_deref(), cca: &cca, todo_tools };
+    // Its advisor (`[sessions] advisor`, fable unless set): as `/advisor fable` in it.
+    let advisor = config::advisor();
+    let how = accounts::Start { name, cwd: cwd.as_deref(), on, task: &first, account: account.as_deref(), cca: &cca, todo_tools, advisor: advisor.as_deref() };
     let (address, placed) = match (&target, &new_space) {
         (Some(sp), _) => (start_in_space(sp, &how, &spaces)?, Some(sp.name.clone())),
         (None, Some(name)) => {

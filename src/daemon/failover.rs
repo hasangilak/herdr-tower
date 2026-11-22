@@ -446,6 +446,8 @@ impl Failover {
             let (k, v) = crate::accounts::TODO_TOOLS.split_once('=').unwrap_or_default();
             env.push((k.to_string(), v.to_string()));
         }
+        // A session keeps its advisor, or gets `[sessions] advisor` (a tower's brain is left as it was).
+        let flags = if crate::brain::brain_of(&t).is_none() { crate::accounts::with_advisor(flags, crate::config::advisor().as_deref()) } else { flags };
         let line = failover::resume_line(&cwd, &failover::resume_argv(&cca, to, &name, &flags, &session_id, &env));
         eprintln!("[failover] {address}: {line}");
         h.type_line(address, &line)?;
@@ -1032,7 +1034,7 @@ mod tests {
             [
                 "keep t5 true".to_string(),
                 "end 77".into(),
-                "type t5 cd /w/app && exec env CLAUDE_CODE_ENABLE_TODO_TOOLS=1 /u/cca orca -n fix-login --model claude-opus-5-5 --resume s-1".into(),
+                "type t5 cd /w/app && exec env CLAUDE_CODE_ENABLE_TODO_TOOLS=1 /u/cca orca -n fix-login --model claude-opus-5-5 --advisor fable --resume s-1".into(),
                 "settle t5".into()
             ]
         );
