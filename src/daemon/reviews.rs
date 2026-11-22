@@ -287,6 +287,8 @@ impl Reviews {
         let on = !space.trim().is_empty() && self.hands.space(&space).review;
         let owner = self.hands.terminal(&pr.session);
         let by_reviewer = owner.as_ref().is_some_and(labelled_reviewer);
+        // The PRs open now: their agreed reviews are kept when the store is pruned.
+        let open: HashSet<String> = self.prs.list().into_iter().filter(Pr::open).map(|p| p.key()).collect();
         let mut b = lock(&self.book);
         let by_reviewer = by_reviewer || b.is_reviewer(&pr.session, owner.as_ref().and_then(crate::hc::created_ms));
         if let Err(why) = b.wants_reviewer(pr, on, by_reviewer) {
@@ -296,6 +298,7 @@ impl Reviews {
         // Its session's account, unless that one is out of usage (then the default `tower start` picks).
         let account = owner.as_ref().and_then(account_of_terminal).filter(|a| crate::failover::usable(a));
         let r = b.begin(pr, account, owner.as_ref().and_then(crate::hc::created_ms), crate::history::now_ms());
+        b.prune(&|k| open.contains(k));
         lock(&self.opening).insert(r.key.clone());
         self.save(&b);
         drop(b);
