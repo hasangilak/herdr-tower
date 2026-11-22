@@ -234,8 +234,50 @@ impl Reviews {
                 let (me, key) = (self.clone(), pr.key());
                 self.run(move || drop(me.end_review(&key, why)));
             }
+            "update" => {
+                if let Some((was, r)) = self.reopen(pr) {
+                    let me = self.clone();
+                    self.run(move || me.review_again(&was, &r.key));
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Commits pushed to an agreed PR: its review begins again (the old
+    /// agreement counts for nothing more), when its space still reviews.
+    /// What it was, and what it is now.
+    pub fn reopen(&self, pr: &Pr) -> Option<(Review, Review)> {
+        if !pr.open() || pr.head_sha.is_empty() {
+            return None;
+        }
+        // Cheap first: most updates are of PRs not agreed, or not moved.
+        if !lock(&self.book).get(&pr.key()).is_some_and(|r| r.moved_past(&pr.head_sha)) {
+            return None;
+        }
+        let space = pr.space.clone().filter(|s| !s.trim().is_empty()).or_else(|| self.get(&pr.key()).map(|r| r.space))?;
+        let sp = self.hands.space(&space);
+        if sp.closed || !sp.review {
+            return None;
+        }
+        let (was, r) = {
+            let mut b = lock(&self.book);
+            let out = b.reopen(pr, crate::history::now_ms())?;
+            lock(&self.opening).insert(pr.key());
+            self.save(&b);
+            out
+        };
+        eprintln!("[reviews] {}: {}", r.key, r.line);
+        self.hands.record(&r, &format!("{} got commits after its review agreed ({}): it is reviewed again", r.short(), r.line));
+        self.publish(&r.key);
+        Some((was, r))
+    }
+
+    /// The agreed reviewer's leftovers go (its session, if it still runs, and its
+    /// checkout: the new one is made in the same place), then a new reviewer opens.
+    fn review_again(&self, was: &Review, key: &str) {
+        self.retire(was);
+        self.open_reviewer(key);
     }
 
     /// A PR found now: its review begins, when it is to have one (kept
@@ -402,6 +444,15 @@ impl Reviews {
     /// Every review not over, looked at: its PR closed, its space closed or
     /// its review off, its reviewer gone (or never opened). The keys ended.
     pub fn sweep(&self) -> Vec<String> {
+        // Agreed ones whose PR was pushed to since (a push the tower didn't hear while it was down).
+        let agreed: Vec<String> = lock(&self.book).reviews.iter().filter(|r| r.status == reviews::Status::Agreed).map(|r| r.key.clone()).collect();
+        for key in agreed {
+            if let Some(pr) = self.prs.get(&key)
+                && let Some((was, r)) = self.reopen(&pr)
+            {
+                self.review_again(&was, &r.key);
+            }
+        }
         let now = crate::history::now_ms();
         let active: Vec<Review> = lock(&self.book).active().cloned().collect();
         let opening = lock(&self.opening).clone();
@@ -536,10 +587,18 @@ impl Reviews {
                 Ok(json!({ "review": r.view() }))
             }
             "agree" => {
+                // The commit it agrees on: the PR's head on GitHub now, else as last seen.
+                let key = find(&lock(&self.book))?;
+                let (repo, number) = key.rsplit_once('#').map(|(r, n)| (r.to_string(), n.parse::<u64>().unwrap_or(0))).unwrap_or_default();
+                let sha = crate::prs::fetch(self.prs.gh(), &repo, number)
+                    .ok()
+                    .and_then(|v| v["headRefOid"].as_str().map(String::from))
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| self.prs.get(&key).map(|p| p.head_sha).filter(|s| !s.is_empty()))
+                    .unwrap_or_default();
                 let r = {
                     let mut b = lock(&self.book);
-                    let key = find(&b)?;
-                    let r = b.agree(&key, text, by, now)?;
+                    let r = b.agree(&key, text, by, &sha, now)?;
                     self.save(&b);
                     r
                 };
@@ -551,7 +610,10 @@ impl Reviews {
                     if me.background {
                         thread::sleep(Duration::from_secs(3));
                     }
-                    me.retire(&done);
+                    // Unless commits came meanwhile and a new review took its place (that retired it).
+                    if me.get(&done.key).is_some_and(|r| r.status == reviews::Status::Agreed) {
+                        me.retire(&done);
+                    }
                 });
                 Ok(json!({ "review": r.view(), "ends": r.reviewer }))
             }
@@ -851,6 +913,85 @@ mod tests {
         assert!(reviews.request("report", "#12", Some(1), "x", Some("t9")).is_err());
         let list = reviews.request("list", "", None, "", None).unwrap();
         assert_eq!(list["reviews"][0]["status"], "agreed");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_push_to_an_agreed_pr_reopens_its_review_for_a_new_reviewer() {
+        let (reviews, hands, prs, base) = setup("again");
+        let repo = base.join("shop");
+        let first = crate::worktrees::tests::sh(&repo, &["rev-parse", "HEAD"]);
+        let gh = prs.gh().to_path_buf();
+        found(&prs, &reviews, "t3", "fix-login");
+        // Agreed at the head GitHub has now: the merge card and auto-merge count it.
+        let v = reviews.request("agree", "#12", None, "approved", Some("t9")).unwrap();
+        assert_eq!((v["review"]["status"].as_str(), v["review"]["agreed_sha"].as_str()), (Some("agreed"), Some(first.as_str())));
+        let pr = prs.get("o/app#12").unwrap();
+        let brief = pr.review.clone().unwrap();
+        assert_eq!((brief.status.as_str(), brief.sha.as_str()), ("agreed", first.as_str()));
+        assert!(brief.agreed_at(&pr.head_sha) && crate::prs::gate(&pr).warnings.iter().all(|w| !w.contains("review")));
+        assert_eq!(lock(&hands.started).len(), 1);
+        assert!(lock(&hands.calls).contains(&"end t9".to_string()), "the agreed reviewer ended");
+        // Seen again at the same head: nothing reopens.
+        prs.poll("o/app#12");
+        assert_eq!(reviews.get("o/app#12").unwrap().status, reviews::Status::Agreed);
+
+        // The owner pushes a new commit after the agreement.
+        std::fs::write(repo.join("src/demo.txt"), "a screenshot demo").unwrap();
+        crate::worktrees::tests::sh(&repo, &["add", "."]);
+        crate::worktrees::tests::sh(&repo, &["commit", "-m", "Show a real screenshot demo"]);
+        let second = crate::worktrees::tests::sh(&repo, &["rev-parse", "HEAD"]);
+        crate::prs::tests::serve(&gh, 12, "OPEN", json!([]), &second);
+        lock(&hands.calls).clear();
+        prs.poll("o/app#12");
+
+        // Its review reset: reviewing again from round 0, the old agreement kept only as where it began again.
+        let r = reviews.get("o/app#12").unwrap();
+        assert_eq!((r.status, r.rounds, r.critical), (reviews::Status::Reviewing, 0, 0));
+        assert_eq!((r.head_sha.as_str(), r.again_from.as_str(), r.agreed_sha.as_str()), (second.as_str(), first.as_str(), ""));
+        assert_eq!(r.steps.iter().filter(|s| s.what == "reopened").count(), 1);
+        assert!(r.line.starts_with(&format!("new commits since the agreement on {}", &first[..7])), "{}", r.line);
+        // The old agreement no longer counts: the chip, the merge card, its readiness, auto-merge.
+        let pr = prs.get("o/app#12").unwrap();
+        let brief = pr.review.clone().unwrap();
+        assert_eq!((brief.status.as_str(), brief.line.as_str(), brief.sha.as_str()), ("reviewing", "Reviewing…", ""));
+        assert!(crate::prs::gate(&pr).warnings.iter().any(|w| w.starts_with("The review isn't done")), "{:?}", crate::prs::gate(&pr).warnings);
+        assert!(!pr.ready_for_user(), "no merge card while its new commits are reviewed");
+        // A new reviewer, in a checkout of the new head, told what changed since the agreement.
+        let started = lock(&hands.started).clone();
+        assert_eq!(started.len(), 2, "a fresh reviewer");
+        let task = started[1].last().unwrap();
+        assert!(task.contains(&format!("An earlier review agreed on it at {first}")) && task.contains(&format!("git diff {first}..{second}")), "{task}");
+        let place = base.join(".tower-worktrees/fix-login/review-shop-12");
+        assert_eq!(crate::worktrees::tests::sh(&place, &["rev-parse", "HEAD"]), second, "its checkout is of the new head");
+        assert_eq!((r.reviewer.as_str(), r.checkout_of.is_empty()), ("t9", false));
+        assert!(lock(&hands.calls).iter().any(|c| c.starts_with("record PR #12 (o/app) got commits after its review agreed")), "{:?}", lock(&hands.calls));
+        // Seen again: still one reopening, one new reviewer.
+        prs.poll("o/app#12");
+        assert_eq!((reviews.get("o/app#12").unwrap().steps.iter().filter(|s| s.what == "reopened").count(), lock(&hands.started).len()), (1, 2));
+        // The new reviewer agrees at the new head: it counts again.
+        reviews.request("agree", "#12", None, "the demo is fine", Some("t9")).unwrap();
+        let pr = prs.get("o/app#12").unwrap();
+        assert!(pr.review.as_ref().unwrap().agreed_at(&pr.head_sha) && pr.ready_for_user());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn an_agreed_review_reopens_only_where_its_space_still_reviews_and_its_pr_is_open() {
+        let (reviews, hands, prs, base) = setup("again-not");
+        let gh = prs.gh().to_path_buf();
+        found(&prs, &reviews, "t3", "fix-login");
+        reviews.request("agree", "#12", None, "approved", Some("t9")).unwrap();
+        // Review turned off for the space: a push reopens nothing.
+        lock(&hands.off).insert("fix-login".into());
+        crate::prs::tests::serve(&gh, 12, "OPEN", json!([]), "f00d");
+        prs.poll("o/app#12");
+        assert_eq!((reviews.get("o/app#12").unwrap().status, lock(&hands.started).len()), (reviews::Status::Agreed, 1));
+        // Back on: the 20-second sweep catches the push it missed.
+        lock(&hands.off).remove("fix-login");
+        reviews.sweep();
+        let r = reviews.get("o/app#12").unwrap();
+        assert_eq!((r.status, r.head_sha.as_str(), lock(&hands.started).len()), (reviews::Status::Reviewing, "f00d", 2));
         let _ = std::fs::remove_dir_all(base);
     }
 

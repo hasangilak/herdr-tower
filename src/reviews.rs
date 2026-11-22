@@ -115,8 +115,15 @@ pub struct Review {
     pub title: String,
     pub base: String,
     pub head: String,
-    /// The head commit when the review began.
+    /// The head commit when the review began (or began again).
     pub head_sha: String,
+    /// The head commit the agreement is on: a push past it reopens the review.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub agreed_sha: String,
+    /// The commit an earlier agreement was on, when this review began again
+    /// for commits pushed after it ("": its first).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub again_from: String,
     pub space: String,
     /// The session that opened the PR: its address and name.
     pub owner: String,
@@ -168,6 +175,7 @@ impl Review {
             reviewer: self.reviewer.clone(),
             reviewer_name: self.reviewer_name.clone(),
             line: String::new(),
+            sha: if self.status == Status::Agreed { self.agreed_on().to_string() } else { String::new() },
         };
         b.line = chip_line(&b);
         b
@@ -186,6 +194,17 @@ impl Review {
         if self.steps.len() > 40 {
             self.steps.remove(1);
         }
+    }
+
+    /// The commit its agreement is on (one agreed before the tower kept
+    /// that: the head it began at).
+    pub fn agreed_on(&self) -> &str {
+        if self.agreed_sha.is_empty() { &self.head_sha } else { &self.agreed_sha }
+    }
+
+    /// Agreed, and its PR has commits pushed since (`head`, as GitHub has it now).
+    pub fn moved_past(&self, head: &str) -> bool {
+        self.status == Status::Agreed && !head.is_empty() && !self.agreed_on().is_empty() && self.agreed_on() != head
     }
 
     /// `PR #12 (o/app)`.
@@ -207,6 +226,22 @@ pub struct Brief {
     pub reviewer_name: String,
     /// What the chip says (`chip_line`).
     pub line: String,
+    /// The head commit an agreement is on ("": not agreed).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub sha: String,
+}
+
+impl Brief {
+    /// An agreement that holds for the PR at `head`: none was pushed past
+    /// the commit it is on. Any other review: false.
+    pub fn agreed_at(&self, head: &str) -> bool {
+        self.status == "agreed" && (self.sha.is_empty() || head.is_empty() || self.sha == head)
+    }
+
+    /// Agreed on an older commit than `head`: what was pushed since isn't reviewed.
+    pub fn outdated(&self, head: &str) -> bool {
+        self.status == "agreed" && !self.agreed_at(head)
+    }
 }
 
 /// What the PR's chip says of its review: "Reviewing…", "Review: 2
@@ -222,6 +257,16 @@ pub fn chip_line(b: &Brief) -> String {
         Status::Ended if b.critical > 0 => format!("Review: ended, {} critical left", b.critical),
         Status::Ended => "Review: ended without agreement".into(),
     }
+}
+
+/// `merge_warning`, for the PR at `head`: an agreement on an older commit
+/// doesn't count (its review begins again).
+pub fn merge_warning_at(b: &Brief, head: &str) -> Option<String> {
+    if b.outdated(head) {
+        let short = |s: &str| s.chars().take(7).collect::<String>();
+        return Some(format!("The review agreed on {}; the commits pushed since ({} now) aren't reviewed yet.", short(&b.sha), short(head)));
+    }
+    merge_warning(b)
 }
 
 /// What the merge card (and a phone's confirm) says when the review isn't
@@ -319,9 +364,18 @@ pub fn instructions(r: &Review, goal: &str, done_when: &str, checkout: bool) -> 
         format!("You work in {}, a folder of your own: read the PR with gh pr diff {n} --repo {repo} and gh pr view {n} --repo {repo}.", r.folder)
     };
     let sha = if r.head_sha.is_empty() { "<the head commit>".to_string() } else { r.head_sha.clone() };
+    let again = if r.again_from.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "An earlier review agreed on it at {old}; commits were pushed since, so it is reviewed again. Review the PR as it is now, whole, and above all what changed since: git diff {old}..{now} (gh pr diff {n} --repo {repo} shows all of it).\n\n",
+            old = r.again_from,
+            now = if r.head_sha.is_empty() { "HEAD" } else { &r.head_sha },
+        )
+    };
     format!(
         "[tower] You are the reviewer of PR #{n} in {repo}{title}{branches}: {url}. The session that opened it is its owner: {owner} ({addr}), in the space \"{space}\".{goal}\n\n\
-{place}\n\n\
+{again}{place}\n\n\
 Review it for CRITICAL issues only:\n\
 - wrong behaviour against the ticket or the space's goal;\n\
 - a crash;\n\
@@ -628,19 +682,51 @@ impl Book {
         Ok(r.clone())
     }
 
-    /// `tower review agree`: both agree; the reviewer approved it.
-    pub fn agree(&mut self, key: &str, text: &str, by: &str, now: u64) -> Result<Review> {
+    /// `tower review agree`: both agree; the reviewer approved it, at the
+    /// head commit `sha` (GitHub's now; "": the one it began at).
+    pub fn agree(&mut self, key: &str, text: &str, by: &str, sha: &str, now: u64) -> Result<Review> {
         let Some(r) = self.get_mut(key) else { bail!("no review of {key}") };
         if r.status.over() {
             bail!("the review of {} is over already ({})", r.short(), r.status.word());
         }
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
         r.status = Status::Agreed;
+        r.agreed_sha = sha.trim().to_string();
         r.critical = 0;
         r.line = if text.is_empty() { "agreed".into() } else { text.clone() };
         r.ended_ms = Some(now);
         r.step("agreed", by, None, &text, now);
         Ok(r.clone())
+    }
+
+    /// Commits were pushed to an agreed PR (`pr`, at its new head): its
+    /// review begins again, for a new reviewer, and the old agreement no
+    /// longer counts. None when it isn't agreed, or nothing moved. What it
+    /// was before (its reviewer and checkout, to take away) and what it is now.
+    pub fn reopen(&mut self, pr: &Pr, now: u64) -> Option<(Review, Review)> {
+        let r = self.get_mut(&pr.key())?;
+        if !r.moved_past(&pr.head_sha) {
+            return None;
+        }
+        let was = r.clone();
+        let short = |s: &str| s.chars().take(7).collect::<String>();
+        let line = format!("new commits since the agreement on {}: reviewed again at {}", short(was.agreed_on()), short(&pr.head_sha));
+        r.again_from = was.agreed_on().to_string();
+        r.head_sha = pr.head_sha.clone();
+        r.agreed_sha = String::new();
+        r.status = Status::Reviewing;
+        (r.rounds, r.critical) = (0, 0);
+        r.line = line.clone();
+        r.fixed = String::new();
+        r.decision = None;
+        r.ended_ms = None;
+        (r.reviewer, r.reviewer_name, r.reviewer_created_ms) = (String::new(), String::new(), None);
+        (r.folder, r.checkout_of) = (String::new(), String::new());
+        if !pr.title.is_empty() {
+            r.title = pr.title.clone();
+        }
+        r.step("reopened", "", None, &line, now);
+        Some((was, r.clone()))
     }
 
     /// It is over without agreement (`why`). None when it was over already.
@@ -725,6 +811,37 @@ mod tests {
     }
 
     #[test]
+    fn an_agreement_holds_only_for_the_commit_it_is_on() {
+        let mut b = Book::default();
+        let k = begun(&mut b, 12);
+        let at = |sha: &str| Pr { head_sha: sha.into(), ..pr(12, "t3", Some("fix-login")) };
+        // Not agreed: nothing reopens.
+        assert!(b.reopen(&at("def456"), 30).is_none());
+        b.agree(&k, "approved", "t9", "abc123", 40).unwrap();
+        let brief = b.get(&k).unwrap().brief();
+        assert_eq!(brief.sha, "abc123");
+        assert!(brief.agreed_at("abc123") && !brief.outdated("abc123") && merge_warning_at(&brief, "abc123").is_none());
+        // A push past it: outdated for the merge card and auto-merge.
+        assert!(brief.outdated("def4567") && !brief.agreed_at("def4567"));
+        assert_eq!(merge_warning_at(&brief, "def4567").unwrap(), "The review agreed on abc123; the commits pushed since (def4567 now) aren't reviewed yet.");
+        assert!(!Pr { review: Some(brief.clone()), ..at("def4567") }.ready_for_user(), "no merge card on the old agreement");
+        // Same head, or no head known: nothing moved.
+        assert!(b.reopen(&at("abc123"), 50).is_none() && b.reopen(&at(""), 50).is_none());
+        let (was, now) = b.reopen(&at("def4567"), 60).unwrap();
+        assert_eq!((was.status, was.reviewer.as_str()), (Status::Agreed, "t9"));
+        assert_eq!((now.status, now.head_sha.as_str(), now.again_from.as_str(), now.reviewer.as_str(), now.folder.as_str(), now.ended_ms), (Status::Reviewing, "def4567", "abc123", "", "", None));
+        assert!(instructions(&now, "", "", true).contains("An earlier review agreed on it at abc123; commits were pushed since"));
+        assert!(!instructions(&was, "", "", true).contains("An earlier review"));
+        assert!(b.reopen(&at("def4567"), 70).is_none(), "once");
+        // One agreed before the tower kept the commit: the head it began at counts.
+        let mut old = Book::default();
+        let k = begun(&mut old, 13);
+        old.agree(&k, "", "t9", "", 40).unwrap();
+        assert_eq!(old.get(&k).unwrap().brief().sha, "abc123");
+        assert!(old.reopen(&Pr { head_sha: "abc123".into(), ..pr(13, "t3", Some("fix-login")) }, 50).is_none());
+    }
+
+    #[test]
     fn a_review_goes_round_by_round_and_is_stuck_after_three() {
         let mut b = Book::default();
         let k = begun(&mut b, 12);
@@ -753,10 +870,10 @@ mod tests {
         let rep = b.report(&k, 1, "still", "t9", false, 80).unwrap();
         assert_eq!((rep.note_owner, rep.raise), (true, false));
         // Agreed: over, and nothing more is reported.
-        let a = b.agree(&k, "approved", "t9", 90).unwrap();
+        let a = b.agree(&k, "approved", "t9", "", 90).unwrap();
         assert_eq!((a.status, a.critical, a.ended_ms, a.brief().line.as_str()), (Status::Agreed, 0, Some(90), "Review: agreed"));
         assert!(b.report(&k, 1, "x", "t9", false, 100).is_err());
-        assert!(b.agree(&k, "", "t9", 100).is_err());
+        assert!(b.agree(&k, "", "t9", "", 100).is_err());
         assert_eq!(b.end(&k, "the PR was merged", 100), None, "agreed stays agreed");
         let whats: Vec<&str> = b.get(&k).unwrap().steps.iter().map(|s| s.what.as_str()).collect();
         assert_eq!(whats, ["opened", "started", "report", "fixed", "report", "report", "stuck", "report", "report", "agreed"]);
@@ -768,7 +885,7 @@ mod tests {
         let k = begun(&mut b, 12);
         let rep = b.report(&k, 0, "nothing critical", "t9", false, 30).unwrap();
         assert_eq!((rep.review.status, rep.review.rounds, rep.note_owner, rep.raise), (Status::Reviewing, 0, false, false));
-        assert_eq!(b.agree(&k, "", "t9", 31).unwrap().line, "agreed");
+        assert_eq!(b.agree(&k, "", "t9", "", 31).unwrap().line, "agreed");
         // Another PR: it ends when its PR closes, with what was left.
         let k2 = begun(&mut b, 13);
         b.report(&k2, 2, "two", "t9", false, 40).unwrap();
@@ -801,7 +918,7 @@ mod tests {
         let k = begun(&mut b, 12);
         // Not twice for one PR, even once it's over.
         assert_eq!(b.wants_reviewer(&p, true, false), Err("it has a review already".into()));
-        b.agree(&k, "", "t9", 30).unwrap();
+        b.agree(&k, "", "t9", "", 30).unwrap();
         assert_eq!(b.wants_reviewer(&p, true, false), Err("it has a review already".into()));
         // A PR the reviewer (t9) itself made: none, while its review runs.
         let k2 = begun(&mut b, 13);

@@ -241,6 +241,24 @@ mod tests {
     }
 
     #[test]
+    fn an_agreement_on_an_older_commit_never_lets_it_merge_by_itself() {
+        let gh = fake_gh("auto-stale-review");
+        serve(&gh, 12, "dev", &["src/Cart.tsx"], "abc");
+        let prs = found(&gh, 12, &ui(), true);
+        pass_all(&prs, "o/app#12");
+        // Its reviewer agreed at "old"; "abc" was pushed since.
+        prs.set_review("o/app#12", Some(crate::reviews::Brief { status: "agreed".into(), sha: "old".into(), ..Default::default() }));
+        let pr = prs.get("o/app#12").unwrap();
+        assert!(matches!(prscore::auto_path(&pr, true), prscore::Path::Waits(w) if w == "its reviewer, for the commits pushed since it agreed"));
+        let m = AutoMerger::new(prs.clone(), || true);
+        assert!(m.tick().is_empty());
+        assert!(!calls(&gh).contains("pr merge"), "{}", calls(&gh));
+        // Agreed at its head: it merges.
+        prs.set_review("o/app#12", Some(crate::reviews::Brief { status: "agreed".into(), sha: "abc".into(), ..Default::default() }));
+        assert_eq!(m.tick(), ["o/app#12"]);
+    }
+
+    #[test]
     fn a_migration_a_pr_into_main_or_an_unplanned_one_unvalidated_never_merges_by_itself() {
         let gh = fake_gh("auto-never");
         // A migration, as the plan predicted it.
