@@ -615,7 +615,6 @@ impl Book {
         r.step("opened", "", None, "", now);
         self.reviews.retain(|x| x.key != r.key);
         self.reviews.push(r.clone());
-        self.prune();
         r
     }
 
@@ -749,18 +748,21 @@ impl Book {
         }
     }
 
-    /// The newest `KEEP_OVER` that are over, and every one that isn't.
-    fn prune(&mut self) {
-        let over = self.reviews.iter().filter(|r| r.status.over()).count();
+    /// The newest `KEEP_OVER` that are over, every one that isn't, and every
+    /// one agreed whose PR is still open (`open`, by its key): a push to it
+    /// reopens it, so the agreement and the commit it is on are kept.
+    pub fn prune(&mut self, open: &dyn Fn(&str) -> bool) {
+        let droppable = |r: &Review| r.status.over() && !(r.status == Status::Agreed && open(&r.key));
+        let over = self.reviews.iter().filter(|r| droppable(r)).count();
         if over <= KEEP_OVER {
             return;
         }
-        let mut ends: Vec<u64> = self.reviews.iter().filter(|r| r.status.over()).map(|r| r.ended_ms.unwrap_or(r.updated_ms)).collect();
+        let mut ends: Vec<u64> = self.reviews.iter().filter(|r| droppable(r)).map(|r| r.ended_ms.unwrap_or(r.updated_ms)).collect();
         ends.sort_unstable();
         let cut = ends[over - KEEP_OVER];
         let mut dropped = 0;
         self.reviews.retain(|r| {
-            let old = r.status.over() && r.ended_ms.unwrap_or(r.updated_ms) < cut && dropped < over - KEEP_OVER;
+            let old = droppable(r) && r.ended_ms.unwrap_or(r.updated_ms) < cut && dropped < over - KEEP_OVER;
             dropped += usize::from(old);
             !old
         });
@@ -1083,9 +1085,18 @@ mod tests {
             let r = b.begin(&pr(n, "t3", Some("s")), None, None, n);
             b.end(&r.key, "closed", n);
         }
+        // One agreed long ago whose PR is still open: kept, for a push to it reopens it.
+        let agreed = b.begin(&pr(500, "t3", Some("s")), None, None, 0);
+        b.agree(&agreed.key, "", "t9", "abc123", 0).unwrap();
         let open = b.begin(&pr(999, "t3", Some("s")), None, None, 1);
         b.begin(&pr(1000, "t3", Some("s")), None, None, 2);
-        assert_eq!(b.reviews.iter().filter(|r| r.status.over()).count(), KEEP_OVER);
+        b.prune(&|k| k == agreed.key);
+        assert_eq!(b.reviews.iter().filter(|r| r.status.over()).count(), KEEP_OVER + 1);
         assert!(b.get(&open.key).is_some() && b.get("acme/shop#0").is_none() && b.get(&format!("acme/shop#{}", KEEP_OVER + 4)).is_some());
+        assert_eq!(b.get(&agreed.key).map(|r| r.agreed_sha.as_str()), Some("abc123"));
+        // Its PR closed: it goes as the others do.
+        b.prune(&|_| false);
+        assert!(b.get(&agreed.key).is_none());
+        assert_eq!(b.reviews.iter().filter(|r| r.status.over()).count(), KEEP_OVER);
     }
 }
