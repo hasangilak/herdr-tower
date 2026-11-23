@@ -108,6 +108,9 @@ pub struct Ask<'a> {
     /// The space of the tower that runs it (`crate::home`: a space's own
     /// tower): with no `--name`, its sessions join it, and it keeps its goal.
     pub home: Option<&'a str>,
+    /// `--needs-mcp`: MCP servers the work needs (with those the goal names:
+    /// `crate::mcps::needs_of`); its sessions open on an account that has them.
+    pub needs_mcp: &'a [String],
 }
 
 /// One message of the conversation that made a space (the full window's
@@ -214,6 +217,8 @@ pub struct World {
     pub no_review: Vec<String>,
     /// The project folders (`projects::candidates`): the repos a goal names.
     pub projects: Vec<std::path::PathBuf>,
+    /// Every account's MCP servers (`crate::mcps`), as last read.
+    pub mcps: crate::mcps::Map,
 }
 
 /// Words of a goal's first line that say how, not what: "open a session at …".
@@ -646,6 +651,16 @@ pub fn plan_with(goal: &str, ask: &Ask, w: &World) -> Result<Plan> {
         Err(_) if w.accounts.is_empty() => (None, format!("the setup's is \"{}\", but no accounts are known (cca isn't installed): plain claude", want.unwrap_or_default())),
         Err(e) => return Err(e),
     };
+    // The MCP servers the work needs (`--needs-mcp`, and the services the goal names): an account
+    // that has them connected, unless one was given (the setup's stays when it has them too).
+    let needs = crate::mcps::needs_of(ask.needs_mcp, &ticket, &w.mcps);
+    let want = crate::mcps::Want { needs: &needs, asked: given(ask.account).and(account.as_deref()), fallback: account.as_deref(), folder: None };
+    let choice = crate::mcps::choose(&want, &w.accounts, &w.mcps, &|a| !crate::failover::usable(a));
+    let (account, account_why) = match &choice {
+        Some(c) if c.moved => (Some(c.account.clone()), c.why.clone()),
+        Some(c) if !c.why.is_empty() => (account, format!("{account_why}; {}", c.why)),
+        _ => (account, account_why),
+    };
     let standing = w.standing.iter().any(|s| s.eq_ignore_ascii_case(&space));
     let review = ask.review.unwrap_or_else(|| !w.no_review.iter().any(|s| s.eq_ignore_ascii_case(&space)));
     let mut taken: BTreeSet<String> = w.names.iter().cloned().collect();
@@ -676,12 +691,16 @@ pub fn plan_with(goal: &str, ask: &Ask, w: &World) -> Result<Plan> {
     } else {
         "none: no repo of the setup is a git checkout"
     };
-    let assumed = json!({
+    let mut assumed = json!({
         "setup": setup.name, "setup_why": setup_why,
         "account": account, "account_why": account_why,
         "name": space, "name_why": name_why,
         "worktrees": sessions.iter().any(|s| s.worktree.is_some()), "worktrees_why": worktrees_why,
     });
+    if let Some(c) = &choice {
+        assumed["mcp_needs"] = json!(needs);
+        assumed["mcp_notes"] = json!(c.notes);
+    }
     Ok(Plan { goal, done_when, ticket, repos_from, space, joins, keeps_goal, setup: setup.clone(), account, sessions, assumed, plan: None, review })
 }
 
@@ -795,6 +814,11 @@ pub fn said(r: &Value) -> String {
         a["worktrees_why"].as_str().unwrap_or(""),
         if dry { "\n(dry run: nothing was opened)" } else { "" }
     );
+    // What the accounts lack of the MCP servers it needs.
+    for n in a["mcp_notes"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        let mut c = n.chars();
+        out += &format!("\nMCP: {}{}.", c.next().map(|f| f.to_uppercase().to_string()).unwrap_or_default(), c.as_str());
+    }
     if let Some(id) = r["act"].as_str() {
         out += &format!("\nTo take it back: tower undo {id}.");
     }
@@ -819,6 +843,7 @@ fn world() -> Result<World> {
         standing: kept.missions.iter().filter(|(_, m)| m.standing).map(|(n, _)| n.clone()).collect(),
         no_review: kept.missions.iter().filter(|(_, m)| !m.review).map(|(n, _)| n.clone()).collect(),
         projects: crate::projects::candidates(&crate::projects::roots()),
+        mcps: crate::mcps::load(),
     })
 }
 
@@ -939,7 +964,12 @@ pub fn world_now() -> Result<World> {
 
 /// What a launch did (or, with `dry_run`, would do): its receipt.
 pub fn launch(goal: &str, ask: &Ask, dry_run: bool) -> Result<Value> {
-    let mut p = plan_with(goal, ask, &world()?)?;
+    let mut w = world()?;
+    // It needs MCP servers: what the accounts have, read again if it is old.
+    if !crate::mcps::needs_of(ask.needs_mcp, goal, &w.mcps).is_empty() {
+        w.mcps = crate::mcps::current();
+    }
+    let mut p = plan_with(goal, ask, &w)?;
     if let Some(id) = ask.plan.map(str::trim).filter(|i| !i.is_empty()) {
         p.plan = Some(crate::plans::brief_of(id)?);
     }
@@ -1094,6 +1124,7 @@ mod tests {
             standing: vec!["M5 Pro".into()],
             no_review: vec![],
             projects: vec![],
+            mcps: Default::default(),
         };
         let p = plan("  Fix the   login redirect on eyzflow ", None, None, &w).unwrap();
         assert_eq!((p.goal.as_str(), p.space.as_str(), p.joins), ("Fix the login redirect on eyzflow", "fix-login-2", false));
@@ -1215,7 +1246,7 @@ mod tests {
         let w = World { setups: vec![project, setup("other", "default", &["/w"])], accounts: accounts(&["default", "orca"]), worktrees: true, spaces: vec!["msg".into()], ..Default::default() };
         let ticket = "EYZFlow Support – Enable Automatic Message and Reply Translation\n\nAcceptance criteria:\n- Messages show translated";
         let repos = vec![s(&room)];
-        let ask = Ask { repos: &repos, name: Some("msg-translation"), title: Some("Translate support messages"), done_when: Some("both languages show"), account: None, setup: Some("EYZFlow"), plan: None, review: None, story: None, home: None };
+        let ask = Ask { repos: &repos, name: Some("msg-translation"), title: Some("Translate support messages"), done_when: Some("both languages show"), account: None, setup: Some("EYZFlow"), plan: None, review: None, story: None, home: None, needs_mcp: &[] };
         let p = plan_with(ticket, &ask, &w).unwrap();
         // Only the repo asked for, though the project has two; its account and its role come with the project.
         assert_eq!((p.sessions.len(), p.sessions[0].folder.as_str(), p.sessions[0].why.as_str()), (1, s(&room).as_str(), "the media backend"));
@@ -1301,10 +1332,53 @@ mod tests {
         assert!(e.iter().all(|e| e.record && e.space.as_deref() == Some("ns-check") && !crate::chat::shown(e)), "the space's, written down, never a chat message");
         assert!(story_entries("ns-check", &[], &receipt, 1_000).is_empty(), "nothing said: nothing kept, not even the launch");
         // `tower launch --story-file` takes it, and not with a draft or a dry run.
-        use clap::Parser;
-        let parse = |args: &[&str]| crate::Cli::try_parse_from([&["tower", "launch", "Fix the login"], args].concat()).map(|c| c.cmd);
+        let parse = |args: &[&str]| crate::parse_args(&[&["tower", "launch", "Fix the login"], args].concat());
         assert!(matches!(parse(&["--story-file", "/tmp/s.json"]), Ok(crate::Cmd::Launch { story_file: Some(ref f), .. }) if f == "/tmp/s.json"));
         assert!(parse(&["--story-file", "/tmp/s.json", "--draft"]).is_err());
         assert!(parse(&["--story-file", "/tmp/s.json", "--dry-run"]).is_err());
+    }
+
+    #[test]
+    fn a_goal_that_needs_an_mcp_opens_on_an_account_that_has_it() {
+        use crate::mcps::{Map, Of, Server, Source, Status};
+        let base = temp("launch-mcp");
+        let app = repo(&base, "app").to_string_lossy().into_owned();
+        let of = |account: &str, sentry: Status| Of {
+            account: account.into(),
+            servers: vec![Server { name: "plugin:sentry:sentry".into(), label: "Sentry".into(), source: Source::Plugin, status: sentry, target: String::new(), project: None }],
+            checked_ms: Some(1),
+            ..Default::default()
+        };
+        let mcps = Map { at_ms: 1, accounts: vec![of("default", Status::NeedsAuth), of("orca", Status::Connected)] };
+        let w = World { setups: vec![setup("App", "default", &[&app])], accounts: accounts(&["default", "orca"]), mcps, ..Default::default() };
+        let ask = |account: Option<&'static str>, needs: &'static [String]| Ask { setup: Some("App"), account, needs_mcp: needs, ..Default::default() };
+        // The goal names Sentry: orca, which has it connected, not the setup's default.
+        let p = plan_with("Fix the crash Sentry reports in checkout", &ask(None, &[]), &w).unwrap();
+        assert_eq!(p.account.as_deref(), Some("orca"));
+        assert_eq!(p.assumed["account_why"], "the only account with Sentry connected (Sentry: connected on orca; needs sign-in on default)");
+        assert_eq!(p.assumed["mcp_needs"], json!(["Sentry"]));
+        // --account wins, and the receipt says what it lacks.
+        let p = plan_with("Fix the crash Sentry reports", &ask(Some("default"), &[]), &w).unwrap();
+        assert_eq!((p.account.as_deref(), p.assumed["account_why"].as_str()), (Some("default"), Some("as given")));
+        assert_eq!(p.assumed["mcp_notes"], json!(["default has no Sentry connected (Sentry: connected on orca; needs sign-in on default)"]));
+        assert!(said(&receipt(&p, &[], None, true)).contains("\nMCP: Default has no Sentry connected"), "{}", said(&receipt(&p, &[], None, true)));
+        // --needs-mcp youtrack: nobody has it: the setup's account, said plainly.
+        static YT: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| vec!["youtrack".to_string()]);
+        let p = plan_with("Tidy the checkout page", &ask(None, &YT), &w).unwrap();
+        assert_eq!((p.account.as_deref(), p.assumed["account_why"].as_str()), (Some("default"), Some("the setup's")));
+        assert_eq!(p.assumed["mcp_notes"], json!(["no account has YouTrack (neither default nor orca), so it runs on default without it"]));
+        // Nothing needed: as before, and nothing said of MCP.
+        let p = plan_with("Tidy the checkout page", &ask(None, &[]), &w).unwrap();
+        assert_eq!((p.account.as_deref(), p.assumed["account_why"].as_str()), (Some("default"), Some("the setup's")));
+        assert!(p.assumed.get("mcp_needs").is_none() && !said(&receipt(&p, &[], None, true)).contains("MCP:"));
+    }
+
+    #[test]
+    fn launch_and_start_take_needs_mcp() {
+        let launch = crate::parse_args(&["tower", "launch", "x", "--needs-mcp", "figma", "--needs-mcp", "sentry,youtrack"]);
+        assert!(matches!(launch, Ok(crate::Cmd::Launch { ref needs_mcp, .. }) if needs_mcp == &["figma", "sentry,youtrack"]));
+        assert!(crate::parse_args(&["tower", "launch", "x", "--needs-mcp", "figma", "--draft"]).is_err(), "a draft opens nothing");
+        let start = crate::parse_args(&["tower", "start", "--name", "s", "--needs-mcp", "sentry", "look"]);
+        assert!(matches!(start, Ok(crate::Cmd::Start { ref needs_mcp, ref task, .. }) if needs_mcp == &["sentry"] && task == &["look"]));
     }
 }

@@ -288,7 +288,7 @@ fn write_if_changed(path: &Path, text: &str) -> Result<bool> {
 /// folder, and whether its instructions changed.
 pub fn write_space_files(space: &str, mission: &Value) -> Result<(PathBuf, bool)> {
     let dir = dir_for(space);
-    let base = crate::behaviors::Store::open().prompt();
+    let base = crate::brain::instructions();
     let changed = write_folder(&dir, &base, &config::tower_bin().display().to_string(), space, mission)?;
     Ok((dir, changed))
 }

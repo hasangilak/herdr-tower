@@ -339,6 +339,12 @@ pub fn run() -> Result<()> {
     failover.start();
     // Each account's usage, and who the failover moved: in the state, for the windows and the phone.
     failover.publish_to(shared.clone());
+    // Each account's MCP servers, read again every few minutes; the brains' instructions follow a change.
+    crate::mcps::keep_fresh(|_| {
+        if let Err(e) = crate::brain::write_prompt() {
+            eprintln!("[mcps] the brains' instructions weren't written again: {e:#}");
+        }
+    });
     // Jobs sessions leave running in the background (a training run while
     // the session waits on it): seen, shown, and told when they end or go quiet.
     let running = {

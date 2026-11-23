@@ -318,7 +318,9 @@ pub fn window_words(label: &str, w: Option<&Window>, now_ms: u64) -> String {
 pub fn moved_words(m: &Moved, now_ms: u64) -> String {
     let at = failover::when(m.at_ms, now_ms);
     if m.how == "moved" {
-        format!("moved from {} at {at}", m.from)
+        // An MCP server it used that the account it went to hasn't connected.
+        let lost = if m.lost.is_empty() { String::new() } else { format!(" (without {})", m.lost.join(", ")) };
+        format!("moved from {} at {at}{lost}", m.from)
     } else {
         let why = if m.why.is_empty() { String::new() } else { format!(": {}", m.why) };
         format!("couldn't move to {} at {at}{why}", m.to)

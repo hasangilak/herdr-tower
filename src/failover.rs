@@ -263,6 +263,9 @@ pub struct Moved {
     pub how: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub why: String,
+    /// The MCP servers it used that `from` had connected and `to` hasn't (`crate::mcps::lost`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lost: Vec<String>,
 }
 
 /// A session that waits for an account: every one was out when it hit its limit.
@@ -282,6 +285,9 @@ pub struct Waiting {
     /// What it was doing when it stopped: sent again when it goes on.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub prompt: String,
+    /// The MCP servers it used, by tool key (`crate::mcps::used_in`): where it goes should have them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub uses: Vec<String>,
 }
 
 impl Waiting {
@@ -430,6 +436,48 @@ pub fn pick(list: &[Account], usage: &BTreeMap<String, Usage>, book: &Book, from
         .filter_map(|a| out(a).map(|u| (a.name.clone(), u)))
         .min_by_key(|(_, u)| *u);
     Pick::AllOut { first }
+}
+
+/// `pick`, keeping a session's MCP servers where it can: of the accounts
+/// it could go to, the first that loses none of those it used (`lost`: what
+/// it would lose on an account), else the one that loses the fewest (the
+/// first of those). With what it loses there.
+pub fn pick_keeping(list: &[Account], usage: &BTreeMap<String, Usage>, book: &Book, from: Option<&str>, now_ms: u64, lost: &dyn Fn(&str) -> Vec<String>) -> (Pick, Vec<String>) {
+    let signed_in = |a: &Account| a.email.trim() != "not signed in";
+    let open: Vec<&Account> =
+        list.iter().filter(|a| Some(a.name.as_str()) != from && signed_in(a) && account_out(book, usage.get(&a.name), &a.name, now_ms).is_none()).collect();
+    match open.iter().map(|a| (a.name.clone(), lost(&a.name))).min_by_key(|(_, l)| l.len()) {
+        Some((to, l)) => (Pick::To(to), l),
+        None => (pick(list, usage, book, from, now_ms), vec![]),
+    }
+}
+
+/// What is said of the MCP servers a move loses: ` It used Sentry, which
+/// orca doesn't have connected.` (`lost`: their labels; none: nothing).
+pub fn lost_words(to: &str, lost: &[String]) -> String {
+    match lost {
+        [] => String::new(),
+        [one] => format!(" It used {one}, which {to} doesn't have connected."),
+        [rest @ .., last] => format!(" It used {} and {last}, which {to} doesn't have connected.", rest.join(", ")),
+    }
+}
+
+/// What a moved session is told of the MCP servers it lost.
+pub fn lost_note(to: &str, lost: &[String]) -> String {
+    if lost.is_empty() {
+        return String::new();
+    }
+    let names = match lost {
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        [] => unreachable!(),
+    };
+    format!(
+        "\n\nNote: you used {names} before the move, and the {to} account doesn't have {} connected, so {} tools aren't here now. If what you're doing needs {}, say so in your answer instead of working around it.",
+        if lost.len() == 1 { "it" } else { "them" },
+        if lost.len() == 1 { "its" } else { "their" },
+        if lost.len() == 1 { "it" } else { "them" }
+    )
 }
 
 // ---- the move ----

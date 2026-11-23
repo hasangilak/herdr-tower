@@ -26,11 +26,24 @@ pub fn name() -> String {
 pub fn write_prompt() -> Result<()> {
     let dir = config::brain_dir();
     std::fs::create_dir_all(&dir)?;
-    let text = crate::behaviors::Store::open().prompt();
+    let text = instructions();
     std::fs::write(dir.join("CLAUDE.md"), &text)?;
     std::fs::write(dir.join("AGENTS.md"), &text)?;
     crate::brains::rewrite_all();
     Ok(())
+}
+
+/// A brain's instructions: the core and the enabled behaviors, then what
+/// the Claude accounts reach through MCP (`mcps::prompt_section`, as last
+/// read: written again when it changes).
+pub fn instructions() -> String {
+    let mut text = crate::behaviors::Store::open().prompt();
+    let mcps = crate::mcps::prompt_section(&crate::mcps::load());
+    if !mcps.is_empty() {
+        text = format!("{}\n\n{}", text.trim_end(), mcps.trim_end());
+        text.push('\n');
+    }
+    text
 }
 
 /// Writes the brain's folder: its instructions (CLAUDE.md for Claude Code,
