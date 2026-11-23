@@ -223,9 +223,16 @@ pub fn names_pr(text: &str, url: &str) -> bool {
         })
 }
 
-/// The ticket among YouTrack's search results whose description links the PR.
+/// A ticket's description is the PR's own ticket: its `**Pull request:**`
+/// line (`description`) names it. Another ticket that only mentions the PR
+/// (what it changes quotes a review of it) isn't.
+pub fn ticket_of(description: &str, url: &str) -> bool {
+    description.lines().filter(|l| l.trim_start().starts_with("**Pull request:**")).any(|l| names_pr(l, url))
+}
+
+/// The ticket among YouTrack's search results that is the PR's own (`ticket_of`).
 pub fn linked_on_youtrack(issues: &[Value], url: &str) -> Option<String> {
-    issues.iter().find(|i| names_pr(i["description"].as_str().unwrap_or(""), url)).and_then(|i| i["idReadable"].as_str()).map(String::from)
+    issues.iter().find(|i| ticket_of(i["description"].as_str().unwrap_or(""), url)).and_then(|i| i["idReadable"].as_str()).map(String::from)
 }
 
 /// The search for a PR's ticket on YouTrack: by its link, in every project
@@ -653,6 +660,10 @@ mod tests {
         let p70 = pr("eyzhub/eyzflow", 70);
         assert!(!names_pr("see https://github.com/eyzhub/eyzflow/pull/70)", &p.url));
         assert!(names_pr("[x](https://github.com/eyzhub/eyzflow/pull/7)", &p.url));
+        // A ticket of another PR that only mentions this one (what it changes quotes its review) isn't its ticket.
+        let other = description(&p70, "Fixes the finding from the review of #7 (https://github.com/eyzhub/eyzflow/pull/7#discussion_r1)");
+        assert!(names_pr(&other, &p.url) && !ticket_of(&other, &p.url) && ticket_of(&other, &p70.url));
+        assert_eq!(linked_on_youtrack(&[json!({ "idReadable": "EYZ-9", "description": other })], &p.url), None);
         let t70 = ensure(&p70, &c, &fake, "x", 10).unwrap();
         assert_eq!((t70.id.as_str(), t70.how.as_str()), ("EYZ-11", "made"));
         // A repo with a project of its own: its ticket goes there.
