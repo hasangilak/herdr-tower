@@ -996,20 +996,60 @@ fn title_words(t: &str) -> Vec<String> {
     tokens(t).into_iter().filter(|w| w.len() >= 3 && !matches!(w.as_str(), "the" | "and" | "for" | "with" | "into" | "from" | "feat" | "fix" | "chore")).collect()
 }
 
+/// A predicted path (`lib/x.js`, `src/**`, `app/help/`, or with the
+/// planner's aside: `tests/a.mjs (or a new one)`) covers the real `path`.
+pub fn path_covers(predicted: &str, path: &str) -> bool {
+    let p = predicted.split(" (").next().unwrap_or("").trim().trim_start_matches("./");
+    if p.is_empty() {
+        return false;
+    }
+    match p.find('*') {
+        Some(i) => path.starts_with(&p[..i]),
+        None if p.ends_with('/') => path.starts_with(p),
+        None => path == p,
+    }
+}
+
+/// How much a real PR (titled `words`, changing `files`) has of a
+/// prediction: the distinct words their titles share, and how many of its
+/// files the prediction names.
+fn evidence(p: &Predicted, words: &[String], files: &[String]) -> (usize, usize) {
+    let mut own = title_words(&p.title);
+    own.sort();
+    own.dedup();
+    let shared = own.iter().filter(|w| words.contains(w)).count();
+    let covered = files.iter().filter(|f| p.files.iter().any(|x| path_covers(x, f))).count();
+    (shared, covered)
+}
+
+/// The words two titles must share for a PR to be a prediction on its title alone.
+pub const MATCH_WORDS: usize = 2;
+
 /// The prediction a real PR (`repo` as `owner/name`, into `base`, titled
-/// `title`) is: one of the same repo not matched yet, the same base first,
-/// then the one whose title shares the most words, then the first in order.
-pub fn best_match(prs: &[Predicted], repo: &str, base: &str, title: &str) -> Option<usize> {
+/// `title`, changing `files`: empty when GitHub couldn't say) is: one of
+/// the same repo and base not matched yet, and only one it shows it is:
+/// its title shares `MATCH_WORDS` words with the prediction's, or at least
+/// half its files are the prediction's, or it is into the branch of a
+/// release the plan predicts (titled a release, into main, not dev). Of those, the one it has the
+/// most of; then the first in order. None: no plan predicted it (a later PR
+/// in the same repo never takes a prediction it merely shares a repo with).
+pub fn best_match(prs: &[Predicted], repo: &str, base: &str, title: &str, files: &[String]) -> Option<usize> {
     let name = folder_name(repo);
     let words = title_words(title);
     // Only into the branch it predicts: a release into main is never taken by a PR into dev.
     let same_base = |p: &Predicted| base.trim().is_empty() || p.base.trim().is_empty() || p.base.trim().eq_ignore_ascii_case(base.trim());
+    // A release the plan predicts (its title says so) into a branch that isn't dev: the branch is enough.
+    // (Not any prediction into a repo's own working branch, `entitlment` and the like.)
+    let release = |p: &Predicted| {
+        !base.trim().is_empty() && p.base.trim().eq_ignore_ascii_case(base.trim()) && !is_dev(&p.base) && tokens(&p.title).iter().any(|w| w == "release")
+    };
     prs.iter()
         .enumerate()
         .filter(|(_, p)| p.pr.is_none() && p.repo.eq_ignore_ascii_case(name) && same_base(p))
-        .map(|(i, p)| (i, title_words(&p.title).iter().filter(|w| words.contains(w)).count()))
-        .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
-        .map(|(i, _)| i)
+        .map(|(i, p)| (i, p, evidence(p, &words, files)))
+        .filter(|(_, p, (shared, covered))| *shared >= MATCH_WORDS || (*covered > 0 && covered * 2 >= files.len()) || release(p))
+        .max_by(|a, b| (a.2.0 + 2 * a.2.1).cmp(&(b.2.0 + 2 * b.2.1)).then(b.0.cmp(&a.0)))
+        .map(|(i, _, _)| i)
 }
 
 // ---- merging it without asking ----
@@ -1371,6 +1411,14 @@ pub(crate) mod tests {
     /// p6 (2026-11-19): its release PR 3 (MediaRoom dev → main) was taken by
     /// #1592, a spec-only fix into dev that came first.
     #[test]
+    fn a_predicted_path_covers_the_files_it_names() {
+        assert!(path_covers("lib/support/helpPages.js", "lib/support/helpPages.js"));
+        assert!(path_covers("tests/support-help.test.mjs (or a new tests/support-help-cache.test.mjs)", "tests/support-help.test.mjs"));
+        assert!(path_covers("src/messages/**", "src/messages/a/b.ts") && path_covers("app/help/", "app/help/x.js") && path_covers("./a.js", "a.js"));
+        assert!(!path_covers("lib/support/helpPages.js", "lib/support/helpPages.json") && !path_covers("", "a") && !path_covers("app/help/", "app/helpers.js"));
+    }
+
+    #[test]
     fn a_release_into_main_is_never_taken_by_a_pr_into_dev() {
         let pred = |n: u32, repo: &str, base: &str, title: &str| Predicted { n, repo: repo.into(), base: base.into(), title: title.into(), ..Default::default() };
         let mut prs = vec![
@@ -1382,13 +1430,13 @@ pub(crate) mod tests {
         prs[0].pr = Some("eyzhub/eyz-mediaroom-serverless#1591".into());
         prs[1].pr = Some("eyzhub/eyzflow#972".into());
         // The spec fix into dev: every dev prediction of the repo is taken, and the release is into main: none.
-        assert_eq!(best_match(&prs, "eyzhub/eyz-mediaroom-serverless", "dev", "test(storefront-users): type the filter spec's stubs so tsc on specs passes"), None);
+        assert_eq!(best_match(&prs, "eyzhub/eyz-mediaroom-serverless", "dev", "test(storefront-users): type the filter spec's stubs so tsc on specs passes", &[]), None);
         // The real release into main: PR 3, and the other repo's release stays for its own.
-        assert_eq!(best_match(&prs, "eyzhub/eyz-mediaroom-serverless", "main", "release: eyz-mediaroom-serverless dev → main (storefront users filter)"), Some(2));
-        assert_eq!(best_match(&prs, "eyzhub/eyzflow", "main", "release: eyzflow dev → main"), Some(3));
+        assert_eq!(best_match(&prs, "eyzhub/eyz-mediaroom-serverless", "main", "release: eyz-mediaroom-serverless dev → main (storefront users filter)", &[]), Some(2));
+        assert_eq!(best_match(&prs, "eyzhub/eyzflow", "main", "release: eyzflow dev → main", &[]), Some(3));
         // Base names in another case are the same branch; a PR into another branch than any predicted: none.
-        assert_eq!(best_match(&prs, "eyzhub/eyzflow", "Main", "anything"), Some(3));
-        assert_eq!(best_match(&prs, "eyzhub/eyzflow", "staging", "release: eyzflow dev → main"), None);
+        assert_eq!(best_match(&prs, "eyzhub/eyzflow", "Main", "anything", &[]), Some(3));
+        assert_eq!(best_match(&prs, "eyzhub/eyzflow", "staging", "release: eyzflow dev → main", &[]), None);
     }
 
     #[test]
@@ -1396,11 +1444,13 @@ pub(crate) mod tests {
         let mut prs = check(&two_prs(), &draft_repos()).unwrap();
         prs.push(Predicted { n: 3, repo: "eyzflow-admin-dashboard".into(), base: "dev".into(), title: "Settings page for translation language".into(), ..Default::default() });
         // The same repo, the closest title.
-        assert_eq!(best_match(&prs, "eyzhub/eyzflow-admin-dashboard", "dev", "feat: translated messages in the inbox"), Some(1));
-        assert_eq!(best_match(&prs, "eyzhub/eyzflow-admin-dashboard", "dev", "language settings page"), Some(2));
-        assert_eq!(best_match(&prs, "eyzhub/other", "dev", "anything"), None);
+        assert_eq!(best_match(&prs, "eyzhub/eyzflow-admin-dashboard", "dev", "feat: translated messages in the inbox", &[]), Some(1));
+        assert_eq!(best_match(&prs, "eyzhub/eyzflow-admin-dashboard", "dev", "language settings page", &[]), Some(2));
+        assert_eq!(best_match(&prs, "eyzhub/other", "dev", "anything", &[]), None);
         prs[1].pr = Some("eyzhub/eyzflow-admin-dashboard#7".into());
-        assert_eq!(best_match(&prs, "eyzhub/eyzflow-admin-dashboard", "dev", "translated messages"), Some(2), "a prediction is matched once");
+        // Matched once: the inbox prediction is taken, and a title that shares nothing with what's left takes nothing.
+        assert_eq!(best_match(&prs, "eyzhub/eyzflow-admin-dashboard", "dev", "translated messages", &[]), None, "a prediction is matched once");
+        assert_eq!(best_match(&prs, "eyzhub/eyzflow-admin-dashboard", "dev", "Settings: translation language", &[]), Some(2));
         // Its own files: low risk as predicted; or a migration the plan didn't predict.
         let ui = &prs[1].score;
         let same = combine(Some(ui), &real_score("Show translated messages", &["src/inbox/MessageRow.tsx".into()]), "abc");

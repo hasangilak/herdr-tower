@@ -660,6 +660,16 @@ fn validate(prs: &crate::prs::Prs, pr: &str, check: &str, status: &str, evidence
 fn remap_plan_pr(plans: &plans::Plans, prs: &crate::prs::Prs, id: &str, body: Option<&serde_json::Value>) -> anyhow::Result<serde_json::Value> {
     let b = body.cloned().unwrap_or_default();
     let n = b["n"].as_u64().ok_or_else(|| anyhow::anyhow!("tower plan remap <id> <n> <pr>"))? as u32;
+    // `none`: the prediction is no PR's; the one that took it loses its planned checks.
+    if b["pr"].as_str().is_some_and(|w| w.trim().eq_ignore_ascii_case("none")) {
+        let id = if id.trim().is_empty() { anyhow::bail!("tower plan remap <id> <n> none: give the plan") } else { id.trim() };
+        let was = plans.unmap(id, n)?;
+        if let Some(old) = &was {
+            prs.set_planned(old, None, None);
+        }
+        eprintln!("[plans] {id}: PR {n} is no PR's now{}", was.as_ref().map(|w| format!(" (it was {w})")).unwrap_or_default());
+        return Ok(serde_json::json!({ "plan": id, "n": n, "pr": null, "was": was }));
+    }
     let key = pr_key(prs, b["pr"].as_str().unwrap_or(""), None)?;
     let pr = prs.get(&key).ok_or_else(|| anyhow::anyhow!("the tower doesn't know {key} yet"))?;
     let id = if id.trim().is_empty() { anyhow::bail!("tower plan remap <id> <n> <pr>: give the plan") } else { id.trim() };
@@ -736,7 +746,6 @@ fn sync_merges(decisions: &decisions::Decisions, prs: &crate::prs::Prs) {
 /// and every checkout under `roots`), which makes it a breaking change
 /// when anything uses what it removes or changes.
 fn score_found(plans: &plans::Plans, gh: &std::path::Path, pr: &crate::prs::Pr, roots: &[std::path::PathBuf]) -> crate::prscore::Scored {
-    let predicted = plans.match_pr(pr);
     let (files, sha) = match crate::prs::fetch_files(gh, &pr.repo, pr.number) {
         Ok(x) => x,
         Err(e) => {
@@ -744,6 +753,8 @@ fn score_found(plans: &plans::Plans, gh: &std::path::Path, pr: &crate::prs::Pr, 
             (vec![], String::new())
         }
     };
+    // Its prediction, by its title and its files: none when it shows it is none.
+    let predicted = plans.match_pr(pr, &files);
     let impact = match crate::impact::of_pr(gh, &pr.repo, pr.number, &sha, roots) {
         Ok(i) => {
             eprintln!("[prs] {}: {}", pr.key(), i.line());
