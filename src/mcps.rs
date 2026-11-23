@@ -515,16 +515,19 @@ fn list_live(cca: &Path, account: &str) -> Result<Vec<Server>> {
 
 /// An account's servers: what the live check said (when it answered: it
 /// is Claude Code's word), else the last one that answered (`prev`), then
-/// what only its files have (one project's servers, a plugin the check
-/// didn't list), as they have it.
+/// one project's servers from its files (the check runs in no project).
+/// A server only its files name, that a check that answered didn't list,
+/// isn't there (a connector since removed, a plugin turned off); with no
+/// check ever answered, its files are all there is.
 pub fn merge(account: &str, dir: &str, local: Vec<Server>, live: Result<Vec<Server>, String>, prev: Option<&Of>, now_ms: u64) -> Of {
     let (mut servers, checked_ms, error) = match live {
         Ok(l) => (l, Some(now_ms), None),
         Err(e) => match prev.filter(|p| p.checked_ms.is_some()) {
-            Some(p) => (p.servers.iter().filter(|s| s.source != Source::Project).cloned().collect(), p.checked_ms, Some(e)),
+            Some(p) => (p.servers.iter().filter(|s| s.project.is_none()).cloned().collect(), p.checked_ms, Some(e)),
             None => (vec![], None, Some(e)),
         },
     };
+    let answered = checked_ms.is_some();
     for s in local {
         match servers.iter_mut().find(|x| x.name == s.name && x.project == s.project) {
             // The live word stands; the files know where it comes from and what it runs.
@@ -536,7 +539,9 @@ pub fn merge(account: &str, dir: &str, local: Vec<Server>, live: Result<Vec<Serv
                     x.target = s.target;
                 }
             }
-            None => servers.push(s),
+            None if s.project.is_some() || !answered => servers.push(s),
+            // Named in its files, not by Claude Code: not there.
+            None => {}
         }
     }
     servers.sort_by_key(|s| (s.project.is_some(), s.source, s.label.to_lowercase()));
@@ -593,15 +598,16 @@ pub fn keep_fresh(changed: impl Fn(&Map) + Send + 'static) {
     let _ = std::thread::Builder::new().name("mcps".into()).spawn(move || {
         // Past the daemon's own start first.
         std::thread::sleep(Duration::from_secs(20));
-        let mut told = prompt_section(&load());
+        // (None: the first reading writes them, whatever was there.)
+        let mut told: Option<String> = None;
         loop {
             match refresh() {
                 Ok(m) => {
                     let now = prompt_section(&m);
-                    if now != told {
+                    if told.as_deref() != Some(now.as_str()) {
                         eprintln!("[mcps] the accounts' MCP servers changed: the brains are told");
                         changed(&m);
-                        told = now;
+                        told = Some(now);
                     }
                     for o in m.accounts.iter().filter(|o| o.error.is_some()) {
                         eprintln!("[mcps] {}: {}", o.account, o.error.as_deref().unwrap_or(""));
@@ -687,6 +693,23 @@ pub fn where_words(need: &str, map: &Map, list: &[Account], folder: Option<&str>
         return format!("{word}: the accounts' MCP servers aren't known yet");
     }
     if by.keys().all(|h| *h == Have::No) {
+        // In one project's folder only, not this one.
+        let mut accts: Vec<String> = vec![];
+        let mut folders: Vec<String> = vec![];
+        for n in &names {
+            for s in map.of(n).into_iter().flat_map(|o| o.servers.iter()).filter(|s| s.project.is_some() && is(need, s)) {
+                let f = s.project.as_deref().unwrap_or("").trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string();
+                if !accts.contains(&n.to_string()) {
+                    accts.push(n.to_string());
+                }
+                if !folders.contains(&f) {
+                    folders.push(f);
+                }
+            }
+        }
+        if !accts.is_empty() {
+            return format!("no account has {word} here ({} {} it in {} only)", and_list(&accts), if accts.len() == 1 { "has" } else { "have" }, and_list(&folders));
+        }
         return match names.len() {
             1 => format!("no account has {word} ({} hasn't)", names[0]),
             2 => format!("no account has {word} (neither {} nor {})", names[0], names[1]),
@@ -1127,6 +1150,12 @@ mod tests {
         assert_eq!((later.checked_ms, later.error.as_deref()), (Some(100), Some("timed out")));
         assert_eq!(later.servers.iter().find(|s| s.name == "plugin:sentry:sentry").unwrap().status, Status::Connected);
         assert!(checked_words(&later, 100 + 5 * 60_000).starts_with("last checked 5 min ago"));
+        // A connector its files remember, that the live check no longer lists: not there.
+        let gone = vec![Server { source: Source::Connector, ..srv("claude.ai Old Tool", Status::Unchecked) }];
+        let now2 = merge("orca", "/p", gone.clone(), Ok(parse_list(LIST)), None, 150);
+        assert!(!now2.servers.iter().any(|s| s.name == "claude.ai Old Tool"), "{:?}", now2.servers);
+        let failed2 = merge("orca", "/p", gone.clone(), Err("timed out".into()), Some(&now2), 160);
+        assert!(!failed2.servers.iter().any(|s| s.name == "claude.ai Old Tool"), "nor while the last answer stands");
         // Never answered: the files only, said so.
         let files = merge("orca", "/p", local, Err("no claude".into()), None, 300);
         assert_eq!((files.checked_ms, files.servers.len()), (None, 3));
@@ -1209,6 +1238,9 @@ mod tests {
         // A setup's own account that has it stays.
         let c = choose_for(&["claude docs"], None, Some("orca"), &none_out).unwrap();
         assert_eq!((c.account.as_str(), c.moved), ("orca", false));
+        // A project's own server, asked for outside that project: said so, not "nobody has it".
+        let c = choose_for(&["notion"], None, None, &none_out).unwrap();
+        assert_eq!(c.notes, ["no account has Notion here (default and orca have it in app only), so it runs on default without it"]);
         // Nothing read yet: said so, it starts as it would have.
         let empty = Map::default();
         let c = choose(&Want { needs: &["sentry".into()], asked: None, fallback: None, folder: None }, &list, &empty, &none_out).unwrap();

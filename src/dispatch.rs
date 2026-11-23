@@ -181,6 +181,10 @@ pub type Fit<'a> = &'a dyn Fn(&Task, &Live) -> Option<String>;
 /// beside it (`mcp_note`), never more.
 pub fn fit_of<'a>(map: &'a crate::mcps::Map, list: &'a [crate::accounts::Account], out: &'a dyn Fn(&str) -> bool) -> impl Fn(&Task, &Live) -> Option<String> + 'a {
     move |t: &Task, l: &Live| {
+        // An account named for it: `tower start` keeps it (and says what it lacks); no session is passed over for that.
+        if t.account.as_deref().is_some_and(|a| !a.trim().is_empty()) {
+            return None;
+        }
         let needs = crate::mcps::needs_of(&t.needs_mcp, "", map);
         let account = l.account.as_deref()?;
         let want = crate::mcps::Want { needs: &needs, asked: None, fallback: Some(account), folder: Some(&l.cwd) };
@@ -798,6 +802,10 @@ mod tests {
         // A session with no name of its own is called by its address.
         let unnamed = vec![Live { name: String::new(), ..on("default")[0].clone() }];
         assert!(matches!(&route_with(&plan_of(&["sentry"], "x"), &[0], &unnamed, &fit).unwrap()["a"], Route::Start { why: Some(w), .. } if w.starts_with("t5 runs on default: a new session on orca")));
+        // An account named for the task: queued all the same (`tower start` would keep that account anyway).
+        let mut named = plan_of(&["sentry"], "x");
+        named.tasks[0].account = Some("default".into());
+        assert_eq!(route_with(&named, &[0], &on("default"), &fit).unwrap()["a"], Route::Queue { session: "t5".into() });
         // On orca already: queued for it, as before.
         assert_eq!(route_with(&plan_of(&["sentry"], "x"), &[0], &on("orca"), &fit).unwrap()["a"], Route::Queue { session: "t5".into() });
         // Nobody has YouTrack: no other account would do better, so it is queued (and said).

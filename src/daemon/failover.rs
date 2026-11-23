@@ -984,7 +984,10 @@ mod tests {
     }
 
     fn setup(fake: Fake) -> (Failover, Arc<Fake>, super::super::decisions::Decisions, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("tower-failover-{}-{}", std::process::id(), fake.now));
+        // One folder per test: two that read the clock in the same millisecond once shared a book.
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("tower-failover-{}-{}-{n}", std::process::id(), fake.now));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let shared = Shared::new(State::new("ptt", "test", "test"));
@@ -1175,6 +1178,21 @@ mod tests {
         settled(&f, "t5");
         assert!(fake.calls().iter().any(|c| c.starts_with("tell moved") && c.ends_with(".")), "{:?}", fake.calls());
         assert!(!fake.calls().iter().any(|c| c.contains("It used")), "nothing lost, nothing said");
+        let _ = std::fs::remove_dir_all(&dir);
+        // Every account out: it waits, and what it used is kept for when one is back (`tick` picks with it).
+        let spent = Usage { five_hour: None, seven_day: Some(crate::accounts::Window { used: 100.0, resets_ms: Some(now + 3_600_000) }) };
+        let usage: BTreeMap<String, Usage> = ["default", "orca"].iter().map(|a| (a.to_string(), spent.clone())).collect();
+        let (f, _, _, dir) = setup(Fake {
+            t: Mutex::new(on_orca()),
+            accounts: vec![acc("default"), acc("orca")],
+            usage,
+            now: now + 3,
+            mcps: crate::mcps::sample(),
+            used: used.clone(),
+            ..Default::default()
+        });
+        assert_eq!(f.limited(hit("t5"))["waiting"], true);
+        assert_eq!(failover::load_from(&dir.join("failover.json")).waiting[0].uses, used);
         let _ = std::fs::remove_dir_all(&dir);
         // A session that used no server: the mod's order, as before.
         let (f, _, _, dir) = setup(Fake { t: Mutex::new(on_orca()), accounts: vec![acc("default"), acc("orca"), acc("third")], now: now + 2, mcps: map, ..Default::default() });
