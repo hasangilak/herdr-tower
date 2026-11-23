@@ -45,6 +45,7 @@ mod install;
 mod introduce;
 mod launch;
 mod links;
+mod mcps;
 mod merges;
 mod missions;
 mod names;
@@ -503,6 +504,11 @@ enum Cmd {
         /// Not kept as an act of its own: `tower launch` keeps one for the whole space.
         #[arg(long, hide = true)]
         no_act: bool,
+        /// An MCP server its task needs (Figma, Sentry, YouTrack, or a server's own name; repeat it, or
+        /// separate several with commas): it starts on an account that has it connected, and says which
+        /// and why, or that none has it. The services the task's words name count too. `--account` wins.
+        #[arg(long = "needs-mcp", value_name = "NAME")]
+        needs_mcp: Vec<String>,
         /// Its first task.
         task: Vec<String>,
     },
@@ -565,6 +571,12 @@ enum Cmd {
         /// launched it is kept in the history as the space's own, how it was created.
         #[arg(long, conflicts_with_all = ["draft", "dry_run"])]
         story_file: Option<String>,
+        /// An MCP server the work needs (Figma, Sentry, YouTrack, or a server's own name; repeat it or
+        /// separate with commas): its sessions open on an account that has it connected (`--account`
+        /// wins; the setup's is kept when it has it), and the receipt says which and why, or that none
+        /// has it. The services the goal's words name count too.
+        #[arg(long = "needs-mcp", value_name = "NAME", conflicts_with = "draft")]
+        needs_mcp: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -640,9 +652,12 @@ enum Cmd {
     /// usage, then every tower and session by space with the account it runs on, and those the failover moved.
     /// `tower accounts browser [<account> [<browser>]]`: the browser each account's links open in (its
     /// sessions' Artifacts and sign-in pages, and the links the tower opens of it): brave, chrome, safari,
-    /// firefox, arc, edge, an app's name, or system (the Mac's default).
+    /// firefox, arc, edge, an app's name, or system (the Mac's default). Each account's MCP servers are
+    /// listed under it (its claude.ai connectors, its plugins' servers, its local ones: connected, needing
+    /// sign-in or failing, as `claude mcp list` under that account said); `tower accounts mcp [<account>]`:
+    /// every server with its URL or command; `--refresh`: read them again now.
     Accounts {
-        /// `browser [<account> [<browser>]]`.
+        /// `browser [<account> [<browser>]]`, or `mcp [<account>]`.
         words: Vec<String>,
         /// Another machine's accounts.
         #[arg(long)]
@@ -650,6 +665,9 @@ enum Cmd {
         /// Usage, and who runs on which account.
         #[arg(long)]
         usage: bool,
+        /// Read every account's MCP servers again now (`claude mcp list` under each), not what was read last.
+        #[arg(long)]
+        refresh: bool,
         /// As JSON (also when not printed to a terminal).
         #[arg(long)]
         json: bool,
@@ -1224,12 +1242,12 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Agents { all } => agents(all),
-        Cmd::Start { account, name, cwd, on, space, new_space, no_watch, agenda, title, plan_id, plan_stage, no_track, no_worktree, no_act, task } => {
+        Cmd::Start { account, name, cwd, on, space, new_space, no_watch, agenda, title, plan_id, plan_stage, no_track, no_worktree, no_act, needs_mcp, task } => {
             let tag = (!no_track).then(|| agenda::Tag { agenda, title: title.unwrap_or_default(), plan_id: plan_id.unwrap_or_default(), stage: plan_stage.unwrap_or_default(), ..Default::default() });
             let space = space.map(|s| spaces::Asked { name: s, new: new_space });
-            start(account.as_deref(), &name, cwd, on.as_deref(), space.as_ref(), no_watch, tag, &task.join(" "), no_worktree, !no_act)
+            start(account.as_deref(), &name, cwd, on.as_deref(), space.as_ref(), no_watch, tag, &task.join(" "), no_worktree, !no_act, &needs_mcp)
         }
-        Cmd::Launch { goal, setup, name, dry_run, draft, adjust, prior, repo, title, done_when, account, plan, review, no_review, story_file, json } => {
+        Cmd::Launch { goal, setup, name, dry_run, draft, adjust, prior, repo, title, done_when, account, plan, review, no_review, story_file, needs_mcp, json } => {
             let goal = goal.join(" ");
             if draft {
                 ticket::cmd(&goal, setup.as_deref(), adjust.as_deref(), prior.as_deref(), json)
@@ -1250,6 +1268,7 @@ fn run(cli: Cli) -> Result<()> {
                     plan: plan.as_deref(),
                     review,
                     story: story_file.as_deref(),
+                    needs_mcp: &needs_mcp,
                     // Run by a space's own tower with no --name: into its space, never a new one by accident.
                     home: home_space.as_deref(),
                 };
@@ -1278,9 +1297,12 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Accounts { words, .. } if words.first().is_some_and(|w| w == "browser") => accounts_browser(&words[1..]),
-        Cmd::Accounts { words, .. } if !words.is_empty() => bail!("tower accounts: no {:?} (only `tower accounts browser [<account> [<browser>]]`)", words[0]),
+        Cmd::Accounts { words, refresh, json, .. } if words.first().is_some_and(|w| w == "mcp" || w == "mcps") => accounts_mcp(words.get(1).map(String::as_str), refresh, json),
+        Cmd::Accounts { words, .. } if !words.is_empty() => {
+            bail!("tower accounts: no {:?} (only `tower accounts browser [<account> [<browser>]]` and `tower accounts mcp [<account>]`)", words[0])
+        }
         Cmd::Accounts { usage: true, json, .. } => accounts_usage(json),
-        Cmd::Accounts { on, .. } => list_accounts(on.as_deref()),
+        Cmd::Accounts { on, refresh, json, .. } => list_accounts(on.as_deref(), refresh, json),
         Cmd::JobRunning { action, what, pid, until, minutes, session } => {
             job_running(&action, what.as_deref().unwrap_or(""), pid, until.as_deref().unwrap_or(""), minutes, session.as_deref())
         }
@@ -2574,6 +2596,7 @@ fn start(
     task: &str,
     no_worktree: bool,
     keep_act: bool,
+    needs_mcp: &[String],
 ) -> Result<()> {
     // `tower` and `tower-…` are the towers' own terminals: a session called so would be taken for one.
     if let Some(why) = brain::not_a_sessions_name(name) {
@@ -2642,8 +2665,8 @@ fn start(
             (l, cca)
         }
     };
-    let account = accounts::resolve(account, &known)?;
-    let account_why = match (&account, &asked_account) {
+    let mut account = accounts::resolve(account, &known)?;
+    let mut account_why = match (&account, &asked_account) {
         (None, _) => "none: no accounts are known here, so it runs plain claude".to_string(),
         (Some(a), Some(asked)) if a.eq_ignore_ascii_case(asked) => "as asked".to_string(),
         (Some(_), Some(asked)) => format!("what \"{asked}\" names"),
@@ -2722,6 +2745,19 @@ fn start(
         (Some(b), true) => b,
         (None, _) => task.to_string(),
     };
+    // The MCP servers its task needs (`--needs-mcp`, and the services its words name): an
+    // account that has them connected, unless one was asked for; what none has is said.
+    let want = mcps::Want { needs: &[], asked: asked_account.as_ref().and(account.as_deref()), fallback: account.as_deref(), folder: cwd.as_deref() };
+    let mcp = mcp_route(&want, needs_mcp, task, on, &known, &mcps::load(), mcps::current, &|a| !failover::usable(a));
+    if let Some((c, _)) = &mcp {
+        if c.moved {
+            account = Some(c.account.clone());
+            account_why = c.why.clone();
+        } else if !c.why.is_empty() {
+            account_why = format!("{account_why}; {}", c.why);
+        }
+        notes.extend(c.notes.iter().cloned());
+    }
     let cca = cca.unwrap_or_else(|| "cca".into());
     // Its task list on, unless turned off (`[sessions] todo_tools`): its progress shows as step N of M.
     let todo_tools = config::todo_tools();
@@ -2808,7 +2844,7 @@ fn start(
     let given = made.as_ref().map(|m| m.place.clone());
     // What was settled without asking, for the receipt and for `tower undo`.
     let folder = project.clone().or_else(|| on.is_none().then(|| std::env::current_dir().ok().map(|d| d.to_string_lossy().into_owned())).flatten());
-    let assumed = json!({
+    let mut assumed = json!({
         "account": account, "account_why": account_why,
         "model": "default model", "model_why": "none was asked for: a session starts on its account's model",
         "folder": folder, "folder_why": folder_why,
@@ -2821,6 +2857,10 @@ fn start(
         "space": placed, "space_why": if placed.is_some() { space_why } else { "none: no Herdr window shows one".to_string() },
         "name": name, "name_why": "as asked",
     });
+    if let Some((c, needs)) = &mcp {
+        assumed["mcp_needs"] = json!(needs);
+        assumed["mcp_notes"] = json!(c.notes);
+    }
     // Which terminal it is: an address can come back for another one.
     let made_ms = hc::get(&address).and_then(|t| hc::created_ms(&t));
     let act = match keep_act && protocol::is_running() {
@@ -3518,12 +3558,60 @@ fn accounts_browser(words: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn list_accounts(on: Option<&str>) -> Result<()> {
+/// The account for a task's MCP needs (`--needs-mcp`, and the services its
+/// words name: `mcps::needs_of`), as `mcps::choose` has it. None: it needs
+/// none, or no accounts are known. On another machine its accounts' servers
+/// aren't read: that is said, and the account stays.
+/// (`cached`: what was read last; `fresh`: read again if it is old, only
+/// when the task needs one; `out`: an account out of usage now.)
+#[allow(clippy::too_many_arguments)]
+fn mcp_route(
+    want: &mcps::Want,
+    asked: &[String],
+    task: &str,
+    on: Option<&str>,
+    known: &[accounts::Account],
+    cached: &mcps::Map,
+    fresh: impl FnOnce() -> mcps::Map,
+    out: &dyn Fn(&str) -> bool,
+) -> Option<(mcps::Choice, Vec<String>)> {
+    if known.is_empty() {
+        return None;
+    }
+    let needs = mcps::needs_of(asked, task, cached);
+    if needs.is_empty() {
+        return None;
+    }
+    if let Some(m) = on {
+        let account = want.asked.or(want.fallback).unwrap_or_default().to_string();
+        let note = format!("the MCP servers it needs ({}) aren't checked on {m}: only this Mac's accounts' are read", needs.join(", "));
+        return Some((mcps::Choice { account, moved: false, why: String::new(), notes: vec![note] }, needs));
+    }
+    let map = fresh();
+    mcps::choose(&mcps::Want { needs: &needs, ..*want }, known, &map, out).map(|c| (c, needs))
+}
+
+/// Every account's MCP servers, for `tower accounts`: read now with
+/// `--refresh`, else what was read last unless it is stale (`mcps::current`).
+fn mcp_map(refresh: bool) -> mcps::Map {
+    if refresh {
+        return mcps::refresh().unwrap_or_else(|e| {
+            eprintln!("tower: couldn't read the accounts' MCP servers now ({e:#}): what was read last");
+            mcps::load()
+        });
+    }
+    mcps::current()
+}
+
+fn list_accounts(on: Option<&str>, refresh: bool, json_out: bool) -> Result<()> {
     let list = match on {
         None => accounts::list()?,
         Some(m) => accounts::list_on(m),
     };
-    if std::io::stdout().is_terminal() {
+    // Only this Mac's accounts' servers are read.
+    let map = if on.is_none() && !list.is_empty() { mcp_map(refresh) } else { mcps::Map::default() };
+    let now = history::now_ms();
+    if std::io::stdout().is_terminal() && !json_out {
         if list.is_empty() {
             println!(
                 "No Claude accounts: the claude-accounts mod (cca) isn't installed{}.",
@@ -3532,9 +3620,66 @@ fn list_accounts(on: Option<&str>) -> Result<()> {
         }
         for (i, a) in list.iter().enumerate() {
             println!("{} {:<12} {:<28} links in {}", if i == 0 { "*" } else { " " }, a.name, a.email, accounts::browser_word(a.browser.as_deref()));
+            match map.of(&a.name) {
+                Some(o) => println!("    MCP: {}  ({})", mcps::line(o), mcps::checked_words(o, now)),
+                None if on.is_none() => println!("    MCP: not read yet (tower accounts --refresh)"),
+                None => {}
+            }
+        }
+        if on.is_some() && !list.is_empty() {
+            println!("(MCP servers are only read for this Mac's accounts.)");
         }
     } else {
-        print_json(&json!({ "default": list.first().map(|a| &a.name), "accounts": list }));
+        let accounts: Vec<Value> = list
+            .iter()
+            .map(|a| {
+                let mut v = json!(a);
+                if let Some(o) = map.of(&a.name) {
+                    let sum = mcps::summary(o);
+                    v["mcp"] = json!({
+                        "connected": sum.usable, "needs_sign_in": sum.needs_sign_in, "failing": sum.failing,
+                        "servers": o.servers, "dir": o.dir, "checked_ms": o.checked_ms, "read_ms": o.read_ms, "error": o.error,
+                    });
+                }
+                v
+            })
+            .collect();
+        print_json(&json!({ "default": list.first().map(|a| &a.name), "accounts": accounts, "mcp_read_ms": (map.at_ms > 0).then_some(map.at_ms) }));
+    }
+    Ok(())
+}
+
+/// `tower accounts mcp [<account>]`: every account's MCP servers, one a
+/// line, with where each comes from and what it reaches.
+fn accounts_mcp(only: Option<&str>, refresh: bool, json_out: bool) -> Result<()> {
+    let list = accounts::list()?;
+    if list.is_empty() {
+        bail!("no Claude accounts: the claude-accounts mod (cca) isn't installed");
+    }
+    let only = match only {
+        Some(w) => Some(accounts::resolve(Some(w), &list)?.unwrap_or_default()),
+        None => None,
+    };
+    let map = mcp_map(refresh);
+    let shown: Vec<&mcps::Of> = list.iter().filter(|a| only.as_ref().is_none_or(|o| *o == a.name)).filter_map(|a| map.of(&a.name)).collect();
+    if json_out || !std::io::stdout().is_terminal() {
+        print_json(&json!({ "read_ms": (map.at_ms > 0).then_some(map.at_ms), "accounts": shown }));
+        return Ok(());
+    }
+    if shown.is_empty() {
+        println!("The accounts' MCP servers aren't read yet: tower accounts mcp --refresh.");
+    }
+    let now = history::now_ms();
+    for o in shown {
+        println!("{}  ({}{})", o.account, mcps::checked_words(o, now), if o.dir.is_empty() { String::new() } else { format!("; profile {}", o.dir) });
+        if o.servers.is_empty() {
+            println!("  no MCP servers");
+        }
+        for s in &o.servers {
+            let place = s.project.as_deref().map(|p| format!(" in {p} only")).unwrap_or_default();
+            println!("  {:<14} {:<9} {:<26} {}{place}", s.label, s.source.word(), s.status.word(), s.target);
+        }
+        println!();
     }
     Ok(())
 }
@@ -3621,13 +3766,53 @@ pub fn show_terminal(address: &str) -> Result<()> {
     }
 }
 
+/// A command line, parsed as `tower` parses it, on a thread with the stack
+/// the program's own main thread has: clap builds every command first, and
+/// in a debug build that takes more than a test thread's 2 MiB.
+#[cfg(test)]
+pub(crate) fn parse_args(args: &[&str]) -> Result<Cmd, clap::Error> {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    std::thread::Builder::new().stack_size(8 << 20).spawn(move || Cli::try_parse_from(args).map(|c| c.cmd)).expect("a thread").join().expect("parsed")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn tower_start_takes_the_account_that_has_the_mcp_its_task_needs() {
+        let known: Vec<accounts::Account> = ["default", "orca"].iter().map(|n| accounts::Account { name: n.to_string(), email: String::new(), browser: None }).collect();
+        let map = mcps::sample();
+        let none_out = |_: &str| false;
+        let route = |asked: Option<&str>, flag: &[&str], task: &str, on: Option<&str>| {
+            let flag: Vec<String> = flag.iter().map(|f| f.to_string()).collect();
+            let want = mcps::Want { needs: &[], asked, fallback: Some(asked.unwrap_or("default")), folder: None };
+            mcp_route(&want, &flag, task, on, &known, &map, || map.clone(), &none_out)
+        };
+        // Nothing named: nothing read, nothing said.
+        assert!(route(None, &[], "fix the login bug", None).is_none());
+        // Its words name Sentry: orca, and why.
+        let (c, needs) = route(None, &[], "look at the Sentry crash", None).unwrap();
+        assert_eq!((c.account.as_str(), c.moved, needs), ("orca", true, vec!["Sentry".to_string()]));
+        // --needs-mcp youtrack: nobody has it, said plainly; it stays on the default.
+        let (c, _) = route(None, &["youtrack"], "tidy up", None).unwrap();
+        assert_eq!((c.account.as_str(), c.moved), ("default", false));
+        assert_eq!(c.notes, ["no account has YouTrack (neither default nor orca), so it runs on default without it"]);
+        // --account default wins; what it lacks is said.
+        let (c, _) = route(Some("default"), &["sentry"], "x", None).unwrap();
+        assert_eq!((c.account.as_str(), c.moved, c.notes.len()), ("default", false, 1));
+        // On another machine: not read there, and said so.
+        let (c, _) = route(None, &["sentry"], "x", Some("vps")).unwrap();
+        assert_eq!((c.account.as_str(), c.moved), ("default", false));
+        assert!(c.notes[0].contains("aren't checked on vps"), "{:?}", c.notes);
+        // No accounts (no mod): nothing.
+        let want = mcps::Want { needs: &[], asked: None, fallback: None, folder: None };
+        assert!(mcp_route(&want, &["sentry".into()], "x", None, &[], &map, || map.clone(), &none_out).is_none());
+    }
+
+    #[test]
     fn a_launch_says_whether_its_prs_get_a_reviewer() {
-        let flags = |args: &[&str]| match Cli::try_parse_from([&["tower", "launch", "Fix the login"], args].concat()).map(|c| c.cmd) {
+        let flags = |args: &[&str]| match parse_args(&[&["tower", "launch", "Fix the login"], args].concat()) {
             Ok(Cmd::Launch { review, no_review, .. }) => Ok((review, no_review)),
             Ok(_) => Err("another command".to_string()),
             Err(e) => Err(e.kind().to_string()),
@@ -3638,8 +3823,8 @@ mod tests {
         assert!(flags(&["--review", "--no-review"]).is_err(), "one or the other");
         assert!(flags(&["--draft", "--no-review"]).is_err(), "a draft opens nothing to review");
         // The space's own switch, and the reviews' commands.
-        assert!(matches!(Cli::try_parse_from(["tower", "space", "review", "fix-login", "off"]).map(|c| c.cmd), Ok(Cmd::Space { ref what, .. }) if what == "review"));
-        let report = Cli::try_parse_from(["tower", "review", "report", "acme/shop#12", "--critical", "2", "a crash", "on empty carts"]).map(|c| c.cmd);
+        assert!(matches!(parse_args(&["tower", "space", "review", "fix-login", "off"]), Ok(Cmd::Space { ref what, .. }) if what == "review"));
+        let report = parse_args(&["tower", "review", "report", "acme/shop#12", "--critical", "2", "a crash", "on empty carts"]);
         assert!(matches!(report, Ok(Cmd::Review { ref action, ref pr, critical: Some(2), ref text, .. }) if action.as_deref() == Some("report") && pr.as_deref() == Some("acme/shop#12") && text.join(" ") == "a crash on empty carts"));
     }
 }

@@ -257,6 +257,17 @@ fn space_named(shared: &Shared, asked: &str) -> String {
     crate::spaces::resolve(asked, &names).unwrap_or_else(|| asked.trim().to_string())
 }
 
+/// The radar line, and what the Claude accounts have of the services the
+/// user's words name (`[mcp] Sentry: connected on orca; needs sign-in on
+/// default`), as last read: the brain's instructions say it as of their
+/// writing, this as of now.
+fn with_mcp(radar: String, text: &str) -> String {
+    match crate::mcps::radar_note(text, &crate::mcps::load(), &[]) {
+        Some(note) => format!("{radar} {note}"),
+        None => radar,
+    }
+}
+
 /// The radar line a space's brain gets: its own sessions only.
 fn radar_of(shared: &Shared, space: &str) -> String {
     let (mine, agents) = shared.with(|s| {
@@ -281,14 +292,14 @@ fn radar_of(shared: &Shared, space: &str) -> String {
 /// space named in front).
 pub fn ask(space: Option<&str>, text: &str, shared: &Shared, source: &str) -> Result<()> {
     let Some(asked) = space.map(str::trim).filter(|s| !s.is_empty()) else {
-        return brain::ask(text, &super::stt::radar(shared), source);
+        return brain::ask(text, &with_mcp(super::stt::radar(shared), text), source);
     };
     let name = space_named(shared, asked);
     // The request is that space's, by its whole name (the agenda reads it so).
     shared.update(|s| s.heard_space = Some(name.clone()));
     let to = target(Some(&name));
     if let Some(own) = to.space.clone() {
-        match brain::ask_as(&to, text, &radar_of(shared, &own), source) {
+        match brain::ask_as(&to, text, &with_mcp(radar_of(shared, &own), text), source) {
             Ok(()) => {
                 eprintln!("[brains] asked of {} ({own})", to.name);
                 // A request there: it may add to what the space is for.
@@ -298,7 +309,7 @@ pub fn ask(space: Option<&str>, text: &str, shared: &Shared, source: &str) -> Re
             Err(e) => eprintln!("[brains] {} can't take the request ({e:#}): to the main brain", to.name),
         }
     }
-    brain::ask(&in_space(&name, text), &super::stt::radar(shared), source)?;
+    brain::ask(&in_space(&name, text), &with_mcp(super::stt::radar(shared), text), source)?;
     super::goals::heard(&name, text, crate::history::now_ms(), "the main tower");
     Ok(())
 }

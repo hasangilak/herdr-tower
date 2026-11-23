@@ -88,6 +88,10 @@ pub trait Hands: Send + Sync {
     fn now(&self) -> u64;
     /// Whether the tower leaves this terminal alone (a test session for the real tower, the rest for a test one).
     fn left_alone(&self, t: &Value) -> bool;
+    /// Every account's MCP servers, as last read (`crate::mcps`).
+    fn mcps(&self) -> crate::mcps::Map;
+    /// The MCP servers a session used, by tool key: from `transcript`, else its registry's.
+    fn used_mcps(&self, address: &str, transcript: &str) -> Vec<String>;
 }
 
 #[derive(Clone)]
@@ -264,12 +268,15 @@ impl Failover {
         }
         let from = self.hands.account_of(&t).unwrap_or_else(|| list[0].name.clone());
         let until = limit.resets_ms.or_else(|| usage.get(&from).and_then(|u| u.spent_until(now)));
-        let pick = {
+        // The MCP servers it used: where it goes should have them connected too (`mcps::lost`).
+        let uses = self.hands.used_mcps(&address, &hit.transcript);
+        let map = self.hands.mcps();
+        let (pick, lost) = {
             let mut b = lock(&self.book);
             b.mark_out(&from, &limit, until, now);
-            let pick = failover::pick(&list, &usage, &b, Some(&from), now);
+            let picked = failover::pick_keeping(&list, &usage, &b, Some(&from), now, &|to| crate::mcps::lost(&map, &from, to, &uses));
             self.save(&b);
-            pick
+            picked
         };
         // A tower's space: as the brains know it, else as its own folder's card says.
         let space = crate::spaces::space_of(&t)
@@ -278,17 +285,18 @@ impl Failover {
         let name = hc::name(&t).unwrap_or(&address).to_string();
         let prompt = if hit.prompt.trim().is_empty() { self.hands.last_prompt(&address) } else { hit.prompt.clone() };
         eprintln!(
-            "[failover] {address} ({name}) hit the {from} account's {}{}: {pick:?}",
+            "[failover] {address} ({name}) hit the {from} account's {}{}: {pick:?}{}",
             limit.what,
-            until.map(|u| format!(", out until {}", failover::when(u, now))).unwrap_or_default()
+            until.map(|u| format!(", out until {}", failover::when(u, now))).unwrap_or_default(),
+            if lost.is_empty() { String::new() } else { format!(", losing {}", lost.join(", ")) }
         );
         match pick {
             Pick::To(to) => {
                 self.set_moving(&address, true);
                 let me = self.clone();
-                let answer = json!({ "moving": true, "from": from, "to": to });
+                let answer = json!({ "moving": true, "from": from, "to": to, "lost": lost });
                 let _ = thread::Builder::new().name("failover-move".into()).spawn(move || {
-                    me.carry(&address, &hit, &name, space, &from, &to, &limit, until, &prompt);
+                    me.carry(&address, &hit, &name, space, &from, &to, &limit, until, &prompt, &lost);
                     me.set_moving(&address, false);
                     me.hands.released(&address);
                 });
@@ -305,6 +313,7 @@ impl Failover {
                         since_ms: now,
                         limit,
                         prompt,
+                        uses,
                     },
                     first,
                 );
@@ -328,6 +337,7 @@ impl Failover {
         limit: &Limit,
         until: Option<u64>,
         prompt: &str,
+        lost: &[String],
     ) {
         let now = self.hands.now();
         let who = failover::called(name, space.as_deref(), hit.tower.as_deref());
@@ -343,9 +353,11 @@ impl Failover {
             session_id: hit.session_id.clone(),
             how: "moved".into(),
             why: String::new(),
+            lost: lost.to_vec(),
         };
         let (line, status) = match &done {
-            Ok(()) => (failover::told(&who, from, to, limit, until, now), "moved"),
+            // A server it used that `to` lacks is said with the move.
+            Ok(()) => (format!("{}{}", failover::told(&who, from, to, limit, until, now), failover::lost_words(to, lost)), "moved"),
             Err(e) => {
                 (m.how, m.why) = ("failed".into(), format!("{e:#}"));
                 (format!("{} hit {from}'s {} and couldn't move to {to}: {e:#}.", failover::opening(&who), limit.what), "failed")
@@ -368,7 +380,7 @@ impl Failover {
             ..Default::default()
         });
         if done.is_ok() {
-            self.go_on(address, name, space.as_deref(), hit.tower.as_deref(), from, to, limit, prompt);
+            self.go_on(address, name, space.as_deref(), hit.tower.as_deref(), from, to, limit, prompt, lost);
         }
     }
 
@@ -385,6 +397,7 @@ impl Failover {
         to: &str,
         limit: &Limit,
         prompt: &str,
+        lost: &[String],
     ) {
         let sent = match tower {
             Some(t) if prompt.trim().is_empty() => {
@@ -392,7 +405,8 @@ impl Failover {
                 return;
             }
             Some(t) => self.hands.note_tower(t, address, space, prompt),
-            None => self.hands.note_session(address, &failover::carry_on(from, to, limit, prompt)),
+            // (And what it used that isn't here now.)
+            None => self.hands.note_session(address, &format!("{}{}", failover::carry_on(from, to, limit, prompt), failover::lost_note(to, lost))),
         };
         if let Err(e) = sent {
             eprintln!("[failover] {address} ({name}): what it was doing couldn't be sent again: {e:#}");
@@ -537,6 +551,7 @@ impl Failover {
             return;
         }
         let Ok((list, usage)) = self.hands.accounts() else { return };
+        let map = self.hands.mcps();
         let mut left: Vec<Waiting> = vec![];
         let mut went: Vec<String> = vec![];
         let mut first: Option<(String, u64)> = None;
@@ -577,23 +592,23 @@ impl Failover {
                 went.push(w.address.clone());
                 continue;
             }
-            match failover::pick(&list, &usage, &book, Some(&own), now) {
-                Pick::To(to) => {
+            match failover::pick_keeping(&list, &usage, &book, Some(&own), now, &|to| crate::mcps::lost(&map, &own, to, &w.uses)) {
+                (Pick::To(to), lost) => {
                     self.set_moving(&w.address, true);
                     let hit = Hit { terminal: w.address.clone(), tower: w.tower.clone(), prompt: w.prompt.clone(), ..Default::default() };
                     let until = book.out.get(&own).and_then(|o| failover::out_until(o, now));
-                    self.carry(&w.address, &hit, &w.name, w.space.clone(), &own, &to, &w.limit, until, &w.prompt);
+                    self.carry(&w.address, &hit, &w.name, w.space.clone(), &own, &to, &w.limit, until, &w.prompt, &lost);
                     self.set_moving(&w.address, false);
                     went.push(w.address.clone());
                 }
-                Pick::AllOut { first: f } => {
+                (Pick::AllOut { first: f }, _) => {
                     first = match (first, f) {
                         (Some(a), Some(b)) => Some(if b.1 < a.1 { b } else { a }),
                         (a, b) => a.or(b),
                     };
                     left.push(w);
                 }
-                Pick::NoAccounts => left.push(w),
+                (Pick::NoAccounts, _) => left.push(w),
             }
         }
         {
@@ -663,17 +678,25 @@ impl Failover {
         }
         let (list, usage) = self.hands.accounts()?;
         let from = self.hands.account_of(&t).or_else(|| list.first().map(|a| a.name.clone())).unwrap_or_default();
-        let to = match to {
-            Some(w) => crate::accounts::resolve(Some(w), &list)?.context("no accounts")?,
-            None => match failover::pick(&list, &usage, &lock(&self.book), Some(&from), self.hands.now()) {
-                Pick::To(a) => a,
+        let registry = super::sessions::registry().get(&address);
+        // The MCP servers it used: kept where it can be, and what is lost said.
+        let uses = self.hands.used_mcps(&address, registry.as_ref().map(|s| s.transcript.as_str()).unwrap_or(""));
+        let map = self.hands.mcps();
+        let lost_on = |to: &str| crate::mcps::lost(&map, &from, to, &uses);
+        let (to, lost) = match to {
+            Some(w) => {
+                let to = crate::accounts::resolve(Some(w), &list)?.context("no accounts")?;
+                let lost = lost_on(&to);
+                (to, lost)
+            }
+            None => match failover::pick_keeping(&list, &usage, &lock(&self.book), Some(&from), self.hands.now(), &lost_on) {
+                (Pick::To(a), lost) => (a, lost),
                 _ => bail!("no other account has usage left"),
             },
         };
         if to == from {
             bail!("{address} runs on {to} already");
         }
-        let registry = super::sessions::registry().get(&address);
         let tower = hc::name(&t).filter(|n| crate::brains::is_space_brain(n) || *n == crate::brain::name()).map(String::from);
         let hit = Hit {
             terminal: address.clone(),
@@ -686,14 +709,16 @@ impl Failover {
         let space = crate::spaces::space_of(&t);
         self.set_moving(&address, true);
         let me = self.clone();
-        let (a, f, to2) = (address.clone(), from.clone(), to.clone());
+        let (a, f, to2, lost2) = (address.clone(), from.clone(), to.clone(), lost.clone());
         thread::spawn(move || {
             let done = me.move_one(&a, &hit, &to2);
+            let moved_ok = done.is_ok();
             let now = me.hands.now();
             let line = match &done {
                 Ok(()) => format!(
-                    "{} moved from the {f} account to {to2}, as you asked.",
-                    failover::opening(&failover::called(&name, space.as_deref(), hit.tower.as_deref()))
+                    "{} moved from the {f} account to {to2}, as you asked.{}",
+                    failover::opening(&failover::called(&name, space.as_deref(), hit.tower.as_deref())),
+                    failover::lost_words(&to2, &lost2)
                 ),
                 Err(e) => format!(
                     "{} couldn't move to {to2}: {e:#}.",
@@ -713,13 +738,14 @@ impl Failover {
                 session_id: hit.session_id.clone(),
                 how: if done.is_ok() { "moved".into() } else { "failed".into() },
                 why: done.err().map(|e| format!("{e:#}")).unwrap_or_default(),
+                lost: if moved_ok { lost2.clone() } else { vec![] },
             });
             me.save(&b);
             drop(b);
             me.set_moving(&a, false);
             me.hands.released(&a);
         });
-        Ok(json!({ "moving": address, "from": from, "to": to }))
+        Ok(json!({ "moving": address, "from": from, "to": to, "lost": lost }))
     }
 
     /// `tower failover clear`: forget what is out and what waits.
@@ -749,6 +775,18 @@ struct Real {
 impl Hands for Real {
     fn get(&self, address: &str) -> Option<Value> {
         hc::get(address)
+    }
+
+    fn mcps(&self) -> crate::mcps::Map {
+        crate::mcps::load()
+    }
+
+    fn used_mcps(&self, address: &str, transcript: &str) -> Vec<String> {
+        let path = match transcript.trim() {
+            "" => super::sessions::registry().get(address).map(|s| s.transcript).unwrap_or_default(),
+            t => t.to_string(),
+        };
+        crate::mcps::used_in_file(&path)
     }
 
     fn keep(&self, address: &str, on: bool) -> Result<()> {
@@ -850,6 +888,8 @@ mod tests {
         usage: BTreeMap<String, Usage>,
         calls: Mutex<Vec<String>>,
         now: u64,
+        mcps: crate::mcps::Map,
+        used: Vec<String>,
     }
 
     impl Fake {
@@ -921,6 +961,12 @@ mod tests {
         }
         fn left_alone(&self, _: &Value) -> bool {
             false
+        }
+        fn mcps(&self) -> crate::mcps::Map {
+            self.mcps.clone()
+        }
+        fn used_mcps(&self, _: &str, _: &str) -> Vec<String> {
+            self.used.clone()
         }
     }
 
@@ -1078,6 +1124,62 @@ mod tests {
             "{calls:?}"
         );
         assert_eq!(calls.last().unwrap(), "tower tower-sandbox t9 [voice] how is the sandbox doing?", "its own prompt, as it was");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_move_keeps_the_mcp_servers_a_session_used_or_says_what_it_loses() {
+        let now = crate::history::now_ms();
+        // Here: Sentry is connected on orca only. A session on orca that used Sentry hits orca's limit.
+        let on_orca = || {
+            let mut t = session("t5", "fix-login");
+            t["account"] = "orca".into();
+            t
+        };
+        let used = vec!["plugin_sentry_sentry".to_string(), "claude_ai_Claude_Docs".into(), "claude-in-chrome".into()];
+        // Only default is left: it goes there all the same, and the user and the session are told what it lost.
+        let (f, fake, _, dir) = setup(Fake {
+            t: Mutex::new(on_orca()),
+            accounts: vec![acc("default"), acc("orca")],
+            now,
+            mcps: crate::mcps::sample(),
+            used: used.clone(),
+            ..Default::default()
+        });
+        let v = f.limited(hit("t5"));
+        assert_eq!((v["from"].as_str(), v["to"].as_str(), v["lost"].clone()), (Some("orca"), Some("default"), json!(["Sentry"])), "{v}");
+        settled(&f, "t5");
+        let calls = fake.calls();
+        let told = calls.iter().find(|c| c.starts_with("tell moved")).unwrap();
+        assert!(told.ends_with(". It used Sentry, which default doesn't have connected."), "{told}");
+        let note = calls.iter().find(|c| c.starts_with("note t5")).unwrap();
+        assert!(note.contains("Note: you used Sentry before the move, and the default account doesn't have it connected"), "{note}");
+        let b = failover::load_from(&dir.join("failover.json"));
+        assert_eq!(b.moves[0].lost, ["Sentry"]);
+        let _ = std::fs::remove_dir_all(&dir);
+        // A third account has Sentry connected: it goes there, past default (first in the mod's order), and nothing is lost.
+        let mut map = crate::mcps::sample();
+        let mut third = map.of("orca").unwrap().clone();
+        third.account = "third".into();
+        map.accounts.push(third);
+        let (f, fake, _, dir) = setup(Fake {
+            t: Mutex::new(on_orca()),
+            accounts: vec![acc("default"), acc("orca"), acc("third")],
+            now: now + 1,
+            mcps: map.clone(),
+            used: used.clone(),
+            ..Default::default()
+        });
+        let v = f.limited(hit("t5"));
+        assert_eq!((v["to"].as_str(), v["lost"].clone()), (Some("third"), json!([])), "{v}");
+        settled(&f, "t5");
+        assert!(fake.calls().iter().any(|c| c.starts_with("tell moved") && c.ends_with(".")), "{:?}", fake.calls());
+        assert!(!fake.calls().iter().any(|c| c.contains("It used")), "nothing lost, nothing said");
+        let _ = std::fs::remove_dir_all(&dir);
+        // A session that used no server: the mod's order, as before.
+        let (f, _, _, dir) = setup(Fake { t: Mutex::new(on_orca()), accounts: vec![acc("default"), acc("orca"), acc("third")], now: now + 2, mcps: map, ..Default::default() });
+        assert_eq!(f.limited(hit("t5"))["to"], "default");
+        settled(&f, "t5");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

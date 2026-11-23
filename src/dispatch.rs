@@ -90,6 +90,28 @@ pub struct Task {
     pub constraints: Option<String>,
     #[serde(default)]
     pub uncertain: Option<String>,
+    /// MCP servers it needs (`["sentry"]`, or one name: Figma, YouTrack, a
+    /// server's own name): a new session for it starts on an account that
+    /// has them connected (`tower start --needs-mcp`), and the session in its
+    /// project is passed over for a new one (in a worktree of its own) when
+    /// its account lacks one another account has. What no account has is said.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub needs_mcp: Vec<String>,
+}
+
+/// A name, or a list of them.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match Option::<OneOrMany>::deserialize(d)? {
+        None => vec![],
+        Some(OneOrMany::One(s)) => vec![s],
+        Some(OneOrMany::Many(v)) => v,
+    })
 }
 
 /// A plan's tasks go out as the structured handoff: each task with `plan`
@@ -133,8 +155,8 @@ fn with_handoffs(plan: &mut Plan) -> Result<BTreeMap<String, String>> {
 pub enum Route {
     /// Queued for (or sent to) an existing session.
     Queue { session: String },
-    /// A new session in `cwd`.
-    Start { name: String, cwd: String, worktree: bool },
+    /// A new session in `cwd`. `why`: the session in that folder it passes over, and why.
+    Start { name: String, cwd: String, worktree: bool, why: Option<String> },
 }
 
 /// An agent session that is running, as dispatch needs it.
@@ -145,6 +167,37 @@ pub struct Live {
     pub cwd: String,
     /// `idle`, `working`, ...
     pub status: String,
+    /// The Claude account it runs on (None: not Claude Code, or not told).
+    pub account: Option<String>,
+}
+
+/// What a task's MCP needs say of a session in its project: Some(why) when
+/// it is passed over for a new session (its account lacks a server the
+/// task names in `needs_mcp`, and another account with usage has it).
+pub type Fit<'a> = &'a dyn Fn(&Task, &Live) -> Option<String>;
+
+/// `Fit` from what the accounts have (`crate::mcps`). Only what the task
+/// names in `needs_mcp` passes a session over; what its words name is said
+/// beside it (`mcp_note`), never more.
+pub fn fit_of<'a>(map: &'a crate::mcps::Map, list: &'a [crate::accounts::Account], out: &'a dyn Fn(&str) -> bool) -> impl Fn(&Task, &Live) -> Option<String> + 'a {
+    move |t: &Task, l: &Live| {
+        let needs = crate::mcps::needs_of(&t.needs_mcp, "", map);
+        let account = l.account.as_deref()?;
+        let want = crate::mcps::Want { needs: &needs, asked: None, fallback: Some(account), folder: Some(&l.cwd) };
+        let c = crate::mcps::choose(&want, list, map, out)?;
+        let who = if l.name.is_empty() || l.name == l.address { l.address.clone() } else { format!("{} ({})", l.name, l.address) };
+        c.moved.then(|| format!("{who} runs on {account}: a new session on {}, {}", c.account, c.why))
+    }
+}
+
+/// What is said of a task queued for a session whose account lacks an MCP
+/// server the task needs (named, or in its words). None: it lacks none.
+pub fn mcp_note(t: &Task, account: Option<&str>, folder: &str, map: &crate::mcps::Map, list: &[crate::accounts::Account]) -> Option<String> {
+    let account = account?;
+    let needs = crate::mcps::needs_of(&t.needs_mcp, &t.instruction, map);
+    let want = crate::mcps::Want { needs: &needs, asked: Some(account), fallback: Some(account), folder: Some(folder) };
+    let c = crate::mcps::choose(&want, list, map, &|_| false)?;
+    (!c.notes.is_empty()).then(|| c.notes.join("; "))
 }
 
 pub fn run(json_text: &str, dry_run: bool) -> Result<()> {
@@ -159,8 +212,21 @@ pub fn run(json_text: &str, dry_run: bool) -> Result<()> {
     }
     let stages = with_handoffs(&mut plan)?;
     let order = check(&plan)?;
-    let live = live_sessions();
-    let routes = route(&plan, &order, &live)?;
+    let mut live = live_sessions();
+    // The accounts' MCP servers, when a task needs one (named, or in its words).
+    let cached = crate::mcps::load();
+    let needs_any = plan.tasks.iter().any(|t| !crate::mcps::needs_of(&t.needs_mcp, &t.instruction, &cached).is_empty());
+    if needs_any {
+        // Then each session's account too (`hc ls` rows have no pid: asked of each terminal).
+        for l in live.iter_mut().filter(|l| l.account.is_none()) {
+            l.account = crate::accounts::of_address(&l.address);
+        }
+    }
+    let map = if needs_any { crate::mcps::current() } else { cached };
+    let accounts = if needs_any { crate::accounts::list().unwrap_or_default() } else { vec![] };
+    let out = |a: &str| !crate::failover::usable(a);
+    let fit = fit_of(&map, &accounts, &out);
+    let routes = route_with(&plan, &order, &live, &fit)?;
     if dry_run {
         let v: Vec<Value> =
             order.iter().map(|&i| json!({ "id": plan.tasks[i].id, "route": format!("{:?}", routes[&plan.tasks[i].id]) })).collect();
@@ -190,10 +256,22 @@ pub fn run(json_text: &str, dry_run: bool) -> Result<()> {
             ..Default::default()
         };
         let (line, id, task) = match &routes[&t.id] {
-            Route::Queue { session } => queue(session, &t.instruction, &after, tag)?,
-            Route::Start { name, cwd, worktree } => {
+            Route::Queue { session } => {
+                let (mut line, id, task) = queue(session, &t.instruction, &after, tag)?;
+                // Its account lacks an MCP server the task needs: said (nothing more).
+                let l = live.iter().find(|l| l.address == *session || l.name == *session);
+                if needs_any && let Some(note) = mcp_note(t, l.and_then(|l| l.account.as_deref()), l.map(|l| l.cwd.as_str()).unwrap_or(""), &map, &accounts) {
+                    line.push_str(&format!(" (MCP: {note})"));
+                }
+                (line, id, task)
+            }
+            Route::Start { name, cwd, worktree, why } => {
                 let cwd = if *worktree { make_worktree(cwd, name)? } else { cwd.clone() };
-                start(t, name, &cwd, *worktree, &after, tag)?
+                let (mut line, id, task) = start(t, name, &cwd, *worktree, &after, tag)?;
+                if let Some(why) = why {
+                    line.push_str(&format!(" (not queued for {why})"));
+                }
+                (line, id, task)
             }
         };
         ids.insert(t.id.clone(), id);
@@ -292,7 +370,15 @@ pub fn fill_home(plan: &mut Plan, space: &str) {
     }
 }
 
+#[cfg(test)]
 pub fn route(plan: &Plan, order: &[usize], live: &[Live]) -> Result<BTreeMap<String, Route>> {
+    route_with(plan, order, live, &|_, _| None)
+}
+
+/// `route`, with a session in a task's project passed over when its
+/// account lacks an MCP server the task needs (`fit`): the task gets a new
+/// session, in a worktree of its own beside it.
+pub fn route_with(plan: &Plan, order: &[usize], live: &[Live], fit: Fit) -> Result<BTreeMap<String, Route>> {
     let mut out = BTreeMap::new();
     let mut names: BTreeSet<String> = live.iter().map(|l| l.name.clone()).collect();
     for &i in order {
@@ -330,8 +416,9 @@ pub fn route(plan: &Plan, order: &[usize], live: &[Live]) -> Result<BTreeMap<Str
             .iter()
             .filter(|l| same_folder(&l.cwd, &cwd) || in_worktree(l))
             .min_by_key(|l| (in_worktree(l) != slug.is_some(), rank(l)));
+        let passed = here.filter(|_| !t.isolate).and_then(|l| fit(t, l));
         match here {
-            Some(l) if !t.isolate => {
+            Some(l) if !t.isolate && passed.is_none() => {
                 out.insert(t.id.clone(), Route::Queue { session: l.address.clone() });
             }
             _ => {
@@ -344,9 +431,9 @@ pub fn route(plan: &Plan, order: &[usize], live: &[Live]) -> Result<BTreeMap<Str
                 }
                 names.insert(name.clone());
                 // A second session in a folder that has one gets a worktree.
-                let worktree =
-                    t.isolate && (here.is_some() || plan.tasks.iter().any(|o| o.id != t.id && same_folder(&expand(&o.project), &cwd)));
-                out.insert(t.id.clone(), Route::Start { name, cwd, worktree });
+                let worktree = (t.isolate || passed.is_some())
+                    && (here.is_some() || plan.tasks.iter().any(|o| o.id != t.id && same_folder(&expand(&o.project), &cwd)));
+                out.insert(t.id.clone(), Route::Start { name, cwd, worktree, why: passed });
             }
         }
     }
@@ -391,6 +478,10 @@ fn start_args(t: &Task, name: &str, cwd: &str, own_worktree: bool) -> Vec<String
         if let Some(v) = v {
             args.extend([flag.to_string(), v.clone()]);
         }
+    }
+    // The MCP servers it needs: `tower start` puts it on an account that has them, and says which.
+    for n in &t.needs_mcp {
+        args.extend(["--needs-mcp".to_string(), n.clone()]);
     }
     args
 }
@@ -518,6 +609,7 @@ pub fn live_sessions() -> Vec<Live> {
             name: hc::name(t).unwrap_or("").to_string(),
             cwd: t["foreground"]["cwd"].as_str().or_else(|| t["cwd"].as_str()).unwrap_or("").to_string(),
             status: hc::status_word(t).unwrap_or_default(),
+            account: crate::accounts::of_terminal(t),
         })
         .collect()
 }
@@ -584,6 +676,7 @@ mod tests {
             so_far: None,
             constraints: None,
             uncertain: None,
+            needs_mcp: vec![],
         }
     }
 
@@ -610,8 +703,8 @@ mod tests {
         std::fs::create_dir_all(&web).unwrap();
         let (api, web) = (api.to_string_lossy().into_owned(), web.to_string_lossy().into_owned());
         let live = vec![
-            Live { address: "t4".into(), name: "api-busy".into(), cwd: api.clone(), status: "blocked".into() },
-            Live { address: "t5".into(), name: "api-main".into(), cwd: api.clone(), status: "idle".into() },
+            Live { address: "t4".into(), name: "api-busy".into(), cwd: api.clone(), status: "blocked".into(), account: None },
+            Live { address: "t5".into(), name: "api-main".into(), cwd: api.clone(), status: "idle".into(), account: None },
         ];
         let mut iso = task("c", &api, &[]);
         iso.isolate = true;
@@ -636,7 +729,7 @@ mod tests {
             std::fs::create_dir_all(d).unwrap();
         }
         let s = |p: &std::path::Path| p.to_string_lossy().into_owned();
-        let l = |address: &str, cwd: &std::path::Path, status: &str| Live { address: address.into(), name: address.into(), cwd: s(cwd), status: status.into() };
+        let l = |address: &str, cwd: &std::path::Path, status: &str| Live { address: address.into(), name: address.into(), cwd: s(cwd), status: status.into(), account: None };
         let live = vec![l("t1", &api, "working"), l("t2", &shop, "working"), l("t3", &docs, "idle")];
         let plan = |space: Option<&str>| {
             let mut t = task("a", &s(&api), &[]);
@@ -675,5 +768,53 @@ mod tests {
     fn names_are_short_and_herdr_safe() {
         assert_eq!(default_name("/w/herder-tower", "Add a mute button to the orb", "a"), "herder-tower-mute-button");
         assert_eq!(default_name("/w/x_y", "", "t1"), "x-y");
+    }
+
+    #[test]
+    fn a_task_that_needs_an_mcp_passes_over_a_session_whose_account_lacks_it() {
+        let dir = std::env::temp_dir().join(format!("tower-dispatch-mcp-{}", std::process::id()));
+        let api = dir.join("api");
+        std::fs::create_dir_all(&api).unwrap();
+        let api = api.to_string_lossy().into_owned();
+        let map = crate::mcps::sample();
+        let list: Vec<crate::accounts::Account> =
+            ["default", "orca"].iter().map(|n| crate::accounts::Account { name: n.to_string(), email: String::new(), browser: None }).collect();
+        let none_out = |_: &str| false;
+        let fit = fit_of(&map, &list, &none_out);
+        let on = |account: &str| vec![Live { address: "t5".into(), name: "api-main".into(), cwd: api.clone(), status: "idle".into(), account: Some(account.into()) }];
+        let plan_of = |needs: &[&str], instruction: &str| Plan {
+            request: String::new(),
+            agenda: None,
+            tasks: vec![Task { instruction: instruction.into(), needs_mcp: needs.iter().map(|n| n.to_string()).collect(), ..task("a", &api, &[]) }],
+        };
+        // It names Sentry: api-main runs on default, which has it only needing sign-in: a new session (orca's), in a worktree.
+        let r = route_with(&plan_of(&["sentry"], "look at the crash"), &[0], &on("default"), &fit).unwrap();
+        match &r["a"] {
+            Route::Start { worktree: true, why: Some(why), .. } => {
+                assert_eq!(why, "api-main (t5) runs on default: a new session on orca, the only account with Sentry connected (Sentry: connected on orca; needs sign-in on default)")
+            }
+            other => panic!("{other:?}"),
+        }
+        // A session with no name of its own is called by its address.
+        let unnamed = vec![Live { name: String::new(), ..on("default")[0].clone() }];
+        assert!(matches!(&route_with(&plan_of(&["sentry"], "x"), &[0], &unnamed, &fit).unwrap()["a"], Route::Start { why: Some(w), .. } if w.starts_with("t5 runs on default: a new session on orca")));
+        // On orca already: queued for it, as before.
+        assert_eq!(route_with(&plan_of(&["sentry"], "x"), &[0], &on("orca"), &fit).unwrap()["a"], Route::Queue { session: "t5".into() });
+        // Nobody has YouTrack: no other account would do better, so it is queued (and said).
+        assert_eq!(route_with(&plan_of(&["youtrack"], "x"), &[0], &on("default"), &fit).unwrap()["a"], Route::Queue { session: "t5".into() });
+        // Only its words name Sentry: queued all the same; what its session's account lacks is said.
+        let words = plan_of(&[], "look at the Sentry crash");
+        assert_eq!(route_with(&words, &[0], &on("default"), &fit).unwrap()["a"], Route::Queue { session: "t5".into() });
+        assert_eq!(
+            mcp_note(&words.tasks[0], Some("default"), &api, &map, &list).as_deref(),
+            Some("default has no Sentry connected (Sentry: connected on orca; needs sign-in on default)")
+        );
+        assert_eq!(mcp_note(&words.tasks[0], Some("orca"), &api, &map, &list), None);
+        // The plan's JSON takes one name or a list; `tower start` gets each.
+        let p: Plan = serde_json::from_str(r#"{"tasks":[{"id":"a","instruction":"x","needs_mcp":"sentry"},{"id":"b","instruction":"y","needs_mcp":["figma","youtrack"]},{"id":"c","instruction":"z"}]}"#).unwrap();
+        assert_eq!([p.tasks[0].needs_mcp.clone(), p.tasks[1].needs_mcp.clone(), p.tasks[2].needs_mcp.clone()], [vec!["sentry".to_string()], vec!["figma".into(), "youtrack".into()], vec![]]);
+        let args = start_args(&p.tasks[1], "s", "/w", false);
+        assert_eq!(args[args.len() - 4..], ["--needs-mcp", "figma", "--needs-mcp", "youtrack"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

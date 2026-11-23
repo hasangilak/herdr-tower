@@ -606,7 +606,7 @@ claude-accounts mod (the `cca` command, in the Herdr header) each time.
 and the tower can use it straight away.
 
 ```sh
-tower accounts                      # the accounts cca knows; * is the default
+tower accounts                      # the accounts cca knows; * is the default; their MCP servers under each
 tower start --name fix-login --cwd ~/w/app "look at the login bug"
 tower start --account <name> --name fix-login --cwd ~/w/app "..."
 tower start --on vps --name x "..." # uses cca on that machine, if it has it
@@ -665,6 +665,59 @@ placed right after it in Herdr's list, and linked to it: its mission keeps
 `spun_from`, which the missions and its own tower's instructions show.
 Herdr has no fork of a space; this is the closest it allows. A finding from
 a muted space isn't said.
+
+#### MCP servers by account
+
+Each account has MCP servers of its own, and they differ: its claude.ai
+connectors (Claude Docs, Figma…), its plugins' servers (each signed in, or
+not, per account) and its local ones (`mcpServers` in its `.claude.json`,
+in every folder or in one project only). The tower reads them for every
+account cca lists (`src/mcps.rs`):
+
+- **Its files.** cca says the account's profile folder (the tower runs cca
+  with a stand-in `claude` that only prints its `CLAUDE_CONFIG_DIR`), and
+  the tower reads its `.claude.json`, the plugins its `settings.json` has
+  on (their `.mcp.json` or `plugin.json`), and `mcp-needs-auth-cache.json`.
+- **Claude Code's word.** `cca <account> mcp list`, in your login shell,
+  from your home folder: each server connected, needing sign-in, or
+  failing. It is what counts. When it doesn't answer, the last answer
+  stands, and `tower accounts` says how old it is and why.
+- **Kept fresh.** In `~/.local/state/herder-tower/mcps.json`; the daemon
+  reads them again every 10 minutes, and a command that finds them older
+  than 25 minutes reads them itself. `--refresh` reads them now.
+
+Only a connected server counts as one an account has; one that needs
+sign-in is listed apart. A project's own server counts only in that folder.
+
+```sh
+tower accounts                       # each account, with its MCP servers under it
+tower accounts mcp [orca] [--refresh]    # every server: where it comes from, its state, its URL or command
+tower start --needs-mcp sentry --name s "look at the crash"   # on an account that has Sentry connected
+tower launch --needs-mcp figma "Build the new header"
+```
+
+**Where a task that needs one goes.** Its needs are what `--needs-mcp`
+names (repeat it, or `sentry,youtrack`) and the services its words name
+(YouTrack, Figma, Sentry, Stripe, Vercel, Notion, Slack…, and every
+connector's and plugin's own name; a word that is also plain English only
+counts through the flag). `tower start` and `tower launch` then take the
+first account with usage left that has them all connected, else the one
+with the most, else the one they'd have taken anyway, and say which and
+why in `account_why` ("the only account with Sentry connected (Sentry:
+connected on orca; needs sign-in on default)"). What the account they run
+on lacks is said in `chose` / the receipt's `mcp_notes`: "no account has
+YouTrack (neither default nor orca), so it runs on default without it".
+`--account` always wins (it is told what it lacks); a setup's own account
+stays when it has them. `tower dispatch` takes `"needs_mcp": ["sentry"]`
+(or one name) on a task: a new session gets it through `tower start`, and
+the session in the task's project is passed over for a new one, in a
+worktree of its own, when its account lacks one another account has. A
+need only the instruction's words name is said beside the task, never more.
+
+The brains are told: their instructions end with each account's servers
+(written again when they change), and when your words name a service the
+radar line adds what the accounts have of it (`[mcp] Sentry: connected on
+orca; needs sign-in on default`).
 
 Every Claude session on this Mac carries its account: `tower agents`,
 `tower spaces`, `tower history` and jobs, and the `agents` in the daemon's
@@ -783,7 +836,13 @@ isn't one.
 - **Where to.** The next account `cca` lists that has usage, the default
   first, then the others in order. An account the tower found out, one
   whose usage cca recorded at 100% (its `U` lines), and one not signed in
-  are skipped. The account it left is out until its reset (from the
+  are skipped. Of those left, the first that has connected every MCP
+  server the session used (its transcript's `mcp__<server>__…` tool calls)
+  that its own account had connected goes first; when none has them all,
+  the one that loses the fewest, and the move says what it loses ("It used
+  Sentry, which default doesn't have connected."), to you and to the
+  session. A server neither account lists (a session's own, like Chrome)
+  isn't counted. The account it left is out until its reset (from the
   message, else from cca's record, else for an hour), kept in
   `~/.local/state/herder-tower/failover.json`. Meanwhile sessions and
   towers that start without an account named start on the next one too.
@@ -811,7 +870,7 @@ isn't one.
   move to another is moved, and the card follows what still waits.
 
 ```sh
-tower failover                          # each account: has usage, or out until when; what moved; what waits
+tower failover                          # each account: has usage, or out until when; what moved (and any MCP server it lost); what waits
 tower failover move fix-login [--to orca]   # move one now (else to the next account with usage)
 tower failover clear                    # forget what is out and what waits
 ```
