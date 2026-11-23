@@ -378,7 +378,7 @@ pub fn verify(plan: &Plan, done: &Done, cfg: &YoutrackCfg, b: &dyn Backend) -> R
         let ty = type_of(&v);
         let parents = parents_of(&v);
         // Exactly one ticket on YouTrack links it, and one comment on the PR links that one.
-        let linking: Vec<String> = without_epics(b.search(&format!("\"{url}\""))?, &epics).iter().filter(|i| youtrack::names_pr(i["description"].as_str().unwrap_or(""), &url)).filter_map(|i| i["idReadable"].as_str().map(String::from)).collect();
+        let linking: Vec<String> = without_epics(b.search(&format!("\"{url}\""))?, &epics).iter().filter(|i| youtrack::ticket_of(i["description"].as_str().unwrap_or(""), &url)).filter_map(|i| i["idReadable"].as_str().map(String::from)).collect();
         let comments: Vec<String> = b.comments(&repo, n)?.iter().filter_map(|(_, body)| youtrack::linked_in(&[(0, body.clone())]).map(|(t, _)| t.id)).collect();
         let mut why = vec![];
         if !project.eq_ignore_ascii_case(&youtrack::project_for(cfg, &repo)) {
@@ -541,7 +541,10 @@ mod tests {
         assert_eq!(bad, 0, "{lines:?}");
         assert_eq!(lines.len(), 4);
         // A second ticket linking a PR is a problem the check names.
-        b.create(&json!({ "project": { "id": "id-EYF" }, "summary": "dup", "description": "https://github.com/o/api/pull/12" })).unwrap();
+        // A ticket that only mentions the PR isn't a second one.
+        b.create(&json!({ "project": { "id": "id-EYF" }, "summary": "mention", "description": "**Pull request:** [o/api#99](https://github.com/o/api/pull/99)\n\nFixes the review of https://github.com/o/api/pull/12#discussion_r1" })).unwrap();
+        assert_eq!(verify(&p, &done, &c, &b).unwrap().1, 0);
+        b.create(&json!({ "project": { "id": "id-EYF" }, "summary": "dup", "description": "**Pull request:** [o/api#12](https://github.com/o/api/pull/12)" })).unwrap();
         let (lines, bad) = verify(&p, &done, &c, &b).unwrap();
         assert_eq!(bad, 1);
         assert!(lines.iter().any(|l| l.starts_with("PROBLEM o/api#12") && l.contains("2 tickets link the PR")), "{lines:?}");
