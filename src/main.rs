@@ -74,6 +74,7 @@ mod usage;
 mod ticket;
 mod worktrees;
 mod youtrack;
+mod backfill;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -304,7 +305,7 @@ enum Cmd {
     /// (keeps your API token in the Keychain: typed at its prompt, or piped in; never shown),
     /// `token clear`, `check` (asks YouTrack who the token is and whether the projects are there),
     /// `now` (makes the tickets due now), `try <PR> [--no-link]` (one PR's ticket now, on or off;
-    /// `set project-for <repo> <PROJECT>` gives a repo its own project) and `remove <ID>` (deletes a ticket the tower made, and
+    /// `set project-for <repo> <PROJECT>` gives a repo its own project) and `backfill <plan.json> [--apply|--verify]` (tickets, under epics, for the PRs a plan lists, merged ones too: a dry run unless --apply; --verify reads them back) and `remove <ID>` (deletes a ticket the tower made, and
     /// its comment on the PR; from a shell only).
     Youtrack {
         #[arg(default_value = "status")]
@@ -1957,6 +1958,49 @@ fn youtrack_cmd(action: &str, args: &[String]) -> Result<()> {
                 println!("{}: {}", d["pr"].as_str().unwrap_or(""), d["did"].as_str().unwrap_or(""));
             }
         }
+        ("backfill", [file, rest @ ..]) => {
+            let (apply, verify) = (rest.contains(&"--apply"), rest.contains(&"--verify"));
+            let plan_path = std::path::PathBuf::from(file);
+            let text = std::fs::read_to_string(&plan_path).with_context(|| format!("reading {}", plan_path.display()))?;
+            let plan: backfill::Plan = serde_json::from_str(&text).with_context(|| format!("reading the plan {}", plan_path.display()))?;
+            // Tickets stay as they are set (`[youtrack] enabled`): this only makes the plan's.
+            let token = youtrack::token().context("no YouTrack token (`tower youtrack token`)")?;
+            if let Some(m) = youtrack::missing(&now, true) {
+                bail!("YouTrack isn't set up: {m}");
+            }
+            let real = youtrack::Real::new(&now, token);
+            let done_path = backfill::done_path(&plan_path);
+            let mut done: backfill::Done = std::fs::read_to_string(&done_path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+            if verify {
+                let (lines, bad) = backfill::verify(&plan, &done, &now, &real)?;
+                for l in &lines {
+                    println!("{l}");
+                }
+                if bad > 0 {
+                    bail!("{bad} of {} not as planned", lines.len());
+                }
+                println!("All {} as planned: each PR has exactly one ticket.", lines.len());
+            } else {
+                let known = prs::load_from(&config::ui_dir());
+                let mut save = |d: &backfill::Done| {
+                    // A dry run writes nothing, not even what it found.
+                    if !apply {
+                        return;
+                    }
+                    if let Err(e) = serde_json::to_vec_pretty(d).map_err(anyhow::Error::from).and_then(|b| std::fs::write(&done_path, b).map_err(Into::into)) {
+                        eprintln!("couldn't keep {}: {e:#}", done_path.display());
+                    }
+                };
+                let res = backfill::run(&plan, &mut done, &now, &real, &known, apply, &mut save);
+                save(&done);
+                for l in res? {
+                    println!("{l}");
+                }
+                if !apply {
+                    println!("(Nothing was written: --apply makes it.)");
+                }
+            }
+        }
         ("remove", [id]) => {
             if home::caller() != home::Caller::Other {
                 bail!("only from a shell: a session or a tower doesn't take back tickets");
@@ -1968,7 +2012,7 @@ fn youtrack_cmd(action: &str, args: &[String]) -> Result<()> {
             let v = r.state.unwrap_or_default();
             println!("Deleted {} (of {}); {}.", v["deleted"].as_str().unwrap_or(""), v["pr"].as_str().unwrap_or(""), v["comment"].as_str().unwrap_or(""));
         }
-        _ => bail!("tower youtrack [status|on|off|set <key> <value>|token [clear]|check|now|remove <ID>]"),
+        _ => bail!("tower youtrack [status|on|off|set <key> <value>|token [clear]|check|now|remove <ID>|backfill <plan.json> [--apply|--verify]]"),
     }
     Ok(())
 }
