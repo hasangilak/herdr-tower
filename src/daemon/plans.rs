@@ -784,9 +784,10 @@ impl Plans {
 
     /// The prediction a PR just found is, in the plan its space was
     /// launched with: (the plan's id, the prediction), marked as opened.
-    pub fn match_pr(&self, pr: &crate::prs::Pr) -> Option<(String, crate::prscore::Predicted)> {
+    /// `files`: what it changes at its head (empty: GitHub couldn't say).
+    pub fn match_pr(&self, pr: &crate::prs::Pr, files: &[String]) -> Option<(String, crate::prscore::Predicted)> {
         let mut b = lock(&self.book);
-        let found = b.match_pr(pr.space.as_deref().unwrap_or(""), &pr.repo, &pr.base, &pr.title, &pr.key(), now())?;
+        let found = b.match_pr(pr.space.as_deref().unwrap_or(""), &pr.repo, &pr.base, &pr.title, files, &pr.key(), now())?;
         self.save(&b);
         self.publish(&b);
         Some(found)
@@ -797,6 +798,15 @@ impl Plans {
     pub fn remap(&self, id: &str, n: u32, key: &str) -> Result<(crate::prscore::Predicted, Option<String>)> {
         let mut b = lock(&self.book);
         let r = b.remap_pr(id, n, key, now())?;
+        self.save(&b);
+        self.publish(&b);
+        Ok(r)
+    }
+
+    /// `tower plan remap <id> <n> none`: the prediction lets its PR go (`plans::Book::unmap_pr`).
+    pub fn unmap(&self, id: &str, n: u32) -> Result<Option<String>> {
+        let mut b = lock(&self.book);
+        let r = b.unmap_pr(id, n, now())?;
         self.save(&b);
         self.publish(&b);
         Ok(r)

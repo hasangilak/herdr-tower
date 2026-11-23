@@ -1316,7 +1316,8 @@ impl Book {
     /// The prediction a real PR is, in the plan its space was launched
     /// with (the latest): matched once (`prscore::best_match`), and marked
     /// with the PR's key. (The plan's id, the prediction.)
-    pub fn match_pr(&mut self, space: &str, repo: &str, base: &str, title: &str, key: &str, now: u64) -> Option<(String, crate::prscore::Predicted)> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn match_pr(&mut self, space: &str, repo: &str, base: &str, title: &str, files: &[String], key: &str, now: u64) -> Option<(String, crate::prscore::Predicted)> {
         let space = space.trim();
         if space.is_empty() {
             return None;
@@ -1326,7 +1327,7 @@ impl Book {
         if let Some(x) = p.prs.iter().find(|x| x.pr.as_deref() == Some(key)) {
             return Some((p.id.clone(), x.clone()));
         }
-        let i = crate::prscore::best_match(&p.prs, repo, base, title)?;
+        let i = crate::prscore::best_match(&p.prs, repo, base, title, files)?;
         p.prs[i].pr = Some(key.to_string());
         p.updated_ms = now;
         Some((p.id.clone(), p.prs[i].clone()))
@@ -1350,6 +1351,17 @@ impl Book {
         let was = p.prs[at].pr.replace(key.to_string()).filter(|w| w != key);
         p.updated_ms = now;
         Ok((p.prs[at].clone(), was))
+    }
+
+    /// The plan's predicted PR `n` is no real PR's (`tower plan remap <id>
+    /// <n> none`): it was taken by one it wasn't made for. The PR it had.
+    pub fn unmap_pr(&mut self, id: &str, n: u32, now: u64) -> Result<Option<String>> {
+        let p = self.plans.iter_mut().find(|p| p.id == id).ok_or_else(|| anyhow::anyhow!("no plan {id}"))?;
+        let ns: Vec<String> = p.prs.iter().map(|x| x.n.to_string()).collect();
+        let x = p.prs.iter_mut().find(|x| x.n == n).ok_or_else(|| anyhow::anyhow!("plan {id} has no PR {n}: its PRs are {}", if ns.is_empty() { "none".into() } else { ns.join(", ") }))?;
+        let was = x.pr.take();
+        p.updated_ms = now;
+        Ok(was)
     }
 
     /// Published (again): its link, and it is ready.
@@ -2636,6 +2648,58 @@ mod tests {
         assert_eq!(v["thread"][0]["from"], "user");
     }
 
+    /// p5 (2026-11-23): eyzhub/sooner-app-web#139, the Help Center (SOO-490,
+    /// no plan), took prediction 11, the stale-cache fix that shipped as
+    /// #125, with its checks c1–c4: it shared only the repo with it.
+    #[test]
+    fn a_fulfilled_prediction_leaves_a_later_pr_in_the_same_repo_with_no_planned_checks() {
+        let mut b = Book::default();
+        let (p, _) = b.add(Form::Page, "Sooner help FAQs", draft(), |id| PathBuf::from(format!("/s/{id}")), 1);
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let check = |id: &str| crate::prscore::Check { id: id.into(), what: format!("check {id}"), ..Default::default() };
+        let pred = |n: u32, title: &str, files: &[&str], checks: &[&str]| crate::prscore::Predicted {
+            n,
+            repo: "sooner-app-web".into(),
+            base: "entitlment".into(),
+            title: title.into(),
+            files: s(files),
+            checks: checks.iter().map(|c| check(c)).collect(),
+            ..Default::default()
+        };
+        let prs = vec![
+            pred(3, "feat(help): the /help FAQ page in the viewer's language, with hreflang and the sitemap", &["app/[locale]/help/page.js", "app/[locale]/help/[slug]/page.js", "components/server/HelpIndex.js", "lib/support/helpIndex.js", "lib/support/helpPages.js"], &["c1", "c2"]),
+            pred(8, "feat(help): mark the help index's root with data-help-index=<locale>", &["components/server/HelpIndex.js", "tests/support-help-index.test.mjs"], &["c1", "c2", "c3"]),
+            pred(11, "fix(help): a page taken down in MediaRoom leaves the storefront within 5 minutes", &["lib/support/helpPages.js", "lib/support/helpIndex.js", "app/[locale]/help/[slug]/page.js", "tests/support-help.test.mjs (or a new tests/support-help-cache.test.mjs)"], &["c1", "c2", "c3", "c4"]),
+        ];
+        b.set_prs(&p.id, prs, 2).unwrap();
+        b.close(&p.id, Some("sooner-help-faqs"), 3).unwrap();
+        let (sp, repo, base) = ("sooner-help-faqs", "eyzhub/sooner-app-web", "entitlment");
+        // Each real PR its own prediction, by its title and its files.
+        let (_, m) = b.match_pr(sp, repo, base, "feat(help): the /help FAQ page in the viewer's language", &s(&["app/[locale]/help/page.js", "lib/support/helpPages.js"]), "eyzhub/sooner-app-web#118", 4).unwrap();
+        assert_eq!(m.n, 3);
+        let (_, m) = b.match_pr(sp, repo, base, "feat(help): mark the help index's root with data-help-index=<locale>", &s(&["components/server/HelpIndex.js", "tests/support-help-index.test.mjs"]), "eyzhub/sooner-app-web#124", 5).unwrap();
+        assert_eq!(m.n, 8);
+        // The stale-cache fix: its title shares only "help" and "page" words loosely, but its files are prediction 11's.
+        let cache = s(&["lib/support/helpCache.js", "lib/support/helpIndex.js", "lib/support/helpPages.js", "tests/helpers/unstable-cache-model.mjs", "tests/support-help-index.test.mjs", "tests/support-help.test.mjs"]);
+        let (_, m) = b.match_pr(sp, repo, base, "fix(help): cache help answers with not-found, so a deleted page goes", &cache, "eyzhub/sooner-app-web#125", 6).unwrap();
+        assert_eq!((m.n, m.checks.len()), (11, 4), "fulfilled by #125");
+        // A later PR in the same repo and space, that no plan predicted: no prediction, so no planned checks.
+        let center = s(&["app/[locale]/help/[slug]/page.js", "app/[locale]/help/filmmakers/page.js", "app/[locale]/help/layout.js", "app/[locale]/help/page.js", "app/[locale]/help/topic/[topic]/page.js", "components/client/HelpCenterBar.js", "components/client/HelpFeedback.js", "components/client/HelpSearch.js", "lib/support/helpCenter.js", "tests/help-center.test.mjs"]);
+        assert!(b.match_pr(sp, repo, base, "feat(help): Sooner Help Center (SOO-490)", &center, "eyzhub/sooner-app-web#139", 7).is_none());
+        // Nor with every prediction of the repo still open: it shares a repo and a word, not the work.
+        let mut fresh = Book::default();
+        let (q, _) = fresh.add(Form::Page, "Sooner help FAQs", draft(), |id| PathBuf::from(format!("/s/{id}")), 1);
+        fresh.set_prs(&q.id, vec![pred(11, "fix(help): a page taken down in MediaRoom leaves the storefront within 5 minutes", &["lib/support/helpPages.js", "lib/support/helpIndex.js", "app/[locale]/help/[slug]/page.js"], &["c1", "c2", "c3", "c4"])], 2).unwrap();
+        fresh.close(&q.id, Some(sp), 3).unwrap();
+        assert!(fresh.match_pr(sp, repo, base, "feat(help): Sooner Help Center (SOO-490)", &center, "eyzhub/sooner-app-web#139", 4).is_none());
+        assert_eq!(fresh.get(&q.id).unwrap().prs[0].pr, None, "it stays open for its own PR");
+        // `tower plan remap <id> 11 none`: a prediction taken by the wrong PR lets it go.
+        assert_eq!(b.unmap_pr(&p.id, 11, 8).unwrap().as_deref(), Some("eyzhub/sooner-app-web#125"));
+        assert_eq!(b.get(&p.id).unwrap().prs[2].pr, None);
+        assert_eq!(b.unmap_pr(&p.id, 11, 9).unwrap(), None);
+        assert!(b.unmap_pr(&p.id, 12, 9).is_err());
+    }
+
     #[test]
     fn a_plan_with_a_migration_pr_and_a_ui_pr_scores_both_and_the_real_prs_carry_them() {
         let mut b = Book::default();
@@ -2655,16 +2719,16 @@ mod tests {
         assert!(text.contains("PR 2 · eyzflow-admin-dashboard → dev: Show translated messages in the inbox\n      Low risk"), "{text}");
         // Launched as its space: a PR a session opens there is matched to its prediction, once.
         b.close(&p.id, Some("msg-translation"), 3).unwrap();
-        let (id, ui) = b.match_pr("Msg-Translation", "eyzhub/eyzflow-admin-dashboard", "dev", "feat: translated messages in the inbox", "eyzhub/eyzflow-admin-dashboard#7", 4).unwrap();
+        let (id, ui) = b.match_pr("Msg-Translation", "eyzhub/eyzflow-admin-dashboard", "dev", "feat: translated messages in the inbox", &[], "eyzhub/eyzflow-admin-dashboard#7", 4).unwrap();
         assert_eq!((id.as_str(), ui.n, ui.score.needs_review), ("p1", 2, false));
         assert_eq!(b.get("p1").unwrap().prs[1].pr.as_deref(), Some("eyzhub/eyzflow-admin-dashboard#7"));
-        let again = b.match_pr("msg-translation", "eyzhub/eyzflow-admin-dashboard", "dev", "anything", "eyzhub/eyzflow-admin-dashboard#7", 5).unwrap();
+        let again = b.match_pr("msg-translation", "eyzhub/eyzflow-admin-dashboard", "dev", "anything", &[], "eyzhub/eyzflow-admin-dashboard#7", 5).unwrap();
         assert_eq!(again.1.n, 2, "the same PR found again: the same prediction");
-        let (_, migration) = b.match_pr("msg-translation", "eyzhub/eyz-customer-support", "dev", "Store translations", "eyzhub/eyz-customer-support#3", 6).unwrap();
+        let (_, migration) = b.match_pr("msg-translation", "eyzhub/eyz-customer-support", "dev", "Store translations", &["db/migrations/0042_message_translations.sql".to_string(), "src/messages/translate.ts".to_string()], "eyzhub/eyz-customer-support#3", 6).unwrap();
         assert!(migration.score.needs_review);
-        assert!(b.match_pr("msg-translation", "eyzhub/eyz-customer-support", "dev", "one more", "eyzhub/eyz-customer-support#4", 7).is_none(), "every prediction of that repo is taken");
-        assert!(b.match_pr("another-space", "eyzhub/eyzflow-admin-dashboard", "dev", "x", "eyzhub/eyzflow-admin-dashboard#9", 8).is_none());
-        assert!(b.match_pr("", "eyzhub/eyzflow-admin-dashboard", "dev", "x", "eyzhub/eyzflow-admin-dashboard#9", 8).is_none(), "no space: no plan");
+        assert!(b.match_pr("msg-translation", "eyzhub/eyz-customer-support", "dev", "one more", &[], "eyzhub/eyz-customer-support#4", 7).is_none(), "every prediction of that repo is taken");
+        assert!(b.match_pr("another-space", "eyzhub/eyzflow-admin-dashboard", "dev", "x", &[], "eyzhub/eyzflow-admin-dashboard#9", 8).is_none());
+        assert!(b.match_pr("", "eyzhub/eyzflow-admin-dashboard", "dev", "x", &[], "eyzhub/eyzflow-admin-dashboard#9", 8).is_none(), "no space: no plan");
         // A plan revised while open keeps the PRs that opened with their predictions.
         let (q, _) = b.add(Form::Page, "t", draft(), |id| PathBuf::from(id), 9);
         let prs = crate::prscore::check(&crate::prscore::tests::two_prs(), &repos_of(&q.draft)).unwrap();
