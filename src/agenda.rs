@@ -1086,41 +1086,42 @@ impl Ledger {
         self.agendas.iter().filter(|a| a.live()).flat_map(|a| a.tasks.iter()).filter(|t| t.state == TaskState::Failed && t.raised).map(|t| t.id.clone()).collect()
     }
 
-    /// The latest task on `session` that isn't settled, in an agenda still open.
     /// The task a verdict on `session` (`tower job done|failed`) is about,
-    /// and whether it is settled already: the one whose turn the session
-    /// ended last. A verdict comes after a turn's end; a task that went in
-    /// after that end (not a turn of its own yet) isn't what it judges, so a
-    /// task settled at that turn's end stays the one (nothing changes), and
-    /// the newer one runs on. With no turn ended lately (`TURN_JUDGED_MS`):
-    /// the newest unfinished task, as before.
+    /// and whether it is settled already: the one whose turn answered last.
+    /// A turn answers when it ends (claimed done) or ends on a question
+    /// (blocked), after its task went in. A verdict comes after that answer:
+    /// a task that went in afterwards hasn't answered anything yet, and an
+    /// older one that answered earlier (the plan's long task, under a short
+    /// note that went in after it) isn't what the verdict is about. A task
+    /// settled at its own turn's end stays as it is (nothing changes). With
+    /// no turn answered lately (`TURN_JUDGED_MS`): the newest unfinished
+    /// task, as before.
     pub fn judged_task(&self, session: &str, now: u64) -> Option<(String, bool)> {
-        let ended = |t: &Task| t.history.iter().filter(|h| h.state == TaskState::DoneClaimed && h.at_ms >= t.delivered_ms).map(|h| h.at_ms).max();
+        let answered = |t: &Task| {
+            t.history
+                .iter()
+                .filter(|h| matches!(h.state, TaskState::DoneClaimed | TaskState::Blocked) && t.delivered_ms > 0 && h.at_ms >= t.delivered_ms)
+                .map(|h| h.at_ms)
+                .max()
+        };
         // Every request's, done ones too: the task its turn's end settled is often its request's
-        // last, and that request is done by then (a781.2, 2026-11-19).
-        let on: Vec<&Task> = self.agendas.iter().flat_map(|a| a.tasks.iter()).filter(|t| !session.is_empty() && t.session == session).collect();
-        let last = on.iter().filter_map(|t| ended(t).map(|at| (at, *t))).max_by_key(|(at, t)| (*at, t.delivered_ms));
-        let lately = last.is_some_and(|(at, _)| now.saturating_sub(at) < TURN_JUDGED_MS);
-        // After a turn ended lately, a task the ledger hasn't seen go in (the queue
-        // typed it a moment ago, before the reconciler looked: a852.2, 4 s after
-        // a835.16's turn ended) isn't one its session could have finished: the
-        // verdict is that turn's. (With no turn to give it to, it is still the one.)
-        let open = self.unfinished_on(session).filter(|u| !lately || u.delivered_ms > 0 || u.state != TaskState::Queued);
-        // A turn ended on the newest unfinished one: it.
-        if let Some(u) = open
-            && (u.state == TaskState::DoneClaimed || ended(u).is_some())
-        {
-            return Some((u.id.clone(), false));
-        }
-        match (last, open) {
-            // The newest unfinished one went in after the last turn's end: the verdict is that turn's.
-            (Some((at, e)), Some(u)) if u.delivered_ms >= at && now.saturating_sub(at) < TURN_JUDGED_MS => Some((e.id.clone(), e.state.settled())),
-            (Some((at, e)), None) if now.saturating_sub(at) < TURN_JUDGED_MS => Some((e.id.clone(), e.state.settled())),
-            (_, Some(u)) => Some((u.id.clone(), false)),
-            _ => None,
+        // last, and that request is done by then (a781.2, 2026-11-19). A task that hasn't gone in
+        // (the queue typed it a moment ago: a852.2) has answered nothing, so it is never the one
+        // while a turn answered lately.
+        let last = self
+            .agendas
+            .iter()
+            .flat_map(|a| a.tasks.iter())
+            .filter(|t| !session.is_empty() && t.session == session)
+            .filter_map(|t| answered(t).map(|at| (at, t)))
+            .max_by_key(|(at, t)| (*at, t.delivered_ms, t.created_at_ms));
+        match last {
+            Some((at, t)) if now.saturating_sub(at) < TURN_JUDGED_MS => Some((t.id.clone(), t.state.settled())),
+            _ => self.unfinished_on(session).map(|u| (u.id.clone(), false)),
         }
     }
 
+    /// The latest task on `session` that isn't settled, in an agenda still open.
     pub fn unfinished_on(&self, session: &str) -> Option<&Task> {
         self.agendas
             .iter()
@@ -1430,12 +1431,24 @@ impl Ledger {
         r
     }
 
-    /// `tower job done|failed <session>`: the brain's word on the session's latest unfinished task.
+    /// `tower job done|failed <session>`: the brain's word on the task the
+    /// session's last turn answered (`judged_task`). Its id.
     pub fn judged(&mut self, session: &str, ok: bool, text: &str, now: u64) -> Option<String> {
+        self.judged_how(session, ok, text, now).map(|j| j.task)
+    }
+
+    /// `judged`, and what it did: which task, and whether it was settled already.
+    pub fn judged_how(&mut self, session: &str, ok: bool, text: &str, now: u64) -> Option<Judged> {
         let (id, settled) = self.judged_task(session, now)?;
+        let title = self.task(&id).map(|t| t.title.clone()).unwrap_or_default();
+        let still_open = |l: &Ledger, id: &str| -> Vec<String> {
+            l.agendas.iter().filter(|a| a.live()).flat_map(|a| a.tasks.iter()).filter(|t| t.session == session && t.id != id && !t.state.settled()).map(|t| format!("{} ({})", t.id, clip(&t.title, 60))).collect()
+        };
         if settled {
-            // About a task settled already (its turn's end checked it): it stays as it is, and the newer one runs on.
-            return Some(id);
+            // About a task settled already (its turn's end checked it): it stays as it is, and the others run on.
+            let state = self.task(&id).map(|t| t.state.word().to_string()).unwrap_or_default();
+            let still_open = still_open(self, &id);
+            return Some(Judged { task: id, title, already: Some(state), still_open });
         }
         let ev = if ok {
             TaskEv::Verify { how: if text.trim().is_empty() { "the brain checked it".into() } else { format!("the brain checked it: {}", clip(text, 200)) } }
@@ -1443,7 +1456,7 @@ impl Ledger {
             TaskEv::Fail { why: if text.trim().is_empty() { "the brain says it didn't work out".into() } else { clip(text, 300) } }
         };
         self.apply(&id, ev, now).ok()?;
-        Some(id)
+        Some(Judged { still_open: still_open(self, &id), task: id, title, already: None })
     }
 
     /// Abandons a task, or every unsettled task of an agenda (and the agenda). Returns the
@@ -1994,12 +2007,17 @@ pub fn act(l: &mut Ledger, c: &Cmd, heard: &Heard, now: u64) -> Result<Acted> {
             if retried.is_some() {
                 return Ok(Acted { value: json!({ "task": null, "retried": retried, "agenda_done": null }), cancel: vec![], changed: false });
             }
-            let task = l.judged(&c.session, c.ok, &c.text, now);
+            let j = l.judged_how(&c.session, c.ok, &c.text, now);
             // The user's request this session worked on, when it is finished
             // now (by this, or checked by the tower itself a moment ago) and
             // its receipt is still to come.
             let done = l.receipt_due(&c.session, now, RECEIPT_DUE_MS).map(|a| a.id.clone());
-            Ok(Acted { value: json!({ "task": task, "agenda_done": done }), cancel: vec![], changed: task.is_some() })
+            let changed = j.as_ref().is_some_and(|j| j.already.is_none());
+            let value = match &j {
+                Some(j) => json!({ "task": j.task, "title": j.title, "already": j.already, "still_open": j.still_open, "agenda_done": done }),
+                None => json!({ "task": null, "agenda_done": done }),
+            };
+            Ok(Acted { value, cancel: vec![], changed })
         }
         // `tower receipt --agenda <id>`: marks the request as receipted.
         "receipt" => {
@@ -2008,6 +2026,18 @@ pub fn act(l: &mut Ledger, c: &Cmd, heard: &Heard, now: u64) -> Result<Acted> {
         }
         other => bail!("tower agenda {other}: use list, tasks, show, new, close, abandon, verify, fail, requeue or move"),
     }
+}
+
+/// What `tower job done|failed` did (`Ledger::judged_how`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Judged {
+    /// The task the verdict was about: the one the session's last turn answered.
+    pub task: String,
+    pub title: String,
+    /// Settled already at its own turn's end (its state): nothing changed.
+    pub already: Option<String>,
+    /// The session's other unsettled tasks ("a1244.2 (eyz-mediaroom-serverless)"): left as they are.
+    pub still_open: Vec<String>,
 }
 
 /// A space's requests (`Ledger::requests_of`).
@@ -3091,6 +3121,48 @@ mod tests {
         to(&mut old, &ids[0], now);
         assert_eq!(old.judged("t12w", false, "it didn't work", now + 5_000), Some(ids[0].clone()));
         assert_eq!(old.task(&ids[0]).unwrap().state, TaskState::Failed);
+    }
+
+    /// a1244/a1245 (2026-11-26): a session with a plan's long task and a
+    /// short FYI note open at once. Twice `tower job done` about the FYI's
+    /// turn settled the plan task instead, so the plan read all done.
+    #[test]
+    fn a_job_done_settles_the_task_whose_turn_answered_last_of_two_open_on_one_session() {
+        let now = 9_000_000_000;
+        let to = |l: &mut Ledger, id: &str, at: u64| {
+            l.task_mut(id).unwrap().apply(TaskEv::Delivered { session: "t25c".into(), name: "mediaroom".into(), created_ms: None, space: None, at_ms: at, fresh: false }, at).unwrap();
+        };
+        // 1) The plan task ended its turn (claimed, not checked yet); the FYI went in and its
+        // own turn's end checked it; then the brain's word on that FYI turn.
+        let (mut l, _, ids) = ledger_with(2, now);
+        let (plan, fyi) = (ids[0].clone(), ids[1].clone());
+        to(&mut l, &plan, now);
+        l.task_mut(&plan).unwrap().apply(TaskEv::Claimed { said: "PR 1 is open; waiting for its review.".into() }, now + 2_852_000).unwrap();
+        to(&mut l, &fyi, now + 2_865_000);
+        l.task_mut(&fyi).unwrap().apply(TaskEv::Claimed { said: "Noted: Zendesk sign-in passed.".into() }, now + 2_887_000).unwrap();
+        l.task_mut(&fyi).unwrap().apply(TaskEv::Verify { how: "its last message says \"passed\"".into() }, now + 2_887_000).unwrap();
+        assert_eq!(l.judged_task("t25c", now + 2_898_000), Some((fyi.clone(), true)));
+        let j = l.judged_how("t25c", true, "Took the Zendesk sign-in note", now + 2_898_000).unwrap();
+        assert_eq!((j.task.as_str(), j.already.as_deref()), (fyi.as_str(), Some("verified")), "the FYI's turn, settled already: nothing changes");
+        assert_eq!(j.still_open, [format!("{plan} ({})", l.task(&plan).unwrap().title)], "it says what it left open");
+        assert_eq!(l.task(&plan).unwrap().state, TaskState::DoneClaimed, "the plan task is not verified by a word about the FYI");
+        // Its own word later: the plan task's turn is the last to answer then.
+        l.task_mut(&plan).unwrap().apply(TaskEv::Claimed { said: "PR 1 reviewed and merged.".into() }, now + 3_500_000).unwrap();
+        assert_eq!(l.judged("t25c", true, "PR 1 merged", now + 3_510_000), Some(plan.clone()));
+        assert_eq!(l.task(&plan).unwrap().state, TaskState::Verified);
+
+        // 2) The FYI's turn ended on a question (blocked); the older plan note went in 1.5 s
+        // later; the brain's word on the FYI's turn came 3 s after that.
+        let (mut l, _, ids) = ledger_with(2, now);
+        let (heads_up, fyi) = (ids[0].clone(), ids[1].clone());
+        to(&mut l, &fyi, now);
+        l.task_mut(&fyi).unwrap().apply(TaskEv::Blocked { question: "PR 3 is waiting for its re-review and your merge.".into() }, now + 14_000).unwrap();
+        to(&mut l, &heads_up, now + 15_700);
+        l.task_mut(&fyi).unwrap().apply(TaskEv::Working, now + 16_000).unwrap();
+        let j = l.judged_how("t25c", true, "Took the Zendesk sign-in note", now + 17_000).unwrap();
+        assert_eq!((j.task.as_str(), j.already.as_deref()), (fyi.as_str(), None));
+        assert_eq!((l.task(&fyi).unwrap().state, l.task(&heads_up).unwrap().state), (TaskState::Verified, TaskState::Running), "the one that just went in runs on");
+        assert!(l.task(&fyi).unwrap().why.contains("Zendesk sign-in note"));
     }
 
     #[test]

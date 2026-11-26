@@ -2992,7 +2992,16 @@ fn agenda_judged(terminal: &str, ok: bool, text: &str) {
         }
     };
     if let Some(t) = v["task"].as_str() {
-        println!("Agenda task {t} is {}.", if ok { "verified" } else { "failed" });
+        let title = v["title"].as_str().filter(|s| !s.trim().is_empty()).map(|s| format!(" ({})", agenda::clip(s, 80))).unwrap_or_default();
+        match v["already"].as_str() {
+            // Its own turn's end settled it: the verdict changes nothing.
+            Some(state) => println!("Agenda task {t}{title}: the turn this is about; it was {state} already at its turn's end, so nothing changed."),
+            None => println!("Agenda task {t}{title} is {}: the task its last turn answered.", if ok { "verified" } else { "failed" }),
+        }
+        let open: Vec<&str> = v["still_open"].as_array().into_iter().flatten().filter_map(|s| s.as_str()).collect();
+        if !open.is_empty() {
+            println!("Still open on that session, untouched: {}.", open.join("; "));
+        }
     }
     // It failed a moment ago and the tower sent it once more by itself: this word is about the try before.
     if let Some(t) = v["retried"].as_str() {
