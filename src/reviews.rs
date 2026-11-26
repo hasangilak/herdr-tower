@@ -270,6 +270,17 @@ pub fn chip_line(b: &Brief) -> String {
     }
 }
 
+/// Its chip's review line for the PR at `head`, and whether it is good
+/// news: "agreed" only when the agreement is on that head. One on an older
+/// commit says what isn't reviewed (`merge_warning_at`), never "agreed".
+pub fn chip_at(b: &Brief, head: &str) -> (String, bool) {
+    if b.outdated(head) {
+        return (merge_warning_at(b, head).unwrap_or_default(), false);
+    }
+    let line = if b.line.is_empty() { chip_line(b) } else { b.line.clone() };
+    (line, b.status == "agreed")
+}
+
 /// `merge_warning`, for the PR at `head`: an agreement on an older commit
 /// doesn't count (its review begins again).
 pub fn merge_warning_at(b: &Brief, head: &str) -> Option<String> {
@@ -935,6 +946,9 @@ mod tests {
         // A push past it: outdated for the merge card and auto-merge.
         assert!(brief.outdated("def4567") && !brief.agreed_at("def4567"));
         assert_eq!(merge_warning_at(&brief, "def4567").unwrap(), "The review agreed on abc123; the commits pushed since (def4567 now) aren't reviewed yet.");
+        // Its chip: agreed only at the head it agreed on.
+        assert_eq!(chip_at(&brief, "abc123").1, true);
+        assert_eq!(chip_at(&brief, "def4567"), ("The review agreed on abc123; the commits pushed since (def4567 now) aren't reviewed yet.".to_string(), false));
         assert!(!Pr { review: Some(brief.clone()), ..at("def4567") }.ready_for_user(), "no merge card on the old agreement");
         // Same head, or no head known: nothing moved.
         assert!(b.reopen(&at("abc123"), 50).is_none() && b.reopen(&at(""), 50).is_none());

@@ -111,9 +111,10 @@ impl Line {
     /// and in what colour: agreed is good news, the rest is to mind.
     fn review(&self) -> Option<(String, u32)> {
         let r = self.pr.review.as_ref()?;
-        let line = if r.line.is_empty() { crate::reviews::chip_line(r) } else { r.line.clone() };
+        // Agreed on an older commit than the PR's head: said so, in amber, never "agreed".
+        let (line, good) = crate::reviews::chip_at(r, &self.pr.head_sha);
         let color = match r.status.as_str() {
-            "agreed" => CYAN,
+            _ if good => CYAN,
             "ended" => 0xcdd6e6,
             _ => AMBER,
         };

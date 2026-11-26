@@ -202,7 +202,8 @@ pub(super) fn review_lines(space: &str, prs: &std::collections::BTreeMap<String,
     list.iter()
         .filter_map(|p| {
             let r = p.review.as_ref()?;
-            let line = if r.line.is_empty() { crate::reviews::chip_line(r) } else { r.line.clone() };
+            // Agreed on an older commit than the head: says what isn't reviewed, never "agreed".
+            let (line, _) = crate::reviews::chip_at(r, &p.head_sha);
             let who = if r.reviewer_name.is_empty() { String::new() } else { format!(" · {}", r.reviewer_name) };
             // Whether a person must read it (`crate::prscore`), when it was scored.
             let score = p.score.as_ref().map(|s| format!(" · {}", s.word())).unwrap_or_default();

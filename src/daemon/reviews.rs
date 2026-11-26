@@ -346,6 +346,12 @@ impl Reviews {
     }
 
     fn try_open(&self, key: &str) -> Result<()> {
+        // GitHub's head now, not the store's last look (up to a poll old): the reviewer
+        // starts at the commit the PR is at, and the review says so.
+        self.prs.poll(key);
+        if let Some(pr) = self.prs.get(key).filter(|p| !p.head_sha.is_empty()) {
+            self.follow(&pr);
+        }
         let Some(r) = self.get(key) else { bail!("no review of {key}") };
         let owner = self.hands.terminal(&r.owner);
         let taken: Vec<String> = self.hands.names().unwrap_or_default().into_iter().map(|(_, n)| n).collect();
@@ -624,15 +630,11 @@ impl Reviews {
                 Ok(json!({ "review": r.view() }))
             }
             "agree" => {
-                // The commit it agrees on: the PR's head on GitHub now, else as last seen.
+                // The commit it agrees on: the PR's head on GitHub now (into the store too, so
+                // the store's next word never takes the review back to an older head), else as last seen.
                 let key = find(&lock(&self.book))?;
-                let (repo, number) = key.rsplit_once('#').map(|(r, n)| (r.to_string(), n.parse::<u64>().unwrap_or(0))).unwrap_or_default();
-                let sha = crate::prs::fetch(self.prs.gh(), &repo, number)
-                    .ok()
-                    .and_then(|v| v["headRefOid"].as_str().map(String::from))
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| self.prs.get(&key).map(|p| p.head_sha).filter(|s| !s.is_empty()))
-                    .unwrap_or_default();
+                self.prs.poll(&key);
+                let sha = self.prs.get(&key).map(|p| p.head_sha).unwrap_or_default();
                 // What its reviewer reviewed: its checkout's commit (where it checked the PR out), else the review's head.
                 let reviewed = self.get(&key).map(|r| r.folder).filter(|f| !f.is_empty()).and_then(|f| checkout_head(&f)).unwrap_or_default();
                 let r = {
@@ -880,6 +882,65 @@ mod tests {
         let r2 = reviews.clone();
         prs.on_change(Box::new(move |op, pr| r2.pr_changed(op, pr)));
         prs.found(&[("o/app".into(), 12)], session, "shop", Some(space), true);
+    }
+
+    /// eyzflow#1066 (2026-11-26): a review began again at the head the
+    /// tower had last seen, while GitHub's was newer; and a refused agreement
+    /// moved the review to GitHub's head but not the store, whose next word
+    /// could take it back. The reviewer starts at GitHub's head, fetched into
+    /// its checkout, reviews from the agreed commit to it, and the review
+    /// never goes back to an older head.
+    #[test]
+    fn a_review_begun_again_starts_at_githubs_head_and_never_goes_back() {
+        let (reviews, hands, prs, base) = setup("fresh-head");
+        let repo = base.join("shop");
+        let sh = |dir: &std::path::Path, args: &[&str]| crate::worktrees::tests::sh(dir, args);
+        let gh = prs.gh().to_path_buf();
+        found(&prs, &reviews, "t3", "fix-login");
+        let agreed = sh(&repo, &["rev-parse", "HEAD"]);
+        reviews.request("agree", "#12", None, "approved", Some("t9")).unwrap();
+        let commit = |text: &str| {
+            std::fs::write(repo.join("src/nav.txt"), text).unwrap();
+            sh(&repo, &["add", "."]);
+            sh(&repo, &["commit", "-m", text]);
+            sh(&repo, &["rev-parse", "HEAD"])
+        };
+        // Begun again at B (what the tower saw); by the time its reviewer opens, GitHub is at C.
+        let b = commit("pills keep one line");
+        let c = commit("a re-fitted menu stays at its end");
+        crate::prs::tests::serve(&gh, 12, "OPEN", json!([]), &c);
+        {
+            let mut book = lock(&reviews.book);
+            let seen = crate::prs::Pr { head_sha: b.clone(), ..prs.get("o/app#12").unwrap() };
+            book.reopen(&seen, 1).unwrap();
+        }
+        reviews.open_reviewer("o/app#12");
+        let place = base.join(".tower-worktrees/fix-login/review-shop-12");
+        let r = reviews.get("o/app#12").unwrap();
+        assert_eq!((sh(&place, &["rev-parse", "HEAD"]), r.head_sha.clone(), r.again_from.clone()), (c.clone(), c.clone(), agreed.clone()), "its checkout and its review at GitHub's head");
+        assert_eq!(prs.get("o/app#12").unwrap().head_sha, c, "the store has GitHub's head too");
+        let task = lock(&hands.started).last().unwrap().last().unwrap().clone();
+        assert!(task.contains(&format!("git diff {agreed}..{c}")), "from the agreed commit to it: {task}");
+
+        // D is pushed; the tower hasn't looked yet. Its reviewer agrees from C: refused, and the
+        // review and the store are both at D, so the store's next word keeps it there.
+        let d = commit("the note folds to one line");
+        crate::prs::tests::serve(&gh, 12, "OPEN", json!([]), &d);
+        let addr = r.reviewer.clone();
+        assert!(reviews.request("agree", "#12", None, "fine", Some(&addr)).is_err());
+        assert_eq!((reviews.get("o/app#12").unwrap().head_sha, prs.get("o/app#12").unwrap().head_sha), (d.clone(), d.clone()));
+        reviews.publish("o/app#12");
+        prs.poll("o/app#12");
+        let r = reviews.get("o/app#12").unwrap();
+        assert_eq!(r.head_sha, d, "never back to an older head");
+        let moves: Vec<&str> = r.steps.iter().filter(|s| s.what == "pushed").map(|s| s.text.as_str()).collect();
+        let to = |from: &str, now: &str| format!("pushed to during the review: {} is now {}", &from[..7], &now[..7]);
+        assert_eq!(moves, [to(&b, &c), to(&c, &d)], "forward only: B to C as its reviewer opened, C to D at the refused agreement");
+        // At D, its agreement counts.
+        sh(&place, &["checkout", "--quiet", "--detach", &d]);
+        let v = reviews.request("agree", "#12", None, "fine", Some(&addr)).unwrap();
+        assert_eq!(v["review"]["status"], "agreed");
+        assert!(prs.get("o/app#12").unwrap().review.unwrap().agreed_at(&d));
     }
 
     #[test]

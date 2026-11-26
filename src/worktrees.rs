@@ -253,6 +253,10 @@ pub fn pr_commit(repo: &Path, slug: &str, number: u64, head: &str, sha: &str) ->
     }
     for r in &tried {
         if git(repo, &["fetch", "--quiet", &remote, r]).is_ok_and(|o| o.code == 0) {
+            // The head GitHub named, when the fetch brought it: that commit, exactly.
+            if has_commit(repo, sha) {
+                return Ok(sha.to_string());
+            }
             let out = git(repo, &["rev-parse", "FETCH_HEAD"])?;
             let got = out.stdout.trim();
             if out.code == 0 && !got.is_empty() {
