@@ -195,10 +195,6 @@ fn file_of(place: &str) -> String {
     p.trim_matches(|c: char| c == '`' || c == '"' || c == '\'' || c == ',').trim_start_matches("./").to_lowercase()
 }
 
-fn files_of(places: &[String]) -> BTreeSet<String> {
-    places.iter().map(|p| file_of(p)).filter(|p| !p.is_empty()).collect()
-}
-
 /// A file's name without its folders and extension: `components/auth/RegisterForm.js` is `registerform`.
 fn file_stem(f: &str) -> &str {
     let name = f.rsplit('/').next().unwrap_or(f);
@@ -230,6 +226,77 @@ fn code_names(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// A place's lines: `a.js:12` is 12–12, `a.js:12-20` and `a.js#L12-L20`
+/// 12–20; none when it gives none (`a.js`, `a.js (pickProfileFields)`).
+fn lines_of(place: &str) -> Option<(u32, u32)> {
+    let p = place.trim().trim_matches(|c: char| c == '`' || c == '"' || c == '\'');
+    let rest = p.split_once(':').map(|(_, r)| r).or_else(|| p.split_once("#L").map(|(_, r)| r))?;
+    let num = |s: &str| -> Option<u32> {
+        let d: String = s.trim_start_matches('L').chars().take_while(|c| c.is_ascii_digit()).collect();
+        d.parse().ok()
+    };
+    let start = num(rest)?;
+    let end = rest.split_once('-').and_then(|(_, e)| num(e)).filter(|e| *e >= start).unwrap_or(start);
+    Some((start, end))
+}
+
+/// The `file:line`s a text gives (`(components/client/Navbar.js:151)`): a
+/// path or a file name with an extension, then a line.
+fn text_places(text: &str) -> Vec<String> {
+    text.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | ',' | ';' | '`' | '"' | '\''))
+        .map(|w| w.trim_end_matches(['.', ':']))
+        .filter(|w| {
+            let Some((f, line)) = w.split_once(':') else { return false };
+            let named = f.contains('/') || f.rsplit_once('.').is_some_and(|(a, ext)| !a.is_empty() && (1..=4).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphabetic()));
+            named && line.starts_with(|c: char| c.is_ascii_digit())
+        })
+        .map(String::from)
+        .collect()
+}
+
+/// The places a report names, with their lines when given: its places,
+/// and any `file:line` its title or account gives.
+fn spots(r: &Report) -> Vec<(String, Option<(u32, u32)>)> {
+    r.places.iter().cloned().chain(text_places(&format!("{} {}", r.title, r.what))).map(|p| (file_of(&p), lines_of(&p))).filter(|(f, _)| !f.is_empty()).collect()
+}
+
+/// How alike two reports at other lines of the same files must be to be one
+/// bug: their titles' words, or all their words (title and account).
+pub const APART_TITLE: f32 = 0.8;
+pub const APART_ALL: f32 = 0.7;
+
+/// Lines this close are one place: the line above or below what the other gave.
+pub const NEAR_LINES: u32 = 2;
+
+/// Two reports' places, file by file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Spots {
+    /// No file in common.
+    Elsewhere,
+    /// A file in common, at the same lines (or one doesn't say which).
+    Same,
+    /// Files in common, but every one at other lines: other code in them.
+    Apart,
+}
+
+fn compare_spots(a: &Report, b: &Report) -> Spots {
+    let (sa, sb) = (spots(a), spots(b));
+    let mut shared = false;
+    for (fa, la) in &sa {
+        for (fb, lb) in &sb {
+            if !same_file(fa, fb) {
+                continue;
+            }
+            shared = true;
+            match (la, lb) {
+                (Some((a0, a1)), Some((b0, b1))) if *a0 > b1 + NEAR_LINES || *b0 > a1 + NEAR_LINES => {}
+                _ => return Spots::Same,
+            }
+        }
+    }
+    if shared { Spots::Apart } else { Spots::Elsewhere }
+}
+
 fn overlap(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f32 {
     let (i, u) = (a.intersection(b).count(), a.union(b).count());
     if u == 0 { 0.0 } else { i as f32 / u as f32 }
@@ -240,16 +307,24 @@ fn overlap(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f32 {
 /// of the same names in code, with a title or account somewhat alike, or a
 /// title and account alike enough on their own. Found by any session, in
 /// any space, reported by any tower.
+///
+/// Files in common at other lines (`Navbar.js:148` and `Navbar.js:151`,
+/// `Footer.js:95` and `Footer.js:110`) are other code in those files: a
+/// title and account somewhat alike (both about German labels) aren't
+/// enough then, only a title or account all but the same.
 pub fn same_bug(a: &Report, b: &Report) -> bool {
     let (ra, rb) = (repo_key(&a.repo), repo_key(&b.repo));
     if !ra.is_empty() && !rb.is_empty() && ra != rb {
         return false;
     }
     let (ta, tb) = (words(&a.title), words(&b.title));
-    let (fa, fb) = (files_of(&a.places), files_of(&b.places));
     let all_a: BTreeSet<String> = ta.iter().cloned().chain(words(&a.what)).collect();
     let all_b: BTreeSet<String> = tb.iter().cloned().chain(words(&b.what)).collect();
-    let same_files = fa.iter().any(|x| fb.iter().any(|y| same_file(x, y)));
+    let spots = compare_spots(a, b);
+    if spots == Spots::Apart {
+        return overlap(&ta, &tb) >= APART_TITLE || overlap(&all_a, &all_b) >= APART_ALL;
+    }
+    let same_files = spots == Spots::Same;
     // Two names in code in common (what it said, its places): as the same files.
     let names = |r: &Report| -> BTreeSet<String> { code_names(&format!("{} {} {}", r.title, r.what, r.places.join(" "))) };
     let same_names = names(a).intersection(&names(b)).count() >= 2;
@@ -435,8 +510,12 @@ pub enum Filed {
 }
 
 /// Files a report in `book` (the judgment made): new, or the finding there is.
+///
+/// A finding's own space (the one it was spun out to) works on that bug, so
+/// whatever its sessions report off that space's goal is another bug.
 pub fn file(book: &mut Book, r: Report, now: u64) -> Filed {
-    if let Some(f) = book.findings.iter_mut().find(|f| same_bug(&f.report, &r)) {
+    let own_space = |f: &Finding| !f.spun_to.is_empty() && f.spun_to == r.space;
+    if let Some(f) = book.findings.iter_mut().find(|f| !own_space(f) && same_bug(&f.report, &r)) {
         let who = format!("{} › {} ({})", r.space, or_name(&r), r.session);
         let first = format!("{} › {} ({})", f.report.space, or_name(&f.report), f.report.session);
         if who != first && !f.again.contains(&who) {
@@ -597,7 +676,13 @@ pub fn report(a: &Args, now: u64) -> Result<Value> {
             let md = dir().join(format!("{}.md", f.id));
             std::fs::create_dir_all(dir())?;
             std::fs::write(&md, writeup(&f))?;
-            Ok(json!({ "filed": "new", "id": f.id, "judged": j.why, "writeup": md,
+            // Filed on the tower's word (--off-goal) though its words alone say on goal: say both.
+            let judged = if j.off {
+                j.why.clone()
+            } else if !j.known {
+                format!("the tower's call (--off-goal): {}", j.why)
+            } else { format!("off its goal by the tower's call (--off-goal); by its words alone: {}", j.why) };
+            Ok(json!({ "filed": "new", "id": f.id, "judged": judged, "writeup": md,
                 "next": format!("Publish {} as an HTML page Artifact with your Artifact tool (its words as they are: what was found, where, how to reproduce, evidence, who found it), then run `tower finding published {} --url <its link>`: that opens its space and tells the session and the user.", md.display(), f.id) }))
         }
     }
@@ -803,6 +888,132 @@ mod tests {
         assert_eq!(file_of("`src/a.rs:12-14`"), "src/a.rs");
         assert!(same_file("registerform", "components/auth/registerform.js") && same_file("user.js", "lib/functions/user.js"));
         assert!(!same_file("user.js", "lib/functions/superuser.js") && !same_file("lib", "lib/functions/user.js") && !same_file("index.js", "src/index.ts"));
+    }
+
+    /// f56 (2026-11-25): the logo link's English screen-reader label, spun
+    /// out to "sooner-support-deploy › bug-logo-links".
+    fn logo_finding() -> Finding {
+        let mut r = rep(
+            "Logo link's screen-reader label stays English on German pages",
+            "The logo link's aria-label stays English (\"Sooner, home\") on German pages. No German translation exists: t() looks it up in the remote eyzflow translations and gets nothing back, and SupportTicketPage and Footer hardcode it.",
+            "/w/eyz/sooner-app-web",
+            &["components/client/HelpCenterBar.js:70", "components/client/Navbar.js:148", "components/client/SupportTicketPage.js:16", "components/server/Footer.js:95"],
+        );
+        (r.space, r.session, r.session_name) = ("sooner-support-deploy".into(), "t221".into(), "sooner-support-deploy-sooner-app-web".into());
+        Finding { id: "f56".into(), report: r, at: 1, state: "spun-out".into(), url: "https://claude.ai/artifact/f56".into(), spun_to: "sooner-support-deploy \u{203a} bug-logo-links".into(), ..Default::default() }
+    }
+
+    /// What t224, a session of f56's own space, reported: another bug in
+    /// two of f56's files, as its tower filed it four times (the first three
+    /// came back as f56).
+    fn nav_and_footer_reports() -> Vec<Report> {
+        let navbar_footer = ["components/client/Navbar.js:151", "components/server/Footer.js:110"];
+        let reports = [
+            rep(
+                "Navbar and Footer screen-reader labels stay English on German pages",
+                "Two more screen-reader labels stay English on German pages: Navbar's nav aria-label t('Primary') has no entry in translations/sooner/de.json, and Footer hardcodes aria-label='Footer links N'. Not fixed in PR #156 (out of its scope, which was the logo link's label).",
+                "/w/eyz/sooner-app-web",
+                &navbar_footer,
+            ),
+            rep(
+                "Main nav and footer link groups have English screen-reader names on German pages",
+                "Not the logo link (f56): the Navbar's <nav aria-label={t('Primary')}> has no German entry in translations/sooner/de.json, so it renders 'Primary'; the Footer hardcodes aria-label='Footer links N' on its link groups, untranslated.",
+                "/w/eyz/sooner-app-web",
+                &navbar_footer,
+            ),
+            rep(
+                "Main nav and footer link groups have English screen-reader names on German pages",
+                "Not the logo link (f56): the Navbar's nav aria-label t('Primary') (components/client/Navbar.js:151) has no German entry in translations/sooner/de.json, so it renders 'Primary'; the Footer hardcodes aria-label='Footer links N' on its link groups (components/server/Footer.js:110), untranslated.",
+                "/w/eyz/sooner-app-web",
+                &[],
+            ),
+            rep(
+                "Main nav and footer link groups have English screen-reader names on German pages",
+                "Not the logo link (f56): the Navbar's nav aria-label t('Primary') (Navbar.js line 151) has no German entry in translations/sooner/de.json, so it renders 'Primary'; the Footer hardcodes aria-label='Footer links N' on its link groups (Footer.js line 110), untranslated.",
+                "/w/eyz/sooner-app-web",
+                &[],
+            ),
+        ];
+        reports
+            .into_iter()
+            .map(|mut r| {
+                (r.space, r.session, r.session_name) = ("sooner-support-deploy \u{203a} bug-logo-links".into(), "t224".into(), "sooner-support-deploy-bug-logo-links-sooner-app".into());
+                r
+            })
+            .collect()
+    }
+
+    #[test]
+    fn another_bug_in_a_findings_files_from_its_own_space_is_filed_new() {
+        let f56 = logo_finding();
+        for (i, r) in nav_and_footer_reports().into_iter().enumerate() {
+            // From f56's own space: a new finding, f57, and f56 doesn't list t224 as finding it again.
+            let mut b = Book { findings: vec![f56.clone()], next: 56 };
+            match file(&mut b, r.clone(), 2) {
+                Filed::New(f) => assert_eq!(f.id, "f57", "report {i}"),
+                Filed::Again(f) => panic!("report {i} filed again as {}", f.id),
+            }
+            assert!(b.findings[0].again.is_empty(), "report {i}");
+            // The same report from any other space: new on what it says alone
+            // (other lines of Navbar.js and Footer.js, another title and account).
+            let mut elsewhere = r;
+            (elsewhere.space, elsewhere.session) = ("sooner-help-faqs".into(), "t300".into());
+            assert!(!same_bug(&f56.report, &elsewhere), "report {i}");
+        }
+        // The first one's title alone is as alike as before (7 of 11 words), but its lines are elsewhere.
+        let first = &nav_and_footer_reports()[0];
+        assert!(overlap(&words(&f56.report.title), &words(&first.title)) >= 0.6);
+
+        // Its space alone can say so: the main nav's label, in Navbar.js
+        // with no line, reads as f56 to a tower anywhere else (the same file,
+        // titles somewhat alike), but from f56's own space it is another bug.
+        let mut nav = nav_and_footer_reports().remove(1);
+        nav.places = vec!["components/client/Navbar.js".into()];
+        assert!(same_bug(&f56.report, &nav));
+        let mut b = Book { findings: vec![f56.clone()], next: 56 };
+        assert!(matches!(file(&mut b, nav, 2), Filed::New(ref f) if f.id == "f57"));
+        assert_eq!(compare_spots(&f56.report, first), Spots::Apart);
+    }
+
+    #[test]
+    fn the_same_bug_in_the_same_files_is_still_found_again() {
+        let f56 = logo_finding();
+        let elsewhere = |title: &str, what: &str, places: &[&str]| {
+            let mut r = rep(title, what, "/w/eyz/sooner-app-web", places);
+            (r.space, r.session) = ("sooner-help-faqs".into(), "t300".into());
+            r
+        };
+        // At its line, or the line next to it, in other words.
+        for line in ["148", "150"] {
+            let r = elsewhere("The logo's aria-label 'Sooner, home' is English on German pages", "On /de pages the logo link reads 'Sooner, home'.", &[&format!("components/client/Navbar.js:{line}")]);
+            assert!(same_bug(&f56.report, &r), "line {line}");
+        }
+        // No line given on one side: the same file is enough, as before.
+        let r = elsewhere("The logo's aria-label 'Sooner, home' is English on German pages", "", &["Navbar.js"]);
+        assert!(same_bug(&f56.report, &r));
+        // Its lines moved on another branch, its words all but the same.
+        let r = elsewhere("Logo link's screen-reader label stays English on German pages", "", &["components/client/Navbar.js:162"]);
+        assert!(same_bug(&f56.report, &r));
+        let mut b = Book { findings: vec![f56.clone()], next: 56 };
+        assert!(matches!(file(&mut b, r, 2), Filed::Again(ref f) if f.id == "f56"));
+
+        // A session of f56's own space that finds another finding's bug: that one, found again.
+        let (sign_up, _) = sign_up_reports();
+        let mut b = Book { findings: vec![f56.clone(), Finding { id: "f31".into(), report: sign_up.clone(), state: "spun-out".into(), ..Default::default() }], next: 56 };
+        let mut again = sign_up;
+        (again.space, again.session) = (f56.spun_to.clone(), "t224".into());
+        assert!(matches!(file(&mut b, again, 2), Filed::Again(ref f) if f.id == "f31"));
+    }
+
+    #[test]
+    fn a_places_lines_are_read_from_places_and_accounts() {
+        assert_eq!(lines_of("components/client/Navbar.js:151"), Some((151, 151)));
+        assert_eq!(lines_of("lib/functions/user.js:17-21"), Some((17, 21)));
+        assert_eq!(lines_of("src/a.rs#L12-L20"), Some((12, 20)));
+        assert_eq!(lines_of("lib/functions/user.js (pickProfileFields)"), None);
+        assert_eq!(lines_of("RegisterForm"), None);
+        assert_eq!(text_places("aria-label t('Primary') (components/client/Navbar.js:151) has no entry; see Footer.js:110."), ["components/client/Navbar.js:151", "Footer.js:110"]);
+        assert!(text_places("at 10:30, PATCH /auth/me, Navbar.js line 151").is_empty());
     }
 
     #[test]
