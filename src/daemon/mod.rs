@@ -1596,7 +1596,22 @@ impl Daemon {
         if merge && let Some(store) = crate::prs::daemon() {
             sync_merges(&self.decisions, store);
         }
-        let settled = self.decisions.get(&raised.id).filter(|d| d.closed_ms.is_some()).map(|d| d.answer);
+        let now_d = self.decisions.get(&raised.id);
+        let settled = now_d.as_ref().filter(|d| d.closed_ms.is_some()).map(|d| d.answer.clone());
+        // A merge raise isn't shown on its own: it waits for its PR's merge card, or went into it.
+        // Whoever raised it is told so in its answer, and the session it is about too, when that is another.
+        let reply = now_d.as_ref().and_then(|d| crate::decisions::merge_raise_reply(d, settled.as_deref()));
+        let by_itself = from.is_some_and(|f| f == address || t.as_ref().is_some_and(|t| t["id"].as_str() == Some(f)));
+        let noted = match &reply {
+            Some(text) if live && raised.fresh && !by_itself => match self.sendq.add(&address, &format!("[tower] Your merge raise: {text}"), &[]) {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!("[tell] couldn't tell {address} about its merge raise: {e:#}");
+                    false
+                }
+            },
+            _ => false,
+        };
         // What is asked, and what the tower would pick.
         let pick = d.pick().filter(|_| raised.fresh).map(|o| o.label.clone());
         let told = told && settled.is_none() && self.watches.raise(&address, &crate::decisions::said(&name, &text, pick.as_deref()));
@@ -1611,6 +1626,7 @@ impl Daemon {
             state: Some(serde_json::json!({
                 "raised": true, "id": raised.id, "new": raised.fresh, "folded": raised.folded, "kind": d.kind.word(), "title": d.title, "detail": d.detail,
                 "count": raised.count, "waiting": raised.waiting, "session": address, "name": name, "space": space, "why": why, "told": told, "settled": settled,
+                "held": reply.is_some() && settled.is_none(), "next": reply, "noted_session": noted,
             })),
         }
     }

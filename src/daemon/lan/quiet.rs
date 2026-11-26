@@ -686,6 +686,7 @@ mod tests {
                 active: None,
                 waiting: None,
                 plans: &[],
+                prs: &[],
             };
             let view = crate::missions::view(&self.kept(), &src);
             self.shared.update(|s| s.missions = view.clone());

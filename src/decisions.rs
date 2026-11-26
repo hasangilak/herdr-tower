@@ -1074,6 +1074,41 @@ pub fn merge_links(text: &str, detail: &str) -> Vec<(String, u64)> {
     crate::prs::links(detail).into_iter().take(1).collect()
 }
 
+/// Why the tower holds a merge raise itself.
+pub const MERGE_RAISE_WAITS: &str = "until its PR's merge card: the merge is asked there";
+
+/// What a merge raise (`tower raise --why merge`) came to, in words for
+/// whoever raised it and the session it is about: the tower doesn't put a
+/// PR's merge to the user on its own, but on the PR's merge card, made once
+/// its review agrees; the raise waits for that card and goes into it. None:
+/// no merge raise, or one shown as it is (a PR the tower doesn't track,
+/// once its wait ran out). (#157 and #158, 25 Nov: their raises left the
+/// queue unanswered and nobody was told, so they were raised again.)
+pub fn merge_raise_reply(d: &Decision, settled: Option<&str>) -> Option<String> {
+    if !(d.key.starts_with("raise:") && d.why.trim().eq_ignore_ascii_case("merge")) {
+        return None;
+    }
+    let pr = match merge_subject(&d.title, &d.detail) {
+        Subject::Keys(keys) => keys.first().map(|k| format!("PR {k}")).unwrap_or_else(|| "its PR".into()),
+        Subject::Number(n) => format!("PR #{n}"),
+        Subject::None => "its PR".into(),
+    };
+    let not_again = "Nothing more to do for it: don't raise it again.";
+    match settled.map(str::trim) {
+        Some(a) if a.starts_with("in the merge card ") => Some(format!(
+            "Not raised on its own: the merge of {pr} is asked on its merge card ({}), in front of the user already, and this raise went into it. The user's answer comes from that card. {not_again}",
+            a.trim_start_matches("in the merge card ")
+        )),
+        Some("merged") => Some(format!("{pr} is merged already: nothing to ask. {not_again}")),
+        Some(a) => Some(format!("Not raised: {a}. {not_again}")),
+        None => d.hold.as_ref().filter(|h| h.by == "tower" && h.reason == MERGE_RAISE_WAITS).map(|_| {
+            format!(
+                "Not shown to the user yet, on purpose: the merge of {pr} is asked on its merge card, which the tower makes once its review agrees and its checks pass. This raise waits for that card and goes into it then (its words are the card's when it has none of its own). {not_again}"
+            )
+        }),
+    }
+}
+
 /// The tracked PR a merge raise is about (`merge_subject`): by its link,
 /// or by its number among its sessions' PRs, else its space's, when only
 /// one there has it.
@@ -1477,6 +1512,12 @@ impl Book {
         ch
     }
 
+    /// The PRs (`owner/name#n`) whose merge card the user put on hold:
+    /// they said not yet, so the PR waits on them, not on its space.
+    pub fn held_merge_prs(&self) -> Vec<String> {
+        self.open.iter().filter(|d| d.kind == Kind::Merge && d.hold.is_some()).flat_map(|d| d.prs.iter().map(|p| p.key.clone())).collect()
+    }
+
     /// The PRs that wait for a merge, as decisions: one per repo and space,
     /// its PRs in order (into `dev` before into `main`), changed in place. A
     /// decision whose PRs all merged or closed is over.
@@ -1782,7 +1823,7 @@ impl Book {
         if merge {
             let seen = d.seen();
             d.hold = Some(Hold {
-                reason: "until its PR's merge card: the merge is asked there".into(),
+                reason: MERGE_RAISE_WAITS.into(),
                 by: "tower".into(),
                 since_ms: now,
                 until_prs: vec![],
@@ -3858,6 +3899,54 @@ mod tests {
         b.sync_merges(&prs, 4 * MIN);
         let bare = b.raise(merge_raise(SPACE, "t1mv", "PR #1578 still waits for your merge", ""), 5 * MIN);
         assert_eq!(bare.id, merge.id);
+    }
+
+    /// #158 (25 Nov): the space's tower raised t22g's merge while its review
+    /// ran; the raise left the queue (held for the merge card) and nobody was
+    /// told, so it was raised again. Each answer now says where it went.
+    #[test]
+    fn a_merge_raise_says_it_waits_for_its_prs_merge_card_and_where_it_went() {
+        let mut b = Book::default();
+        let title = "Merge PR #158 into entitlment (sooner-app-web): German labels for the menu button and the skip link on /de pages";
+        let detail = "eyzhub/sooner-app-web#158, commit 46eb605, base entitlment. https://github.com/eyzhub/sooner-app-web/pull/158 Translations only.";
+        let r = b.raise(merge_raise(SPACE, "t22g", title, detail), MIN);
+        // Under review: no merge card, the raise held for it, and the answer says so.
+        let mut p = their_pr("eyzhub/sooner-app-web", 158, "t22g", SPACE);
+        p.review = Some(crate::reviews::Brief { status: "reviewing".into(), ..Default::default() });
+        b.sync_merges(std::slice::from_ref(&p), 2 * MIN);
+        let d = b.find(&r.id).unwrap().clone();
+        assert_eq!(d.hold.as_ref().map(|h| h.reason.as_str()), Some(MERGE_RAISE_WAITS));
+        let held = merge_raise_reply(&d, None).expect("a reply");
+        assert!(held.starts_with("Not shown to the user yet, on purpose: the merge of PR eyzhub/sooner-app-web#158 is asked on its merge card, which the tower makes once its review agrees"), "{held}");
+        assert!(held.ends_with("don't raise it again."));
+        // Raised again while it waits: the same raise, the same answer.
+        let again = b.raise(merge_raise(SPACE, "t22g", title, &format!("{detail} Still open.")), 3 * MIN);
+        assert_eq!((again.id.clone(), again.fresh), (r.id.clone(), false));
+        assert_eq!(merge_raise_reply(b.find(&r.id).unwrap(), None), Some(held));
+        // The review agrees: its merge card comes, the raise goes into it, and its answer names the card.
+        p.review = Some(crate::reviews::Brief { status: "agreed".into(), ..Default::default() });
+        let ch = b.sync_merges(std::slice::from_ref(&p), 4 * MIN);
+        let card = ch.fresh.first().cloned().expect("its merge card");
+        let over = b.closed.iter().find(|c| c.id == r.id).unwrap().clone();
+        let went = merge_raise_reply(&over, Some(&over.answer)).unwrap();
+        assert_eq!(went, format!("Not raised on its own: the merge of PR eyzhub/sooner-app-web#158 is asked on its merge card ({card}), in front of the user already, and this raise went into it. The user's answer comes from that card. Nothing more to do for it: don't raise it again."));
+        // Merged, or another kind of raise: said so, or nothing to add.
+        assert!(merge_raise_reply(&over, Some("merged")).unwrap().starts_with("PR eyzhub/sooner-app-web#158 is merged already"));
+        let other = b.raise(Raise { space: Some(SPACE.into()), who: who("t22g"), why: "deploy".into(), text: "Deploy the German labels to production?".into(), detail: String::new(), options: vec![] }, 5 * MIN);
+        assert_eq!(merge_raise_reply(b.find(&other.id).unwrap(), None), None);
+    }
+
+    #[test]
+    fn a_merge_card_the_user_holds_is_the_only_held_merge() {
+        let mut b = Book::default();
+        let p = their_pr("eyzhub/sooner-app-web", 160, "t221", SPACE);
+        // A session's merge raise the tower holds for the card: no merge card is held.
+        b.raise(merge_raise(SPACE, "t221", "Merge PR #160 into entitlment", "https://github.com/eyzhub/sooner-app-web/pull/160"), MIN);
+        let card = b.sync_merges(std::slice::from_ref(&p), 2 * MIN).fresh[0].clone();
+        assert!(b.held_merge_prs().is_empty());
+        // The user holds its merge card: that PR is held.
+        b.hold(&card, "after the release", "mac", 3 * MIN).unwrap();
+        assert_eq!(b.held_merge_prs(), ["eyzhub/sooner-app-web#160"]);
     }
 
     /// #116: t1mz raised its merge before its review was done (no merge card

@@ -197,7 +197,10 @@ impl Missions {
         // What waits for its sessions in the send queue, and the live plans' stages.
         let waiting = super::sendq::waiting_counts();
         let plans = self.shared.with(|s| s.plans_live.clone());
-        let src = Sources { sessions: Some(&sessions), decisions: &decisions, ledger: &ledger, threads: &threads, towers: &towers, now, auto_close_hours, active: Some(&active_of), waiting: Some(&waiting), plans: &plans };
+        // The open PRs (under review, checks running, waiting for a merge), but those whose merge card the user holds.
+        let held = self.decisions.held_merge_prs();
+        let prs: Vec<crate::prs::Pr> = crate::prs::daemon().map(|p| p.list()).unwrap_or_default().into_iter().filter(|p| p.open() && !held.iter().any(|k| k.eq_ignore_ascii_case(&p.key()))).collect();
+        let src = Sources { sessions: Some(&sessions), decisions: &decisions, ledger: &ledger, threads: &threads, towers: &towers, now, auto_close_hours, active: Some(&active_of), waiting: Some(&waiting), plans: &plans, prs: &prs };
         // The first look of this run, or the first in a while (the Mac slept, Herdr
         // couldn't be asked, the clock moved): what wasn't watched isn't a space left alone.
         let away = asked && missions::was_away(lock(&self.looked).replace(now), now);

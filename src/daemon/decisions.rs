@@ -389,6 +389,12 @@ impl Decisions {
     }
 
     /// The open merge cards: each one's id, space and PRs (repo, number).
+    /// The PRs (`owner/name#n`) whose merge card the user put on hold
+    /// (not the tower's own wait of a merge raise for its card).
+    pub fn held_merge_prs(&self) -> Vec<String> {
+        lock(&self.book).held_merge_prs()
+    }
+
     pub fn open_merges(&self) -> Vec<(String, Option<String>, Vec<(String, u64)>)> {
         lock(&self.book).open.iter().filter(|d| d.kind == decisions::Kind::Merge).map(|d| (d.id.clone(), d.space.clone(), d.prs.iter().map(|p| (p.repo.clone(), p.number)).collect())).collect()
     }
