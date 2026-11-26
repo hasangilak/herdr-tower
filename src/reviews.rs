@@ -213,6 +213,17 @@ impl Review {
     }
 }
 
+/// Two commits the same: equal, or one the other's short form (7 or more).
+pub fn same_commit(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    !a.is_empty() && (a == b || (short.len() >= 7 && long.starts_with(short)))
+}
+
+fn short_sha(s: &str) -> String {
+    s.chars().take(7).collect()
+}
+
 /// A PR's review in a few words, kept with the PR (`prs.json`): its chip,
 /// the merge card and the phone read it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -396,6 +407,18 @@ Never merge, close or push; never edit, commit or change the owner's code or bra
         owner = if r.owner_name.is_empty() { "its session".to_string() } else { r.owner_name.clone() },
         addr = r.owner,
         space = r.space,
+    )
+}
+
+/// The tower's note to a reviewer whose PR was pushed to while it
+/// reviews: the head it is to review now (its checkout is at `was`).
+pub fn pushed_note(r: &Review, was: &str) -> String {
+    format!(
+        "[tower] PR #{n} ({repo}) was pushed to while you review it: its head is now {now}, not {was} (new commits, or a rebase or force-push; {was} may be on no branch now). Review the PR as it is at {now}: gh pr checkout {n} --repo {repo} --detach first. An agreement counts only on the PR's head: tower review agree is refused while your checkout is at another commit.",
+        n = r.number,
+        repo = r.repo,
+        now = short_sha(&r.head_sha),
+        was = short_sha(was),
     )
 }
 
@@ -681,21 +704,60 @@ impl Book {
         Ok(r.clone())
     }
 
-    /// `tower review agree`: both agree; the reviewer approved it, at the
-    /// head commit `sha` (GitHub's now; "": the one it began at).
+    /// Both agree, at the head commit `sha` (GitHub's now; "": the one it
+    /// began at), whatever the reviewer's checkout: the tests' shorthand.
+    #[cfg(test)]
     pub fn agree(&mut self, key: &str, text: &str, by: &str, sha: &str, now: u64) -> Result<Review> {
+        self.agree_at(key, text, by, "", sha, now)
+    }
+
+    /// `tower review agree`, of the commit the reviewer reviewed
+    /// (`reviewed`: its checkout's; "": the review's head) when that is the
+    /// PR's head on GitHub (`head`; "": not known). An agreement on any
+    /// other commit (one since pushed past, or rebased away) doesn't count:
+    /// refused, the review's head brought to GitHub's, and the reviewer told
+    /// to review that.
+    pub fn agree_at(&mut self, key: &str, text: &str, by: &str, reviewed: &str, head: &str, now: u64) -> Result<Review> {
         let Some(r) = self.get_mut(key) else { bail!("no review of {key}") };
         if r.status.over() {
             bail!("the review of {} is over already ({})", r.short(), r.status.word());
         }
+        let (reviewed, head) = (reviewed.trim(), head.trim());
+        let reviewed = if reviewed.is_empty() { r.head_sha.clone() } else { reviewed.to_string() };
+        if !head.is_empty() && !reviewed.is_empty() && !same_commit(&reviewed, head) {
+            let n = r.number;
+            let repo = r.repo.clone();
+            r.head_sha = head.to_string();
+            bail!(
+                "not agreed: you reviewed {}, but PR #{n}'s head on GitHub is now {} (commits were pushed, or the branch was rebased or force-pushed). Review the PR as it is now: gh pr checkout {n} --repo {repo} --detach, then look at what changed, and agree again (or report what is critical).",
+                short_sha(&reviewed),
+                short_sha(head)
+            );
+        }
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
         r.status = Status::Agreed;
-        r.agreed_sha = sha.trim().to_string();
+        r.agreed_sha = if head.is_empty() { reviewed } else { head.to_string() };
         r.critical = 0;
         r.line = if text.is_empty() { "agreed".into() } else { text.clone() };
         r.ended_ms = Some(now);
         r.step("agreed", by, None, &text, now);
         Ok(r.clone())
+    }
+
+    /// Commits were pushed to a PR still under review (`pr`, at its new
+    /// head: a fix, or a rebase or force-push that left the commit it began
+    /// at on no branch): the review follows it to that head. None when it
+    /// isn't under review, or its head didn't move. The head it was at, and
+    /// what it is now.
+    pub fn follow(&mut self, pr: &Pr, now: u64) -> Option<(String, Review)> {
+        let r = self.get_mut(&pr.key())?;
+        if r.status.over() || pr.head_sha.is_empty() || same_commit(&r.head_sha, &pr.head_sha) {
+            return None;
+        }
+        let was = std::mem::replace(&mut r.head_sha, pr.head_sha.clone());
+        let line = if was.is_empty() { format!("its head is {}", short_sha(&pr.head_sha)) } else { format!("pushed to during the review: {} is now {}", short_sha(&was), short_sha(&pr.head_sha)) };
+        r.step("pushed", "", None, &line, now);
+        Some((was, r.clone()))
     }
 
     /// Commits were pushed to an agreed PR (`pr`, at its new head): its
@@ -810,6 +872,35 @@ mod tests {
         b.placed(&r.key, "fix-login-review-shop-12", "/w/.tower-worktrees/fix-login/review-shop-12", "/w/shop");
         b.started(&r.key, "t9", Some(500), 20);
         r.key
+    }
+
+    #[test]
+    fn a_review_follows_its_prs_head_and_agrees_only_on_it() {
+        let mut b = Book::default();
+        let k = begun(&mut b, 12);
+        let at = |sha: &str| Pr { head_sha: sha.into(), ..pr(12, "t3", Some("fix-login")) };
+        // The same head (or its short form), or none known: nothing to follow.
+        assert!(b.follow(&at("abc123"), 30).is_none() && b.follow(&at(""), 30).is_none());
+        // Rebased and force-pushed under review: the review is at the new head, its old one kept in the step.
+        let (was, r) = b.follow(&at("7ebff09ae925f6fe"), 31).unwrap();
+        assert_eq!((was.as_str(), r.head_sha.as_str(), r.status), ("abc123", "7ebff09ae925f6fe", Status::Reviewing));
+        assert_eq!(r.steps.last().unwrap().text, "pushed to during the review: abc123 is now 7ebff09");
+        assert!(b.follow(&at("7ebff09"), 32).is_none(), "its short form is the same commit");
+        assert!(instructions(&r, "", "", true).contains("commit_id=7ebff09ae925f6fe"), "its comments go on the new head");
+        assert!(pushed_note(&r, &was).contains("its head is now 7ebff09, not abc123"));
+        // Its reviewer agrees on what it reviewed, the old head: refused, and the review's head is GitHub's.
+        let err = b.agree_at(&k, "fine", "t9", "abc123", "7ebff09ae925f6fe", 33).unwrap_err().to_string();
+        assert!(err.starts_with("not agreed: you reviewed abc123, but PR #12's head on GitHub is now 7ebff09"), "{err}");
+        assert_eq!(b.get(&k).unwrap().status, Status::Reviewing);
+        // GitHub moved on again before the tower heard: refused too, the review's head brought along.
+        assert!(b.agree_at(&k, "fine", "t9", "", "0637b7a11", 34).is_err());
+        assert_eq!(b.get(&k).unwrap().head_sha, "0637b7a11");
+        // At the head: agreed on it.
+        let r = b.agree_at(&k, "fine", "t9", "0637b7a11", "0637b7a11", 35).unwrap();
+        assert_eq!((r.status, r.agreed_sha.as_str()), (Status::Agreed, "0637b7a11"));
+        // Agreed or over: pushes reopen it (`reopen`), never follow it.
+        assert!(b.follow(&at("fffffff1"), 36).is_none());
+        assert!(same_commit("7ebff09ae925", "7ebff09") && same_commit("abc", "abc") && !same_commit("7ebff0", "7ebff09ae925") && !same_commit("", ""));
     }
 
     #[test]
