@@ -1043,6 +1043,46 @@ pub fn like_words(a: &str, b: &str) -> bool {
     both / (x.union(&y).count() as f64) >= 0.55
 }
 
+/// Two cards about one session that ask it the same thing: their lines in
+/// like words (`like_words`), or an answer of four words or more that both
+/// offer word for word. 26 Nov (a launched film space): the space's tower
+/// raised "should it be pushed and published, … the font and the boat's
+/// size?" while the session's own turn-end question asked "Push and publish
+/// …? (and 2 more)": other words, but the raise's "Keep it local for now"
+/// was the first answer the question offered too, so the user had two
+/// cards, two alerts, and answered both.
+pub fn same_ask(a_title: &str, a_options: &[Opt], b_title: &str, b_options: &[Opt]) -> bool {
+    if like_words(a_title, b_title) {
+        return true;
+    }
+    let theirs = offered(b_options);
+    offered(a_options).iter().any(|o| theirs.contains(o))
+}
+
+/// What a card's options offer, each answer as a key has it (`normalise`):
+/// a raise's labels and the words it sends; a question's labels (one per
+/// question, ` · ` between them) and the replies they type. Answers of
+/// fewer than four words ("Yes", "Not yet") say nothing about what is asked.
+fn offered(options: &[Opt]) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for o in options {
+        let mut add = |s: &str| {
+            let n = normalise(s);
+            if n.split(' ').count() >= 4 {
+                out.insert(n);
+            }
+        };
+        o.label.split(" · ").for_each(&mut add);
+        add(&o.text);
+        for a in o.answers.as_array().into_iter().flatten() {
+            if let Some(words) = a["choice"]["other"].as_str() {
+                add(words);
+            }
+        }
+    }
+    out
+}
+
 /// The PR a merge raise is about.
 #[derive(Debug, Clone, PartialEq)]
 enum Subject {
@@ -1457,15 +1497,26 @@ impl Book {
                         ..Default::default()
                     };
                     let id = self.add(d, now);
-                    // A raise about the same session asking the same in like words (its tower raised what its
-                    // dialog asks now): the dialog is where it is answered, once.
-                    let over: Vec<String> = self
+                    // A raise about the same session asking the same (its tower raised what its
+                    // dialog asks now, `same_ask`): the dialog is where it is answered, once.
+                    let over: Vec<(String, bool)> = self
                         .open
                         .iter()
-                        .filter(|r| matches!(r.kind, Kind::Raised | Kind::Choice) && r.key.starts_with("raise:") && r.sessions.iter().any(|w| w.address == a.who.address) && like_words(&r.title, &a.title))
-                        .map(|r| r.id.clone())
+                        .filter(|r| {
+                            matches!(r.kind, Kind::Raised | Kind::Choice)
+                                && r.key.starts_with("raise:")
+                                && r.sessions.iter().any(|w| w.address == a.who.address)
+                                && same_ask(&r.title, &r.options, &a.title, &a.options)
+                        })
+                        .map(|r| (r.id.clone(), r.told))
                         .collect();
-                    for rid in over {
+                    // The user was told of it as the raise: the question that takes its place is not told again.
+                    if over.iter().any(|(_, told)| *told)
+                        && let Some(q) = self.open.iter_mut().find(|q| q.id == id)
+                    {
+                        q.told = true;
+                    }
+                    for (rid, _) in over {
                         if self.close(&rid, State::Stopped, now).is_some()
                             && let Some(c) = self.closed.iter_mut().rev().find(|c| c.id == rid)
                         {
@@ -1658,12 +1709,12 @@ impl Book {
                 .or_else(|| self.open.iter().position(|d| matches!(d.kind, Kind::Raised | Kind::Choice) && about(d) && d.why.eq_ignore_ascii_case(&why) && like_words(&d.title, &r.text))),
             "failed" => self.open.iter().position(|d| d.kind == Kind::Failed && about(d)),
             // The same session raising what it raised, in other words: that card, its words brought up to date;
-            // or what its own dialog asks already, in like words (19 Nov 12:46: the release scope twice).
+            // or what its own dialog asks already (19 Nov 12:46: the release scope twice; `same_ask`).
             _ => self
                 .open
                 .iter()
                 .position(|d| matches!(d.kind, Kind::Raised | Kind::Choice) && about(d) && d.why.eq_ignore_ascii_case(&why) && like_words(&d.title, &r.text))
-                .or_else(|| self.open.iter().position(|d| d.kind.asks() && about(d) && like_words(&d.title, &r.text))),
+                .or_else(|| self.open.iter().position(|d| d.kind.asks() && about(d) && same_ask(&d.title, &d.options, &r.text, &r.options))),
         }
     }
 
@@ -2084,6 +2135,12 @@ impl Book {
     /// their words. None: it isn't open (or that session isn't on it); else
     /// whether it is over.
     pub fn settled_in_terminal(&mut self, id: &str, address: &str, words: &str, now: u64) -> Option<bool> {
+        self.settled_there(id, address, "in its terminal", words, now)
+    }
+
+    /// `settled_in_terminal`, the words given `place` ("in its terminal",
+    /// "in its own question"): what the card closes with says where.
+    pub fn settled_there(&mut self, id: &str, address: &str, place: &str, words: &str, now: u64) -> Option<bool> {
         let d = self.open.iter_mut().find(|d| d.id == id)?;
         if !d.sessions.iter().any(|w| w.address == address) {
             return None;
@@ -2091,7 +2148,7 @@ impl Book {
         d.sessions.retain(|w| w.address != address);
         let over = !d.sessions.iter().any(|w| w.waiting);
         if over {
-            self.answered(id, &format!("in its terminal: {}", words.trim()), now);
+            self.answered(id, &format!("{place}: {}", words.trim()), now);
         }
         Some(over)
     }
@@ -3770,6 +3827,87 @@ mod tests {
         // Another session's raise, or other words: its own card.
         assert!(b.raise(Raise { who: who("t1n0"), ..raise(scope) }, 3 * MIN).fresh);
         assert!(b.raise(raise("Turn the notification flag on in production?"), 4 * MIN).fresh);
+    }
+
+    /// 26 Nov (a launched space's lone session, its first turn over): its
+    /// turn-end message asked three things (publish? the homepage? the
+    /// font and the boat's size?), and the space's tower raised them too, in
+    /// other words: "should it be pushed and published, and … the font and
+    /// the boat's final size first?". The question's card came 18 s later,
+    /// once its answers were scored, beside the raise: two cards and two
+    /// alerts ("needs you: …", then "asks: … (and 2 more)") for one thing.
+    /// The user answered the question in their words, then the raise's
+    /// first option, and the session was sent that option's words again.
+    /// Now the question takes the raise's place (the raise's first answer
+    /// is the question's first, word for word), and as the user was told of
+    /// the raise, the question isn't told again.
+    #[test]
+    fn a_raise_and_its_sessions_turn_end_question_in_other_words_with_the_same_answers_are_one_card_told_once() {
+        const SPACE: &str = "paper-boat-film";
+        let keep = "Keep the film local and unpushed for now; no PR.";
+        let raise = Raise {
+            space: Some(SPACE.into()),
+            who: who("t9"),
+            why: "design".into(),
+            text: "The paper boat film is done locally; the quote is still under copyright, so should it be pushed and published, and do you want to settle the font and the boat's final size first?".into(),
+            detail: "Three local commits, not pushed.".into(),
+            options: vec![
+                Opt { label: "Keep it local for now".into(), why: "nothing goes public".into(), pick: true, text: keep.into(), ..Default::default() },
+                Opt { label: "Push and open a PR into dev".into(), text: "Push your branch and open the PR into dev; keep the page unlisted.".into(), ..Default::default() },
+                Opt { label: "Tweak first".into(), text: "Try a handwriting font first and show me stills.".into(), ..Default::default() },
+            ],
+        };
+        let mut b = Book::default();
+        let r = b.raise(raise.clone(), MIN);
+        assert!(r.fresh);
+        // Its line was told: "needs you: …".
+        assert_eq!(b.claim_told(&r.id), Some(true));
+        // The session's own question, from the same turn's end, read and scored a little later.
+        let message = "My part is finished: three local commits, not pushed.\n\nWhat's left is your call:\n- Publishing: the quote is under copyright.\n- Placement: whether it ever goes on the homepage.\n- Look: which font, and how small the boat ends up.";
+        let mut set = questions::text_set("t9", "film", message, "make the paper boat film");
+        set.space = Some(SPACE.into());
+        set.tabs = ["Push and publish the film, given the quote is under copyright?", "Should a version ever go on the homepage?", "Keep this font or a handwriting one, and how small should the boat end?"]
+            .iter()
+            .map(|q| questions::Tab { title: "Reply".into(), question: q.to_string(), allows_other: true, ..Default::default() })
+            .collect();
+        let rec = |label: &str, words: &str| questions::Rec { label: label.into(), why: String::new(), choice: json!({ "other": words }) };
+        set.recommendations = Some(vec![
+            questions::TabRecs { tab: 0, options: vec![rec("Keep it local for now", keep), rec("Push and open a PR into dev", "Push your branch and open the PR into dev.")] },
+            questions::TabRecs { tab: 1, options: vec![rec("No, its own page", "Keep it as its own page."), rec("Yes, later", "Plan a short version later.")] },
+            questions::TabRecs { tab: 2, options: vec![rec("Keep the font", "Keep the font and make the boat smaller at the end."), rec("Try another", "Try a handwriting font.")] },
+        ]);
+        set.state.decision = crate::daemon::card::Decision::Escalated;
+        set.reason = "it deploys or releases".into();
+        let a = asked_all(std::slice::from_ref(&set));
+        // Not like words: only their answers say it is the same thing.
+        assert!(!like_words(&raise.text, &a[0].title), "{}", a[0].title);
+        let ch = b.sync_questions(&a, &|_| State::Stopped, MIN + 18_000);
+        // One card: the session's own question, where it is answered once.
+        assert_eq!(ch.fresh.len(), 1);
+        assert_eq!(b.open.len(), 1, "{:?}", b.open.iter().map(|d| &d.title).collect::<Vec<_>>());
+        assert!(b.open[0].kind.asks() && b.open[0].title.starts_with("Push and publish the film"));
+        let over = b.closed.iter().find(|c| c.id == r.id).unwrap();
+        assert!(over.state == State::Stopped && over.answer.starts_with("asked in its session's own question"), "{over:?}");
+        assert!(ch.closed.iter().any(|c| c.id == r.id));
+        // Told as the raise: the question's "asks: …" isn't said again.
+        assert_eq!(b.claim_told(&ch.fresh[0]), Some(false));
+        // The question first, the raise after it: the raise joins the question's card.
+        let mut b = Book::default();
+        b.sync_questions(&a, &|_| State::Stopped, MIN);
+        let q = b.open[0].id.clone();
+        let again = b.raise(raise.clone(), 2 * MIN);
+        assert_eq!((again.id, again.fresh, b.open.len()), (q, false, 1));
+        // Short answers alike ("Not yet", "Yes") are no sign: another question stays its own card.
+        let mut b = Book::default();
+        let short = |l: &str| Opt { label: l.into(), ..Default::default() };
+        let r = b.raise(Raise { options: vec![short("Yes"), short("Not yet")], text: "Turn the beta flag on for everyone?".into(), ..raise.clone() }, MIN);
+        let mut other = questions::text_set("t9", "film", "Which port should the preview use, 3000 or 3001?", "");
+        other.space = Some(SPACE.into());
+        other.recommendations = Some(vec![questions::TabRecs { tab: 0, options: vec![rec("Yes", "Yes"), rec("Not yet", "Not yet")] }]);
+        other.state.decision = crate::daemon::card::Decision::Escalated;
+        b.sync_questions(&asked_all(std::slice::from_ref(&other)), &|_| State::Stopped, 2 * MIN);
+        assert_eq!(b.open.len(), 2);
+        assert!(b.find(&r.id).is_some_and(|d| d.closed_ms.is_none()));
     }
 
     /// 19 Nov, after aa96771: a merge raise still stood alone 1 to 4

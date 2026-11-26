@@ -260,8 +260,36 @@ pub(super) fn rows(entries: &[Value]) -> Vec<Row> {
         }
         out.push(Row { at, what, kind, space: s(e, "space"), who, text });
     }
+    let mut out = folded(out);
     out.reverse();
     out
+}
+
+/// Rows this close to a row that says the same (ms) are folded into it.
+const SAYS_AGAIN_MS: u64 = 2 * 60 * 1000;
+
+/// The rows (oldest first) without those that only say again what a row
+/// beside them says. 26 Nov (a launched film space): one finished turn
+/// with one decision was five rows. A session's "is done" line beside its
+/// job's own finish, which says what it did, is that finish; and that
+/// finish, when the tower's receipt for the request follows it (the one
+/// line for it), is that receipt. "needs you: <the decision>" beside the
+/// decision raised about it is that decision. (A finish beside another
+/// session's in the same space keeps its row: the receipt may be the other's.)
+fn folded(rows: Vec<Row>) -> Vec<Row> {
+    let near = |a: &Row, b: &Row| a.space == b.space && a.who == b.who && a.at.abs_diff(b.at) <= SAYS_AGAIN_MS;
+    let receipt_after = |r: &Row| {
+        let alone = !rows.iter().any(|o| o.what == What::Finished && o.space == r.space && o.who != r.who && o.at.abs_diff(r.at) <= SAYS_AGAIN_MS);
+        alone && !r.space.is_empty() && rows.iter().any(|o| o.what == What::Receipt && o.space == r.space && o.at >= r.at && o.at - r.at <= SAYS_AGAIN_MS)
+    };
+    let again = |r: &Row| match (r.kind.as_str(), r.what) {
+        ("alert", What::Finished) => rows.iter().any(|o| o.kind == "job" && o.what == What::Finished && near(r, o)) || receipt_after(r),
+        ("job", What::Finished) => receipt_after(r),
+        ("alert", What::NeedsYou) => rows.iter().any(|o| o.what == What::Raised && near(r, o)),
+        _ => false,
+    };
+    let keep: Vec<bool> = rows.iter().map(|r| !again(r)).collect();
+    rows.into_iter().zip(keep).filter(|(_, k)| *k).map(|(r, _)| r).collect()
 }
 
 /// The rows of one space (`None`: of every space).
@@ -448,8 +476,8 @@ mod tests {
         let rows = rows(&entries);
         let got: Vec<(String, String, &str)> = rows.iter().rev().map(|r| (r.label(), r.place(), r.text.as_str())).collect();
         let want = [
+            // (Its "needs you: …" beside it says the same: folded into it, `folded`.)
             ("Decision raised", "isa › release", "merge: Merge PR #42 into main: the checks pass"),
-            ("Needs you", "isa › release", "release needs you: Merge PR #42 into main: the checks pass. I'd say: Merge it"),
             ("Decision answered", "isa › release", "Merge PR #42 into main: the checks pass → Merge it"),
             ("Decision dismissed", "isa", "Which microscope drawing?"),
             ("Decision over", "isa › clips", "Run the migration?"),
@@ -464,6 +492,40 @@ mod tests {
             ("Delivered", "sandbox › eyzflow", "delivered to eyzflow: run the tests"),
         ];
         assert_eq!(got.iter().map(|(l, p, t)| (l.as_str(), p.as_str(), *t)).collect::<Vec<_>>(), want);
+    }
+
+    /// 26 Nov: one finished turn with one decision was five rows. The
+    /// session's "is done" line is its job's finish, which says what it did;
+    /// "needs you: …" is the decision raised beside it. A row the same
+    /// session wrote longer apart, or another session's, stays.
+    #[test]
+    fn a_finished_turn_with_one_decision_reads_as_its_finish_and_its_decision() {
+        let min = 60_000;
+        let entries = vec![
+            json!({ "at": 1_000, "kind": "alert", "status": "done", "session": "t9", "name": "film", "space": "boat", "text": "boat › film is done", "record": true }),
+            json!({ "at": 1_000 + 15_000, "kind": "job", "status": "done", "session": "t9", "name": "film", "space": "boat", "text": "Built the film page; three local commits, not pushed.", "record": true }),
+            json!({ "at": 1_000 + 16_000, "kind": "raised", "id": "d0123456789ab", "session": "t9", "name": "film", "space": "boat", "why": "design", "text": "Publish the film, or keep it local?" }),
+            json!({ "at": 1_000 + 16_000, "kind": "alert", "status": "blocked", "session": "t9", "name": "film", "space": "boat", "text": "boat › film needs you: Publish the film, or keep it local? I'd say: Keep it local" }),
+            json!({ "at": 1_000 + 34_000, "kind": "receipt", "text": "The film is built and checked locally; publishing waits for you.", "space": "boat", "agenda": "a1", "record": true }),
+            // Another session's line, and the same session's long after: their own rows.
+            json!({ "at": 1_000 + 20_000, "kind": "alert", "status": "done", "session": "t8", "name": "docs", "space": "boat", "text": "boat › docs is done", "record": true }),
+            json!({ "at": 1_000 + 30 * min, "kind": "alert", "status": "blocked", "session": "t9", "name": "film", "space": "boat", "text": "boat › film needs you" }),
+        ];
+        let got: Vec<(String, String)> = rows(&entries).iter().rev().map(|r| (r.label(), r.text.clone())).collect();
+        // (The docs session finished beside it: the receipt may be its, so the film's finish stays.)
+        let want = [
+            ("Finished", "Built the film page; three local commits, not pushed."),
+            ("Decision raised", "design: Publish the film, or keep it local?"),
+            ("Receipt", "The film is built and checked locally; publishing waits for you."),
+            ("Finished", "boat › docs is done"),
+            ("Needs you", "boat › film needs you"),
+        ];
+        assert_eq!(got.iter().map(|(l, t)| (l.as_str(), t.as_str())).collect::<Vec<_>>(), want);
+        // Alone in its space: its finish and its receipt are one line, the receipt, beside the decision.
+        let alone: Vec<serde_json::Value> = entries.iter().filter(|e| e["session"] != "t8").take(5).cloned().collect();
+        let got: Vec<(String, String)> = rows(&alone).iter().rev().map(|r| (r.label(), r.text.clone())).collect();
+        let want = [("Decision raised", "design: Publish the film, or keep it local?"), ("Receipt", "The film is built and checked locally; publishing waits for you.")];
+        assert_eq!(got.iter().map(|(l, t)| (l.as_str(), t.as_str())).collect::<Vec<_>>(), want);
     }
 
     #[test]

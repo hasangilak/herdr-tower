@@ -984,12 +984,17 @@ impl Radar {
         if t["state"] != "live" || hc::status_word(&t).is_some() {
             return true;
         }
-        let screen = hc::run(&["read", address, "--lines", "0"]).map(|o| o.stdout).unwrap_or_default().to_lowercase();
+        let shown = hc::run(&["read", address, "--lines", "0"]).map(|o| o.stdout).unwrap_or_default();
+        let screen = shown.to_lowercase();
         if !screen.contains("trust") {
             return false;
         }
         let name = hc::spoken_name(&t);
         let folder = t["cwd"].as_str().unwrap_or("its folder");
+        // A worktree the tower made for it: the tower's to say yes to, nobody is asked.
+        if super::asks::trust_prompt(&shown, folder) == Some(super::asks::Trust::Answer) && super::asks::trust_worktree(address, &name, &shown, folder) {
+            return true;
+        }
         let report = Pending {
             address: address.to_string(),
             name: name.clone(),
@@ -1139,7 +1144,9 @@ impl Radar {
             // A wait the tower put in front of the user as a decision (told
             // once, in its own words): the plain "is waiting for you" beside
             // it is only written down.
-            let decided = beside_decision(level, &p.status, lock(&self.waiting).contains(&p.address));
+            // (Or one it is blocked on that the user was told of already: 26 Nov, a trust prompt's
+            // "needs you" and "is waiting for you" 2 s apart.)
+            let decided = beside_decision(level, &p.status, lock(&self.waiting).contains(&p.address) || self.decisions.told_for(&p.address));
             let record = crate::tell::for_record(level, &p.status) || decided;
             let status_line = |p: &Pending| {
                 if p.kind == "queue" || p.kind == "pr" || p.kind == "agenda" {

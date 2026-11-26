@@ -214,15 +214,16 @@ impl Introducer {
             due
         };
         for m in due {
-            let text = introduce::rule_note(&m.space, &goal(&m.space), &m);
-            match self.sendq.add_note(&m.address, &text) {
+            // With its next instruction, never alone: a note of its own costs the session a turn,
+            // and one queued while it works goes in only once its work is done.
+            match self.sendq.ride(&m.address, &introduce::rule_rider(&m.space)) {
                 Ok(_) => {
                     let mut b = lock(&self.book);
                     b.ruled_now(&m, now);
                     self.save(&b);
-                    eprintln!("[introduce] {}: told {} ({}) the bug rule", m.space, m.label(), m.address);
+                    eprintln!("[introduce] {}: the bug rule rides with the next instruction to {} ({})", m.space, m.label(), m.address);
                 }
-                Err(e) => eprintln!("[introduce] {}: couldn't queue the bug rule for {}: {e:#}", m.space, m.address),
+                Err(e) => eprintln!("[introduce] {}: couldn't give {} the bug rule: {e:#}", m.space, m.address),
             }
         }
     }

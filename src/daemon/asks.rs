@@ -999,11 +999,22 @@ impl Asks {
                     // Its usage limit's screen: the failover moves it, nothing for the user to look at.
                     && !super::failover::at_limit(address)
                 {
-                    let notice = blocked_notice(&hc::spoken_name(&t), &t["status"]);
+                    let name = hc::spoken_name(&t);
+                    let (mut notice, mut title) = (blocked_notice(&name, &t["status"]), blocked_title(&t["status"]));
+                    // What it can't read may be Claude's first-run question: may it trust its folder?
+                    let screen = if cfg!(test) { String::new() } else { hc::run(&["read", address, "--lines", "0"]).map(|o| o.stdout).unwrap_or_default() };
+                    match trust_prompt(&screen, folder_of(&t)) {
+                        Some(Trust::Answer) if trust_worktree(address, &name, &screen, folder_of(&t)) => return None,
+                        Some(_) => {
+                            title = trust_line(folder_of(&t));
+                            notice = format!("{name} a{}", title.strip_prefix('A').unwrap_or(&title));
+                        }
+                        None => {}
+                    }
                     let told = match self.decisions.get() {
                         Some(d) => {
-                            let who = crate::decisions::Who::new(address, &hc::spoken_name(&t));
-                            d.blocked(crate::spaces::space_of(&t), who, &blocked_title(&t["status"]))
+                            let who = crate::decisions::Who::new(address, &name);
+                            d.blocked(crate::spaces::space_of(&t), who, &title)
                         }
                         None => true,
                     };
@@ -2031,7 +2042,7 @@ impl Asks {
                 self.learn(k, answers);
             }
             if k.kind == "text" {
-                return self.reply(k, answers);
+                return self.reply(k, answers, !auto);
             }
         } else if let Some(p) = self.past(target) {
             // A card that is over. Read again (or hidden): what the screen
@@ -2187,7 +2198,8 @@ fn late_of(p: &QuestionSet) -> String {
 impl Asks {
     /// A text question's answer: one reply, typed into the session now if it
     /// is idle or done, else when it is.
-    fn reply(&self, set: &QuestionSet, answers: &[Answer]) -> Result<QuestionSet> {
+    /// `by_user`: the user's answer (not one the tower gave itself).
+    fn reply(&self, set: &QuestionSet, answers: &[Answer], by_user: bool) -> Result<QuestionSet> {
         let text = questions::compose_reply(set, answers)?;
         let status = hc::get(&set.session).map(|t| hc::status_live(&t)).unwrap_or(SessionStatus::Gone);
         let queued = !status.ready();
@@ -2221,6 +2233,12 @@ impl Asks {
         // Words of the user's own in it: their request in that session (what it works on now).
         if let Some(words) = questions::users_words(answers) {
             super::agendas::answered_on_card(&set.session, &words);
+        }
+        // The user's answer: a card a brain raised about this session that it settles closes with
+        // it, as when they type in its terminal: the session got the answer once, and nothing sends
+        // it again from a card left behind. (Never on the tower's own answer.)
+        if by_user && let Some(d) = self.decisions.get() {
+            d.answered_its_question(&set.session, &set.name, &text);
         }
         let done = {
             let mut i = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -2555,6 +2573,55 @@ fn edited(path: &str) -> String {
     }
     let name = path.rsplit('/').find(|p| !p.is_empty()).unwrap_or(path);
     if name.chars().count() <= 60 { name.to_string() } else { format!("{}…", name.chars().take(60).collect::<String>()) }
+}
+
+/// A first-run question on a session's screen: may it trust its folder?
+#[derive(Debug, Clone, PartialEq)]
+pub enum Trust {
+    /// Its folder is a worktree the tower made for it (`worktrees::repo_of`,
+    /// of a repo the user gave a space): the tower says yes itself.
+    Answer,
+    /// Any other folder: the user's to answer, named plainly (`trust_line`).
+    Ask,
+}
+
+/// The folder-trust question `screen` shows, if it shows one, and whose it
+/// is to answer for a session in `folder`. 26 Nov (a launched film space):
+/// a launched session's worktree held it, and the user got "needs you", "is
+/// waiting for you" and "it shows something the tower can't read" before
+/// the brain said yes.
+pub fn trust_prompt(screen: &str, folder: &str) -> Option<Trust> {
+    crate::brain::trust_keys(screen, true)?;
+    Some(if crate::worktrees::repo_of(std::path::Path::new(folder)).is_some() { Trust::Answer } else { Trust::Ask })
+}
+
+/// What a session that asks to trust its folder asks, in a card's words:
+/// "Asks whether to trust its folder site" (the folder by its name, never the whole path).
+pub fn trust_line(folder: &str) -> String {
+    let name = std::path::Path::new(folder.trim_end_matches('/')).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if name.is_empty() { "Asks whether to trust its folder".into() } else { format!("Asks whether to trust its folder {name}") }
+}
+
+/// A session's folder, as Herdr has it (its foreground's, else its own).
+fn folder_of(t: &Value) -> &str {
+    t["foreground"]["cwd"].as_str().or_else(|| t["cwd"].as_str()).unwrap_or("")
+}
+
+/// Says yes to the folder-trust question on `address`'s screen (a worktree
+/// the tower made for it), and writes it down. False: it couldn't.
+pub fn trust_worktree(address: &str, name: &str, screen: &str, folder: &str) -> bool {
+    let Some(keys) = crate::brain::trust_keys(screen, true) else { return false };
+    let mut args = vec!["keys", address];
+    args.extend(keys);
+    if let Err(e) = hc::run(&args) {
+        eprintln!("[questions] {address}: couldn't answer its folder-trust question ({e:#})");
+        return false;
+    }
+    let shown = std::path::Path::new(folder.trim_end_matches('/')).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let line = format!("{name} asked whether to trust its folder {shown}; the tower said yes: it is the worktree the tower made for it");
+    eprintln!("[questions] {address}: {line}");
+    crate::history::record_session_as("answered", address, &line, None, true);
+    true
 }
 
 /// The same as a decision's title, which names no session (its card shows
@@ -3780,6 +3847,14 @@ mod tests {
         );
         assert_eq!(n("permission", "approve Write: /Users/me/Work/app/src/very/long/pa…"), "The orb session asks to edit a file");
         assert_eq!(blocked_title(&json!({ "kind": "permission", "msg": "approve Update: /Users/me/.claude/projects/x/memory/notes.md" })), "Asks to edit notes.md");
+        // 26 Nov: Claude's first-run question, which the status line doesn't name. In a worktree
+        // the tower made for the session, the tower answers it; anywhere else it is named plainly.
+        let screen = " Quick safety check: Is this a project you created or one you trust?\n ❯ 1. Yes, I trust this folder\n   2. No, exit\n Enter to confirm";
+        assert_eq!(trust_prompt(screen, "/w/stuff/.tower-worktrees/boat-film/site"), Some(Trust::Answer));
+        assert_eq!(trust_prompt(screen, "/w/stuff/site"), Some(Trust::Ask));
+        assert_eq!(trust_prompt("Which database should the app use?\n ❯ 1. Postgres", "/w/.tower-worktrees/x/y"), None, "no trust question: none");
+        assert_eq!(trust_line("/w/stuff/site/"), "Asks whether to trust its folder site");
+        assert_eq!(trust_line(""), "Asks whether to trust its folder");
         assert_eq!(n("permission", "approve mcp__x__deploy: prod"), "The orb session asks to use mcp__x__deploy: prod");
         assert_eq!(n("question", ""), "The orb session has questions");
         assert_eq!(n("", ""), "The orb session needs you", "nothing to say: the bare notice");
