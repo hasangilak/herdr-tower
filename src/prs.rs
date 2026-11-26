@@ -996,18 +996,26 @@ impl Prs {
     /// for the same checks stay. The PR as it is now.
     pub fn set_planned(&self, k: &str, planned: Option<String>, validation: Option<crate::prscore::Validation>) -> Option<Pr> {
         let mut pr = self.get(k)?;
-        let had = pr.validation.take();
-        pr.validation = validation.map(|mut v| {
-            for c in v.checks.iter_mut() {
-                if let Some(o) = had.as_ref().and_then(|h| h.checks.iter().find(|o| o.id == c.id && o.status != crate::prscore::PLANNED)) {
-                    (c.status, c.proof, c.by, c.at_ms) = (o.status.clone(), o.proof.clone(), o.by.clone(), o.at_ms);
-                }
-            }
-            v
-        });
-        let mut score = pr.score.clone().unwrap_or_default();
-        score.planned = planned;
-        pr.score = Some(score);
+        planned_onto(&mut pr, planned, validation);
+        self.store(pr.clone(), "update", true);
+        Some(pr)
+    }
+
+    /// The plan that predicted open PR `k` (`planned`, `p6#3`) now plans
+    /// these checks for it: a revision added, changed or dropped some since
+    /// the PR took its prediction. Results reported for the same checks
+    /// stay, and the new ones can be reported (`tower validate`). The PR
+    /// when that changed anything; none when it is closed, unknown, took
+    /// another prediction (or none), or had them all already.
+    pub fn follow_plan(&self, k: &str, planned: &str, validation: crate::prscore::Validation) -> Option<Pr> {
+        let was = self.get(k).filter(Pr::open).filter(|p| p.score.as_ref().and_then(|s| s.planned.as_deref()) == Some(planned))?;
+        let mut pr = was.clone();
+        planned_onto(&mut pr, Some(planned.to_string()), Some(validation));
+        if pr.validation == was.validation && pr.score == was.score {
+            return None;
+        }
+        let ids = |p: &Pr| p.validation.as_ref().map(|v| v.checks.iter().map(|c| c.id.clone()).collect::<Vec<_>>().join(",")).unwrap_or_default();
+        eprintln!("[prs] {k}: its plan ({planned}) plans checks {} now (it had {})", ids(&pr), ids(&was));
         self.store(pr.clone(), "update", true);
         Some(pr)
     }
@@ -1472,6 +1480,23 @@ impl Prs {
     }
 }
 
+/// The plan's prediction `planned` and the checks it plans onto `pr` (or
+/// neither): what was reported before for a check of the same id stays.
+fn planned_onto(pr: &mut Pr, planned: Option<String>, validation: Option<crate::prscore::Validation>) {
+    let had = pr.validation.take();
+    pr.validation = validation.map(|mut v| {
+        for c in v.checks.iter_mut() {
+            if let Some(o) = had.as_ref().and_then(|h| h.checks.iter().find(|o| o.id == c.id && o.status != crate::prscore::PLANNED)) {
+                (c.status, c.proof, c.by, c.at_ms) = (o.status.clone(), o.proof.clone(), o.by.clone(), o.at_ms);
+            }
+        }
+        v
+    });
+    let mut score = pr.score.clone().unwrap_or_default();
+    score.planned = planned;
+    pr.score = Some(score);
+}
+
 /// The tower's own fields of `old` onto `pr` (a look at GitHub knows none of them).
 fn keep_own(pr: &mut Pr, old: &Pr) {
     pr.review = old.review.clone();
@@ -1778,6 +1803,45 @@ esac
         let again = Prs::at(path, gh.clone());
         assert_eq!(again.get("o/app#12").unwrap(), prs.get("o/app#12").unwrap());
         assert!(!calls(&gh).contains("pr merge"), "nothing merged");
+    }
+
+    #[test]
+    fn a_plans_checks_added_after_its_pr_opened_reach_the_pr_and_can_be_reported() {
+        use crate::prscore::{Check, Validation, PASSED, PLANNED};
+        let gh = fake_gh("plan-checks");
+        serve(&gh, 12, "OPEN", passing(), "abc");
+        let prs = Prs::at(gh.with_file_name("prs.json"), gh.clone());
+        let check = |id: &str, what: &str| Check { id: id.into(), what: what.into(), how: "npm test".into(), evidence: "test output".into(), status: PLANNED.into(), ..Default::default() };
+        let planned = |ids: &[&str]| Validation { checks: ids.iter().map(|id| check(id, &format!("{id} holds"))).collect(), edge_cases: vec![] };
+        // Found as the plan's PR 3, which planned c1 and c2 then.
+        let first = planned(&["c1", "c2"]);
+        prs.on_score(Box::new(move |_| crate::prscore::Scored { score: Some(crate::prscore::Score { planned: Some("p7#3".into()), ..Default::default() }), validation: Some(first.clone()), impact: None }));
+        prs.found(&[("o/app".into(), 12)], "t58", "mediaroom", Some("shop"), false);
+        prs.report_check("o/app#12", "c1", "passed", "npm test: ok", "t58").unwrap();
+        let updates = Arc::new(Mutex::new(0));
+        let u = updates.clone();
+        prs.on_change(Box::new(move |op, _| *u.lock().unwrap() += usize::from(op == "update")));
+        // The plan is revised: c3 is new. Before, the PR knew only c1 and c2, so c3 couldn't be reported.
+        assert!(prs.report_check("o/app#12", "c3", "passed", "screenshot", "t58").unwrap_err().to_string().contains("its checks are c1, c2"));
+        let pr = prs.follow_plan("o/app#12", "p7#3", planned(&["c1", "c2", "c3"])).expect("the PR takes the plan's new check");
+        let v = pr.validation.unwrap();
+        assert_eq!(v.checks.iter().map(|c| (c.id.as_str(), c.status.as_str())).collect::<Vec<_>>(), [("c1", PASSED), ("c2", PLANNED), ("c3", PLANNED)]);
+        assert_eq!((v.checks[0].proof.as_str(), v.checks[0].by.as_str()), ("npm test: ok", "t58"), "what was reported stays");
+        assert_eq!(*updates.lock().unwrap(), 1);
+        // Now c3 can be reported.
+        let pr = prs.report_check("o/app#12", "c3", "passed", "screenshot c3.png", "t58").unwrap();
+        assert_eq!(pr.validation.unwrap().checks[2].status, PASSED);
+        // The same checks again (a re-predict that changed nothing for it, a restart): nothing stored, nobody told.
+        assert!(prs.follow_plan("o/app#12", "p7#3", planned(&["c1", "c2", "c3"])).is_none());
+        assert_eq!(*updates.lock().unwrap(), 2, "only the report");
+        // Another prediction's checks never land on it; nor on a PR the tower doesn't know.
+        assert!(prs.follow_plan("o/app#12", "p8#1", planned(&["c1"])).is_none());
+        assert!(prs.follow_plan("o/app#99", "p7#3", planned(&["c1"])).is_none());
+        assert_eq!(prs.get("o/app#12").unwrap().validation.unwrap().checks.len(), 3);
+        // Closed: its checks stay as they were.
+        serve(&gh, 12, "MERGED", passing(), "abc");
+        prs.poll("o/app#12");
+        assert!(prs.follow_plan("o/app#12", "p7#3", planned(&["c1"])).is_none());
     }
 
     #[test]

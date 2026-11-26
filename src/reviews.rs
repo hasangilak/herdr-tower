@@ -410,6 +410,16 @@ Never merge, close or push; never edit, commit or change the owner's code or bra
     )
 }
 
+/// A review's line once its PR was pushed to under review: the head it is
+/// reviewed at now (`head`), and the one it was at (`was`).
+fn pushed_line(was: &str, head: &str) -> String {
+    if was.is_empty() {
+        format!("reviewed at {}", short_sha(head))
+    } else {
+        format!("pushed to during the review: reviewed again at {}, not {}", short_sha(head), short_sha(was))
+    }
+}
+
 /// The tower's note to a reviewer whose PR was pushed to while it
 /// reviews: the head it is to review now (its checkout is at `was`).
 pub fn pushed_note(r: &Review, was: &str) -> String {
@@ -727,7 +737,10 @@ impl Book {
         if !head.is_empty() && !reviewed.is_empty() && !same_commit(&reviewed, head) {
             let n = r.number;
             let repo = r.repo.clone();
-            r.head_sha = head.to_string();
+            if !same_commit(&r.head_sha, head) {
+                let was = std::mem::replace(&mut r.head_sha, head.to_string());
+                r.line = pushed_line(&was, head);
+            }
             bail!(
                 "not agreed: you reviewed {}, but PR #{n}'s head on GitHub is now {} (commits were pushed, or the branch was rebased or force-pushed). Review the PR as it is now: gh pr checkout {n} --repo {repo} --detach, then look at what changed, and agree again (or report what is critical).",
                 short_sha(&reviewed),
@@ -757,6 +770,8 @@ impl Book {
         let was = std::mem::replace(&mut r.head_sha, pr.head_sha.clone());
         let line = if was.is_empty() { format!("its head is {}", short_sha(&pr.head_sha)) } else { format!("pushed to during the review: {} is now {}", short_sha(&was), short_sha(&pr.head_sha)) };
         r.step("pushed", "", None, &line, now);
+        // What `tower review` and its chip say: the head it is reviewed at now, never the one before.
+        r.line = pushed_line(&was, &pr.head_sha);
         Some((was, r.clone()))
     }
 
@@ -885,6 +900,9 @@ mod tests {
         let (was, r) = b.follow(&at("7ebff09ae925f6fe"), 31).unwrap();
         assert_eq!((was.as_str(), r.head_sha.as_str(), r.status), ("abc123", "7ebff09ae925f6fe", Status::Reviewing));
         assert_eq!(r.steps.last().unwrap().text, "pushed to during the review: abc123 is now 7ebff09");
+        // What `tower review` shows says the new head, not the one it was reopened at.
+        assert_eq!(r.line, "pushed to during the review: reviewed again at 7ebff09, not abc123");
+        assert!(row(&r).ends_with(": pushed to during the review: reviewed again at 7ebff09, not abc123"), "{}", row(&r));
         assert!(b.follow(&at("7ebff09"), 32).is_none(), "its short form is the same commit");
         assert!(instructions(&r, "", "", true).contains("commit_id=7ebff09ae925f6fe"), "its comments go on the new head");
         assert!(pushed_note(&r, &was).contains("its head is now 7ebff09, not abc123"));
@@ -894,7 +912,7 @@ mod tests {
         assert_eq!(b.get(&k).unwrap().status, Status::Reviewing);
         // GitHub moved on again before the tower heard: refused too, the review's head brought along.
         assert!(b.agree_at(&k, "fine", "t9", "", "0637b7a11", 34).is_err());
-        assert_eq!(b.get(&k).unwrap().head_sha, "0637b7a11");
+        assert_eq!((b.get(&k).unwrap().head_sha.as_str(), b.get(&k).unwrap().line.as_str()), ("0637b7a11", "pushed to during the review: reviewed again at 0637b7a, not 7ebff09"));
         // At the head: agreed on it.
         let r = b.agree_at(&k, "fine", "t9", "0637b7a11", "0637b7a11", 35).unwrap();
         assert_eq!((r.status, r.agreed_sha.as_str()), (Status::Agreed, "0637b7a11"));

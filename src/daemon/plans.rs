@@ -37,6 +37,9 @@ const BRAIN_MS: u64 = 2 * 60_000;
 
 /// A PR's planned checks as the tower has them, by its key.
 pub type PrChecks = Arc<dyn Fn(&str) -> Option<crate::prscore::Validation> + Send + Sync>;
+/// A plan's checks for the PR that took one of its predictions: (the PR's
+/// key, the prediction `p7#3`, the checks it plans now).
+pub type PlannedChecks = Arc<dyn Fn(&str, &str, crate::prscore::Validation) + Send + Sync>;
 /// Hands a note to the tower's brain.
 pub type BrainNote = Arc<dyn Fn(&str) + Send + Sync>;
 /// The critic: one headless call with its prompt, its answer back.
@@ -56,6 +59,8 @@ pub struct Plans {
     decisions: Option<super::decisions::Decisions>,
     /// The PRs' checks, for a stage's state (none: no PR has opened).
     pr_checks: Option<PrChecks>,
+    /// Where a revised prediction's checks go: the PR that took it.
+    planned_checks: Option<PlannedChecks>,
     /// The brain, for the questions it may answer itself.
     brain: Option<BrainNote>,
     /// How long the brain has before a question goes to the user.
@@ -85,7 +90,7 @@ impl Plans {
 
     pub fn at(path: PathBuf, shared: Shared, sendq: SendQueue) -> Plans {
         let book: Book = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-        let plans = Plans { book: Arc::new(Mutex::new(book)), path, shared, sendq, hands: Arc::default(), decisions: None, pr_checks: None, brain: None, brain_ms: BRAIN_MS, critic: None, stage_tasks: None, handoffs: Arc::default() };
+        let plans = Plans { book: Arc::new(Mutex::new(book)), path, shared, sendq, hands: Arc::default(), decisions: None, pr_checks: None, planned_checks: None, brain: None, brain_ms: BRAIN_MS, critic: None, stage_tasks: None, handoffs: Arc::default() };
         plans.publish(&lock(&plans.book));
         plans
     }
@@ -96,6 +101,34 @@ impl Plans {
         (self.decisions, self.pr_checks, self.brain) = (Some(decisions), Some(pr_checks), Some(brain));
         self.publish(&lock(&self.book));
         self
+    }
+
+    /// With the PR store's door for checks: a PR that took a prediction
+    /// gets the checks the plan gives it now, after every revision.
+    pub fn giving_checks(mut self, f: PlannedChecks) -> Plans {
+        self.planned_checks = Some(f);
+        self
+    }
+
+    /// Each opened PR of plan `p` gets the checks its prediction plans
+    /// now (`PlannedChecks`): a revision that added one after the PR
+    /// opened would leave it unreportable there.
+    fn give_checks(&self, p: &Plan) {
+        let Some(f) = &self.planned_checks else { return };
+        for x in &p.prs {
+            if let Some(k) = &x.pr {
+                f(k, &format!("{}#{}", p.id, x.n), x.validation());
+            }
+        }
+    }
+
+    /// At the start: every plan's opened PRs get the checks their
+    /// predictions plan (one revised while the tower ran an older build).
+    pub fn give_all_checks(&self) {
+        let plans: Vec<Plan> = lock(&self.book).plans.iter().filter(|p| p.prs.iter().any(|x| x.pr.is_some())).cloned().collect();
+        for p in &plans {
+            self.give_checks(p);
+        }
     }
 
     /// With a critic, and the agenda's tasks of each stage.
@@ -554,6 +587,8 @@ impl Plans {
         let prs = crate::prscore::check(&v, &repos)?;
         let p = self.change(|b| b.set_prs(id, prs, now()))?;
         eprintln!("[plans] {id}: {} PR(s) predicted, {} needing review", p.prs.len(), p.prs.iter().filter(|x| x.score.needs_review).count());
+        // The PRs already open take the checks as they are now (not the plan's own lock: the store calls in here).
+        self.give_checks(&p);
         Ok(p)
     }
 
@@ -950,7 +985,15 @@ mod tests {
         std::fs::create_dir_all(dir.join("p1")).unwrap();
         let mut predicted = ask("prs", "p1");
         if let Request::Plan { prs, .. } = &mut predicted {
-            *prs = Some(json!({ "prs": [
+            *prs = Some(translation_prs());
+        }
+        let r = plans.request(&predicted);
+        assert!(r.ok, "{:?}", r.error);
+    }
+
+    /// The translation plan's three PRs, as its planner first predicts them.
+    fn translation_prs() -> Value {
+        json!({ "prs": [
                 { "repo": "eyz-customer-support-api", "title": "Translations table", "files": ["db/migrations/0042_translations.sql"], "migration": true,
                   "checks": [{ "what": "It applies and rolls back", "how": "npm run db:migrate && npm run db:rollback", "evidence": "the output" }],
                   "edge_cases": [{ "case": "Rows exist on rollback", "checks": ["c1"] }], "outside": "nothing reads the table yet" },
@@ -959,10 +1002,39 @@ mod tests {
                   "edge_cases": [{ "case": "The provider times out", "checks": ["c1"] }], "outside": "only the dashboard will call it" },
                 { "repo": "eyz-customer-support-dashboard", "title": "Translate toggle in the inbox", "files": ["src/inbox/Message.tsx"], "after": [2],
                   "checks": [{ "what": "The toggle shows the translation", "how": "open /inbox on dev and toggle a German message", "evidence": "a screenshot" }],
-                  "edge_cases": [{ "case": "A message already in English", "checks": ["c1"] }], "outside": "a new component" } ] }));
+                  "edge_cases": [{ "case": "A message already in English", "checks": ["c1"] }], "outside": "a new component" } ] })
+    }
+
+    #[test]
+    fn a_revision_gives_the_pr_that_opened_already_its_new_checks() {
+        let dir = std::env::temp_dir().join(format!("tower-plans-checks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let given: Arc<Mutex<Vec<(String, String, Vec<String>)>>> = Arc::default();
+        let g = given.clone();
+        let planned_checks: PlannedChecks = Arc::new(move |k: &str, planned: &str, v: crate::prscore::Validation| {
+            g.lock().unwrap().push((k.into(), planned.into(), v.checks.iter().map(|c| format!("{} {}", c.id, c.what)).collect()));
+        });
+        let plans = Plans::at(dir.join("plans.json"), Shared::new(State::new("off", "test", "test")), SendQueue::open()).giving_checks(planned_checks);
+        translation_plan(&plans, &dir);
+        assert!(lock(&given).is_empty(), "no PR opened yet");
+        // PR 3 opened as #5, with the one check it had then.
+        plans.remap("p1", 3, "eyz/eyz-customer-support-dashboard#5").unwrap();
+        // The planner revises: PR 3 checks more (c2), after the PR opened.
+        let mut v = translation_prs();
+        v["prs"][2]["checks"].as_array_mut().unwrap().push(json!({ "what": "The toggle fits a small screen", "how": "open /inbox at 1280x720", "evidence": "a screenshot" }));
+        let mut revised = ask("prs", "p1");
+        if let Request::Plan { prs, .. } = &mut revised {
+            *prs = Some(v);
         }
-        let r = plans.request(&predicted);
+        let r = plans.request(&revised);
         assert!(r.ok, "{:?}", r.error);
+        let want = ("eyz/eyz-customer-support-dashboard#5".to_string(), "p1#3".to_string(), vec!["c1 The toggle shows the translation".to_string(), "c2 The toggle fits a small screen".to_string()]);
+        assert_eq!(*lock(&given), [want.clone()], "only the PR that opened, with the checks as revised");
+        // At the start, the same again (the store keeps it when nothing changed).
+        plans.give_all_checks();
+        assert_eq!(lock(&given).last(), Some(&want));
+        assert_eq!(lock(&given).len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn structure_of() -> Value {

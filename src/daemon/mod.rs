@@ -390,9 +390,13 @@ pub fn run() -> Result<()> {
                 })
                 .collect()
         });
-        plans::Plans::open(shared.clone(), sendq.clone()).wired(decisions.clone(), pr_checks, brain).reviewed(critic, stage_tasks)
+        // A revision's checks reach the PRs that opened already (each keeps what it reported).
+        let store = prs.clone();
+        let planned_checks: plans::PlannedChecks = std::sync::Arc::new(move |key: &str, planned: &str, v| drop(store.follow_plan(key, planned, v)));
+        plans::Plans::open(shared.clone(), sendq.clone()).wired(decisions.clone(), pr_checks, brain).reviewed(critic, stage_tasks).giving_checks(planned_checks)
     };
     plans.start();
+    plans.give_all_checks();
     // A PR found from now on carries its review score: its plan's prediction, and its own files.
     {
         let (plans, gh) = (plans.clone(), prs.gh().to_path_buf());
@@ -649,6 +653,10 @@ fn validate(prs: &crate::prs::Prs, pr: &str, check: &str, status: &str, evidence
     } else {
         let p = prs.report_check(&key, check, status, evidence, from.unwrap_or(""))?;
         eprintln!("[prs] {key}: check {check} {status} (by {})", from.unwrap_or("?"));
+        // A session reports after it pushed: GitHub is asked for its head now, not at the next poll,
+        // so a review under way follows it at once (the "update" moves it).
+        let (store, k) = (prs.clone(), key.clone());
+        let _ = std::thread::Builder::new().name("validate-poll".into()).spawn(move || drop(store.poll(&k)));
         p
     };
     Ok(serde_json::json!({ "pr": pr.key(), "validation": pr.validation, "line": pr.validation.as_ref().map(|v| v.line()) }))
