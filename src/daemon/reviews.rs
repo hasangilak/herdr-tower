@@ -238,6 +238,8 @@ impl Reviews {
                 if let Some((was, r)) = self.reopen(pr) {
                     let me = self.clone();
                     self.run(move || me.review_again(&was, &r.key));
+                } else {
+                    self.follow(pr);
                 }
             }
             _ => {}
@@ -271,6 +273,31 @@ impl Reviews {
         self.hands.record(&r, &format!("{} got commits after its review agreed ({}): it is reviewed again", r.short(), r.line));
         self.publish(&r.key);
         Some((was, r))
+    }
+
+    /// Commits pushed to a PR still under review (a fix, a rebase, a
+    /// force-push): its review's head follows GitHub's, and a reviewer
+    /// still on its first look is told to review the new head (in a fix
+    /// round the owner tells it, and it checks out the PR again).
+    pub fn follow(&self, pr: &Pr) -> Option<Review> {
+        if pr.head_sha.is_empty() {
+            return None;
+        }
+        let (was, r) = {
+            let mut b = lock(&self.book);
+            let out = b.follow(pr, crate::history::now_ms())?;
+            self.save(&b);
+            out
+        };
+        eprintln!("[reviews] {}: {}", r.key, r.steps.last().map(|s| s.text.as_str()).unwrap_or(""));
+        if r.status == reviews::Status::Reviewing && !r.reviewer.is_empty() && !was.is_empty() {
+            let text = reviews::pushed_note(&r, &was);
+            if let Err(e) = self.hands.note(&r.reviewer, &text) {
+                eprintln!("[reviews] {}: couldn't tell its reviewer {}: {e:#}", r.key, r.reviewer);
+            }
+        }
+        self.publish(&r.key);
+        Some(r)
     }
 
     /// The agreed reviewer's leftovers go (its session, if it still runs, and its
@@ -456,6 +483,13 @@ impl Reviews {
                 self.review_again(&was, &r.key);
             }
         }
+        // Under review, and pushed to since (a fix, a rebase or force-push the tower didn't hear).
+        let under: Vec<String> = lock(&self.book).active().map(|r| r.key.clone()).collect();
+        for key in under {
+            if let Some(pr) = self.prs.get(&key).filter(Pr::open) {
+                self.follow(&pr);
+            }
+        }
         let now = crate::history::now_ms();
         let active: Vec<Review> = lock(&self.book).active().cloned().collect();
         let opening = lock(&self.opening).clone();
@@ -599,11 +633,14 @@ impl Reviews {
                     .filter(|s| !s.is_empty())
                     .or_else(|| self.prs.get(&key).map(|p| p.head_sha).filter(|s| !s.is_empty()))
                     .unwrap_or_default();
+                // What its reviewer reviewed: its checkout's commit (where it checked the PR out), else the review's head.
+                let reviewed = self.get(&key).map(|r| r.folder).filter(|f| !f.is_empty()).and_then(|f| checkout_head(&f)).unwrap_or_default();
                 let r = {
                     let mut b = lock(&self.book);
-                    let r = b.agree(&key, text, by, &sha, now)?;
+                    let r = b.agree_at(&key, text, by, &reviewed, &sha, now);
+                    // Refused or not, its head as GitHub has it now is kept.
                     self.save(&b);
-                    r
+                    r?
                 };
                 self.hands.record(&r, &format!("{} and {} agree on {}: {}", r.reviewer_name, r.owner_name, r.short(), r.line));
                 self.publish(&r.key);
@@ -623,6 +660,21 @@ impl Reviews {
             other => bail!("tower review {other}: use list, show <pr>, report <pr> --critical <n> \"<line>\", agree <pr> [\"<line>\"] or fixed <pr> \"<line>\""),
         }
     }
+}
+
+/// The commit a checkout is at (`git rev-parse HEAD`); None when the
+/// folder isn't a checkout of its own (a reviewer's plain folder inside
+/// some other repo isn't).
+fn checkout_head(folder: &str) -> Option<String> {
+    let o = std::process::Command::new("git").args(["-C", folder, "rev-parse", "--show-toplevel", "HEAD"]).output().ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    let mut lines = out.lines();
+    let (top, sha) = (lines.next()?.trim(), lines.next()?.trim());
+    let canon = |p: &str| std::fs::canonicalize(p).ok();
+    (canon(top).is_some() && canon(top) == canon(folder) && sha.len() >= 7).then(|| sha.to_string())
 }
 
 /// The daemon's hands: Herdr, this program's `tower start`, the send queue,
@@ -976,6 +1028,92 @@ mod tests {
         reviews.request("agree", "#12", None, "the demo is fine", Some("t9")).unwrap();
         let pr = prs.get("o/app#12").unwrap();
         assert!(pr.review.as_ref().unwrap().agreed_at(&pr.head_sha) && pr.ready_for_user());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// eyzhub/sooner-app-web#157 (2026-11-25): agreed, pushed to, reopened
+    /// at 0144fed; then rebased onto #156 (head 7ebff09, 0144fed on no
+    /// branch) while its new reviewer reviewed. The review stayed at 0144fed,
+    /// and an agreement would have been stamped with GitHub's head.
+    #[test]
+    fn a_pr_force_pushed_under_review_is_reviewed_and_agreed_only_at_its_new_head() {
+        let (reviews, hands, prs, base) = setup("force");
+        let repo = base.join("shop");
+        let sh = |dir: &std::path::Path, args: &[&str]| crate::worktrees::tests::sh(dir, args);
+        let gh = prs.gh().to_path_buf();
+        found(&prs, &reviews, "t3", "fix-login");
+        reviews.request("agree", "#12", None, "approved", Some("t9")).unwrap();
+        // A push after the agreement: reopened, a new reviewer at the new head (0144fed).
+        std::fs::write(repo.join("src/nav.txt"), "nav labels").unwrap();
+        sh(&repo, &["add", "."]);
+        sh(&repo, &["commit", "-m", "Name the nav landmarks"]);
+        let pushed = sh(&repo, &["rev-parse", "HEAD"]);
+        crate::prs::tests::serve(&gh, 12, "OPEN", json!([]), &pushed);
+        prs.poll("o/app#12");
+        let place = base.join(".tower-worktrees/fix-login/review-shop-12");
+        assert_eq!((reviews.get("o/app#12").unwrap().head_sha, sh(&place, &["rev-parse", "HEAD"])), (pushed.clone(), pushed.clone()));
+
+        // Rebased and force-pushed while the new reviewer reviews (7ebff09): the old head is on no branch.
+        std::fs::write(repo.join("src/nav.txt"), "nav labels, on top of the logo fix").unwrap();
+        sh(&repo, &["add", "."]);
+        sh(&repo, &["commit", "--amend", "-m", "Name the nav landmarks (stacked)"]);
+        let rebased = sh(&repo, &["rev-parse", "HEAD"]);
+        assert!(sh(&repo, &["branch", "--contains", &pushed]).is_empty(), "the old head is on no branch");
+        crate::prs::tests::serve(&gh, 12, "OPEN", json!([]), &rebased);
+        lock(&hands.notes).clear();
+        prs.poll("o/app#12");
+
+        // The review follows GitHub's head, still under review, and its reviewer is told.
+        let r = reviews.get("o/app#12").unwrap();
+        assert_eq!((r.status, r.head_sha.as_str()), (reviews::Status::Reviewing, rebased.as_str()));
+        let step = r.steps.last().unwrap();
+        assert_eq!((step.what.as_str(), step.text.clone()), ("pushed", format!("pushed to during the review: {} is now {}", &pushed[..7], &rebased[..7])));
+        let notes = lock(&hands.notes).clone();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].0, "t9");
+        assert!(notes[0].1.contains(&format!("its head is now {}, not {}", &rebased[..7], &pushed[..7])) && notes[0].1.contains("gh pr checkout 12 --repo o/app --detach"), "{}", notes[0].1);
+        assert_eq!(lock(&hands.started).len(), 2, "the same reviewer goes on: no third");
+        // Seen again: nothing more.
+        prs.poll("o/app#12");
+        assert_eq!((reviews.get("o/app#12").unwrap().steps.iter().filter(|s| s.what == "pushed").count(), lock(&hands.notes).len()), (1, 1));
+
+        // Its reviewer agrees from its checkout of the old head: refused, nothing counts.
+        lock(&hands.calls).clear();
+        let err = reviews.request("agree", "#12", None, "fine", Some("t9")).unwrap_err().to_string();
+        assert!(err.contains(&format!("you reviewed {}", &pushed[..7])) && err.contains(&format!("head on GitHub is now {}", &rebased[..7])), "{err}");
+        let pr = prs.get("o/app#12").unwrap();
+        assert_eq!(reviews.get("o/app#12").unwrap().status, reviews::Status::Reviewing);
+        assert!(!pr.review.as_ref().unwrap().agreed_at(&pr.head_sha) && !pr.ready_for_user(), "no agreement, no merge card");
+        assert!(!lock(&hands.calls).iter().any(|c| c == "end t9"), "the reviewer goes on");
+
+        // It checks out the PR's head and agrees: on that commit, and it counts.
+        sh(&place, &["checkout", "--detach", &rebased]);
+        let v = reviews.request("agree", "#12", None, "fine at the new head", Some("t9")).unwrap();
+        assert_eq!((v["review"]["status"].as_str(), v["review"]["agreed_sha"].as_str()), (Some("agreed"), Some(rebased.as_str())));
+        let pr = prs.get("o/app#12").unwrap();
+        assert!(pr.review.as_ref().unwrap().agreed_at(&pr.head_sha) && pr.ready_for_user());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_push_the_tower_missed_under_review_is_followed_by_the_sweep() {
+        let (reviews, hands, prs, base) = setup("missed");
+        let repo = base.join("shop");
+        let gh = prs.gh().to_path_buf();
+        // Found, its reviewer opened, but the reviews don't hear the store's changes (the tower was down).
+        prs.found(&[("o/app".into(), 12)], "t3", "shop", Some("fix-login"), true);
+        let r = reviews.found(&prs.get("o/app#12").unwrap()).unwrap();
+        reviews.open_reviewer(&r.key);
+        let first = reviews.get("o/app#12").unwrap().head_sha;
+        assert_eq!(reviews.get("o/app#12").unwrap().reviewer, "t9");
+        crate::worktrees::tests::sh(&repo, &["commit", "--allow-empty", "--amend", "-m", "rebased"]);
+        let rebased = crate::worktrees::tests::sh(&repo, &["rev-parse", "HEAD"]);
+        crate::prs::tests::serve(&gh, 12, "OPEN", json!([]), &rebased);
+        prs.poll("o/app#12");
+        assert_eq!((reviews.get("o/app#12").unwrap().head_sha, prs.get("o/app#12").unwrap().head_sha), (first, rebased.clone()));
+        reviews.sweep();
+        assert_eq!(reviews.get("o/app#12").unwrap().head_sha, rebased);
+        assert_eq!(lock(&hands.notes).len(), 1, "its reviewer is told");
         let _ = std::fs::remove_dir_all(base);
     }
 
