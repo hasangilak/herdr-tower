@@ -389,13 +389,16 @@ pub struct Facts {
     pub waiting: usize,
     /// Stages not done of a live plan it was launched with.
     pub stages: usize,
+    /// Its open PRs (by its name, or made by one of its sessions): under
+    /// review, its checks running, or waiting for the user's merge.
+    pub prs: usize,
 }
 
 impl Facts {
     /// Nothing asked for there is still open: no request, decision, task,
-    /// waiting instruction or plan stage.
+    /// waiting instruction, plan stage or open PR.
     pub fn settled(&self) -> bool {
-        self.open_requests == 0 && self.decisions == 0 && self.tasks == 0 && self.waiting == 0 && self.stages == 0
+        self.open_requests == 0 && self.decisions == 0 && self.tasks == 0 && self.waiting == 0 && self.stages == 0 && self.prs == 0
     }
 }
 
@@ -684,6 +687,9 @@ pub struct Sources<'a> {
     pub waiting: Option<&'a BTreeMap<String, usize>>,
     /// The live plans, as the state carries them (`launched`, each stage's `state`).
     pub plans: &'a [Value],
+    /// The PRs the tower tracks, but those whose merge card the user put
+    /// on hold (they said not yet: it waits on them, not on the space).
+    pub prs: &'a [crate::prs::Pr],
 }
 
 impl Sources<'_> {
@@ -715,6 +721,14 @@ impl Sources<'_> {
             .count()
     }
 
+    /// Its open PRs: by its name, or made by one of its sessions (`here`).
+    /// Under review, its checks running, or its merge card waiting: the
+    /// space isn't finished while one is open (#158, 25 Nov: ready while
+    /// its reviewer reviewed it and its merge raise waited for the card).
+    fn open_prs(&self, space: &str, here: &[&str]) -> usize {
+        self.prs.iter().filter(|p| p.open() && (p.space.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(space)) || here.contains(&p.session.as_str()))).count()
+    }
+
     /// What `step` needs: a line for every space with live sessions.
     pub fn facts(&self, s: &Spaces) -> BTreeMap<String, Facts> {
         let mut out: BTreeMap<String, Facts> = BTreeMap::new();
@@ -731,6 +745,7 @@ impl Sources<'_> {
             f.tasks = self.ledger.in_flight(space, &here);
             f.waiting = here.iter().map(|a| self.waiting.and_then(|w| w.get(*a)).copied().unwrap_or(0)).sum();
             f.stages = self.open_stages(space);
+            f.prs = self.open_prs(space, &here);
         }
         out
     }
@@ -812,7 +827,7 @@ fn from_files() -> Value {
         true => crate::daemon::brains::towers_of(&crate::brains::known_from_herdr(), &Default::default()),
         false => BTreeMap::new(),
     };
-    view(&spaces::load(), &Sources { sessions: sessions.as_deref(), decisions: &decisions, ledger: &ledger, threads: &threads, towers: &towers, now: history::now_ms(), auto_close_hours, active: None, waiting: None, plans: &[] })
+    view(&spaces::load(), &Sources { sessions: sessions.as_deref(), decisions: &decisions, ledger: &ledger, threads: &threads, towers: &towers, now: history::now_ms(), auto_close_hours, active: None, waiting: None, plans: &[], prs: &[] })
 }
 
 /// The missions now: the voice's (it looks again first), or from the files.
@@ -1663,7 +1678,7 @@ mod tests {
         let c = goal_from_request(&mut s, "shop", ("Ship the checkout", ""), "Ship it with Apple Pay", "Apple Pay works", &req, 420).unwrap();
         assert_eq!((c.by.as_str(), c.request.as_str(), s.agendas["Shop"].as_str(), s.missions["Shop"].goal_ms), ("request", "add Apple Pay too", "Ship it with Apple Pay", 420));
         // The view carries it for the windows and the phone.
-        let v = view(&s, &Sources { sessions: None, decisions: &[], ledger: &crate::agenda::Ledger::default(), threads: &BTreeMap::new(), towers: &BTreeMap::new(), now: 500, auto_close_hours: 24, active: None, waiting: None, plans: &[] });
+        let v = view(&s, &Sources { sessions: None, decisions: &[], ledger: &crate::agenda::Ledger::default(), threads: &BTreeMap::new(), towers: &BTreeMap::new(), now: 500, auto_close_hours: 24, active: None, waiting: None, plans: &[], prs: &[] });
         let row = v["spaces"].as_array().unwrap().iter().find(|r| r["name"] == "Shop").unwrap();
         assert_eq!(row["goal_history"].as_array().unwrap().last().unwrap()["by"], "request");
     }
@@ -1677,7 +1692,7 @@ mod tests {
         let held = json!({ "id": "d1", "space": "docs", "hold": { "reason": "after the launch", "by": "mac", "at_ms": 200 } });
         let waits = json!({ "id": "d2", "space": "Docs" });
         let needs = |decisions: &[Value]| {
-            let v = view(&s, &Sources { sessions: None, decisions, ledger: &crate::agenda::Ledger::default(), threads: &BTreeMap::new(), towers: &BTreeMap::new(), now: 500, auto_close_hours: 24, active: None, waiting: None, plans: &[] });
+            let v = view(&s, &Sources { sessions: None, decisions, ledger: &crate::agenda::Ledger::default(), threads: &BTreeMap::new(), towers: &BTreeMap::new(), now: 500, auto_close_hours: 24, active: None, waiting: None, plans: &[], prs: &[] });
             v["spaces"][0]["needs"].as_u64()
         };
         assert_eq!(needs(std::slice::from_ref(&held)), Some(0));
@@ -2151,7 +2166,7 @@ mod tests {
         l.apply(&t, TaskEv::Verify { how: "checked".into() }, now - MIN).unwrap();
         let (threads, towers) = (BTreeMap::new(), BTreeMap::new());
         let ready_with = |l: &Ledger, decisions: &[Value], waiting: Option<&BTreeMap<String, usize>>, plans: &[Value]| -> (Facts, Vec<Effect>, Vec<Effect>) {
-            let src = Sources { sessions: Some(&sessions), decisions, ledger: l, threads: &threads, towers: &towers, now, auto_close_hours: 24, active: None, waiting, plans };
+            let src = Sources { sessions: Some(&sessions), decisions, ledger: l, threads: &threads, towers: &towers, now, auto_close_hours: 24, active: None, waiting, plans, prs: &[] };
             let facts = src.facts(&s);
             let mut open = s.clone();
             let from_open = step(&mut open, &facts, now, 24);
@@ -2200,6 +2215,59 @@ mod tests {
         assert_eq!(open, [Effect::Ready(space.into())]);
     }
 
+    /// 'sooner-support-deploy › … › bug-hamburger-toggle' (25 Nov): ready
+    /// ("nothing waits for the user") while its PR #158 into entitlment was
+    /// open, its reviewer reviewing it at 46eb605 and its checks running;
+    /// its session's merge raise waited, on hold, for the merge card.
+    #[test]
+    fn a_space_with_an_open_pr_is_never_ready() {
+        let now = 1_800_000_000_000;
+        let space = "sooner-support-deploy \u{203a} bug-logo-links \u{203a} bug-main-nav \u{203a} bug-hamburger-toggle";
+        let mut s = Spaces::default();
+        s.agendas.insert(space.into(), "German labels for the menu toggle and the skip link".into());
+        s.missions.insert(space.into(), Mission::born(now - HOUR));
+        let sessions = vec![seen(space, "t22g", "idle")];
+        let (threads, towers) = (BTreeMap::new(), BTreeMap::new());
+        // Its one request, done and checked (the session's fix, PR #158 open).
+        let mut l = Ledger::default();
+        let a = l.open("Translate the menu toggle and the skip link", "", "user", 0, &[space.to_string()], now - HOUR);
+        let tag = Tag { agenda: Some(a), title: "fix it".into(), space: Some(space.into()), ..Default::default() };
+        let t = l.register(&Reg { queue_id: 1, session: "t22g".into(), name: "t22g".into(), text: "fix it".into(), tag, session_space: None }, &Default::default(), now - HOUR).unwrap().task;
+        l.apply(&t, TaskEv::Verify { how: "checked".into() }, now - MIN).unwrap();
+        let pr = |n: u64, state: &str, session: &str, of: Option<&str>| crate::prs::Pr {
+            repo: "eyzhub/sooner-app-web".into(),
+            number: n,
+            base: "entitlment".into(),
+            state: state.into(),
+            session: session.into(),
+            space: of.map(String::from),
+            ..Default::default()
+        };
+        // The session's merge raise, held by the tower until the PR's merge card: it isn't counted.
+        let raise = json!({ "id": "db80c343d8c68", "kind": "raised", "space": space, "sessions": [{ "address": "t22g" }], "hold": { "by": "tower", "reason": "until its PR's merge card: the merge is asked there" } });
+        let look = |prs: &[crate::prs::Pr]| -> (Facts, Vec<Effect>, Vec<Effect>) {
+            let decisions = [raise.clone()];
+            let src = Sources { sessions: Some(&sessions), decisions: &decisions, ledger: &l, threads: &threads, towers: &towers, now, auto_close_hours: 24, active: None, waiting: None, plans: &[], prs };
+            let facts = src.facts(&s);
+            let (mut open, mut ready) = (s.clone(), s.clone());
+            ready.missions.get_mut(space).unwrap().state = State::Ready;
+            let (a, b) = (step(&mut open, &facts, now, 24), step(&mut ready, &facts, now, 24));
+            (facts[space].clone(), a, b)
+        };
+        // #158 open, under review, by the space's name: not ready, and a ready one opens again.
+        let (f, open, ready) = look(&[pr(158, "open", "t22g", Some(space))]);
+        assert_eq!(f.prs, 1);
+        assert!(!f.settled() && !open.contains(&Effect::Ready(space.into())), "{f:?}");
+        assert_eq!(ready, [Effect::Reopened(space.into())]);
+        // Made by its session, carrying no space (or another's): the same.
+        let (f, ..) = look(&[pr(158, "open", "t22g", None)]);
+        assert_eq!(f.prs, 1);
+        // Merged or closed, another space's, another session's: ready.
+        let (f, open, _) = look(&[pr(158, "merged", "t22g", Some(space)), pr(157, "closed", "t22g", Some(space)), pr(160, "open", "t221", Some("sooner-support-deploy"))]);
+        assert!(f.settled(), "{f:?}");
+        assert_eq!(open, [Effect::Ready(space.into())]);
+    }
+
     #[test]
     fn the_missions_are_listed_in_a_stable_order_with_all_the_ui_needs() {
         let now = 1_800_000_000_000;
@@ -2232,7 +2300,7 @@ mod tests {
             ("Shop".to_string(), json!({ "name": "tower-shop", "status": "ready", "address": "t20" })),
             ("zeta".to_string(), json!({ "name": "tower-zeta", "status": "off", "address": null })),
         ]);
-        let src = Sources { sessions: Some(&sessions), decisions: &decisions, ledger: &l, threads: &threads, towers: &towers, now, auto_close_hours: 24, active: None, waiting: None, plans: &[] };
+        let src = Sources { sessions: Some(&sessions), decisions: &decisions, ledger: &l, threads: &threads, towers: &towers, now, auto_close_hours: 24, active: None, waiting: None, plans: &[], prs: &[] };
         let v = view(&s, &src);
         let names: Vec<&str> = v["spaces"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap()).collect();
         // Needs you, then at work (by name, any case), then the rest, then the quiet ones.

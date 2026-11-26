@@ -1450,7 +1450,10 @@ fn run(cli: Cli) -> Result<()> {
             let v = r.state.unwrap_or_default();
             if std::io::stdout().is_terminal() {
                 let (id, name, session) = (v["id"].as_str().unwrap_or(""), v["name"].as_str().unwrap_or(""), v["session"].as_str().unwrap_or(""));
-                if v["new"] == true {
+                if let Some(next) = v["next"].as_str() {
+                    // A merge raise: not shown on its own (it waits for its PR's merge card, or went into it).
+                    println!("{id}: {next}");
+                } else if v["new"] == true {
                     println!("Raised for the user as {id}, about {name} ({session}). It is shown, and said once: don't say or raise it again.");
                 } else {
                     println!(
