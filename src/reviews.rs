@@ -704,8 +704,9 @@ impl Book {
         Ok(r.clone())
     }
 
-    /// `tower review agree`: both agree; the reviewer approved it, at the
-    /// head commit `sha` (GitHub's now; "": the one it began at).
+    /// Both agree, at the head commit `sha` (GitHub's now; "": the one it
+    /// began at), whatever the reviewer's checkout: the tests' shorthand.
+    #[cfg(test)]
     pub fn agree(&mut self, key: &str, text: &str, by: &str, sha: &str, now: u64) -> Result<Review> {
         self.agree_at(key, text, by, "", sha, now)
     }
