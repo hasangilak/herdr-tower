@@ -1481,12 +1481,18 @@ impl Prs {
 }
 
 /// The plan's prediction `planned` and the checks it plans onto `pr` (or
-/// neither): what was reported before for a check of the same id stays.
+/// neither): what was reported before for the same check stays, the same
+/// id saying the same thing, or the same thing renumbered (a check put in
+/// ahead of it). A check reworded, or another under its old id, is
+/// reported anew: a result never vouches for what it didn't run.
 fn planned_onto(pr: &mut Pr, planned: Option<String>, validation: Option<crate::prscore::Validation>) {
     let had = pr.validation.take();
+    let same = |o: &crate::prscore::Check, c: &crate::prscore::Check| o.what.trim() == c.what.trim();
     pr.validation = validation.map(|mut v| {
         for c in v.checks.iter_mut() {
-            if let Some(o) = had.as_ref().and_then(|h| h.checks.iter().find(|o| o.id == c.id && o.status != crate::prscore::PLANNED)) {
+            let reported = had.iter().flat_map(|h| h.checks.iter()).filter(|o| o.status != crate::prscore::PLANNED);
+            let found = reported.clone().find(|o| o.id == c.id && same(o, c)).or_else(|| reported.clone().find(|o| same(o, c)));
+            if let Some(o) = found {
                 (c.status, c.proof, c.by, c.at_ms) = (o.status.clone(), o.proof.clone(), o.by.clone(), o.at_ms);
             }
         }
@@ -1838,10 +1844,20 @@ esac
         assert!(prs.follow_plan("o/app#12", "p8#1", planned(&["c1"])).is_none());
         assert!(prs.follow_plan("o/app#99", "p7#3", planned(&["c1"])).is_none());
         assert_eq!(prs.get("o/app#12").unwrap().validation.unwrap().checks.len(), 3);
+        // A check put in ahead of c1 (the planner gave no ids: they follow the order): the result
+        // stays with the check it was reported for, now c2, never with the new c1.
+        let ahead = Validation { checks: vec![check("c1", "the new one holds"), check("c2", "c1 holds"), check("c3", "c2 holds"), check("c4", "c3 holds")], edge_cases: vec![] };
+        let v = prs.follow_plan("o/app#12", "p7#3", ahead).unwrap().validation.unwrap();
+        assert_eq!(v.checks.iter().map(|c| (c.id.as_str(), c.status.as_str())).collect::<Vec<_>>(), [("c1", PLANNED), ("c2", PASSED), ("c3", PLANNED), ("c4", PASSED)]);
+        // Reworded: what it shows changed, so its old result doesn't count for it.
+        let reworded = Validation { checks: vec![check("c1", "the new one holds"), check("c2", "c1 holds on dev"), check("c3", "c2 holds"), check("c4", "c3 holds")], edge_cases: vec![] };
+        let v = prs.follow_plan("o/app#12", "p7#3", reworded).unwrap().validation.unwrap();
+        assert_eq!((v.checks[1].status.as_str(), v.checks[3].status.as_str()), (PLANNED, PASSED));
         // Closed: its checks stay as they were.
         serve(&gh, 12, "MERGED", passing(), "abc");
         prs.poll("o/app#12");
         assert!(prs.follow_plan("o/app#12", "p7#3", planned(&["c1"])).is_none());
+        assert_eq!(prs.get("o/app#12").unwrap().validation.unwrap().checks.len(), 4);
     }
 
     #[test]
