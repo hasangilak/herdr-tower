@@ -240,18 +240,31 @@ fn lines_of(place: &str) -> Option<(u32, u32)> {
     Some((start, end))
 }
 
-/// The `file:line`s a text gives (`(components/client/Navbar.js:151)`): a
-/// path or a file name with an extension, then a line.
+/// The `file:line`s a text gives: `(components/client/Navbar.js:151)`,
+/// and in words, `Navbar.js line 151`, `layout.js lines 30-38`: a path or a
+/// file name with an extension, then a line.
 fn text_places(text: &str) -> Vec<String> {
-    text.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | ',' | ';' | '`' | '"' | '\''))
-        .map(|w| w.trim_end_matches(['.', ':']))
-        .filter(|w| {
-            let Some((f, line)) = w.split_once(':') else { return false };
-            let named = f.contains('/') || f.rsplit_once('.').is_some_and(|(a, ext)| !a.is_empty() && (1..=4).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphabetic()));
-            named && line.starts_with(|c: char| c.is_ascii_digit())
-        })
-        .map(String::from)
-        .collect()
+    let named = |f: &str| f.contains('/') || f.rsplit_once('.').is_some_and(|(a, ext)| !a.is_empty() && (1..=4).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphabetic()));
+    let digit = |w: &str| w.starts_with(|c: char| c.is_ascii_digit());
+    let tokens: Vec<&str> = text
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';' | '`' | '"' | '\''))
+        .map(|w| w.trim_matches(['[', ']']).trim_end_matches(['.', ':']))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut out = vec![];
+    for (i, w) in tokens.iter().enumerate() {
+        if let Some((f, line)) = w.split_once(':') {
+            if named(f) && digit(line) {
+                out.push(w.to_string());
+            }
+        } else if named(w)
+            && tokens.get(i + 1).is_some_and(|l| l.eq_ignore_ascii_case("line") || l.eq_ignore_ascii_case("lines"))
+            && let Some(n) = tokens.get(i + 2).filter(|n| digit(n))
+        {
+            out.push(format!("{w}:{n}"));
+        }
+    }
+    out
 }
 
 /// The places a report names, with their lines when given: its places,
@@ -633,6 +646,18 @@ fn say(text: &str) {
     let _ = crate::protocol::send(&crate::protocol::Request::Say { text: text.into(), interrupt: false, kind: String::new(), from: None, brain: None });
 }
 
+/// How a report filed new was judged: its words' judgment, or, when the
+/// tower filed it with `--off-goal` though its words say on goal, both.
+fn judged_line(j: &Judged) -> String {
+    if j.off {
+        j.why.clone()
+    } else if !j.known {
+        format!("off its goal by the tower's call (--off-goal): {}", j.why)
+    } else {
+        format!("off its goal by the tower's call (--off-goal); by its words alone {}", j.why)
+    }
+}
+
 /// `tower finding report --from <session> --title "…" --what "…" [--repo <folder>] [--place <file:lines>…] [--repro "…"] [--evidence "…"] [--off-goal]`.
 pub fn report(a: &Args, now: u64) -> Result<Value> {
     let from = a.from.as_deref().map(str::trim).filter(|s| !s.is_empty()).context("--from <the session that found it>")?;
@@ -676,13 +701,7 @@ pub fn report(a: &Args, now: u64) -> Result<Value> {
             let md = dir().join(format!("{}.md", f.id));
             std::fs::create_dir_all(dir())?;
             std::fs::write(&md, writeup(&f))?;
-            // Filed on the tower's word (--off-goal) though its words alone say on goal: say both.
-            let judged = if j.off {
-                j.why.clone()
-            } else if !j.known {
-                format!("the tower's call (--off-goal): {}", j.why)
-            } else { format!("off its goal by the tower's call (--off-goal); by its words alone: {}", j.why) };
-            Ok(json!({ "filed": "new", "id": f.id, "judged": judged, "writeup": md,
+            Ok(json!({ "filed": "new", "id": f.id, "judged": judged_line(&j), "writeup": md,
                 "next": format!("Publish {} as an HTML page Artifact with your Artifact tool (its words as they are: what was found, where, how to reproduce, evidence, who found it), then run `tower finding published {} --url <its link>`: that opens its space and tells the session and the user.", md.display(), f.id) }))
         }
     }
@@ -1013,7 +1032,99 @@ mod tests {
         assert_eq!(lines_of("lib/functions/user.js (pickProfileFields)"), None);
         assert_eq!(lines_of("RegisterForm"), None);
         assert_eq!(text_places("aria-label t('Primary') (components/client/Navbar.js:151) has no entry; see Footer.js:110."), ["components/client/Navbar.js:151", "Footer.js:110"]);
-        assert!(text_places("at 10:30, PATCH /auth/me, Navbar.js line 151").is_empty());
+        assert!(text_places("at 10:30, PATCH /auth/me, translations/sooner/de.json").is_empty());
+        // In words, as f57 and t229 wrote them.
+        assert_eq!(
+            text_places("t('Primary') (Navbar.js line 151) has no entry; app/[locale]/layout.js line 38 hardcodes it; see Footer.js lines 108-112."),
+            ["Navbar.js:151", "app/[locale]/layout.js:38", "Footer.js:108-112"]
+        );
+        assert!(text_places("the line 151 of it, a file line").is_empty());
+        assert_eq!(lines_of("Footer.js:108-112"), Some((108, 112)));
+    }
+
+    /// f57 (2026-11-25): the main nav and footer link groups, spun out to
+    /// "… › bug-logo-links › bug-main-nav"; its lines only in its account.
+    fn nav_finding() -> Finding {
+        let r = nav_and_footer_reports().remove(3);
+        Finding { id: "f57".into(), report: r, at: 2, state: "spun-out".into(), url: "https://claude.ai/artifact/f57".into(), spun_to: "sooner-support-deploy \u{203a} bug-logo-links \u{203a} bug-main-nav".into(), ..Default::default() }
+    }
+
+    /// What t229, a session of f57's own space, reported: a third bug (the
+    /// mobile-menu toggle at Navbar.js:287, the skip link at layout.js:38),
+    /// as its towers filed it. The first two came back as f56, the third as
+    /// f57; only the fourth, reworded, was filed new (f58).
+    fn menu_and_skip_link_reports() -> Vec<Report> {
+        let places = ["components/client/Navbar.js:287", "app/[locale]/layout.js:38"];
+        let repo = "/w/eyz/sooner-app-web";
+        [
+            rep(
+                "Mobile-menu button and skip link are announced in English on German pages",
+                "On German pages the Navbar's mobile-menu toggle uses t('Open menu') / t('Close menu'), which have no entries in translations/sooner/de.json, so its aria-label stays English; the layout hardcodes the skip link's text 'Skip to main content'. Found while fixing the nav landmarks' names (PR #157 covers only the nav landmarks).",
+                repo,
+                &places,
+            ),
+            rep(
+                "Mobile-menu toggle 'Open menu'/'Close menu' and the 'Skip to main content' skip link stay English on German pages (not the logo link, f56)",
+                "Distinct from f56 (logo link label) and f57 (nav landmark names); PR #156 and #157 change neither. The Navbar's mobile-menu button uses t('Open menu') / t('Close menu') with no entries in translations/sooner/de.json, and app/[locale]/layout.js hardcodes the skip link text 'Skip to main content'.",
+                repo,
+                &places,
+            ),
+            rep(
+                "Mobile menu button and skip link stay English on German pages",
+                "Not the logo link (f56) nor the nav/footer labels (f57): the mobile-menu button's t('Open menu') / t('Close menu') (Navbar.js line 287) has no entry in translations/sooner/de.json, and app/[locale]/layout.js line 38 hardcodes 'Skip to main content'. Both stay English on German pages; neither PR #156 nor #157 touches them.",
+                repo,
+                &[],
+            ),
+            rep(
+                "Hamburger toggle and skip-to-content link untranslated in the de locale",
+                "The hamburger toggle's t('Open menu') / t('Close menu') (Navbar.js line 287) has no key in translations/sooner/de.json, and app/[locale]/layout.js line 38 hardcodes 'Skip to main content'. Separate from f56 and f57; PRs #156 and #157 don't touch either.",
+                repo,
+                &[],
+            ),
+        ]
+        .into_iter()
+        .map(|mut r| {
+            (r.space, r.session, r.session_name) = ("sooner-support-deploy \u{203a} bug-logo-links \u{203a} bug-main-nav".into(), "t229".into(), "sooner-support-deploy-bug-logo-links-bug-main-na".into());
+            r
+        })
+        .collect()
+    }
+
+    #[test]
+    fn a_third_bug_from_a_spun_out_findings_space_is_filed_new() {
+        let (f56, f57) = (logo_finding(), nav_finding());
+        for (i, r) in menu_and_skip_link_reports().into_iter().enumerate() {
+            // From f57's own space, with f56 (its parent's finding) in the book too: f58.
+            let mut b = Book { findings: vec![f56.clone(), f57.clone()], next: 57 };
+            match file(&mut b, r.clone(), 3) {
+                Filed::New(f) => assert_eq!(f.id, "f58", "report {i}"),
+                Filed::Again(f) => panic!("report {i} filed again as {}", f.id),
+            }
+            assert!(b.findings.iter().all(|f| f.again.is_empty()), "report {i}");
+            // From any other space too: other lines of Navbar.js (287, not
+            // 148 or 151), and words in common (English, German pages,
+            // label, translations/sooner/de.json) aren't enough.
+            let mut elsewhere = r;
+            (elsewhere.space, elsewhere.session) = ("sooner-help-faqs".into(), "t300".into());
+            assert!(!same_bug(&f56.report, &elsewhere) && !same_bug(&f57.report, &elsewhere), "report {i}");
+        }
+        // f57's lines, though written in words, are read: Navbar.js 151 against 287.
+        assert_eq!(compare_spots(&f57.report, &menu_and_skip_link_reports()[2]), Spots::Apart);
+        // And f57's own reports from f56's space are still new beside f56.
+        for r in nav_and_footer_reports() {
+            let mut b = Book { findings: vec![f56.clone()], next: 56 };
+            assert!(matches!(file(&mut b, r, 2), Filed::New(_)));
+        }
+    }
+
+    #[test]
+    fn a_report_filed_off_goal_by_the_tower_says_so() {
+        let on = Judged { off: false, known: true, why: "on its goal: it is about link, main".into() };
+        assert_eq!(judged_line(&on), "off its goal by the tower's call (--off-goal); by its words alone on its goal: it is about link, main");
+        let off = Judged { off: true, known: true, why: "off its goal: only label in common".into() };
+        assert_eq!(judged_line(&off), "off its goal: only label in common");
+        let none = Judged { off: false, known: false, why: "the space has no goal to judge it by".into() };
+        assert!(judged_line(&none).starts_with("off its goal by the tower's call (--off-goal)"));
     }
 
     #[test]
