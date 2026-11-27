@@ -814,6 +814,18 @@ pub fn account_key(cause: &str) -> String {
     format!("account:{cause}")
 }
 
+/// The line under a blocked card's title: how the user answers what its
+/// session shows (nothing typed on the card reaches it).
+pub fn blocked_hint(title: &str) -> &'static str {
+    if title.starts_with(crate::daemon::asks::LOGIN_AGAIN) {
+        "Log in again in the session: run /login there. Nothing typed here reaches it."
+    } else if title.starts_with("Asks whether to trust its folder") {
+        "Answer it in the session: nothing typed here reaches it."
+    } else {
+        "The tower can't read what it shows: answer it in the session."
+    }
+}
+
 /// A session blocked on what the tower can't read: one decision per session.
 pub fn blocked_key(space: Option<&str>, address: &str) -> String {
     format!("blocked:{}:{}", space_part(space), address.trim())

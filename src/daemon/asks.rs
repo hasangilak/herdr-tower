@@ -1000,14 +1000,15 @@ impl Asks {
                     && !super::failover::at_limit(address)
                 {
                     let name = hc::spoken_name(&t);
-                    let (mut notice, mut title) = (blocked_notice(&name, &t["status"]), blocked_title(&t["status"]));
-                    // What it can't read may be Claude's first-run question: may it trust its folder?
+                    // What its status can't say, its screen may: an expired login, or
+                    // Claude's first-run question (may it trust its folder?).
                     let screen = if cfg!(test) { String::new() } else { hc::run(&["read", address, "--lines", "0"]).map(|o| o.stdout).unwrap_or_default() };
+                    let (mut notice, mut title) = read_blocked(&name, &t["status"], &screen, || super::reviews::account_of_terminal(&t));
                     match trust_prompt(&screen, folder_of(&t)) {
                         Some(Trust::Answer) if trust_worktree(address, &name, &screen, folder_of(&t)) => return None,
                         Some(_) => {
                             title = trust_line(folder_of(&t));
-                            notice = format!("{name} a{}", title.strip_prefix('A').unwrap_or(&title));
+                            notice = said_by(&name, &title);
                         }
                         None => {}
                     }
@@ -2602,6 +2603,53 @@ pub fn trust_line(folder: &str) -> String {
     if name.is_empty() { "Asks whether to trust its folder".into() } else { format!("Asks whether to trust its folder {name}") }
 }
 
+/// A blocked session's notice and its card's title, from its status and,
+/// when the status says nothing ("needs you" alone), from its `screen`:
+/// an expired login says so and names the account it runs on (`account`,
+/// asked only then). 27 Nov (a homepage mockup space): a session showed
+/// "Login reached its time limit · Please run /login", and its card only
+/// said "it shows something the tower can't read".
+pub fn read_blocked(name: &str, status: &Value, screen: &str, account: impl FnOnce() -> Option<String>) -> (String, String) {
+    let (notice, title) = (blocked_notice(name, status), blocked_title(status));
+    if notice != format!("{name} needs you") || !login_expired(screen) {
+        return (notice, title);
+    }
+    let title = login_line(account().as_deref());
+    (said_by(name, &title), title)
+}
+
+/// Claude Code's expired-login screen, in its last lines ("Login reached
+/// its time limit · Please run /login", an expired OAuth token). What
+/// scrolled up from the conversation doesn't count.
+pub fn login_expired(screen: &str) -> bool {
+    let lines: Vec<String> = screen.lines().map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty()).collect();
+    lines[lines.len().saturating_sub(12)..]
+        .iter()
+        .any(|l| l.contains("login reached its time limit") || l.contains("please run /login") || (l.contains("oauth token") && l.contains("expired")))
+}
+
+/// What a session whose login expired needs, in a card's words, with the
+/// account it runs on: "Needs you to log in again: its login to the
+/// account work expired. Run /login in the session".
+pub fn login_line(account: Option<&str>) -> String {
+    match account.map(str::trim).filter(|a| !a.is_empty()) {
+        Some(a) => format!("{LOGIN_AGAIN}: its login to the account {a} expired. Run /login in the session"),
+        None => format!("{LOGIN_AGAIN}: its Claude login expired. Run /login in the session"),
+    }
+}
+
+/// How a login card's title starts (`decisions::blocked_hint` knows it by this).
+pub const LOGIN_AGAIN: &str = "Needs you to log in again";
+
+/// A card's title said of a session: "Asks …" → "t1wc asks …".
+fn said_by(name: &str, title: &str) -> String {
+    let mut c = title.chars();
+    match c.next() {
+        Some(f) => format!("{name} {}{}", f.to_lowercase(), c.as_str()),
+        None => name.to_string(),
+    }
+}
+
 /// A session's folder, as Herdr has it (its foreground's, else its own).
 fn folder_of(t: &Value) -> &str {
     t["foreground"]["cwd"].as_str().or_else(|| t["cwd"].as_str()).unwrap_or("")
@@ -3855,6 +3903,24 @@ mod tests {
         assert_eq!(trust_prompt("Which database should the app use?\n ❯ 1. Postgres", "/w/.tower-worktrees/x/y"), None, "no trust question: none");
         assert_eq!(trust_line("/w/stuff/site/"), "Asks whether to trust its folder site");
         assert_eq!(trust_line(""), "Asks whether to trust its folder");
+        // 27 Nov (a homepage mockup space): an expired login, which the status line doesn't name.
+        let login = "  ⎿  Login reached its time limit · Please run /login\n\n╭──────────────────────╮\n│ >                    │\n╰──────────────────────╯\n  ? for shortcuts";
+        let blocked = json!({ "kind": "", "msg": "" });
+        let (notice, title) = read_blocked("t1wc", &blocked, login, || Some("work".into()));
+        println!("notice: {notice}\ntitle:  {title}");
+        assert_eq!(notice, "t1wc needs you to log in again: its login to the account work expired. Run /login in the session");
+        assert_eq!(title, "Needs you to log in again: its login to the account work expired. Run /login in the session");
+        assert_eq!(read_blocked("t1wc", &blocked, login, || None).1, "Needs you to log in again: its Claude login expired. Run /login in the session");
+        assert!(login_expired("API Error: 401 · OAuth token has expired. Please obtain a new token\n  · Please run /login"));
+        assert!(!super::super::failover::limit_on_screen(login), "an expired login is no usage limit: the failover doesn't take it");
+        // Nothing about a login on screen, or only long ago in the conversation: as before.
+        assert_eq!(read_blocked("t1wc", &blocked, "", || panic!("no account asked")).1, "Needs you: it shows something the tower can't read");
+        let old = format!("I'll remind you: please run /login later\n{}", "work line\n".repeat(20));
+        assert!(!login_expired(&old), "a mention that scrolled up is no login screen");
+        // A status that says what it asks keeps saying it.
+        let asked = json!({ "kind": "permission", "msg": "approve Bash: npm test" });
+        assert_eq!(read_blocked("t1wc", &asked, login, || panic!("no account asked")).0, "t1wc asks to run npm test");
+        assert_eq!(crate::decisions::blocked_hint(&title), "Log in again in the session: run /login there. Nothing typed here reaches it.");
         assert_eq!(n("permission", "approve mcp__x__deploy: prod"), "The orb session asks to use mcp__x__deploy: prod");
         assert_eq!(n("question", ""), "The orb session has questions");
         assert_eq!(n("", ""), "The orb session needs you", "nothing to say: the bare notice");
