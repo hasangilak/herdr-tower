@@ -50,8 +50,9 @@ pub(super) struct SessionUi {
     screen: String,
     read_at: Option<Instant>,
     reading: bool,
-    /// Why it couldn't be shown in Herdr.
-    note: Option<String>,
+    /// A session that couldn't be shown in Herdr, and why (said where its
+    /// button is: a card, the session view, the planner's row).
+    note: Option<(String, String)>,
 }
 
 impl Panel {
@@ -65,17 +66,39 @@ impl Panel {
             .unwrap_or_default()
     }
 
+    /// "Show in Herdr": Herdr on the session's space and tab, in front of
+    /// the app the user is in (`crate::show_in_front`). The tower's windows
+    /// sit above every app's, so they step out of its way
+    /// (`crate::orb::step_aside`). Why it couldn't be is said beside the button.
     pub(super) fn show_in_herdr(&mut self, addr: &str, cx: &mut Context<Self>) {
         let addr = addr.to_string();
-        let task = cx.background_executor().spawn(async move { crate::show_terminal(&addr) });
+        let task = cx.background_executor().spawn({
+            let addr = addr.clone();
+            async move { crate::show_in_front(&addr) }
+        });
+        let tower = self.tower.clone();
         cx.spawn(async move |this, cx| {
             let result = task.await;
+            match &result {
+                Ok(()) => eprintln!("[orb] {addr}: shown in Herdr"),
+                Err(e) => eprintln!("[orb] {addr}: not shown in Herdr: {e:#}"),
+            }
+            let shown = result.is_ok();
             let _ = this.update(cx, |this, cx| {
-                this.session.note = result.err().map(|e| format!("{e:#}"));
+                this.session.note = result.err().map(|e| (addr.clone(), format!("Couldn't show it in Herdr: {e:#}")));
                 cx.notify();
             });
+            // Out of the panel's own update: the floating panel may close.
+            if shown {
+                cx.update(|cx| crate::orb::step_aside(&tower, cx));
+            }
         })
         .detach();
+    }
+
+    /// Why `addr` couldn't be shown in Herdr, if its last try failed.
+    pub(super) fn show_note(&self, addr: &str) -> Option<AnyElement> {
+        self.session.note.as_ref().filter(|(a, _)| a == addr).map(|(_, why)| cstat(why.clone(), true))
     }
 
     /// The session the window shows (none: another view): a new one's screen is read at once.
@@ -83,7 +106,8 @@ impl Panel {
         if self.session.addr.as_deref() == addr {
             return;
         }
-        self.session = SessionUi { addr: addr.map(String::from), ..Default::default() };
+        // (A note on why a session wasn't shown stays with its own button.)
+        self.session = SessionUi { addr: addr.map(String::from), note: self.session.note.take(), ..Default::default() };
         self.session_tick(cx);
     }
 
@@ -265,9 +289,7 @@ impl Panel {
         );
         let a = addr.to_string();
         items.push(acts_row().child(mbtn("session-show", "Show in Herdr", true, None).on_click(cx.listener(move |this, _, _, cx| this.show_in_herdr(&a, cx)))).into_any_element());
-        if let Some(n) = &self.session.note {
-            items.push(cstat(n.clone(), true));
-        }
+        items.extend(self.show_note(addr));
         (head, items)
     }
 }

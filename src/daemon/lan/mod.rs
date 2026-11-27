@@ -1535,7 +1535,7 @@ impl Lan {
                 if !valid_address(address) {
                     return Some(Response::error(400, "bad_address", "an address looks like t3 or vps/t3"));
                 }
-                match crate::show_terminal(address) {
+                match crate::show_in_front(address) {
                     Ok(()) => Response::json(200, &json!({ "shown": address })),
                     Err(e) => {
                         let msg = format!("{e:#}");

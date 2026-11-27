@@ -1558,7 +1558,7 @@ fn run(cli: Cli) -> Result<()> {
             println!("Watching {terminal}: you'll get a [watch] message when it stops working. End your turn now.");
             Ok(())
         }
-        Cmd::Show { terminal } => show_terminal(terminal.as_deref().unwrap_or(brain::NAME)),
+        Cmd::Show { terminal } => show_in_front(terminal.as_deref().unwrap_or(brain::NAME)),
         Cmd::Install { keys } => install::install(keys),
         Cmd::Orb { ui_dir } => orb::run(ui_dir),
         Cmd::Doctor => install::doctor(),
@@ -3805,6 +3805,39 @@ fn accounts_usage(json_out: bool) -> Result<()> {
     Ok(())
 }
 
+/// A session on screen for the user: Herdr goes to its space and tab
+/// (`show_terminal`) and then comes in front of whatever app they're in.
+/// This is what "Show in Herdr", `tower show` and the phone's show mean.
+/// (The radar's showing of a session a brain started is `show_terminal`
+/// alone: Herdr isn't pulled over the user's work unasked.)
+pub fn show_in_front(address: &str) -> Result<()> {
+    show_terminal(address)?;
+    let argv = herdr_front_argv(&config::herdr_app_bin(), std::env::var_os("PATH").as_deref());
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    match hc::output_within(cmd, "bringing Herdr forward", std::time::Duration::from_secs(10)) {
+        Ok(o) if o.code == 0 => Ok(()),
+        Ok(o) => bail!("it's on its tab, but Herdr didn't come forward: {}", o.stderr.trim()),
+        Err(e) => bail!("it's on its tab, but Herdr didn't come forward: {e:#}"),
+    }
+}
+
+/// What brings Herdr in front. On macOS, `open` on the app bundle that
+/// `herdr-app` lives in: `~/.local/bin/herdr-app` is a link to
+/// `Herdr.app/Contents/MacOS/Herdr`, and opening that bundle brings the
+/// running Herdr forward as it is. A `herdr-app` outside a bundle (a
+/// stand-in, or not on macOS) runs bare, which is Herdr's own way to open
+/// or raise its window.
+fn herdr_front_argv(bin: &std::path::Path, path: Option<&std::ffi::OsStr>) -> Vec<std::ffi::OsString> {
+    // A bare name is found as the shell would find it.
+    let found = if bin.components().count() > 1 { Some(bin.to_path_buf()) } else { path.and_then(|p| std::env::split_paths(p).map(|d| d.join(bin)).find(|f| f.is_file())) };
+    let bundle = found.and_then(|f| std::fs::canonicalize(f).ok()).and_then(|real| real.ancestors().find(|a| a.extension().is_some_and(|e| e == "app")).map(std::path::Path::to_path_buf));
+    match bundle {
+        Some(app) if cfg!(target_os = "macos") => vec!["open".into(), app.into_os_string()],
+        _ => vec![bin.as_os_str().to_os_string()],
+    }
+}
+
 pub fn show_terminal(address: &str) -> Result<()> {
     let Some(t) = hc::get(address) else { bail!("no terminal {address}") };
     let addr = t["address"].as_str().unwrap_or(address).to_string();
@@ -3834,6 +3867,36 @@ pub(crate) fn parse_args(args: &[&str]) -> Result<Cmd, clap::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "Show in Herdr" brought Herdr nowhere: the window switched to the
+    /// session behind the app in front. What brings it forward is the app
+    /// bundle `herdr-app` links into, opened; a stand-in runs bare.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn showing_a_session_brings_the_herdr_app_that_herdr_app_links_to_forward() {
+        use std::ffi::OsString;
+        let dir = std::env::temp_dir().join(format!("tower-herdr-front-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let exe = dir.join("Apps/Herdr.app/Contents/MacOS/Herdr");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "").unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&exe, dir.join("bin/herdr-app")).unwrap();
+        let stand_in = dir.join("fake-herdr-app");
+        std::fs::write(&stand_in, "").unwrap();
+        let path = std::env::join_paths([dir.join("empty"), dir.join("bin")]).unwrap();
+        let bundle = std::fs::canonicalize(dir.join("Apps/Herdr.app")).unwrap();
+        let open = vec![OsString::from("open"), bundle.into_os_string()];
+        // The installed way: a bare `herdr-app`, found on PATH, a link into the bundle.
+        assert_eq!(herdr_front_argv(std::path::Path::new("herdr-app"), Some(&path)), open);
+        // The same link, named by its path.
+        assert_eq!(herdr_front_argv(&dir.join("bin/herdr-app"), None), open);
+        // A stand-in (`HERDER_TOWER_HERDR_APP`) outside any bundle: it runs bare, so no real Herdr is touched.
+        assert_eq!(herdr_front_argv(&stand_in, Some(&path)), vec![stand_in.clone().into_os_string()]);
+        // Not on PATH at all: bare too (Herdr's own "opens or raises the window", or the error it gives).
+        assert_eq!(herdr_front_argv(std::path::Path::new("herdr-app"), Some(&std::env::join_paths([dir.join("empty")]).unwrap())), vec![OsString::from("herdr-app")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn tower_start_takes_the_account_that_has_the_mcp_its_task_needs() {

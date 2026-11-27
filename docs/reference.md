@@ -254,7 +254,15 @@ folded into one line, and **Record**, **Shots**, **Projects** and
   main tower, with the space named).
 - **A session** (a click on its row): what it was asked, what it last
   said, its screen as it is now (read again every couple of seconds), the
-  card that waits on it, and **Show in Herdr**.
+  card that waits on it, and **Show in Herdr**. Show in Herdr (here, on a
+  blocked card, and on a planner that waits) does three things:
+  - Herdr goes to the session's space and tab.
+  - Herdr comes in front of the app you're in.
+  - The tower's window steps out of its way: the full window goes into the
+    orb, and the floating panel closes. A click on the orb brings either one
+    back.
+
+  If the session can't be shown, the reason appears under the button.
 - **New space**: a goal, or a whole ticket pasted as it is, said in its
   conversation, and a **Project** (none picked: the tower's brain picks). A goal whose first
   line names the repos ("open sessions in eyzflow and mediaroom: …") shows
