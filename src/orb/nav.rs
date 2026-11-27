@@ -129,6 +129,25 @@ impl Scope {
             _ => (Scope::All, None),
         }
     }
+
+    /// The scope's word, as `parse` reads it: what `window.json` keeps of
+    /// where the window was, so a restarted orb opens there again.
+    pub fn word(&self) -> String {
+        match self {
+            Scope::All => "all".into(),
+            Scope::Space(name) => format!("space={name}"),
+            Scope::New => "new".into(),
+            Scope::Record => "record".into(),
+            Scope::Shots => "shots".into(),
+            Scope::Projects => "projects".into(),
+            Scope::Settings => "settings".into(),
+            Scope::Behaviors => "behaviors".into(),
+            Scope::Phone => "phone".into(),
+            Scope::Session { space, addr } if space.is_empty() => format!("session={addr}"),
+            Scope::Session { space, addr } => format!("session={space}/{addr}"),
+            Scope::Accounts => "accounts".into(),
+        }
+    }
 }
 
 /// The full window's place in the tower.
@@ -228,6 +247,27 @@ impl Nav {
         self.launched.as_ref().filter(|l| now_ms.saturating_sub(l.at) < LAUNCH_GRACE_MS).map(|l| l.name.as_str())
     }
 
+    /// Whether `settle` may judge the view by the open spaces as the tower
+    /// lists them (`open`).
+    /// - A list with spaces in it: yes.
+    /// - An empty list: only once Herdr's spaces were read (`herdr`, `None`
+    ///   until then) and the view's own space isn't among them either.
+    ///
+    /// A tower that has just started lists no missions for its first
+    /// seconds (the daemon's first look waits 10 s). An orb open across a
+    /// restart of the voice, or just started itself, would otherwise take
+    /// that empty list for every space closed, and send its view to All.
+    pub fn open_known(&self, open: &[&str], herdr: Option<&[&str]>) -> bool {
+        if !open.is_empty() {
+            return true;
+        }
+        let Some(herdr) = herdr else { return false };
+        match &self.scope {
+            Scope::Space(name) => !herdr.contains(&name.as_str()),
+            _ => true,
+        }
+    }
+
     /// Looks at the open spaces again: a view of a space that is gone
     /// (closed, emptied) falls back to every space, and a launched space
     /// that got another name than expected (the one new space there is) is
@@ -324,6 +364,51 @@ mod tests {
         let m = crate::orb::model::missions(state, &Default::default(), &[], &[], &all);
         let names: Vec<&str> = m.open.iter().map(|m| m.name.as_str()).collect();
         nav.settle(&names, now)
+    }
+
+    /// After a restart (of the orb, or of the voice under an open orb) the
+    /// tower lists no open space for its first seconds. The window keeps
+    /// its space until the open spaces are known, and leaves it only for a
+    /// space that is really gone. (It went to All on 2026-11-27 when the
+    /// voice restarted under an orb showing M5 Pro.)
+    #[test]
+    fn a_restart_keeps_the_window_on_its_space_while_the_open_spaces_are_unknown() {
+        let now = 1_000_000;
+        let open_of = |state: &serde_json::Value| -> Vec<String> {
+            let all = crate::orb::model::decisions(state, &Default::default(), &|_| String::new(), now);
+            crate::orb::model::missions(state, &Default::default(), &[], &[], &all).open.into_iter().map(|m| m.name).collect()
+        };
+        // The window opens where `window.json` kept it.
+        let mut nav = Nav { scope: Scope::parse(&Scope::Space("M5 Pro".into()).word()).0, ..Default::default() };
+        assert_eq!(nav.scope, Scope::Space("M5 Pro".into()));
+        // A daemon's state before its first look: no open space at all.
+        let fresh = serde_json::json!({ "missions": { "spaces": [], "quiet": [], "closed_today": [] } });
+        let none = open_of(&fresh);
+        let none: Vec<&str> = none.iter().map(String::as_str).collect();
+        assert!(none.is_empty());
+        // Herdr's spaces not read yet: nothing is judged.
+        assert!(!nav.open_known(&none, None));
+        // Read, and M5 Pro is one of them: the empty list isn't believed.
+        assert!(!nav.open_known(&none, Some(&["sandbox", "M5 Pro"])));
+        assert_eq!(nav.scope, Scope::Space("M5 Pro".into()));
+        // The tower's first look lists it: judged, and the window stays.
+        let looked = serde_json::json!({ "missions": { "spaces": [{ "name": "M5 Pro", "state": "open", "sessions": [{ "address": "t13z", "name": "panel", "status": "idle" }] }] } });
+        let open = open_of(&looked);
+        let open: Vec<&str> = open.iter().map(String::as_str).collect();
+        assert!(nav.open_known(&open, Some(&["sandbox", "M5 Pro"])));
+        assert!(!nav.settle(&open, now));
+        assert_eq!(nav.scope, Scope::Space("M5 Pro".into()));
+        // Closed while the orb was down: Herdr hasn't it either, so the empty list is believed.
+        assert!(nav.open_known(&none, Some(&["sandbox"])));
+        assert!(nav.settle(&none, now));
+        assert_eq!(nav.scope, Scope::All);
+        // Any other view: an empty list moves nothing anyway.
+        assert!(nav.open_known(&none, Some(&["sandbox"])));
+        // Every view's word reads back as that view.
+        let session = |space: &str, addr: &str| Scope::Session { space: space.into(), addr: addr.into() };
+        for s in [Scope::All, Scope::Space("M5 Pro".into()), Scope::New, Scope::Record, Scope::Shots, Scope::Projects, Scope::Settings, Scope::Behaviors, Scope::Phone, Scope::Accounts, session("M5 Pro", "t13z"), session("", "t7")] {
+            assert_eq!(Scope::parse(&s.word()).0, s, "{}", s.word());
+        }
     }
 
     #[test]

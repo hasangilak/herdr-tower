@@ -229,7 +229,12 @@ and the round minimize button beside "Floating" minimize it too.
 **Floating**, beside
 "Tower", switches back: the full window closes, the floating panel opens,
 and the orb opens the floating panel from then on. The mode is kept in
-`window.json` with the window's spot and size. Both windows show one model:
+`window.json` with the window's spot and size, and so is the view the
+window shows (`view`, e.g. `space=M5 Pro`): a restarted orb opens the
+window there again. A space view stays while the tower doesn't list the
+open spaces yet (a tower that has just started lists none for its first
+seconds), and falls back to All only for a space that is really gone:
+the tower doesn't list it, and Herdr doesn't have it either. Both windows show one model:
 a card answered or picked in one is so in the other. A sidebar on the left: **All spaces** with the count of what is
 yours, each open space with its mark and a line (its sessions, "standing",
 "ready to close"), **New space**, the quiet spaces and what closed today
@@ -1338,7 +1343,8 @@ for **Herdr Core**, because the voice runs in a Herdr terminal.
   `HERDER_TOWER_ORB_PANEL=show[@x,y]` (the floating panel) and
   `HERDER_TOWER_ORB_WINDOW=show[:<view>][@x,y]` (the full window at `all`,
   `space=<name>`, `new[=<goal>]`, `record[=<space>]`, `shots`, `settings`,
-  `behaviors`, `phone` or `session=<space>/<address>`).
+  `behaviors`, `phone` or `session=<space>/<address>`; a bare `show`: the
+  view `window.json` kept).
 
 ## Limits
 

@@ -2587,8 +2587,8 @@ question set's `status: failed`, and offers the session or another try.
 (the floating panel up from the start) and
 `HERDER_TOWER_ORB_WINDOW=show[:<view>][@<x>,<y>]` (the full window at
 `all`, `space=<name>`, `new[=<goal>]`, `record[=<space>]`, `shots`,
-`settings`, `behaviors`, `phone`, `session=<space>/<address>`). Neither
-takes the keyboard; a spot off the screen's edge keeps them out of the way.
+`settings`, `behaviors`, `phone`, `session=<space>/<address>`; a bare
+`show`: the view `window.json` kept). Neither takes the keyboard; a spot off the screen's edge keeps them out of the way.
 `HERDER_TOWER_ORB_ANSWER=<decision id>:<n>[:rule]` has the full window
 answer that card with its option `n` (from 0) two and a half seconds after
 the start, as a click on it would, and with `:rule` take its receipt's

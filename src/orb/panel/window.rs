@@ -597,11 +597,13 @@ impl Panel {
         let missions = self.missions(&all, cx);
         let names: Vec<&str> = missions.open.iter().map(|m| m.name.as_str()).collect();
         let now = history::now_ms();
-        // (Not before Herdr's spaces were read: a window that has just opened knows none.)
-        let known = !names.is_empty() || self.live_read;
+        // Herdr's own spaces, once read: an empty list from a tower that has
+        // just started isn't taken for every space closed (`Nav::open_known`).
+        let herdr: Vec<&str> = self.live.iter().map(|l| l.name.as_str()).collect();
+        let herdr = self.live_read.then_some(herdr.as_slice());
         let (scope, to_phone) = self.tower.update(cx, |t, _| {
             let was = t.nav.scope.clone();
-            if known && t.nav.settle(&names, now) {
+            if t.nav.open_known(&names, herdr) && t.nav.settle(&names, now) {
                 eprintln!("[orb] the window's view moved from {was:?} to {:?}: its space isn't among the open ones ({names:?})", t.nav.scope);
             }
             // The phone is a card of Settings: asked for, Settings opens there.
@@ -623,6 +625,8 @@ impl Panel {
         }
         let from = full.shown.replace(scope.clone());
         eprintln!("[orb] the window shows {scope:?} (it showed {from:?})");
+        // Where it is, kept: a restarted orb opens the window there again.
+        crate::orb::save_window_view(&scope);
         // What a command said belongs to the view it was asked in.
         full.notes.clear();
         full.edit = None;

@@ -918,9 +918,10 @@ impl Render for Orb {
 
 /// `HERDER_TOWER_ORB_WINDOW=show[:<view>][@<x>,<y>]`: the full window is up
 /// from the start (it takes no keyboard), at that view and that spot, to
-/// look at it with test data (`tower orb --ui-dir`). `show:new=<goal>` opens
-/// the launcher with that goal typed in (`from_start_goal`).
-fn window_from_start() -> Option<(nav::Scope, Option<String>, Option<(f64, f64)>)> {
+/// look at it with test data (`tower orb --ui-dir`). A bare `show` opens it
+/// at the view `window.json` kept (none: every space). `show:new=<goal>`
+/// opens the launcher with that goal typed in (`from_start_goal`).
+fn window_from_start() -> Option<(Option<nav::Scope>, Option<String>, Option<(f64, f64)>)> {
     let v = std::env::var("HERDER_TOWER_ORB_WINDOW").ok()?;
     let (word, at) = match v.rsplit_once('@') {
         Some((w, at)) => (w, at.split_once(',').and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?)))),
@@ -931,8 +932,11 @@ fn window_from_start() -> Option<(nav::Scope, Option<String>, Option<(f64, f64)>
         None if word == "show" => "",
         _ => return None,
     };
+    if view.trim().is_empty() {
+        return Some((None, None, at));
+    }
     let (scope, filter) = nav::Scope::parse(view);
-    Some((scope, filter, at))
+    Some((Some(scope), filter, at))
 }
 
 /// `HERDER_TOWER_ORB_ANSWER=<decision id>:<n>[:rule]`: a moment after the
@@ -1478,6 +1482,22 @@ fn set_columns(v: &mut Value, side: Option<f32>, chat: Option<f32>) {
     }
 }
 
+/// The full window shows `scope` now: kept in `window.json` (`view`, the
+/// scope's word), with the frame, the mode and the columns kept as they are.
+pub(crate) fn save_window_view(scope: &nav::Scope) {
+    let mut v = window_file();
+    if v["view"].as_str() == Some(scope.word().as_str()) {
+        return;
+    }
+    v["view"] = serde_json::json!(scope.word());
+    write_window_file(&v);
+}
+
+/// Where the full window was when the orb last ran (none kept: every space).
+fn saved_view() -> Option<nav::Scope> {
+    window_file()["view"].as_str().map(|w| nav::Scope::parse(w).0)
+}
+
 /// Which of the two the orb opens: the full window (`true`) or the floating panel.
 fn saved_full_mode() -> bool {
     window_file()["mode"].as_str() == Some("full")
@@ -1793,9 +1813,17 @@ pub fn run(ui_dir: Option<PathBuf>) -> Result<()> {
         let orb = Rc::new(RefCell::new(open_orb(tower.clone(), cx)));
         let handle = *orb.borrow();
         tower.update(cx, |t, _| t.orb = handle);
+        // The window opens where it was when the orb last ran, the space kept
+        // until the open spaces are known (`Nav::open_known`).
+        // (A view `HERDER_TOWER_ORB_WINDOW` names, below, wins.)
+        if let Some(scope) = saved_view() {
+            tower.update(cx, |t, _| t.nav.go(scope));
+        }
         if let Some((scope, filter, spot)) = window_from_start() {
             tower.update(cx, |t, _| {
-                t.nav.go(scope);
+                if let Some(scope) = scope {
+                    t.nav.go(scope);
+                }
                 t.nav.rec_filter = filter.or(t.nav.rec_filter.take());
                 t.nav.goal = from_start_goal();
             });
@@ -2004,6 +2032,14 @@ mod tests {
         save_window_frame(30.0, 40.0, 1100.0, 700.0);
         assert!(saved_full_mode());
         assert_eq!(saved_window(), Some((30.0, 40.0, 1100.0, 700.0)));
+        // Where it was kept beside them: a restarted orb opens the window on that space.
+        assert_eq!(saved_view(), None, "none kept yet: every space, as before");
+        save_window_view(&nav::Scope::Space("M5 Pro".into()));
+        assert_eq!(saved_view(), Some(nav::Scope::Space("M5 Pro".into())));
+        assert!(saved_full_mode());
+        assert_eq!(saved_window(), Some((30.0, 40.0, 1100.0, 700.0)));
+        save_window_frame(31.0, 41.0, 1100.0, 700.0);
+        assert_eq!(saved_view(), Some(nav::Scope::Space("M5 Pro".into())), "moving the window keeps it");
         // A file from before the mode was kept: the floating panel.
         write_window_file(&serde_json::json!({ "x": 1.0, "y": 2.0 }));
         assert!(!saved_full_mode());
