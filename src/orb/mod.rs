@@ -402,15 +402,14 @@ impl Tower {
         .detach();
     }
 
-    /// Right-click: the brain's terminal, on screen in Herdr.
+    /// Right-click: the brain's terminal, on screen in Herdr (`tower show`
+    /// brings Herdr forward too).
     fn show(cx: &mut App) {
         cx.background_executor()
             .spawn(async move {
                 let ok = Command::new(config::tower_bin()).arg("show").stdin(Stdio::null()).output();
                 match ok {
-                    Ok(o) if o.status.success() => {
-                        let _ = Command::new("open").args(["-a", "Herdr"]).status();
-                    }
+                    Ok(o) if o.status.success() => {}
                     Ok(o) => {
                         let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
                         notify_error(msg.strip_prefix("tower: ").unwrap_or(&msg));
@@ -1051,6 +1050,12 @@ fn full_shown(tower: &Entity<Tower>, cx: &mut App) -> bool {
 /// The orb's click on the full window: it is minimized into the orb, kept as
 /// it is, and the keyboard goes back to the app that had it.
 fn hide_full(tower: &Entity<Tower>, cx: &mut App) {
+    tuck_full(tower, cx);
+    mac::give_back_focus();
+}
+
+/// The full window out of sight, minimized into the orb as it is.
+fn tuck_full(tower: &Entity<Tower>, cx: &mut App) {
     if let Some(h) = tower.read(cx).full {
         let _ = h.update(cx, |_, window, _| {
             if let Some(w) = mac::Win::of(window) {
@@ -1062,7 +1067,20 @@ fn hide_full(tower: &Entity<Tower>, cx: &mut App) {
         t.full_hidden = true;
         cx.notify();
     });
-    mac::give_back_focus();
+}
+
+/// "Show in Herdr" worked: Herdr is in front, but the tower's windows are
+/// pop-ups above every app's, so they would still cover it. They step out
+/// of its way: the full window goes into the orb as it is, and the floating
+/// panel closes. A click on the orb brings either back. The keyboard isn't
+/// handed back to the app that had it before, because Herdr has it now.
+fn step_aside(tower: &Entity<Tower>, cx: &mut App) {
+    if full_shown(tower, cx) {
+        tuck_full(tower, cx);
+    }
+    if let Some(o) = tower.read(cx).orb {
+        let _ = o.update(cx, |orb, _, cx| orb.close_panel(false, cx));
+    }
 }
 
 /// "Minimize" (and Esc) in the full window, from its own click: it goes into

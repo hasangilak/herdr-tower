@@ -143,6 +143,11 @@ pub(super) fn scores_text(s: &crate::scoring::Scores) -> String {
     out
 }
 
+/// The session a blocked card's "Show in Herdr" shows: the one waiting, else its first.
+fn blocked_address(d: &Decision) -> Option<String> {
+    d.sessions.iter().find(|s| s.waiting).or(d.sessions.first()).map(|s| s.address.clone())
+}
+
 pub(super) fn cstat(text: impl Into<SharedString>, bad: bool) -> AnyElement {
     div()
         .text_size(px(13.0))
@@ -620,7 +625,7 @@ impl Panel {
         }
         // Blocked on what the tower can't read: 1 shows it in Herdr, as its button does.
         if d.kind == Kind::Blocked {
-            let Some(a) = d.sessions.iter().find(|s| s.waiting).or(d.sessions.first()).map(|s| s.address.clone()) else { return false };
+            let Some(a) = blocked_address(d) else { return false };
             if n != 0 {
                 return false;
             }
@@ -685,6 +690,14 @@ impl Panel {
         if d.kind == Kind::Merge && !d.prs.is_empty() {
             match self.merge_acts(&d, cx).into_iter().nth(choice) {
                 Some((_, _, act)) => self.merge_act(&d, act, cx),
+                None => eprintln!("[orb] HERDER_TOWER_ORB_ANSWER: {id} has no button {choice}"),
+            }
+            return;
+        }
+        // A blocked card: its one button, Show in Herdr.
+        if d.kind == Kind::Blocked {
+            match blocked_address(&d).filter(|_| choice == 0) {
+                Some(a) => self.show_in_herdr(&a, cx),
                 None => eprintln!("[orb] HERDER_TOWER_ORB_ANSWER: {id} has no button {choice}"),
             }
             return;
@@ -1359,7 +1372,8 @@ impl Panel {
         let g = glass();
         let id = d.id.clone();
         let who: Vec<&str> = d.sessions.iter().map(|s| s.label()).collect();
-        let address = d.sessions.iter().find(|s| s.waiting).or(d.sessions.first()).map(|s| s.address.clone());
+        let address = blocked_address(d);
+        let note = address.as_deref().and_then(|a| self.show_note(a));
         let mut acts = acts_row();
         if let Some(a) = address {
             acts = acts.child(mbtn(format!("show-{id}"), "Show in Herdr", true, Some(0)).on_click(cx.listener(move |this, _, _, cx| this.show_in_herdr(&a, cx))));
@@ -1378,6 +1392,7 @@ impl Panel {
             .when(!who.is_empty(), |el| el.child(div().text_size(px(12.0)).text_color(g.faint).truncate().child(who.join(", "))))
             .child(cstat("The tower can't read what it shows: answer it in the session.", false))
             .child(acts)
+            .children(note)
             .into_any_element()
     }
 

@@ -1714,6 +1714,7 @@ impl Panel {
                     .children(p.address.clone().filter(|_| p.blocked).map(|a| {
                         acts_row().child(mbtn("plan-show", "Show in Herdr", false, None).on_click(cx.listener(move |this, _, _, cx| this.show_in_herdr(&a, cx))))
                     }))
+                    .children(p.address.as_deref().filter(|_| p.blocked).and_then(|a| self.show_note(a)))
                     .when(!p.why.is_empty(), |el| el.child(cstat(p.why.clone(), false)))
                     .into_any_element(),
             );
@@ -1734,6 +1735,7 @@ impl Panel {
                         )))
                     })
                     .children(show)
+                    .children(p.address.as_deref().filter(|_| p.blocked).and_then(|a| self.show_note(a)))
                     .into_any_element(),
             );
         }
