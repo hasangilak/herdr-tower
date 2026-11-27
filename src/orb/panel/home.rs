@@ -1390,7 +1390,7 @@ impl Panel {
             )
             .child(card_title(&d.title))
             .when(!who.is_empty(), |el| el.child(div().text_size(px(12.0)).text_color(g.faint).truncate().child(who.join(", "))))
-            .child(cstat("The tower can't read what it shows: answer it in the session.", false))
+            .child(cstat(crate::decisions::blocked_hint(&d.title), false))
             .child(acts)
             .children(note)
             .into_any_element()

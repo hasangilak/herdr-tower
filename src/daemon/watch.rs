@@ -854,7 +854,15 @@ impl Radar {
             return;
         }
         // What it asks, in a sentence (or just that it needs you).
-        let (notice, notice_said) = named(super::asks::blocked_notice(&name, &t["status"]));
+        // A blocked session its status says nothing of: its screen may (an expired login).
+        let screen = || if cfg!(test) { String::new() } else { hc::run(&["read", &address, "--lines", "0"]).map(|o| o.stdout).unwrap_or_default() };
+        let plain = super::asks::blocked_notice(&name, &t["status"]);
+        let plain = if status == SessionStatus::Blocked && plain == format!("{name} needs you") {
+            super::asks::read_blocked(&name, &t["status"], &screen(), || super::reviews::account_of_terminal(t)).0
+        } else {
+            plain
+        };
+        let (notice, notice_said) = named(plain);
         let (finished, finished_said) = named(format!("{name} finished"));
         let (error, error_said) = named(format!("{name} hit an error"));
         let news = match status {
