@@ -40,6 +40,9 @@ pub struct Missions {
     full: Arc<Mutex<HashMap<String, (u64, Value)>>>,
     /// The sessions as last seen: shown while Herdr can't be asked.
     last: Arc<Mutex<Vec<missions::Seen>>>,
+    /// The spaces whose sessions went missing from the last look, carried
+    /// once (`missions::carry_missing`): a second look without them decides.
+    missed: Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// When Herdr last answered a look (None: not yet in this run).
     looked: Arc<Mutex<Option<u64>>>,
     /// Each space's active time, from the history's status lines (`crate::active`).
@@ -87,6 +90,7 @@ impl Missions {
             turn: Arc::default(),
             full: Arc::default(),
             last: Arc::default(),
+            missed: Arc::default(),
             looked: Arc::default(),
             // (Tests never read the user's history.)
             active: Arc::new(Mutex::new(crate::active::Tracker::at(if cfg!(test) { std::path::PathBuf::from("/nonexistent/history.jsonl") } else { crate::history::path() }))),
@@ -173,8 +177,10 @@ impl Missions {
     fn settle(&self, sessions: Option<Vec<missions::Seen>>, ui: &Path, now: u64, auto_close_hours: u64) -> Value {
         let asked = sessions.is_some();
         let sessions = match sessions {
-            Some(list) => {
-                *lock(&self.last) = list.clone();
+            Some(mut list) => {
+                let mut last = lock(&self.last);
+                missions::carry_missing(&mut list, &last, &mut lock(&self.missed));
+                *last = list.clone();
                 list
             }
             None => lock(&self.last).clone(),
@@ -486,7 +492,11 @@ mod tests {
             v
         };
         assert_eq!(undated(blind), undated(v.clone()));
-        // Shop's last session goes.
+        // Shop's last session goes. Missing from one look, it is carried that once (a live
+        // session Herdr reads a moment without its status never makes its space quiet).
+        let v = m.settle(Some(vec![seen("Docs", "t7", "idle")]), &ui, now + 40_000, 24);
+        assert!(v["quiet"].as_array().is_none_or(|q| q.is_empty()) && v["spaces"][0]["state"] == "open", "{}", v["quiet"]);
+        // Gone the next look too: quiet.
         let v = m.settle(Some(vec![seen("Docs", "t7", "idle")]), &ui, now + 60_000, 24);
         assert_eq!((v["quiet"].clone(), v["spaces"][1]["name"].as_str(), v["spaces"][1]["state"].as_str()), (serde_json::json!(["Shop"]), Some("Shop"), Some("quiet")));
         let s = spaces::load_from(&ui);

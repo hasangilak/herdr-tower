@@ -48,6 +48,8 @@ pub struct Member {
     pub machine: Option<String>,
     /// The Claude account it runs on, when known.
     pub account: Option<String>,
+    /// Its first task told it the bug rule (`BUG_RULE`): a launched session's does.
+    pub heard_rule: bool,
 }
 
 impl Member {
@@ -117,7 +119,9 @@ pub fn member_of(listed: &Value, full: Option<&Value>) -> Option<Member> {
     let address = listed["address"].as_str()?.to_string();
     let machine = listed["machine"].as_str().map(String::from).or_else(|| address.split_once('/').map(|(m, _)| m.to_string()));
     let account = if app == "claude-code" && machine.is_none() { full.and_then(crate::accounts::of_terminal) } else { None };
-    Some(Member { address, name, folder, space, created_ms: crate::hc::created_ms(t), task: String::new(), task_done: false, app, machine, account })
+    // The task it was started with (its command line's last word) told it the bug rule.
+    let heard_rule = crate::daemon::typed::given_task(t).is_some_and(|g| told_rule(&g));
+    Some(Member { address, name, folder, space, created_ms: crate::hc::created_ms(t), task: String::new(), task_done: false, app, machine, account, heard_rule })
 }
 
 /// Members by space, each space's in address order.
@@ -285,6 +289,12 @@ impl Book {
             self.rules_seeded = true;
             return (vec![], true);
         }
+        // Told it in its first task (`launch::instruction`): it has it.
+        let heard: Vec<String> = here.iter().filter(|m| m.heard_rule && !self.has_rule(m)).map(|m| m.key()).collect();
+        changed |= !heard.is_empty();
+        for k in heard {
+            self.ruled.insert(k, now);
+        }
         let due: Vec<Member> = here
             .into_iter()
             .filter(|m| !self.has_rule(m) && !settling.contains_key(&m.space) && has_goal(&m.space))
@@ -410,10 +420,18 @@ pub fn is_introduction(text: &str) -> bool {
     text.contains("[tower] You are ") && text.contains("in the Herdr space") && (text.contains("other session") || text.contains("Claude session") || text.contains("report it to the tower"))
 }
 
-/// The bug rule for a session on its own (`Book::rules_due`): its space and goal, the rule.
-pub fn rule_note(space: &str, goal: &str, to: &Member) -> String {
-    let goal = clip(goal, 200);
-    format!("[tower] You are {} ({}) in the Herdr space \"{space}\", whose goal is: {goal}. {BUG_RULE}Nothing to answer here: carry on with your work.", to.label(), to.address)
+/// The bug rule as it rides with a session's next instruction
+/// (`SendQueue::ride`): after that instruction, once, never a message of
+/// its own. (Not an introduction's words: the instruction it rides with is
+/// still the session's task, `is_introduction`.)
+pub fn rule_rider(space: &str) -> String {
+    format!("(From the tower, once, for your time in the space \"{space}\": {})", BUG_RULE.trim())
+}
+
+/// A text that tells the bug rule (a first task that carries it).
+pub fn told_rule(text: &str) -> bool {
+    let squash = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+    squash(text).contains(&squash(BUG_RULE.trim()))
 }
 
 /// What a session is on, from its latest prompt: the text without what
@@ -571,6 +589,7 @@ mod tests {
             app: "claude-code".into(),
             machine: None,
             account: None,
+            heard_rule: false,
         }
     }
 
@@ -591,9 +610,12 @@ mod tests {
         let g = groups(&[m("t0", "Shop"), lone.clone()]);
         let (due, _) = b.rules_due(&g, &none, goal, 2_000);
         assert_eq!(due.iter().map(|m| m.address.as_str()).collect::<Vec<_>>(), ["t1"]);
-        let note = rule_note("Shop", "Ship the checkout", &due[0]);
-        assert!(note.contains("\"Shop\", whose goal is: Ship the checkout.") && note.contains(BUG_RULE) && is_introduction(&note), "{note}");
-        assert_eq!(task_from_prompt(&note), None, "never its task");
+        // It rides with the session's next instruction, after it: that instruction is still its task.
+        let rider = rule_rider("Shop");
+        assert!(rider.contains("\"Shop\"") && told_rule(&rider), "{rider}");
+        let delivered = format!("Add the coupon field to the checkout.\n\n{rider}");
+        assert!(!is_introduction(&delivered));
+        assert!(task_from_prompt(&delivered).is_some_and(|t| t.starts_with("Add the coupon field")), "still its task");
         b.ruled_now(&lone, 2_000);
         assert!(b.rules_due(&g, &none, goal, 3_000).0.is_empty(), "told once");
         // Then another joins it: the introduction it gets leaves the rule out; the newcomer's has it.
@@ -614,6 +636,10 @@ mod tests {
         let mut codex = m("t9", "Shop");
         codex.app = "codex".into();
         assert!(b.rules_due(&groups(&[m("t3", "Notes"), remote, codex]), &none, goal, 6_000).0.is_empty());
+        // Launched with the rule in its first task (`launch::instruction`): it has it, nothing is due.
+        let launched = Member { heard_rule: true, ..m("t10", "Shop") };
+        let (due, _) = b.rules_due(&groups(&[m("t0", "Shop"), lone.clone(), launched.clone()]), &none, goal, 5_500);
+        assert!(due.is_empty() && b.has_rule(&launched), "{due:?}");
         // Gone an hour, the book forgets it; back sooner, it keeps it.
         b.rules_due(&groups(&[]), &none, goal, 6_000);
         assert!(b.has_rule(&lone), "kept a while");
@@ -841,6 +867,13 @@ mod tests {
         };
         let a = member_of(&listed("t5", "claude-code", Some("B2C support / mediaroom"), Some("b2c-mediaroom")), None).unwrap();
         assert_eq!((a.space.as_str(), a.name.as_str(), a.folder.as_str()), ("B2C support", "b2c-mediaroom", "/w/app"));
+        assert!(!a.heard_rule);
+        // Launched with a first task that tells the bug rule (`launch::instruction`), as its
+        // command line has it behind the login shell `tower start` runs it in: it has heard it.
+        let first = format!("Ship the coupon field.\n\nThat is the goal of the space \"B2C support\". {}When your part is done, say what you did and what is left.", BUG_RULE);
+        let mut full = listed("t5", "claude-code", Some("B2C support / mediaroom"), Some("b2c-mediaroom"));
+        full["argv"] = json!(["/bin/zsh", "-lic", "\"$@\"; exec \"$0\" -li", "/bin/zsh", "/w/bin/cca", "default", "-n", "b2c-mediaroom", first]);
+        assert!(member_of(&full, Some(&full)).unwrap().heard_rule);
         // Codex is introduced too, and named so.
         let codex = member_of(&listed("t6", "codex", Some("B2C support / x"), None), None).unwrap();
         assert_eq!((codex.app.as_str(), codex.runs()), ("codex", "Codex".to_string()));

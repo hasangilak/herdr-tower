@@ -37,7 +37,7 @@
 //! `daemon::missions`); `view` is what `state.json`, `tower missions` and
 //! the phone carry.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
 use std::time::Duration;
 
@@ -588,8 +588,10 @@ pub fn seen_of(row: &Value, full: Option<&Value>, said: Option<String>) -> Optio
     if row["state"].as_str().is_some_and(|s| s != "live") {
         return None;
     }
-    // A plain program reports no status.
-    let status = hc::status_word(row).or_else(|| hc::status_word(t))?;
+    // A plain program reports no status. A Claude Code or Codex that reports none yet (a
+    // first-run question holds it, it is starting again) is a session all the same: starting.
+    let agent = |v: &Value| v["agent"].as_str().is_some_and(|a| a == "claude-code" || a == "codex");
+    let status = hc::status_word(row).or_else(|| hc::status_word(t)).or_else(|| (agent(row) || agent(t)).then(|| "starting".to_string()))?;
     let place = row["where"].as_str().or_else(|| row["labels"]["where"].as_str()).or_else(|| t["labels"]["where"].as_str())?;
     let space = place.split(" / ").next().map(str::trim).filter(|s| !s.is_empty())?.to_string();
     let name = hc::name(t).or_else(|| hc::name(row)).unwrap_or("");
@@ -652,6 +654,25 @@ pub fn scan(get: &dyn Fn(&str) -> Option<Value>, said: &dyn Fn(&str) -> Option<S
         }
     }
     Some(out)
+}
+
+/// A space whose sessions all went missing from one look while the look
+/// before had them (`last`): they stay this once, as they were, and the
+/// next look decides. A live session must never make its space quiet, and
+/// one Herdr reads for a moment without its status or place (Claude
+/// starting again past its folder-trust question, 26 Nov) is still there.
+/// `missed`: the spaces carried so this look (one carried before is let go).
+pub fn carry_missing(seen: &mut Vec<Seen>, last: &[Seen], missed: &mut BTreeSet<String>) {
+    let now: BTreeSet<String> = seen.iter().map(|x| x.space.clone()).collect();
+    let was: BTreeSet<String> = last.iter().map(|x| x.space.clone()).collect();
+    let gone: Vec<String> = was.difference(&now).filter(|s| !missed.contains(*s)).cloned().collect();
+    missed.retain(|s| !now.contains(s) && was.contains(s));
+    let here: BTreeSet<String> = seen.iter().map(|x| x.address.clone()).collect();
+    for space in gone {
+        // (One seen in another space now moved there: never carried as a ghost in its old one.)
+        seen.extend(last.iter().filter(|x| x.space == space && !here.contains(&x.address)).cloned());
+        missed.insert(space);
+    }
 }
 
 /// The start of the local day `now` is in (Unix ms).
@@ -2363,6 +2384,54 @@ mod tests {
         // Herdr couldn't be asked: the missions are still there, without sessions.
         let blind = view(&s, &Sources { sessions: None, ..src });
         assert_eq!(blind["spaces"].as_array().map(Vec::len), Some(6));
+    }
+
+    /// 26 Nov 13:33 (a launched film space): its only session, alive past
+    /// its folder-trust question, was missing from one look, and the space
+    /// was "quiet: no session left there" (open again the next look). A
+    /// Claude session that reports no status yet is a session, starting;
+    /// and sessions missing from one look stay that once: a second look
+    /// without them decides.
+    #[test]
+    fn a_live_session_never_makes_its_space_quiet() {
+        // Claude Code (or Codex) with no status yet: a session, starting. A shell is still none.
+        let starting = json!({ "address": "t9", "agent": "claude-code", "state": "live", "where": "boat / boat-film" });
+        assert_eq!(seen_of(&starting, None, None).map(|s| (s.space, s.status)), Some(("boat".into(), "starting".into())));
+        assert!(seen_of(&json!({ "address": "t8", "agent": "zsh", "state": "live", "where": "boat / 1" }), None, None).is_none());
+        // Missing from one look: carried, and the space keeps its session.
+        let film = Seen { space: "boat".into(), address: "t9".into(), name: "film".into(), status: "working".into(), ..Default::default() };
+        let docs = Seen { space: "docs".into(), address: "t7".into(), name: "docs".into(), status: "idle".into(), ..Default::default() };
+        let mut missed = BTreeSet::new();
+        let last = vec![film.clone(), docs.clone()];
+        let mut now = vec![docs.clone()];
+        carry_missing(&mut now, &last, &mut missed);
+        assert_eq!(now.iter().map(|x| x.address.as_str()).collect::<Vec<_>>(), ["t7", "t9"]);
+        let mut s = Spaces::default();
+        let facts = |list: &[Seen]| -> BTreeMap<String, Facts> {
+            let mut f: BTreeMap<String, Facts> = BTreeMap::new();
+            for x in list {
+                f.entry(x.space.clone()).or_default().sessions.push(SessionStatus::from(x.status.as_str()));
+            }
+            f
+        };
+        step(&mut s, &facts(&last), HOUR, 24);
+        assert!(step(&mut s, &facts(&now), HOUR + 20_000, 24).is_empty(), "not quiet on one look");
+        // Back the next look: nothing happened.
+        let mut back = vec![film.clone(), docs.clone()];
+        carry_missing(&mut back, &now, &mut missed);
+        assert_eq!(back.len(), 2);
+        assert!(missed.is_empty());
+        // Gone two looks running: it is gone, and the space is quiet.
+        let mut gone = vec![docs.clone()];
+        carry_missing(&mut gone, &back, &mut missed);
+        let mut still = vec![docs.clone()];
+        carry_missing(&mut still, &gone, &mut missed);
+        assert_eq!(still.len(), 1);
+        assert_eq!(step(&mut s, &facts(&still), HOUR + 60_000, 24), [Effect::Quiet("boat".into())]);
+        // A session that moved to another space is there, not carried as a ghost in its old one.
+        let mut moved = vec![Seen { space: "docs".into(), ..film.clone() }, docs.clone()];
+        carry_missing(&mut moved, &[film.clone(), docs.clone()], &mut BTreeSet::new());
+        assert_eq!(moved.iter().map(|x| (x.space.as_str(), x.address.as_str())).collect::<Vec<_>>(), [("docs", "t9"), ("docs", "t7")]);
     }
 
     #[test]

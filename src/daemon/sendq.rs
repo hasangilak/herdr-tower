@@ -404,6 +404,23 @@ pub struct Check {
     pub items: Vec<(u64, String)>,
 }
 
+/// A word that rides with a session's next instruction (`Book::riders`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct Rider {
+    text: String,
+    at_ms: u64,
+    /// Its terminal when it was given: another terminal at that address never gets it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_ms: Option<u64>,
+}
+
+/// Whether `item` is an instruction a word may ride with: work for the
+/// session (not a note, not another session's message, not a start).
+fn carries(item: &Item) -> bool {
+    !item.quiet && item.from.is_none() && item.start.is_empty()
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Book {
     next_id: u64,
@@ -412,6 +429,11 @@ struct Book {
     /// its old address, its new one. What is sent to the old one goes there.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     moved: BTreeMap<String, String>,
+    /// A word for a session that never goes on its own (`SendQueue::ride`):
+    /// it goes in with the next instruction it is given, after its text.
+    /// By its address; dropped when its session ends.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    riders: BTreeMap<String, Rider>,
     /// Notes an earlier version kept for the brain (handed to the outbox at start).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     notes: Vec<String>,
@@ -826,6 +848,31 @@ impl SendQueue {
     /// an instruction, so a working session is never interrupted.
     pub fn add_note(&self, session: &str, text: &str) -> Result<(Added, String, String)> {
         self.add_note_with(&Herdr, session, text, false)
+    }
+
+    /// A word for `session` that never goes on its own: it rides with the
+    /// next instruction the session is given (after its text, in the same
+    /// message), so it never costs a turn of its own. 26 Nov: the bug rule,
+    /// queued as a note at a launched session's start, waited out its whole
+    /// first turn and went in alone once it had finished; the session took
+    /// a turn to repeat its summary. A second word for the same session
+    /// replaces the first.
+    pub fn ride(&self, session: &str, text: &str) -> Result<String> {
+        self.ride_with(&Herdr, session, text)
+    }
+
+    fn ride_with(&self, h: &dyn Sessions, session: &str, text: &str) -> Result<String> {
+        let text = hc::clean(text.trim());
+        let s = match h.look(session) {
+            Look::Live(s) => s,
+            Look::Finished => bail!("{session} has ended"),
+            Look::Gone => bail!("no session {session}"),
+            Look::Unreachable(e) => bail!("can't reach {session} right now ({e})"),
+        };
+        let mut b = self.lock();
+        b.riders.insert(s.address.clone(), Rider { text, at_ms: crate::history::now_ms(), created_ms: s.created_ms });
+        self.save(&b)?;
+        Ok(s.address)
     }
 
     /// `add_note`, ahead of everything that waits for `session`: what a
@@ -1608,6 +1655,10 @@ impl SendQueue {
                 && turn > before
             {
                 eprintln!("[queue] #{} went in on an earlier try", item.id);
+                // (With the word that rode with it, if one did: never typed twice.)
+                if carries(&item) {
+                    b.riders.remove(&s.address);
+                }
                 self.went_in(h, &mut b, &item, s, now);
                 let _ = self.save(&b);
                 return;
@@ -1642,10 +1693,23 @@ impl SendQueue {
             }
             (b.items[pos].clone(), busy)
         };
-        let result = h.send(&s.address, &item.text, busy);
+        // A word that rides with it (the tower's bug rule): after its text, in the same message.
+        let rider = {
+            let b = self.lock();
+            b.riders.get(&s.address).filter(|r| carries(&item) && r.created_ms.zip(s.created_ms).is_none_or(|(a, b)| a == b)).map(|r| r.text.clone())
+        };
+        let typed = match &rider {
+            Some(r) => format!("{}\n\n{r}", item.text),
+            None => item.text.clone(),
+        };
+        let result = h.send(&s.address, &typed, busy);
         let mut b = self.lock();
         match result {
             Ok(()) => {
+                if rider.is_some() {
+                    b.riders.remove(&s.address);
+                    eprintln!("[queue] #{} took the word that rode with it to {}", item.id, s.address);
+                }
                 self.went_in(h, &mut b, &item, s, now);
                 if busy {
                     let mins = s.status_ms.map(|t| now.saturating_sub(t) / 60_000).unwrap_or(0);
@@ -1724,8 +1788,9 @@ impl SendQueue {
     /// What waits for a session that ended (or whose address is another
     /// terminal's now) goes nowhere by itself; the brain hears it once.
     fn park(&self, h: &dyn Sessions, b: &mut Book, session: &str, why: ParkWhy, name: &str) {
-        // A note for a session that's gone is moot: dropped, not parked.
+        // A note for a session that's gone is moot: dropped, not parked (and so is a word that rode with its next instruction).
         b.items.retain(|i| !(i.session == session && i.quiet && matches!(i.state(), ItemState::Waiting | ItemState::WaitingFor(_))));
+        b.riders.remove(session);
         // A message from another session: its sender hears it didn't arrive, nobody else.
         let gone = if why == ParkWhy::Replaced { "its terminal is another session's now" } else { "it has ended" };
         self.bounce(h, b, &|i| i.session == session && matches!(i.state(), ItemState::Waiting | ItemState::WaitingFor(_)), gone);
@@ -3040,6 +3105,48 @@ mod tests {
         assert!(items.iter().any(|i| i.id == work && i.parked == Some(ParkWhy::Gone)));
         assert!(items.iter().any(|i| i.quiet && i.session == "t1" && i.text.contains("Your message to t2-name (t2) was not delivered")));
         assert_eq!(h.peers().len(), 1);
+    }
+
+    /// 26 Nov (a launched film space): the bug rule, queued as a note
+    /// when a launched session began its first task, waited out that whole
+    /// turn (53 min) and went in alone the moment the session was done: it
+    /// took a turn of its own to say "noted" and repeat its summary. A word
+    /// that rides goes in with the next instruction, after it, never alone,
+    /// and once.
+    #[test]
+    fn a_word_that_rides_goes_in_with_the_next_instruction_never_alone() {
+        let (q, _d) = queue();
+        let h = Fake::default();
+        h.set("t5", "working");
+        q.ride_with(&h, "t5", "(From the tower, once: report bugs off your goal.)").unwrap();
+        // Its turn ends with nothing else for it: nothing goes in.
+        h.set("t5", "done");
+        q.tick(&h);
+        q.tick(&h);
+        assert!(h.sent().is_empty(), "never a turn of its own: {:?}", h.sent());
+        // A note (an introduction) or another session's message doesn't carry it either.
+        q.add_note_with(&h, "t5", "the others in this space", false).unwrap();
+        assert_eq!(h.sent(), vec!["the others in this space"]);
+        // The user's next instruction does: after its text, in the same message.
+        h.turn("t5");
+        h.set("t5", "idle");
+        settle(&q);
+        q.session_round(&h, "t5");
+        q.add_with(&h, "t5", "publish the page", &[], None).unwrap();
+        assert_eq!(h.sent().last().map(String::as_str), Some("publish the page\n\n(From the tower, once: report bugs off your goal.)"));
+        // Once: the next one goes as it is.
+        h.turn("t5");
+        h.set("t5", "idle");
+        settle(&q);
+        q.session_round(&h, "t5");
+        q.add_with(&h, "t5", "now the docs", &[], None).unwrap();
+        assert_eq!(h.sent().last().map(String::as_str), Some("now the docs"));
+        // A session that ends takes it with it.
+        h.set("t6", "working");
+        q.ride_with(&h, "t6", "a word").unwrap();
+        h.sessions.lock().unwrap().remove("t6");
+        q.session_round(&h, "t6");
+        assert!(q.lock().riders.is_empty());
     }
 
     #[test]

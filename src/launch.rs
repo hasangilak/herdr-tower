@@ -80,6 +80,10 @@ pub struct Plan {
     /// The PRs its sessions open get a reviewer (`crate::reviews`):
     /// `--review` / `--no-review`, else as the space has it (on for a new one).
     pub review: bool,
+    /// What the user said after their first words while the space was
+    /// drafted (`--story-file`, oldest first): their corrections, which the
+    /// first task carries (they count over the ticket's words).
+    pub said: Vec<String>,
 }
 
 /// What a launch is asked beside its goal, each as `tower launch` takes it.
@@ -154,6 +158,16 @@ pub fn story_entries(space: &str, story: &[Told], r: &Value, now: u64) -> Vec<cr
         out.push(creation(space, "tower", &line, now));
     }
     out
+}
+
+/// What the user said in `story` after their first words (the ticket's,
+/// `ticket`): each message of theirs that isn't those words again.
+pub fn said_after(story: &[Told], ticket: &str) -> Vec<String> {
+    let squash = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let first = squash(ticket);
+    let mine: Vec<&Told> = story.iter().filter(|t| t.who == "you" && !t.text.trim().is_empty()).collect();
+    // Their first message is the ticket (or what it was drafted from): only what came after.
+    mine.iter().skip(1).filter(|t| !first.contains(&squash(&t.text))).map(|t| t.text.trim().to_string()).collect()
 }
 
 fn creation(space: &str, who: &str, text: &str, at: u64) -> crate::history::Entry {
@@ -701,11 +715,18 @@ pub fn plan_with(goal: &str, ask: &Ask, w: &World) -> Result<Plan> {
         assumed["mcp_needs"] = json!(needs);
         assumed["mcp_notes"] = json!(c.notes);
     }
-    Ok(Plan { goal, done_when, ticket, repos_from, space, joins, keeps_goal, setup: setup.clone(), account, sessions, assumed, plan: None, review })
+    Ok(Plan { goal, done_when, ticket, repos_from, space, joins, keeps_goal, setup: setup.clone(), account, sessions, assumed, plan: None, review, said: vec![] })
 }
 
 /// What a session of the plan is asked first: the whole ticket (with its
-/// title in front when the ticket doesn't have it), and its part in it.
+/// title in front when the ticket doesn't have it), what the user said
+/// after it while the space was drafted, and its part in it. A space's only
+/// session is told the goal is what to make, not its repository's product:
+/// 26 Nov (a launched film space), a lone session in a worktree of a
+/// website, told to "do the part of it that belongs in this repository",
+/// took a standalone art piece for the site's homepage, though the user
+/// had said so while the space was drafted. And the tower's bug rule goes
+/// with it (`introduce::BUG_RULE`): never later, as a turn of its own.
 pub fn instruction(p: &Plan, me: &Session) -> String {
     let others: Vec<String> = p.sessions.iter().filter(|s| s.name != me.name).map(|s| format!("{} ({})", s.name, repo_name(&s.folder))).collect();
     let with = match others.as_slice() {
@@ -713,8 +734,21 @@ pub fn instruction(p: &Plan, me: &Session) -> String {
         list => format!(" The space's other sessions each have their own repository: {}. The tower introduces you to each other; work the seams out with them.", list.join(", ")),
     };
     let squash = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-    let text = if p.goal.is_empty() || squash(&p.ticket).contains(&squash(p.goal.trim_end_matches('…'))) { p.ticket.clone() } else { format!("{}\n\n{}", p.goal, p.ticket) };
+    let mut text = if p.goal.is_empty() || squash(&p.ticket).contains(&squash(p.goal.trim_end_matches('…'))) { p.ticket.clone() } else { format!("{}\n\n{}", p.goal, p.ticket) };
+    let said: Vec<String> = p.said.iter().map(|w| w.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|w| !w.is_empty()).collect();
+    if !said.is_empty() {
+        text = format!(
+            "{text}\n\nWhat the user told the tower after that, while the space was drafted, oldest first (it counts over the words above):\n{}",
+            said.iter().map(|w| format!("- {w}")).collect::<Vec<_>>().join("\n")
+        );
+    }
     let done = if p.done_when.is_empty() { String::new() } else { format!(" It is done when: {}.", p.done_when.trim_end_matches('.')) };
+    let role = if p.sessions.len() == 1 {
+        let place = if me.worktree.is_some() { format!("a worktree of {} (a branch of its own)", repo_name(&me.folder)) } else { repo_name(&me.folder) };
+        format!("You are its only session, working in {place}: make what the goal above asks for.")
+    } else {
+        format!("You are its {} session: do the part of it that belongs in this repository.", repo_name(&me.folder))
+    };
     // The plan it was planned with: its link, and this session's part of it.
     let plan = match &p.plan {
         Some(b) => {
@@ -724,9 +758,9 @@ pub fn instruction(p: &Plan, me: &Session) -> String {
         None => String::new(),
     };
     format!(
-        "{text}\n\nThat is the goal of the space \"{}\".{done} You are its {} session: do the part of it that belongs in this repository.{with} When your part is done, say what you did and what is left.{plan}",
+        "{text}\n\nThat is the goal of the space \"{}\".{done} {role}{with} {}When your part is done, say what you did and what is left.{plan}",
         p.space,
-        repo_name(&me.folder)
+        crate::introduce::BUG_RULE
     )
 }
 
@@ -973,24 +1007,28 @@ pub fn launch(goal: &str, ask: &Ask, dry_run: bool) -> Result<Value> {
     if let Some(id) = ask.plan.map(str::trim).filter(|i| !i.is_empty()) {
         p.plan = Some(crate::plans::brief_of(id)?);
     }
+    // The conversation that made it (`--story-file`): the user's corrections go with the first task.
+    let story: Option<Vec<Told>> = ask.story.map(str::trim).filter(|s| !s.is_empty()).map(|path| match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
+            eprintln!("tower: the story in {path} isn't one ({e}): not kept");
+            vec![]
+        }),
+        Err(e) => {
+            eprintln!("tower: no story in {path}: {e}");
+            vec![]
+        }
+    });
+    if let Some(story) = &story {
+        p.said = said_after(story, &p.ticket);
+    }
     if dry_run {
         return Ok(receipt(&p, &[], None, true));
     }
     let mut r = open(&p, None, &mut |_| ())?;
     // The conversation that made it is the space's own from now on (only once something opened).
-    if let Some(path) = ask.story.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(story) = &story {
         let opened = r["sessions"].as_array().is_some_and(|a| a.iter().any(|s| s["error"].is_null()));
-        let story: Vec<Told> = match std::fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
-                eprintln!("tower: the story in {path} isn't one ({e}): not kept");
-                vec![]
-            }),
-            Err(e) => {
-                eprintln!("tower: no story in {path}: {e}");
-                vec![]
-            }
-        };
-        r["story"] = json!(if opened { record_story(&p.space, &story, &r) } else { 0 });
+        r["story"] = json!(if opened { record_story(&p.space, story, &r) } else { 0 });
     }
     // Planned and launched: the plan is done, and its planner ends.
     if let Some(b) = &p.plan
@@ -1255,7 +1293,10 @@ mod tests {
         // The sessions get the whole ticket, the title in front when the ticket doesn't have it, and what counts as done.
         let first = instruction(&p, &p.sessions[0]);
         assert!(first.starts_with("Translate support messages\n\nEYZFlow Support – Enable Automatic Message and Reply Translation\n\nAcceptance criteria:"), "{first}");
-        assert!(first.contains("That is the goal of the space \"msg-translation\". It is done when: both languages show. You are its eyz-mediaroom-serverless session"), "{first}");
+        assert!(first.contains("That is the goal of the space \"msg-translation\". It is done when: both languages show. You are its only session, working in "), "{first}");
+        assert!(first.contains("eyz-mediaroom-serverless") && first.contains(": make what the goal above asks for.") && !first.contains("belongs in this repository"), "{first}");
+        // The tower's bug rule goes with it, never later as a turn of its own.
+        assert!(crate::introduce::told_rule(&first), "{first}");
         let r = receipt(&p, &[], None, true);
         assert_eq!((r["goal"].as_str(), r["done_when"].as_str(), r["sessions"][0]["why"].as_str()), (Some("Translate support messages"), Some("both languages show"), Some("the media backend")));
         assert!(r["plan"].is_null() && !first.contains("The space's plan"), "no plan: none said");
@@ -1278,6 +1319,25 @@ mod tests {
         assert_eq!((p.account.as_deref(), p.assumed["account_why"].as_str(), p.setup.name.as_str(), p.sessions[0].why.as_str()), (Some("default"), Some("as given"), "the repos asked for", "asked for"));
         assert_eq!(p.space, "eyzflow-support", "named from the ticket");
         assert!(instruction(&p, &p.sessions[0]).starts_with("EYZFlow Support – Enable"), "the ticket has its title: not twice");
+        // 26 Nov (a lone session in a worktree of a website): the user's first words named the site's
+        // hero banner; drafting, they said it was a project of its own. Those words go with the first
+        // task, after the ticket, and the session isn't told to do "the part that belongs in" the repo.
+        let story = vec![
+            Told { who: "you".into(), text: "make a short paper boat film for the site's hero banner".into(), at: 1 },
+            Told { who: "tower".into(), text: "Drafted paper-boat-film: …".into(), at: 2 },
+            Told { who: "you".into(), text: "not a hero banner: a film of its own".into(), at: 3 },
+            Told { who: "tower".into(), text: "Redrafted …".into(), at: 4 },
+        ];
+        let mut lone = plan_with("make a short paper boat film for the site's hero banner", &Ask { repos: &repos, title: Some("An artistic paper boat film of its own"), ..Default::default() }, &w).unwrap();
+        lone.said = said_after(&story, &lone.ticket);
+        assert_eq!(lone.said, ["not a hero banner: a film of its own"]);
+        let first = instruction(&lone, &lone.sessions[0]);
+        assert!(first.starts_with("An artistic paper boat film of its own\n\nmake a short paper boat film"), "the goal first: {first}");
+        assert!(first.contains("What the user told the tower after that, while the space was drafted, oldest first (it counts over the words above):\n- not a hero banner: a film of its own"), "{first}");
+        assert!(first.contains("You are its only session, working in ") && first.contains(": make what the goal above asks for."), "{first}");
+        assert!(!first.contains("belongs in this repository"), "{first}");
+        // The first words again, or a tower's line, are no correction.
+        assert!(said_after(&story[..2], &lone.ticket).is_empty());
         // An empty done-when is kept empty, not filled from the ticket.
         let ask = Ask { repos: &repos, done_when: Some(""), ..Default::default() };
         assert_eq!(plan_with(ticket, &ask, &w).unwrap().done_when, "");

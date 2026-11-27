@@ -574,25 +574,44 @@ impl Decisions {
     /// settle it?), and one they settle closes, answered there, and is
     /// written down. Off the caller's thread: the weighing is a model call.
     pub fn typed_in(&self, address: &str, name: &str, words: &str) {
+        self.settles_raised(address, name, words, "in its terminal");
+    }
+
+    /// The user answered the question `address`'s session asked at the end
+    /// of its turn (on its card) with `words`: each card a brain raised that
+    /// it waits on is weighed as `typed_in` weighs words typed there, and
+    /// one they settle closes, answered there. 26 Nov: the raise left beside
+    /// the answered question sent its first option's words again.
+    pub fn answered_its_question(&self, address: &str, name: &str, words: &str) {
+        self.settles_raised(address, name, words, "in its own question");
+    }
+
+    fn settles_raised(&self, address: &str, name: &str, words: &str, place: &'static str) {
         if lock(&self.book).raised_for(address).is_empty() {
             return;
         }
         let (me, address, name, words) = (self.clone(), address.to_string(), name.to_string(), words.to_string());
         std::thread::spawn(move || {
-            me.typed_in_with(&address, &words, &|d: &Decision, w: &str| crate::covered::settles_card(&name, &card_text(d), w));
+            me.settled_with(&address, &words, place, &|d: &Decision, w: &str| crate::covered::settles_card(&name, &card_text(d), w));
         });
     }
 
     /// `typed_in`, weighed by `settles`. The cards it closed.
     pub fn typed_in_with(&self, address: &str, words: &str, settles: &dyn Fn(&Decision, &str) -> anyhow::Result<bool>) -> Vec<String> {
+        self.settled_with(address, words, "in its terminal", settles)
+    }
+
+    /// The user's `words` to the session at `address` (`place`: where they
+    /// gave them), weighed by `settles` against each card raised about it. The cards it closed.
+    pub fn settled_with(&self, address: &str, words: &str, place: &str, settles: &dyn Fn(&Decision, &str) -> anyhow::Result<bool>) -> Vec<String> {
         let mut closed = vec![];
         // (Taken first: the book is locked again to close one.)
         let cards = lock(&self.book).raised_for(address);
         for d in cards {
             match settles(&d, words) {
                 Ok(true) => {
-                    let over = self.change(|b, now| b.settled_in_terminal(&d.id, address, words, now));
-                    eprintln!("[decisions] {}: {address} answered it in its terminal (\"{}\"){}", d.id, crate::agenda::clip(words, 80), if over == Some(true) { "; the card is over" } else { "" });
+                    let over = self.change(|b, now| b.settled_there(&d.id, address, place, words, now));
+                    eprintln!("[decisions] {}: {address} answered it {place} (\"{}\"){}", d.id, crate::agenda::clip(words, 80), if over == Some(true) { "; the card is over" } else { "" });
                     if over == Some(true) {
                         self.record_closed(&d.id);
                         closed.push(d.id.clone());
@@ -613,6 +632,14 @@ impl Decisions {
         if moved {
             self.change(|b, _| b.session_waits(address, waiting));
         }
+    }
+
+    /// The user was told already of an open decision that names the session
+    /// at `address` (one it is blocked on, a question it asks, a raise about
+    /// it): what is said of its wait beside it ("is waiting for you") is
+    /// only written down.
+    pub fn told_for(&self, address: &str) -> bool {
+        lock(&self.book).open.iter().any(|d| d.told && !d.held() && d.sessions.iter().any(|w| w.address == address))
     }
 
     /// The open decisions that stand for a question set.
@@ -1280,6 +1307,18 @@ mod tests {
         }
     }
 
+    /// 26 Nov: the user answered a session's own question on its card; the
+    /// card a brain raised about the same session closes with that answer,
+    /// and says where it was given.
+    #[test]
+    fn a_raised_card_an_answer_to_its_sessions_own_question_settles_says_so() {
+        let d = Decisions::new(shared());
+        let (card, ..) = d.raise(raise("boat", "t9", "Publish the film, or keep it local?"));
+        assert_eq!(d.settled_with("t9", "Keep it local for now; no PR.", "in its own question", &|_, _| Ok(true)), std::slice::from_ref(&card.id));
+        let c = d.get(&card.id).unwrap();
+        assert_eq!((c.state, c.answer.as_str()), (State::Answered, "in its own question: Keep it local for now; no PR."));
+    }
+
     /// 15 Nov: the search-llm brain raised "Check 4 fresh search labels
     /// (group F)…" for t12r; the user labelled them and typed "i labeled all"
     /// in t12r itself; the card stayed in the queue.
@@ -1318,6 +1357,21 @@ mod tests {
         let merge = d.for_prs(&prs)[0].clone();
         assert!(d.typed_in_with("t9", "merged it", &|_, _| Ok(true)).is_empty());
         assert_eq!(d.get(&merge).map(|c| c.state), Some(State::Open));
+    }
+
+    /// 26 Nov: a launched session held by its folder-trust question gave
+    /// "needs you" and, 2 s later, "is waiting for you": the watch's line for
+    /// a wait the user was just told of as a decision. Once the user was told
+    /// of an open decision about a session, that line is only written down.
+    #[test]
+    fn a_session_with_a_told_decision_is_known_as_told() {
+        let s = shared();
+        let d = Decisions::telling(s.clone(), || Level::Decisions);
+        assert!(!d.told_for("t9"));
+        let who = crate::decisions::Who::new("t9", "film");
+        assert!(d.blocked(Some("boat".into()), who, "Asks whether to trust its folder site"), "told, the first time");
+        assert!(d.told_for("t9"));
+        assert!(!d.told_for("t8"), "another session's");
     }
 
     /// "In the PR cards in the queue let me write something if I want
