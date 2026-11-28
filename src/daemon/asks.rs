@@ -2748,6 +2748,69 @@ mod tests {
         t.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// 2026-11-28: a session whose PR was open already asked (Claude's
+    /// question) whether it may run a live round trip against dev that
+    /// writes dev data and spends credits; the tower answered it with its
+    /// open-the-PR yes, since the question named the PR and said "open".
+    /// A question that mentions the PR but asks something else is the
+    /// user's to answer, as is any once its PR is open.
+    #[test]
+    fn a_question_that_only_mentions_an_open_pr_reaches_the_user_and_isnt_answered_open_the_pr() {
+        let at = questions::PrPlace { branch: "bug-nightly/media-api".into(), base: "dev".into(), default: "main".into() };
+        let (mut a, brain) = asks();
+        let went = Arc::new(Mutex::new(vec![]));
+        let w = went.clone();
+        a.answers = Arc::new(move |_: &Asks, id: &str| w.lock().unwrap_or_else(|e| e.into_inner()).push(id.to_string()));
+        let place = at.clone();
+        a.pr_place = Arc::new(move |_: &QuestionSet| Some(place.clone()));
+        a.set_policy("normal");
+        let question = "PR #1729 (nightly Dev smoke fix) is open. To verify it end to end I'd run the new round trip once from this laptop against dev, as your own dev sign-in in the smoke org <org>. It would: save one workflow \"Nightly smoke: ghost-40s-<time>\" (inspection + German subtitles), switch it on with a start that fires only for its own uploaded file, upload the 40 s ghost clip through link <link>, wait up to 25 min for the run, then archive the workflow. It also re-runs the trigger checks, which store last_check on the org's triggers, as every nightly does. Cost: one inspection and one transcription in compute credits, plus one Bridge file. <workflow> and every other workflow stay as they are. May I run it?";
+        let set = QuestionSet {
+            id: "q-live-run".into(),
+            session: "t9".into(),
+            name: "media api".into(),
+            kind: "claude-ask".into(),
+            title: "Live run".into(),
+            space: Some("bug-nightly".into()),
+            status: "pending".into(),
+            tabs: vec![questions::Tab {
+                title: "Live run".into(),
+                question: question.into(),
+                options: vec![
+                    questions::Opt { label: "Yes, run it now (Recommended)".into(), description: "Run nightly.mjs once against dev as described; I report the result and add it to PR #1729.".into(), ..Default::default() },
+                    questions::Opt { label: "No, leave it to the nightly".into(), description: "Don't touch dev; the first nightly after the merge is the live check, and the PR keeps it as not verified.".into(), ..Default::default() },
+                ],
+                allows_other: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(questions::may_open_pr(&set), "its words name the PR: the rule looks at it");
+        assert_eq!(questions::open_pr_yes(&set, &at), None, "it asks to run something, not to open the PR");
+        let s = a.upsert(set.clone());
+        assert_ne!(s.reason, questions::pr_yes_why("dev"));
+        assert_ne!(s.state.decision, Decision::Auto, "not answered by the tower");
+        assert!(went.lock().unwrap().is_empty(), "nothing typed into the session");
+        assert_eq!(told(&brain, 1).len(), 1, "judged as any other question, on its way to the user");
+
+        // Each guard alone: the PR named as open, the question asked, what it costs.
+        let ask = |text: &str| QuestionSet { tabs: vec![questions::Tab { question: text.into(), allows_other: true, options: vec![questions::Opt { label: "Yes".into(), ..Default::default() }], ..Default::default() }], ..set.clone() };
+        for no in [
+            "PR #1729 is open. Should I open a PR into dev?",
+            "The PR is open already. Want me to open the PR into dev?",
+            "The fix is pushed and https://github.com/acme/api/pull/1729 is up. Shall I open the PR?",
+            "Before I open the PR into dev I'd run the live smoke once. May I run it?",
+            "Open the PR into dev and run the live smoke, which spends compute credits?",
+            "Open the PR into dev? It uploads the test clip to dev first.",
+        ] {
+            assert_eq!(questions::open_pr_yes(&ask(no), &at), None, "{no}");
+        }
+        // Still the tower's yes: a question that asks only that.
+        for ok in ["Tests pass. Should I push the branch and open the PR into dev?", "Open a PR into dev?"] {
+            assert!(questions::open_pr_yes(&ask(ok), &at).is_some(), "{ok}");
+        }
+    }
+
     /// t1mv's release dialog of 19 Nov: two questions, only the second about #1580.
     fn release_dialog() -> QuestionSet {
         let tab = |title: &str, question: &str, options: &[(&str, &str)]| questions::Tab {
