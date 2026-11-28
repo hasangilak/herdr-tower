@@ -318,6 +318,11 @@ pub fn run() -> Result<()> {
         std::sync::Arc::new(reviews::Real { sendq: sendq.clone(), decisions: decisions.clone(), watches: watches.clone() }),
     );
     reviews.start();
+    // A push note to a reviewer says the PR's head as GitHub has it when it goes in (or nothing).
+    {
+        let r = reviews.clone();
+        sendq.on_send(std::sync::Arc::new(move |key: &str, session: &str| r.fresh_push(key, session)));
+    }
     // The agenda ledger: what the user asked for, followed until it's done.
     let agendas = agendas::Agendas::open();
     // A space's goal follows the user's requests there.

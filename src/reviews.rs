@@ -263,7 +263,9 @@ pub fn chip_line(b: &Brief) -> String {
         Status::Reviewing if b.rounds == 0 => "Reviewing…".into(),
         Status::Reviewing => format!("Reviewing the fixes… (after round {})", b.rounds),
         Status::Changes => format!("Review: {} critical, round {}", b.critical, b.rounds),
-        Status::Agreed => "Review: agreed".into(),
+        Status::Agreed if b.sha.is_empty() => "Review: agreed".into(),
+        // The commit the tower has it agreed on, never one the reviewer's own words name.
+        Status::Agreed => format!("Review: agreed at {}", short_sha(&b.sha)),
         Status::Stuck => format!("Review: stuck after {} rounds, yours to decide", b.rounds),
         Status::Ended if b.critical > 0 => format!("Review: ended, {} critical left", b.critical),
         Status::Ended => "Review: ended without agreement".into(),
@@ -390,7 +392,7 @@ pub fn instructions(r: &Review, goal: &str, done_when: &str, checkout: bool) -> 
         String::new()
     } else {
         format!(
-            "An earlier review agreed on it at {old}; commits were pushed since, so it is reviewed again. Review the PR as it is now, whole, and above all what changed since: git diff {old}..{now} (gh pr diff {n} --repo {repo} shows all of it).\n\n",
+            "An earlier review agreed on it at {old}; commits were pushed since, so it is reviewed again. Review the PR as it is now, whole, and above all what changed since: check it out as it is now (gh pr checkout {n} --repo {repo} --detach), then git diff {old}..HEAD ({now} as this begins; the PR may move on while you review, and the diff then reaches its new head too; gh pr diff {n} --repo {repo} shows all of it).\n\n",
             old = r.again_from,
             now = if r.head_sha.is_empty() { "HEAD" } else { &r.head_sha },
         )
@@ -407,10 +409,10 @@ Review it for CRITICAL issues only:\n\
 - a breaking change: something outside this PR uses what it removes, renames or changes (a function's callers, an API route, a request or response field, a DB column, an event, a config key, a shared type), in this repo or another (the dashboard that calls this API, the SDK, the mobile app), and no longer works.\n\
 Nothing else: no style, naming, nits or suggestions. What isn't critical, leave out.\n\n\
 Does it break other people's code? The tower searched every repo under ~/Work for what uses what this PR changes: tower impact {key} lists them (repo, file, the function each is in). For each, check it still works: type-check or compile it, run its tests against this change where you can, and search the other repos for what the tower missed (git grep). A break is a critical issue: post it as the others, naming what breaks and who uses it, and report it: tower impact {key} breaks \"<what breaks, and who uses it: repo, file, function>\". Nothing breaks: tower impact {key} clean \"<what you compiled, type-checked or ran>\".\n\n\
-1. Post each critical issue as a review comment on the PR, inline where you can, opening with \"Critical:\": gh api repos/{repo}/pulls/{n}/comments -f body='Critical: …' -f commit_id={sha} -f path=<file> -F line=<line> -f side=RIGHT (one that has no line: gh pr comment {n} --repo {repo} --body 'Critical: …').\n\
+1. Post each critical issue as a review comment on the PR, inline where you can, opening with \"Critical:\": gh api repos/{repo}/pulls/{n}/comments -f body='Critical: …' -f commit_id=<the commit you reviewed: git rev-parse HEAD in your checkout, {sha} as this begins> -f path=<file> -F line=<line> -f side=RIGHT (one that has no line: gh pr comment {n} --repo {repo} --body 'Critical: …').\n\
 2. Message the owner yourself, with the list and the links: tower queue {addr} \"<the critical issues, each with its link>\". The tower doesn't pass your messages on: you two talk directly.\n\
 3. Report to the tower: tower review report {key} --critical <n> \"<one line>\".\n\n\
-None critical: approve it at once (gh pr review {n} --repo {repo} --approve --body \"<a short note>\"), tell the owner in a line (tower queue {addr} \"…\"), then tower review agree {key} \"<one line>\".\n\
+None critical: approve it at once (gh pr review {n} --repo {repo} --approve --body \"<a short note, naming the commit you reviewed as your checkout has it: git rev-parse --short HEAD; never a commit from this message, which the PR may have moved past>\"), tell the owner in a line (tower queue {addr} \"…\"), then tower review agree {key} \"<one line>\".\n\
 When the owner says it's fixed: check again (gh pr checkout {n} --repo {repo} --detach first), then agree (approve as above, then tower review agree {key}), or post what is still critical, tell the owner, and report again. After {ROUNDS} rounds without agreement the tower puts it to the user, and their word comes to both of you.\n\
 If GitHub refuses the approval (a PR of your own account can't be approved), post it as a comment instead (gh pr review {n} --repo {repo} --comment --body \"Approved: …\") and agree all the same.\n\
 Never merge, close or push; never edit, commit or change the owner's code or branch: what needs changing, the owner changes. Don't ask the user anything: what you two can't agree on, the tower puts to them. Once you have agreed, your session ends.",
@@ -431,11 +433,20 @@ fn pushed_line(was: &str, head: &str) -> String {
     }
 }
 
+/// What a reviewer's push note stands for in the send queue: one per PR,
+/// the newest taking the place of one still waiting.
+pub const PUSH_KEY: &str = "review-push:";
+
+/// `PUSH_KEY` for the PR `key`.
+pub fn push_key(key: &str) -> String {
+    format!("{PUSH_KEY}{key}")
+}
+
 /// The tower's note to a reviewer whose PR was pushed to while it
 /// reviews: the head it is to review now (its checkout is at `was`).
 pub fn pushed_note(r: &Review, was: &str) -> String {
     format!(
-        "[tower] PR #{n} ({repo}) was pushed to while you review it: its head is now {now}, not {was} (new commits, or a rebase or force-push; {was} may be on no branch now). Review the PR as it is at {now}: gh pr checkout {n} --repo {repo} --detach first. An agreement counts only on the PR's head: tower review agree is refused while your checkout is at another commit.",
+        "[tower] PR #{n} ({repo}) was pushed to while you review it: its head is now {now}, not {was} (new commits, or a rebase or force-push; {was} may be on no branch now). Review the PR as it is at {now}: gh pr checkout {n} --repo {repo} --detach first, then git diff {was}..{now} for what came since. An agreement counts only on the PR's head: tower review agree is refused while your checkout is at another commit.",
         n = r.number,
         repo = r.repo,
         now = short_sha(&r.head_sha),
@@ -762,7 +773,14 @@ impl Book {
         r.status = Status::Agreed;
         r.agreed_sha = if head.is_empty() { reviewed } else { head.to_string() };
         r.critical = 0;
-        r.line = if text.is_empty() { "agreed".into() } else { text.clone() };
+        // The commit it is agreed on, as the tower has it: the reviewer's own words may name another.
+        let at = short_sha(&r.agreed_sha);
+        r.line = match (text.is_empty(), at.is_empty()) {
+            (true, true) => "agreed".into(),
+            (true, false) => format!("agreed at {at}"),
+            (false, true) => text.clone(),
+            (false, false) => format!("agreed at {at}: {text}"),
+        };
         r.ended_ms = Some(now);
         r.step("agreed", by, None, &text, now);
         Ok(r.clone())
@@ -915,7 +933,7 @@ mod tests {
         assert_eq!(r.line, "pushed to during the review: reviewed again at 7ebff09, not abc123");
         assert!(row(&r).ends_with(": pushed to during the review: reviewed again at 7ebff09, not abc123"), "{}", row(&r));
         assert!(b.follow(&at("7ebff09"), 32).is_none(), "its short form is the same commit");
-        assert!(instructions(&r, "", "", true).contains("commit_id=7ebff09ae925f6fe"), "its comments go on the new head");
+        assert!(instructions(&r, "", "", true).contains("git rev-parse HEAD in your checkout, 7ebff09ae925f6fe as this begins"), "its comments go on the commit it reviewed, the new head as it begins");
         assert!(pushed_note(&r, &was).contains("its head is now 7ebff09, not abc123"));
         // Its reviewer agrees on what it reviewed, the old head: refused, and the review's head is GitHub's.
         let err = b.agree_at(&k, "fine", "t9", "abc123", "7ebff09ae925f6fe", 33).unwrap_err().to_string();
@@ -996,7 +1014,7 @@ mod tests {
         assert_eq!((rep.note_owner, rep.raise), (true, false));
         // Agreed: over, and nothing more is reported.
         let a = b.agree(&k, "approved", "t9", "", 90).unwrap();
-        assert_eq!((a.status, a.critical, a.ended_ms, a.brief().line.as_str()), (Status::Agreed, 0, Some(90), "Review: agreed"));
+        assert_eq!((a.status, a.critical, a.ended_ms, a.brief().line.as_str()), (Status::Agreed, 0, Some(90), "Review: agreed at abc123"));
         assert!(b.report(&k, 1, "x", "t9", false, 100).is_err());
         assert!(b.agree(&k, "", "t9", "", 100).is_err());
         assert_eq!(b.end(&k, "the PR was merged", 100), None, "agreed stays agreed");
@@ -1010,7 +1028,7 @@ mod tests {
         let k = begun(&mut b, 12);
         let rep = b.report(&k, 0, "nothing critical", "t9", false, 30).unwrap();
         assert_eq!((rep.review.status, rep.review.rounds, rep.note_owner, rep.raise), (Status::Reviewing, 0, false, false));
-        assert_eq!(b.agree(&k, "", "t9", "", 31).unwrap().line, "agreed");
+        assert_eq!(b.agree(&k, "", "t9", "", 31).unwrap().line, "agreed at abc123", "the commit it is agreed on, as the tower has it");
         // Another PR: it ends when its PR closes, with what was left.
         let k2 = begun(&mut b, 13);
         b.report(&k2, 2, "two", "t9", false, 40).unwrap();
@@ -1122,7 +1140,7 @@ mod tests {
             "tower impact acme/shop#12 clean \"<what you compiled, type-checked or ran>\"",
             "no style, naming, nits",
             "opening with \"Critical:\"",
-            "gh api repos/acme/shop/pulls/12/comments -f body='Critical: …' -f commit_id=abc123",
+            "gh api repos/acme/shop/pulls/12/comments -f body='Critical: …' -f commit_id=<the commit you reviewed: git rev-parse HEAD in your checkout, abc123 as this begins>",
             "tower queue t3 \"<the critical issues, each with its link>\"",
             "The tower doesn't pass your messages on",
             "tower review report acme/shop#12 --critical <n> \"<one line>\"",

@@ -21,6 +21,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
+use super::sendq::Fresh;
 use super::state::Shared;
 use crate::prs::{Pr, Prs};
 use crate::reviews::{self, Book, Review};
@@ -57,6 +58,9 @@ pub trait Hands: Send + Sync {
     fn end(&self, address: &str);
     /// A quiet note to a session, through the send queue.
     fn note(&self, address: &str, text: &str) -> Result<()>;
+    /// A quiet note that stands for one thing (`key`): a newer one takes
+    /// the place of one still waiting (`SendQueue::add_keyed_note`).
+    fn note_keyed(&self, address: &str, text: &str, key: &str) -> Result<()>;
     /// The decision for a stuck review, about both sessions: its id.
     fn raise(&self, r: &Review) -> Option<String>;
     fn decision_open(&self, id: &str) -> bool;
@@ -77,6 +81,9 @@ pub struct Reviews {
     hands: Arc<dyn Hands>,
     /// Reviews whose reviewer is being opened right now.
     opening: Arc<Mutex<HashSet<String>>>,
+    /// Reviews whose reviewer has a push note on its way: the head it
+    /// last knew of (where that note says the PR was), until it goes in.
+    told: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// Reviews whose PR's session was seen gone, and since when: each waits
     /// `owner_grace_ms` for that conversation to go on in another terminal
     /// (`carry_over`) before it ends.
@@ -150,6 +157,7 @@ impl Reviews {
             shared,
             hands,
             opening: Arc::default(),
+            told: Arc::default(),
             owner_gone: Arc::default(),
             owner_grace_ms: crate::reopen::GRACE_MS,
             background: false,
@@ -291,13 +299,59 @@ impl Reviews {
         };
         eprintln!("[reviews] {}: {}", r.key, r.steps.last().map(|s| s.text.as_str()).unwrap_or(""));
         if r.status == reviews::Status::Reviewing && !r.reviewer.is_empty() && !was.is_empty() {
-            let text = reviews::pushed_note(&r, &was);
-            if let Err(e) = self.hands.note(&r.reviewer, &text) {
+            // One note however many pushes come before it goes in: the newest
+            // head, from the head the reviewer knew before the first of them.
+            let from = lock(&self.told).entry(r.key.clone()).or_insert(was).clone();
+            let text = reviews::pushed_note(&r, &from);
+            if let Err(e) = self.hands.note_keyed(&r.reviewer, &text, &reviews::push_key(&r.key)) {
                 eprintln!("[reviews] {}: couldn't tell its reviewer {}: {e:#}", r.key, r.reviewer);
             }
         }
         self.publish(&r.key);
         Some(r)
+    }
+
+    /// A push note (`reviews::push_key`) as it goes in to `session`: the
+    /// PR's head read from GitHub now (the review follows it), and nothing
+    /// at all when the review isn't under way with that reviewer any more,
+    /// or its checkout is at that head already (it fetched it itself).
+    pub fn fresh_push(&self, key: &str, session: &str) -> Fresh {
+        let Some(pr_key) = key.strip_prefix(reviews::PUSH_KEY) else { return Fresh::Keep };
+        let Some(r) = self.get(pr_key) else { return Fresh::Drop(format!("no review of {pr_key} any more")) };
+        if r.status != reviews::Status::Reviewing {
+            lock(&self.told).remove(pr_key);
+            return Fresh::Drop(format!("the review of {} is {} now", r.short(), r.status.word()));
+        }
+        if r.reviewer != session {
+            return Fresh::Drop(format!("{session} isn't the reviewer of {} any more", r.short()));
+        }
+        // GitHub's head now (as it was last seen, when GitHub can't be asked).
+        let head = crate::prs::fetch(self.prs.gh(), &r.repo, r.number)
+            .ok()
+            .and_then(|v| v["headRefOid"].as_str().map(String::from))
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| r.head_sha.clone());
+        let r = match self.prs.get(pr_key) {
+            Some(mut pr) if !reviews::same_commit(&r.head_sha, &head) => {
+                pr.head_sha = head.clone();
+                let mut b = lock(&self.book);
+                let out = b.follow(&pr, crate::history::now_ms());
+                self.save(&b);
+                drop(b);
+                self.publish(pr_key);
+                out.map(|(_, r)| r).unwrap_or(r)
+            }
+            _ => r,
+        };
+        let checkout = Some(r.folder.as_str()).filter(|f| !f.is_empty()).and_then(checkout_head);
+        let from = lock(&self.told).remove(pr_key);
+        if checkout.as_deref().is_some_and(|c| reviews::same_commit(c, &r.head_sha)) {
+            return Fresh::Drop(format!("{}'s checkout is at {} already", r.reviewer, &r.head_sha[..r.head_sha.len().min(7)]));
+        }
+        match checkout.or(from) {
+            Some(was) => Fresh::Text(reviews::pushed_note(&r, &was)),
+            None => Fresh::Keep,
+        }
     }
 
     /// The agreed reviewer's leftovers go (its session, if it still runs, and its
@@ -743,6 +797,10 @@ impl Hands for Real {
         self.sendq.add_note(address, text).map(|_| ())
     }
 
+    fn note_keyed(&self, address: &str, text: &str, key: &str) -> Result<()> {
+        self.sendq.add_keyed_note(address, text, key).map(|_| ())
+    }
+
     fn raise(&self, r: &Review) -> Option<String> {
         let (title, detail, options) = reviews::stuck_decision(r);
         let who = |address: &str, name: &str| -> Option<crate::decisions::Who> {
@@ -847,6 +905,10 @@ mod tests {
             lock(&self.notes).push((address.into(), text.into()));
             Ok(())
         }
+        fn note_keyed(&self, address: &str, text: &str, _key: &str) -> Result<()> {
+            lock(&self.notes).push((address.into(), text.into()));
+            Ok(())
+        }
         fn raise(&self, r: &Review) -> Option<String> {
             lock(&self.calls).push(format!("raise {} {} {}", r.key, r.owner, r.reviewer));
             lock(&self.open_decisions).insert("d000000000001".into());
@@ -882,6 +944,65 @@ mod tests {
         let r2 = reviews.clone();
         prs.on_change(Box::new(move |op, pr| r2.pr_changed(op, pr)));
         prs.found(&[("o/app".into(), 12)], session, "shop", Some(space), true);
+    }
+
+    /// 27 Nov (a support space's PR): three pushes while its reviewer
+    /// worked queued three "its head is now …" notes, each stale by the time
+    /// it went in, the last after the reviewer had fetched that head itself.
+    /// One note stands for them all (keyed, from the head the reviewer knew
+    /// before the first), and as it goes in it says GitHub's head then, or
+    /// nothing when the reviewer's checkout is there already.
+    #[test]
+    fn pushes_under_review_make_one_note_that_says_githubs_head_as_it_goes_in() {
+        let (reviews, hands, prs, base) = setup("one-push-note");
+        let repo = base.join("shop");
+        let sh = |dir: &std::path::Path, args: &[&str]| crate::worktrees::tests::sh(dir, args);
+        let gh = prs.gh().to_path_buf();
+        found(&prs, &reviews, "t3", "fix-login");
+        let place = base.join(".tower-worktrees/fix-login/review-shop-12");
+        let began = sh(&place, &["rev-parse", "HEAD"]);
+        let key = reviews::push_key("o/app#12");
+        let commit = |what: &str| {
+            std::fs::write(repo.join("src/nav.txt"), what).unwrap();
+            sh(&repo, &["add", "."]);
+            sh(&repo, &["commit", "-m", what]);
+            sh(&repo, &["rev-parse", "HEAD"])
+        };
+        // Three pushes, each seen: every note says where the reviewer was before the first.
+        let mut heads = vec![];
+        for what in ["relay rule", "fallback note", "reply-to order"] {
+            let head = commit(what);
+            crate::prs::tests::serve(&gh, 12, "OPEN", json!([]), &head);
+            prs.poll("o/app#12");
+            heads.push(head);
+        }
+        let notes = lock(&hands.notes).clone();
+        assert_eq!(notes.len(), 3, "(the queue keeps one of them: sendq's test)");
+        for (n, head) in notes.iter().zip(&heads) {
+            assert!(n.1.contains(&format!("its head is now {}, not {}", &head[..7], &began[..7])), "{}", n.1);
+        }
+        assert_eq!(reviews.get("o/app#12").unwrap().head_sha, heads[2]);
+
+        // A fourth push GitHub has, not yet seen by the tower: as the note goes in, it says that one.
+        let newest = commit("one more");
+        crate::prs::tests::serve(&gh, 12, "OPEN", json!([]), &newest);
+        let Fresh::Text(text) = reviews.fresh_push(&key, "t9") else { panic!("a note to send") };
+        println!("the one note: {text}");
+        assert!(text.contains(&format!("its head is now {}, not {}", &newest[..7], &began[..7])), "{text}");
+        assert!(text.contains(&format!("git diff {}..{}", &began[..7], &newest[..7])), "the range to look at: {text}");
+        assert_eq!(reviews.get("o/app#12").unwrap().head_sha, newest, "the review follows GitHub's head");
+
+        // The reviewer fetched the head itself: the note would say nothing new.
+        sh(&place, &["checkout", "--detach", &newest]);
+        assert!(matches!(reviews.fresh_push(&key, "t9"), Fresh::Drop(why) if why.contains("checkout is at")));
+        // Another session, or a review that is over: nothing either.
+        assert!(matches!(reviews.fresh_push(&key, "t7"), Fresh::Drop(_)));
+        reviews.request("agree", "#12", None, "fine", Some("t9")).unwrap();
+        assert!(matches!(reviews.fresh_push(&key, "t9"), Fresh::Drop(why) if why.contains("agreed")));
+        // The chip names the commit it is agreed on, as the tower has it.
+        assert_eq!(prs.get("o/app#12").unwrap().review.unwrap().line, format!("Review: agreed at {}", &newest[..7]));
+        // Not a push note: as it was.
+        assert_eq!(reviews.fresh_push("other:x", "t9"), Fresh::Keep);
     }
 
     /// eyzflow#1066 (2026-11-26): a review began again at the head the
@@ -920,7 +1041,7 @@ mod tests {
         assert_eq!((sh(&place, &["rev-parse", "HEAD"]), r.head_sha.clone(), r.again_from.clone()), (c.clone(), c.clone(), agreed.clone()), "its checkout and its review at GitHub's head");
         assert_eq!(prs.get("o/app#12").unwrap().head_sha, c, "the store has GitHub's head too");
         let task = lock(&hands.started).last().unwrap().last().unwrap().clone();
-        assert!(task.contains(&format!("git diff {agreed}..{c}")), "from the agreed commit to it: {task}");
+        assert!(task.contains(&format!("git diff {agreed}..HEAD ({c} as this begins")), "from the agreed commit to its checkout's head: {task}");
 
         // D is pushed; the tower hasn't looked yet. Its reviewer agrees from C: refused, and the
         // review and the store are both at D, so the store's next word keeps it there.
@@ -1024,7 +1145,7 @@ mod tests {
         let calls = lock(&hands.calls).clone();
         assert!(calls.contains(&"end t9".to_string()) && calls.contains(&"settle d000000000001".to_string()), "{calls:?}");
         assert!(!base.join(".tower-worktrees/fix-login/review-shop-12").exists());
-        assert_eq!(prs.get("o/app#12").unwrap().review.unwrap().line, "Review: agreed");
+        assert!(prs.get("o/app#12").unwrap().review.unwrap().line.starts_with("Review: agreed at "), "the chip names the commit it is agreed on");
         assert!(crate::prs::gate(&prs.get("o/app#12").unwrap()).warnings.iter().all(|w| !w.contains("review")));
         assert!(reviews.request("report", "#12", Some(1), "x", Some("t9")).is_err());
         let list = reviews.request("list", "", None, "", None).unwrap();
@@ -1077,7 +1198,7 @@ mod tests {
         let started = lock(&hands.started).clone();
         assert_eq!(started.len(), 2, "a fresh reviewer");
         let task = started[1].last().unwrap();
-        assert!(task.contains(&format!("An earlier review agreed on it at {first}")) && task.contains(&format!("git diff {first}..{second}")), "{task}");
+        assert!(task.contains(&format!("An earlier review agreed on it at {first}")) && task.contains(&format!("git diff {first}..HEAD ({second} as this begins")), "{task}");
         let place = base.join(".tower-worktrees/fix-login/review-shop-12");
         assert_eq!(crate::worktrees::tests::sh(&place, &["rev-parse", "HEAD"]), second, "its checkout is of the new head");
         assert_eq!((r.reviewer.as_str(), r.checkout_of.is_empty()), ("t9", false));

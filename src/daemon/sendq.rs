@@ -257,6 +257,11 @@ pub struct Item {
     /// again while the session works, only once it is free.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub busy: bool,
+    /// A note that stands for one thing (`review-push:<pr>`, see
+    /// `add_keyed_note`): a newer one takes its place while it waits, and
+    /// what it says is looked at again as it goes in (`on_send`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 impl Item {
@@ -771,8 +776,24 @@ pub struct Note {
     pub speech: String,
 }
 
+/// What a keyed note says as it goes in (`SendQueue::on_send`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fresh {
+    /// As it was queued.
+    Keep,
+    /// These words instead (what it stands for moved on meanwhile).
+    Text(String),
+    /// Nothing: it would only say what is no longer so (why, for the log).
+    Drop(String),
+}
+
+/// Looks at a keyed note as it goes in: its key and its session.
+pub type FreshFn = Arc<dyn Fn(&str, &str) -> Fresh + Send + Sync>;
+
 #[derive(Clone)]
 pub struct SendQueue {
+    /// Looks at a keyed note again as it goes in (`on_send`).
+    fresh: Arc<Mutex<Option<FreshFn>>>,
     book: Arc<Mutex<Book>>,
     path: PathBuf,
     /// Sessions being worked on right now (one hand-over per session at a time).
@@ -788,6 +809,7 @@ impl SendQueue {
 
     pub(super) fn at(path: PathBuf) -> SendQueue {
         SendQueue {
+            fresh: Arc::new(Mutex::new(None)),
             book: Arc::new(Mutex::new(Book::load_from(&path))),
             path,
             busy: Arc::new(Mutex::new(HashSet::new())),
@@ -850,6 +872,25 @@ impl SendQueue {
         self.add_note_with(&Herdr, session, text, false)
     }
 
+    /// `add_note` for a note that stands for one thing (`key`): while one
+    /// with that key waits for the session, the newer words take its place
+    /// (never a second), and as it goes in the `on_send` hook looks at it
+    /// again. 27 Nov: three pushes to a PR under review queued three
+    /// "its head is now …" notes for its working reviewer; each went in
+    /// after the PR had moved on, the last after it had fetched the head itself.
+    pub fn add_keyed_note(&self, session: &str, text: &str, key: &str) -> Result<(Added, String, String)> {
+        self.add_keyed_note_with(&Herdr, session, text, key)
+    }
+
+    fn add_keyed_note_with(&self, h: &dyn Sessions, session: &str, text: &str, key: &str) -> Result<(Added, String, String)> {
+        self.add_note_as(h, session, text, false, Some(key))
+    }
+
+    /// What a keyed note says as it goes in: `f(key, session)`.
+    pub fn on_send(&self, f: FreshFn) {
+        *self.fresh.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+    }
+
     /// A word for `session` that never goes on its own: it rides with the
     /// next instruction the session is given (after its text, in the same
     /// message), so it never costs a turn of its own. 26 Nov: the bug rule,
@@ -883,6 +924,10 @@ impl SendQueue {
     }
 
     fn add_note_with(&self, h: &dyn Sessions, session: &str, text: &str, first: bool) -> Result<(Added, String, String)> {
+        self.add_note_as(h, session, text, first, None)
+    }
+
+    fn add_note_as(&self, h: &dyn Sessions, session: &str, text: &str, first: bool, key: Option<&str>) -> Result<(Added, String, String)> {
         let text = hc::clean(text.trim());
         let s = match h.look(session) {
             Look::Live(s) => s,
@@ -896,10 +941,25 @@ impl SendQueue {
             if let Some(i) = b.items.iter().find(|i| i.session == s.address && i.text == text) {
                 return Ok((Added::Queued { id: i.id, position: 1, status: s.status.word().to_string() }, s.address, s.name));
             }
+            // The same thing said again while it waits: the newer words, in its place.
+            if let Some(k) = key
+                && let Some(i) = b.items.iter_mut().find(|i| i.session == s.address && i.key.as_deref() == Some(k) && i.state() == ItemState::Waiting)
+            {
+                let (id, was) = (i.id, std::mem::replace(&mut i.text, text.clone()));
+                if let Err(e) = self.save(&b) {
+                    if let Some(i) = b.items.iter_mut().find(|i| i.id == id) {
+                        i.text = was;
+                    }
+                    return Err(e);
+                }
+                eprintln!("[queue] #{id} for {} says the newer {k} now", s.address);
+                return Ok((Added::Queued { id, position: 1, status: s.status.word().to_string() }, s.address, s.name));
+            }
             let pos = b.items.len();
             let mut item = b.push(&s, &text, &[], now);
             item.quiet = true;
             b.items[pos].quiet = true;
+            b.items[pos].key = key.map(String::from);
             if first && let Some(at) = b.items.iter().position(|i| i.session == s.address && i.id != item.id) {
                 let it = b.items.remove(pos);
                 b.items.insert(at, it);
@@ -1693,6 +1753,31 @@ impl SendQueue {
             }
             (b.items[pos].clone(), busy)
         };
+        // A keyed note, looked at again as it goes in: what it says may have moved on, or be moot.
+        let fresh = self.fresh.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut item = item;
+        if let (Some(k), Some(f)) = (item.key.clone(), fresh) {
+            match f(&k, &s.address) {
+                Fresh::Keep => {}
+                Fresh::Text(t) => {
+                    let t = hc::clean(t.trim());
+                    let mut b = self.lock();
+                    if let Some(i) = b.items.iter_mut().find(|i| i.id == item.id) {
+                        i.text = t.clone();
+                    }
+                    let _ = self.save(&b);
+                    item.text = t;
+                }
+                Fresh::Drop(why) => {
+                    let mut b = self.lock();
+                    b.items.retain(|i| i.id != item.id);
+                    b.cancelled.insert(item.id);
+                    let _ = self.save(&b);
+                    eprintln!("[queue] #{} for {} not sent: {why}", item.id, s.address);
+                    return;
+                }
+            }
+        }
         // A word that rides with it (the tower's bug rule): after its text, in the same message.
         let rider = {
             let b = self.lock();
@@ -3113,6 +3198,59 @@ mod tests {
     /// took a turn of its own to say "noted" and repeat its summary. A word
     /// that rides goes in with the next instruction, after it, never alone,
     /// and once.
+    /// 27 Nov: three pushes to a PR under review queued three "its head is
+    /// now …" notes for its working reviewer, each delivered after the PR had
+    /// moved on. Keyed notes: one waits, the newest words in it; as it goes in
+    /// it says what is so then (GitHub's head), or nothing when that is moot.
+    #[test]
+    fn three_pushes_queued_for_a_working_reviewer_go_in_as_one_note_naming_the_newest_head() {
+        let (q, _d) = queue();
+        let h = Fake::default();
+        h.set("t9", "working");
+        let key = "review-push:o/app#12";
+        let note = |head: &str| format!("[tower] PR #12 (o/app) was pushed to while you review it: its head is now {head}, not 1f00000");
+        for head in ["0f20000", "d330000", "fefe000"] {
+            q.add_keyed_note_with(&h, "t9", &note(head), key).unwrap();
+        }
+        {
+            let b = q.lock();
+            let waiting: Vec<&Item> = b.items.iter().filter(|i| i.session == "t9").collect();
+            assert_eq!(waiting.len(), 1, "one note stands for the three");
+            assert_eq!(waiting[0].text, note("fefe000"));
+        }
+        // As it goes in, GitHub's head then (one more push came meanwhile).
+        let github = Arc::new(Mutex::new("a5e0000".to_string()));
+        let g = github.clone();
+        q.on_send(Arc::new(move |k: &str, session: &str| {
+            assert_eq!((k, session), ("review-push:o/app#12", "t9"));
+            let head = g.lock().unwrap().clone();
+            if head == "checked-out" { Fresh::Drop("its checkout is at the head already".into()) } else { Fresh::Text(note(&head)) }
+        }));
+        h.set("t9", "done");
+        q.tick(&h);
+        q.tick(&h);
+        println!("delivered: {:?}", h.sent());
+        assert_eq!(h.sent(), vec![note("a5e0000")], "one notice, naming the newest head");
+        assert!(q.lock().items.is_empty());
+
+        // Queued again while it works, and its reviewer fetched that head itself: nothing goes in.
+        h.turn("t9");
+        h.set("t9", "working");
+        q.add_keyed_note_with(&h, "t9", &note("b6b0000"), key).unwrap();
+        *github.lock().unwrap() = "checked-out".into();
+        h.set("t9", "done");
+        settle(&q);
+        q.session_round(&h, "t9");
+        q.tick(&h);
+        assert_eq!(h.sent().len(), 1, "moot: not sent {:?}", h.sent());
+        assert!(q.lock().items.is_empty(), "and out of the queue");
+        // A note without a key is never merged: two stay two.
+        h.set("t9", "working");
+        q.add_note_with(&h, "t9", "one", false).unwrap();
+        q.add_note_with(&h, "t9", "two", false).unwrap();
+        assert_eq!(q.lock().items.len(), 2);
+    }
+
     #[test]
     fn a_word_that_rides_goes_in_with_the_next_instruction_never_alone() {
         let (q, _d) = queue();
