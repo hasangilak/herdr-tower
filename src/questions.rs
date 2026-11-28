@@ -2633,8 +2633,10 @@ fn pr_base_ok(b: &str, at: &PrPlace) -> bool {
 /// - A question (Claude's own, or one at the end of a turn) whose every
 ///   question asks to open the PR (and maybe push the branch for it), into
 ///   dev or the planned base or no branch named, and nothing more: no
-///   merge, no main, prod or release, no force, nothing else on the list
-///   (`pr_question`). Claude's question: its option that opens it, else
+///   merge, no main, prod or release, no force, no credits, data or
+///   uploads, nothing else on the list (`pr_question`); every sentence
+///   that asks something asks that (`asks_only_pr`), and it doesn't say
+///   the PR is open already (`pr_already_open`). Claude's question: its option that opens it, else
 ///   the reply typed; a turn's question: the reply, naming the branch.
 ///
 /// Never when the session is on a shared branch, or there is no base to
@@ -2655,6 +2657,9 @@ pub fn open_pr_yes(set: &QuestionSet, at: &PrPlace) -> Option<RuleYes> {
         "claude-ask" => {
             let [tab] = set.tabs.as_slice() else { return None };
             let base = pr_question(&tab.question, at)?;
+            if !asks_only_pr(&tab.question, at, &base) {
+                return None;
+            }
             // Its option that opens the PR, when one does and says nothing more.
             // (Its plain "Yes" when the question itself only asks it.)
             let pick = tab.options.iter().position(|o| {
@@ -2734,6 +2739,10 @@ fn names_branch(text: &str) -> bool {
 /// or anything more (a merge; main, prod or a release; a force push; a
 /// push to dev; another branch; anything else on the 90/10 list).
 fn pr_question(q: &str, at: &PrPlace) -> Option<String> {
+    // A PR that is open already isn't what it asks to open: whatever it asks is something else.
+    if pr_already_open(q) {
+        return None;
+    }
     let flat = norm(&q.replace('’', "'"));
     let ws: Vec<&str> = flat.split(' ').collect();
     // The PR: "PR", "pull request".
@@ -2744,6 +2753,9 @@ fn pr_question(q: &str, at: &PrPlace) -> Option<String> {
     const MORE: &[&str] = &[
         "merge", "merges", "merging", "merged", "force", "rebase", "squash", "deploy", "deploys", "deploying", "release", "releases", "releasing", "publish",
         "prod", "production", "main", "master", "trunk", "live", "staging", "close", "delete", "approve", "tag", "hotfix", "revert",
+        // What a run costs or changes elsewhere: credits, money, data.
+        "credit", "credits", "cost", "costs", "spend", "spends", "spending", "billing", "charge", "charges", "migrate", "migration", "migrations",
+        "database", "upload", "uploads", "uploading",
     ];
     if ws.iter().any(|w| MORE.contains(w)) {
         return None;
@@ -2771,6 +2783,26 @@ fn pr_question(q: &str, at: &PrPlace) -> Option<String> {
     }
     let base = named.unwrap_or_else(|| at.base.clone());
     pr_base_ok(&base, at).then_some(base)
+}
+
+/// A PR its words say is there already: a number (`#1729`, `…/pull/1729`),
+/// or "is open", "already opened" and the like.
+fn pr_already_open(q: &str) -> bool {
+    let c: Vec<char> = q.chars().collect();
+    if c.windows(2).any(|w| w[0] == '#' && w[1].is_ascii_digit()) || q.to_lowercase().contains("/pull/") {
+        return true;
+    }
+    let n = format!(" {} ", norm(&q.replace('’', "'")));
+    [" is open ", " are open ", " already open", " was opened ", " were opened ", " been opened ", " is up ", " are up ", " already up ", " pr exists ", " pr is there "].iter().any(|w| n.contains(w))
+}
+
+/// Whether every sentence of `q` that asks something (ends with `?`) asks
+/// to open the PR into `base` (or only to push the branch for it): a
+/// question that mentions the PR but asks something else ("PR … is open.
+/// To verify it I'd run … May I run it?") isn't one. A question with no `?`
+/// is taken whole.
+fn asks_only_pr(q: &str, at: &PrPlace, base: &str) -> bool {
+    questions_in(q).iter().all(|s| pr_question(s, at).is_some_and(|b| b == base) || push_for_it(s, at))
 }
 
 /// A question that only asks to push the session's branch (beside one that
