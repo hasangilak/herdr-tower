@@ -12,7 +12,10 @@
 //!   though some words match.
 //! - **Once** (`same_bug`): the same bug found again, by this session or one
 //!   of another space, is the finding there is: its reporter is added, and
-//!   it is told where the bug went. Nothing new opens.
+//!   it is told where the bug went. Nothing new opens. Unless that finding's
+//!   space has closed (or was resolved) since: nobody works on it there any
+//!   more, so it is filed new, following the old one (`Finding::follows`),
+//!   and opens a space of its own.
 //! - **Written up** (`writeup`, `findings/<id>.md`): what was found, where
 //!   (repo, files and lines), how to reproduce it, the evidence, and which
 //!   space and session found it. The tower publishes it as an artifact and
@@ -73,6 +76,17 @@ pub struct Finding {
     pub spun_to: String,
     /// Whoever found it again: "space › session (address)".
     pub again: Vec<String>,
+    /// The finding it follows (`f2`): the same bug found before, whose
+    /// space has closed since (fixed for the cause found then, resolved, or
+    /// left). Nobody works on that one any more: this one opens a space of
+    /// its own, and says where the first went.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub follows: String,
+    /// That finding's space (closed) and link.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub follows_space: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub follows_url: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -360,6 +374,14 @@ pub fn writeup(f: &Finding) -> String {
     let places = if r.places.is_empty() { "- (not given)".to_string() } else { r.places.iter().map(|p| format!("- `{p}`")).collect::<Vec<_>>().join("\n") };
     let mut s = format!("# {}\n\n", r.title.trim());
     s += &format!("Found {} by {} ({}) in the space \"{}\", while it worked on that space's own goal. Spun out by the tower ({}).\n\n", when(f.at), or(&r.session_name, &r.session), r.session, r.space, f.id);
+    if !f.follows.is_empty() {
+        s += &format!(
+            "## Found before\n\nThe same bug, or the same symptom, was found before as {} and spun out to the space \"{}\"{}, which has closed since: fixed for the cause found then, resolved, or left. This report is what was found now: check it against that one's fix first.\n\n",
+            f.follows,
+            f.follows_space,
+            if f.follows_url.is_empty() { String::new() } else { format!(" ({})", f.follows_url) }
+        );
+    }
     s += &format!("## What was found\n\n{}\n\n", or(&r.what, "(not given)"));
     s += &format!("## Where\n\n- Repo: `{}`\n{places}\n\n", tilde(&or(&r.repo, "(not given)")));
     s += &format!("## How to reproduce\n\n{}\n\n", or(&r.repro, "(not given: find it from the evidence)"));
@@ -460,7 +482,13 @@ pub fn ticket(f: &Finding) -> String {
 /// The line the finding session gets: note it, don't chase it.
 pub fn told_finder(f: &Finding, again: bool) -> String {
     let title = f.report.title.trim().trim_end_matches('.');
-    let first = if again { format!("The bug you reported (\"{title}\") was found before") } else { format!("Thanks: the bug you reported (\"{title}\") is off this space's goal") };
+    let first = if again {
+        format!("The bug you reported (\"{title}\") was found before")
+    } else if !f.follows.is_empty() {
+        format!("Thanks: the bug you reported (\"{title}\") is off this space's goal, and was found before ({}), but its space \"{}\" has closed since", f.follows, f.follows_space)
+    } else {
+        format!("Thanks: the bug you reported (\"{title}\") is off this space's goal")
+    };
     format!(
         "{first}: the tower spun it out to the space \"{}\", where a session of its own works on it (write-up: {}). Note it in your report if it matters there, don't fix it here, and carry on with your own goal.",
         f.spun_to, f.url
@@ -470,7 +498,8 @@ pub fn told_finder(f: &Finding, again: bool) -> String {
 /// The user's one line.
 pub fn told_user(f: &Finding) -> String {
     let title = f.report.title.trim().trim_end_matches('.');
-    format!("A bug {} found off its goal in {} is spun out to the new space \"{}\": {title} ({}).", or_name(&f.report), f.report.space, f.spun_to, f.url)
+    let before = if f.follows.is_empty() { String::new() } else { format!(" It was found before as {}, whose space \"{}\" has closed since.", f.follows, f.follows_space) };
+    format!("A bug {} found off its goal in {} is spun out to the new space \"{}\": {title} ({}).{before}", or_name(&f.report), f.report.space, f.spun_to, f.url)
 }
 
 fn or_name(r: &Report) -> String {
@@ -522,13 +551,26 @@ pub enum Filed {
     Again(Finding),
 }
 
+/// Files a report in `book` (the judgment made), every space open.
+#[cfg(test)]
+pub fn file(book: &mut Book, r: Report, now: u64) -> Filed {
+    file_with(book, r, now, |_| true)
+}
+
 /// Files a report in `book` (the judgment made): new, or the finding there is.
 ///
 /// A finding's own space (the one it was spun out to) works on that bug, so
 /// whatever its sessions report off that space's goal is another bug.
-pub fn file(book: &mut Book, r: Report, now: u64) -> Filed {
+///
+/// `open`: whether a space is open (`space_open`). A finding spun out to a
+/// space that has closed since is nobody's work any more: the same bug
+/// found again is filed new, following it (the latest such one), and
+/// opens a space of its own.
+pub fn file_with(book: &mut Book, r: Report, now: u64, open: impl Fn(&str) -> bool) -> Filed {
     let own_space = |f: &Finding| !f.spun_to.is_empty() && f.spun_to == r.space;
-    if let Some(f) = book.findings.iter_mut().find(|f| !own_space(f) && same_bug(&f.report, &r)) {
+    let closed = |f: &Finding| f.state == "spun-out" && !open(&f.spun_to);
+    let follows = book.findings.iter().rev().find(|f| !own_space(f) && closed(f) && same_bug(&f.report, &r)).map(|f| (f.id.clone(), f.spun_to.clone(), f.url.clone()));
+    if let Some(f) = book.findings.iter_mut().find(|f| !own_space(f) && !closed(f) && same_bug(&f.report, &r)) {
         let who = format!("{} › {} ({})", r.space, or_name(&r), r.session);
         let first = format!("{} › {} ({})", f.report.space, or_name(&f.report), f.report.session);
         if who != first && !f.again.contains(&who) {
@@ -537,9 +579,17 @@ pub fn file(book: &mut Book, r: Report, now: u64) -> Filed {
         return Filed::Again(f.clone());
     }
     book.next += 1;
-    let f = Finding { id: format!("f{}", book.next), report: r, at: now, state: "drafted".into(), ..Default::default() };
+    let (follows, follows_space, follows_url) = follows.unwrap_or_default();
+    let f = Finding { id: format!("f{}", book.next), report: r, at: now, state: "drafted".into(), follows, follows_space, follows_url, ..Default::default() };
     book.findings.push(f.clone());
     Filed::New(f)
+}
+
+/// Whether `space` is open, by the tower's missions: a spun-out finding's
+/// space is one `tower launch` made, so one the tower doesn't know (any
+/// more) is gone, as one closed (or resolved, which closes it) is.
+pub fn space_open(s: &crate::spaces::Spaces, space: &str) -> bool {
+    !space.trim().is_empty() && crate::missions::of(s, space).is_some_and(|(_, m)| m.state != crate::missions::State::Closed && m.closed_ms.is_none())
 }
 
 /// A draft older than this, or a space that began to open longer ago, is
@@ -684,7 +734,7 @@ pub fn report(a: &Args, now: u64) -> Result<Value> {
         return Ok(json!({ "filed": "on-goal", "space": space, "goal": goal, "done_when": done_when, "why": why,
             "next": format!("Not spun out ({why}). If it is the session's own work, let it fix it; if you judge it off goal, run this again with --off-goal.") }));
     }
-    let filed = update_at(&path(), |b| file(b, r, now));
+    let filed = update_at(&path(), |b| file_with(b, r, now, |space| space_open(&s, space)));
     match filed {
         Filed::Again(f) => {
             // Found before: told where it went, once more for this one.
@@ -701,8 +751,13 @@ pub fn report(a: &Args, now: u64) -> Result<Value> {
             let md = dir().join(format!("{}.md", f.id));
             std::fs::create_dir_all(dir())?;
             std::fs::write(&md, writeup(&f))?;
-            Ok(json!({ "filed": "new", "id": f.id, "judged": judged_line(&j), "writeup": md,
-                "next": format!("Publish {} as an HTML page Artifact with your Artifact tool (its words as they are: what was found, where, how to reproduce, evidence, who found it), then run `tower finding published {} --url <its link>`: that opens its space and tells the session and the user.", md.display(), f.id) }))
+            let before = if f.follows.is_empty() {
+                String::new()
+            } else {
+                format!("Found before as {}, but its space \"{}\" has closed since, so nobody works on it: filed as a new finding, {}, that follows {} (its write-up says so). ", f.follows, f.follows_space, f.id, f.follows)
+            };
+            Ok(json!({ "filed": "new", "id": f.id, "judged": judged_line(&j), "writeup": md, "follows": f.follows, "follows_space": f.follows_space,
+                "next": format!("{before}Publish {} as an HTML page Artifact with your Artifact tool (its words as they are: what was found, where, how to reproduce, evidence, who found it), then run `tower finding published {} --url <its link>`: that opens its space and tells the session and the user.", md.display(), f.id) }))
         }
     }
 }
@@ -822,6 +877,55 @@ mod tests {
         // No goal (a standing space): the tower's call.
         let j = judge("", "", &upload);
         assert!(!j.known && !j.off);
+    }
+
+    /// 2026-11-28: a nightly smoke check was fixed for its first cause and
+    /// its finding's space closed; a session then found a new cause of the
+    /// same symptom, and it was filed "again" into the closed space, where
+    /// nobody would work on it.
+    #[test]
+    fn a_bug_found_again_after_its_space_closed_opens_a_new_finding_that_follows_it() {
+        use crate::missions::{Mission, State};
+        let places = [".github/workflows/nightly.yml:40-60"];
+        let mut b = Book { next: 1, ..Default::default() };
+        let first = rep("The nightly's Dev smoke fails every night: its public upload link expired", "The nightly's Dev smoke step uploads a fixture and reads it back through a public link, which has expired.", "/w/media-api", &places);
+        let Filed::New(f2) = file(&mut b, first, 1) else { panic!("new") };
+        let Some(Claim::Go(_)) = claim(&mut b, &f2.id, "https://claude.ai/artifact/f2", 2) else { panic!("go") };
+        (b.findings[0].state, b.findings[0].spun_to) = ("spun-out".into(), "bug-nightly-smoke".into());
+        let mut again = rep("The nightly's Dev smoke fails every night: its default workflow times out", "The nightly's Dev smoke step fails again: the default workflow it starts times out.", "/w/media-api", &places);
+        (again.space, again.session, again.session_name) = ("inbox".into(), "t41".into(), "mail".into());
+        assert!(same_bug(&f2.report, &again), "the same symptom: a match");
+        // The spaces as the tower's missions have them.
+        let mut s = crate::spaces::Spaces::default();
+        s.missions.insert("bug-nightly-smoke".into(), Mission::born(1));
+        s.missions.insert("inbox".into(), Mission::born(1));
+        // While its space is open, the same bug is the finding there is: nothing new opens.
+        let mut open_book = b.clone();
+        assert!(matches!(file_with(&mut open_book, again.clone(), 3, |sp| space_open(&s, sp)), Filed::Again(ref f) if f.id == "f2"));
+        // Its space closes (fixed for its first cause, or resolved).
+        let m = s.missions.get_mut("bug-nightly-smoke").unwrap();
+        (m.state, m.closed_ms) = (State::Closed, Some(4));
+        assert!(!space_open(&s, "bug-nightly-smoke") && space_open(&s, "inbox"));
+        assert!(!space_open(&s, "never-made"), "a space the tower doesn't know is gone");
+        // Reported again: a new finding, following the old one.
+        let Filed::New(f) = file_with(&mut b, again.clone(), 5, |sp| space_open(&s, sp)) else { panic!("its space closed: a new finding") };
+        assert_eq!((f.id.as_str(), f.follows.as_str(), f.follows_space.as_str(), f.follows_url.as_str()), ("f3", "f2", "bug-nightly-smoke", "https://claude.ai/artifact/f2"));
+        assert!(b.findings[0].again.is_empty(), "not filed into the closed one");
+        let w = writeup(&f);
+        assert!(w.contains("## Found before") && w.contains("found before as f2 and spun out to the space \"bug-nightly-smoke\" (https://claude.ai/artifact/f2), which has closed since"), "{w}");
+        // Spun out: the finder and the user are told it follows f2.
+        b.findings[1].state = "publishing".into();
+        let mut out = f.clone();
+        (out.state, out.spun_to, out.url) = ("spun-out".into(), "inbox › bug-nightly-smoke".into(), "https://claude.ai/artifact/f3".into());
+        assert!(told_user(&out).ends_with("It was found before as f2, whose space \"bug-nightly-smoke\" has closed since."), "{}", told_user(&out));
+        assert!(told_finder(&out, false).contains("was found before (f2), but its space \"bug-nightly-smoke\" has closed since: the tower spun it out to the space \"inbox › bug-nightly-smoke\""), "{}", told_finder(&out, false));
+        // Its new space open, the next report of it is that one, not a third.
+        b.findings[1] = out.clone();
+        s.missions.insert(out.spun_to.clone(), Mission::born(6));
+        let mut third = again;
+        (third.space, third.session, third.session_name) = ("sandbox".into(), "t40".into(), "api".into());
+        assert!(matches!(file_with(&mut b, third, 7, |sp| space_open(&s, sp)), Filed::Again(ref f) if f.id == "f3"));
+        assert_eq!(b.findings.len(), 2);
     }
 
     #[test]
